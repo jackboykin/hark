@@ -221,6 +221,76 @@ pub const Message = struct {
     additionals: []const ResourceRecord,
 };
 
+// ── Name / Query builders ──────────────────────────────────────────────
+
+pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
+    // Handle root zone
+    if (dotted.len == 0 or (dotted.len == 1 and dotted[0] == '.')) {
+        const labels = allocator.alloc([]const u8, 0) catch return error.OutOfMemory;
+        return .{ .labels = labels };
+    }
+
+    // Strip optional trailing dot
+    const name_str = if (dotted[dotted.len - 1] == '.') dotted[0 .. dotted.len - 1] else dotted;
+
+    // Validate first (no allocations, so no cleanup needed on error)
+    var total_len: usize = 0;
+    var label_count: usize = 0;
+    {
+        var iter = mem.splitScalar(u8, name_str, '.');
+        while (iter.next()) |label| {
+            if (label.len == 0) return error.InvalidLabelType;
+            if (label.len > max_label_len) return error.LabelTooLong;
+            total_len += label.len + 1;
+            if (total_len > max_name_len + 1) return error.NameTooLong;
+            label_count += 1;
+        }
+    }
+
+    // Allocate and populate
+    const labels = allocator.alloc([]const u8, label_count) catch return error.OutOfMemory;
+    var i: usize = 0;
+    var iter = mem.splitScalar(u8, name_str, '.');
+    while (iter.next()) |label| {
+        labels[i] = allocator.dupe(u8, label) catch return error.OutOfMemory;
+        i += 1;
+    }
+
+    return .{ .labels = labels };
+}
+
+pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType) Error!Message {
+    const name = try parseDottedName(allocator, name_str);
+    const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
+    questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
+
+    const empty_rr = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
+    const empty_rr2 = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
+    const empty_rr3 = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
+
+    return .{
+        .header = .{
+            .id = id,
+            .qr = false,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = true,
+            .ra = false,
+            .z = 0,
+            .rcode = .no_error,
+            .qd_count = 1,
+            .an_count = 0,
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = questions,
+        .answers = empty_rr,
+        .authorities = empty_rr2,
+        .additionals = empty_rr3,
+    };
+}
+
 // ── Parser ─────────────────────────────────────────────────────────────
 
 pub const Parser = struct {
@@ -1136,7 +1206,7 @@ fn freeRData(allocator: Allocator, rdata: RData) void {
     }
 }
 
-fn freeMessage(allocator: Allocator, msg: Message) void {
+pub fn freeMessage(allocator: Allocator, msg: Message) void {
     for (msg.questions) |q| freeName(allocator, q.name);
     allocator.free(msg.questions);
     for (msg.answers) |rr| {
@@ -1154,4 +1224,69 @@ fn freeMessage(allocator: Allocator, msg: Message) void {
         freeRData(allocator, rr.rdata);
     }
     allocator.free(msg.additionals);
+}
+
+test "parseDottedName basic" {
+    const name = try parseDottedName(testing.allocator, "example.com");
+    defer {
+        for (name.labels) |l| testing.allocator.free(l);
+        testing.allocator.free(name.labels);
+    }
+    try testing.expectEqual(@as(usize, 2), name.labels.len);
+    try testing.expectEqualStrings("example", name.labels[0]);
+    try testing.expectEqualStrings("com", name.labels[1]);
+}
+
+test "parseDottedName trailing dot" {
+    const name = try parseDottedName(testing.allocator, "example.com.");
+    defer {
+        for (name.labels) |l| testing.allocator.free(l);
+        testing.allocator.free(name.labels);
+    }
+    try testing.expectEqual(@as(usize, 2), name.labels.len);
+    try testing.expectEqualStrings("example", name.labels[0]);
+    try testing.expectEqualStrings("com", name.labels[1]);
+}
+
+test "parseDottedName root zone" {
+    const name = try parseDottedName(testing.allocator, ".");
+    defer testing.allocator.free(name.labels);
+    try testing.expectEqual(@as(usize, 0), name.labels.len);
+
+    const name2 = try parseDottedName(testing.allocator, "");
+    defer testing.allocator.free(name2.labels);
+    try testing.expectEqual(@as(usize, 0), name2.labels.len);
+}
+
+test "parseDottedName empty label" {
+    try testing.expectError(error.InvalidLabelType, parseDottedName(testing.allocator, "example..com"));
+}
+
+test "parseDottedName too-long label" {
+    const long_label = "a" ** 64 ++ ".com";
+    try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, long_label));
+}
+
+test "buildQuery roundtrip" {
+    const msg = try buildQuery(testing.allocator, 0x1234, "example.com", .a);
+    defer freeMessage(testing.allocator, msg);
+
+    try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
+    try testing.expect(!msg.header.qr);
+    try testing.expect(msg.header.rd);
+    try testing.expectEqual(@as(u16, 1), msg.header.qd_count);
+    try testing.expectEqual(@as(usize, 1), msg.questions.len);
+    try testing.expectEqual(RType.a, msg.questions[0].qtype);
+    try testing.expectEqual(RClass.in, msg.questions[0].qclass);
+
+    // Serialize and re-parse
+    var buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    try testing.expectEqual(msg.header.id, msg2.header.id);
+    try testing.expectEqual(msg.header.rd, msg2.header.rd);
+    try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
+    try testing.expectEqual(msg.questions[0].qtype, msg2.questions[0].qtype);
 }
