@@ -5,6 +5,7 @@ const EventLoop = hark.event_loop.EventLoop;
 const UdpTransport = hark.transport.UdpTransport;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
+const RRsetCache = hark.cache.RRsetCache;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -130,6 +131,10 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer t.deinit();
 
+    // Cache: 16MB cap, 10k max entries
+    var cache = RRsetCache.init(gpa_alloc, 16 * 1024 * 1024, 10_000);
+    defer cache.deinit();
+
     // DNS message data uses arena
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     defer arena.deinit();
@@ -142,7 +147,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
     } else blk: {
-        var resolver = RecursiveResolver.init(&t);
+        var resolver = RecursiveResolver.initWithCache(&t, &cache);
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);

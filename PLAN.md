@@ -8,6 +8,26 @@
 - **Dependency-minimal**: Zig stdlib only. No external packages.
 - **Test everything**: Fuzz parsers, integration-test against real DNS, use `std.testing.allocator` to catch leaks.
 
+## Design Anti-Patterns (Lessons from Hickory)
+
+These are concrete bugs found while contributing to Hickory DNS (hickory-dns/hickory-dns#3477)
+that inform hark's design:
+
+- **Never fabricate protocol states from application state.** Hickory's answer filter
+  silently converted an empty answer set into a synthetic NXDOMAIN response code. This
+  poisoned the negative cache with a 1-hour NXDOMAIN for records that actually existed
+  (NOERROR). Negative caching is dangerous — be very conservative about NXDOMAIN generation.
+- **Track zone cuts explicitly.** Hickory used `zone.base_name()` as the bailiwick boundary,
+  but this silently drifted from the actual zone cut in flat NS structures (e.g.
+  `r06.twtrdns.net`). The bailiwick filter then dropped legitimate SOA records, triggering
+  a bogus RFC 8020 NXDOMAIN synthesis. Zone cut tracking must be an explicit, separate value
+  from the query name being resolved.
+- **Keep resolution state deterministic and traceable.** Hickory's cache poisoning bug only
+  fired when the async connection pool happened to return `Ok` instead of `Err` — depending
+  on which nameserver the Tokio scheduler reached first. Hiding resolution state behind an
+  opaque async runtime made this non-deterministic and nearly impossible to reproduce. hark's
+  io_uring event loop gives linear, inspectable control flow by design.
+
 ## Architecture Overview
 
 ```
@@ -87,6 +107,14 @@
 - Cache eviction: simple LRU or random eviction when at capacity
 - Serve stale with background refresh (optional, RFC 8767)
 - No disk persistence — in-memory only, clean restart
+- Pre-allocated bounded arena for cache entries — deterministic memory cap, DDoS resilience
+
+**Performance notes for hashmap design:**
+- Investigate SIMD-accelerated metadata probing (SwissTable / F14 pattern): separate dense
+  control byte array, vectorized 16/32-slot parallel probe in a single cycle. Eliminates
+  collision penalty for hot-path cache lookups.
+- History-independent Robin Hood hashing: final memory layout is identical regardless of
+  insertion order, so tail latency stays flat under constant TTL churn and cache floods.
 
 ### M5: TCP Transport
 **RFCs**: 7766 (DNS over TCP), 5966
@@ -173,6 +201,16 @@ Revisit stdlib maturity when we reach this milestone.*
   - Upstream servers, forwarding mode toggle, cache size, listen addresses
 - Graceful shutdown
 - Logging / metrics (optional)
+
+**Concurrency architecture notes:**
+- Thread-per-core with shared-nothing sharded cache (no mutexes). Each core owns
+  exclusive cache shards, determined by hashing the query name.
+- `SO_REUSEPORT` + eBPF packet steering: attach a small eBPF program to the socket that
+  parses incoming UDP query names, hashes them, and steers packets to the io_uring instance
+  on the core that owns that shard. Lock-free by construction.
+- If shared cache is needed instead, use epoch-based / RCU memory reclamation: readers never
+  lock, writers build new entries and atomically swap pointers, retired memory cleaned up at
+  event loop epoch boundaries.
 
 ## Key Architectural Decisions
 

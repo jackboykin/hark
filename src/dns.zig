@@ -1202,12 +1202,12 @@ test "fuzz: random bytes must not panic" {
 
 // ── Test helper: free all allocations from a parsed message ────────────
 
-fn freeName(allocator: Allocator, name: Name) void {
+pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);
 }
 
-fn freeRData(allocator: Allocator, rdata: RData) void {
+pub fn freeRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa => {},
         .ns => |name| freeName(allocator, name),

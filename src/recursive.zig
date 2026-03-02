@@ -3,6 +3,8 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
+const cache_mod = @import("cache.zig");
+const RRsetCache = cache_mod.RRsetCache;
 
 // ── Root Hints ─────────────────────────────────────────────────────────
 // IPv4 addresses for a.root-servers.net through m.root-servers.net.
@@ -32,9 +34,14 @@ const max_cname_chain = 8;
 
 pub const RecursiveResolver = struct {
     transport: *UdpTransport,
+    cache: ?*RRsetCache,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
-        return .{ .transport = transport };
+        return .{ .transport = transport, .cache = null };
+    }
+
+    pub fn initWithCache(transport: *UdpTransport, cache: *RRsetCache) RecursiveResolver {
+        return .{ .transport = transport, .cache = cache };
     }
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !dns.Message {
@@ -48,6 +55,23 @@ pub const RecursiveResolver = struct {
         var cname_count: usize = 0;
 
         cname_loop: while (true) {
+            // CACHE CHECK 1: Do we already have a cached answer?
+            if (self.cache) |c| {
+                if (c.lookup(allocator, current_name, qtype, .in)) |result| {
+                    switch (result) {
+                        .hit => |h| return makeCachedMessage(h.records, &.{}, .no_error),
+                        .negative => |n| {
+                            const authorities = if (n.soa) |soa| blk: {
+                                const auths = try allocator.alloc(dns.ResourceRecord, 1);
+                                auths[0] = soa;
+                                break :blk auths;
+                            } else &[_]dns.ResourceRecord{};
+                            return makeCachedMessage(&.{}, authorities, n.rcode);
+                        },
+                    }
+                }
+            }
+
             var servers: [max_servers_per_level]std.net.Address = undefined;
             var server_count: usize = root_hints.len;
             @memcpy(servers[0..root_hints.len], &root_hints);
@@ -60,6 +84,13 @@ pub const RecursiveResolver = struct {
             // Parent zone tracks the zone the current servers are authoritative for.
             // Starts as root (empty labels = ".") since we begin at root hints.
             var parent_zone = dns.Name{ .labels = &.{} };
+
+            // CACHE CHECK 2: Find closest cached delegation to skip root/TLD queries.
+            if (self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
+                server_count = deleg.count;
+                @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
+                parent_zone = deleg.zone;
+            }
 
             for (0..max_referrals) |_| {
                 // Shuffle servers (Fisher-Yates)
@@ -91,13 +122,24 @@ pub const RecursiveResolver = struct {
                     // Parse response
                     response = try dns.parseMessage(allocator, response_data);
                     got_response = true;
+
+                    // CACHE STORE: Cache all RRsets from this response
+                    if (self.cache) |c| c.storeResponse(response, parent_zone);
+
                     break;
                 }
 
                 if (!got_response) return error.Timeout;
 
                 // Classify response
-                if (response.header.rcode != .no_error) return response;
+                if (response.header.rcode != .no_error) {
+                    // Cache NXDOMAIN from authoritative responses only (Hickory lesson:
+                    // never fabricate NXDOMAIN from application state).
+                    if (response.header.rcode == .name_error and response.header.aa) {
+                        if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
+                    }
+                    return response;
+                }
 
                 if (response.answers.len > 0) {
                     // Follow CNAME if the answer doesn't contain the queried type
@@ -122,7 +164,13 @@ pub const RecursiveResolver = struct {
                 }
 
                 // Check for referral (NS records in authority section)
-                const referral = extractReferral(response, target_name, parent_zone) orelse return response; // NODATA
+                const referral = extractReferral(response, target_name, parent_zone) orelse {
+                    // NODATA: no answers, no referral. Cache only if authoritative.
+                    if (response.header.aa) {
+                        if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
+                    }
+                    return response;
+                };
                 switch (referral) {
                     .referral => |ref| {
                         // Loop detection: reject if we've already visited this zone
@@ -137,12 +185,15 @@ pub const RecursiveResolver = struct {
                         @memcpy(servers[0..ref.count], ref.addrs[0..ref.count]);
                     },
                     .no_glue => |ng| {
-                        const resolved = self.resolveNsAddresses(
-                            allocator,
-                            ng.ns_names[0..ng.ns_count],
-                            depth,
-                        ) catch return error.NoGlueRecords;
-                        const res = resolved orelse return error.NoGlueRecords;
+                        // CACHE CHECK 3: Try cached A records for NS names first
+                        const res = self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count]) orelse blk: {
+                            const resolved = self.resolveNsAddresses(
+                                allocator,
+                                ng.ns_names[0..ng.ns_count],
+                                depth,
+                            ) catch return error.NoGlueRecords;
+                            break :blk resolved orelse return error.NoGlueRecords;
+                        };
 
                         // Loop detection on the zone cut (same as .referral path)
                         for (seen_zones[0..seen_zone_count]) |sz| {
@@ -167,7 +218,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         ns_names: []const dns.Name,
         depth: usize,
-    ) !?struct { addrs: [max_servers_per_level]std.net.Address, count: usize } {
+    ) !?NsAddrResult {
         if (depth >= max_resolve_depth) return null;
 
         var addrs: [max_servers_per_level]std.net.Address = undefined;
@@ -188,7 +239,154 @@ pub const RecursiveResolver = struct {
         if (count == 0) return null;
         return .{ .addrs = addrs, .count = count };
     }
+
+    const NsAddrResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize };
+    const DelegationResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize, zone: dns.Name };
+
+    /// Check cache for A records of NS names, avoiding network queries.
+    fn lookupCachedNsAddresses(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        ns_names: []const dns.Name,
+    ) ?NsAddrResult {
+        const cache = self.cache orelse return null;
+
+        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var count: usize = 0;
+
+        for (ns_names) |ns_name| {
+            const ns_dotted = nameToDotted(allocator, ns_name) catch continue;
+            if (cache.lookup(allocator, ns_dotted, .a, .in)) |result| {
+                switch (result) {
+                    .hit => |h| {
+                        for (h.records) |rr| {
+                            if (rr.rtype == .a and count < max_servers_per_level) {
+                                addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
+                                count += 1;
+                            }
+                        }
+                        if (count > 0) break;
+                    },
+                    .negative => {},
+                }
+            }
+        }
+
+        if (count == 0) return null;
+        return .{ .addrs = addrs, .count = count };
+    }
+
+    /// Walk the domain name from TLD to find the closest cached delegation.
+    /// E.g., for "www.example.com", check NS records for "com" then "example.com".
+    fn findClosestCachedDelegation(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        target_name: []const u8,
+    ) ?DelegationResult {
+        const cache = self.cache orelse return null;
+
+        // Split into labels
+        var parts: [128][]const u8 = undefined;
+        var part_count: usize = 0;
+        var iter = mem.splitScalar(u8, target_name, '.');
+        while (iter.next()) |part| {
+            if (part.len == 0) continue;
+            if (part_count >= 128) break;
+            parts[part_count] = part;
+            part_count += 1;
+        }
+        if (part_count == 0) return null;
+
+        // Walk from TLD toward full name, looking for cached NS + addresses
+        var best: ?DelegationResult = null;
+
+        var i: usize = part_count;
+        while (i > 0) {
+            i -= 1;
+            // Build zone name string from parts[i..part_count]
+            var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+            var pos: usize = 0;
+            for (parts[i..part_count]) |p| {
+                if (pos > 0) {
+                    zone_buf[pos] = '.';
+                    pos += 1;
+                }
+                if (pos + p.len > dns.max_name_len) break;
+                @memcpy(zone_buf[pos..][0..p.len], p);
+                pos += p.len;
+            }
+            const zone_str = zone_buf[0..pos];
+
+            // Look up cached NS records for this zone
+            if (cache.lookup(allocator, zone_str, .ns, .in)) |result| {
+                switch (result) {
+                    .hit => |h| {
+                        // Try to find cached A records for these NS names
+                        var addrs: [max_servers_per_level]std.net.Address = undefined;
+                        var addr_count: usize = 0;
+
+                        for (h.records) |ns_rr| {
+                            if (ns_rr.rtype != .ns) continue;
+                            const ns_dotted = nameToDotted(allocator, ns_rr.rdata.ns) catch continue;
+                            if (cache.lookup(allocator, ns_dotted, .a, .in)) |a_result| {
+                                switch (a_result) {
+                                    .hit => |a_hit| {
+                                        for (a_hit.records) |a_rr| {
+                                            if (a_rr.rtype == .a and addr_count < max_servers_per_level) {
+                                                addrs[addr_count] = std.net.Address.initIp4(a_rr.rdata.a, 53);
+                                                addr_count += 1;
+                                            }
+                                        }
+                                    },
+                                    .negative => {},
+                                }
+                            }
+                        }
+
+                        if (addr_count > 0) {
+                            const zone_name = dns.parseDottedName(allocator, zone_str) catch continue;
+                            best = .{
+                                .addrs = addrs,
+                                .count = addr_count,
+                                .zone = zone_name,
+                            };
+                            // Keep going to find a more specific zone
+                        }
+                    },
+                    .negative => {},
+                }
+            }
+        }
+
+        return best;
+    }
 };
+
+// ── Response synthesis (for cache hits) ────────────────────────────────
+
+fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const dns.ResourceRecord, rcode: dns.RCode) dns.Message {
+    return .{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .rcode = rcode,
+            .qd_count = 0,
+            .an_count = @intCast(answers.len),
+            .ns_count = @intCast(authorities.len),
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = answers,
+        .authorities = authorities,
+        .additionals = &.{},
+    };
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
