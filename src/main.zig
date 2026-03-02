@@ -4,6 +4,7 @@ const dns = hark.dns;
 const EventLoop = hark.event_loop.EventLoop;
 const UdpTransport = hark.transport.UdpTransport;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
+const RecursiveResolver = hark.recursive.RecursiveResolver;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -36,10 +37,14 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  dump                Read a raw DNS packet from stdin and print it
-        \\  query <name> [type] [--upstream <ip>]
-        \\                      Forward a DNS query to an upstream server
+        \\  query <name> [type] [options]
+        \\                      Resolve a DNS query (recursive by default)
         \\
-        \\Defaults: type=A, upstream=8.8.8.8
+        \\Query options:
+        \\  --forward           Use forwarding mode instead of recursive resolution
+        \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
+        \\
+        \\Defaults: type=A, mode=recursive
         \\
     , .{});
 }
@@ -88,10 +93,13 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     const name = args[0];
     var qtype: dns.RType = .a;
     var upstream_ip: [4]u8 = .{ 8, 8, 8, 8 };
+    var forward_mode = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--upstream")) {
+        if (std.mem.eql(u8, args[i], "--forward")) {
+            forward_mode = true;
+        } else if (std.mem.eql(u8, args[i], "--upstream")) {
             i += 1;
             if (i >= args.len) {
                 std.debug.print("Error: --upstream requires an IP address\n", .{});
@@ -109,8 +117,6 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    const upstream = std.net.Address.initIp4(upstream_ip, 53);
-
     // EventLoop and transport use GPA (long-lived)
     const loop = EventLoop.create(gpa_alloc) catch |err| {
         std.debug.print("Failed to initialize io_uring: {}\n", .{err});
@@ -124,15 +130,23 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer t.deinit();
 
-    var resolver = ForwardingResolver.init(&t);
-
     // DNS message data uses arena
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     defer arena.deinit();
 
-    const response = resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
-        std.debug.print("Query failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+    const response = if (forward_mode) blk: {
+        var resolver = ForwardingResolver.init(&t);
+        const upstream = std.net.Address.initIp4(upstream_ip, 53);
+        break :blk resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
+            std.debug.print("Query failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else blk: {
+        var resolver = RecursiveResolver.init(&t);
+        break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
+            std.debug.print("Query failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
     };
 
     var stdout_buf: [4096]u8 = undefined;
