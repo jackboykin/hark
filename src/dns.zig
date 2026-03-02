@@ -158,6 +158,18 @@ pub const Name = struct {
         }
         return true;
     }
+
+    /// Returns true if self is equal to or a subdomain of parent.
+    /// E.g. "www.example.com".isSubdomainOf("example.com") == true
+    pub fn isSubdomainOf(self: Name, parent: Name) bool {
+        if (parent.labels.len == 0) return true; // everything is under root
+        if (self.labels.len < parent.labels.len) return false;
+        const offset = self.labels.len - parent.labels.len;
+        for (parent.labels, 0..) |p_label, i| {
+            if (!std.ascii.eqlIgnoreCase(self.labels[offset + i], p_label)) return false;
+        }
+        return true;
+    }
 };
 
 // ── RData types ────────────────────────────────────────────────────────
@@ -1273,6 +1285,35 @@ test "parseDottedName empty label" {
 test "parseDottedName too-long label" {
     const long_label = "a" ** 64 ++ ".com";
     try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, long_label));
+}
+
+test "isSubdomainOf equal names" {
+    const name = Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(name.isSubdomainOf(name));
+}
+
+test "isSubdomainOf child of parent" {
+    const child = Name{ .labels = &.{ "www", "example", "com" } };
+    const parent = Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(child.isSubdomainOf(parent));
+}
+
+test "isSubdomainOf sibling returns false" {
+    const a = Name{ .labels = &.{ "a", "example", "com" } };
+    const b = Name{ .labels = &.{ "b", "example", "com" } };
+    try testing.expect(!a.isSubdomainOf(b));
+}
+
+test "isSubdomainOf root parent" {
+    const name = Name{ .labels = &.{ "example", "com" } };
+    const root = Name{ .labels = &.{} };
+    try testing.expect(name.isSubdomainOf(root));
+}
+
+test "isSubdomainOf case insensitive" {
+    const child = Name{ .labels = &.{ "WWW", "EXAMPLE", "COM" } };
+    const parent = Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(child.isSubdomainOf(parent));
 }
 
 test "buildQuery roundtrip" {

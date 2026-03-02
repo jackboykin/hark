@@ -26,6 +26,7 @@ pub const root_hints: [13]std.net.Address = .{
 
 const max_referrals = 10;
 const max_servers_per_level = 13;
+const max_cname_chain = 8;
 
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
@@ -37,77 +38,149 @@ pub const RecursiveResolver = struct {
     }
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !dns.Message {
-        var servers: [max_servers_per_level]std.net.Address = undefined;
-        var server_count: usize = root_hints.len;
-        @memcpy(servers[0..root_hints.len], &root_hints);
+        var current_name: []const u8 = name;
+        var cname_count: usize = 0;
 
-        for (0..max_referrals) |_| {
-            // Shuffle servers (Fisher-Yates)
-            fisherYatesShuffle(std.net.Address, servers[0..server_count]);
+        cname_loop: while (true) {
+            var servers: [max_servers_per_level]std.net.Address = undefined;
+            var server_count: usize = root_hints.len;
+            @memcpy(servers[0..root_hints.len], &root_hints);
 
-            // Try each server until one responds
-            var got_response = false;
-            var response: dns.Message = undefined;
+            const target_name = try dns.parseDottedName(allocator, current_name);
 
-            for (servers[0..server_count]) |server| {
-                // Generate random query ID
-                var id_bytes: [2]u8 = undefined;
-                std.crypto.random.bytes(&id_bytes);
-                const query_id = mem.readInt(u16, &id_bytes, .big);
+            var seen_zones: [max_referrals]dns.Name = undefined;
+            var seen_zone_count: usize = 0;
 
-                // Build iterative query (rd=false)
-                const query_msg = try dns.buildQueryWithOptions(allocator, query_id, name, qtype, .{ .rd = false });
+            for (0..max_referrals) |_| {
+                // Shuffle servers (Fisher-Yates)
+                fisherYatesShuffle(std.net.Address, servers[0..server_count]);
 
-                // Serialize
-                var wire_buf: [dns.max_udp_payload]u8 = undefined;
-                const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
+                // Try each server until one responds
+                var got_response = false;
+                var response: dns.Message = undefined;
 
-                // Send and receive
-                const response_data = self.transport.query(wire_query, query_id, server) catch |err| switch (err) {
-                    error.Timeout => continue, // try next server
-                    else => return err,
-                };
+                for (servers[0..server_count]) |server| {
+                    // Generate random query ID
+                    var id_bytes: [2]u8 = undefined;
+                    std.crypto.random.bytes(&id_bytes);
+                    const query_id = mem.readInt(u16, &id_bytes, .big);
 
-                // Parse response
-                response = try dns.parseMessage(allocator, response_data);
-                got_response = true;
-                break;
+                    // Build iterative query (rd=false)
+                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, current_name, qtype, .{ .rd = false });
+
+                    // Serialize
+                    var wire_buf: [dns.max_udp_payload]u8 = undefined;
+                    const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
+
+                    // Send and receive
+                    const response_data = self.transport.query(wire_query, query_id, server) catch |err| switch (err) {
+                        error.Timeout => continue, // try next server
+                        else => return err,
+                    };
+
+                    // Parse response
+                    response = try dns.parseMessage(allocator, response_data);
+                    got_response = true;
+                    break;
+                }
+
+                if (!got_response) return error.Timeout;
+
+                // Classify response
+                if (response.header.rcode != .no_error) return response;
+
+                if (response.answers.len > 0) {
+                    // Follow CNAME if the answer doesn't contain the queried type
+                    if (qtype != .cname) {
+                        var has_target_type = false;
+                        for (response.answers) |rr| {
+                            if (rr.rtype == qtype) {
+                                has_target_type = true;
+                                break;
+                            }
+                        }
+                        if (!has_target_type) {
+                            if (try findCname(response, target_name, allocator)) |cname_target| {
+                                if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
+                                cname_count += 1;
+                                current_name = cname_target;
+                                continue :cname_loop;
+                            }
+                        }
+                    }
+                    return response;
+                }
+
+                // Check for referral (NS records in authority section)
+                const referral = extractReferral(response, target_name) orelse return response; // NODATA
+                switch (referral) {
+                    .referral => |ref| {
+                        // Loop detection: reject if we've already visited this zone
+                        for (seen_zones[0..seen_zone_count]) |sz| {
+                            if (sz.eql(ref.zone_cut)) return error.ReferralLoop;
+                        }
+                        seen_zones[seen_zone_count] = ref.zone_cut;
+                        seen_zone_count += 1;
+
+                        server_count = ref.count;
+                        @memcpy(servers[0..ref.count], ref.addrs[0..ref.count]);
+                    },
+                    .no_glue => return error.NoGlueRecords,
+                }
             }
 
-            if (!got_response) return error.Timeout;
-
-            // Classify response
-            if (response.header.rcode != .no_error) return response;
-            if (response.answers.len > 0) return response;
-
-            // Check for referral (NS records in authority section)
-            const referral = extractReferral(response) orelse return response; // NODATA
-            switch (referral) {
-                .addresses => |addrs| {
-                    server_count = addrs.len;
-                    @memcpy(servers[0..addrs.len], addrs);
-                },
-                .no_glue => return error.NoGlueRecords,
-            }
+            return error.MaxReferralsExceeded;
         }
-
-        return error.MaxReferralsExceeded;
     }
 };
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
+    const buf = name.format();
+    const len = mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+    return allocator.dupe(u8, buf[0..len]);
+}
+
+fn findCname(response: dns.Message, target: dns.Name, allocator: mem.Allocator) !?[]const u8 {
+    for (response.answers) |rr| {
+        if (rr.rtype == .cname and target.eql(rr.name)) {
+            return try nameToDotted(allocator, rr.rdata.cname);
+        }
+    }
+    return null;
+}
 
 // ── Referral extraction ────────────────────────────────────────────────
 
 const ReferralResult = union(enum) {
-    addresses: []const std.net.Address,
+    referral: struct {
+        addrs: [max_servers_per_level]std.net.Address,
+        count: usize,
+        zone_cut: dns.Name, // borrows from response (valid for caller's scope)
+    },
     no_glue,
 };
 
-fn extractReferral(response: dns.Message) ?ReferralResult {
-    // Collect NS names from authority section
+fn extractReferral(response: dns.Message, target: dns.Name) ?ReferralResult {
+    // Find the most specific zone cut: NS owner where target is a subdomain
+    var zone_cut: ?dns.Name = null;
+    var zone_cut_depth: usize = 0;
+    for (response.authorities) |rr| {
+        if (rr.rtype == .ns and target.isSubdomainOf(rr.name)) {
+            if (zone_cut == null or rr.name.labels.len > zone_cut_depth) {
+                zone_cut = rr.name;
+                zone_cut_depth = rr.name.labels.len;
+            }
+        }
+    }
+    const zc = zone_cut orelse return null;
+
+    // Collect NS names at the zone cut
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;
     for (response.authorities) |rr| {
-        if (rr.rtype == .ns) {
+        if (rr.rtype == .ns and rr.name.eql(zc)) {
             if (ns_count < max_servers_per_level) {
                 ns_names[ns_count] = rr.rdata.ns;
                 ns_count += 1;
@@ -115,29 +188,38 @@ fn extractReferral(response: dns.Message) ?ReferralResult {
         }
     }
 
-    if (ns_count == 0) return null;
-
-    // Match glue A records from additionals
-    var glue_count: usize = 0;
-    // Static buffer — at most max_servers_per_level glue addresses
+    // Match glue A/AAAA records with bailiwick check
     var glue_addrs: [max_servers_per_level]std.net.Address = undefined;
+    var glue_count: usize = 0;
     for (response.additionals) |rr| {
-        if (rr.rtype == .a) {
-            for (ns_names[0..ns_count]) |ns_name| {
-                if (ns_name.eql(rr.name)) {
-                    if (glue_count < max_servers_per_level) {
+        const is_a = rr.rtype == .a;
+        const is_aaaa = rr.rtype == .aaaa;
+        if (!is_a and !is_aaaa) continue;
+        // Bailiwick: glue name must be under the zone cut
+        if (!rr.name.isSubdomainOf(zc)) continue;
+
+        for (ns_names[0..ns_count]) |ns_name| {
+            if (ns_name.eql(rr.name)) {
+                if (glue_count < max_servers_per_level) {
+                    if (is_a) {
                         glue_addrs[glue_count] = std.net.Address.initIp4(rr.rdata.a, 53);
-                        glue_count += 1;
+                    } else {
+                        glue_addrs[glue_count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
                     }
-                    break;
+                    glue_count += 1;
                 }
+                break;
             }
         }
     }
 
     if (glue_count == 0) return .no_glue;
 
-    return .{ .addresses = glue_addrs[0..glue_count] };
+    return .{ .referral = .{
+        .addrs = glue_addrs,
+        .count = glue_count,
+        .zone_cut = zc,
+    } };
 }
 
 fn fisherYatesShuffle(comptime T: type, items: []T) void {
@@ -163,10 +245,29 @@ test "root_hints has 13 entries, all port 53" {
     }
 }
 
+// ── Helper to build a minimal response ────────────────────────────────
+
+fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {
+    return .{
+        .id = 0x1234,
+        .qr = true,
+        .opcode = .query,
+        .aa = false,
+        .tc = false,
+        .rd = false,
+        .ra = false,
+        .z = 0,
+        .rcode = .no_error,
+        .qd_count = 0,
+        .an_count = an_count,
+        .ns_count = ns_count,
+        .ar_count = ar_count,
+    };
+}
+
+// ── extractReferral tests ─────────────────────────────────────────────
+
 test "extractReferral with NS and glue A records" {
-    // Build a synthetic referral response:
-    //   authority: example.com NS ns1.example.com
-    //   additional: ns1.example.com A 192.0.2.1
     const alloc = testing.allocator;
 
     const ns_name_labels = try alloc.alloc([]const u8, 3);
@@ -180,7 +281,6 @@ test "extractReferral with NS and glue A records" {
     zone_labels[1] = try alloc.dupe(u8, "com");
     const zone_name = dns.Name{ .labels = zone_labels };
 
-    // Glue record name (same as ns_name but separate allocation)
     const glue_name_labels = try alloc.alloc([]const u8, 3);
     glue_name_labels[0] = try alloc.dupe(u8, "ns1");
     glue_name_labels[1] = try alloc.dupe(u8, "example");
@@ -206,72 +306,43 @@ test "extractReferral with NS and glue A records" {
     };
 
     const response = dns.Message{
-        .header = .{
-            .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 1,
-            .ar_count = 1,
-        },
+        .header = makeHeader(1, 1, 0),
         .questions = &.{},
         .answers = &.{},
         .authorities = authorities,
         .additionals = additionals,
     };
-    defer {
-        dns.freeMessage(alloc, response);
-    }
+    defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response) orelse {
-        try testing.expect(false); // should not be null
-        return;
+    // Target is under the zone being delegated
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
     };
     switch (result) {
-        .addresses => |addrs| {
-            try testing.expectEqual(@as(usize, 1), addrs.len);
-            const ip = addrs[0].in.sa.addr;
+        .referral => |ref| {
+            try testing.expectEqual(@as(usize, 1), ref.count);
             const expected = std.net.Address.initIp4(.{ 192, 0, 2, 1 }, 53);
-            try testing.expectEqual(expected.in.sa.addr, ip);
-            try testing.expectEqual(@as(u16, 53), addrs[0].getPort());
+            try testing.expectEqual(expected.in.sa.addr, ref.addrs[0].in.sa.addr);
+            try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
+            // Zone cut should be example.com
+            try testing.expect(ref.zone_cut.eql(zone_name));
         },
-        .no_glue => {
-            try testing.expect(false); // should have glue
-        },
+        .no_glue => return error.TestUnexpectedResult,
     }
 }
 
 test "extractReferral with no NS records returns null" {
     const response = dns.Message{
-        .header = .{
-            .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
+        .header = makeHeader(0, 0, 0),
         .questions = &.{},
         .answers = &.{},
         .authorities = &.{},
         .additionals = &.{},
     };
 
-    try testing.expect(extractReferral(response) == null);
+    const target = dns.Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(extractReferral(response, target) == null);
 }
 
 test "extractReferral with NS but no glue returns no_glue" {
@@ -298,33 +369,17 @@ test "extractReferral with NS but no glue returns no_glue" {
     };
 
     const response = dns.Message{
-        .header = .{
-            .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 1,
-            .ar_count = 0,
-        },
+        .header = makeHeader(1, 0, 0),
         .questions = &.{},
         .answers = &.{},
         .authorities = authorities,
         .additionals = &.{},
     };
-    defer {
-        dns.freeMessage(alloc, response);
-    }
+    defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response) orelse {
-        try testing.expect(false);
-        return;
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
     };
     try testing.expect(result == .no_glue);
 }
@@ -370,42 +425,291 @@ test "extractReferral case-insensitive glue matching" {
     };
 
     const response = dns.Message{
-        .header = .{
-            .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 1,
-            .ar_count = 1,
-        },
+        .header = makeHeader(1, 1, 0),
         .questions = &.{},
         .answers = &.{},
         .authorities = authorities,
         .additionals = additionals,
     };
-    defer {
-        dns.freeMessage(alloc, response);
-    }
+    defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response) orelse {
-        try testing.expect(false);
-        return;
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
     };
     switch (result) {
-        .addresses => |addrs| {
-            try testing.expectEqual(@as(usize, 1), addrs.len);
+        .referral => |ref| {
+            try testing.expectEqual(@as(usize, 1), ref.count);
         },
-        .no_glue => {
-            try testing.expect(false);
-        },
+        .no_glue => return error.TestUnexpectedResult,
     }
+}
+
+test "extractReferral rejects out-of-zone glue" {
+    const alloc = testing.allocator;
+
+    // NS for example.com pointing to ns1.evil.org
+    const ns_name_labels = try alloc.alloc([]const u8, 3);
+    ns_name_labels[0] = try alloc.dupe(u8, "ns1");
+    ns_name_labels[1] = try alloc.dupe(u8, "evil");
+    ns_name_labels[2] = try alloc.dupe(u8, "org");
+    const ns_name = dns.Name{ .labels = ns_name_labels };
+
+    const zone_labels = try alloc.alloc([]const u8, 2);
+    zone_labels[0] = try alloc.dupe(u8, "example");
+    zone_labels[1] = try alloc.dupe(u8, "com");
+    const zone_name = dns.Name{ .labels = zone_labels };
+
+    // Out-of-zone glue for ns1.evil.org
+    const glue_name_labels = try alloc.alloc([]const u8, 3);
+    glue_name_labels[0] = try alloc.dupe(u8, "ns1");
+    glue_name_labels[1] = try alloc.dupe(u8, "evil");
+    glue_name_labels[2] = try alloc.dupe(u8, "org");
+    const glue_name = dns.Name{ .labels = glue_name_labels };
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = zone_name,
+        .rtype = .ns,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .ns = ns_name },
+    };
+
+    const additionals = try alloc.alloc(dns.ResourceRecord, 1);
+    additionals[0] = .{
+        .name = glue_name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .a = .{ 6, 6, 6, 6 } },
+    };
+
+    const response = dns.Message{
+        .header = makeHeader(1, 1, 0),
+        .questions = &.{},
+        .answers = &.{},
+        .authorities = authorities,
+        .additionals = additionals,
+    };
+    defer dns.freeMessage(alloc, response);
+
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
+    };
+    // Glue for ns1.evil.org is out of zone (example.com), so should be rejected
+    try testing.expect(result == .no_glue);
+}
+
+test "extractReferral accepts in-zone glue" {
+    const alloc = testing.allocator;
+
+    // NS for com pointing to ns1.example.com (in-zone under com)
+    const ns_name_labels = try alloc.alloc([]const u8, 3);
+    ns_name_labels[0] = try alloc.dupe(u8, "ns1");
+    ns_name_labels[1] = try alloc.dupe(u8, "example");
+    ns_name_labels[2] = try alloc.dupe(u8, "com");
+    const ns_name = dns.Name{ .labels = ns_name_labels };
+
+    const zone_labels = try alloc.alloc([]const u8, 1);
+    zone_labels[0] = try alloc.dupe(u8, "com");
+    const zone_name = dns.Name{ .labels = zone_labels };
+
+    const glue_name_labels = try alloc.alloc([]const u8, 3);
+    glue_name_labels[0] = try alloc.dupe(u8, "ns1");
+    glue_name_labels[1] = try alloc.dupe(u8, "example");
+    glue_name_labels[2] = try alloc.dupe(u8, "com");
+    const glue_name = dns.Name{ .labels = glue_name_labels };
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = zone_name,
+        .rtype = .ns,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .ns = ns_name },
+    };
+
+    const additionals = try alloc.alloc(dns.ResourceRecord, 1);
+    additionals[0] = .{
+        .name = glue_name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .a = .{ 192, 0, 2, 53 } },
+    };
+
+    const response = dns.Message{
+        .header = makeHeader(1, 1, 0),
+        .questions = &.{},
+        .answers = &.{},
+        .authorities = authorities,
+        .additionals = additionals,
+    };
+    defer dns.freeMessage(alloc, response);
+
+    // Target under com
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
+    };
+    switch (result) {
+        .referral => |ref| {
+            try testing.expectEqual(@as(usize, 1), ref.count);
+        },
+        .no_glue => return error.TestUnexpectedResult,
+    }
+}
+
+test "extractReferral with AAAA glue returns IPv6 address" {
+    const alloc = testing.allocator;
+
+    const ns_name_labels = try alloc.alloc([]const u8, 3);
+    ns_name_labels[0] = try alloc.dupe(u8, "ns1");
+    ns_name_labels[1] = try alloc.dupe(u8, "example");
+    ns_name_labels[2] = try alloc.dupe(u8, "com");
+    const ns_name = dns.Name{ .labels = ns_name_labels };
+
+    const zone_labels = try alloc.alloc([]const u8, 2);
+    zone_labels[0] = try alloc.dupe(u8, "example");
+    zone_labels[1] = try alloc.dupe(u8, "com");
+    const zone_name = dns.Name{ .labels = zone_labels };
+
+    const glue_name_labels = try alloc.alloc([]const u8, 3);
+    glue_name_labels[0] = try alloc.dupe(u8, "ns1");
+    glue_name_labels[1] = try alloc.dupe(u8, "example");
+    glue_name_labels[2] = try alloc.dupe(u8, "com");
+    const glue_name = dns.Name{ .labels = glue_name_labels };
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = zone_name,
+        .rtype = .ns,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .ns = ns_name },
+    };
+
+    // AAAA glue: 2001:db8::1
+    const additionals = try alloc.alloc(dns.ResourceRecord, 1);
+    additionals[0] = .{
+        .name = glue_name,
+        .rtype = .aaaa,
+        .rclass = .in,
+        .ttl = 172800,
+        .rdata = .{ .aaaa = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+    };
+
+    const response = dns.Message{
+        .header = makeHeader(1, 1, 0),
+        .questions = &.{},
+        .answers = &.{},
+        .authorities = authorities,
+        .additionals = additionals,
+    };
+    defer dns.freeMessage(alloc, response);
+
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = extractReferral(response, target) orelse {
+        return error.TestUnexpectedResult;
+    };
+    switch (result) {
+        .referral => |ref| {
+            try testing.expectEqual(@as(usize, 1), ref.count);
+            try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
+            // Verify it's an IPv6 address
+            const expected = std.net.Address.initIp6(
+                .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+                53,
+                0,
+                0,
+            );
+            try testing.expectEqual(expected.in6.sa.addr, ref.addrs[0].in6.sa.addr);
+        },
+        .no_glue => return error.TestUnexpectedResult,
+    }
+}
+
+// ── findCname / nameToDotted tests ────────────────────────────────────
+
+test "nameToDotted round-trips correctly" {
+    const alloc = testing.allocator;
+    const name = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const dotted = try nameToDotted(alloc, name);
+    defer alloc.free(dotted);
+    try testing.expectEqualStrings("www.example.com", dotted);
+}
+
+test "findCname finds CNAME matching target" {
+    const alloc = testing.allocator;
+
+    // CNAME: www.example.com -> example.com
+    const owner_labels = try alloc.alloc([]const u8, 3);
+    owner_labels[0] = try alloc.dupe(u8, "www");
+    owner_labels[1] = try alloc.dupe(u8, "example");
+    owner_labels[2] = try alloc.dupe(u8, "com");
+    const owner = dns.Name{ .labels = owner_labels };
+
+    const cname_labels = try alloc.alloc([]const u8, 2);
+    cname_labels[0] = try alloc.dupe(u8, "example");
+    cname_labels[1] = try alloc.dupe(u8, "com");
+    const cname_target = dns.Name{ .labels = cname_labels };
+
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{
+        .name = owner,
+        .rtype = .cname,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .cname = cname_target },
+    };
+
+    const response = dns.Message{
+        .header = makeHeader(0, 0, 1),
+        .questions = &.{},
+        .answers = answers,
+        .authorities = &.{},
+        .additionals = &.{},
+    };
+    defer dns.freeMessage(alloc, response);
+
+    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const result = try findCname(response, target, alloc);
+    try testing.expect(result != null);
+    defer alloc.free(result.?);
+    try testing.expectEqualStrings("example.com", result.?);
+}
+
+test "findCname returns null when no CNAME present" {
+    const alloc = testing.allocator;
+
+    const owner_labels = try alloc.alloc([]const u8, 2);
+    owner_labels[0] = try alloc.dupe(u8, "example");
+    owner_labels[1] = try alloc.dupe(u8, "com");
+    const owner = dns.Name{ .labels = owner_labels };
+
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{
+        .name = owner,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .a = .{ 93, 184, 216, 34 } },
+    };
+
+    const response = dns.Message{
+        .header = makeHeader(0, 0, 1),
+        .questions = &.{},
+        .answers = answers,
+        .authorities = &.{},
+        .additionals = &.{},
+    };
+    defer dns.freeMessage(alloc, response);
+
+    const target = dns.Name{ .labels = &.{ "example", "com" } };
+    const result = try findCname(response, target, alloc);
+    try testing.expect(result == null);
 }
 
 // ── Integration tests (require Linux + io_uring + network) ─────────────
@@ -436,6 +740,8 @@ test "recursive resolve example.com A from root hints" {
     const response = resolver.resolve(arena.allocator(), "example.com", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
+        error.ReferralLoop => return error.SkipZigTest,
+        error.CnameChainTooLong => return error.SkipZigTest,
         else => return err,
     };
 
@@ -474,6 +780,8 @@ test "recursive resolve nonexistent domain returns name_error" {
     const response = resolver.resolve(arena.allocator(), "this-domain-does-not-exist-xyzzy.example.com", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
+        error.ReferralLoop => return error.SkipZigTest,
+        error.CnameChainTooLong => return error.SkipZigTest,
         else => return err,
     };
 
