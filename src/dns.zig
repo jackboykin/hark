@@ -259,7 +259,15 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
+pub const QueryOptions = struct {
+    rd: bool = true,
+};
+
 pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType) Error!Message {
+    return buildQueryWithOptions(allocator, id, name_str, qtype, .{});
+}
+
+pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
     const name = try parseDottedName(allocator, name_str);
     const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
@@ -275,7 +283,7 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
             .opcode = .query,
             .aa = false,
             .tc = false,
-            .rd = true,
+            .rd = options.rd,
             .ra = false,
             .z = 0,
             .rcode = .no_error,
@@ -1289,4 +1297,22 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(msg.header.rd, msg2.header.rd);
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
     try testing.expectEqual(msg.questions[0].qtype, msg2.questions[0].qtype);
+}
+
+test "buildQueryWithOptions rd=false roundtrip" {
+    const msg = try buildQueryWithOptions(testing.allocator, 0x5678, "example.com", .a, .{ .rd = false });
+    defer freeMessage(testing.allocator, msg);
+
+    try testing.expect(!msg.header.rd);
+    try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
+
+    // Serialize and re-parse to verify rd bit survives wire format
+    var buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    try testing.expect(!msg2.header.rd);
+    try testing.expectEqual(@as(u16, 0x5678), msg2.header.id);
+    try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
 }
