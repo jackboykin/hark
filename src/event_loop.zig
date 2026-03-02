@@ -191,17 +191,19 @@ pub const EventLoop = struct {
         sqe.user_data = std.math.maxInt(u64);
     }
 
-    /// Submit pending SQEs, drain ready CQEs without blocking, free completed slots.
+    /// Submit pending SQEs and wait for all active operations to complete.
     pub fn flush(self: *EventLoop) void {
-        _ = self.ring.submit() catch return;
-        var cqes: [max_operations]linux.io_uring_cqe = undefined;
-        const count = self.ring.copy_cqes(&cqes, 0) catch return;
-        for (cqes[0..count]) |cqe| {
-            if (cqe.user_data == std.math.maxInt(u64)) continue;
-            if (cqe.user_data < max_operations) {
-                const id: OperationId = @intCast(cqe.user_data);
-                if (self.slots[id].active) {
-                    self.freeSlot(id);
+        while (self.free_count < max_operations) {
+            _ = self.ring.submit_and_wait(1) catch return;
+            var cqes: [max_operations]linux.io_uring_cqe = undefined;
+            const count = self.ring.copy_cqes(&cqes, 0) catch return;
+            for (cqes[0..count]) |cqe| {
+                if (cqe.user_data == std.math.maxInt(u64)) continue;
+                if (cqe.user_data < max_operations) {
+                    const id: OperationId = @intCast(cqe.user_data);
+                    if (self.slots[id].active) {
+                        self.freeSlot(id);
+                    }
                 }
             }
         }
