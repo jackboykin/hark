@@ -10,6 +10,9 @@ pub const tls_transport = @import("tls_transport.zig");
 pub const connection_pool = @import("connection_pool.zig");
 pub const tls_client = @import("tls_client.zig");
 pub const encryption_state = @import("encryption_state.zig");
+pub const toml = @import("toml.zig");
+pub const config = @import("config.zig");
+pub const server = @import("server.zig");
 
 test {
     _ = dns;
@@ -24,4 +27,7 @@ test {
     _ = connection_pool;
     _ = tls_client;
     _ = encryption_state;
+    _ = toml;
+    _ = config;
+    _ = server;
 }

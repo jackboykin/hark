@@ -303,6 +303,7 @@ pub const RRsetCache = struct {
     map: std.HashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, 80),
     max_entries: u32,
     now_fn: *const fn () i64,
+    mutex: ?std.Thread.Mutex = null,
 
     pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
         return .{
@@ -311,6 +312,12 @@ pub const RRsetCache = struct {
             .max_entries = max_entries,
             .now_fn = &defaultNowSeconds,
         };
+    }
+
+    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
+        var c = init(backing, max_bytes, max_entries);
+        c.mutex = .{};
+        return c;
     }
 
     pub fn deinit(self: *RRsetCache) void {
@@ -335,6 +342,8 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
@@ -396,6 +405,8 @@ pub const RRsetCache = struct {
     /// Cache all RRsets from a DNS response. Applies bailiwick filtering
     /// to the additional section.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
         self.storeRRsets(response.answers, authority_zone, false);
         self.storeRRsets(response.authorities, authority_zone, false);
         self.storeRRsets(response.additionals, authority_zone, true);
@@ -411,6 +422,8 @@ pub const RRsetCache = struct {
         rcode: dns.RCode,
         authorities: []const dns.ResourceRecord,
     ) void {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
         // Find SOA in authority section — required per RFC 2308
         var soa_record: ?dns.ResourceRecord = null;
         for (authorities) |rr| {

@@ -22,6 +22,8 @@ pub const Result = union(enum) {
     connect: ConnectResult,
     tcp_send: TcpSendResult,
     tcp_recv: TcpRecvResult,
+    accept: AcceptResult,
+    read: ReadResult,
 };
 
 pub const SendResult = struct {
@@ -51,9 +53,21 @@ pub const TcpRecvResult = struct {
     err: ?anyerror,
 };
 
+pub const AcceptResult = struct {
+    fd: posix.fd_t,
+    addr: std.net.Address,
+    err: ?anyerror,
+};
+
+pub const ReadResult = struct {
+    bytes_read: usize,
+    data: []const u8,
+    err: ?anyerror,
+};
+
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { send, recv, timeout, cancel, connect, tcp_send, tcp_recv };
+const OpKind = enum { send, recv, timeout, cancel, connect, tcp_send, tcp_recv, accept, read };
 
 const Slot = struct {
     kind: OpKind,
@@ -241,6 +255,34 @@ pub const EventLoop = struct {
         return id;
     }
 
+    pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
+        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const slot = &self.slots[id];
+        slot.kind = .accept;
+        slot.context = context;
+        slot.active = true;
+        slot.addr = std.mem.zeroes(std.net.Address);
+        slot.addr_len = @sizeOf(std.net.Address);
+
+        var sqe = try self.ring.get_sqe();
+        sqe.prep_accept(listen_fd, @ptrCast(&slot.addr.any), &slot.addr_len, 0);
+        sqe.user_data = id;
+        return id;
+    }
+
+    pub fn read(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
+        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const slot = &self.slots[id];
+        slot.kind = .read;
+        slot.context = context;
+        slot.active = true;
+
+        var sqe = try self.ring.get_sqe();
+        sqe.prep_read(fd, &slot.recv_buf, 0);
+        sqe.user_data = id;
+        return id;
+    }
+
     pub fn cancel(self: *EventLoop, target_id: OperationId) !void {
         var sqe = try self.ring.get_sqe();
         sqe.prep_cancel(@as(u64, target_id), 0);
@@ -352,6 +394,55 @@ pub const EventLoop = struct {
                         completion.result = .{ .tcp_recv = .{
                             .data = &.{},
                             .err = error.RecvFailed,
+                        } };
+                    }
+                },
+                .accept => {
+                    if (cqe.res >= 0) {
+                        completion.result = .{ .accept = .{
+                            .fd = @intCast(cqe.res),
+                            .addr = slot.addr,
+                            .err = null,
+                        } };
+                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                        completion.result = .{ .accept = .{
+                            .fd = -1,
+                            .addr = slot.addr,
+                            .err = error.Cancelled,
+                        } };
+                    } else {
+                        completion.result = .{ .accept = .{
+                            .fd = -1,
+                            .addr = slot.addr,
+                            .err = error.AcceptFailed,
+                        } };
+                    }
+                },
+                .read => {
+                    if (cqe.res > 0) {
+                        const len: usize = @intCast(cqe.res);
+                        completion.result = .{ .read = .{
+                            .bytes_read = len,
+                            .data = slot.recv_buf[0..len],
+                            .err = null,
+                        } };
+                    } else if (cqe.res == 0) {
+                        completion.result = .{ .read = .{
+                            .bytes_read = 0,
+                            .data = &.{},
+                            .err = error.EndOfFile,
+                        } };
+                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                        completion.result = .{ .read = .{
+                            .bytes_read = 0,
+                            .data = &.{},
+                            .err = error.Cancelled,
+                        } };
+                    } else {
+                        completion.result = .{ .read = .{
+                            .bytes_read = 0,
+                            .data = &.{},
+                            .err = error.ReadFailed,
                         } };
                     }
                 },

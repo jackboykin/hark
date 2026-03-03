@@ -11,6 +11,8 @@ const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RRsetCache = hark.cache.RRsetCache;
 const Certificate = std.crypto.Certificate;
+const Server = hark.server.Server;
+const ServerConfig = hark.config.ServerConfig;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -30,6 +32,8 @@ pub fn main() !void {
         return runDump(allocator);
     } else if (std.mem.eql(u8, command, "query")) {
         return runQuery(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "serve")) {
+        return runServe(allocator, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n\n", .{command});
         printUsage();
@@ -45,6 +49,7 @@ fn printUsage() void {
         \\  dump                Read a raw DNS packet from stdin and print it
         \\  query <name> [type] [options]
         \\                      Resolve a DNS query (recursive by default)
+        \\  serve [options]     Start DNS server
         \\
         \\Query options:
         \\  --forward           Use forwarding mode instead of recursive resolution
@@ -55,6 +60,9 @@ fn printUsage() void {
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
         \\  --no-dnssec         Disable DNSSEC validation (default)
+        \\
+        \\Serve options:
+        \\  --config <path>     Path to config file (default: ./hark.toml)
         \\
         \\Defaults: type=A, mode=recursive, QNAME minimization enabled, DNSSEC off
         \\
@@ -269,4 +277,50 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     }
     if (octet_idx != 4) return null;
     return result;
+}
+
+fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
+    // Parse --config flag
+    var config_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--config")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --config requires a path\n", .{});
+                std.process.exit(1);
+            }
+            config_path = args[i];
+        } else {
+            std.debug.print("Unknown serve option: {s}\n", .{args[i]});
+            std.process.exit(1);
+        }
+    }
+
+    // Load config: explicit path → ./hark.toml → /etc/hark/hark.toml → defaults
+    var cfg = if (config_path) |path|
+        hark.config.parseConfigFile(gpa_alloc, path) catch |err| {
+            std.debug.print("Error loading config '{s}': {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        }
+    else
+        hark.config.parseConfigFile(gpa_alloc, "hark.toml") catch
+            hark.config.parseConfigFile(gpa_alloc, "/etc/hark/hark.toml") catch
+            hark.config.parseConfig(gpa_alloc, "") catch |err| {
+            std.debug.print("Error creating default config: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    defer cfg.deinit();
+
+    // Start server
+    var server = Server.init(gpa_alloc, cfg) catch |err| {
+        std.debug.print("Error initializing server: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer server.deinit();
+
+    server.run() catch |err| {
+        std.debug.print("Server error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 }
