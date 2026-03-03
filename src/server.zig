@@ -14,6 +14,8 @@ const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const ServerConfig = @import("config.zig").ServerConfig;
 
+const log = std.log.scoped(.server);
+
 const tcp_idle_timeout_ms: u32 = 10_000;
 
 // ── Context tags for the event loop ────────────────────────────────────
@@ -64,21 +66,21 @@ pub const Server = struct {
 
         if (workers <= 1) {
             // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
-            std.debug.print("hark: listening on port {d} (UDP+TCP), 1 worker\n", .{listen_addr.getPort()});
+            log.info("listening on port {d} (UDP+TCP), 1 worker", .{listen_addr.getPort()});
             self.runWorker(listen_addr, sig_fd, false);
         } else {
-            std.debug.print("hark: listening on port {d} (UDP+TCP), {d} workers\n", .{ listen_addr.getPort(), workers });
+            log.info("listening on port {d} (UDP+TCP), {d} workers", .{ listen_addr.getPort(), workers });
 
             // Spawn N-1 worker threads + run one on main thread
             const threads = self.allocator.alloc(std.Thread, workers - 1) catch |err| {
-                std.debug.print("hark: failed to allocate thread array: {s}\n", .{@errorName(err)});
+                log.err("failed to allocate thread array: {s}", .{@errorName(err)});
                 return err;
             };
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*t, i| {
                 t.* = std.Thread.spawn(.{}, workerThread, .{ self, listen_addr }) catch |err| {
-                    std.debug.print("hark: failed to spawn worker {d}: {s}\n", .{ i + 1, @errorName(err) });
+                    log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
                     // Signal shutdown to already-spawned threads
                     self.shutdown.store(true, .release);
                     for (threads[0..i]) |prev| prev.join();
@@ -92,6 +94,14 @@ pub const Server = struct {
             // Join all worker threads
             for (threads) |t| t.join();
         }
+
+        // Log cache stats on shutdown
+        const stats = self.cache.getStats();
+        const hit_total = stats.hits + stats.misses;
+        const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
+        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions", .{
+            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions,
+        });
     }
 
     fn workerThread(self: *Server, listen_addr: std.net.Address) void {
@@ -101,14 +111,14 @@ pub const Server = struct {
     fn runWorker(self: *Server, listen_addr: std.net.Address, sig_fd: posix.fd_t, reuseport: bool) void {
         // Per-thread EventLoop
         const loop = EventLoop.create(self.allocator) catch |err| {
-            std.debug.print("hark: worker failed to create event loop: {s}\n", .{@errorName(err)});
+            log.err("worker failed to create event loop: {s}", .{@errorName(err)});
             return;
         };
         defer loop.destroy();
 
         // Per-thread outbound transport
         var udp_transport = UdpTransport.init(loop, .{}) catch |err| {
-            std.debug.print("hark: worker failed to create UDP transport: {s}\n", .{@errorName(err)});
+            log.err("worker failed to create UDP transport: {s}", .{@errorName(err)});
             return;
         };
         defer udp_transport.deinit();
@@ -118,24 +128,24 @@ pub const Server = struct {
         // Per-thread server sockets
         const udp_sock = if (reuseport)
             createUdpSocketReuseport(listen_addr) catch |err| {
-                std.debug.print("hark: worker failed to create UDP socket: {s}\n", .{@errorName(err)});
+                log.err("worker failed to create UDP socket: {s}", .{@errorName(err)});
                 return;
             }
         else
             createUdpSocket(listen_addr) catch |err| {
-                std.debug.print("hark: worker failed to create UDP socket: {s}\n", .{@errorName(err)});
+                log.err("worker failed to create UDP socket: {s}", .{@errorName(err)});
                 return;
             };
         defer posix.close(udp_sock);
 
         const tcp_sock = if (reuseport)
             createTcpListenSocketReuseport(listen_addr) catch |err| {
-                std.debug.print("hark: worker failed to create TCP socket: {s}\n", .{@errorName(err)});
+                log.err("worker failed to create TCP socket: {s}", .{@errorName(err)});
                 return;
             }
         else
             createTcpListenSocket(listen_addr) catch |err| {
-                std.debug.print("hark: worker failed to create TCP socket: {s}\n", .{@errorName(err)});
+                log.err("worker failed to create TCP socket: {s}", .{@errorName(err)});
                 return;
             };
         defer posix.close(tcp_sock);
@@ -187,7 +197,7 @@ const WorkerState = struct {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
                     .signal => {
-                        std.debug.print("\nhark: shutting down\n", .{});
+                        log.info("shutting down", .{});
                         self.shutdown.store(true, .release);
                         break;
                     },
@@ -271,13 +281,18 @@ const WorkerState = struct {
 
         const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
+        const start_ns = std.time.nanoTimestamp();
         const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
+            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+            log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, @tagName(question.qtype), elapsed_ms });
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd)) |wire| {
                 sendUdpResponse(sock, self.loop, wire, client_addr);
             }
             return;
         };
+        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+        log.debug("{s} {s} {s} {d}ms", .{ name_str, @tagName(question.qtype), @tagName(response.header.rcode), elapsed_ms });
 
         var wire_buf: [65535]u8 = undefined;
         if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.questions, response, query.opt != null, max_payload)) |wire| {
@@ -334,9 +349,14 @@ const WorkerState = struct {
         const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
         const name_str = name_buf[0..name_len];
 
+        const start_ns = std.time.nanoTimestamp();
         const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
+            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+            log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, @tagName(question.qtype), elapsed_ms });
             return serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd);
         };
+        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, @tagName(question.qtype), @tagName(response.header.rcode), elapsed_ms });
 
         return buildResponseWire(response_wire, query.header.id, query.header.rd, query.questions, response, query.opt != null, 65535);
     }

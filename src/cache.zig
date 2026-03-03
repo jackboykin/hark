@@ -304,6 +304,11 @@ pub const RRsetCache = struct {
     max_entries: u32,
     now_fn: *const fn () i64,
     mutex: ?std.Thread.Mutex = null,
+    hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    negative_stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
         return .{
@@ -318,6 +323,30 @@ pub const RRsetCache = struct {
         var c = init(backing, max_bytes, max_entries);
         c.mutex = .{};
         return c;
+    }
+
+    pub const Stats = struct {
+        entries: u32,
+        memory_bytes: usize,
+        hits: u64,
+        misses: u64,
+        stores: u64,
+        negative_stores: u64,
+        evictions: u64,
+    };
+
+    pub fn getStats(self: *RRsetCache) Stats {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
+        return .{
+            .entries = @intCast(self.map.count()),
+            .memory_bytes = self.counting.current_bytes,
+            .hits = self.hits.load(.monotonic),
+            .misses = self.misses.load(.monotonic),
+            .stores = self.stores.load(.monotonic),
+            .negative_stores = self.negative_stores.load(.monotonic),
+            .evictions = self.evictions.load(.monotonic),
+        };
     }
 
     pub fn deinit(self: *RRsetCache) void {
@@ -347,7 +376,10 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const entry = self.map.get(probe) orelse return null;
+        const entry = self.map.get(probe) orelse {
+            _ = self.misses.fetchAdd(1, .monotonic);
+            return null;
+        };
 
         const now = self.now_fn();
 
@@ -355,6 +387,7 @@ pub const RRsetCache = struct {
             .positive => |rrset| {
                 if (now >= rrset.expires_at) {
                     self.removeAndFree(probe);
+                    _ = self.misses.fetchAdd(1, .monotonic);
                     return null;
                 }
                 const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
@@ -371,11 +404,13 @@ pub const RRsetCache = struct {
                     };
                 }
 
+                _ = self.hits.fetchAdd(1, .monotonic);
                 return .{ .hit = .{ .records = records, .remaining_ttl = remaining } };
             },
             .negative => |neg| {
                 if (now >= neg.expires_at) {
                     self.removeAndFree(probe);
+                    _ = self.misses.fetchAdd(1, .monotonic);
                     return null;
                 }
                 const elapsed: u32 = @intCast(@min(@max(now - neg.stored_at, 0), neg.original_ttl));
@@ -391,6 +426,7 @@ pub const RRsetCache = struct {
                     };
                 } else null;
 
+                _ = self.hits.fetchAdd(1, .monotonic);
                 return .{ .negative = .{
                     .rcode = neg.rcode,
                     .remaining_ttl = remaining,
@@ -474,7 +510,9 @@ pub const RRsetCache = struct {
             dns.freeName(alloc, cached_soa.name);
             dns.freeRData(alloc, cached_soa.rdata);
             alloc.free(key_name);
+            return;
         };
+        _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
     // ── Internal ──────────────────────────────────────────────────────
@@ -614,7 +652,9 @@ pub const RRsetCache = struct {
                 }
                 alloc.free(final_records);
                 alloc.free(key_name);
+                continue;
             };
+            _ = self.stores.fetchAdd(1, .monotonic);
         }
     }
 
@@ -645,6 +685,7 @@ pub const RRsetCache = struct {
                 self.map.removeByPtr(entry.key_ptr);
                 freeKey(alloc, key);
                 freeEntry(alloc, val);
+                _ = self.evictions.fetchAdd(1, .monotonic);
                 return;
             }
         }
@@ -662,6 +703,7 @@ pub const RRsetCache = struct {
                 self.map.removeByPtr(entry.key_ptr);
                 freeKey(alloc, key);
                 freeEntry(alloc, val);
+                _ = self.evictions.fetchAdd(1, .monotonic);
                 return;
             }
             idx += 1;
@@ -1188,4 +1230,69 @@ test "cache negative without SOA is not stored" {
     defer arena.deinit();
     const result = cache.lookup(arena.allocator(), "no-soa.example.com", .a, .in);
     try testing.expect(result == null);
+}
+
+test "cache stats tracking" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // Initial stats should be zero
+    const initial = cache.getStats();
+    try testing.expectEqual(@as(u64, 0), initial.hits);
+    try testing.expectEqual(@as(u64, 0), initial.misses);
+    try testing.expectEqual(@as(u64, 0), initial.stores);
+    try testing.expectEqual(@as(u32, 0), initial.entries);
+
+    // Miss on empty cache
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = cache.lookup(arena.allocator(), "nonexistent.com", .a, .in);
+    try testing.expectEqual(@as(u64, 0), cache.getStats().hits);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().misses);
+
+    // Store a record
+    const name_labels = try alloc.alloc([]const u8, 2);
+    name_labels[0] = try alloc.dupe(u8, "stats");
+    name_labels[1] = try alloc.dupe(u8, "test");
+    const name = dns.Name{ .labels = name_labels };
+
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{
+        .name = name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
+    };
+
+    const response = dns.Message{
+        .header = .{
+            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
+            .rd = false, .ra = false, .z = 0, .rcode = .no_error,
+            .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = answers,
+        .authorities = &.{},
+        .additionals = &.{},
+    };
+    defer dns.freeMessage(alloc, response);
+
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try testing.expectEqual(@as(u64, 1), cache.getStats().stores);
+    try testing.expectEqual(@as(u32, 1), cache.getStats().entries);
+
+    // Hit on stored record
+    _ = cache.lookup(arena.allocator(), "stats.test", .a, .in);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().hits);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().misses); // unchanged
+
+    // Expired entry counts as miss
+    test_time = 1301;
+    _ = cache.lookup(arena.allocator(), "stats.test", .a, .in);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().hits); // unchanged
+    try testing.expectEqual(@as(u64, 2), cache.getStats().misses);
 }

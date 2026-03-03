@@ -14,6 +14,57 @@ const Certificate = std.crypto.Certificate;
 const Server = hark.server.Server;
 const ServerConfig = hark.config.ServerConfig;
 
+var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+pub const std_options: std.Options = .{
+    .logFn = logFn,
+    .log_level = .debug,
+};
+
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (level == .debug and !log_verbose.load(.acquire)) return;
+
+    const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    const level_prefix = comptime level.asText() ++ scope_prefix;
+
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    // Timestamp
+    const secs: u64 = @intCast(std.time.timestamp());
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ds = es.getDaySeconds();
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+
+    const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z ", .{
+        yd.year, md.month.numeric(), @as(u9, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch return;
+    pos = ts.len;
+
+    // Level + scope prefix
+    if (pos + level_prefix.len >= buf.len) return;
+    @memcpy(buf[pos..][0..level_prefix.len], level_prefix);
+    pos += level_prefix.len;
+
+    // Message
+    const msg = std.fmt.bufPrint(buf[pos..], format ++ "\n", args) catch return;
+    pos += msg.len;
+
+    // Write atomically to stderr
+    const stderr = std.debug.lockStderrWriter(buf[pos..]);
+    defer std.debug.unlockStderrWriter();
+    nosuspend stderr.writeAll(buf[0..pos]) catch {};
+}
+
+const log = std.log;
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -35,7 +86,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "serve")) {
         return runServe(allocator, args[2..]);
     } else {
-        std.debug.print("Unknown command: {s}\n\n", .{command});
+        log.err("unknown command: {s}", .{command});
         printUsage();
         std.process.exit(1);
     }
@@ -64,6 +115,7 @@ fn printUsage() void {
         \\
         \\Serve options:
         \\  --config <path>     Path to config file (default: ./hark.toml)
+        \\  --verbose, -v       Enable debug logging (per-query log lines)
         \\
         \\Defaults: type=A, mode=recursive, QNAME minimization enabled, DNSSEC off
         \\
@@ -78,17 +130,17 @@ fn runDump(gpa_alloc: std.mem.Allocator) !void {
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
     const input = stdin_reader.interface.allocRemaining(allocator, @enumFromInt(dns.max_udp_payload * 4)) catch |err| {
-        std.debug.print("Failed to read stdin: {}\n", .{err});
+        log.err("failed to read stdin: {}", .{err});
         std.process.exit(1);
     };
 
     if (input.len == 0) {
-        std.debug.print("No input. Pipe a raw DNS packet via stdin.\n", .{});
+        log.err("no input — pipe a raw DNS packet via stdin", .{});
         std.process.exit(1);
     }
 
     const msg = dns.parseMessage(allocator, input) catch |err| {
-        std.debug.print("Failed to parse DNS message: {s}\n", .{@errorName(err)});
+        log.err("failed to parse DNS message: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
 
@@ -97,7 +149,7 @@ fn runDump(gpa_alloc: std.mem.Allocator) !void {
     const stdout = &stdout_writer.interface;
 
     dns.printMessage(msg, stdout) catch |err| {
-        std.debug.print("Failed to print message: {}\n", .{err});
+        log.err("failed to print message: {}", .{err});
         std.process.exit(1);
     };
 
@@ -106,7 +158,7 @@ fn runDump(gpa_alloc: std.mem.Allocator) !void {
 
 fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
-        std.debug.print("Error: query requires a domain name\n\n", .{});
+        log.err("query requires a domain name", .{});
         printUsage();
         std.process.exit(1);
     }
@@ -132,7 +184,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[i], "--dot-host")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("Error: --dot-host requires a hostname\n", .{});
+                log.err("--dot-host requires a hostname", .{});
                 std.process.exit(1);
             }
             dot_host = args[i];
@@ -151,16 +203,16 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[i], "--upstream")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("Error: --upstream requires an IP address\n", .{});
+                log.err("--upstream requires an IP address", .{});
                 std.process.exit(1);
             }
             upstream_ip = parseIpv4(args[i]) orelse {
-                std.debug.print("Error: invalid IPv4 address: {s}\n", .{args[i]});
+                log.err("invalid IPv4 address: {s}", .{args[i]});
                 std.process.exit(1);
             };
         } else {
             qtype = parseRType(args[i]) orelse {
-                std.debug.print("Error: unknown record type: {s}\n", .{args[i]});
+                log.err("unknown record type: {s}", .{args[i]});
                 std.process.exit(1);
             };
         }
@@ -168,13 +220,13 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     // EventLoop and transport use GPA (long-lived)
     const loop = EventLoop.create(gpa_alloc) catch |err| {
-        std.debug.print("Failed to initialize io_uring: {}\n", .{err});
+        log.err("failed to initialize io_uring: {}", .{err});
         std.process.exit(1);
     };
     defer loop.destroy();
 
     var t = UdpTransport.init(loop, .{}) catch |err| {
-        std.debug.print("Failed to create UDP socket: {}\n", .{err});
+        log.err("failed to create UDP socket: {}", .{err});
         std.process.exit(1);
     };
     defer t.deinit();
@@ -182,7 +234,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var tcp_t = TcpTransport.init(loop, .{});
 
     if (dot_strict and dot_host == null) {
-        std.debug.print("Error: --dot-strict requires --dot-host for hostname verification\n", .{});
+        log.err("--dot-strict requires --dot-host for hostname verification", .{});
         std.process.exit(1);
     }
 
@@ -191,7 +243,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var ca_bundle_loaded = false;
     if (dot_mode) {
         ca_bundle.rescan(gpa_alloc) catch {
-            std.debug.print("Error: failed to load system CA certificates\n", .{});
+            log.err("failed to load system CA certificates", .{});
             std.process.exit(1);
         };
         ca_bundle_loaded = true;
@@ -219,7 +271,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         }
         const upstream = std.net.Address.initIp4(upstream_ip, 53);
         break :blk resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
-            std.debug.print("Query failed: {s}\n", .{@errorName(err)});
+            log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
     } else blk: {
@@ -234,7 +286,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             resolver.encryption_state = &enc_state;
         }
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
-            std.debug.print("Query failed: {s}\n", .{@errorName(err)});
+            log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
     };
@@ -244,7 +296,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     const stdout = &stdout_writer.interface;
 
     dns.printMessage(response, stdout) catch |err| {
-        std.debug.print("Failed to print response: {}\n", .{err});
+        log.err("failed to print response: {}", .{err});
         std.process.exit(1);
     };
 
@@ -292,19 +344,22 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
 }
 
 fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
-    // Parse --config flag
+    // Parse serve flags
     var config_path: ?[]const u8 = null;
+    var cli_verbose = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--config")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("Error: --config requires a path\n", .{});
+                log.err("--config requires a path", .{});
                 std.process.exit(1);
             }
             config_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
+            cli_verbose = true;
         } else {
-            std.debug.print("Unknown serve option: {s}\n", .{args[i]});
+            log.err("unknown serve option: {s}", .{args[i]});
             std.process.exit(1);
         }
     }
@@ -312,27 +367,32 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     // Load config: explicit path → ./hark.toml → /etc/hark/hark.toml → defaults
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(gpa_alloc, path) catch |err| {
-            std.debug.print("Error loading config '{s}': {s}\n", .{ path, @errorName(err) });
+            log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
         }
     else
         hark.config.parseConfigFile(gpa_alloc, "hark.toml") catch
             hark.config.parseConfigFile(gpa_alloc, "/etc/hark/hark.toml") catch
             hark.config.parseConfig(gpa_alloc, "") catch |err| {
-            std.debug.print("Error creating default config: {s}\n", .{@errorName(err)});
+            log.err("creating default config: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
     defer cfg.deinit();
 
+    // Enable verbose logging from CLI flag or config
+    if (cli_verbose or cfg.log_queries) {
+        log_verbose.store(true, .release);
+    }
+
     // Start server
     var server = Server.init(gpa_alloc, cfg) catch |err| {
-        std.debug.print("Error initializing server: {s}\n", .{@errorName(err)});
+        log.err("initializing server: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
     defer server.deinit();
 
     server.run() catch |err| {
-        std.debug.print("Server error: {s}\n", .{@errorName(err)});
+        log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
 }

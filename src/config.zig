@@ -16,6 +16,7 @@ pub const ServerConfig = struct {
     qname_minimization: bool,
     opportunistic: bool,
     workers: u16,
+    log_queries: bool,
 
     allocator: Allocator,
 
@@ -56,6 +57,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .qname_minimization = true,
         .opportunistic = false,
         .workers = @intCast(@max(1, std.Thread.getCpuCount() catch 1)),
+        .log_queries = false,
         .allocator = allocator,
     };
 }
@@ -109,6 +111,11 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (cache.getInteger("entries")) |e| {
             cfg.cache_entries = @intCast(@max(0, @min(e, std.math.maxInt(u32))));
         }
+    }
+
+    // [logging] section
+    if (parsed.table.getTable("logging")) |logging| {
+        if (logging.getBool("queries")) |q| cfg.log_queries = q;
     }
 
     // Validation
@@ -302,4 +309,19 @@ test "invalid worker count" {
         \\workers = 0
     );
     try testing.expectError(error.InvalidWorkerCount, result);
+}
+
+test "logging config" {
+    // Default: log_queries is false
+    var cfg1 = try parseConfig(testing.allocator, "");
+    defer cfg1.deinit();
+    try testing.expectEqual(false, cfg1.log_queries);
+
+    // Explicit enable
+    var cfg2 = try parseConfig(testing.allocator,
+        \\[logging]
+        \\queries = true
+    );
+    defer cfg2.deinit();
+    try testing.expectEqual(true, cfg2.log_queries);
 }
