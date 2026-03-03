@@ -413,6 +413,8 @@ pub const RRsetCache = struct {
 
             // Skip SOA in authority — these are for negative caching, handled separately
             if (rr.rtype == .soa) continue;
+            // Skip OPT pseudo-records (belt-and-suspenders; parseMessage excludes them)
+            if (rr.rtype == .opt) continue;
 
             // Check if we already processed this (name, type) group
             const name_fmt = rr.name.format();

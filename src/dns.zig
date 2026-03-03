@@ -10,6 +10,7 @@ pub const max_label_len = 63;
 pub const max_name_len = 253;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
+pub const edns_udp_payload: u16 = 1232;
 
 // ── Enums ──────────────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ pub const RType = enum(u16) {
     mx = 15,
     txt = 16,
     aaaa = 28,
+    opt = 41,
     _,
 };
 
@@ -205,6 +207,21 @@ pub const RData = union(enum) {
     unknown: []const u8,
 };
 
+// ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
+
+pub const EdnsOption = struct {
+    code: u16,
+    data: []const u8,
+};
+
+pub const OptRecord = struct {
+    udp_payload_size: u16,
+    extended_rcode: u8,
+    version: u8,
+    do_bit: bool,
+    options: []const EdnsOption,
+};
+
 // ── Question ───────────────────────────────────────────────────────────
 
 pub const Question = struct {
@@ -231,6 +248,7 @@ pub const Message = struct {
     answers: []const ResourceRecord,
     authorities: []const ResourceRecord,
     additionals: []const ResourceRecord,
+    opt: ?OptRecord = null,
 };
 
 // ── Name / Query builders ──────────────────────────────────────────────
@@ -271,8 +289,14 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
+pub const EdnsConfig = struct {
+    udp_payload_size: u16 = edns_udp_payload,
+    do_bit: bool = false,
+};
+
 pub const QueryOptions = struct {
     rd: bool = true,
+    edns: ?EdnsConfig = null,
 };
 
 pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType) Error!Message {
@@ -308,6 +332,13 @@ pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8
         .answers = empty_rr,
         .authorities = empty_rr2,
         .additionals = empty_rr3,
+        .opt = if (options.edns) |edns| .{
+            .udp_payload_size = edns.udp_payload_size,
+            .extended_rcode = 0,
+            .version = 0,
+            .do_bit = edns.do_bit,
+            .options = &.{},
+        } else null,
     };
 }
 
@@ -480,7 +511,7 @@ pub const Parser = struct {
                     .strings = strings.toOwnedSlice(allocator) catch return error.OutOfMemory,
                 } };
             },
-            _ => {
+            .opt, _ => {
                 const data = try self.readSlice(rdlength);
                 const duped = allocator.dupe(u8, data) catch return error.OutOfMemory;
                 return .{ .unknown = duped };
@@ -488,6 +519,25 @@ pub const Parser = struct {
         }
     }
 };
+
+// ── EDNS option parsing ────────────────────────────────────────────────
+
+fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsOption {
+    if (rdata.len == 0) return &.{};
+
+    var options: ArrayList(EdnsOption) = .empty;
+    var pos: usize = 0;
+    while (pos + 4 <= rdata.len) {
+        const code = mem.readInt(u16, rdata[pos..][0..2], .big);
+        const length = mem.readInt(u16, rdata[pos + 2 ..][0..2], .big);
+        pos += 4;
+        if (pos + length > rdata.len) break;
+        const data = allocator.dupe(u8, rdata[pos..][0..length]) catch return error.OutOfMemory;
+        options.append(allocator, .{ .code = code, .data = data }) catch return error.OutOfMemory;
+        pos += length;
+    }
+    return options.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
 
 // ── Top-level parse ────────────────────────────────────────────────────
 
@@ -513,8 +563,21 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     }
 
     var additionals: ArrayList(ResourceRecord) = .empty;
+    var opt: ?OptRecord = null;
     for (0..hdr.ar_count) |_| {
-        additionals.append(allocator, try parser.parseResourceRecord(allocator)) catch return error.OutOfMemory;
+        const rr = try parser.parseResourceRecord(allocator);
+        if (rr.rtype == .opt and opt == null) {
+            // Extract OPT pseudo-record fields (RFC 6891)
+            opt = .{
+                .udp_payload_size = @intFromEnum(rr.rclass),
+                .extended_rcode = @intCast(rr.ttl >> 24),
+                .version = @intCast((rr.ttl >> 16) & 0xFF),
+                .do_bit = (rr.ttl & 0x8000) != 0,
+                .options = parseEdnsOptions(allocator, rr.rdata.unknown) catch &.{},
+            };
+        } else {
+            additionals.append(allocator, rr) catch return error.OutOfMemory;
+        }
     }
 
     return .{
@@ -523,6 +586,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
         .answers = answers.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .authorities = authorities.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .additionals = additionals.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .opt = opt,
     };
 }
 
@@ -635,11 +699,38 @@ pub const Serializer = struct {
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ser = Serializer.init(buf);
-    try ser.writeHeader(msg.header);
+
+    // Write header with adjusted ar_count for OPT
+    var hdr = msg.header;
+    if (msg.opt != null) hdr.ar_count += 1;
+    try ser.writeHeader(hdr);
+
     for (msg.questions) |q| try ser.writeQuestion(q);
     for (msg.answers) |rr| try ser.writeResourceRecord(rr);
     for (msg.authorities) |rr| try ser.writeResourceRecord(rr);
     for (msg.additionals) |rr| try ser.writeResourceRecord(rr);
+
+    // Append OPT pseudo-record
+    if (msg.opt) |opt| {
+        try ser.writeU8(0); // root name
+        try ser.writeU16(41); // type OPT
+        try ser.writeU16(opt.udp_payload_size); // class = UDP payload size
+        // TTL = extended_rcode(8) | version(8) | DO(1) | Z(15)
+        const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
+            (@as(u32, opt.version) << 16) |
+            (@as(u32, @intFromBool(opt.do_bit)) << 15);
+        try ser.writeU32(ttl);
+        // RDLENGTH: sum of all options (code(2) + length(2) + data)
+        var rdlength: u16 = 0;
+        for (opt.options) |o| rdlength += 4 + @as(u16, @intCast(o.data.len));
+        try ser.writeU16(rdlength);
+        for (opt.options) |o| {
+            try ser.writeU16(o.code);
+            try ser.writeU16(@intCast(o.data.len));
+            try ser.writeSlice(o.data);
+        }
+    }
+
     return buf[0..ser.pos];
 }
 
@@ -659,6 +750,17 @@ pub fn printMessage(msg: Message, writer: anytype) !void {
     try writer.print("; QUERY: {d}, ANSWER: {d}, AUTHORITY: {d}, ADDITIONAL: {d}\n\n", .{
         hdr.qd_count, hdr.an_count, hdr.ns_count, hdr.ar_count,
     });
+
+    if (msg.opt) |opt| {
+        try writer.print(";; OPT PSEUDOSECTION:\n", .{});
+        try writer.print("; EDNS: version: {d}, flags:", .{opt.version});
+        if (opt.do_bit) try writer.print(" do", .{});
+        try writer.print("; udp: {d}\n", .{opt.udp_payload_size});
+        if (opt.options.len > 0) {
+            try writer.print("; OPTIONS: {d}\n", .{opt.options.len});
+        }
+        try writer.print("\n", .{});
+    }
 
     if (msg.questions.len > 0) {
         try writer.print(";; QUESTION SECTION:\n", .{});
@@ -1200,6 +1302,104 @@ test "fuzz: random bytes must not panic" {
     try testing.fuzz(Context{}, Context.testOne, .{});
 }
 
+test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const msg = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{ .rd = true, .edns = .{ .do_bit = true } });
+
+    // Verify opt was set on the built message
+    try testing.expect(msg.opt != null);
+    const opt = msg.opt.?;
+    try testing.expectEqual(edns_udp_payload, opt.udp_payload_size);
+    try testing.expect(opt.do_bit);
+    try testing.expectEqual(@as(u8, 0), opt.version);
+
+    // Serialize
+    var buf: [edns_udp_payload]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+
+    // Parse back
+    const parsed = try parseMessage(alloc, wire);
+
+    // Verify the opt record survives the roundtrip
+    try testing.expect(parsed.opt != null);
+    const parsed_opt = parsed.opt.?;
+    try testing.expectEqual(edns_udp_payload, parsed_opt.udp_payload_size);
+    try testing.expect(parsed_opt.do_bit);
+    try testing.expectEqual(@as(u8, 0), parsed_opt.version);
+    try testing.expectEqual(@as(u8, 0), parsed_opt.extended_rcode);
+
+    // OPT should not appear in additionals
+    try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
+}
+
+test "EDNS0: parse non-EDNS response has null opt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Build a query without EDNS
+    const msg = try buildQuery(alloc, 0x5678, "example.com", .a);
+    try testing.expect(msg.opt == null);
+
+    // Serialize and parse
+    var buf: [max_udp_payload]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+    const parsed = try parseMessage(alloc, wire);
+
+    try testing.expect(parsed.opt == null);
+    try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
+}
+
+test "EDNS0: serialized OPT has correct wire format" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const msg = try buildQueryWithOptions(alloc, 0xABCD, "x.com", .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
+
+    var buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+
+    // ar_count in header should be 1 (the OPT record)
+    const ar_count = mem.readInt(u16, wire[10..12], .big);
+    try testing.expectEqual(@as(u16, 1), ar_count);
+
+    // Find the OPT record at the end: after header(12) + question section
+    // Question: \x01x\x03com\x00 (7 bytes) + qtype(2) + qclass(2) = 11 bytes
+    const opt_start = 12 + 11;
+
+    // root name
+    try testing.expectEqual(@as(u8, 0x00), wire[opt_start]);
+    // type 41
+    try testing.expectEqual(@as(u16, 41), mem.readInt(u16, wire[opt_start + 1 ..][0..2], .big));
+    // class = 4096
+    try testing.expectEqual(@as(u16, 4096), mem.readInt(u16, wire[opt_start + 3 ..][0..2], .big));
+    // TTL: DO bit set = 0x00008000
+    const ttl = mem.readInt(u32, wire[opt_start + 5 ..][0..4], .big);
+    try testing.expectEqual(@as(u32, 0x00008000), ttl);
+    // RDLENGTH = 0
+    try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
+}
+
+test "EDNS0: buildQuery without edns has no opt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const msg = try buildQueryWithOptions(alloc, 0x1111, "test.com", .aaaa, .{ .rd = false });
+    try testing.expect(msg.opt == null);
+
+    var buf: [max_udp_payload]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+
+    // ar_count should be 0
+    const ar_count = mem.readInt(u16, wire[10..12], .big);
+    try testing.expectEqual(@as(u16, 0), ar_count);
+}
+
 // ── Test helper: free all allocations from a parsed message ────────────
 
 pub fn freeName(allocator: Allocator, name: Name) void {
@@ -1226,6 +1426,11 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
     }
 }
 
+pub fn freeOpt(allocator: Allocator, opt: OptRecord) void {
+    for (opt.options) |o| allocator.free(o.data);
+    if (opt.options.len > 0) allocator.free(opt.options);
+}
+
 pub fn freeMessage(allocator: Allocator, msg: Message) void {
     for (msg.questions) |q| freeName(allocator, q.name);
     allocator.free(msg.questions);
@@ -1244,6 +1449,7 @@ pub fn freeMessage(allocator: Allocator, msg: Message) void {
         freeRData(allocator, rr.rdata);
     }
     allocator.free(msg.additionals);
+    if (msg.opt) |opt| freeOpt(allocator, opt);
 }
 
 test "parseDottedName basic" {

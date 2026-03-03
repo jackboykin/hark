@@ -112,11 +112,11 @@ pub const RecursiveResolver = struct {
                     std.crypto.random.bytes(&id_bytes);
                     const query_id = mem.readInt(u16, &id_bytes, .big);
 
-                    // Build iterative query (rd=false)
-                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, current_name, qtype, .{ .rd = false });
+                    // Build iterative query (rd=false, EDNS0)
+                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, current_name, qtype, .{ .rd = false, .edns = .{} });
 
                     // Serialize
-                    var wire_buf: [dns.max_udp_payload]u8 = undefined;
+                    var wire_buf: [dns.edns_udp_payload]u8 = undefined;
                     const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
                     // Send and receive

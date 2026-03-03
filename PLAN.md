@@ -39,7 +39,7 @@ that inform hark's design:
                   ┌────────────▼─────────────┐
                   │    Query Pipeline         │
                   │  ┌─────────────────────┐  │
-                  │  │ Cache lookup         │  │  M4
+                  │  │ Cache lookup         │  │  M4 ✅
                   │  │ QNAME minimization   │  │  M7
                   │  │ Recursive resolution │  │  M3 ✅
                   │  │ Forwarding fallback  │  │  M3 ✅
@@ -50,7 +50,7 @@ that inform hark's design:
                   ┌────────────▼─────────────┐
                   │    Transport              │
                   │  UDP / io_uring           │  M2 ✅
-                  │  TCP fallback             │  M5
+                  │  TCP fallback             │  M5 ✅
                   │  EDNS0 payload sizing     │  M6
                   └──────────────────────────┘
                                │
@@ -88,69 +88,37 @@ that inform hark's design:
 - Forwarding fallback mode (configurable: upstream server list)
 - Test: resolve a multi-delegation domain from root
 
+### M3c: CLI Integration ✅
+- Recursive resolution as default mode, `--forward` flag for forwarding
+
+### M4: In-Memory Cache ✅
+- RRset cache keyed by (name, type, class) with absolute TTL expiry
+- CountingAllocator for deterministic 16MB byte cap
+- Deep-copy ownership model (cache owns all memory)
+- RFC 2308 negative caching (authoritative-only NXDOMAIN/NODATA)
+- Six cache touchpoints in recursive resolver
+- Closest cached delegation (skip root/TLD for known zones)
+
+### M5: TCP Transport ✅
+- EventLoop gains connect/tcpSend/tcpRecv io_uring operations
+- TcpTransport: per-query TCP with DNS length-prefix framing, 3-phase state machine
+- TC-bit fallback in both ForwardingResolver and RecursiveResolver
+- Per-query TCP connections (connection reuse deferred)
+
 ## Milestone Roadmap
-
-### M3c: CLI Integration
-**Goal**: Wire up RecursiveResolver as the default resolution mode.
-
-- `hark query <domain>` uses recursive resolution by default
-- `--forward` flag falls back to forwarding resolver
-- First moment hark is a genuinely usable tool
-
-### M4: In-Memory Cache
-**RFCs**: 1035 §7 (caching), 2308 (negative caching)
-**Goal**: Cache responses, respect TTLs, serve from cache.
-
-- Cache keyed by (name, type, class) → RRset
-- TTL countdown (store absolute expiry time, not raw TTL)
-- Negative caching (NXDOMAIN, NODATA per RFC 2308)
-- Cache eviction: simple LRU or random eviction when at capacity
-- Serve stale with background refresh (optional, RFC 8767)
-- No disk persistence — in-memory only, clean restart
-- Pre-allocated bounded arena for cache entries — deterministic memory cap, DDoS resilience
-
-**Performance notes for hashmap design:**
-- Investigate SIMD-accelerated metadata probing (SwissTable / F14 pattern): separate dense
-  control byte array, vectorized 16/32-slot parallel probe in a single cycle. Eliminates
-  collision penalty for hot-path cache lookups.
-- History-independent Robin Hood hashing: final memory layout is identical regardless of
-  insertion order, so tail latency stays flat under constant TTL churn and cache floods.
-
-### M5: TCP Transport
-**RFCs**: 7766 (DNS over TCP), 5966
-**Goal**: TCP fallback for truncated and large responses.
-
-*Rationale for moving ahead of EDNS0/DNSSEC: Research shows 3-7% of real UDP
-responses are truncated (SIDN Labs/APNIC 2020-2024). DNS Flag Day 2025 and
-RFC 9609 treat TCP as non-optional. EDNS0 and DNSSEC both produce responses
-that frequently exceed UDP limits, so TCP is a prerequisite for both.*
-
-- TCP connection management in the event loop (io_uring connect/read/write)
-- Automatic fallback when TC bit is set in UDP response
-- Length-prefixed framing (2-byte length + message)
-- Connection reuse / pooling to authoritative servers
-- Idle timeout handling
 
 ### M6: EDNS0
 **RFCs**: 6891 (EDNS0)
 **Goal**: Support larger UDP payloads and EDNS option negotiation.
 
-*Rationale for placing after TCP: EDNS0 advertises larger buffer sizes but
-truncation still occurs. TCP fallback (M5) must exist before EDNS0 can work
-correctly. EDNS0's DO bit is also required to request DNSSEC records.*
-
 - OPT pseudo-record parsing + serialization in dns.zig
-- Advertise 1232-byte UDP buffer size (IPv6-safe per RFC 8085 guidance)
+- Advertise 1232-byte UDP buffer size (IPv6-safe per DNS Flag Day 2020)
 - Parse EDNS options from responses
-- TC fallback to TCP (leverages M5)
+- DO bit support (prerequisite for DNSSEC)
 
 ### M7: QNAME Minimization
 **RFCs**: 9156 (QNAME minimization)
 **Goal**: Minimize information leaked to each nameserver.
-
-*Rationale for placing before DNSSEC: Much simpler to implement, provides
-immediate privacy benefit, and integrates cleanly into the existing resolution
-state machine. No dependency on EDNS0 or TCP.*
 
 - Send only the necessary labels (zone cut + 1) to each authoritative
 - Fall back to full QNAME on NXDOMAIN (strict vs relaxed mode)
@@ -159,9 +127,6 @@ state machine. No dependency on EDNS0 or TCP.*
 ### M8: DNSSEC Validation
 **RFCs**: 4033-4035 (DNSSEC), 5155 (NSEC3)
 **Goal**: Full chain-of-trust validation.
-
-*Now sits on solid foundations: TCP (M5) handles large signed responses,
-EDNS0 (M6) provides the DO bit to request signatures.*
 
 - New record types: DNSKEY, RRSIG, DS, NSEC, NSEC3
 - Crypto algorithms:
@@ -183,7 +148,7 @@ EDNS0 (M6) provides the DO bit to request signatures.*
 
 *Note: As of Zig 0.15, `std.crypto.tls` has gaps — missing ALPN, incomplete
 TLS 1.2, real-world compatibility issues with some servers. Community
-alternatives exist (ianic/tls.zig, shiguredo/tls13-zig) but add external deps.
+alternatives exist (iotic/tls.zig, shiguredo/tls13-zig) but add external deps.
 Revisit stdlib maturity when we reach this milestone.*
 
 - DoT: TLS wrapper over TCP framing from M5

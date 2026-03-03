@@ -26,11 +26,11 @@ pub const ForwardingResolver = struct {
         std.crypto.random.bytes(&id_bytes);
         const query_id = mem.readInt(u16, &id_bytes, .big);
 
-        // Build query message
-        const query_msg = try dns.buildQuery(allocator, query_id, name, qtype);
+        // Build query message (with EDNS0)
+        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, name, qtype, .{ .edns = .{} });
 
         // Serialize to wire format
-        var wire_buf: [dns.max_udp_payload]u8 = undefined;
+        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
         // Send and receive
