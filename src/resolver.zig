@@ -5,13 +5,19 @@ const posix = std.posix;
 const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const UdpTransport = @import("transport.zig").UdpTransport;
+const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const Config = @import("transport.zig").Config;
 
 pub const ForwardingResolver = struct {
     transport: *UdpTransport,
+    tcp_transport: ?*TcpTransport,
 
     pub fn init(transport: *UdpTransport) ForwardingResolver {
-        return .{ .transport = transport };
+        return .{ .transport = transport, .tcp_transport = null };
+    }
+
+    pub fn initWithTcp(transport: *UdpTransport, tcp: *TcpTransport) ForwardingResolver {
+        return .{ .transport = transport, .tcp_transport = tcp };
     }
 
     pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: std.net.Address) !dns.Message {
@@ -31,11 +37,18 @@ pub const ForwardingResolver = struct {
         const response_data = try self.transport.query(wire_query, query_id, upstream);
 
         // Parse response
-        const response = try dns.parseMessage(allocator, response_data);
+        var response = try dns.parseMessage(allocator, response_data);
 
-        // Warn about truncation
+        // TC bit: retry same query over TCP
         if (response.header.tc) {
-            std.log.warn("response truncated (TC bit set), TCP fallback not yet implemented", .{});
+            if (self.tcp_transport) |tcp| {
+                var tcp_buf: [65535]u8 = undefined;
+                if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
+                    response = try dns.parseMessage(allocator, tcp_data);
+                } else |_| {
+                    // TCP failed — return truncated UDP response
+                }
+            }
         }
 
         return response;

@@ -3,6 +3,7 @@ const hark = @import("hark");
 const dns = hark.dns;
 const EventLoop = hark.event_loop.EventLoop;
 const UdpTransport = hark.transport.UdpTransport;
+const TcpTransport = hark.tcp_transport.TcpTransport;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RRsetCache = hark.cache.RRsetCache;
@@ -131,6 +132,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer t.deinit();
 
+    var tcp_t = TcpTransport.init(loop, .{});
+
     // Cache: 16MB cap, 10k max entries
     var cache = RRsetCache.init(gpa_alloc, 16 * 1024 * 1024, 10_000);
     defer cache.deinit();
@@ -140,14 +143,14 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver.init(&t);
+        var resolver = ForwardingResolver.initWithTcp(&t, &tcp_t);
         const upstream = std.net.Address.initIp4(upstream_ip, 53);
         break :blk resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
     } else blk: {
-        var resolver = RecursiveResolver.initWithCache(&t, &cache);
+        var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);

@@ -3,6 +3,7 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
+const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 
@@ -34,14 +35,19 @@ const max_cname_chain = 8;
 
 pub const RecursiveResolver = struct {
     transport: *UdpTransport,
+    tcp_transport: ?*TcpTransport,
     cache: ?*RRsetCache,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
-        return .{ .transport = transport, .cache = null };
+        return .{ .transport = transport, .tcp_transport = null, .cache = null };
     }
 
     pub fn initWithCache(transport: *UdpTransport, cache: *RRsetCache) RecursiveResolver {
-        return .{ .transport = transport, .cache = cache };
+        return .{ .transport = transport, .tcp_transport = null, .cache = cache };
+    }
+
+    pub fn initFull(transport: *UdpTransport, tcp: *TcpTransport, cache: *RRsetCache) RecursiveResolver {
+        return .{ .transport = transport, .tcp_transport = tcp, .cache = cache };
     }
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !dns.Message {
@@ -121,6 +127,19 @@ pub const RecursiveResolver = struct {
 
                     // Parse response
                     response = try dns.parseMessage(allocator, response_data);
+
+                    // TC bit: retry same query over TCP
+                    if (response.header.tc) {
+                        if (self.tcp_transport) |tcp| {
+                            var tcp_buf: [65535]u8 = undefined;
+                            if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
+                                response = try dns.parseMessage(allocator, tcp_data);
+                            } else |_| {
+                                // TCP failed — use truncated UDP response
+                            }
+                        }
+                    }
+
                     got_response = true;
 
                     // CACHE STORE: Cache all RRsets from this response

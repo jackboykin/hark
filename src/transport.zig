@@ -86,8 +86,7 @@ pub const UdpTransport = struct {
                                 // Wrong ID — re-queue recv
                                 recv_op = try self.loop.recvFrom(self.sock, @ptrCast(&recv_ctx));
                             },
-                            .send => {},
-                            .timeout => {},
+                            else => {},
                         }
                     },
                     .retransmit => {
