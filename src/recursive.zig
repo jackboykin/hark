@@ -256,8 +256,18 @@ pub const RecursiveResolver = struct {
 
                     if (response.header.rcode == .name_error) {
                         // Probe NXDOMAIN — relaxed mode: cache negative and stop minimising
-                        if (response.header.aa) {
-                            if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities);
+                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                        switch (validateNegativeResponse(security_state, response.authorities, probe_name, query_type, true)) {
+                            .proceed => {
+                                if (response.header.aa) {
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities);
+                                }
+                            },
+                            .skip_cache => {},
+                            .bogus => {
+                                minimise_label_count = target_name.labels.len;
+                                continue;
+                            },
                         }
                         minimise_label_count = target_name.labels.len;
                         continue;
@@ -276,8 +286,20 @@ pub const RecursiveResolver = struct {
                     }
 
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
-                    if (response.header.aa) {
-                        if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities);
+                    {
+                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                        switch (validateNegativeResponse(security_state, response.authorities, probe_name, query_type, false)) {
+                            .proceed => {
+                                if (response.header.aa) {
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities);
+                                }
+                            },
+                            .skip_cache => {},
+                            .bogus => {
+                                minimise_label_count = target_name.labels.len;
+                                continue;
+                            },
+                        }
                     }
                     minimise_label_count += 1;
                     continue;
@@ -288,7 +310,13 @@ pub const RecursiveResolver = struct {
                 // Classify response
                 if (response.header.rcode != .no_error) {
                     if (response.header.rcode == .name_error and response.header.aa) {
-                        if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
+                        switch (validateNegativeResponse(security_state, response.authorities, target_name, qtype, true)) {
+                            .proceed => {
+                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
+                            },
+                            .skip_cache => {},
+                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                        }
                     }
                     return response;
                 }
@@ -319,7 +347,13 @@ pub const RecursiveResolver = struct {
                 const referral = extractReferral(response, target_name, parent_zone) orelse {
                     // NODATA: no answers, no referral. Cache only if authoritative.
                     if (response.header.aa) {
-                        if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
+                        switch (validateNegativeResponse(security_state, response.authorities, target_name, qtype, false)) {
+                            .proceed => {
+                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
+                            },
+                            .skip_cache => {},
+                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                        }
                     }
                     return response;
                 };
@@ -650,6 +684,25 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
         .count = glue_count,
         .zone_cut = zc,
     } };
+}
+
+// ── Negative proof validation ──────────────────────────────────────────
+
+const NegativeValidation = enum { proceed, skip_cache, bogus };
+
+fn validateNegativeResponse(
+    security_state: dnssec.SecurityStatus,
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    qtype: dns.RType,
+    is_nxdomain: bool,
+) NegativeValidation {
+    if (security_state != .secure) return .proceed;
+    return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain)) {
+        .secure => .proceed,
+        .bogus => .bogus,
+        .unchecked, .insecure => .skip_cache,
+    };
 }
 
 fn fisherYatesShuffle(comptime T: type, items: []T) void {
@@ -1516,5 +1569,72 @@ test "recursive resolve with CNAME chain" {
         }
     }
     try testing.expect(found_a);
+}
+
+// ── validateNegativeResponse tests ─────────────────────────────────────
+
+test "validateNegativeResponse returns proceed when security_state is not secure" {
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
+    // unchecked/insecure → proceed regardless of authorities
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false));
+}
+
+test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
+    // Build authorities with both NSEC and NSEC3 records
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = dns.Name{ .labels = &.{ "example", "com" } },
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 3600,
+            .rdata = .{ .nsec = .{
+                .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+                .type_bit_maps = &.{ 0, 1, 0x40 }, // window 0, len 1, A bit
+            } },
+        },
+        .{
+            .name = dns.Name{ .labels = &.{ "example", "com" } },
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 3600,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = &.{},
+                .next_hashed_owner = &(.{@as(u8, 0)} ** 20),
+                .type_bit_maps = &.{},
+            } },
+        },
+    };
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true));
+}
+
+test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
+    // NSEC owner matches qname, type bitmap does NOT include A.
+    // Bitmap with only SOA (type 6): window 0, len 1, byte 0 = 0x02 (bit 6)
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = dns.Name{ .labels = &.{ "example", "com" } },
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 3600,
+            .rdata = .{ .nsec = .{
+                .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+                .type_bit_maps = &.{ 0, 1, 0x02 }, // window 0, len 1, only SOA
+            } },
+        },
+    };
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false));
+}
+
+test "validateNegativeResponse returns skip_cache when no proof found in secure zone" {
+    const name = dns.Name{ .labels = &.{ "nonexistent", "example", "com" } };
+    // Empty authorities — no NSEC/NSEC3 records to prove anything
+    try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, true));
+    try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, false));
 }
 
