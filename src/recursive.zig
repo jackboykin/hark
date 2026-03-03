@@ -72,6 +72,7 @@ pub const RecursiveResolver = struct {
         var current_name: []const u8 = name;
         var cname_count: usize = 0;
         var total_probes: usize = 0;
+        var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
 
         // DNSSEC chain of trust state — starts as secure at root
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
@@ -81,14 +82,14 @@ pub const RecursiveResolver = struct {
             if (self.cache) |c| {
                 if (c.lookup(allocator, current_name, qtype, .in)) |result| {
                     switch (result) {
-                        .hit => |h| return makeCachedMessage(h.records, &.{}, .no_error),
+                        .hit => |h| return try withCnameChain(allocator, cname_chain.items, makeCachedMessage(h.records, &.{}, .no_error)),
                         .negative => |n| {
                             const authorities = if (n.soa) |soa| blk: {
                                 const auths = try allocator.alloc(dns.ResourceRecord, 1);
                                 auths[0] = soa;
                                 break :blk auths;
                             } else &[_]dns.ResourceRecord{};
-                            return makeCachedMessage(&.{}, authorities, n.rcode);
+                            return try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, n.rcode));
                         },
                     }
                 }
@@ -399,7 +400,7 @@ pub const RecursiveResolver = struct {
                             .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
                         }
                     }
-                    return response;
+                    return try withCnameChain(allocator, cname_chain.items, response);
                 }
 
                 if (response.answers.len > 0) {
@@ -413,15 +414,16 @@ pub const RecursiveResolver = struct {
                             }
                         }
                         if (!has_target_type) {
-                            if (try findCname(response, target_name, allocator)) |cname_target| {
+                            if (findCnameRecord(response, target_name)) |cname_rr| {
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
-                                current_name = cname_target;
+                                try cname_chain.append(allocator, cname_rr);
+                                current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
                                 continue :cname_loop;
                             }
                         }
                     }
-                    return response;
+                    return try withCnameChain(allocator, cname_chain.items, response);
                 }
 
                 // Check for referral (NS records in authority section)
@@ -436,7 +438,7 @@ pub const RecursiveResolver = struct {
                             .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
                         }
                     }
-                    return response;
+                    return try withCnameChain(allocator, cname_chain.items, response);
                 };
 
                 // DNSSEC: classify delegation security at referral
@@ -686,13 +688,24 @@ fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
     return allocator.dupe(u8, buf[0..len]);
 }
 
-fn findCname(response: dns.Message, target: dns.Name, allocator: mem.Allocator) !?[]const u8 {
+fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord {
     for (response.answers) |rr| {
         if (rr.rtype == .cname and target.eql(rr.name)) {
-            return try nameToDotted(allocator, rr.rdata.cname);
+            return rr;
         }
     }
     return null;
+}
+
+fn withCnameChain(allocator: mem.Allocator, chain: []const dns.ResourceRecord, response: dns.Message) !dns.Message {
+    if (chain.len == 0) return response;
+    const new_answers = try allocator.alloc(dns.ResourceRecord, chain.len + response.answers.len);
+    @memcpy(new_answers[0..chain.len], chain);
+    @memcpy(new_answers[chain.len..], response.answers);
+    var msg = response;
+    msg.answers = new_answers;
+    msg.header.an_count = @intCast(new_answers.len);
+    return msg;
 }
 
 // ── Referral extraction ────────────────────────────────────────────────
@@ -1286,7 +1299,7 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     }
 }
 
-// ── findCname / nameToDotted tests ────────────────────────────────────
+// ── findCnameRecord / nameToDotted tests ──────────────────────────────
 
 test "nameToDotted round-trips correctly" {
     const alloc = testing.allocator;
@@ -1296,7 +1309,7 @@ test "nameToDotted round-trips correctly" {
     try testing.expectEqualStrings("www.example.com", dotted);
 }
 
-test "findCname finds CNAME matching target" {
+test "findCnameRecord finds CNAME matching target" {
     const alloc = testing.allocator;
 
     // CNAME: www.example.com -> example.com
@@ -1330,13 +1343,13 @@ test "findCname finds CNAME matching target" {
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
-    const result = try findCname(response, target, alloc);
+    const result = findCnameRecord(response, target);
     try testing.expect(result != null);
-    defer alloc.free(result.?);
-    try testing.expectEqualStrings("example.com", result.?);
+    try testing.expectEqual(dns.RType.cname, result.?.rtype);
+    try testing.expect(target.eql(result.?.name));
 }
 
-test "findCname returns null when no CNAME present" {
+test "findCnameRecord returns null when no CNAME present" {
     const alloc = testing.allocator;
 
     const owner_labels = try alloc.alloc([]const u8, 2);
@@ -1363,7 +1376,7 @@ test "findCname returns null when no CNAME present" {
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "example", "com" } };
-    const result = try findCname(response, target, alloc);
+    const result = findCnameRecord(response, target);
     try testing.expect(result == null);
 }
 
@@ -1652,13 +1665,13 @@ test "recursive resolve with CNAME chain" {
     try testing.expect(response.answers.len > 0);
 
     var found_a = false;
+    var found_cname = false;
     for (response.answers) |rr| {
-        if (rr.rtype == .a) {
-            found_a = true;
-            break;
-        }
+        if (rr.rtype == .a) found_a = true;
+        if (rr.rtype == .cname) found_cname = true;
     }
     try testing.expect(found_a);
+    try testing.expect(found_cname);
 }
 
 // ── validateNegativeResponse tests ─────────────────────────────────────
