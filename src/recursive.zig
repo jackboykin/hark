@@ -6,7 +6,8 @@ const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
+const encryption_state = @import("encryption_state.zig");
+const EncryptionStateCache = encryption_state.EncryptionStateCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const cache_mod = @import("cache.zig");
@@ -209,7 +210,18 @@ pub const RecursiveResolver = struct {
                     // ── RFC 9539: Opportunistic encrypted query ──
                     if (self.tls_transport) |tls_t| {
                         if (self.encryption_state) |enc_state| {
-                            if (enc_state.shouldAttemptEncrypted(addr_key)) {
+                            const enc_status = enc_state.getStatus(addr_key);
+                            const should_try_tls = switch (enc_status) {
+                                .unknown => true, // probe with short timeout
+                                .success => true, // known good, full timeout
+                                .failed, .timeout => false, // in damping period, skip
+                            };
+                            if (should_try_tls) {
+                                const tls_timeout: u32 = if (enc_status == .success)
+                                    encryption_state.opportunistic_timeout_ms // 4s for known-good
+                                else
+                                    encryption_state.probe_timeout_ms; // 500ms for unknown
+
                                 // Build padded query for TLS (RFC 8467 §4.1: 468 bytes)
                                 const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
                                     .rd = false,
@@ -219,7 +231,7 @@ pub const RecursiveResolver = struct {
                                 const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
                                 var tls_response_buf: [65535]u8 = undefined;
-                                if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf)) |tls_data| {
+                                if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, tls_timeout)) |tls_data| {
                                     enc_state.recordSuccess(addr_key);
                                     response = try dns.parseMessage(allocator, tls_data);
                                     got_response = true;

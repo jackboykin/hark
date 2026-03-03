@@ -175,7 +175,7 @@ pub const TlsTransport = struct {
 
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
     /// no SNI, 4-second connect timeout, immediate fallback on any failure.
-    pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: net.Address, response_buf: []u8) ![]const u8 {
+    pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: net.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
         var tls_server = server;
         switch (tls_server.any.family) {
             posix.AF.INET => tls_server.in.setPort(self.config.port),
@@ -192,7 +192,7 @@ pub const TlsTransport = struct {
         var timeout_ctx = Ctx{ .tag = .timeout };
 
         const connect_op = try self.loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
-        const timeout_op = try self.loop.setTimeout(encryption_state.opportunistic_timeout_ms, @ptrCast(&timeout_ctx));
+        const timeout_op = try self.loop.setTimeout(timeout_ms, @ptrCast(&timeout_ctx));
 
         connect_loop: while (true) {
             var completions: [max_operations]Completion = undefined;
@@ -226,8 +226,8 @@ pub const TlsTransport = struct {
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = try posix.fcntl(sock, posix.F.SETFL, current_flags & ~nonblock_bit);
 
-        const timeout_sec: i64 = @intCast(encryption_state.opportunistic_timeout_ms / 1000);
-        const timeout_usec: i64 = @intCast(@as(u64, encryption_state.opportunistic_timeout_ms % 1000) * 1000);
+        const timeout_sec: i64 = @intCast(timeout_ms / 1000);
+        const timeout_usec: i64 = @intCast(@as(u64, timeout_ms % 1000) * 1000);
         const recv_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
         const send_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&recv_timeout));

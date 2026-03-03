@@ -14,6 +14,9 @@ const damping_sec: i64 = 1 * 24 * 3600; // 1 day
 /// TCP+TLS connect timeout for opportunistic probes.
 pub const opportunistic_timeout_ms: u32 = 4000; // 4 seconds
 
+/// Short timeout for probing unknown servers (fast RST / connect fail).
+pub const probe_timeout_ms: u32 = 500;
+
 // ── Per-IP Encryption State ─────────────────────────────────────────
 
 pub const EncryptionStatus = enum {
@@ -47,6 +50,18 @@ pub const EncryptionStateCache = struct {
 
     pub fn deinit(self: *EncryptionStateCache) void {
         self.entries.deinit();
+    }
+
+    /// Return the current encryption status for a server without side effects.
+    /// Used to select probe timeout: unknown → short probe, success → full timeout.
+    pub fn getStatus(self: *EncryptionStateCache, key: AddressKey) EncryptionStatus {
+        const state = self.entries.get(key) orelse return .unknown;
+        const now = self.now_fn();
+        return switch (state.status) {
+            .success => if (now - state.last_success < persistence_sec) .success else .unknown,
+            .failed, .timeout => if (now - state.last_failure < damping_sec) state.status else .unknown,
+            .unknown => .unknown,
+        };
     }
 
     /// RFC 9539 §4.6: Decide whether to attempt encrypted transport.
