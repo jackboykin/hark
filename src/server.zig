@@ -29,7 +29,10 @@ const CtxTag = enum { udp_recv, tcp_accept, signal };
 
 const Ctx = struct {
     tag: CtxTag,
+    fd: posix.fd_t,
 };
+
+const max_listen_addrs = 8;
 
 // ── Server ─────────────────────────────────────────────────────────────
 
@@ -79,10 +82,15 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        const listen_addr = if (self.config.listen.len > 0)
-            self.config.listen[0]
+        const listen_addrs: []const std.net.Address = if (self.config.listen.len > 0)
+            self.config.listen
         else
-            std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 53);
+            &.{std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 53)};
+
+        if (listen_addrs.len > max_listen_addrs) {
+            log.err("too many listen addresses ({d}), maximum is {d}", .{ listen_addrs.len, max_listen_addrs });
+            return error.TooManyListenAddresses;
+        }
 
         const workers = self.config.workers;
 
@@ -90,12 +98,18 @@ pub const Server = struct {
         const sig_fd = setupSignalFd() catch -1;
         defer if (sig_fd >= 0) posix.close(sig_fd);
 
+        for (listen_addrs) |addr| {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = formatAddress(addr, &addr_buf);
+            log.info("listening on {s} (UDP+TCP)", .{addr_str});
+        }
+
         if (workers <= 1) {
             // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
-            log.info("listening on port {d} (UDP+TCP), 1 worker", .{listen_addr.getPort()});
-            self.runWorker(listen_addr, sig_fd, false);
+            log.info("{d} worker", .{workers});
+            self.runWorker(listen_addrs, sig_fd, false);
         } else {
-            log.info("listening on port {d} (UDP+TCP), {d} workers", .{ listen_addr.getPort(), workers });
+            log.info("{d} workers", .{workers});
 
             // Spawn N-1 worker threads + run one on main thread
             const threads = self.allocator.alloc(std.Thread, workers - 1) catch |err| {
@@ -105,7 +119,7 @@ pub const Server = struct {
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*t, i| {
-                t.* = std.Thread.spawn(.{}, workerThread, .{ self, listen_addr }) catch |err| {
+                t.* = std.Thread.spawn(.{}, workerThread, .{ self, listen_addrs }) catch |err| {
                     log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
                     // Signal shutdown to already-spawned threads
                     self.shutdown.store(true, .release);
@@ -115,7 +129,7 @@ pub const Server = struct {
             }
 
             // Main thread runs a worker too, with signalfd for shutdown
-            self.runWorker(listen_addr, sig_fd, true);
+            self.runWorker(listen_addrs, sig_fd, true);
 
             // Join all worker threads
             for (threads) |t| t.join();
@@ -130,11 +144,11 @@ pub const Server = struct {
         });
     }
 
-    fn workerThread(self: *Server, listen_addr: std.net.Address) void {
-        self.runWorker(listen_addr, -1, true);
+    fn workerThread(self: *Server, listen_addrs: []const std.net.Address) void {
+        self.runWorker(listen_addrs, -1, true);
     }
 
-    fn runWorker(self: *Server, listen_addr: std.net.Address, sig_fd: posix.fd_t, reuseport: bool) void {
+    fn runWorker(self: *Server, listen_addrs: []const std.net.Address, sig_fd: posix.fd_t, reuseport: bool) void {
         // Per-thread EventLoop for server accept/recv
         const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
@@ -160,30 +174,52 @@ pub const Server = struct {
 
         var tcp_transport = TcpTransport.init(transport_loop, .{});
 
-        // Per-thread server sockets
-        const udp_sock = if (reuseport)
-            createUdpSocketReuseport(listen_addr) catch |err| {
-                log.err("worker failed to create UDP socket: {s}", .{@errorName(err)});
-                return;
-            }
-        else
-            createUdpSocket(listen_addr) catch |err| {
-                log.err("worker failed to create UDP socket: {s}", .{@errorName(err)});
-                return;
-            };
-        defer posix.close(udp_sock);
+        // Per-thread server sockets — one UDP + one TCP per listen address
+        var udp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
+        var tcp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
 
-        const tcp_sock = if (reuseport)
-            createTcpListenSocketReuseport(listen_addr) catch |err| {
-                log.err("worker failed to create TCP socket: {s}", .{@errorName(err)});
-                return;
-            }
-        else
-            createTcpListenSocket(listen_addr) catch |err| {
-                log.err("worker failed to create TCP socket: {s}", .{@errorName(err)});
-                return;
+        defer for (0..listen_addrs.len) |i| {
+            if (udp_socks[i] >= 0) posix.close(udp_socks[i]);
+            if (tcp_socks[i] >= 0) posix.close(tcp_socks[i]);
+        };
+
+        for (listen_addrs, 0..) |addr, i| {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = formatAddress(addr, &addr_buf);
+
+            const udp_fd = if (reuseport)
+                createUdpSocketReuseport(addr)
+            else
+                createUdpSocket(addr);
+            udp_socks[i] = udp_fd catch |err| {
+                log.warn("failed to create UDP socket for {s}: {s}", .{ addr_str, @errorName(err) });
+                continue;
             };
-        defer posix.close(tcp_sock);
+
+            const tcp_fd = if (reuseport)
+                createTcpListenSocketReuseport(addr)
+            else
+                createTcpListenSocket(addr);
+            tcp_socks[i] = tcp_fd catch |err| {
+                log.warn("failed to create TCP socket for {s}: {s}", .{ addr_str, @errorName(err) });
+                posix.close(udp_socks[i]);
+                udp_socks[i] = -1;
+                continue;
+            };
+        }
+
+        // Check at least one address succeeded
+        var any_ok = false;
+        for (0..listen_addrs.len) |i| {
+            if (udp_socks[i] >= 0) {
+                any_ok = true;
+                break;
+            }
+        }
+        if (!any_ok) {
+            log.err("worker failed to bind any listen address", .{});
+            return;
+        }
 
         // Per-worker TLS transport + encryption state (opportunistic encryption)
         var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle);
@@ -204,7 +240,7 @@ pub const Server = struct {
             .shutdown = &self.shutdown,
         };
 
-        ws.serveLoop(udp_sock, tcp_sock, sig_fd);
+        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
     }
 };
 
@@ -223,13 +259,31 @@ const WorkerState = struct {
     rtt_cache: *RttCache,
     shutdown: *std.atomic.Value(bool),
 
-    fn serveLoop(self: *WorkerState, udp_sock: posix.fd_t, tcp_sock: posix.fd_t, sig_fd: posix.fd_t) void {
-        var udp_ctx = Ctx{ .tag = .udp_recv };
-        var accept_ctx = Ctx{ .tag = .tcp_accept };
-        var signal_ctx = Ctx{ .tag = .signal };
+    fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
+        const n = udp_socks.len;
 
-        var recv_op = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch return;
-        var accept_op = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch return;
+        var udp_ctxs: [max_listen_addrs]Ctx = undefined;
+        var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
+        var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
+
+        // Op IDs indexed by listen address; null means inactive
+        var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
+        var tcp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
+
+        // Register recvFrom for each UDP socket
+        for (udp_socks, 0..) |fd, i| {
+            if (fd < 0) continue;
+            udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
+            udp_ops[i] = self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i])) catch null;
+        }
+
+        // Register accept for each TCP socket
+        for (tcp_socks, 0..) |fd, i| {
+            if (fd < 0) continue;
+            tcp_ctxs[i] = .{ .tag = .tcp_accept, .fd = fd };
+            tcp_ops[i] = self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])) catch null;
+        }
+
         const signal_op: ?OperationId = if (sig_fd >= 0)
             self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null
         else
@@ -252,13 +306,15 @@ const WorkerState = struct {
                         switch (c.result) {
                             .recv => |recv| {
                                 if (recv.err == null and recv.data.len > 0) {
-                                    self.handleUdpQuery(udp_sock, recv.data, recv.addr);
+                                    self.handleUdpQuery(ctx.fd, recv.data, recv.addr);
                                 }
                             },
                             else => {},
                         }
                         if (!self.shutdown.load(.acquire)) {
-                            recv_op = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch break;
+                            // Find which index this ctx belongs to and re-register
+                            const idx = ctxIndex(&udp_ctxs, n, ctx) orelse break;
+                            udp_ops[idx] = self.loop.recvFrom(ctx.fd, @ptrCast(ctx)) catch break;
                         }
                     },
                     .tcp_accept => {
@@ -271,7 +327,8 @@ const WorkerState = struct {
                             else => {},
                         }
                         if (!self.shutdown.load(.acquire)) {
-                            accept_op = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch break;
+                            const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse break;
+                            tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch break;
                         }
                     },
                 }
@@ -279,8 +336,10 @@ const WorkerState = struct {
         }
 
         // Cancel pending operations before draining, so flush() doesn't block
-        self.loop.cancel(recv_op) catch {};
-        self.loop.cancel(accept_op) catch {};
+        for (0..n) |i| {
+            if (udp_ops[i]) |op| self.loop.cancel(op) catch {};
+            if (tcp_ops[i]) |op| self.loop.cancel(op) catch {};
+        }
         if (signal_op) |op| self.loop.cancel(op) catch {};
         self.loop.flush();
     }
@@ -584,12 +643,56 @@ fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: std.net.Address) vo
     _ = posix.sendto(sock, data, 0, &dest.any, dest.getOsSockLen()) catch return;
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────
+
+fn ctxIndex(ctxs: *const [max_listen_addrs]Ctx, n: usize, target: *const Ctx) ?usize {
+    for (0..n) |i| {
+        if (&ctxs[i] == target) return i;
+    }
+    return null;
+}
+
+fn formatAddress(addr: std.net.Address, buf: []u8) []const u8 {
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort(),
+            }) catch "<address>";
+        },
+        posix.AF.INET6 => {
+            const port = addr.getPort();
+            const a = addr.in6.sa.addr;
+            return std.fmt.bufPrint(buf, "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}", .{
+                mem.readInt(u16, a[0..2], .big),
+                mem.readInt(u16, a[2..4], .big),
+                mem.readInt(u16, a[4..6], .big),
+                mem.readInt(u16, a[6..8], .big),
+                mem.readInt(u16, a[8..10], .big),
+                mem.readInt(u16, a[10..12], .big),
+                mem.readInt(u16, a[12..14], .big),
+                mem.readInt(u16, a[14..16], .big),
+                port,
+            }) catch "<address>";
+        },
+        else => return "<unknown>",
+    }
+}
+
+fn setV6Only(sock: posix.fd_t, family: u16) !void {
+    if (family == posix.AF.INET6) {
+        const v6only: c_int = 1;
+        try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(v6only));
+    }
+}
+
 // ── Socket creation ────────────────────────────────────────────────────
 
 fn createUdpSocket(addr: std.net.Address) !posix.fd_t {
     const sock = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(sock);
 
+    try setV6Only(sock, addr.any.family);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     try posix.bind(sock, &addr.any, addr.getOsSockLen());
@@ -601,6 +704,7 @@ fn createUdpSocketReuseport(addr: std.net.Address) !posix.fd_t {
     const sock = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(sock);
 
+    try setV6Only(sock, addr.any.family);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
@@ -613,6 +717,7 @@ fn createTcpListenSocket(addr: std.net.Address) !posix.fd_t {
     const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(sock);
 
+    try setV6Only(sock, addr.any.family);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     try posix.bind(sock, &addr.any, addr.getOsSockLen());
@@ -625,6 +730,7 @@ fn createTcpListenSocketReuseport(addr: std.net.Address) !posix.fd_t {
     const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(sock);
 
+    try setV6Only(sock, addr.any.family);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
