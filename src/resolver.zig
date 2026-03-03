@@ -70,7 +70,7 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();

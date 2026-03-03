@@ -105,7 +105,7 @@ pub const RecursiveResolver = struct {
             var parent_zone = dns.Name{ .labels = &.{} };
 
             // CACHE CHECK 2: Find closest cached delegation to skip root/TLD queries.
-            if (self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
+            if (try self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
                 server_count = deleg.count;
                 @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
                 parent_zone = deleg.zone;
@@ -270,8 +270,11 @@ pub const RecursiveResolver = struct {
                                 continue;
                             },
                             .no_glue => |ng| {
-                                const res = self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count]) orelse blk: {
-                                    const resolved = self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth) catch return error.NoGlueRecords;
+                                const res = (try self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count])) orelse blk: {
+                                    const resolved = self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth) catch |err| {
+                                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                                        return error.NoGlueRecords;
+                                    };
                                     break :blk resolved orelse return error.NoGlueRecords;
                                 };
                                 for (seen_zones[0..seen_zone_count]) |sz| {
@@ -419,12 +422,15 @@ pub const RecursiveResolver = struct {
                     },
                     .no_glue => |ng| {
                         // CACHE CHECK 3: Try cached A records for NS names first
-                        const res = self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count]) orelse blk: {
+                        const res = (try self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count])) orelse blk: {
                             const resolved = self.resolveNsAddresses(
                                 allocator,
                                 ng.ns_names[0..ng.ns_count],
                                 depth,
-                            ) catch return error.NoGlueRecords;
+                            ) catch |err| {
+                                if (err == error.OutOfMemory) return error.OutOfMemory;
+                                return error.NoGlueRecords;
+                            };
                             break :blk resolved orelse return error.NoGlueRecords;
                         };
 
@@ -459,8 +465,14 @@ pub const RecursiveResolver = struct {
         var count: usize = 0;
 
         for (ns_names) |ns_name| {
-            const ns_dotted = nameToDotted(allocator, ns_name) catch continue;
-            const ns_response = self.resolveImpl(allocator, ns_dotted, .a, depth + 1) catch continue;
+            const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                continue;
+            };
+            const ns_response = self.resolveImpl(allocator, ns_dotted, .a, depth + 1) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                continue;
+            };
             for (ns_response.answers) |rr| {
                 if (rr.rtype == .a and count < max_servers_per_level) {
                     addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
@@ -482,14 +494,14 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         ns_names: []const dns.Name,
-    ) ?NsAddrResult {
+    ) !?NsAddrResult {
         const cache = self.cache orelse return null;
 
         var addrs: [max_servers_per_level]std.net.Address = undefined;
         var count: usize = 0;
 
         for (ns_names) |ns_name| {
-            const ns_dotted = nameToDotted(allocator, ns_name) catch continue;
+            const ns_dotted = try nameToDotted(allocator, ns_name);
             if (cache.lookup(allocator, ns_dotted, .a, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
@@ -516,7 +528,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         target_name: []const u8,
-    ) ?DelegationResult {
+    ) !?DelegationResult {
         const cache = self.cache orelse return null;
 
         // Split into labels
@@ -561,7 +573,7 @@ pub const RecursiveResolver = struct {
 
                         for (h.records) |ns_rr| {
                             if (ns_rr.rtype != .ns) continue;
-                            const ns_dotted = nameToDotted(allocator, ns_rr.rdata.ns) catch continue;
+                            const ns_dotted = try nameToDotted(allocator, ns_rr.rdata.ns);
                             if (cache.lookup(allocator, ns_dotted, .a, .in)) |a_result| {
                                 switch (a_result) {
                                     .hit => |a_hit| {
@@ -578,7 +590,7 @@ pub const RecursiveResolver = struct {
                         }
 
                         if (addr_count > 0) {
-                            const zone_name = dns.parseDottedName(allocator, zone_str) catch continue;
+                            const zone_name = try dns.parseDottedName(allocator, zone_str);
                             best = .{
                                 .addrs = addrs,
                                 .count = addr_count,
@@ -1456,7 +1468,7 @@ test "recursive resolve example.com A from root hints" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -1497,7 +1509,7 @@ test "recursive resolve nonexistent domain returns name_error" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -1526,7 +1538,7 @@ test "recursive resolve domain with glueless NS" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -1568,7 +1580,7 @@ test "recursive resolve with CNAME chain" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();

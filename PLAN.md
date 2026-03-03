@@ -32,8 +32,8 @@ that inform hark's design:
 
 ```
                   ┌─────────────────────────┐
-    clients ───►  │    Server (UDP/TCP)      │  M10
-                  │    DoT / DoH listeners   │  M9
+    clients ───►  │    Server (UDP/TCP)      │  M10 ✅
+                  │    DoT / DoH listeners   │  M9 ✅
                   └────────────┬─────────────┘
                                │
                   ┌────────────▼─────────────┐
@@ -52,7 +52,7 @@ that inform hark's design:
                   │  UDP / io_uring           │  M2 ✅
                   │  TCP fallback             │  M5 ✅
                   │  EDNS0 payload sizing     │  M6 ✅
-                  │  DoT / RFC 9539          │  M9
+                  │  DoT / RFC 9539           │  M9 ✅
                   └──────────────────────────┘
                                │
                   ┌────────────▼─────────────┐
@@ -123,55 +123,23 @@ that inform hark's design:
 - Bogus vs. insecure vs. secure classification
 - Policy: unsupported algorithms (Ed448, legacy SHA1) → bogus → ServFail (safe default)
 
+### M9: DNS-over-TLS + RFC 9539 ✅
+- RFCs 7858 (DoT), 9539 (opportunistic recursive-to-authoritative encryption)
+- Connection pooling with ALPN negotiation (`"dot"` token)
+- Per-IP encrypted-capability state (3-day success cache, 1-day failure damping)
+- Graceful fallback to cleartext Do53 on failure (RFC 9539)
+- Stdlib TLS 1.3 client with cherry-picked ALPN from Zig PR #24983
+
+### M10: Server Mode + Configuration ✅
+- UDP + TCP listeners on configurable port (default 53)
+- TOML configuration file (upstream servers, forwarding mode, cache size, listen addresses)
+- Thread pool with `SO_REUSEPORT` and shared mutex-protected cache
+- `signalfd`-based graceful shutdown
+- RFC 1035/6891 compliant response truncation with EDNS support
+
 ## Milestone Roadmap
 
-### M9: DNS-over-TLS + RFC 9539
-**RFCs**: 7858 (DoT), 9539 (opportunistic recursive-to-authoritative encryption)
-**Goal**: Encrypted transport — both traditional DoT and opportunistic encryption.
-
-**Two distinct use cases:**
-
-| Use Case | Direction | Cert Auth | ALPN | Fallback |
-|----------|-----------|-----------|------|----------|
-| Traditional DoT | Client→hark or hark→upstream | Yes (PKI) | Optional | No |
-| RFC 9539 | hark recursive→authoritative | No (any cert) | Required (`"dot"`) | Yes (Do53) |
-
-**Transport architecture requirements:**
-- Connection reuse (persistent TCP/TLS connections)
-- Per-IP encrypted-capability state (3-day success cache, 1-day failure damping)
-- ALPN negotiation (`"dot"` token)
-- Graceful fallback to cleartext Do53 on failure (RFC 9539)
-- 4-second timeout for encrypted connection attempts
-
-**TLS approach (least-dependency order):**
-1. Stdlib TLS 1.3 client — works for most DoT servers today
-2. Cherry-pick ALPN from Zig PR #24983 — needed for RFC 9539
-3. Vendor `iotic/tls.zig` if stdlib insufficient (TLS 1.3/1.2 client + server, stdlib ancestor)
-4. External dep only as last resort
-
-**Zig 0.15.2 stdlib TLS status:**
-- TLS 1.3 client works; TLS 1.2 buggy; ALPN missing (PR #24983); server-side TLS none
-- Certificate validation partial (RSA chains OK; EC←EC←RSA broken)
-
-### M10: Server Mode + Configuration
-**Goal**: Listen for client queries, configurable operation.
-
-- UDP + TCP listeners on configurable port (default 53)
-- Client query dispatch to resolver pipeline
-- Configuration file (TOML or simple custom format)
-  - Upstream servers, forwarding mode toggle, cache size, listen addresses
-- Graceful shutdown
-- Logging / metrics (optional)
-
-**Concurrency architecture notes:**
-- Thread-per-core with shared-nothing sharded cache (no mutexes). Each core owns
-  exclusive cache shards, determined by hashing the query name.
-- `SO_REUSEPORT` + eBPF packet steering: attach a small eBPF program to the socket that
-  parses incoming UDP query names, hashes them, and steers packets to the io_uring instance
-  on the core that owns that shard. Lock-free by construction.
-- If shared cache is needed instead, use epoch-based / RCU memory reclamation: readers never
-  lock, writers build new entries and atomically swap pointers, retired memory cleaned up at
-  event loop epoch boundaries.
+Future milestones TBD.
 
 ## Key Architectural Decisions
 
@@ -182,7 +150,8 @@ that inform hark's design:
 | Cache | In-memory, no persistence | Cleanest approach. Not worth the complexity for a usable tool. |
 | TLS | Stdlib first, ALPN patch, vendor iotic as fallback | Zero deps preferred. Stdlib TLS 1.3 works; ALPN needed for RFC 9539. |
 | DNSSEC RSA | `std.crypto.Certificate.rsa` (internal) | Works. All 5 production algorithms implemented. |
-| Config format | Defer decision | Not needed until M10. |
+| Config format | TOML | Minimal subset parser, one file per concern. |
+| Concurrency | Thread pool + `SO_REUSEPORT` + shared mutex cache | Simple and correct. Sharded/lock-free deferred. |
 | File structure | One file per concern | `dns.zig`, `recursive.zig`, `cache.zig`, `transport.zig`, `event_loop.zig`, etc. |
 | Testing | RFC test vectors + real DNS + fuzz | Fuzz all parsers. Integration test against live DNS for resolution. |
 

@@ -467,7 +467,7 @@ fn isLinuxIoUringAvailable() bool {
 test "EventLoop create/destroy" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -478,7 +478,7 @@ test "EventLoop create/destroy" {
 test "EventLoop setTimeout fires" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -496,7 +496,7 @@ test "EventLoop setTimeout fires" {
 test "EventLoop sendTo/recvFrom loopback" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -555,7 +555,7 @@ test "EventLoop sendTo/recvFrom loopback" {
 test "EventLoop cancel pending recvFrom" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -591,7 +591,7 @@ test "EventLoop cancel pending recvFrom" {
 test "EventLoop TCP connect/send/recv loopback" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();

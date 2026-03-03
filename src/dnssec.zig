@@ -698,9 +698,10 @@ pub fn validateNegativeProof(
 
             if (!is_nxdomain) {
                 // NODATA: find matching NSEC3 and check type bitmap
+                const owner_hash = nsec3Hash(rr.name, nsec3.salt, nsec3.iterations) catch continue;
                 const target_hash = nsec3Hash(qname, nsec3.salt, nsec3.iterations) catch continue;
-                if (mem.eql(u8, nsec3.next_hashed_owner, &target_hash) or
-                    nsec3HashInRange(nsec3.next_hashed_owner, nsec3.next_hashed_owner, &target_hash))
+                if (mem.eql(u8, &owner_hash, &target_hash) or
+                    nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &target_hash))
                 {
                     // This is a rough check — the hash might match or be covered
                     if (!dns.typeBitmapContains(nsec3.type_bit_maps, qtype)) {

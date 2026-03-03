@@ -78,7 +78,7 @@ pub const TcpTransport = struct {
         var bytes_sent: usize = 0;
 
         while (bytes_sent < total_send) {
-            _ = try self.loop.tcpSend(sock, send_buf[bytes_sent..total_send], @ptrCast(&send_ctx));
+            const send_op = try self.loop.tcpSend(sock, send_buf[bytes_sent..total_send], @ptrCast(&send_ctx));
 
             send_wait: while (true) {
                 var completions: [max_operations]Completion = undefined;
@@ -97,6 +97,7 @@ pub const TcpTransport = struct {
                         },
                         .timeout => {
                             if (c.result.timeout.expired) {
+                                self.loop.cancel(send_op) catch {};
                                 self.loop.flush();
                                 return error.Timeout;
                             }
@@ -114,7 +115,7 @@ pub const TcpTransport = struct {
         var body_filled: usize = 0;
 
         recv_loop: while (true) {
-            _ = try self.loop.tcpRecv(sock, @ptrCast(&recv_ctx));
+            const recv_op = try self.loop.tcpRecv(sock, @ptrCast(&recv_ctx));
 
             recv_wait: while (true) {
                 var completions: [max_operations]Completion = undefined;
@@ -166,6 +167,7 @@ pub const TcpTransport = struct {
                         },
                         .timeout => {
                             if (c.result.timeout.expired) {
+                                self.loop.cancel(recv_op) catch {};
                                 self.loop.flush();
                                 return error.Timeout;
                             }
@@ -190,7 +192,7 @@ test "TcpTransport query 8.8.8.8 for example.com A" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();

@@ -24,33 +24,42 @@ const Context = struct {
 
 pub const UdpTransport = struct {
     loop: *EventLoop,
-    sock: posix.fd_t,
     config: Config,
 
     pub fn init(loop: *EventLoop, config: Config) !UdpTransport {
+        return .{ .loop = loop, .config = config };
+    }
+
+    pub fn deinit(self: *UdpTransport) void {
+        _ = self;
+    }
+
+    /// Create a fresh UDP socket bound to a random ephemeral port (RFC 5452
+    /// source-port randomization).  The caller must close the returned fd.
+    fn openSocket() !posix.fd_t {
         const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
 
         const bind_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
         try posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen());
 
-        return .{ .loop = loop, .sock = sock, .config = config };
-    }
-
-    pub fn deinit(self: *UdpTransport) void {
-        posix.close(self.sock);
+        return sock;
     }
 
     pub fn query(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+        // Per-query socket for source-port randomization (RFC 5452)
+        const sock = try openSocket();
+        errdefer posix.close(sock);
+
         var recv_ctx = Context{ .tag = .recv };
         var retransmit_ctx = Context{ .tag = .retransmit };
         var overall_ctx = Context{ .tag = .overall };
 
         // Send initial query
-        _ = try self.loop.sendTo(self.sock, wire_query, upstream, @ptrCast(&recv_ctx));
+        _ = try self.loop.sendTo(sock, wire_query, upstream, @ptrCast(&recv_ctx));
 
         // Start recv
-        var recv_op = try self.loop.recvFrom(self.sock, @ptrCast(&recv_ctx));
+        var recv_op = try self.loop.recvFrom(sock, @ptrCast(&recv_ctx));
 
         // Start retransmit timer
         var retransmit_op = try self.loop.setTimeout(self.config.retransmit_ms, @ptrCast(&retransmit_ctx));
@@ -80,11 +89,12 @@ pub const UdpTransport = struct {
                                         self.loop.cancel(overall_op) catch {};
                                         // Drain remaining completions
                                         self.drainPending();
+                                        posix.close(sock);
                                         return r.data;
                                     }
                                 }
                                 // Wrong ID — re-queue recv
-                                recv_op = try self.loop.recvFrom(self.sock, @ptrCast(&recv_ctx));
+                                recv_op = try self.loop.recvFrom(sock, @ptrCast(&recv_ctx));
                             },
                             else => {},
                         }
@@ -95,7 +105,7 @@ pub const UdpTransport = struct {
                         if (retries_left == 0) continue;
                         retries_left -= 1;
                         // Retransmit
-                        _ = try self.loop.sendTo(self.sock, wire_query, upstream, @ptrCast(&recv_ctx));
+                        _ = try self.loop.sendTo(sock, wire_query, upstream, @ptrCast(&recv_ctx));
                         // Reset retransmit timer
                         retransmit_op = try self.loop.setTimeout(self.config.retransmit_ms, @ptrCast(&retransmit_ctx));
                     },
@@ -106,7 +116,7 @@ pub const UdpTransport = struct {
                         self.loop.cancel(recv_op) catch {};
                         self.loop.cancel(retransmit_op) catch {};
                         self.drainPending();
-                        return error.Timeout;
+                        return error.Timeout; // errdefer closes sock
                     },
                 }
             }
@@ -127,7 +137,7 @@ fn skipIfNotLinux() !void {
 test "UdpTransport loopback query" {
     try skipIfNotLinux();
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -195,7 +205,7 @@ test "UdpTransport loopback query" {
 test "UdpTransport timeout" {
     try skipIfNotLinux();
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();

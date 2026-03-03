@@ -65,6 +65,7 @@ pub const Error = error{
     LabelTooLong,
     NameTooLong,
     CompressionPointerLoop,
+    FormatError,
     InvalidLabelType,
     InvalidRDataLength,
     OutOfMemory,
@@ -507,7 +508,7 @@ pub const Parser = struct {
         var labels: ArrayList([]const u8) = .empty;
         var total_len: usize = 0;
         var jumps: usize = 0;
-        const max_jumps = 128;
+        const max_jumps = 32;
         var cursor = self.pos;
         var saved_pos: ?usize = null;
 
@@ -530,6 +531,8 @@ pub const Parser = struct {
                 if (jumps > max_jumps) return error.CompressionPointerLoop;
                 if (saved_pos == null) saved_pos = cursor + 2;
                 const offset = (@as(u16, len_byte & 0x3F) << 8) | @as(u16, self.msg[cursor + 1]);
+                // RFC 1035 §4.1.4: pointers must reference prior occurrences
+                if (offset >= cursor) return error.FormatError;
                 cursor = offset;
             } else if (label_type == 0x00) {
                 // Normal label
@@ -1343,11 +1346,18 @@ test "name parsing - compressed" {
     try testing.expectEqual(@as(usize, 19), parser.pos);
 }
 
-test "name parsing - pointer loop detection" {
-    // Two pointers pointing at each other
+test "name parsing - forward pointer rejection" {
+    // Forward pointer at position 0 pointing to offset 2 — rejected per RFC 1035 §4.1.4
     const data = [_]u8{ 0xC0, 0x02, 0xC0, 0x00 };
     var parser = Parser{ .msg = &data, .pos = 0 };
-    try testing.expectError(error.CompressionPointerLoop, parser.parseName(testing.allocator));
+    try testing.expectError(error.FormatError, parser.parseName(testing.allocator));
+}
+
+test "name parsing - self pointer rejection" {
+    // Self-pointer: offset == cursor, rejected as non-backward
+    const data = [_]u8{ 0xC0, 0x00 };
+    var parser = Parser{ .msg = &data, .pos = 0 };
+    try testing.expectError(error.FormatError, parser.parseName(testing.allocator));
 }
 
 test "full query packet parse" {

@@ -572,7 +572,13 @@ pub const RRsetCache = struct {
                 }
             }
 
-            if (idx == 0) {
+            if (idx == 0 or idx < count) {
+                // idx==0: no records cloned; idx<count: partial clone failure —
+                // don't cache an incomplete RRset.
+                for (cached_records[0..idx]) |cr| {
+                    dns.freeName(alloc, cr.name);
+                    dns.freeRData(alloc, cr.rdata);
+                }
                 alloc.free(cached_records);
                 alloc.free(key_name);
                 continue;

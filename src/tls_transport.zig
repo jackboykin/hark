@@ -314,7 +314,7 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -355,7 +355,7 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
@@ -394,7 +394,7 @@ test "TlsTransport connection pooling reuses connection" {
     try skipIfNotLinux();
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated => return error.SkipZigTest,
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
