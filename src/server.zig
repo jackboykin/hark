@@ -7,6 +7,7 @@ const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
+const OperationId = @import("event_loop.zig").OperationId;
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const RecursiveResolver = @import("recursive.zig").RecursiveResolver;
@@ -125,21 +126,30 @@ pub const Server = struct {
     }
 
     fn runWorker(self: *Server, listen_addr: std.net.Address, sig_fd: posix.fd_t, reuseport: bool) void {
-        // Per-thread EventLoop
-        const loop = EventLoop.create(self.allocator) catch |err| {
+        // Per-thread EventLoop for server accept/recv
+        const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
             return;
         };
-        defer loop.destroy();
+        defer server_loop.destroy();
 
-        // Per-thread outbound transport
-        var udp_transport = UdpTransport.init(loop, .{}) catch |err| {
+        // Separate EventLoop for outbound resolution queries.
+        // The resolver's tick()/flush() must not interfere with the
+        // server's pending accept/signalfd operations.
+        const transport_loop = EventLoop.create(self.allocator) catch |err| {
+            log.err("worker failed to create transport event loop: {s}", .{@errorName(err)});
+            return;
+        };
+        defer transport_loop.destroy();
+
+        // Per-thread outbound transport (uses its own loop)
+        var udp_transport = UdpTransport.init(transport_loop, .{}) catch |err| {
             log.err("worker failed to create UDP transport: {s}", .{@errorName(err)});
             return;
         };
         defer udp_transport.deinit();
 
-        var tcp_transport = TcpTransport.init(loop, .{});
+        var tcp_transport = TcpTransport.init(transport_loop, .{});
 
         // Per-thread server sockets
         const udp_sock = if (reuseport)
@@ -167,7 +177,7 @@ pub const Server = struct {
         defer posix.close(tcp_sock);
 
         // Per-worker TLS transport + encryption state (opportunistic encryption)
-        var tls_transport = TlsTransport.init(loop, self.allocator, .{}, self.ca_bundle);
+        var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle);
         var enc_state = EncryptionStateCache.init(self.allocator);
         defer if (self.config.opportunistic) enc_state.deinit();
 
@@ -175,7 +185,7 @@ pub const Server = struct {
         var ws = WorkerState{
             .config = &self.config,
             .allocator = self.allocator,
-            .loop = loop,
+            .loop = server_loop,
             .udp_transport = &udp_transport,
             .tcp_transport = &tcp_transport,
             .tls_transport = if (self.config.opportunistic) &tls_transport else null,
@@ -207,11 +217,12 @@ const WorkerState = struct {
         var accept_ctx = Ctx{ .tag = .tcp_accept };
         var signal_ctx = Ctx{ .tag = .signal };
 
-        _ = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch return;
-        _ = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch return;
-        if (sig_fd >= 0) {
-            _ = self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch {};
-        }
+        var recv_op = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch return;
+        var accept_op = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch return;
+        const signal_op: ?OperationId = if (sig_fd >= 0)
+            self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null
+        else
+            null;
 
         var completions: [max_operations]Completion = undefined;
 
@@ -236,7 +247,7 @@ const WorkerState = struct {
                             else => {},
                         }
                         if (!self.shutdown.load(.acquire)) {
-                            _ = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch break;
+                            recv_op = self.loop.recvFrom(udp_sock, @ptrCast(&udp_ctx)) catch break;
                         }
                     },
                     .tcp_accept => {
@@ -249,13 +260,17 @@ const WorkerState = struct {
                             else => {},
                         }
                         if (!self.shutdown.load(.acquire)) {
-                            _ = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch break;
+                            accept_op = self.loop.accept(tcp_sock, @ptrCast(&accept_ctx)) catch break;
                         }
                     },
                 }
             }
         }
 
+        // Cancel pending operations before draining, so flush() doesn't block
+        self.loop.cancel(recv_op) catch {};
+        self.loop.cancel(accept_op) catch {};
+        if (signal_op) |op| self.loop.cancel(op) catch {};
         self.loop.flush();
     }
 
@@ -269,7 +284,7 @@ const WorkerState = struct {
                 const id = mem.readInt(u16, data[0..2], .big);
                 var wire_buf: [512]u8 = undefined;
                 if (serializeErrorResponse(&wire_buf, id, .format_error, false)) |wire| {
-                    sendUdpResponse(sock, self.loop, wire, client_addr);
+                    sendUdpResponse(sock, wire, client_addr);
                 }
             }
             return;
@@ -278,7 +293,7 @@ const WorkerState = struct {
         if (query.header.opcode != .query) {
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .not_implemented, query.header.rd)) |wire| {
-                sendUdpResponse(sock, self.loop, wire, client_addr);
+                sendUdpResponse(sock, wire, client_addr);
             }
             return;
         }
@@ -286,7 +301,7 @@ const WorkerState = struct {
         if (query.questions.len != 1) {
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .format_error, query.header.rd)) |wire| {
-                sendUdpResponse(sock, self.loop, wire, client_addr);
+                sendUdpResponse(sock, wire, client_addr);
             }
             return;
         }
@@ -294,7 +309,7 @@ const WorkerState = struct {
         if (query.questions[0].qclass != .in) {
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .refused, query.header.rd)) |wire| {
-                sendUdpResponse(sock, self.loop, wire, client_addr);
+                sendUdpResponse(sock, wire, client_addr);
             }
             return;
         }
@@ -312,7 +327,7 @@ const WorkerState = struct {
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, @tagName(question.qtype), elapsed_ms });
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd)) |wire| {
-                sendUdpResponse(sock, self.loop, wire, client_addr);
+                sendUdpResponse(sock, wire, client_addr);
             }
             return;
         };
@@ -321,7 +336,7 @@ const WorkerState = struct {
 
         var wire_buf: [65535]u8 = undefined;
         if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.questions, response, query.opt != null, max_payload)) |wire| {
-            sendUdpResponse(sock, self.loop, wire, client_addr);
+            sendUdpResponse(sock, wire, client_addr);
         }
     }
 
@@ -607,11 +622,10 @@ fn drainCancel(loop: *EventLoop) void {
     _ = loop.tick(&completions) catch {};
 }
 
-fn sendUdpResponse(sock: posix.fd_t, loop: *EventLoop, data: []const u8, dest: std.net.Address) void {
-    var discard_ctx: u8 = 0;
-    _ = loop.sendTo(sock, data, dest, @ptrCast(&discard_ctx)) catch return;
-    var completions: [max_operations]Completion = undefined;
-    _ = loop.tick(&completions) catch return;
+fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: std.net.Address) void {
+    // Use direct sendto instead of io_uring to avoid consuming server CQEs
+    // (accept, signalfd) that might arrive during the send.
+    _ = posix.sendto(sock, data, 0, &dest.any, dest.getOsSockLen()) catch return;
 }
 
 // ── Socket creation ────────────────────────────────────────────────────

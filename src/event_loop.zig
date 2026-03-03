@@ -552,6 +552,95 @@ test "EventLoop sendTo/recvFrom loopback" {
     try testing.expect(got_recv);
 }
 
+test "EventLoop recvFrom with external sender (server pattern)" {
+    // This test mimics the server's exact pattern: recvFrom + accept + read
+    // on a non-seekable fd (pipe, like signalfd), with data from an external source.
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer loop.destroy();
+
+    // Create a "server" UDP socket (like the server does)
+    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(server_sock);
+    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try posix.bind(server_sock, &bind_addr.any, bind_addr.getOsSockLen());
+
+    var server_addr: std.net.Address = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
+    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+
+    // Also create a TCP listen socket (like server does)
+    const tcp_sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(tcp_sock);
+    const tcp_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try posix.bind(tcp_sock, &tcp_bind.any, tcp_bind.getOsSockLen());
+    try posix.listen(tcp_sock, 1);
+
+    // Create a pipe to simulate signalfd (non-seekable fd)
+    const pipe_fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Submit recvFrom + accept + read (like serveLoop does)
+    var recv_ctx: u8 = 1;
+    var accept_ctx: u8 = 2;
+    var read_ctx: u8 = 3;
+    _ = try loop.recvFrom(server_sock, @ptrCast(&recv_ctx));
+    _ = try loop.accept(tcp_sock, @ptrCast(&accept_ctx));
+    _ = try loop.read(pipe_fds[0], @ptrCast(&read_ctx));
+
+    // Send data from a separate thread using plain posix (external client)
+    const payload = "external DNS query";
+    const SenderThread = struct {
+        fn run(addr: std.net.Address, data: []const u8) void {
+            const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+            defer posix.close(sock);
+            _ = posix.sendto(sock, data, 0, &addr.any, addr.getOsSockLen()) catch return;
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, payload });
+
+    // tick() should return with the recvFrom completion (not blocked by pipe/accept)
+    var completions: [max_operations]Completion = undefined;
+    var got_recv = false;
+
+    for (0..5) |_| {
+        const results = try loop.tick(&completions);
+        for (results) |c| {
+            const tag = @as(*u8, @ptrCast(@alignCast(c.context))).*;
+            if (tag == 1) { // recv_ctx
+                switch (c.result) {
+                    .recv => |r| {
+                        if (r.err == null) {
+                            try testing.expectEqualStrings(payload, r.data);
+                            got_recv = true;
+                        }
+                    },
+                    else => {},
+                }
+            } else if (tag == 3) { // read_ctx - pipe read completed unexpectedly
+                switch (c.result) {
+                    .read => |r| {
+                        // If the pipe read failed (ESPIPE, etc), this is a bug
+                        // that would cause the real server to falsely trigger shutdown
+                        if (r.err != null) {
+                            std.debug.print("PIPE READ ERROR: {?}\n", .{r.err});
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+        if (got_recv) break;
+    }
+
+    thread.join();
+    try testing.expect(got_recv);
+}
+
 test "EventLoop cancel pending recvFrom" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
