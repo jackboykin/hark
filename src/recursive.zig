@@ -5,6 +5,9 @@ const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
+const TlsTransport = @import("tls_transport.zig").TlsTransport;
+const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
+const AddressKey = @import("connection_pool.zig").AddressKey;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 
@@ -41,6 +44,8 @@ pub const RecursiveResolver = struct {
     cache: ?*RRsetCache,
     qname_minimisation: bool = true,
     dnssec_enabled: bool = false,
+    tls_transport: ?*TlsTransport = null,
+    encryption_state: ?*EncryptionStateCache = null,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
         return .{ .transport = transport, .tcp_transport = null, .cache = null };
@@ -177,7 +182,36 @@ pub const RecursiveResolver = struct {
                     var wire_buf: [dns.edns_udp_payload]u8 = undefined;
                     const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
-                    // Send and receive
+                    // ── RFC 9539: Opportunistic encrypted query ──
+                    if (self.tls_transport) |tls_t| {
+                        if (self.encryption_state) |enc_state| {
+                            const addr_key = AddressKey.fromAddress(server);
+                            if (enc_state.shouldAttemptEncrypted(addr_key)) {
+                                // Build padded query for TLS (RFC 8467 §4.1: 468 bytes)
+                                const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                                    .rd = false,
+                                    .edns = .{ .do_bit = self.dnssec_enabled, .padding_target = 468 },
+                                });
+                                var padded_buf: [dns.edns_udp_payload]u8 = undefined;
+                                const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
+
+                                var tls_response_buf: [65535]u8 = undefined;
+                                if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf)) |tls_data| {
+                                    enc_state.recordSuccess(addr_key);
+                                    response = try dns.parseMessage(allocator, tls_data);
+                                    got_response = true;
+                                    if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                    break;
+                                } else |err| {
+                                    const was_timeout = (err == error.Timeout);
+                                    enc_state.recordFailure(addr_key, was_timeout);
+                                    // Fall through to Do53
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Do53: UDP with TCP fallback ──
                     const response_data = self.transport.query(wire_query, query_id, server) catch |err| switch (err) {
                         error.Timeout => continue, // try next server
                         else => return err,

@@ -5,6 +5,8 @@ const EventLoop = hark.event_loop.EventLoop;
 const UdpTransport = hark.transport.UdpTransport;
 const TcpTransport = hark.tcp_transport.TcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
+const ConnectionPool = hark.connection_pool.ConnectionPool;
+const EncryptionStateCache = hark.encryption_state.EncryptionStateCache;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RRsetCache = hark.cache.RRsetCache;
@@ -49,6 +51,7 @@ fn printUsage() void {
         \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
         \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
         \\  --dot-host <name>   TLS server hostname for SNI/cert verification
+        \\  --opportunistic     Opportunistic encryption to authoritatives (RFC 9539)
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
         \\  --no-dnssec         Disable DNSSEC validation (default)
@@ -107,6 +110,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var dot_host: ?[]const u8 = null;
     var no_qmin = false;
     var dnssec_enabled = false;
+    var opportunistic = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -122,6 +126,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
                 std.process.exit(1);
             }
             dot_host = args[i];
+        } else if (std.mem.eql(u8, args[i], "--opportunistic")) {
+            opportunistic = true;
         } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
             no_qmin = true;
         } else if (std.mem.eql(u8, args[i], "--dnssec")) {
@@ -174,7 +180,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     defer if (ca_bundle_loaded) ca_bundle.deinit(gpa_alloc);
 
     // TLS transport (only when --dot is set)
-    var tls_t = TlsTransport.init(loop, .{
+    var tls_t = TlsTransport.init(loop, gpa_alloc, .{
         .server_name = dot_host,
     }, ca_bundle);
 
@@ -197,9 +203,16 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
     } else blk: {
+        var enc_state = EncryptionStateCache.init(gpa_alloc);
+        defer enc_state.deinit();
+
         var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
         if (no_qmin) resolver.qname_minimisation = false;
         resolver.dnssec_enabled = dnssec_enabled;
+        if (opportunistic) {
+            resolver.tls_transport = &tls_t;
+            resolver.encryption_state = &enc_state;
+        }
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);

@@ -336,6 +336,9 @@ pub const OptRecord = struct {
     version: u8,
     do_bit: bool,
     options: []const EdnsOption,
+    /// If non-zero, serializeMessage adds an EDNS0 padding option (code 12)
+    /// so the total message reaches this size. Set by buildQueryWithOptions.
+    padding_target: u16 = 0,
 };
 
 // ── Question ───────────────────────────────────────────────────────────
@@ -408,6 +411,9 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
 pub const EdnsConfig = struct {
     udp_payload_size: u16 = edns_udp_payload,
     do_bit: bool = false,
+    /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) to reach
+    /// this total message size. RFC 8467 §4.1 recommends 468 for DoT.
+    padding_target: u16 = 0,
 };
 
 pub const QueryOptions = struct {
@@ -454,6 +460,7 @@ pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8
             .version = 0,
             .do_bit = edns.do_bit,
             .options = &.{},
+            .padding_target = edns.padding_target,
         } else null,
     };
 }
@@ -1010,14 +1017,38 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
             (@as(u32, opt.version) << 16) |
             (@as(u32, @intFromBool(opt.do_bit)) << 15);
         try ser.writeU32(ttl);
-        // RDLENGTH: sum of all options (code(2) + length(2) + data)
+
+        // Compute RDLENGTH: existing options + optional padding
         var rdlength: u16 = 0;
         for (opt.options) |o| rdlength += 4 + @as(u16, @intCast(o.data.len));
+
+        // EDNS0 padding (RFC 7830, option code 12): pad total message to padding_target
+        var padding_len: u16 = 0;
+        if (opt.padding_target > 0) {
+            // OPT fixed overhead: 1(name) + 2(type) + 2(class) + 4(ttl) + 2(rdlength) = 11
+            const msg_size_before_padding = ser.pos + 11 + rdlength + 4; // +4 for padding option header
+            if (opt.padding_target > msg_size_before_padding) {
+                padding_len = @intCast(opt.padding_target - msg_size_before_padding);
+            }
+            rdlength += 4 + padding_len; // code(2) + length(2) + padding data
+        }
+
         try ser.writeU16(rdlength);
         for (opt.options) |o| {
             try ser.writeU16(o.code);
             try ser.writeU16(@intCast(o.data.len));
             try ser.writeSlice(o.data);
+        }
+
+        // Write padding option if needed
+        if (opt.padding_target > 0) {
+            try ser.writeU16(12); // EDNS0 Padding option code (RFC 7830)
+            try ser.writeU16(padding_len);
+            // Write zero-filled padding
+            var i: u16 = 0;
+            while (i < padding_len) : (i += 1) {
+                try ser.writeU8(0);
+            }
         }
     }
 
