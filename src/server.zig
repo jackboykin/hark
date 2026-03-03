@@ -14,6 +14,7 @@ const RecursiveResolver = @import("recursive.zig").RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
+const RttCache = @import("ns_rtt.zig").RttCache;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Certificate = std.crypto.Certificate;
@@ -36,6 +37,7 @@ pub const Server = struct {
     config: ServerConfig,
     allocator: mem.Allocator,
     cache: RRsetCache,
+    rtt_cache: RttCache,
     ca_bundle: Certificate.Bundle,
     shutdown: std.atomic.Value(bool),
 
@@ -44,6 +46,11 @@ pub const Server = struct {
             RRsetCache.initThreadSafe(allocator, cfg.cache_size, cfg.cache_entries)
         else
             RRsetCache.init(allocator, cfg.cache_size, cfg.cache_entries);
+
+        const rtt_cache = if (cfg.workers > 1)
+            RttCache.initThreadSafe(allocator)
+        else
+            RttCache.init(allocator);
 
         var ca_bundle: Certificate.Bundle = .{};
         if (cfg.opportunistic) {
@@ -57,6 +64,7 @@ pub const Server = struct {
             .config = cfg,
             .allocator = allocator,
             .cache = cache,
+            .rtt_cache = rtt_cache,
             .ca_bundle = ca_bundle,
             .shutdown = std.atomic.Value(bool).init(false),
         };
@@ -67,6 +75,7 @@ pub const Server = struct {
             self.ca_bundle.deinit(self.allocator);
         }
         self.cache.deinit();
+        self.rtt_cache.deinit();
     }
 
     pub fn run(self: *Server) !void {
@@ -191,6 +200,7 @@ pub const Server = struct {
             .tls_transport = if (self.config.opportunistic) &tls_transport else null,
             .encryption_state = if (self.config.opportunistic) &enc_state else null,
             .cache = &self.cache,
+            .rtt_cache = &self.rtt_cache,
             .shutdown = &self.shutdown,
         };
 
@@ -210,6 +220,7 @@ const WorkerState = struct {
     tls_transport: ?*TlsTransport,
     encryption_state: ?*EncryptionStateCache,
     cache: *RRsetCache,
+    rtt_cache: *RttCache,
     shutdown: *std.atomic.Value(bool),
 
     fn serveLoop(self: *WorkerState, udp_sock: posix.fd_t, tcp_sock: posix.fd_t, sig_fd: posix.fd_t) void {
@@ -324,7 +335,8 @@ const WorkerState = struct {
         const start_ns = std.time.nanoTimestamp();
         const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-            log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, @tagName(question.qtype), elapsed_ms });
+            var qtype_buf1: [24]u8 = undefined;
+            log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
             var wire_buf: [512]u8 = undefined;
             if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd)) |wire| {
                 sendUdpResponse(sock, wire, client_addr);
@@ -332,7 +344,9 @@ const WorkerState = struct {
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-        log.debug("{s} {s} {s} {d}ms", .{ name_str, @tagName(question.qtype), @tagName(response.header.rcode), elapsed_ms });
+        var qtype_buf2: [24]u8 = undefined;
+        var rcode_buf2: [24]u8 = undefined;
+        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf2), elapsed_ms });
 
         var wire_buf: [65535]u8 = undefined;
         if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.questions, response, query.opt != null, max_payload)) |wire| {
@@ -392,11 +406,14 @@ const WorkerState = struct {
         const start_ns = std.time.nanoTimestamp();
         const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-            log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, @tagName(question.qtype), elapsed_ms });
+            var qtype_buf3: [24]u8 = undefined;
+            log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
             return serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd);
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, @tagName(question.qtype), @tagName(response.header.rcode), elapsed_ms });
+        var qtype_buf4: [24]u8 = undefined;
+        var rcode_buf4: [24]u8 = undefined;
+        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf4), elapsed_ms });
 
         return buildResponseWire(response_wire, query.header.id, query.header.rd, query.questions, response, query.opt != null, 65535);
     }
@@ -409,6 +426,7 @@ const WorkerState = struct {
                 resolver.dnssec_enabled = self.config.dnssec;
                 if (self.tls_transport) |tls_t| resolver.tls_transport = tls_t;
                 if (self.encryption_state) |enc| resolver.encryption_state = enc;
+                resolver.rtt_cache = self.rtt_cache;
                 return try resolver.resolve(alloc, name, qtype);
             },
             .forward => {

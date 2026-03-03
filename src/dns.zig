@@ -4,6 +4,18 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// Safe replacement for `@tagName` on non-exhaustive enums.
+/// Returns the field name for known values, or the numeric string for unknown ones.
+pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
+    const info = @typeInfo(E).@"enum";
+    inline for (info.fields) |field| {
+        if (@intFromEnum(val) == field.value) return field.name;
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{@intFromEnum(val)}) catch "?";
+}
+
 // ── Constants ──────────────────────────────────────────────────────────
 
 pub const max_label_len = 63;
@@ -1062,8 +1074,10 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 
 pub fn printMessage(msg: Message, writer: anytype) !void {
     const hdr = msg.header;
+    var opcode_buf: [24]u8 = undefined;
+    var rcode_buf: [24]u8 = undefined;
     try writer.print(";; ->>HEADER<<- opcode: {s}, status: {s}, id: {d}\n", .{
-        @tagName(hdr.opcode), @tagName(hdr.rcode), hdr.id,
+        safeTagName(OpCode, hdr.opcode, &opcode_buf), safeTagName(RCode, hdr.rcode, &rcode_buf), hdr.id,
     });
     try writer.print(";; flags:", .{});
     if (hdr.qr) try writer.print(" qr", .{});
@@ -1090,7 +1104,9 @@ pub fn printMessage(msg: Message, writer: anytype) !void {
         try writer.print(";; QUESTION SECTION:\n", .{});
         for (msg.questions) |q| {
             try printName(q.name, writer);
-            try writer.print("\t\t{s}\t{s}\n", .{ @tagName(q.qclass), @tagName(q.qtype) });
+            var qclass_buf: [24]u8 = undefined;
+            var qtype_buf: [24]u8 = undefined;
+            try writer.print("\t\t{s}\t{s}\n", .{ safeTagName(RClass, q.qclass, &qclass_buf), safeTagName(RType, q.qtype, &qtype_buf) });
         }
         try writer.print("\n", .{});
     }
@@ -1126,7 +1142,9 @@ fn printName(name: Name, writer: anytype) !void {
 
 fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
     try printName(rr.name, writer);
-    try writer.print("\t{d}\t{s}\t{s}\t", .{ rr.ttl, @tagName(rr.rclass), @tagName(rr.rtype) });
+    var rclass_buf: [24]u8 = undefined;
+    var rtype_buf: [24]u8 = undefined;
+    try writer.print("\t{d}\t{s}\t{s}\t", .{ rr.ttl, safeTagName(RClass, rr.rclass, &rclass_buf), safeTagName(RType, rr.rtype, &rtype_buf) });
     switch (rr.rdata) {
         .a => |addr| try writer.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }),
         .aaaa => |addr| {
@@ -1157,10 +1175,12 @@ fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
             }
         },
         .rrsig => |rrsig| {
+            var tc_buf: [24]u8 = undefined;
+            var algo_buf: [24]u8 = undefined;
             try writer.print("{s} {d} {s} {d} {d} {d} {d} ", .{
-                @tagName(rrsig.type_covered),
+                safeTagName(RType, rrsig.type_covered, &tc_buf),
                 rrsig.labels,
-                @tagName(rrsig.algorithm),
+                safeTagName(DnssecAlgorithm, rrsig.algorithm, &algo_buf),
                 rrsig.original_ttl,
                 rrsig.sig_expiration,
                 rrsig.sig_inception,
@@ -1169,17 +1189,20 @@ fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
             try printName(rrsig.signer_name, writer);
         },
         .dnskey => |dnskey| {
+            var dkalgo_buf: [24]u8 = undefined;
             try writer.print("{d} {d} {s}", .{
                 dnskey.flags,
                 dnskey.protocol,
-                @tagName(dnskey.algorithm),
+                safeTagName(DnssecAlgorithm, dnskey.algorithm, &dkalgo_buf),
             });
         },
         .ds => |ds_data| {
+            var dsalgo_buf: [24]u8 = undefined;
+            var digest_buf: [24]u8 = undefined;
             try writer.print("{d} {s} {s} ", .{
                 ds_data.key_tag,
-                @tagName(ds_data.algorithm),
-                @tagName(ds_data.digest_type),
+                safeTagName(DnssecAlgorithm, ds_data.algorithm, &dsalgo_buf),
+                safeTagName(DigestType, ds_data.digest_type, &digest_buf),
             });
             for (ds_data.digest) |b| {
                 try writer.print("{X:0>2}", .{b});
@@ -1237,7 +1260,8 @@ fn printTypeBitmap(bitmap: []const u8, writer: anytype) !void {
                 if (byte & (@as(u8, 0x80) >> @intCast(bit_idx)) != 0) {
                     const type_num = @as(u16, window) * 256 + @as(u16, @intCast(byte_idx)) * 8 + @as(u16, @intCast(bit_idx));
                     const rtype: RType = @enumFromInt(type_num);
-                    try writer.print(" {s}", .{@tagName(rtype)});
+                    var tbm_buf: [24]u8 = undefined;
+                    try writer.print(" {s}", .{safeTagName(RType, rtype, &tbm_buf)});
                 }
             }
         }
@@ -2410,4 +2434,23 @@ test "typeBitmapContains" {
 
     // Empty bitmap
     try testing.expect(!typeBitmapContains(&.{}, .a));
+}
+
+test "safeTagName handles known and unknown enum values" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("a", safeTagName(RType, .a, &buf));
+    try testing.expectEqualStrings("aaaa", safeTagName(RType, .aaaa, &buf));
+    try testing.expectEqualStrings("no_error", safeTagName(RCode, .no_error, &buf));
+
+    // Unknown values — HTTPS (65), SVCB (64), CAA (257)
+    const https: RType = @enumFromInt(65);
+    try testing.expectEqualStrings("65", safeTagName(RType, https, &buf));
+    const svcb: RType = @enumFromInt(64);
+    try testing.expectEqualStrings("64", safeTagName(RType, svcb, &buf));
+    const caa: RType = @enumFromInt(257);
+    try testing.expectEqualStrings("257", safeTagName(RType, caa, &buf));
+
+    // Unknown RCode
+    const rcode7: RCode = @enumFromInt(7);
+    try testing.expectEqualStrings("7", safeTagName(RCode, rcode7, &buf));
 }

@@ -8,6 +8,7 @@ const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
+const RttCache = @import("ns_rtt.zig").RttCache;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 
@@ -46,6 +47,7 @@ pub const RecursiveResolver = struct {
     dnssec_enabled: bool = false,
     tls_transport: ?*TlsTransport = null,
     encryption_state: ?*EncryptionStateCache = null,
+    rtt_cache: ?*RttCache = null,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
         return .{ .transport = transport, .tcp_transport = null, .cache = null };
@@ -159,14 +161,36 @@ pub const RecursiveResolver = struct {
                     }
                 }
 
-                // Shuffle servers (Fisher-Yates)
-                fisherYatesShuffle(std.net.Address, servers[0..server_count]);
+                // Order servers: RTT-band selection if available, Fisher-Yates otherwise
+                var order_buf: [max_servers_per_level]usize = undefined;
+                const server_order = if (self.rtt_cache) |rc|
+                    rc.selectServers(servers[0..server_count], &order_buf)
+                else blk: {
+                    for (0..server_count) |idx| order_buf[idx] = idx;
+                    fisherYatesShuffle(std.net.Address, servers[0..server_count]);
+                    for (0..server_count) |idx| order_buf[idx] = idx;
+                    break :blk order_buf[0..server_count];
+                };
 
                 // Try each server until one responds
                 var got_response = false;
                 var response: dns.Message = undefined;
 
-                for (servers[0..server_count]) |server| {
+                for (server_order) |server_idx| {
+                    const server = servers[server_idx];
+                    const addr_key = AddressKey.fromAddress(server);
+
+                    // Skip dead servers unless it's our last resort
+                    if (self.rtt_cache) |rc| {
+                        if (rc.isDead(addr_key) and server_order.len > 1) continue;
+                    }
+
+                    // Per-server timeout from RTT cache, or default
+                    const per_server_timeout: u32 = if (self.rtt_cache) |rc|
+                        rc.getTimeout(addr_key)
+                    else
+                        self.transport.config.timeout_ms;
+
                     // Generate random query ID
                     var id_bytes: [2]u8 = undefined;
                     std.crypto.random.bytes(&id_bytes);
@@ -185,7 +209,6 @@ pub const RecursiveResolver = struct {
                     // ── RFC 9539: Opportunistic encrypted query ──
                     if (self.tls_transport) |tls_t| {
                         if (self.encryption_state) |enc_state| {
-                            const addr_key = AddressKey.fromAddress(server);
                             if (enc_state.shouldAttemptEncrypted(addr_key)) {
                                 // Build padded query for TLS (RFC 8467 §4.1: 468 bytes)
                                 const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
@@ -201,6 +224,7 @@ pub const RecursiveResolver = struct {
                                     response = try dns.parseMessage(allocator, tls_data);
                                     got_response = true;
                                     if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                    if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
                                     break;
                                 } else |err| {
                                     const was_timeout = (err == error.Timeout);
@@ -212,10 +236,18 @@ pub const RecursiveResolver = struct {
                     }
 
                     // ── Do53: UDP with TCP fallback ──
-                    const response_data = self.transport.query(wire_query, query_id, server) catch |err| switch (err) {
-                        error.Timeout => continue, // try next server
+                    const query_start = std.time.microTimestamp();
+                    const response_data = self.transport.queryWithTimeout(wire_query, query_id, server, per_server_timeout) catch |err| switch (err) {
+                        error.Timeout => {
+                            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+                            continue; // try next server
+                        },
                         else => return err,
                     };
+                    const elapsed_us = std.time.microTimestamp() - query_start;
+
+                    // Record RTT on success
+                    if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
 
                     // Parse response
                     response = try dns.parseMessage(allocator, response_data);

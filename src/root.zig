@@ -13,6 +13,7 @@ pub const encryption_state = @import("encryption_state.zig");
 pub const toml = @import("toml.zig");
 pub const config = @import("config.zig");
 pub const server = @import("server.zig");
+pub const ns_rtt = @import("ns_rtt.zig");
 
 test {
     _ = dns;
@@ -30,4 +31,5 @@ test {
     _ = toml;
     _ = config;
     _ = server;
+    _ = ns_rtt;
 }

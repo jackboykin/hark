@@ -9,6 +9,7 @@ const ConnectionPool = hark.connection_pool.ConnectionPool;
 const EncryptionStateCache = hark.encryption_state.EncryptionStateCache;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
+const RttCache = hark.ns_rtt.RttCache;
 const RRsetCache = hark.cache.RRsetCache;
 const Certificate = std.crypto.Certificate;
 const Server = hark.server.Server;
@@ -278,9 +279,13 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         var enc_state = EncryptionStateCache.init(gpa_alloc);
         defer enc_state.deinit();
 
+        var rtt_cache = RttCache.init(gpa_alloc);
+        defer rtt_cache.deinit();
+
         var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
         if (no_qmin) resolver.qname_minimisation = false;
         resolver.dnssec_enabled = dnssec_enabled;
+        resolver.rtt_cache = &rtt_cache;
         if (opportunistic) {
             resolver.tls_transport = &tls_t;
             resolver.encryption_state = &enc_state;

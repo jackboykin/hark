@@ -137,9 +137,16 @@ that inform hark's design:
 - `signalfd`-based graceful shutdown
 - RFC 1035/6891 compliant response truncation with EDNS support
 
+### M11: Crash Fix + RTT-Based Nameserver Selection ✅
+- `safeTagName` helper for non-exhaustive enums (HTTPS/65, SVCB/64, CAA/257 no longer panic)
+- `RttCache` (`ns_rtt.zig`): per-IP RTT tracking with RFC 6298 EWMA, Unbound-style RTT-band selection
+- 400ms initial timeout (was 5s fixed), exponential backoff, dead server marking after 4 consecutive timeouts
+- `UdpTransport.queryWithTimeout` for per-server timeouts
+- Shared thread-safe `RttCache` in server mode; per-invocation cache in CLI `query`
+
 ## Milestone Roadmap
 
-### M11: DNSSEC Positive-Answer Validation
+### M12: DNSSEC Positive-Answer Validation
 **RFCs**: 4035 §5, 6840 (clarifications)
 **Goal**: Validate RRSIG chains on positive answers (A, AAAA, MX, etc.), not just negative proofs.
 

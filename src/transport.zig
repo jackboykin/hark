@@ -47,6 +47,11 @@ pub const UdpTransport = struct {
     }
 
     pub fn query(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+        return self.queryWithTimeout(wire_query, query_id, upstream, self.config.timeout_ms);
+    }
+
+    /// Like `query`, but with a caller-specified overall timeout in milliseconds.
+    pub fn queryWithTimeout(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address, timeout_ms: u32) ![]const u8 {
         // Per-query socket for source-port randomization (RFC 5452)
         const sock = try openSocket();
         errdefer posix.close(sock);
@@ -61,11 +66,14 @@ pub const UdpTransport = struct {
         // Start recv
         var recv_op = try self.loop.recvFrom(sock, @ptrCast(&recv_ctx));
 
+        // Retransmit interval: 1/3 of overall timeout, at least 50ms
+        const retransmit_ms = @max(50, timeout_ms / 3);
+
         // Start retransmit timer
-        var retransmit_op = try self.loop.setTimeout(self.config.retransmit_ms, @ptrCast(&retransmit_ctx));
+        var retransmit_op = try self.loop.setTimeout(retransmit_ms, @ptrCast(&retransmit_ctx));
 
         // Start overall timeout
-        const overall_op = try self.loop.setTimeout(self.config.timeout_ms, @ptrCast(&overall_ctx));
+        const overall_op = try self.loop.setTimeout(timeout_ms, @ptrCast(&overall_ctx));
 
         var retries_left: u32 = self.config.max_retries;
 
