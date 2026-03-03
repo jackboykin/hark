@@ -294,7 +294,7 @@ const WorkerState = struct {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
                 var wire_buf: [512]u8 = undefined;
-                if (serializeErrorResponse(&wire_buf, id, .format_error, false)) |wire| {
+                if (serializeErrorResponse(&wire_buf, id, .format_error, false, &.{})) |wire| {
                     sendUdpResponse(sock, wire, client_addr);
                 }
             }
@@ -303,7 +303,7 @@ const WorkerState = struct {
 
         if (query.header.opcode != .query) {
             var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .not_implemented, query.header.rd)) |wire| {
+            if (serializeErrorResponse(&wire_buf, query.header.id, .not_implemented, query.header.rd, query.questions)) |wire| {
                 sendUdpResponse(sock, wire, client_addr);
             }
             return;
@@ -311,7 +311,7 @@ const WorkerState = struct {
 
         if (query.questions.len != 1) {
             var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .format_error, query.header.rd)) |wire| {
+            if (serializeErrorResponse(&wire_buf, query.header.id, .format_error, query.header.rd, query.questions)) |wire| {
                 sendUdpResponse(sock, wire, client_addr);
             }
             return;
@@ -319,7 +319,7 @@ const WorkerState = struct {
 
         if (query.questions[0].qclass != .in) {
             var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .refused, query.header.rd)) |wire| {
+            if (serializeErrorResponse(&wire_buf, query.header.id, .refused, query.header.rd, query.questions)) |wire| {
                 sendUdpResponse(sock, wire, client_addr);
             }
             return;
@@ -338,7 +338,7 @@ const WorkerState = struct {
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
             var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd)) |wire| {
+            if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd, query.questions)) |wire| {
                 sendUdpResponse(sock, wire, client_addr);
             }
             return;
@@ -399,19 +399,19 @@ const WorkerState = struct {
         const query = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                return serializeErrorResponse(response_wire, id, .format_error, false);
+                return serializeErrorResponse(response_wire, id, .format_error, false, &.{});
             }
             return null;
         };
 
         if (query.header.opcode != .query) {
-            return serializeErrorResponse(response_wire, query.header.id, .not_implemented, query.header.rd);
+            return serializeErrorResponse(response_wire, query.header.id, .not_implemented, query.header.rd, query.questions);
         }
         if (query.questions.len != 1) {
-            return serializeErrorResponse(response_wire, query.header.id, .format_error, query.header.rd);
+            return serializeErrorResponse(response_wire, query.header.id, .format_error, query.header.rd, query.questions);
         }
         if (query.questions[0].qclass != .in) {
-            return serializeErrorResponse(response_wire, query.header.id, .refused, query.header.rd);
+            return serializeErrorResponse(response_wire, query.header.id, .refused, query.header.rd, query.questions);
         }
 
         const question = query.questions[0];
@@ -424,7 +424,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
-            return serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd);
+            return serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions);
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
         var qtype_buf4: [24]u8 = undefined;
@@ -534,7 +534,7 @@ fn buildResponseWire(
     return null;
 }
 
-fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: bool) ?[]const u8 {
+fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question) ?[]const u8 {
     const msg = dns.Message{
         .header = .{
             .id = query_id,
@@ -546,12 +546,12 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
             .ra = true,
             .z = 0, .ad = false, .cd = false,
             .rcode = rcode,
-            .qd_count = 0,
+            .qd_count = @intCast(questions.len),
             .an_count = 0,
             .ns_count = 0,
             .ar_count = 0,
         },
-        .questions = &.{},
+        .questions = questions,
         .answers = &.{},
         .authorities = &.{},
         .additionals = &.{},
@@ -770,18 +770,36 @@ test "buildResponseWire with EDNS0" {
 }
 
 test "serializeErrorResponse produces valid DNS message" {
-    var buf: [512]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, true).?;
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    const a = arena.allocator();
 
-    const parsed = try dns.parseMessage(arena.allocator(), wire);
+    const name = try dns.parseDottedName(a, "example.com");
+    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
+
+    var buf: [512]u8 = undefined;
+    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, true, questions).?;
+
+    const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
     try testing.expectEqual(dns.RCode.refused, parsed.header.rcode);
     try testing.expectEqual(true, parsed.header.rd);
     try testing.expectEqual(true, parsed.header.ra);
     try testing.expectEqual(true, parsed.header.qr);
+    try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
+}
+
+test "serializeErrorResponse with no question (parse failure)" {
+    var buf: [512]u8 = undefined;
+    const wire = serializeErrorResponse(&buf, 0x1234, .format_error, false, &.{}).?;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try dns.parseMessage(arena.allocator(), wire);
+    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
+    try testing.expectEqual(dns.RCode.format_error, parsed.header.rcode);
+    try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
 }
 
 test "createUdpSocket binds to ephemeral port" {

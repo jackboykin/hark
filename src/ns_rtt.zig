@@ -198,7 +198,7 @@ pub const RttCache = struct {
         return order_buf[0 .. live_count + dead_count];
     }
 
-    const max_order = 13; // max_servers_per_level
+    const max_order = 26; // max_servers_per_level (13 IPv4 + 13 IPv6)
 };
 
 fn computeTimeout(state: RttState) u32 {

@@ -105,7 +105,7 @@ fn printUsage() void {
         \\
         \\Query options:
         \\  --forward           Use forwarding mode instead of recursive resolution
-        \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
+        \\  --upstream <addr>   Upstream server (IPv4, IPv6, or [IPv6]:port; default: 8.8.8.8)
         \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
         \\  --dot-host <name>   TLS server hostname for SNI/cert verification
         \\  --dot-strict        Require hostname verification (RFC 7858 strict mode)
@@ -166,7 +166,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     const name = args[0];
     var qtype: dns.RType = .a;
-    var upstream_ip: [4]u8 = .{ 8, 8, 8, 8 };
+    var upstream_addr = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
     var forward_mode = false;
     var dot_mode = false;
     var dot_host: ?[]const u8 = null;
@@ -204,11 +204,11 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[i], "--upstream")) {
             i += 1;
             if (i >= args.len) {
-                log.err("--upstream requires an IP address", .{});
+                log.err("--upstream requires an address", .{});
                 std.process.exit(1);
             }
-            upstream_ip = parseIpv4(args[i]) orelse {
-                log.err("invalid IPv4 address: {s}", .{args[i]});
+            upstream_addr = hark.config.parseAddress(args[i], 53) orelse {
+                log.err("invalid address: {s}", .{args[i]});
                 std.process.exit(1);
             };
         } else {
@@ -270,8 +270,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         if (dot_mode) {
             resolver.tls_transport = &tls_t;
         }
-        const upstream = std.net.Address.initIp4(upstream_ip, 53);
-        break :blk resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
+        break :blk resolver.resolve(arena.allocator(), name, qtype, upstream_addr) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -333,19 +332,6 @@ fn parseRType(s: []const u8) ?dns.RType {
     if (std.mem.eql(u8, lower, "nsec3")) return .nsec3;
     if (std.mem.eql(u8, lower, "nsec3param")) return .nsec3param;
     return null;
-}
-
-fn parseIpv4(s: []const u8) ?[4]u8 {
-    var result: [4]u8 = undefined;
-    var octet_idx: usize = 0;
-    var iter = std.mem.splitScalar(u8, s, '.');
-    while (iter.next()) |part| {
-        if (octet_idx >= 4) return null;
-        result[octet_idx] = std.fmt.parseInt(u8, part, 10) catch return null;
-        octet_idx += 1;
-    }
-    if (octet_idx != 4) return null;
-    return result;
 }
 
 fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {

@@ -146,7 +146,7 @@ fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port
     return addrs;
 }
 
-fn parseAddress(s: []const u8, default_port: u16) ?std.net.Address {
+pub fn parseAddress(s: []const u8, default_port: u16) ?std.net.Address {
     // IPv6 with brackets: [::1]:53 or [::1]
     if (s.len > 0 and s[0] == '[') {
         const close = mem.indexOfScalar(u8, s, ']') orelse return null;

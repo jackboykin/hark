@@ -14,10 +14,11 @@ const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 
 // ── Root Hints ─────────────────────────────────────────────────────────
-// IPv4 addresses for a.root-servers.net through m.root-servers.net.
+// IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
 // Source: https://www.internic.net/domain/named.root
 
-pub const root_hints: [13]std.net.Address = .{
+pub const root_hints: [26]std.net.Address = .{
+    // IPv4
     std.net.Address.initIp4(.{ 198, 41, 0, 4 }, 53), // a
     std.net.Address.initIp4(.{ 170, 247, 170, 2 }, 53), // b
     std.net.Address.initIp4(.{ 192, 33, 4, 12 }, 53), // c
@@ -31,10 +32,24 @@ pub const root_hints: [13]std.net.Address = .{
     std.net.Address.initIp4(.{ 193, 0, 14, 129 }, 53), // k
     std.net.Address.initIp4(.{ 199, 7, 83, 42 }, 53), // l
     std.net.Address.initIp4(.{ 202, 12, 27, 33 }, 53), // m
+    // IPv6
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
+    std.net.Address.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d }, 53, 0, 0), // d
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e }, 53, 0, 0), // e
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f }, 53, 0, 0), // f
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d, 0x0d }, 53, 0, 0), // g
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // h
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x07, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // i
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0x0c, 0x27, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // j
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x07, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 }, 53, 0, 0), // k
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 }, 53, 0, 0), // l
+    std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
 };
 
 const max_referrals = 10;
-const max_servers_per_level = 13;
+const max_servers_per_level = 26;
 const max_cname_chain = 8;
 const max_minimise_count = 10;
 
@@ -515,15 +530,27 @@ pub const RecursiveResolver = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 continue;
             };
-            const ns_response = self.resolveImpl(allocator, ns_dotted, .a, depth + 1) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                continue;
-            };
-            for (ns_response.answers) |rr| {
-                if (rr.rtype == .a and count < max_servers_per_level) {
-                    addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
-                    count += 1;
+            // Resolve A records
+            if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |ns_response| {
+                for (ns_response.answers) |rr| {
+                    if (rr.rtype == .a and count < max_servers_per_level) {
+                        addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
+                        count += 1;
+                    }
                 }
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+            }
+            // Resolve AAAA records
+            if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |ns6_response| {
+                for (ns6_response.answers) |rr| {
+                    if (rr.rtype == .aaaa and count < max_servers_per_level) {
+                        addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                        count += 1;
+                    }
+                }
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
             }
             if (count > 0) break; // one working NS is enough
         }
@@ -557,11 +584,24 @@ pub const RecursiveResolver = struct {
                                 count += 1;
                             }
                         }
-                        if (count > 0) break;
                     },
                     .negative => {},
                 }
             }
+            if (cache.lookup(allocator, ns_dotted, .aaaa, .in)) |result| {
+                switch (result) {
+                    .hit => |h| {
+                        for (h.records) |rr| {
+                            if (rr.rtype == .aaaa and count < max_servers_per_level) {
+                                addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                                count += 1;
+                            }
+                        }
+                    },
+                    .negative => {},
+                }
+            }
+            if (count > 0) break;
         }
 
         if (count == 0) return null;
@@ -613,7 +653,7 @@ pub const RecursiveResolver = struct {
             if (cache.lookup(allocator, zone_str, .ns, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
-                        // Try to find cached A records for these NS names
+                        // Try to find cached A and AAAA records for these NS names
                         var addrs: [max_servers_per_level]std.net.Address = undefined;
                         var addr_count: usize = 0;
 
@@ -626,6 +666,19 @@ pub const RecursiveResolver = struct {
                                         for (a_hit.records) |a_rr| {
                                             if (a_rr.rtype == .a and addr_count < max_servers_per_level) {
                                                 addrs[addr_count] = std.net.Address.initIp4(a_rr.rdata.a, 53);
+                                                addr_count += 1;
+                                            }
+                                        }
+                                    },
+                                    .negative => {},
+                                }
+                            }
+                            if (cache.lookup(allocator, ns_dotted, .aaaa, .in)) |aaaa_result| {
+                                switch (aaaa_result) {
+                                    .hit => |aaaa_hit| {
+                                        for (aaaa_hit.records) |aaaa_rr| {
+                                            if (aaaa_rr.rtype == .aaaa and addr_count < max_servers_per_level) {
+                                                addrs[addr_count] = std.net.Address.initIp6(aaaa_rr.rdata.aaaa, 53, 0, 0);
                                                 addr_count += 1;
                                             }
                                         }
@@ -823,10 +876,9 @@ fn fisherYatesShuffle(comptime T: type, items: []T) void {
 // Tests
 // ════════════════════════════════════════════════════════════════════════
 
-test "root_hints has 13 entries, all port 53" {
-    try testing.expectEqual(@as(usize, 13), root_hints.len);
+test "root_hints has 26 entries, all port 53" {
+    try testing.expectEqual(@as(usize, 26), root_hints.len);
     for (root_hints) |addr| {
-        // All should be IPv4, port 53
         try testing.expectEqual(@as(u16, 53), addr.getPort());
     }
 }
