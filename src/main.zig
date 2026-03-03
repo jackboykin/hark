@@ -46,8 +46,10 @@ fn printUsage() void {
         \\  --forward           Use forwarding mode instead of recursive resolution
         \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
+        \\  --dnssec            Enable DNSSEC validation
+        \\  --no-dnssec         Disable DNSSEC validation (default)
         \\
-        \\Defaults: type=A, mode=recursive, QNAME minimization enabled
+        \\Defaults: type=A, mode=recursive, QNAME minimization enabled, DNSSEC off
         \\
     , .{});
 }
@@ -98,6 +100,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var upstream_ip: [4]u8 = .{ 8, 8, 8, 8 };
     var forward_mode = false;
     var no_qmin = false;
+    var dnssec_enabled = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -105,6 +108,10 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             forward_mode = true;
         } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
             no_qmin = true;
+        } else if (std.mem.eql(u8, args[i], "--dnssec")) {
+            dnssec_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-dnssec")) {
+            dnssec_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--upstream")) {
             i += 1;
             if (i >= args.len) {
@@ -156,6 +163,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     } else blk: {
         var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
         if (no_qmin) resolver.qname_minimisation = false;
+        resolver.dnssec_enabled = dnssec_enabled;
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
@@ -192,6 +200,12 @@ fn parseRType(s: []const u8) ?dns.RType {
     if (std.mem.eql(u8, lower, "ptr")) return .ptr;
     if (std.mem.eql(u8, lower, "mx")) return .mx;
     if (std.mem.eql(u8, lower, "txt")) return .txt;
+    if (std.mem.eql(u8, lower, "ds")) return .ds;
+    if (std.mem.eql(u8, lower, "rrsig")) return .rrsig;
+    if (std.mem.eql(u8, lower, "nsec")) return .nsec;
+    if (std.mem.eql(u8, lower, "dnskey")) return .dnskey;
+    if (std.mem.eql(u8, lower, "nsec3")) return .nsec3;
+    if (std.mem.eql(u8, lower, "nsec3param")) return .nsec3param;
     return null;
 }
 

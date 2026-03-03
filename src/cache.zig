@@ -199,6 +199,76 @@ fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
             }
             break :blk .{ .txt = .{ .strings = strings } };
         },
+        .rrsig => |rrsig| blk: {
+            const signer = try cloneName(alloc, rrsig.signer_name);
+            errdefer dns.freeName(alloc, signer);
+            const sig = try alloc.dupe(u8, rrsig.signature);
+            break :blk .{ .rrsig = .{
+                .type_covered = rrsig.type_covered,
+                .algorithm = rrsig.algorithm,
+                .labels = rrsig.labels,
+                .original_ttl = rrsig.original_ttl,
+                .sig_expiration = rrsig.sig_expiration,
+                .sig_inception = rrsig.sig_inception,
+                .key_tag = rrsig.key_tag,
+                .signer_name = signer,
+                .signature = sig,
+            } };
+        },
+        .dnskey => |dnskey| .{ .dnskey = .{
+            .flags = dnskey.flags,
+            .protocol = dnskey.protocol,
+            .algorithm = dnskey.algorithm,
+            .public_key = try alloc.dupe(u8, dnskey.public_key),
+        } },
+        .ds => |ds_data| .{ .ds = .{
+            .key_tag = ds_data.key_tag,
+            .algorithm = ds_data.algorithm,
+            .digest_type = ds_data.digest_type,
+            .digest = try alloc.dupe(u8, ds_data.digest),
+        } },
+        .nsec => |nsec_data| blk: {
+            const next_name = try cloneName(alloc, nsec_data.next_domain_name);
+            errdefer dns.freeName(alloc, next_name);
+            const bitmaps = if (nsec_data.type_bit_maps.len > 0)
+                try alloc.dupe(u8, nsec_data.type_bit_maps)
+            else
+                @as([]const u8, &.{});
+            break :blk .{ .nsec = .{
+                .next_domain_name = next_name,
+                .type_bit_maps = bitmaps,
+            } };
+        },
+        .nsec3 => |nsec3| blk: {
+            const salt = if (nsec3.salt.len > 0)
+                try alloc.dupe(u8, nsec3.salt)
+            else
+                @as([]const u8, &.{});
+            errdefer if (salt.len > 0) alloc.free(salt);
+            const next_hash = try alloc.dupe(u8, nsec3.next_hashed_owner);
+            errdefer alloc.free(next_hash);
+            const bitmaps = if (nsec3.type_bit_maps.len > 0)
+                try alloc.dupe(u8, nsec3.type_bit_maps)
+            else
+                @as([]const u8, &.{});
+            break :blk .{ .nsec3 = .{
+                .hash_algorithm = nsec3.hash_algorithm,
+                .flags = nsec3.flags,
+                .iterations = nsec3.iterations,
+                .salt = salt,
+                .next_hashed_owner = next_hash,
+                .type_bit_maps = bitmaps,
+            } };
+        },
+        .nsec3param => |nsec3p| .{ .nsec3param = .{
+            .hash_algorithm = nsec3p.hash_algorithm,
+            .flags = nsec3p.flags,
+            .iterations = nsec3p.iterations,
+            .salt = if (nsec3p.salt.len > 0)
+                try alloc.dupe(u8, nsec3p.salt)
+            else
+                @as([]const u8, &.{}),
+        } },
         .unknown => |data| .{ .unknown = try alloc.dupe(u8, data) },
     };
 }

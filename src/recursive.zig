@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
+const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const cache_mod = @import("cache.zig");
@@ -39,6 +40,7 @@ pub const RecursiveResolver = struct {
     tcp_transport: ?*TcpTransport,
     cache: ?*RRsetCache,
     qname_minimisation: bool = true,
+    dnssec_enabled: bool = false,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
         return .{ .transport = transport, .tcp_transport = null, .cache = null };
@@ -62,6 +64,9 @@ pub const RecursiveResolver = struct {
         var current_name: []const u8 = name;
         var cname_count: usize = 0;
         var total_probes: usize = 0;
+
+        // DNSSEC chain of trust state — starts as secure at root
+        var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
 
         cname_loop: while (true) {
             // CACHE CHECK 1: Do we already have a cached answer?
@@ -163,7 +168,10 @@ pub const RecursiveResolver = struct {
                     const query_id = mem.readInt(u16, &id_bytes, .big);
 
                     // Build iterative query (rd=false, EDNS0)
-                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{ .rd = false, .edns = .{} });
+                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                        .rd = false,
+                        .edns = .{ .do_bit = self.dnssec_enabled },
+                    });
 
                     // Serialize
                     var wire_buf: [dns.edns_udp_payload]u8 = undefined;
@@ -204,6 +212,16 @@ pub const RecursiveResolver = struct {
                 if (!is_final) {
                     // Check for referral first — applies to probes too
                     if (extractReferral(response, target_name, parent_zone)) |referral| {
+                        const zone_cut = switch (referral) {
+                            .referral => |ref| ref.zone_cut,
+                            .no_glue => |ng| ng.zone_cut,
+                        };
+
+                        // DNSSEC: classify delegation security at referral
+                        if (security_state == .secure) {
+                            security_state = dnssec.classifyDelegation(response.authorities, zone_cut);
+                        }
+
                         switch (referral) {
                             .referral => |ref| {
                                 for (seen_zones[0..seen_zone_count]) |sz| {
@@ -305,6 +323,18 @@ pub const RecursiveResolver = struct {
                     }
                     return response;
                 };
+
+                // DNSSEC: classify delegation security at referral
+                {
+                    const zone_cut = switch (referral) {
+                        .referral => |ref| ref.zone_cut,
+                        .no_glue => |ng| ng.zone_cut,
+                    };
+                    if (security_state == .secure) {
+                        security_state = dnssec.classifyDelegation(response.authorities, zone_cut);
+                    }
+                }
+
                 switch (referral) {
                     .referral => |ref| {
                         // Loop detection: reject if we've already visited this zone

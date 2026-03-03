@@ -41,6 +41,12 @@ pub const RType = enum(u16) {
     txt = 16,
     aaaa = 28,
     opt = 41,
+    ds = 43,
+    rrsig = 46,
+    nsec = 47,
+    dnskey = 48,
+    nsec3 = 50,
+    nsec3param = 51,
     _,
 };
 
@@ -195,6 +201,86 @@ pub const TxtData = struct {
     strings: []const []const u8,
 };
 
+// ── DNSSEC types (RFC 4034, 5155) ──────────────────────────────────
+
+pub const DnssecAlgorithm = enum(u8) {
+    rsamd5 = 1,
+    dh = 2,
+    dsasha1 = 3,
+    rsasha1 = 5,
+    dsasha1_nsec3 = 6,
+    rsasha1_nsec3 = 7,
+    rsasha256 = 8,
+    rsasha512 = 10,
+    ecdsap256sha256 = 13,
+    ecdsap384sha384 = 14,
+    ed25519 = 15,
+    ed448 = 16,
+    _,
+};
+
+pub const DigestType = enum(u8) {
+    sha1 = 1,
+    sha256 = 2,
+    sha384 = 4,
+    _,
+};
+
+pub const RrsigData = struct {
+    type_covered: RType,
+    algorithm: DnssecAlgorithm,
+    labels: u8,
+    original_ttl: u32,
+    sig_expiration: u32,
+    sig_inception: u32,
+    key_tag: u16,
+    signer_name: Name,
+    signature: []const u8,
+};
+
+pub const DnskeyData = struct {
+    flags: u16,
+    protocol: u8,
+    algorithm: DnssecAlgorithm,
+    public_key: []const u8,
+
+    pub fn isZoneKey(self: DnskeyData) bool {
+        return (self.flags & 0x100) != 0; // bit 7 (ZONE flag)
+    }
+
+    pub fn isSecureEntryPoint(self: DnskeyData) bool {
+        return (self.flags & 0x0001) != 0; // bit 15 (SEP flag)
+    }
+};
+
+pub const DsData = struct {
+    key_tag: u16,
+    algorithm: DnssecAlgorithm,
+    digest_type: DigestType,
+    digest: []const u8,
+};
+
+pub const NsecData = struct {
+    next_domain_name: Name,
+    type_bit_maps: []const u8,
+};
+
+pub const Nsec3Data = struct {
+    hash_algorithm: u8,
+    flags: u8,
+    iterations: u16,
+    salt: []const u8,
+    next_hashed_owner: []const u8,
+    type_bit_maps: []const u8,
+};
+
+pub const Nsec3ParamData = struct {
+    hash_algorithm: u8,
+    flags: u8,
+    iterations: u16,
+    salt: []const u8,
+};
+
 pub const RData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
@@ -204,8 +290,38 @@ pub const RData = union(enum) {
     mx: MxData,
     soa: SoaData,
     txt: TxtData,
+    rrsig: RrsigData,
+    dnskey: DnskeyData,
+    ds: DsData,
+    nsec: NsecData,
+    nsec3: Nsec3Data,
+    nsec3param: Nsec3ParamData,
     unknown: []const u8,
 };
+
+/// Check if an RType is present in a type bitmap (RFC 4034 §4.1.2).
+/// Used by NSEC and NSEC3 records.
+pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
+    const type_num = @intFromEnum(rtype);
+    const window = type_num >> 8; // high byte = window number
+    const bit_offset: u8 = @intCast(type_num & 0xFF); // low byte = offset within window
+    const byte_in_window = bit_offset >> 3;
+    const bit_in_byte: u3 = @intCast(bit_offset & 0x07);
+
+    var pos: usize = 0;
+    while (pos + 2 <= bitmap.len) {
+        const win = bitmap[pos];
+        const win_len = bitmap[pos + 1];
+        pos += 2;
+        if (pos + win_len > bitmap.len) return false;
+        if (win == window) {
+            if (byte_in_window >= win_len) return false;
+            return (bitmap[pos + byte_in_window] & (@as(u8, 0x80) >> bit_in_byte)) != 0;
+        }
+        pos += win_len;
+    }
+    return false;
+}
 
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
 
@@ -511,6 +627,136 @@ pub const Parser = struct {
                     .strings = strings.toOwnedSlice(allocator) catch return error.OutOfMemory,
                 } };
             },
+            .rrsig => {
+                if (rdlength < 18) return error.InvalidRDataLength;
+                const type_covered: RType = @enumFromInt(try self.readU16());
+                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
+                const label_count = try self.readU8();
+                const original_ttl = try self.readU32();
+                const sig_expiration = try self.readU32();
+                const sig_inception = try self.readU32();
+                const key_tag = try self.readU16();
+                const name_start = self.pos;
+                const signer_name = try self.parseName(allocator);
+                const name_len = self.pos - name_start;
+                const sig_len = rdlength - 18 - name_len;
+                const sig_data = try self.readSlice(sig_len);
+                const signature = allocator.dupe(u8, sig_data) catch return error.OutOfMemory;
+                return .{ .rrsig = .{
+                    .type_covered = type_covered,
+                    .algorithm = algorithm,
+                    .labels = label_count,
+                    .original_ttl = original_ttl,
+                    .sig_expiration = sig_expiration,
+                    .sig_inception = sig_inception,
+                    .key_tag = key_tag,
+                    .signer_name = signer_name,
+                    .signature = signature,
+                } };
+            },
+            .dnskey => {
+                if (rdlength < 4) return error.InvalidRDataLength;
+                const flags = try self.readU16();
+                const protocol = try self.readU8();
+                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
+                const key_data = try self.readSlice(rdlength - 4);
+                const public_key = allocator.dupe(u8, key_data) catch return error.OutOfMemory;
+                return .{ .dnskey = .{
+                    .flags = flags,
+                    .protocol = protocol,
+                    .algorithm = algorithm,
+                    .public_key = public_key,
+                } };
+            },
+            .ds => {
+                if (rdlength < 4) return error.InvalidRDataLength;
+                const key_tag = try self.readU16();
+                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
+                const digest_type: DigestType = @enumFromInt(try self.readU8());
+                const digest_data = try self.readSlice(rdlength - 4);
+                const digest = allocator.dupe(u8, digest_data) catch return error.OutOfMemory;
+                return .{ .ds = .{
+                    .key_tag = key_tag,
+                    .algorithm = algorithm,
+                    .digest_type = digest_type,
+                    .digest = digest,
+                } };
+            },
+            .nsec => {
+                if (rdlength < 1) return error.InvalidRDataLength;
+                const name_start = self.pos;
+                const next_domain_name = try self.parseName(allocator);
+                const name_len = self.pos - name_start;
+                const bitmap_len = rdlength - name_len;
+                if (bitmap_len > 0) {
+                    const bitmap_data = try self.readSlice(bitmap_len);
+                    const type_bit_maps = allocator.dupe(u8, bitmap_data) catch return error.OutOfMemory;
+                    return .{ .nsec = .{
+                        .next_domain_name = next_domain_name,
+                        .type_bit_maps = type_bit_maps,
+                    } };
+                }
+                return .{ .nsec = .{
+                    .next_domain_name = next_domain_name,
+                    .type_bit_maps = &.{},
+                } };
+            },
+            .nsec3 => {
+                if (rdlength < 5) return error.InvalidRDataLength;
+                const hash_algorithm = try self.readU8();
+                const flags = try self.readU8();
+                const iterations = try self.readU16();
+                const salt_len: usize = try self.readU8();
+                const salt_data = try self.readSlice(salt_len);
+                const salt = if (salt_len > 0)
+                    allocator.dupe(u8, salt_data) catch return error.OutOfMemory
+                else
+                    @as([]const u8, &.{});
+                const hash_len: usize = try self.readU8();
+                const hash_data = try self.readSlice(hash_len);
+                const next_hashed_owner = allocator.dupe(u8, hash_data) catch return error.OutOfMemory;
+                // Remaining bytes are type bit maps
+                const consumed = 5 + salt_len + 1 + hash_len;
+                const bitmap_len = if (rdlength > consumed) rdlength - consumed else 0;
+                if (bitmap_len > 0) {
+                    const bitmap_data = try self.readSlice(bitmap_len);
+                    const type_bit_maps = allocator.dupe(u8, bitmap_data) catch return error.OutOfMemory;
+                    return .{ .nsec3 = .{
+                        .hash_algorithm = hash_algorithm,
+                        .flags = flags,
+                        .iterations = iterations,
+                        .salt = salt,
+                        .next_hashed_owner = next_hashed_owner,
+                        .type_bit_maps = type_bit_maps,
+                    } };
+                }
+                return .{ .nsec3 = .{
+                    .hash_algorithm = hash_algorithm,
+                    .flags = flags,
+                    .iterations = iterations,
+                    .salt = salt,
+                    .next_hashed_owner = next_hashed_owner,
+                    .type_bit_maps = &.{},
+                } };
+            },
+            .nsec3param => {
+                if (rdlength < 5) return error.InvalidRDataLength;
+                const hash_algorithm = try self.readU8();
+                const flags = try self.readU8();
+                const iterations = try self.readU16();
+                const salt_len: usize = try self.readU8();
+                const salt_data = try self.readSlice(salt_len);
+                const salt = if (salt_len > 0)
+                    allocator.dupe(u8, salt_data) catch return error.OutOfMemory
+                else
+                    @as([]const u8, &.{});
+                return .{ .nsec3param = .{
+                    .hash_algorithm = hash_algorithm,
+                    .flags = flags,
+                    .iterations = iterations,
+                    .salt = salt,
+                } };
+            },
             .opt, _ => {
                 const data = try self.readSlice(rdlength);
                 const duped = allocator.dupe(u8, data) catch return error.OutOfMemory;
@@ -666,7 +912,7 @@ pub const Serializer = struct {
         mem.writeInt(u16, self.buf[rdlength_pos..][0..2], @intCast(rdata_len), .big);
     }
 
-    fn writeRData(self: *Serializer, rdata: RData) Error!void {
+    pub fn writeRData(self: *Serializer, rdata: RData) Error!void {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
@@ -691,6 +937,50 @@ pub const Serializer = struct {
                     try self.writeU8(@intCast(s.len));
                     try self.writeSlice(s);
                 }
+            },
+            .rrsig => |rrsig| {
+                try self.writeU16(@intFromEnum(rrsig.type_covered));
+                try self.writeU8(@intFromEnum(rrsig.algorithm));
+                try self.writeU8(rrsig.labels);
+                try self.writeU32(rrsig.original_ttl);
+                try self.writeU32(rrsig.sig_expiration);
+                try self.writeU32(rrsig.sig_inception);
+                try self.writeU16(rrsig.key_tag);
+                try self.writeName(rrsig.signer_name);
+                try self.writeSlice(rrsig.signature);
+            },
+            .dnskey => |dnskey| {
+                try self.writeU16(dnskey.flags);
+                try self.writeU8(dnskey.protocol);
+                try self.writeU8(@intFromEnum(dnskey.algorithm));
+                try self.writeSlice(dnskey.public_key);
+            },
+            .ds => |ds_data| {
+                try self.writeU16(ds_data.key_tag);
+                try self.writeU8(@intFromEnum(ds_data.algorithm));
+                try self.writeU8(@intFromEnum(ds_data.digest_type));
+                try self.writeSlice(ds_data.digest);
+            },
+            .nsec => |nsec_data| {
+                try self.writeName(nsec_data.next_domain_name);
+                try self.writeSlice(nsec_data.type_bit_maps);
+            },
+            .nsec3 => |nsec3| {
+                try self.writeU8(nsec3.hash_algorithm);
+                try self.writeU8(nsec3.flags);
+                try self.writeU16(nsec3.iterations);
+                try self.writeU8(@intCast(nsec3.salt.len));
+                try self.writeSlice(nsec3.salt);
+                try self.writeU8(@intCast(nsec3.next_hashed_owner.len));
+                try self.writeSlice(nsec3.next_hashed_owner);
+                try self.writeSlice(nsec3.type_bit_maps);
+            },
+            .nsec3param => |nsec3p| {
+                try self.writeU8(nsec3p.hash_algorithm);
+                try self.writeU8(nsec3p.flags);
+                try self.writeU16(nsec3p.iterations);
+                try self.writeU8(@intCast(nsec3p.salt.len));
+                try self.writeSlice(nsec3p.salt);
             },
             .unknown => |data| try self.writeSlice(data),
         }
@@ -832,9 +1122,93 @@ fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
                 try writer.print("\"{s}\" ", .{s});
             }
         },
+        .rrsig => |rrsig| {
+            try writer.print("{s} {d} {s} {d} {d} {d} {d} ", .{
+                @tagName(rrsig.type_covered),
+                rrsig.labels,
+                @tagName(rrsig.algorithm),
+                rrsig.original_ttl,
+                rrsig.sig_expiration,
+                rrsig.sig_inception,
+                rrsig.key_tag,
+            });
+            try printName(rrsig.signer_name, writer);
+        },
+        .dnskey => |dnskey| {
+            try writer.print("{d} {d} {s}", .{
+                dnskey.flags,
+                dnskey.protocol,
+                @tagName(dnskey.algorithm),
+            });
+        },
+        .ds => |ds_data| {
+            try writer.print("{d} {s} {s} ", .{
+                ds_data.key_tag,
+                @tagName(ds_data.algorithm),
+                @tagName(ds_data.digest_type),
+            });
+            for (ds_data.digest) |b| {
+                try writer.print("{X:0>2}", .{b});
+            }
+        },
+        .nsec => |nsec_data| {
+            try printName(nsec_data.next_domain_name, writer);
+            try printTypeBitmap(nsec_data.type_bit_maps, writer);
+        },
+        .nsec3 => |nsec3| {
+            try writer.print("{d} {d} {d} ", .{
+                nsec3.hash_algorithm,
+                nsec3.flags,
+                nsec3.iterations,
+            });
+            if (nsec3.salt.len == 0) {
+                try writer.print("- ", .{});
+            } else {
+                for (nsec3.salt) |b| try writer.print("{X:0>2}", .{b});
+                try writer.print(" ", .{});
+            }
+            for (nsec3.next_hashed_owner) |b| {
+                try writer.print("{X:0>2}", .{b});
+            }
+            try printTypeBitmap(nsec3.type_bit_maps, writer);
+        },
+        .nsec3param => |nsec3p| {
+            try writer.print("{d} {d} {d} ", .{
+                nsec3p.hash_algorithm,
+                nsec3p.flags,
+                nsec3p.iterations,
+            });
+            if (nsec3p.salt.len == 0) {
+                try writer.print("-", .{});
+            } else {
+                for (nsec3p.salt) |b| try writer.print("{X:0>2}", .{b});
+            }
+        },
         .unknown => |data| try writer.print("<{d} bytes>", .{data.len}),
     }
     try writer.print("\n", .{});
+}
+
+fn printTypeBitmap(bitmap: []const u8, writer: anytype) !void {
+    var pos: usize = 0;
+    while (pos + 2 <= bitmap.len) {
+        const window = bitmap[pos];
+        const win_len = bitmap[pos + 1];
+        pos += 2;
+        if (pos + win_len > bitmap.len) break;
+        for (0..win_len) |byte_idx| {
+            const byte = bitmap[pos + byte_idx];
+            if (byte == 0) continue;
+            for (0..8) |bit_idx| {
+                if (byte & (@as(u8, 0x80) >> @intCast(bit_idx)) != 0) {
+                    const type_num = @as(u16, window) * 256 + @as(u16, @intCast(byte_idx)) * 8 + @as(u16, @intCast(bit_idx));
+                    const rtype: RType = @enumFromInt(type_num);
+                    try writer.print(" {s}", .{@tagName(rtype)});
+                }
+            }
+        }
+        pos += win_len;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1422,6 +1796,28 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
             for (txt.strings) |s| allocator.free(s);
             allocator.free(txt.strings);
         },
+        .rrsig => |rrsig| {
+            freeName(allocator, rrsig.signer_name);
+            if (rrsig.signature.len > 0) allocator.free(rrsig.signature);
+        },
+        .dnskey => |dnskey| {
+            if (dnskey.public_key.len > 0) allocator.free(dnskey.public_key);
+        },
+        .ds => |ds_data| {
+            if (ds_data.digest.len > 0) allocator.free(ds_data.digest);
+        },
+        .nsec => |nsec_data| {
+            freeName(allocator, nsec_data.next_domain_name);
+            if (nsec_data.type_bit_maps.len > 0) allocator.free(nsec_data.type_bit_maps);
+        },
+        .nsec3 => |nsec3| {
+            if (nsec3.salt.len > 0) allocator.free(nsec3.salt);
+            if (nsec3.next_hashed_owner.len > 0) allocator.free(nsec3.next_hashed_owner);
+            if (nsec3.type_bit_maps.len > 0) allocator.free(nsec3.type_bit_maps);
+        },
+        .nsec3param => |nsec3p| {
+            if (nsec3p.salt.len > 0) allocator.free(nsec3p.salt);
+        },
         .unknown => |data| allocator.free(data),
     }
 }
@@ -1562,4 +1958,415 @@ test "buildQueryWithOptions rd=false roundtrip" {
     try testing.expect(!msg2.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg2.header.id);
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
+}
+
+// ── DNSSEC record type tests ────────────────────────────────────────
+
+test "DNSKEY record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    // Header: ancount=1
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    // Name: "." (root)
+    pkt[pos] = 0;
+    pos += 1;
+    mem.writeInt(u16, pkt[pos..][0..2], 48, .big); // DNSKEY
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 172800, .big); // TTL
+    pos += 4;
+    // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
+    const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
+    const rdlen: u16 = 4 + key_data.len;
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 257, .big); // flags
+    pos += 2;
+    pkt[pos] = 3; // protocol
+    pos += 1;
+    pkt[pos] = 8; // algorithm
+    pos += 1;
+    @memcpy(pkt[pos..][0..key_data.len], &key_data);
+    pos += key_data.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    const dnskey = msg.answers[0].rdata.dnskey;
+    try testing.expectEqual(@as(u16, 257), dnskey.flags);
+    try testing.expectEqual(@as(u8, 3), dnskey.protocol);
+    try testing.expectEqual(DnssecAlgorithm.rsasha256, dnskey.algorithm);
+    try testing.expect(dnskey.isZoneKey());
+    try testing.expect(dnskey.isSecureEntryPoint());
+    try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
+
+    // Serialize and re-parse
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const dk2 = msg2.answers[0].rdata.dnskey;
+    try testing.expectEqual(dnskey.flags, dk2.flags);
+    try testing.expectEqual(dnskey.protocol, dk2.protocol);
+    try testing.expectEqual(dnskey.algorithm, dk2.algorithm);
+    try testing.expectEqualSlices(u8, dnskey.public_key, dk2.public_key);
+}
+
+test "DS record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 43, .big); // DS
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 86400, .big);
+    pos += 4;
+    // RDATA: key_tag=20326, alg=8, digest_type=2 (SHA-256), digest=32 bytes
+    const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
+    mem.writeInt(u16, pkt[pos..][0..2], @intCast(4 + digest.len), .big);
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 20326, .big); // key_tag
+    pos += 2;
+    pkt[pos] = 8; // algorithm
+    pos += 1;
+    pkt[pos] = 2; // digest_type (SHA-256)
+    pos += 1;
+    @memcpy(pkt[pos..][0..digest.len], &digest);
+    pos += digest.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    const ds = msg.answers[0].rdata.ds;
+    try testing.expectEqual(@as(u16, 20326), ds.key_tag);
+    try testing.expectEqual(DnssecAlgorithm.rsasha256, ds.algorithm);
+    try testing.expectEqual(DigestType.sha256, ds.digest_type);
+    try testing.expectEqualSlices(u8, &digest, ds.digest);
+
+    // Roundtrip
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const ds2 = msg2.answers[0].rdata.ds;
+    try testing.expectEqual(ds.key_tag, ds2.key_tag);
+    try testing.expectEqualSlices(u8, ds.digest, ds2.digest);
+}
+
+test "RRSIG record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 46, .big); // RRSIG
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 300, .big);
+    pos += 4;
+
+    const signer_wire = "\x07example\x03com\x00"; // example.com
+    const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
+    const rdlen: u16 = 18 + @as(u16, signer_wire.len) + fake_sig.len;
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // type_covered = A
+    pos += 2;
+    pkt[pos] = 13; // algorithm = ECDSAP256SHA256
+    pos += 1;
+    pkt[pos] = 2; // labels
+    pos += 1;
+    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // original_ttl
+    pos += 4;
+    mem.writeInt(u32, pkt[pos..][0..4], 1700000000, .big); // sig_expiration
+    pos += 4;
+    mem.writeInt(u32, pkt[pos..][0..4], 1699000000, .big); // sig_inception
+    pos += 4;
+    mem.writeInt(u16, pkt[pos..][0..2], 12345, .big); // key_tag
+    pos += 2;
+    @memcpy(pkt[pos..][0..signer_wire.len], signer_wire);
+    pos += signer_wire.len;
+    @memcpy(pkt[pos..][0..fake_sig.len], &fake_sig);
+    pos += fake_sig.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    const rrsig = msg.answers[0].rdata.rrsig;
+    try testing.expectEqual(RType.a, rrsig.type_covered);
+    try testing.expectEqual(DnssecAlgorithm.ecdsap256sha256, rrsig.algorithm);
+    try testing.expectEqual(@as(u8, 2), rrsig.labels);
+    try testing.expectEqual(@as(u32, 300), rrsig.original_ttl);
+    try testing.expectEqual(@as(u32, 1700000000), rrsig.sig_expiration);
+    try testing.expectEqual(@as(u32, 1699000000), rrsig.sig_inception);
+    try testing.expectEqual(@as(u16, 12345), rrsig.key_tag);
+    try testing.expectEqualStrings("example", rrsig.signer_name.labels[0]);
+    try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
+
+    // Roundtrip
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const rrsig2 = msg2.answers[0].rdata.rrsig;
+    try testing.expectEqual(rrsig.type_covered, rrsig2.type_covered);
+    try testing.expectEqual(rrsig.key_tag, rrsig2.key_tag);
+    try testing.expect(rrsig.signer_name.eql(rrsig2.signer_name));
+    try testing.expectEqualSlices(u8, rrsig.signature, rrsig2.signature);
+}
+
+test "NSEC record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 47, .big); // NSEC
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big);
+    pos += 4;
+
+    const next_name = "\x04host\x07example\x03com\x00";
+    // Type bitmap: window 0, length 7 bytes
+    // A(1): byte 0, bit 1 => 0x40
+    // NS(2): byte 0, bit 2 => 0x20
+    // SOA(6): byte 0, bit 6 => 0x02
+    // => byte 0 = 0x62
+    // MX(15): byte 1, bit 7 => 0x01
+    // RRSIG(46): byte 5, bit 6 => 0x02
+    // NSEC(47): byte 5, bit 7 => 0x01
+    // => byte 5 = 0x03
+    // DNSKEY(48): byte 6, bit 0 => 0x80
+    const bitmap = [_]u8{ 0x00, 0x07, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const rdlen: u16 = @intCast(next_name.len + bitmap.len);
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    @memcpy(pkt[pos..][0..next_name.len], next_name);
+    pos += next_name.len;
+    @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
+    pos += bitmap.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    const nsec = msg.answers[0].rdata.nsec;
+    try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .a));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .ns));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .soa));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .mx));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .rrsig));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .nsec));
+    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .dnskey));
+    try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .aaaa));
+    try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .txt));
+
+    // Roundtrip
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const nsec2 = msg2.answers[0].rdata.nsec;
+    try testing.expect(nsec.next_domain_name.eql(nsec2.next_domain_name));
+    try testing.expectEqualSlices(u8, nsec.type_bit_maps, nsec2.type_bit_maps);
+}
+
+test "NSEC3 record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    // Owner: some base32 hash label under example.com (simplified for test)
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 50, .big); // NSEC3
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big);
+    pos += 4;
+
+    const salt = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
+    const bitmap = [_]u8{ 0x00, 0x01, 0x40 }; // window 0, len 1, A bit set
+    // hash_alg(1) + flags(1) + iterations(2) + salt_len(1) + salt(4) + hash_len(1) + hash(20) + bitmap(3)
+    const rdlen: u16 = 1 + 1 + 2 + 1 + salt.len + 1 + next_hash.len + bitmap.len;
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    pkt[pos] = 1; // hash_algorithm (SHA-1)
+    pos += 1;
+    pkt[pos] = 0; // flags
+    pos += 1;
+    mem.writeInt(u16, pkt[pos..][0..2], 10, .big); // iterations
+    pos += 2;
+    pkt[pos] = @intCast(salt.len); // salt_len
+    pos += 1;
+    @memcpy(pkt[pos..][0..salt.len], &salt);
+    pos += salt.len;
+    pkt[pos] = @intCast(next_hash.len); // hash_len
+    pos += 1;
+    @memcpy(pkt[pos..][0..next_hash.len], &next_hash);
+    pos += next_hash.len;
+    @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
+    pos += bitmap.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    const nsec3 = msg.answers[0].rdata.nsec3;
+    try testing.expectEqual(@as(u8, 1), nsec3.hash_algorithm);
+    try testing.expectEqual(@as(u8, 0), nsec3.flags);
+    try testing.expectEqual(@as(u16, 10), nsec3.iterations);
+    try testing.expectEqualSlices(u8, &salt, nsec3.salt);
+    try testing.expectEqualSlices(u8, &next_hash, nsec3.next_hashed_owner);
+    try testing.expect(typeBitmapContains(nsec3.type_bit_maps, .a));
+    try testing.expect(!typeBitmapContains(nsec3.type_bit_maps, .aaaa));
+
+    // Roundtrip
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const n3_2 = msg2.answers[0].rdata.nsec3;
+    try testing.expectEqual(nsec3.hash_algorithm, n3_2.hash_algorithm);
+    try testing.expectEqual(nsec3.iterations, n3_2.iterations);
+    try testing.expectEqualSlices(u8, nsec3.salt, n3_2.salt);
+    try testing.expectEqualSlices(u8, nsec3.next_hashed_owner, n3_2.next_hashed_owner);
+    try testing.expectEqualSlices(u8, nsec3.type_bit_maps, n3_2.type_bit_maps);
+}
+
+test "NSEC3PARAM record parse/serialize roundtrip" {
+    var pkt: [512]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
+    mem.writeInt(u16, pkt[4..6], 0, .big);
+    mem.writeInt(u16, pkt[6..8], 1, .big);
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 51, .big); // NSEC3PARAM
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 0, .big); // TTL=0 per RFC 5155
+    pos += 4;
+
+    const salt = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    mem.writeInt(u16, pkt[pos..][0..2], @intCast(5 + salt.len), .big);
+    pos += 2;
+    pkt[pos] = 1; // hash_algorithm
+    pos += 1;
+    pkt[pos] = 0; // flags
+    pos += 1;
+    mem.writeInt(u16, pkt[pos..][0..2], 0, .big); // iterations
+    pos += 2;
+    pkt[pos] = @intCast(salt.len);
+    pos += 1;
+    @memcpy(pkt[pos..][0..salt.len], &salt);
+    pos += salt.len;
+
+    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
+    defer freeMessage(testing.allocator, msg);
+
+    const nsec3p = msg.answers[0].rdata.nsec3param;
+    try testing.expectEqual(@as(u8, 1), nsec3p.hash_algorithm);
+    try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
+    try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
+
+    // Roundtrip
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    const msg2 = try parseMessage(testing.allocator, wire);
+    defer freeMessage(testing.allocator, msg2);
+
+    const np2 = msg2.answers[0].rdata.nsec3param;
+    try testing.expectEqual(nsec3p.hash_algorithm, np2.hash_algorithm);
+    try testing.expectEqualSlices(u8, nsec3p.salt, np2.salt);
+}
+
+test "typeBitmapContains" {
+    // Type A = 1: byte 0, bit 1, mask = 0x80>>1 = 0x40
+    // Type NS = 2: byte 0, bit 2, mask = 0x80>>2 = 0x20
+    // Type SOA = 6: byte 0, bit 6, mask = 0x80>>6 = 0x02
+    // => byte 0 = 0x62
+    // Type RRSIG = 46: byte 5, bit 6, mask = 0x80>>6 = 0x02
+    // Type NSEC = 47: byte 5, bit 7, mask = 0x80>>7 = 0x01
+    // => byte 5 = 0x03
+    // Type DNSKEY = 48: byte 6, bit 0, mask = 0x80>>0 = 0x80
+    // => byte 6 = 0x80
+    // Need window 0, length 7 (bytes 0-6)
+    const bitmap = [_]u8{
+        0x00, 0x07, // window 0, length 7
+        0x62, // byte 0: A(1), NS(2), SOA(6)
+        0x00, // byte 1: empty
+        0x00, // byte 2: empty
+        0x00, // byte 3: empty
+        0x00, // byte 4: empty
+        0x03, // byte 5: RRSIG(46), NSEC(47)
+        0x80, // byte 6: DNSKEY(48)
+    };
+
+    try testing.expect(typeBitmapContains(&bitmap, .a));
+    try testing.expect(typeBitmapContains(&bitmap, .ns));
+    try testing.expect(typeBitmapContains(&bitmap, .soa));
+    try testing.expect(typeBitmapContains(&bitmap, .rrsig));
+    try testing.expect(typeBitmapContains(&bitmap, .nsec));
+    try testing.expect(typeBitmapContains(&bitmap, .dnskey));
+    try testing.expect(!typeBitmapContains(&bitmap, .aaaa));
+    try testing.expect(!typeBitmapContains(&bitmap, .mx));
+    try testing.expect(!typeBitmapContains(&bitmap, .txt));
+    try testing.expect(!typeBitmapContains(&bitmap, .cname));
+
+    // Empty bitmap
+    try testing.expect(!typeBitmapContains(&.{}, .a));
 }
