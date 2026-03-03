@@ -93,7 +93,9 @@ pub const Header = struct {
     tc: bool,
     rd: bool,
     ra: bool,
-    z: u3,
+    z: u1,
+    ad: bool,
+    cd: bool,
     rcode: RCode,
     qd_count: u16,
     an_count: u16,
@@ -116,7 +118,9 @@ pub const Header = struct {
             .tc = (flags >> 9) & 1 == 1,
             .rd = (flags >> 8) & 1 == 1,
             .ra = (flags >> 7) & 1 == 1,
-            .z = @truncate(flags >> 4),
+            .z = @truncate(flags >> 6),
+            .ad = (flags >> 5) & 1 == 1,
+            .cd = (flags >> 4) & 1 == 1,
             .rcode = @enumFromInt(@as(u4, @truncate(flags))),
             .qd_count = qd_count,
             .an_count = an_count,
@@ -135,7 +139,9 @@ pub const Header = struct {
         flags |= @as(u16, @intFromBool(self.tc)) << 9;
         flags |= @as(u16, @intFromBool(self.rd)) << 8;
         flags |= @as(u16, @intFromBool(self.ra)) << 7;
-        flags |= @as(u16, self.z) << 4;
+        flags |= @as(u16, self.z) << 6;
+        flags |= @as(u16, @intFromBool(self.ad)) << 5;
+        flags |= @as(u16, @intFromBool(self.cd)) << 4;
         flags |= @as(u16, @intFromEnum(self.rcode));
         mem.writeInt(u16, out[2..4], flags, .big);
 
@@ -456,7 +462,7 @@ pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8
             .tc = false,
             .rd = options.rd,
             .ra = false,
-            .z = 0,
+            .z = 0, .ad = false, .cd = false,
             .rcode = .no_error,
             .qd_count = 1,
             .an_count = 0,
@@ -1085,6 +1091,8 @@ pub fn printMessage(msg: Message, writer: anytype) !void {
     if (hdr.tc) try writer.print(" tc", .{});
     if (hdr.rd) try writer.print(" rd", .{});
     if (hdr.ra) try writer.print(" ra", .{});
+    if (hdr.ad) try writer.print(" ad", .{});
+    if (hdr.cd) try writer.print(" cd", .{});
     try writer.print("; QUERY: {d}, ANSWER: {d}, AUTHORITY: {d}, ADDITIONAL: {d}\n\n", .{
         hdr.qd_count, hdr.an_count, hdr.ns_count, hdr.ar_count,
     });
@@ -1282,7 +1290,7 @@ test "header roundtrip" {
         .tc = false,
         .rd = true,
         .ra = true,
-        .z = 0,
+        .z = 0, .ad = false, .cd = false,
         .rcode = .no_error,
         .qd_count = 1,
         .an_count = 2,
@@ -1302,6 +1310,8 @@ test "header roundtrip" {
     try testing.expectEqual(original.rd, parsed.rd);
     try testing.expectEqual(original.ra, parsed.ra);
     try testing.expectEqual(original.z, parsed.z);
+    try testing.expectEqual(original.ad, parsed.ad);
+    try testing.expectEqual(original.cd, parsed.cd);
     try testing.expectEqual(original.rcode, parsed.rcode);
     try testing.expectEqual(original.qd_count, parsed.qd_count);
     try testing.expectEqual(original.an_count, parsed.an_count);
