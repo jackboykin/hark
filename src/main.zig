@@ -56,6 +56,7 @@ fn printUsage() void {
         \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
         \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
         \\  --dot-host <name>   TLS server hostname for SNI/cert verification
+        \\  --dot-strict        Require hostname verification (RFC 7858 strict mode)
         \\  --opportunistic     Opportunistic encryption to authoritatives (RFC 9539)
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
@@ -116,6 +117,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var forward_mode = false;
     var dot_mode = false;
     var dot_host: ?[]const u8 = null;
+    var dot_strict = false;
     var no_qmin = false;
     var dnssec_enabled = false;
     var opportunistic = false;
@@ -134,6 +136,10 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
                 std.process.exit(1);
             }
             dot_host = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dot-strict")) {
+            dot_strict = true;
+            dot_mode = true;
+            forward_mode = true;
         } else if (std.mem.eql(u8, args[i], "--opportunistic")) {
             opportunistic = true;
         } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
@@ -175,6 +181,11 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     var tcp_t = TcpTransport.init(loop, .{});
 
+    if (dot_strict and dot_host == null) {
+        std.debug.print("Error: --dot-strict requires --dot-host for hostname verification\n", .{});
+        std.process.exit(1);
+    }
+
     // Load CA bundle if DoT is enabled
     var ca_bundle: Certificate.Bundle = .{};
     var ca_bundle_loaded = false;
@@ -190,6 +201,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     // TLS transport (only when --dot is set)
     var tls_t = TlsTransport.init(loop, gpa_alloc, .{
         .server_name = dot_host,
+        .strict = dot_strict,
     }, ca_bundle);
 
     // Cache: 16MB cap, 10k max entries

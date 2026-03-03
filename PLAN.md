@@ -139,7 +139,18 @@ that inform hark's design:
 
 ## Milestone Roadmap
 
-Future milestones TBD.
+### M11: DNSSEC Positive-Answer Validation
+**RFCs**: 4035 §5, 6840 (clarifications)
+**Goal**: Validate RRSIG chains on positive answers (A, AAAA, MX, etc.), not just negative proofs.
+
+- Full chain-of-trust: root DNSKEY → DS → zone DNSKEY → RRSIG → RRset
+- Call `validateDnskeyRrset` (already implemented, never called) on delegation trust path
+- Validate RRSIGs on answer RRsets using the authenticated zone DNSKEY
+- Wildcard answer validation (NSEC/NSEC3 proof of non-existence for the exact name)
+- CNAME chain validation (each CNAME target's zone must be validated)
+- Secure/insecure/bogus classification on positive answers (currently only on negatives)
+- SERVFAIL on bogus positive answers when DNSSEC is enabled
+- Update `--dnssec` flag to cover both positive and negative validation
 
 ## Key Architectural Decisions
 

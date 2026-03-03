@@ -22,6 +22,8 @@ pub const TlsConfig = struct {
     response_timeout_ms: u32 = 10000,
     server_name: ?[]const u8 = null,
     skip_verification: bool = false,
+    /// RFC 7858 strict mode: require hostname verification (server_name must be set).
+    strict: bool = false,
     port: u16 = 853,
 };
 
@@ -143,6 +145,11 @@ pub const TlsTransport = struct {
         conn.last_used = 0;
         conn.net_reader = net.Stream.Reader.init(stream, &conn.net_read_buf);
         conn.net_writer = net.Stream.Writer.init(stream, &conn.net_write_buf);
+
+        // RFC 7858 strict mode: hostname verification is mandatory.
+        if (self.config.strict and self.config.server_name == null) {
+            return error.StrictModeRequiresHostname;
+        }
 
         conn.tls_client = tls.Client.init(conn.net_reader.interface(), &conn.net_writer.interface, .{
             .host = if (self.config.skip_verification)
