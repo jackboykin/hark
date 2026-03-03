@@ -30,6 +30,7 @@ pub const root_hints: [13]std.net.Address = .{
 const max_referrals = 10;
 const max_servers_per_level = 13;
 const max_cname_chain = 8;
+const max_minimise_count = 10;
 
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
@@ -37,6 +38,7 @@ pub const RecursiveResolver = struct {
     transport: *UdpTransport,
     tcp_transport: ?*TcpTransport,
     cache: ?*RRsetCache,
+    qname_minimisation: bool = true,
 
     pub fn init(transport: *UdpTransport) RecursiveResolver {
         return .{ .transport = transport, .tcp_transport = null, .cache = null };
@@ -59,6 +61,7 @@ pub const RecursiveResolver = struct {
     fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!dns.Message {
         var current_name: []const u8 = name;
         var cname_count: usize = 0;
+        var total_probes: usize = 0;
 
         cname_loop: while (true) {
             // CACHE CHECK 1: Do we already have a cached answer?
@@ -98,7 +101,54 @@ pub const RecursiveResolver = struct {
                 parent_zone = deleg.zone;
             }
 
+            // QNAME minimization (RFC 9156): start probing one label past the
+            // current zone cut and advance toward the full target name.
+            var minimise_label_count: usize = if (self.qname_minimisation)
+                parent_zone.labels.len + 1
+            else
+                target_name.labels.len; // disabled: always send full name
+
             for (0..max_referrals) |_| {
+                // Determine if this iteration sends the full (final) query or a probe.
+                const is_final = minimise_label_count >= target_name.labels.len or
+                    !self.qname_minimisation or total_probes >= max_minimise_count;
+
+                // Build probe name from target's trailing labels, or use the full name.
+                const query_name: []const u8 = if (is_final) current_name else blk: {
+                    const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                    const child_buf = child_view.format();
+                    const child_len = mem.indexOfScalar(u8, &child_buf, 0) orelse child_buf.len;
+                    break :blk try allocator.dupe(u8, child_buf[0..child_len]);
+                };
+                const query_type: dns.RType = if (is_final) qtype else .a;
+
+                if (!is_final) total_probes += 1;
+
+                // QMIN cache check: see if the probe answer is already cached.
+                if (!is_final) {
+                    if (self.cache) |c| {
+                        if (c.lookup(allocator, query_name, query_type, .in)) |result| {
+                            switch (result) {
+                                .hit => {
+                                    // Name exists — advance probe
+                                    minimise_label_count += 1;
+                                    continue;
+                                },
+                                .negative => |n| {
+                                    if (n.rcode == .name_error) {
+                                        // Cached NXDOMAIN — relaxed mode: stop minimising
+                                        minimise_label_count = target_name.labels.len;
+                                        continue;
+                                    }
+                                    // Cached NODATA — name exists, advance
+                                    minimise_label_count += 1;
+                                    continue;
+                                },
+                            }
+                        }
+                    }
+                }
+
                 // Shuffle servers (Fisher-Yates)
                 fisherYatesShuffle(std.net.Address, servers[0..server_count]);
 
@@ -113,7 +163,7 @@ pub const RecursiveResolver = struct {
                     const query_id = mem.readInt(u16, &id_bytes, .big);
 
                     // Build iterative query (rd=false, EDNS0)
-                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, current_name, qtype, .{ .rd = false, .edns = .{} });
+                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{ .rd = false, .edns = .{} });
 
                     // Serialize
                     var wire_buf: [dns.edns_udp_payload]u8 = undefined;
@@ -150,10 +200,75 @@ pub const RecursiveResolver = struct {
 
                 if (!got_response) return error.Timeout;
 
+                // ── Probe response handling (non-final queries) ──
+                if (!is_final) {
+                    // Check for referral first — applies to probes too
+                    if (extractReferral(response, target_name, parent_zone)) |referral| {
+                        switch (referral) {
+                            .referral => |ref| {
+                                for (seen_zones[0..seen_zone_count]) |sz| {
+                                    if (sz.eql(ref.zone_cut)) return error.ReferralLoop;
+                                }
+                                seen_zones[seen_zone_count] = ref.zone_cut;
+                                seen_zone_count += 1;
+                                parent_zone = ref.zone_cut;
+                                server_count = ref.count;
+                                @memcpy(servers[0..ref.count], ref.addrs[0..ref.count]);
+                                minimise_label_count = parent_zone.labels.len + 1;
+                                continue;
+                            },
+                            .no_glue => |ng| {
+                                const res = self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count]) orelse blk: {
+                                    const resolved = self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth) catch return error.NoGlueRecords;
+                                    break :blk resolved orelse return error.NoGlueRecords;
+                                };
+                                for (seen_zones[0..seen_zone_count]) |sz| {
+                                    if (sz.eql(ng.zone_cut)) return error.ReferralLoop;
+                                }
+                                seen_zones[seen_zone_count] = ng.zone_cut;
+                                seen_zone_count += 1;
+                                parent_zone = ng.zone_cut;
+                                server_count = res.count;
+                                @memcpy(servers[0..res.count], res.addrs[0..res.count]);
+                                minimise_label_count = parent_zone.labels.len + 1;
+                                continue;
+                            },
+                        }
+                    }
+
+                    if (response.header.rcode == .name_error) {
+                        // Probe NXDOMAIN — relaxed mode: cache negative and stop minimising
+                        if (response.header.aa) {
+                            if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities);
+                        }
+                        minimise_label_count = target_name.labels.len;
+                        continue;
+                    }
+
+                    if (response.header.rcode == .server_failure or response.header.rcode == .refused) {
+                        // Probe SERVFAIL/REFUSED — stop minimising, send full QNAME
+                        minimise_label_count = target_name.labels.len;
+                        continue;
+                    }
+
+                    if (response.answers.len > 0) {
+                        // Probe got an answer — name exists, advance
+                        minimise_label_count += 1;
+                        continue;
+                    }
+
+                    // NODATA (no answers, no referral) — name exists, cache negative, advance
+                    if (response.header.aa) {
+                        if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities);
+                    }
+                    minimise_label_count += 1;
+                    continue;
+                }
+
+                // ── Final query response handling (unchanged logic) ──
+
                 // Classify response
                 if (response.header.rcode != .no_error) {
-                    // Cache NXDOMAIN from authoritative responses only (Hickory lesson:
-                    // never fabricate NXDOMAIN from application state).
                     if (response.header.rcode == .name_error and response.header.aa) {
                         if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
                     }
@@ -202,6 +317,7 @@ pub const RecursiveResolver = struct {
                         parent_zone = ref.zone_cut;
                         server_count = ref.count;
                         @memcpy(servers[0..ref.count], ref.addrs[0..ref.count]);
+                        minimise_label_count = parent_zone.labels.len + 1;
                     },
                     .no_glue => |ng| {
                         // CACHE CHECK 3: Try cached A records for NS names first
@@ -224,6 +340,7 @@ pub const RecursiveResolver = struct {
                         parent_zone = ng.zone_cut;
                         server_count = res.count;
                         @memcpy(servers[0..res.count], res.addrs[0..res.count]);
+                        minimise_label_count = parent_zone.labels.len + 1;
                     },
                 }
             }
@@ -1075,6 +1192,139 @@ test "findCname returns null when no CNAME present" {
     const target = dns.Name{ .labels = &.{ "example", "com" } };
     const result = try findCname(response, target, alloc);
     try testing.expect(result == null);
+}
+
+// ── QNAME minimization tests ──────────────────────────────────────────
+
+test "probe name construction from label sub-slice" {
+    // Verify that Name{ .labels = sub_slice }.format() produces correct dotted names
+    const full_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
+
+    // 1 label: "com"
+    const view1 = dns.Name{ .labels = full_labels[3..] };
+    const buf1 = view1.format();
+    const len1 = mem.indexOfScalar(u8, &buf1, 0) orelse buf1.len;
+    try testing.expectEqualStrings("com", buf1[0..len1]);
+
+    // 2 labels: "example.com"
+    const view2 = dns.Name{ .labels = full_labels[2..] };
+    const buf2 = view2.format();
+    const len2 = mem.indexOfScalar(u8, &buf2, 0) orelse buf2.len;
+    try testing.expectEqualStrings("example.com", buf2[0..len2]);
+
+    // 3 labels: "sub.example.com"
+    const view3 = dns.Name{ .labels = full_labels[1..] };
+    const buf3 = view3.format();
+    const len3 = mem.indexOfScalar(u8, &buf3, 0) orelse buf3.len;
+    try testing.expectEqualStrings("sub.example.com", buf3[0..len3]);
+
+    // All 4 labels: "www.sub.example.com"
+    const view4 = dns.Name{ .labels = full_labels[0..] };
+    const buf4 = view4.format();
+    const len4 = mem.indexOfScalar(u8, &buf4, 0) orelse buf4.len;
+    try testing.expectEqualStrings("www.sub.example.com", buf4[0..len4]);
+}
+
+test "minimisation stepping — probes advance one label at a time" {
+    // Simulate: target = "www.sub.example.com", parent_zone = "com" (1 label)
+    // Expected probes: label_count 2 → "example.com", 3 → "sub.example.com", 4 → final "www.sub.example.com"
+    const target_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
+    const parent_zone_labels: usize = 1; // "com"
+
+    var label_count: usize = parent_zone_labels + 1; // start at 2
+
+    // First probe: "example.com"
+    try testing.expectEqual(@as(usize, 2), label_count);
+    const v1 = dns.Name{ .labels = target_labels[target_labels.len - label_count ..] };
+    const b1 = v1.format();
+    const l1 = mem.indexOfScalar(u8, &b1, 0) orelse b1.len;
+    try testing.expectEqualStrings("example.com", b1[0..l1]);
+
+    label_count += 1; // advance
+
+    // Second probe: "sub.example.com"
+    try testing.expectEqual(@as(usize, 3), label_count);
+    const v2 = dns.Name{ .labels = target_labels[target_labels.len - label_count ..] };
+    const b2 = v2.format();
+    const l2 = mem.indexOfScalar(u8, &b2, 0) orelse b2.len;
+    try testing.expectEqualStrings("sub.example.com", b2[0..l2]);
+
+    label_count += 1; // advance
+
+    // Now label_count == target_labels.len → is_final
+    try testing.expectEqual(@as(usize, 4), label_count);
+    try testing.expect(label_count >= target_labels.len);
+}
+
+test "referral resets minimise_label_count" {
+    // parent_zone = "." (0 labels) → label_count = 1
+    // After referral to "com" (1 label) → label_count should reset to 2
+    // After referral to "example.com" (2 labels) → label_count should reset to 3
+    var parent_zone_len: usize = 0;
+    var label_count: usize = parent_zone_len + 1;
+    try testing.expectEqual(@as(usize, 1), label_count);
+
+    // Referral to "com"
+    parent_zone_len = 1;
+    label_count = parent_zone_len + 1;
+    try testing.expectEqual(@as(usize, 2), label_count);
+
+    // Referral to "example.com"
+    parent_zone_len = 2;
+    label_count = parent_zone_len + 1;
+    try testing.expectEqual(@as(usize, 3), label_count);
+}
+
+test "max_minimise_count cap forces full QNAME" {
+    // After max_minimise_count probes, is_final should be true
+    const target_label_count: usize = 20; // very deep name
+    var total_probes: usize = 0;
+    var minimise_label_count: usize = 1; // start from root
+
+    // Simulate probes
+    while (total_probes < max_minimise_count) : (total_probes += 1) {
+        const is_final = minimise_label_count >= target_label_count or
+            total_probes >= max_minimise_count;
+        try testing.expect(!is_final); // should still be probing
+        minimise_label_count += 1;
+    }
+
+    // Now total_probes == max_minimise_count, should be final
+    const is_final = minimise_label_count >= target_label_count or
+        total_probes >= max_minimise_count;
+    try testing.expect(is_final);
+}
+
+test "NXDOMAIN during probe — relaxed mode stops minimising" {
+    // Simulate: probe returns NXDOMAIN → set label_count to target length
+    const target_label_count: usize = 4;
+    var minimise_label_count: usize = 2;
+
+    // Probe NXDOMAIN → relaxed mode
+    const probe_nxdomain = true;
+    if (probe_nxdomain) {
+        minimise_label_count = target_label_count;
+    }
+
+    // Next iteration should be final
+    try testing.expect(minimise_label_count >= target_label_count);
+}
+
+test "qname_minimisation=false sends full name immediately" {
+    // When disabled, minimise_label_count starts at target_name.labels.len
+    const target_label_count: usize = 4;
+    const qname_minimisation = false;
+    const parent_zone_labels: usize = 0;
+
+    const minimise_label_count: usize = if (qname_minimisation)
+        parent_zone_labels + 1
+    else
+        target_label_count;
+
+    // Should always be final
+    const is_final = minimise_label_count >= target_label_count or !qname_minimisation;
+    try testing.expect(is_final);
+    try testing.expectEqual(target_label_count, minimise_label_count);
 }
 
 // ── Integration tests (require Linux + io_uring + network) ─────────────

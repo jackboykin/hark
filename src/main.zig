@@ -45,8 +45,9 @@ fn printUsage() void {
         \\Query options:
         \\  --forward           Use forwarding mode instead of recursive resolution
         \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
+        \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\
-        \\Defaults: type=A, mode=recursive
+        \\Defaults: type=A, mode=recursive, QNAME minimization enabled
         \\
     , .{});
 }
@@ -96,11 +97,14 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var qtype: dns.RType = .a;
     var upstream_ip: [4]u8 = .{ 8, 8, 8, 8 };
     var forward_mode = false;
+    var no_qmin = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--forward")) {
             forward_mode = true;
+        } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
+            no_qmin = true;
         } else if (std.mem.eql(u8, args[i], "--upstream")) {
             i += 1;
             if (i >= args.len) {
@@ -151,6 +155,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         };
     } else blk: {
         var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
+        if (no_qmin) resolver.qname_minimisation = false;
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
