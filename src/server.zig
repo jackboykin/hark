@@ -11,8 +11,11 @@ const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const RecursiveResolver = @import("recursive.zig").RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
+const TlsTransport = @import("tls_transport.zig").TlsTransport;
+const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const ServerConfig = @import("config.zig").ServerConfig;
+const Certificate = std.crypto.Certificate;
 
 const log = std.log.scoped(.server);
 
@@ -32,6 +35,7 @@ pub const Server = struct {
     config: ServerConfig,
     allocator: mem.Allocator,
     cache: RRsetCache,
+    ca_bundle: Certificate.Bundle,
     shutdown: std.atomic.Value(bool),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig) !Server {
@@ -40,15 +44,27 @@ pub const Server = struct {
         else
             RRsetCache.init(allocator, cfg.cache_size, cfg.cache_entries);
 
+        var ca_bundle: Certificate.Bundle = .{};
+        if (cfg.opportunistic) {
+            ca_bundle.rescan(allocator) catch |err| {
+                log.err("failed to load CA certificates: {s}", .{@errorName(err)});
+                return err;
+            };
+        }
+
         return .{
             .config = cfg,
             .allocator = allocator,
             .cache = cache,
+            .ca_bundle = ca_bundle,
             .shutdown = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.config.opportunistic) {
+            self.ca_bundle.deinit(self.allocator);
+        }
         self.cache.deinit();
     }
 
@@ -150,6 +166,11 @@ pub const Server = struct {
             };
         defer posix.close(tcp_sock);
 
+        // Per-worker TLS transport + encryption state (opportunistic encryption)
+        var tls_transport = TlsTransport.init(loop, self.allocator, .{}, self.ca_bundle);
+        var enc_state = EncryptionStateCache.init(self.allocator);
+        defer if (self.config.opportunistic) enc_state.deinit();
+
         // Worker state
         var ws = WorkerState{
             .config = &self.config,
@@ -157,6 +178,8 @@ pub const Server = struct {
             .loop = loop,
             .udp_transport = &udp_transport,
             .tcp_transport = &tcp_transport,
+            .tls_transport = if (self.config.opportunistic) &tls_transport else null,
+            .encryption_state = if (self.config.opportunistic) &enc_state else null,
             .cache = &self.cache,
             .shutdown = &self.shutdown,
         };
@@ -174,6 +197,8 @@ const WorkerState = struct {
     loop: *EventLoop,
     udp_transport: *UdpTransport,
     tcp_transport: *TcpTransport,
+    tls_transport: ?*TlsTransport,
+    encryption_state: ?*EncryptionStateCache,
     cache: *RRsetCache,
     shutdown: *std.atomic.Value(bool),
 
@@ -367,6 +392,8 @@ const WorkerState = struct {
                 var resolver = RecursiveResolver.initFull(self.udp_transport, self.tcp_transport, self.cache);
                 if (!self.config.qname_minimization) resolver.qname_minimisation = false;
                 resolver.dnssec_enabled = self.config.dnssec;
+                if (self.tls_transport) |tls_t| resolver.tls_transport = tls_t;
+                if (self.encryption_state) |enc| resolver.encryption_state = enc;
                 return try resolver.resolve(alloc, name, qtype);
             },
             .forward => {
