@@ -357,25 +357,41 @@ const WorkerState = struct {
     fn handleTcpClient(self: *WorkerState, client_fd: posix.fd_t) void {
         defer posix.close(client_fd);
 
+        // Switch accepted fd to blocking mode with idle timeout.
+        // This avoids calling tick() on the server_loop, which would steal
+        // completions for accept/recvFrom/signalfd and cause a deadlock.
+        const flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch return;
+        const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        _ = posix.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
+
+        const timeout_sec: i64 = @intCast(tcp_idle_timeout_ms / 1000);
+        const timeout_usec: i64 = @intCast(@as(u64, tcp_idle_timeout_ms % 1000) * 1000);
+        const tv = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
+        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch return;
+        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&tv)) catch return;
+
         while (!self.shutdown.load(.acquire)) {
-            const len_bytes = tcpReadExact(self.loop, client_fd, 2, tcp_idle_timeout_ms) orelse return;
-            const msg_len = mem.readInt(u16, len_bytes[0..2], .big);
+            // Read 2-byte length prefix
+            var len_buf: [2]u8 = undefined;
+            tcpReadExactBlocking(client_fd, &len_buf) orelse return;
+            const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
-            const query_data = tcpReadExact(self.loop, client_fd, msg_len, tcp_idle_timeout_ms) orelse return;
+            // Read query body
+            var query_buf: [65535]u8 = undefined;
+            tcpReadExactBlocking(client_fd, query_buf[0..msg_len]) orelse return;
 
+            // Process query (resolution uses transport_loop, not server_loop)
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
-            const alloc = arena.allocator();
-
             var response_wire: [65535]u8 = undefined;
-            const wire = self.processQuery(alloc, query_data[0..msg_len], &response_wire) orelse return;
+            const wire = self.processQuery(arena.allocator(), query_buf[0..msg_len], &response_wire) orelse return;
 
+            // Write length-prefixed response
             var len_prefix: [2]u8 = undefined;
             mem.writeInt(u16, &len_prefix, @intCast(wire.len), .big);
-
-            if (!tcpSendAll(self.loop, client_fd, &len_prefix)) return;
-            if (!tcpSendAll(self.loop, client_fd, wire)) return;
+            tcpWriteAllBlocking(client_fd, &len_prefix) orelse return;
+            tcpWriteAllBlocking(client_fd, wire) orelse return;
         }
     }
 
@@ -543,101 +559,23 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
 
-// ── TCP helpers ────────────────────────────────────────────────────────
+// ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 
-fn tcpReadExact(loop: *EventLoop, fd: posix.fd_t, needed: u16, timeout_ms: u32) ?[]const u8 {
-    var total_buf: [65537]u8 = undefined;
+fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8) ?void {
     var total: usize = 0;
-
-    while (total < needed) {
-        var recv_ctx: u8 = 0;
-        var timeout_ctx: u8 = 1;
-
-        const recv_op = loop.tcpRecv(fd, @ptrCast(&recv_ctx)) catch return null;
-        const timeout_op = loop.setTimeout(timeout_ms, @ptrCast(&timeout_ctx)) catch {
-            loop.cancel(recv_op) catch {};
-            return null;
-        };
-
-        var completions: [max_operations]Completion = undefined;
-        var got_data = false;
-        var timed_out = false;
-
-        for (0..10) |_| {
-            const results = loop.tick(&completions) catch return null;
-            for (results) |c| {
-                const tag = @as(*u8, @ptrCast(@alignCast(c.context))).*;
-                if (tag == 0) {
-                    switch (c.result) {
-                        .tcp_recv => |r| {
-                            if (r.err != null) {
-                                loop.cancel(timeout_op) catch {};
-                                drainCancel(loop);
-                                return null;
-                            }
-                            const chunk = r.data;
-                            const to_copy = @min(chunk.len, needed - total);
-                            @memcpy(total_buf[total..][0..to_copy], chunk[0..to_copy]);
-                            total += to_copy;
-                            got_data = true;
-                        },
-                        else => {},
-                    }
-                } else {
-                    switch (c.result) {
-                        .timeout => |t| {
-                            if (t.expired) {
-                                timed_out = true;
-                                loop.cancel(recv_op) catch {};
-                                drainCancel(loop);
-                                return null;
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            }
-            if (got_data or timed_out) break;
-        }
-
-        if (got_data) {
-            loop.cancel(timeout_op) catch {};
-            drainCancel(loop);
-        }
-
-        if (!got_data) return null;
+    while (total < buf.len) {
+        const n = posix.read(fd, buf[total..]) catch return null;
+        if (n == 0) return null; // connection closed
+        total += n;
     }
-
-    return total_buf[0..needed];
 }
 
-fn tcpSendAll(loop: *EventLoop, fd: posix.fd_t, data: []const u8) bool {
-    var sent: usize = 0;
-    while (sent < data.len) {
-        var ctx: u8 = 0;
-        _ = loop.tcpSend(fd, data[sent..], @ptrCast(&ctx)) catch return false;
-
-        var completions: [max_operations]Completion = undefined;
-        for (0..5) |_| {
-            const results = loop.tick(&completions) catch return false;
-            for (results) |c| {
-                switch (c.result) {
-                    .tcp_send => |r| {
-                        if (r.bytes_sent <= 0) return false;
-                        sent += @intCast(r.bytes_sent);
-                    },
-                    else => {},
-                }
-            }
-            if (sent >= data.len) break;
-        }
+fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8) ?void {
+    var total: usize = 0;
+    while (total < data.len) {
+        const n = posix.write(fd, data[total..]) catch return null;
+        total += n;
     }
-    return sent >= data.len;
-}
-
-fn drainCancel(loop: *EventLoop) void {
-    var completions: [max_operations]Completion = undefined;
-    _ = loop.tick(&completions) catch {};
 }
 
 fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: std.net.Address) void {
