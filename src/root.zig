@@ -6,6 +6,7 @@ pub const resolver = @import("resolver.zig");
 pub const recursive = @import("recursive.zig");
 pub const cache = @import("cache.zig");
 pub const dnssec = @import("dnssec.zig");
+pub const tls_transport = @import("tls_transport.zig");
 
 test {
     _ = dns;
@@ -16,4 +17,5 @@ test {
     _ = recursive;
     _ = cache;
     _ = dnssec;
+    _ = tls_transport;
 }

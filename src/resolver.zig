@@ -6,18 +6,20 @@ const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
+const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const Config = @import("transport.zig").Config;
 
 pub const ForwardingResolver = struct {
     transport: *UdpTransport,
     tcp_transport: ?*TcpTransport,
+    tls_transport: ?*TlsTransport,
 
     pub fn init(transport: *UdpTransport) ForwardingResolver {
-        return .{ .transport = transport, .tcp_transport = null };
+        return .{ .transport = transport, .tcp_transport = null, .tls_transport = null };
     }
 
     pub fn initWithTcp(transport: *UdpTransport, tcp: *TcpTransport) ForwardingResolver {
-        return .{ .transport = transport, .tcp_transport = tcp };
+        return .{ .transport = transport, .tcp_transport = tcp, .tls_transport = null };
     }
 
     pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: std.net.Address) !dns.Message {
@@ -33,7 +35,14 @@ pub const ForwardingResolver = struct {
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
-        // Send and receive
+        // DoT path: send directly over TLS (already TCP-based, no TC-bit fallback needed)
+        if (self.tls_transport) |tls_t| {
+            var response_buf: [65535]u8 = undefined;
+            const response_data = try tls_t.query(wire_query, upstream, &response_buf);
+            return try dns.parseMessage(allocator, response_data);
+        }
+
+        // Do53 path: UDP with TCP fallback on truncation
         const response_data = try self.transport.query(wire_query, query_id, upstream);
 
         // Parse response

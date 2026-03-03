@@ -5,7 +5,7 @@
 - **Usable tool**: Correct and robust enough to run on your own machines. Not a toy, not enterprise-grade.
 - **RFC-driven**: Build directly from the RFCs. Write our own solutions. Reference unbound only when stuck.
 - **Linux-first**: io_uring for I/O. Portability is not a goal.
-- **Dependency-minimal**: Zig stdlib only. No external packages.
+- **Dependency-minimal**: Zero deps preferred. Stdlib first, local patches second, vendor third, external dep last resort.
 - **Test everything**: Fuzz parsers, integration-test against real DNS, use `std.testing.allocator` to catch leaks.
 
 ## Design Anti-Patterns (Lessons from Hickory)
@@ -40,10 +40,10 @@ that inform hark's design:
                   │    Query Pipeline         │
                   │  ┌─────────────────────┐  │
                   │  │ Cache lookup         │  │  M4 ✅
-                  │  │ QNAME minimization   │  │  M7
+                  │  │ QNAME minimization   │  │  M7 ✅
                   │  │ Recursive resolution │  │  M3 ✅
                   │  │ Forwarding fallback  │  │  M3 ✅
-                  │  │ DNSSEC validation    │  │  M8
+                  │  │ DNSSEC validation    │  │  M8 ✅
                   │  └─────────────────────┘  │
                   └────────────┬──────────────┘
                                │
@@ -51,7 +51,8 @@ that inform hark's design:
                   │    Transport              │
                   │  UDP / io_uring           │  M2 ✅
                   │  TCP fallback             │  M5 ✅
-                  │  EDNS0 payload sizing     │  M6
+                  │  EDNS0 payload sizing     │  M6 ✅
+                  │  DoT / RFC 9539          │  M9
                   └──────────────────────────┘
                                │
                   ┌────────────▼─────────────┐
@@ -105,57 +106,52 @@ that inform hark's design:
 - TC-bit fallback in both ForwardingResolver and RecursiveResolver
 - Per-query TCP connections (connection reuse deferred)
 
+### M6: EDNS0 ✅
+- OPT pseudo-record (type 41) in Message, parse/serialize/pretty-print
+- EdnsConfig in QueryOptions, 1232-byte UDP payload (IPv6-safe per DNS Flag Day 2020)
+- DO bit support (prerequisite for DNSSEC)
+- Both resolvers send OPT by default
+
+### M7: QNAME Minimization ✅
+- Send only the necessary labels (zone cut + 1) to each authoritative
+- Relaxed NXDOMAIN mode (fall back to full QNAME on NXDOMAIN)
+
+### M8: DNSSEC Validation ✅
+- Chain-of-trust validation (DNSKEY → DS chain), negative proofs (NSEC/NSEC3)
+- All 5 production algorithms: RSA-SHA256 (8), RSA-SHA512 (10), ECDSA P-256 (13),
+  P-384 (14), Ed25519 (15). RSA via `std.crypto.Certificate.rsa` (internal but accessible).
+- Bogus vs. insecure vs. secure classification
+- Policy: unsupported algorithms (Ed448, legacy SHA1) → bogus → ServFail (safe default)
+
 ## Milestone Roadmap
 
-### M6: EDNS0
-**RFCs**: 6891 (EDNS0)
-**Goal**: Support larger UDP payloads and EDNS option negotiation.
+### M9: DNS-over-TLS + RFC 9539
+**RFCs**: 7858 (DoT), 9539 (opportunistic recursive-to-authoritative encryption)
+**Goal**: Encrypted transport — both traditional DoT and opportunistic encryption.
 
-- OPT pseudo-record parsing + serialization in dns.zig
-- Advertise 1232-byte UDP buffer size (IPv6-safe per DNS Flag Day 2020)
-- Parse EDNS options from responses
-- DO bit support (prerequisite for DNSSEC)
+**Two distinct use cases:**
 
-### M7: QNAME Minimization
-**RFCs**: 9156 (QNAME minimization)
-**Goal**: Minimize information leaked to each nameserver.
+| Use Case | Direction | Cert Auth | ALPN | Fallback |
+|----------|-----------|-----------|------|----------|
+| Traditional DoT | Client→hark or hark→upstream | Yes (PKI) | Optional | No |
+| RFC 9539 | hark recursive→authoritative | No (any cert) | Required (`"dot"`) | Yes (Do53) |
 
-- Send only the necessary labels (zone cut + 1) to each authoritative
-- Fall back to full QNAME on NXDOMAIN (strict vs relaxed mode)
-- Integrate into the resolution state machine from M3
+**Transport architecture requirements:**
+- Connection reuse (persistent TCP/TLS connections)
+- Per-IP encrypted-capability state (3-day success cache, 1-day failure damping)
+- ALPN negotiation (`"dot"` token)
+- Graceful fallback to cleartext Do53 on failure (RFC 9539)
+- 4-second timeout for encrypted connection attempts
 
-### M8: DNSSEC Validation
-**RFCs**: 4033-4035 (DNSSEC), 5155 (NSEC3)
-**Goal**: Full chain-of-trust validation.
+**TLS approach (least-dependency order):**
+1. Stdlib TLS 1.3 client — works for most DoT servers today
+2. Cherry-pick ALPN from Zig PR #24983 — needed for RFC 9539
+3. Vendor `iotic/tls.zig` if stdlib insufficient (TLS 1.3/1.2 client + server, stdlib ancestor)
+4. External dep only as last resort
 
-- New record types: DNSKEY, RRSIG, DS, NSEC, NSEC3
-- Crypto algorithms:
-  - ECDSA P-256/P-384 (algorithms 13, 14) — available in `std.crypto`
-  - Ed25519 (algorithm 15) — available in `std.crypto`
-  - RSA-SHA256/SHA512 (algorithms 8, 10) — **not publicly exposed** in Zig 0.15
-    (`std.crypto.Certificate` has an internal implementation; Zig issue #19776
-    tracks a public RSA module). Options: wrap internal impl, implement minimal
-    RSA verifier (modexp + PKCS#1 v1.5 padding), or defer RSA until stdlib ships it.
-- Trust anchor: hardcoded root KSK (RFC 5011 rollover as stretch)
-- Validation pipeline: verify RRSIG covers RRset, walk DS→DNSKEY chain
-- Authenticated denial of existence (NSEC/NSEC3 proof verification)
-- NSEC3 aggressive negative caching (RFC 8198)
-- Bogus vs. insecure vs. secure classification
-
-### M9: DNS-over-TLS / DNS-over-HTTPS
-**RFCs**: 7858 (DoT), 8484 (DoH)
-**Goal**: Encrypted transport for client-facing and upstream connections.
-
-*Note: As of Zig 0.15, `std.crypto.tls` has gaps — missing ALPN, incomplete
-TLS 1.2, real-world compatibility issues with some servers. Community
-alternatives exist (iotic/tls.zig, shiguredo/tls13-zig) but add external deps.
-Revisit stdlib maturity when we reach this milestone.*
-
-- DoT: TLS wrapper over TCP framing from M5
-- DoH: HTTP/2 framing (or HTTP/1.1 with content-type application/dns-message)
-- Certificate validation (system trust store or bundled roots)
-- Upstream DoT/DoH (encrypted forwarding)
-- TLS approach TBD — revisit when we reach this milestone
+**Zig 0.15.2 stdlib TLS status:**
+- TLS 1.3 client works; TLS 1.2 buggy; ALPN missing (PR #24983); server-side TLS none
+- Certificate validation partial (RSA chains OK; EC←EC←RSA broken)
 
 ### M10: Server Mode + Configuration
 **Goal**: Listen for client queries, configurable operation.
@@ -184,8 +180,8 @@ Revisit stdlib maturity when we reach this milestone.*
 | I/O model | io_uring via thin owned `EventLoop` | Modern, fast, no external deps. ~200-300 line abstraction. |
 | Allocator strategy | Arena per query | Each query gets an arena, freed on completion. No per-struct deinit. |
 | Cache | In-memory, no persistence | Cleanest approach. Not worth the complexity for a usable tool. |
-| TLS | `std.crypto.tls` (stdlib), revisit at M9 | Zero deps goal, but stdlib has gaps. May need community lib or defer. |
-| DNSSEC RSA | TBD at M8 | stdlib lacks public RSA. Wrap internal impl, write minimal verifier, or wait. |
+| TLS | Stdlib first, ALPN patch, vendor iotic as fallback | Zero deps preferred. Stdlib TLS 1.3 works; ALPN needed for RFC 9539. |
+| DNSSEC RSA | `std.crypto.Certificate.rsa` (internal) | Works. All 5 production algorithms implemented. |
 | Config format | Defer decision | Not needed until M10. |
 | File structure | One file per concern | `dns.zig`, `recursive.zig`, `cache.zig`, `transport.zig`, `event_loop.zig`, etc. |
 | Testing | RFC test vectors + real DNS + fuzz | Fuzz all parsers. Integration test against live DNS for resolution. |

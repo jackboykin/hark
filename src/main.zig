@@ -4,9 +4,11 @@ const dns = hark.dns;
 const EventLoop = hark.event_loop.EventLoop;
 const UdpTransport = hark.transport.UdpTransport;
 const TcpTransport = hark.tcp_transport.TcpTransport;
+const TlsTransport = hark.tls_transport.TlsTransport;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RRsetCache = hark.cache.RRsetCache;
+const Certificate = std.crypto.Certificate;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -45,6 +47,8 @@ fn printUsage() void {
         \\Query options:
         \\  --forward           Use forwarding mode instead of recursive resolution
         \\  --upstream <ip>     Upstream server for forwarding mode (default: 8.8.8.8)
+        \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
+        \\  --dot-host <name>   TLS server hostname for SNI/cert verification
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
         \\  --no-dnssec         Disable DNSSEC validation (default)
@@ -99,6 +103,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var qtype: dns.RType = .a;
     var upstream_ip: [4]u8 = .{ 8, 8, 8, 8 };
     var forward_mode = false;
+    var dot_mode = false;
+    var dot_host: ?[]const u8 = null;
     var no_qmin = false;
     var dnssec_enabled = false;
 
@@ -106,6 +112,16 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--forward")) {
             forward_mode = true;
+        } else if (std.mem.eql(u8, args[i], "--dot")) {
+            dot_mode = true;
+            forward_mode = true; // DoT implies forwarding
+        } else if (std.mem.eql(u8, args[i], "--dot-host")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --dot-host requires a hostname\n", .{});
+                std.process.exit(1);
+            }
+            dot_host = args[i];
         } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
             no_qmin = true;
         } else if (std.mem.eql(u8, args[i], "--dnssec")) {
@@ -145,6 +161,23 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     var tcp_t = TcpTransport.init(loop, .{});
 
+    // Load CA bundle if DoT is enabled
+    var ca_bundle: Certificate.Bundle = .{};
+    var ca_bundle_loaded = false;
+    if (dot_mode) {
+        ca_bundle.rescan(gpa_alloc) catch {
+            std.debug.print("Error: failed to load system CA certificates\n", .{});
+            std.process.exit(1);
+        };
+        ca_bundle_loaded = true;
+    }
+    defer if (ca_bundle_loaded) ca_bundle.deinit(gpa_alloc);
+
+    // TLS transport (only when --dot is set)
+    var tls_t = TlsTransport.init(loop, .{
+        .server_name = dot_host,
+    }, ca_bundle);
+
     // Cache: 16MB cap, 10k max entries
     var cache = RRsetCache.init(gpa_alloc, 16 * 1024 * 1024, 10_000);
     defer cache.deinit();
@@ -155,6 +188,9 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     const response = if (forward_mode) blk: {
         var resolver = ForwardingResolver.initWithTcp(&t, &tcp_t);
+        if (dot_mode) {
+            resolver.tls_transport = &tls_t;
+        }
         const upstream = std.net.Address.initIp4(upstream_ip, 53);
         break :blk resolver.resolve(arena.allocator(), name, qtype, upstream) catch |err| {
             std.debug.print("Query failed: {s}\n", .{@errorName(err)});
