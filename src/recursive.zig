@@ -448,7 +448,23 @@ pub const RecursiveResolver = struct {
                                 break;
                             }
                         }
-                        if (!has_target_type) {
+                        // Follow CNAME when: no target type records, or target type
+                        // records are from a different zone (cross-zone CDN response).
+                        // Cross-zone answers have RRSIG signers that differ between the
+                        // CNAME and target type — fetchDnskey would query the wrong
+                        // servers, so resolve the target through its own delegation chain.
+                        const should_follow_cname = if (!has_target_type)
+                            true
+                        else if (self.dnssec_enabled and security_state == .secure) blk: {
+                            const main_rrsig = dnssec.findRrsig(response.answers, qtype);
+                            const cname_rrsig = dnssec.findRrsig(response.answers, .cname);
+                            break :blk if (main_rrsig != null and cname_rrsig != null)
+                                !main_rrsig.?.signer_name.eql(cname_rrsig.?.signer_name)
+                            else
+                                false;
+                        } else false;
+
+                        if (should_follow_cname) {
                             if (findCnameRecord(response, target_name)) |cname_rr| {
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
