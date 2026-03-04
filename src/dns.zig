@@ -28,6 +28,7 @@ pub fn hasTcBit(bytes: []const u8) bool {
 // ── Constants ──────────────────────────────────────────────────────────
 
 pub const max_label_len = 63;
+pub const max_label_count = 127; // max_name_len / (1 label byte + 1 char) = 127
 pub const max_name_len = 253;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
@@ -349,6 +350,59 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
         pos += win_len;
     }
     return false;
+}
+
+// ── Base32hex (RFC 4648 §7) ───────────────────────────────────────────
+
+/// Decode base32hex (RFC 4648 §7) without padding.
+/// Returns the number of bytes written to `dest`.
+pub fn base32HexDecode(dest: []u8, encoded: []const u8) error{InvalidBase32}!usize {
+    var bits: u32 = 0;
+    var bit_count: u4 = 0;
+    var out: usize = 0;
+
+    for (encoded) |c| {
+        const val: u5 = switch (c) {
+            '0'...'9' => @intCast(c - '0'),
+            'A'...'V' => @intCast(c - 'A' + 10),
+            'a'...'v' => @intCast(c - 'a' + 10),
+            else => return error.InvalidBase32,
+        };
+        bits = (bits << 5) | val;
+        bit_count += 5;
+        if (bit_count >= 8) {
+            bit_count -= 8;
+            if (out >= dest.len) return error.InvalidBase32;
+            dest[out] = @intCast((bits >> bit_count) & 0xFF);
+            out += 1;
+        }
+    }
+    return out;
+}
+
+/// Encode bytes to base32hex (RFC 4648 §7) without padding.
+/// Returns a slice into `dest` with the encoded string.
+pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
+    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var bits: u32 = 0;
+    var bit_count: u4 = 0;
+    var out: usize = 0;
+
+    for (data) |b| {
+        bits = (bits << 8) | b;
+        bit_count += 8;
+        while (bit_count >= 5) {
+            bit_count -= 5;
+            dest[out] = alphabet[@intCast((bits >> bit_count) & 0x1F)];
+            out += 1;
+        }
+    }
+    // Emit trailing bits (if any)
+    if (bit_count > 0) {
+        dest[out] = alphabet[@intCast((bits << (5 - bit_count)) & 0x1F)];
+        out += 1;
+    }
+    return dest[0..out];
 }
 
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────

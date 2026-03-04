@@ -172,9 +172,21 @@ pub fn classifyDelegation(
             }
         }
         if (rr.rtype == .nsec3) {
-            // NSEC3 — if it covers the child and DS not in bitmap
-            if (!dns.typeBitmapContains(rr.rdata.nsec3.type_bit_maps, .ds)) {
-                return .insecure;
+            const nsec3 = rr.rdata.nsec3;
+            if (nsec3.iterations > max_nsec3_iterations) continue;
+            const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            const child_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
+            // Exact match: NSEC3 owner == hash(child_zone), DS absent
+            if (mem.eql(u8, &owner_hash, &child_hash)) {
+                if (!dns.typeBitmapContains(nsec3.type_bit_maps, .ds)) {
+                    return .insecure;
+                }
+            }
+            // Opt-Out cover: child_hash in range and Opt-Out flag set
+            if (nsec3.flags & 1 != 0) {
+                if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &child_hash)) {
+                    return .insecure;
+                }
             }
         }
     }
@@ -659,6 +671,35 @@ pub fn nsec3HashInRange(
     return false;
 }
 
+// ── NSEC3 Owner Hash + Budgeted Hashing ──────────────────────────────
+
+/// Maximum hash computations per NSEC3 validation (CVE-2023-50868 mitigation).
+pub const max_nsec3_hash_budget: u16 = 8;
+
+/// Extract the raw hash from an NSEC3 owner name by base32hex-decoding its first label.
+/// Returns null if the label length is wrong or contains invalid characters.
+pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
+    if (name.labels.len == 0) return null;
+    const label = name.labels[0];
+    if (label.len != 32) return null; // SHA-1 = 20 bytes = 32 base32hex chars
+    var result: [Sha1.digest_length]u8 = undefined;
+    const n = dns.base32HexDecode(&result, label) catch return null;
+    if (n != Sha1.digest_length) return null;
+    return result;
+}
+
+/// Compute NSEC3 hash with budget tracking. Returns null if budget exhausted.
+pub fn budgetedNsec3Hash(
+    name: dns.Name,
+    salt: []const u8,
+    iterations: u16,
+    budget: *u16,
+) ?[Sha1.digest_length]u8 {
+    if (budget.* == 0) return null;
+    budget.* -= 1;
+    return nsec3Hash(name, salt, iterations) catch return null;
+}
+
 // ── Mixed NSEC/NSEC3 Detection ───────────────────────────────────────
 
 /// Check if a response mixes NSEC and NSEC3 from the same zone.
@@ -703,31 +744,115 @@ pub fn validateNegativeProof(
     }
 
     // Try NSEC3 proofs
+    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain);
+}
+
+/// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5).
+fn validateNsec3NegativeProof(
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    qtype: dns.RType,
+    is_nxdomain: bool,
+) SecurityStatus {
+    // Extract NSEC3 parameters from first NSEC3 record
+    var salt: []const u8 = &.{};
+    var iterations: u16 = 0;
+    var found_nsec3 = false;
     for (authorities) |rr| {
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
-            // Iteration cap — treat high iterations as insecure, not bogus
             if (nsec3.iterations > max_nsec3_iterations) return .insecure;
+            salt = nsec3.salt;
+            iterations = nsec3.iterations;
+            found_nsec3 = true;
+            break;
+        }
+    }
+    if (!found_nsec3) return .unchecked;
 
-            if (!is_nxdomain) {
-                // NODATA: find matching NSEC3 and check type bitmap
-                const owner_hash = nsec3Hash(rr.name, nsec3.salt, nsec3.iterations) catch continue;
-                const target_hash = nsec3Hash(qname, nsec3.salt, nsec3.iterations) catch continue;
-                if (mem.eql(u8, &owner_hash, &target_hash) or
-                    nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &target_hash))
+    var budget: u16 = max_nsec3_hash_budget;
+
+    if (!is_nxdomain) {
+        // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
+        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) orelse return .insecure;
+        for (authorities) |rr| {
+            if (rr.rtype != .nsec3) continue;
+            const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            if (mem.eql(u8, &owner_hash, &qname_hash)) {
+                const nsec3 = rr.rdata.nsec3;
+                // Must not have qtype AND must not have CNAME (RFC 5155 §8.5)
+                if (!dns.typeBitmapContains(nsec3.type_bit_maps, qtype) and
+                    !dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
                 {
-                    // This is a rough check — the hash might match or be covered
-                    if (!dns.typeBitmapContains(nsec3.type_bit_maps, qtype)) {
-                        return .secure;
-                    }
+                    return .secure;
                 }
+                return .unchecked;
             }
-            // For NXDOMAIN with NSEC3, we'd need closest encloser proof
-            // which requires walking up labels — simplified here
+        }
+        return .unchecked;
+    }
+
+    // NXDOMAIN (RFC 5155 §8.4): closest encloser proof
+    // Walk up from qname toward root to find closest encloser
+    var ce_idx: ?usize = null; // index into qname.labels where CE starts
+    var label_offset: usize = 0;
+    while (label_offset < qname.labels.len) : (label_offset += 1) {
+        // Build ancestor name from qname.labels[label_offset..]
+        const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
+        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) orelse return .insecure;
+
+        for (authorities) |rr| {
+            if (rr.rtype != .nsec3) continue;
+            const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            if (mem.eql(u8, &owner_hash, &ancestor_hash)) {
+                ce_idx = label_offset;
+                break;
+            }
+        }
+        if (ce_idx != null) break;
+    }
+    const ce_offset = ce_idx orelse return .unchecked;
+
+    // CE == qname itself contradicts NXDOMAIN
+    if (ce_offset == 0) return .bogus;
+
+    // Next closer name: CE + one label toward qname = qname.labels[ce_offset - 1..]
+    const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) orelse return .insecure;
+
+    // Wildcard at closest encloser: *.CE
+    var wc_labels_buf: [dns.max_label_count][]const u8 = undefined;
+    const ce_labels = qname.labels[ce_offset..];
+    wc_labels_buf[0] = "*";
+    for (ce_labels, 0..) |label, i| {
+        wc_labels_buf[1 + i] = label;
+    }
+    const wildcard = dns.Name{ .labels = wc_labels_buf[0 .. 1 + ce_labels.len] };
+    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) orelse return .insecure;
+
+    // Verify: some NSEC3 covers the next-closer hash
+    var nc_covered = false;
+    var wc_covered = false;
+    for (authorities) |rr| {
+        if (rr.rtype != .nsec3) continue;
+        const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+        const nsec3 = rr.rdata.nsec3;
+
+        if (!nc_covered and nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) {
+            nc_covered = true;
+        }
+        // Wildcard: covered (doesn't exist) OR exact match with no qtype (NODATA at wildcard)
+        if (!wc_covered) {
+            if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
+                wc_covered = true;
+            } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
+                // Wildcard exists but doesn't have the type — still proves NXDOMAIN
+                wc_covered = true;
+            }
         }
     }
 
-    // Could not prove — return unchecked (don't bogus, don't secure)
+    if (nc_covered and wc_covered) return .secure;
     return .unchecked;
 }
 
@@ -1370,4 +1495,425 @@ test "validateNegativeProof NSEC NXDOMAIN" {
     };
     const status = validateNegativeProof(&authorities, beta, .a, true);
     try testing.expectEqual(SecurityStatus.secure, status);
+}
+
+// ── NSEC3 Helper Tests ───────────────────────────────────────────────
+
+/// Build an NSEC3 owner name by base32hex-encoding a hash and appending zone labels.
+/// Returns the label slices and Name referencing them. Caller must keep returned
+/// struct alive for as long as the Name is used.
+fn makeNsec3OwnerName(
+    hash: [Sha1.digest_length]u8,
+    zone_labels: []const []const u8,
+    encode_buf: []u8,
+    labels_buf: [][]const u8,
+) dns.Name {
+    const encoded = dns.base32HexEncode(encode_buf, &hash);
+    labels_buf[0] = encoded;
+    for (zone_labels, 0..) |zl, i| {
+        labels_buf[1 + i] = zl;
+    }
+    return dns.Name{ .labels = labels_buf[0 .. 1 + zone_labels.len] };
+}
+
+test "base32hex decode/encode roundtrip" {
+    // RFC 5155 Appendix B: "example" with salt aabbccdd, 12 iterations
+    // Expected base32hex: 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM
+    const name = dns.Name{ .labels = &.{@as([]const u8, "example")} };
+    const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    const hash = try nsec3Hash(name, &salt, 12);
+
+    // Encode to base32hex
+    var enc_buf: [32]u8 = undefined;
+    const encoded = dns.base32HexEncode(&enc_buf, &hash);
+    try testing.expectEqual(@as(usize, 32), encoded.len);
+
+    // Decode back
+    var dec_buf: [20]u8 = undefined;
+    const n = try dns.base32HexDecode(&dec_buf, encoded);
+    try testing.expectEqual(@as(usize, 20), n);
+    try testing.expectEqualSlices(u8, &hash, dec_buf[0..n]);
+}
+
+test "base32hex case insensitivity" {
+    var buf1: [20]u8 = undefined;
+    var buf2: [20]u8 = undefined;
+    const n1 = try dns.base32HexDecode(&buf1, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM");
+    const n2 = try dns.base32HexDecode(&buf2, "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
+    try testing.expectEqual(n1, n2);
+    try testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
+}
+
+test "base32hex invalid characters" {
+    var buf: [20]u8 = undefined;
+    try testing.expectError(error.InvalidBase32, dns.base32HexDecode(&buf, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
+}
+
+test "nsec3OwnerHash extraction" {
+    const name = dns.Name{ .labels = &.{@as([]const u8, "example")} };
+    const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    const hash = try nsec3Hash(name, &salt, 12);
+
+    // Encode to build a proper NSEC3 owner
+    var enc_buf: [32]u8 = undefined;
+    const encoded = dns.base32HexEncode(&enc_buf, &hash);
+
+    const owner_name = dns.Name{
+        .labels = &.{ encoded, @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const extracted = nsec3OwnerHash(owner_name).?;
+    try testing.expectEqualSlices(u8, &hash, &extracted);
+
+    // Wrong length label
+    const bad_name = dns.Name{ .labels = &.{@as([]const u8, "tooshort")} };
+    try testing.expect(nsec3OwnerHash(bad_name) == null);
+
+    // Empty name
+    const empty_name = dns.Name{ .labels = &.{} };
+    try testing.expect(nsec3OwnerHash(empty_name) == null);
+}
+
+test "NSEC3 NODATA - secure" {
+    // Query: example.com AAAA (NODATA)
+    // NSEC3 at hash(example.com) has A and NS but not AAAA, not CNAME
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{ @as([]const u8, "com") };
+    const salt: []const u8 = &.{};
+    const hash = try nsec3Hash(qname, salt, 0);
+
+    var enc_buf: [32]u8 = undefined;
+    var labels_buf: [4][]const u8 = undefined;
+    const owner_name = makeNsec3OwnerName(hash, zone_labels, &enc_buf, &labels_buf);
+
+    // Bitmap: window 0, len 1, A(bit1=0x40) + NS(bit2=0x20) = 0x60
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0xFF} ** 20),
+            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS
+        } },
+    }};
+
+    const status = validateNegativeProof(&authorities, qname, .aaaa, false);
+    try testing.expectEqual(SecurityStatus.secure, status);
+}
+
+test "NSEC3 NODATA - CNAME in bitmap" {
+    // If CNAME is in bitmap, should NOT prove NODATA (RFC 5155 §8.5)
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "alias"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+    const hash = try nsec3Hash(qname, salt, 0);
+
+    var enc_buf: [32]u8 = undefined;
+    var labels_buf: [4][]const u8 = undefined;
+    const owner_name = makeNsec3OwnerName(hash, zone_labels, &enc_buf, &labels_buf);
+
+    // Bitmap with CNAME (type 5): window 0, len 1, CNAME bit = 0x04
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0xFF} ** 20),
+            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x04 }, // CNAME only
+        } },
+    }};
+
+    const status = validateNegativeProof(&authorities, qname, .aaaa, false);
+    try testing.expectEqual(SecurityStatus.unchecked, status);
+}
+
+test "NSEC3 NXDOMAIN - closest encloser proof" {
+    // Query: nonexistent.example.com A (NXDOMAIN)
+    // Closest encloser = example.com
+    // Next closer = nonexistent.example.com
+    // Wildcard = *.example.com
+    // Need 3 NSEC3 records: CE match, NC cover, WC cover
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "nonexistent"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const ce_name = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    // Hash CE (example.com)
+    const ce_hash = try nsec3Hash(ce_name, salt, 0);
+    // Hash next closer (nonexistent.example.com = qname)
+    const nc_hash = try nsec3Hash(qname, salt, 0);
+    // Hash wildcard (*.example.com)
+    const wc_name = dns.Name{
+        .labels = &.{ @as([]const u8, "*"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const wc_hash = try nsec3Hash(wc_name, salt, 0);
+
+    // NSEC3 #1: owner hash = CE hash (proves closest encloser exists)
+    var enc_buf1: [32]u8 = undefined;
+    var labels_buf1: [4][]const u8 = undefined;
+    const ce_owner = makeNsec3OwnerName(ce_hash, zone_labels, &enc_buf1, &labels_buf1);
+
+    // NSEC3 #2: covers NC hash (next closer doesn't exist)
+    // Pick owner < nc_hash < next
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    @memcpy(&nc_low, &nc_hash);
+    @memcpy(&nc_high, &nc_hash);
+    nc_low[19] -|= 1; // wrapping subtract
+    nc_high[19] +|= 1; // wrapping add
+    var enc_buf2: [32]u8 = undefined;
+    var labels_buf2: [4][]const u8 = undefined;
+    const nc_owner = makeNsec3OwnerName(nc_low, zone_labels, &enc_buf2, &labels_buf2);
+
+    // NSEC3 #3: covers WC hash (wildcard doesn't exist)
+    var wc_low: [20]u8 = undefined;
+    var wc_high: [20]u8 = undefined;
+    @memcpy(&wc_low, &wc_hash);
+    @memcpy(&wc_high, &wc_hash);
+    wc_low[19] -|= 1;
+    wc_high[19] +|= 1;
+    var enc_buf3: [32]u8 = undefined;
+    var labels_buf3: [4][]const u8 = undefined;
+    const wc_owner = makeNsec3OwnerName(wc_low, zone_labels, &enc_buf3, &labels_buf3);
+
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = ce_owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = salt,
+                .next_hashed_owner = &([_]u8{0xFF} ** 20),
+                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x40 }, // A
+            } },
+        },
+        .{
+            .name = nc_owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = salt,
+                .next_hashed_owner = &nc_high,
+                .type_bit_maps = &.{},
+            } },
+        },
+        .{
+            .name = wc_owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = salt,
+                .next_hashed_owner = &wc_high,
+                .type_bit_maps = &.{},
+            } },
+        },
+    };
+
+    const status = validateNegativeProof(&authorities, qname, .a, true);
+    try testing.expectEqual(SecurityStatus.secure, status);
+}
+
+test "NSEC3 NXDOMAIN - missing wildcard cover" {
+    // Same as above but without the wildcard-covering NSEC3
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "gone"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const ce_name = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    const ce_hash = try nsec3Hash(ce_name, salt, 0);
+    const nc_hash = try nsec3Hash(qname, salt, 0);
+
+    var enc_buf1: [32]u8 = undefined;
+    var labels_buf1: [4][]const u8 = undefined;
+    const ce_owner = makeNsec3OwnerName(ce_hash, zone_labels, &enc_buf1, &labels_buf1);
+
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    @memcpy(&nc_low, &nc_hash);
+    @memcpy(&nc_high, &nc_hash);
+    nc_low[19] -|= 1;
+    nc_high[19] +|= 1;
+    var enc_buf2: [32]u8 = undefined;
+    var labels_buf2: [4][]const u8 = undefined;
+    const nc_owner = makeNsec3OwnerName(nc_low, zone_labels, &enc_buf2, &labels_buf2);
+
+    // Only CE match + NC cover, NO wildcard cover
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = ce_owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = salt,
+                .next_hashed_owner = &([_]u8{0xFF} ** 20),
+                .type_bit_maps = &.{},
+            } },
+        },
+        .{
+            .name = nc_owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = 1,
+                .flags = 0,
+                .iterations = 0,
+                .salt = salt,
+                .next_hashed_owner = &nc_high,
+                .type_bit_maps = &.{},
+            } },
+        },
+    };
+
+    const status = validateNegativeProof(&authorities, qname, .a, true);
+    try testing.expectEqual(SecurityStatus.unchecked, status);
+}
+
+test "classifyDelegation NSEC3 match" {
+    // NSEC3 owner matches hash(child_zone), DS absent → insecure
+    const child_zone = dns.Name{
+        .labels = &.{ @as([]const u8, "unsigned"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
+    const salt: []const u8 = &.{};
+    const child_hash = try nsec3Hash(child_zone, salt, 0);
+
+    var enc_buf: [32]u8 = undefined;
+    var labels_buf: [4][]const u8 = undefined;
+    const owner_name = makeNsec3OwnerName(child_hash, zone_labels, &enc_buf, &labels_buf);
+
+    // Bitmap: NS only (no DS) — window 0, len 1, NS(bit2=0x20)
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0xFF} ** 20),
+            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x20 }, // NS only, no DS
+        } },
+    }};
+
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+}
+
+test "classifyDelegation NSEC3 non-match" {
+    // Unrelated NSEC3 should not falsely prove insecure
+    const child_zone = dns.Name{
+        .labels = &.{ @as([]const u8, "signed"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
+    const salt: []const u8 = &.{};
+
+    // Use a different name's hash as the NSEC3 owner
+    const other_name = dns.Name{
+        .labels = &.{ @as([]const u8, "other"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const other_hash = try nsec3Hash(other_name, salt, 0);
+
+    var enc_buf: [32]u8 = undefined;
+    var labels_buf: [4][]const u8 = undefined;
+    const owner_name = makeNsec3OwnerName(other_hash, zone_labels, &enc_buf, &labels_buf);
+
+    // This NSEC3 doesn't match child_zone and doesn't cover it (no opt-out)
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0, // no opt-out
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0} ** 20), // next < owner, wraps but may not cover
+            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x20 }, // NS only
+        } },
+    }};
+
+    // Falls through to the final .insecure (no DS, no proof) — this is the existing behavior
+    // for zones without any DS or valid NSEC proof
+    const result = classifyDelegation(&authorities, child_zone);
+    try testing.expectEqual(SecurityStatus.insecure, result);
+}
+
+test "NSEC3 hash budget exhaustion" {
+    // Deep qname: a.b.c.d.e.f.g.h.i.j.example.com — needs 10+ hashes to find CE,
+    // but budget is 8, so should return insecure
+    const qname = dns.Name{
+        .labels = &.{
+            @as([]const u8, "a"), @as([]const u8, "b"), @as([]const u8, "c"),
+            @as([]const u8, "d"), @as([]const u8, "e"), @as([]const u8, "f"),
+            @as([]const u8, "g"), @as([]const u8, "h"), @as([]const u8, "i"),
+            @as([]const u8, "j"), @as([]const u8, "example"), @as([]const u8, "com"),
+        },
+    };
+    const salt: []const u8 = &.{};
+
+    // One unrelated NSEC3 — will never match any ancestor, so budget gets exhausted
+    const unrelated_hash = [_]u8{0x42} ** 20;
+    var enc_buf: [32]u8 = undefined;
+    var labels_buf: [4][]const u8 = undefined;
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const owner_name = makeNsec3OwnerName(unrelated_hash, zone_labels, &enc_buf, &labels_buf);
+
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0x43} ** 20),
+            .type_bit_maps = &.{},
+        } },
+    }};
+
+    // NXDOMAIN with deep name — budget should be exhausted
+    const status = validateNegativeProof(&authorities, qname, .a, true);
+    try testing.expectEqual(SecurityStatus.insecure, status);
 }
