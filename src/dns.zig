@@ -585,6 +585,12 @@ pub const Parser = struct {
         return slice;
     }
 
+    fn dupSlice(self: *Parser, allocator: Allocator, len: usize) Error![]const u8 {
+        if (len == 0) return &.{};
+        const data = try self.readSlice(len);
+        return allocator.dupe(u8, data) catch return error.OutOfMemory;
+    }
+
     pub fn parseName(self: *Parser, allocator: Allocator) Error!Name {
         var labels: ArrayList([]const u8) = .empty;
         var total_len: usize = 0;
@@ -778,18 +784,9 @@ pub const Parser = struct {
                 const name_start = self.pos;
                 const next_domain_name = try self.parseName(allocator);
                 const name_len = self.pos - name_start;
-                const bitmap_len = rdlength - name_len;
-                if (bitmap_len > 0) {
-                    const bitmap_data = try self.readSlice(bitmap_len);
-                    const type_bit_maps = allocator.dupe(u8, bitmap_data) catch return error.OutOfMemory;
-                    return .{ .nsec = .{
-                        .next_domain_name = next_domain_name,
-                        .type_bit_maps = type_bit_maps,
-                    } };
-                }
                 return .{ .nsec = .{
                     .next_domain_name = next_domain_name,
-                    .type_bit_maps = &.{},
+                    .type_bit_maps = try self.dupSlice(allocator, rdlength - name_len),
                 } };
             },
             .nsec3 => {
@@ -798,36 +795,18 @@ pub const Parser = struct {
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
-                const salt_data = try self.readSlice(salt_len);
-                const salt = if (salt_len > 0)
-                    allocator.dupe(u8, salt_data) catch return error.OutOfMemory
-                else
-                    @as([]const u8, &.{});
+                const salt = try self.dupSlice(allocator, salt_len);
                 const hash_len: usize = try self.readU8();
-                const hash_data = try self.readSlice(hash_len);
-                const next_hashed_owner = allocator.dupe(u8, hash_data) catch return error.OutOfMemory;
-                // Remaining bytes are type bit maps
+                const next_hashed_owner = try self.dupSlice(allocator, hash_len);
                 const consumed = 5 + salt_len + 1 + hash_len;
                 const bitmap_len = if (rdlength > consumed) rdlength - consumed else 0;
-                if (bitmap_len > 0) {
-                    const bitmap_data = try self.readSlice(bitmap_len);
-                    const type_bit_maps = allocator.dupe(u8, bitmap_data) catch return error.OutOfMemory;
-                    return .{ .nsec3 = .{
-                        .hash_algorithm = hash_algorithm,
-                        .flags = flags,
-                        .iterations = iterations,
-                        .salt = salt,
-                        .next_hashed_owner = next_hashed_owner,
-                        .type_bit_maps = type_bit_maps,
-                    } };
-                }
                 return .{ .nsec3 = .{
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
                     .iterations = iterations,
                     .salt = salt,
                     .next_hashed_owner = next_hashed_owner,
-                    .type_bit_maps = &.{},
+                    .type_bit_maps = try self.dupSlice(allocator, bitmap_len),
                 } };
             },
             .nsec3param => {
@@ -836,16 +815,11 @@ pub const Parser = struct {
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
-                const salt_data = try self.readSlice(salt_len);
-                const salt = if (salt_len > 0)
-                    allocator.dupe(u8, salt_data) catch return error.OutOfMemory
-                else
-                    @as([]const u8, &.{});
                 return .{ .nsec3param = .{
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
                     .iterations = iterations,
-                    .salt = salt,
+                    .salt = try self.dupSlice(allocator, salt_len),
                 } };
             },
             .opt, _ => {
@@ -2013,33 +1987,26 @@ pub fn freeOpt(allocator: Allocator, opt: OptRecord) void {
     if (opt.options.len > 0) allocator.free(opt.options);
 }
 
+fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
+    for (rrs) |rr| {
+        freeName(allocator, rr.name);
+        freeRData(allocator, rr.rdata);
+    }
+    allocator.free(rrs);
+}
+
 pub fn freeMessage(allocator: Allocator, msg: Message) void {
     for (msg.questions) |q| freeName(allocator, q.name);
     allocator.free(msg.questions);
-    for (msg.answers) |rr| {
-        freeName(allocator, rr.name);
-        freeRData(allocator, rr.rdata);
-    }
-    allocator.free(msg.answers);
-    for (msg.authorities) |rr| {
-        freeName(allocator, rr.name);
-        freeRData(allocator, rr.rdata);
-    }
-    allocator.free(msg.authorities);
-    for (msg.additionals) |rr| {
-        freeName(allocator, rr.name);
-        freeRData(allocator, rr.rdata);
-    }
-    allocator.free(msg.additionals);
+    freeResourceRecords(allocator, msg.answers);
+    freeResourceRecords(allocator, msg.authorities);
+    freeResourceRecords(allocator, msg.additionals);
     if (msg.opt) |opt| freeOpt(allocator, opt);
 }
 
 test "parseDottedName basic" {
     const name = try parseDottedName(testing.allocator, "example.com");
-    defer {
-        for (name.labels) |l| testing.allocator.free(l);
-        testing.allocator.free(name.labels);
-    }
+    defer freeName(testing.allocator, name);
     try testing.expectEqual(@as(usize, 2), name.labels.len);
     try testing.expectEqualStrings("example", name.labels[0]);
     try testing.expectEqualStrings("com", name.labels[1]);
@@ -2047,10 +2014,7 @@ test "parseDottedName basic" {
 
 test "parseDottedName trailing dot" {
     const name = try parseDottedName(testing.allocator, "example.com.");
-    defer {
-        for (name.labels) |l| testing.allocator.free(l);
-        testing.allocator.free(name.labels);
-    }
+    defer freeName(testing.allocator, name);
     try testing.expectEqual(@as(usize, 2), name.labels.len);
     try testing.expectEqualStrings("example", name.labels[0]);
     try testing.expectEqualStrings("com", name.labels[1]);
@@ -2116,10 +2080,7 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
 
-    // Serialize and re-parse
-    var buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     try testing.expectEqual(msg.header.id, msg2.header.id);
@@ -2135,10 +2096,7 @@ test "buildQueryWithOptions rd=false roundtrip" {
     try testing.expect(!msg.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
 
-    // Serialize and re-parse to verify rd bit survives wire format
-    var buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     try testing.expect(!msg2.header.rd);
@@ -2146,17 +2104,35 @@ test "buildQueryWithOptions rd=false roundtrip" {
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
 }
 
+// ── Test helpers ────────────────────────────────────────────────────
+
+fn testHeader(pkt: *[512]u8, opts: struct {
+    id: u16 = 0x0001,
+    flags: u16 = 0x8000,
+    qd: u16 = 0,
+    an: u16 = 1,
+    ns: u16 = 0,
+    ar: u16 = 0,
+}) void {
+    mem.writeInt(u16, pkt[0..2], opts.id, .big);
+    mem.writeInt(u16, pkt[2..4], opts.flags, .big);
+    mem.writeInt(u16, pkt[4..6], opts.qd, .big);
+    mem.writeInt(u16, pkt[6..8], opts.an, .big);
+    mem.writeInt(u16, pkt[8..10], opts.ns, .big);
+    mem.writeInt(u16, pkt[10..12], opts.ar, .big);
+}
+
+fn testRoundtrip(allocator: Allocator, msg: Message) Error!Message {
+    var ser_buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&ser_buf, msg);
+    return parseMessage(allocator, wire);
+}
+
 // ── DNSSEC record type tests ────────────────────────────────────────
 
 test "DNSKEY record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    // Header: ancount=1
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     // Name: "." (root)
@@ -2194,10 +2170,7 @@ test "DNSKEY record parse/serialize roundtrip" {
     try testing.expect(dnskey.isSecureEntryPoint());
     try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
 
-    // Serialize and re-parse
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const dk2 = msg2.answers[0].rdata.dnskey;
@@ -2209,12 +2182,7 @@ test "DNSKEY record parse/serialize roundtrip" {
 
 test "DS record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     const rrname = "\x07example\x03com\x00";
@@ -2248,10 +2216,7 @@ test "DS record parse/serialize roundtrip" {
     try testing.expectEqual(DigestType.sha256, ds.digest_type);
     try testing.expectEqualSlices(u8, &digest, ds.digest);
 
-    // Roundtrip
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const ds2 = msg2.answers[0].rdata.ds;
@@ -2261,12 +2226,7 @@ test "DS record parse/serialize roundtrip" {
 
 test "RRSIG record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     const rrname = "\x07example\x03com\x00";
@@ -2317,10 +2277,7 @@ test "RRSIG record parse/serialize roundtrip" {
     try testing.expectEqualStrings("example", rrsig.signer_name.labels[0]);
     try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
 
-    // Roundtrip
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const rrsig2 = msg2.answers[0].rdata.rrsig;
@@ -2332,12 +2289,7 @@ test "RRSIG record parse/serialize roundtrip" {
 
 test "NSEC record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     const rrname = "\x07example\x03com\x00";
@@ -2385,10 +2337,7 @@ test "NSEC record parse/serialize roundtrip" {
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .aaaa));
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .txt));
 
-    // Roundtrip
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const nsec2 = msg2.answers[0].rdata.nsec;
@@ -2398,12 +2347,7 @@ test "NSEC record parse/serialize roundtrip" {
 
 test "NSEC3 record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     // Owner: some base32 hash label under example.com (simplified for test)
@@ -2453,10 +2397,7 @@ test "NSEC3 record parse/serialize roundtrip" {
     try testing.expect(typeBitmapContains(nsec3.type_bit_maps, .a));
     try testing.expect(!typeBitmapContains(nsec3.type_bit_maps, .aaaa));
 
-    // Roundtrip
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const n3_2 = msg2.answers[0].rdata.nsec3;
@@ -2469,12 +2410,7 @@ test "NSEC3 record parse/serialize roundtrip" {
 
 test "NSEC3PARAM record parse/serialize roundtrip" {
     var pkt: [512]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
+    testHeader(&pkt, .{});
 
     var pos: usize = 12;
     const rrname = "\x07example\x03com\x00";
@@ -2509,10 +2445,7 @@ test "NSEC3PARAM record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
 
-    // Roundtrip
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
-    const msg2 = try parseMessage(testing.allocator, wire);
+    const msg2 = try testRoundtrip(testing.allocator, msg);
     defer freeMessage(testing.allocator, msg2);
 
     const np2 = msg2.answers[0].rdata.nsec3param;
