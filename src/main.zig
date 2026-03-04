@@ -311,30 +311,12 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn parseRType(s: []const u8) ?dns.RType {
-    const lower = blk: {
-        var buf: [16]u8 = undefined;
-        if (s.len > buf.len) return null;
-        for (s, 0..) |c, idx| {
-            buf[idx] = std.ascii.toLower(c);
-        }
-        break :blk buf[0..s.len];
-    };
-
-    if (std.mem.eql(u8, lower, "a")) return .a;
-    if (std.mem.eql(u8, lower, "aaaa")) return .aaaa;
-    if (std.mem.eql(u8, lower, "ns")) return .ns;
-    if (std.mem.eql(u8, lower, "cname")) return .cname;
-    if (std.mem.eql(u8, lower, "soa")) return .soa;
-    if (std.mem.eql(u8, lower, "ptr")) return .ptr;
-    if (std.mem.eql(u8, lower, "mx")) return .mx;
-    if (std.mem.eql(u8, lower, "txt")) return .txt;
-    if (std.mem.eql(u8, lower, "ds")) return .ds;
-    if (std.mem.eql(u8, lower, "rrsig")) return .rrsig;
-    if (std.mem.eql(u8, lower, "nsec")) return .nsec;
-    if (std.mem.eql(u8, lower, "dnskey")) return .dnskey;
-    if (std.mem.eql(u8, lower, "nsec3")) return .nsec3;
-    if (std.mem.eql(u8, lower, "nsec3param")) return .nsec3param;
-    return null;
+    var buf: [16]u8 = undefined;
+    if (s.len > buf.len) return null;
+    for (s, 0..) |c, idx| buf[idx] = std.ascii.toLower(c);
+    const result = std.meta.stringToEnum(dns.RType, buf[0..s.len]) orelse return null;
+    if (result == .opt) return null; // pseudo-type, not a real query type
+    return result;
 }
 
 fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {

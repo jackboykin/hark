@@ -273,18 +273,22 @@ fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
     };
 }
 
+/// Lowercase src into dest, returning the written slice.
+fn lowerInto(dest: []u8, src: []const u8) []const u8 {
+    for (src, 0..) |c, i| dest[i] = std.ascii.toLower(c);
+    return dest[0..src.len];
+}
+
 /// Lowercase a name into a stack buffer for lookup. Returns null if name too long.
 fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
     if (name.len > dns.max_name_len) return null;
-    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..name.len];
+    return lowerInto(buf, name);
 }
 
 /// Allocate a lowercased copy of a name string.
 fn toLowerNameAlloc(alloc: Allocator, name: []const u8) ![]const u8 {
     const buf = try alloc.alloc(u8, name.len);
-    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf;
+    return lowerInto(buf, name);
 }
 
 /// Convert a dns.Name to a lowercased dotted string, allocated.
@@ -292,8 +296,7 @@ fn nameToLowerDotted(alloc: Allocator, name: dns.Name) ![]const u8 {
     const fmt = name.format();
     const len = mem.indexOfScalar(u8, &fmt, 0) orelse fmt.len;
     const result = try alloc.alloc(u8, len);
-    for (fmt[0..len], 0..) |c, i| result[i] = std.ascii.toLower(c);
-    return result;
+    return lowerInto(result, fmt[0..len]);
 }
 
 // ── RRsetCache ────────────────────────────────────────────────────────
@@ -785,6 +788,26 @@ fn makeTestCache(alloc: Allocator) RRsetCache {
     return cache;
 }
 
+fn makeTestName(alloc: Allocator, comptime labels: []const []const u8) !dns.Name {
+    const name_labels = try alloc.alloc([]const u8, labels.len);
+    inline for (labels, 0..) |label, i| name_labels[i] = try alloc.dupe(u8, label);
+    return dns.Name{ .labels = name_labels };
+}
+
+fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
+    return .{
+        .header = .{
+            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
+            .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error,
+            .qd_count = 0, .an_count = @intCast(answers.len), .ns_count = 0, .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = answers,
+        .authorities = &.{},
+        .additionals = &.{},
+    };
+}
+
 test "cache store and lookup positive" {
     const alloc = testing.allocator;
     test_time = 1000;
@@ -792,42 +815,11 @@ test "cache store and lookup positive" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // Build a response with an A record for example.com
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "example");
-    name_labels[1] = try alloc.dupe(u8, "com");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "example", "com" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .a = .{ 93, 184, 216, 34 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 93, 184, 216, 34 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0, .ad = false, .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     const root_zone = dns.Name{ .labels = &.{} };
@@ -856,41 +848,11 @@ test "cache lookup expired entry returns null" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "example");
-    name_labels[1] = try alloc.dupe(u8, "com");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "example", "com" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 60,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0, .ad = false, .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} });
@@ -911,41 +873,11 @@ test "cache TTL adjustment" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "example");
-    name_labels[1] = try alloc.dupe(u8, "com");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "example", "com" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0, .ad = false, .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} });
@@ -970,41 +902,11 @@ test "cache case insensitive lookup" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "EXAMPLE");
-    name_labels[1] = try alloc.dupe(u8, "COM");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "EXAMPLE", "COM" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0, .ad = false, .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} });
@@ -1023,23 +925,9 @@ test "cache negative NXDOMAIN" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // SOA record for the authority section
-    const soa_name_labels = try alloc.alloc([]const u8, 2);
-    soa_name_labels[0] = try alloc.dupe(u8, "example");
-    soa_name_labels[1] = try alloc.dupe(u8, "com");
-    const soa_name = dns.Name{ .labels = soa_name_labels };
-
-    const mname_labels = try alloc.alloc([]const u8, 3);
-    mname_labels[0] = try alloc.dupe(u8, "ns1");
-    mname_labels[1] = try alloc.dupe(u8, "example");
-    mname_labels[2] = try alloc.dupe(u8, "com");
-    const mname = dns.Name{ .labels = mname_labels };
-
-    const rname_labels = try alloc.alloc([]const u8, 3);
-    rname_labels[0] = try alloc.dupe(u8, "admin");
-    rname_labels[1] = try alloc.dupe(u8, "example");
-    rname_labels[2] = try alloc.dupe(u8, "com");
-    const rname = dns.Name{ .labels = rname_labels };
+    const soa_name = try makeTestName(alloc, &.{ "example", "com" });
+    const mname = try makeTestName(alloc, &.{ "ns1", "example", "com" });
+    const rname = try makeTestName(alloc, &.{ "admin", "example", "com" });
 
     const authorities = try alloc.alloc(dns.ResourceRecord, 1);
     authorities[0] = .{
@@ -1093,38 +981,10 @@ test "cache eviction when full" {
     const names = [_][]const u8{ "a.com", "b.com", "c.com" };
     for (names) |n| {
         const parsed = try dns.parseDottedName(alloc, n);
-
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
-        answers[0] = .{
-            .name = parsed,
-            .rtype = .a,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-        };
+        answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-        const response = dns.Message{
-            .header = .{
-                .id = 0,
-                .qr = true,
-                .opcode = .query,
-                .aa = true,
-                .tc = false,
-                .rd = false,
-                .ra = false,
-                .z = 0, .ad = false, .cd = false,
-                .rcode = .no_error,
-                .qd_count = 0,
-                .an_count = 1,
-                .ns_count = 0,
-                .ar_count = 0,
-            },
-            .questions = &.{},
-            .answers = answers,
-            .authorities = &.{},
-            .additionals = &.{},
-        };
-
+        const response = makeTestResponse(answers);
         cache.storeResponse(response, dns.Name{ .labels = &.{} });
         dns.freeMessage(alloc, response);
     }
@@ -1146,43 +1006,11 @@ test "cache deep copy independence" {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const name_labels = try a.alloc([]const u8, 2);
-        name_labels[0] = try a.dupe(u8, "deep");
-        name_labels[1] = try a.dupe(u8, "test");
-        const name = dns.Name{ .labels = name_labels };
-
+        const name = try makeTestName(a, &.{ "deep", "test" });
         const answers = try a.alloc(dns.ResourceRecord, 1);
-        answers[0] = .{
-            .name = name,
-            .rtype = .a,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .a = .{ 10, 20, 30, 40 } },
-        };
+        answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 10, 20, 30, 40 } } };
 
-        const response = dns.Message{
-            .header = .{
-                .id = 0,
-                .qr = true,
-                .opcode = .query,
-                .aa = true,
-                .tc = false,
-                .rd = false,
-                .ra = false,
-                .z = 0, .ad = false, .cd = false,
-                .rcode = .no_error,
-                .qd_count = 0,
-                .an_count = 1,
-                .ns_count = 0,
-                .ar_count = 0,
-            },
-            .questions = &.{},
-            .answers = answers,
-            .authorities = &.{},
-            .additionals = &.{},
-        };
-
-        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        cache.storeResponse(makeTestResponse(answers), dns.Name{ .labels = &.{} });
         // arena destroyed here — cache must still work
     }
 
@@ -1207,41 +1035,11 @@ test "cache skip zero TTL records" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "zero");
-    name_labels[1] = try alloc.dupe(u8, "ttl");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "zero", "ttl" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 0,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 0, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0, .ad = false, .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} });
@@ -1290,31 +1088,11 @@ test "cache stats tracking" {
     try testing.expectEqual(@as(u64, 1), cache.getStats().misses);
 
     // Store a record
-    const name_labels = try alloc.alloc([]const u8, 2);
-    name_labels[0] = try alloc.dupe(u8, "stats");
-    name_labels[1] = try alloc.dupe(u8, "test");
-    const name = dns.Name{ .labels = name_labels };
-
+    const name = try makeTestName(alloc, &.{ "stats", "test" });
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-    };
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
-            .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error,
-            .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
-    };
+    const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} });

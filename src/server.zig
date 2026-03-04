@@ -187,20 +187,12 @@ pub const Server = struct {
             var addr_buf: [64]u8 = undefined;
             const addr_str = formatAddress(addr, &addr_buf);
 
-            const udp_fd = if (reuseport)
-                createUdpSocketReuseport(addr)
-            else
-                createUdpSocket(addr);
-            udp_socks[i] = udp_fd catch |err| {
+            udp_socks[i] = createSocket(addr, posix.SOCK.DGRAM, reuseport, false) catch |err| {
                 log.warn("failed to create UDP socket for {s}: {s}", .{ addr_str, @errorName(err) });
                 continue;
             };
 
-            const tcp_fd = if (reuseport)
-                createTcpListenSocketReuseport(addr)
-            else
-                createTcpListenSocket(addr);
-            tcp_socks[i] = tcp_fd catch |err| {
+            tcp_socks[i] = createSocket(addr, posix.SOCK.STREAM, reuseport, true) catch |err| {
                 log.warn("failed to create TCP socket for {s}: {s}", .{ addr_str, @errorName(err) });
                 posix.close(udp_socks[i]);
                 udp_socks[i] = -1;
@@ -344,6 +336,13 @@ const WorkerState = struct {
         self.loop.flush();
     }
 
+    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: std.net.Address) void {
+        var wire_buf: [512]u8 = undefined;
+        if (serializeErrorResponse(&wire_buf, id, rcode, rd, questions)) |wire| {
+            sendUdpResponse(sock, wire, client_addr);
+        }
+    }
+
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: std.net.Address) void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -352,35 +351,23 @@ const WorkerState = struct {
         const query = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                var wire_buf: [512]u8 = undefined;
-                if (serializeErrorResponse(&wire_buf, id, .format_error, false, &.{})) |wire| {
-                    sendUdpResponse(sock, wire, client_addr);
-                }
+                sendErrorUdp(sock, id, .format_error, false, &.{}, client_addr);
             }
             return;
         };
 
         if (query.header.opcode != .query) {
-            var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .not_implemented, query.header.rd, query.questions)) |wire| {
-                sendUdpResponse(sock, wire, client_addr);
-            }
+            sendErrorUdp(sock, query.header.id, .not_implemented, query.header.rd, query.questions, client_addr);
             return;
         }
 
         if (query.questions.len != 1) {
-            var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .format_error, query.header.rd, query.questions)) |wire| {
-                sendUdpResponse(sock, wire, client_addr);
-            }
+            sendErrorUdp(sock, query.header.id, .format_error, query.header.rd, query.questions, client_addr);
             return;
         }
 
         if (query.questions[0].qclass != .in) {
-            var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .refused, query.header.rd, query.questions)) |wire| {
-                sendUdpResponse(sock, wire, client_addr);
-            }
+            sendErrorUdp(sock, query.header.id, .refused, query.header.rd, query.questions, client_addr);
             return;
         }
 
@@ -396,10 +383,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
-            var wire_buf: [512]u8 = undefined;
-            if (serializeErrorResponse(&wire_buf, query.header.id, .server_failure, query.header.rd, query.questions)) |wire| {
-                sendUdpResponse(sock, wire, client_addr);
-            }
+            sendErrorUdp(sock, query.header.id, .server_failure, query.header.rd, query.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
@@ -701,54 +685,20 @@ fn setV6Only(sock: posix.fd_t, family: u16) !void {
 
 // ── Socket creation ────────────────────────────────────────────────────
 
-fn createUdpSocket(addr: std.net.Address) !posix.fd_t {
-    const sock = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+fn createSocket(addr: std.net.Address, sock_type: u32, reuseport: bool, listen: bool) !posix.fd_t {
+    const sock = try posix.socket(addr.any.family, sock_type | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(sock);
 
     try setV6Only(sock, addr.any.family);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
+    if (reuseport) {
+        try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
+    }
     try posix.bind(sock, &addr.any, addr.getOsSockLen());
-
-    return sock;
-}
-
-fn createUdpSocketReuseport(addr: std.net.Address) !posix.fd_t {
-    const sock = try posix.socket(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    errdefer posix.close(sock);
-
-    try setV6Only(sock, addr.any.family);
-    const optval: c_int = 1;
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
-    try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
-
-    return sock;
-}
-
-fn createTcpListenSocket(addr: std.net.Address) !posix.fd_t {
-    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    errdefer posix.close(sock);
-
-    try setV6Only(sock, addr.any.family);
-    const optval: c_int = 1;
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
-    try posix.listen(sock, 128);
-
-    return sock;
-}
-
-fn createTcpListenSocketReuseport(addr: std.net.Address) !posix.fd_t {
-    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    errdefer posix.close(sock);
-
-    try setV6Only(sock, addr.any.family);
-    const optval: c_int = 1;
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
-    try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
-    try posix.listen(sock, 128);
+    if (listen) {
+        try posix.listen(sock, 128);
+    }
 
     return sock;
 }
@@ -921,9 +871,9 @@ test "serializeErrorResponse with no question (parse failure)" {
     try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
 }
 
-test "createUdpSocket binds to ephemeral port" {
+test "createSocket UDP binds to ephemeral port" {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const sock = createUdpSocket(addr) catch return error.SkipZigTest;
+    const sock = createSocket(addr, posix.SOCK.DGRAM, false, false) catch return error.SkipZigTest;
     defer posix.close(sock);
 
     var bound: std.net.Address = undefined;
@@ -932,9 +882,9 @@ test "createUdpSocket binds to ephemeral port" {
     try testing.expect(bound.getPort() > 0);
 }
 
-test "createTcpListenSocket binds and listens" {
+test "createSocket TCP binds and listens" {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const sock = createTcpListenSocket(addr) catch return error.SkipZigTest;
+    const sock = createSocket(addr, posix.SOCK.STREAM, false, true) catch return error.SkipZigTest;
     defer posix.close(sock);
 
     var bound: std.net.Address = undefined;
@@ -943,9 +893,9 @@ test "createTcpListenSocket binds and listens" {
     try testing.expect(bound.getPort() > 0);
 }
 
-test "createUdpSocketReuseport allows multiple binds" {
+test "createSocket UDP reuseport allows multiple binds" {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const sock1 = createUdpSocketReuseport(addr) catch return error.SkipZigTest;
+    const sock1 = createSocket(addr, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
     defer posix.close(sock1);
 
     // Get the actual port
@@ -956,6 +906,6 @@ test "createUdpSocketReuseport allows multiple binds" {
 
     // Second socket on same port should succeed with SO_REUSEPORT
     const addr2 = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    const sock2 = createUdpSocketReuseport(addr2) catch return error.SkipZigTest;
+    const sock2 = createSocket(addr2, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
     defer posix.close(sock2);
 }

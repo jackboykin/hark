@@ -143,12 +143,18 @@ pub const EventLoop = struct {
         self.free_count += 1;
     }
 
-    pub fn setTimeout(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
+    fn initOp(self: *EventLoop, kind: OpKind, context: *anyopaque) !OperationId {
         const id = self.allocSlot() orelse return error.TooManyOperations;
         const slot = &self.slots[id];
-        slot.kind = .timeout;
+        slot.kind = kind;
         slot.context = context;
         slot.active = true;
+        return id;
+    }
+
+    pub fn setTimeout(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
+        const id = try self.initOp(.timeout, context);
+        const slot = &self.slots[id];
         slot.timeout_spec = .{
             .sec = @intCast(ms / 1000),
             .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000),
@@ -161,11 +167,8 @@ pub const EventLoop = struct {
     }
 
     pub fn sendTo(self: *EventLoop, fd: posix.fd_t, data: []const u8, dest: std.net.Address, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const id = try self.initOp(.send, context);
         const slot = &self.slots[id];
-        slot.kind = .send;
-        slot.context = context;
-        slot.active = true;
 
         slot.iov_const[0] = .{ .base = data.ptr, .len = data.len };
         slot.addr = dest;
@@ -188,11 +191,8 @@ pub const EventLoop = struct {
     }
 
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const id = try self.initOp(.recv, context);
         const slot = &self.slots[id];
-        slot.kind = .recv;
-        slot.context = context;
-        slot.active = true;
 
         slot.iov[0] = .{ .base = &slot.recv_buf, .len = recv_buf_size };
         slot.addr = std.mem.zeroes(std.net.Address);
@@ -215,11 +215,8 @@ pub const EventLoop = struct {
     }
 
     pub fn connect(self: *EventLoop, fd: posix.fd_t, dest: std.net.Address, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const id = try self.initOp(.connect, context);
         const slot = &self.slots[id];
-        slot.kind = .connect;
-        slot.context = context;
-        slot.active = true;
         slot.addr = dest;
         slot.addr_len = dest.getOsSockLen();
 
@@ -230,12 +227,7 @@ pub const EventLoop = struct {
     }
 
     pub fn tcpSend(self: *EventLoop, fd: posix.fd_t, data: []const u8, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
-        const slot = &self.slots[id];
-        slot.kind = .tcp_send;
-        slot.context = context;
-        slot.active = true;
-
+        const id = try self.initOp(.tcp_send, context);
         var sqe = try self.ring.get_sqe();
         sqe.prep_send(fd, data, 0);
         sqe.user_data = id;
@@ -243,24 +235,16 @@ pub const EventLoop = struct {
     }
 
     pub fn tcpRecv(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
-        const slot = &self.slots[id];
-        slot.kind = .tcp_recv;
-        slot.context = context;
-        slot.active = true;
-
+        const id = try self.initOp(.tcp_recv, context);
         var sqe = try self.ring.get_sqe();
-        sqe.prep_recv(fd, &slot.recv_buf, 0);
+        sqe.prep_recv(fd, &self.slots[id].recv_buf, 0);
         sqe.user_data = id;
         return id;
     }
 
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
+        const id = try self.initOp(.accept, context);
         const slot = &self.slots[id];
-        slot.kind = .accept;
-        slot.context = context;
-        slot.active = true;
         slot.addr = std.mem.zeroes(std.net.Address);
         slot.addr_len = @sizeOf(std.net.Address);
 
@@ -271,14 +255,9 @@ pub const EventLoop = struct {
     }
 
     pub fn read(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
-        const slot = &self.slots[id];
-        slot.kind = .read;
-        slot.context = context;
-        slot.active = true;
-
+        const id = try self.initOp(.read, context);
         var sqe = try self.ring.get_sqe();
-        sqe.prep_read(fd, &slot.recv_buf, 0);
+        sqe.prep_read(fd, &self.slots[id].recv_buf, 0);
         sqe.user_data = id;
         return id;
     }
@@ -313,6 +292,10 @@ pub const EventLoop = struct {
         return self.reapCompletions(completions_buf);
     }
 
+    fn isCancelled(cqe: linux.io_uring_cqe) bool {
+        return cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)));
+    }
+
     fn reapCompletions(self: *EventLoop, buf: []Completion) ![]Completion {
         var cqes: [max_operations]linux.io_uring_cqe = undefined;
         const count = try self.ring.copy_cqes(&cqes, 0);
@@ -343,7 +326,7 @@ pub const EventLoop = struct {
                             .addr = slot.addr,
                             .err = null,
                         } };
-                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                    } else if (isCancelled(cqe)) {
                         completion.result = .{ .recv = .{
                             .data = &.{},
                             .addr = slot.addr,
@@ -358,13 +341,13 @@ pub const EventLoop = struct {
                     }
                 },
                 .timeout => {
-                    const cancelled = cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)));
+                    const cancelled = isCancelled(cqe);
                     completion.result = .{ .timeout = .{ .expired = !cancelled } };
                 },
                 .connect => {
                     if (cqe.res == 0) {
                         completion.result = .{ .connect = .{ .err = null } };
-                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                    } else if (isCancelled(cqe)) {
                         completion.result = .{ .connect = .{ .err = error.Cancelled } };
                     } else {
                         completion.result = .{ .connect = .{ .err = error.ConnectFailed } };
@@ -385,7 +368,7 @@ pub const EventLoop = struct {
                             .data = &.{},
                             .err = error.ConnectionClosed,
                         } };
-                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                    } else if (isCancelled(cqe)) {
                         completion.result = .{ .tcp_recv = .{
                             .data = &.{},
                             .err = error.Cancelled,
@@ -404,7 +387,7 @@ pub const EventLoop = struct {
                             .addr = slot.addr,
                             .err = null,
                         } };
-                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                    } else if (isCancelled(cqe)) {
                         completion.result = .{ .accept = .{
                             .fd = -1,
                             .addr = slot.addr,
@@ -432,7 +415,7 @@ pub const EventLoop = struct {
                             .data = &.{},
                             .err = error.EndOfFile,
                         } };
-                    } else if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)))) {
+                    } else if (isCancelled(cqe)) {
                         completion.result = .{ .read = .{
                             .bytes_read = 0,
                             .data = &.{},
@@ -459,28 +442,23 @@ pub const EventLoop = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-fn isLinuxIoUringAvailable() bool {
-    if (comptime @import("builtin").os.tag != .linux) return false;
-    return true;
-}
-
-test "EventLoop create/destroy" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
+fn createTestLoop() !*EventLoop {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    return EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
+}
+
+test "EventLoop create/destroy" {
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     try testing.expectEqual(@as(u16, max_operations), loop.free_count);
 }
 
 test "EventLoop setTimeout fires" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     var ctx: u8 = 42;
@@ -494,11 +472,7 @@ test "EventLoop setTimeout fires" {
 }
 
 test "EventLoop sendTo/recvFrom loopback" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     // Create two UDP sockets
@@ -555,11 +529,7 @@ test "EventLoop sendTo/recvFrom loopback" {
 test "EventLoop recvFrom with external sender (server pattern)" {
     // This test mimics the server's exact pattern: recvFrom + accept + read
     // on a non-seekable fd (pipe, like signalfd), with data from an external source.
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     // Create a "server" UDP socket (like the server does)
@@ -642,11 +612,7 @@ test "EventLoop recvFrom with external sender (server pattern)" {
 }
 
 test "EventLoop cancel pending recvFrom" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -678,11 +644,7 @@ test "EventLoop cancel pending recvFrom" {
 }
 
 test "EventLoop TCP connect/send/recv loopback" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const loop = try createTestLoop();
     defer loop.destroy();
 
     // Create a TCP listener

@@ -15,6 +15,11 @@ pub const TcpConfig = struct {
 const Tag = enum { connect, timeout, send, recv };
 const Ctx = struct { tag: Tag };
 
+fn cancelAndFlush(loop: *EventLoop, op: @import("event_loop.zig").OperationId) void {
+    loop.cancel(op) catch {};
+    loop.flush();
+}
+
 pub const TcpTransport = struct {
     loop: *EventLoop,
     config: TcpConfig,
@@ -46,18 +51,15 @@ pub const TcpTransport = struct {
                 switch (ctx.tag) {
                     .connect => {
                         if (c.result.connect.err != null) {
-                            self.loop.cancel(timeout_op) catch {};
-                            self.loop.flush();
+                            cancelAndFlush(self.loop, timeout_op);
                             return error.ConnectFailed;
                         }
-                        self.loop.cancel(timeout_op) catch {};
-                        self.loop.flush();
+                        cancelAndFlush(self.loop, timeout_op);
                         break :connect_loop;
                     },
                     .timeout => {
                         if (c.result.timeout.expired) {
-                            self.loop.cancel(connect_op) catch {};
-                            self.loop.flush();
+                            cancelAndFlush(self.loop, connect_op);
                             return error.Timeout;
                         }
                     },
@@ -88,8 +90,7 @@ pub const TcpTransport = struct {
                     switch (ctx.tag) {
                         .send => {
                             if (c.result.tcp_send.bytes_sent <= 0) {
-                                self.loop.cancel(timeout_op) catch {};
-                                self.loop.flush();
+                                cancelAndFlush(self.loop, timeout_op);
                                 return error.SendFailed;
                             }
                             bytes_sent += @intCast(c.result.tcp_send.bytes_sent);
@@ -97,8 +98,7 @@ pub const TcpTransport = struct {
                         },
                         .timeout => {
                             if (c.result.timeout.expired) {
-                                self.loop.cancel(send_op) catch {};
-                                self.loop.flush();
+                                cancelAndFlush(self.loop, send_op);
                                 return error.Timeout;
                             }
                         },
@@ -126,8 +126,7 @@ pub const TcpTransport = struct {
                         .recv => {
                             const r = c.result.tcp_recv;
                             if (r.err != null or r.data.len == 0) {
-                                self.loop.cancel(timeout_op) catch {};
-                                self.loop.flush();
+                                cancelAndFlush(self.loop, timeout_op);
                                 return error.ConnectionClosed;
                             }
 
@@ -142,8 +141,7 @@ pub const TcpTransport = struct {
                             if (len_filled == 2 and body_len == null) {
                                 const bl = mem.readInt(u16, &len_buf, .big);
                                 if (bl == 0 or bl > response_buf.len) {
-                                    self.loop.cancel(timeout_op) catch {};
-                                    self.loop.flush();
+                                    cancelAndFlush(self.loop, timeout_op);
                                     return error.InvalidLength;
                                 }
                                 body_len = bl;
@@ -158,8 +156,7 @@ pub const TcpTransport = struct {
                                 body_filled += to_copy;
 
                                 if (body_filled >= bl) {
-                                    self.loop.cancel(timeout_op) catch {};
-                                    self.loop.flush();
+                                    cancelAndFlush(self.loop, timeout_op);
                                     break :recv_loop;
                                 }
                             }
@@ -167,8 +164,7 @@ pub const TcpTransport = struct {
                         },
                         .timeout => {
                             if (c.result.timeout.expired) {
-                                self.loop.cancel(recv_op) catch {};
-                                self.loop.flush();
+                                cancelAndFlush(self.loop, recv_op);
                                 return error.Timeout;
                             }
                         },
