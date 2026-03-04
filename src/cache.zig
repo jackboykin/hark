@@ -448,15 +448,6 @@ pub const RRsetCache = struct {
         self.storeRRsets(response.additionals, authority_zone, true);
     }
 
-    /// Cache only authority + additional sections (NS, glue, DS, NSEC) from a
-    /// response. Answer RRsets are omitted so they can be validated first.
-    pub fn storeReferralData(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
-        self.storeRRsets(response.authorities, authority_zone, false);
-        self.storeRRsets(response.additionals, authority_zone, true);
-    }
-
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
     /// Only caches if a SOA record is present in the authority section.
     pub fn storeNegative(

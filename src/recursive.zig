@@ -270,7 +270,7 @@ pub const RecursiveResolver = struct {
                                     enc_state.recordSuccess(addr_key);
                                     response = try dns.parseMessage(allocator, tls_data);
                                     got_response = true;
-                                    if (self.cache) |c| c.storeReferralData(response, parent_zone);
+                                    if (self.cache) |c| c.storeResponse(response, parent_zone);
                                     if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
                                     break;
                                 } else |err| {
@@ -303,7 +303,7 @@ pub const RecursiveResolver = struct {
                             if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
                                 response = try dns.parseMessage(allocator, tcp_data);
                                 got_response = true;
-                                if (self.cache) |c| c.storeReferralData(response, parent_zone);
+                                if (self.cache) |c| c.storeResponse(response, parent_zone);
                                 break;
                             } else |_| {
                                 // TCP failed — ignore truncated response, try next server
@@ -317,8 +317,8 @@ pub const RecursiveResolver = struct {
 
                     got_response = true;
 
-                    // CACHE STORE: Cache referral data now; answers deferred until after validation
-                    if (self.cache) |c| c.storeReferralData(response, parent_zone);
+                    // CACHE STORE: Cache all RRsets from this response
+                    if (self.cache) |c| c.storeResponse(response, parent_zone);
 
                     break;
                 }
@@ -502,8 +502,6 @@ pub const RecursiveResolver = struct {
                             .valid, .skip => {},
                         }
                     }
-                    // Answers validated (or DNSSEC off) — now safe to cache
-                    if (self.cache) |c| c.storeResponse(response, parent_zone);
 
                     return try withCnameChain(allocator, cname_chain.items, response);
                 }
