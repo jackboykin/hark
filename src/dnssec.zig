@@ -331,8 +331,18 @@ pub fn buildSignedData(
     for (rrset, 0..) |rr, idx| {
         const rr_start = temp_pos;
 
-        // Canonical owner name (lowercase, uncompressed)
-        const owner_len = writeCanonicalNameWire(buf[temp_pos..], rr.name) catch return error.BufferTooSmall;
+        // RFC 4035 §5.3.2: reconstruct wildcard owner if labels < name label count
+        const owner_name = if (rrsig.labels < rr.name.labels.len) blk: {
+            var wc_labels: [dns.max_label_count][]const u8 = undefined;
+            wc_labels[0] = "*";
+            const suffix = rr.name.labels[rr.name.labels.len - rrsig.labels ..];
+            for (suffix, 1..) |label, i| {
+                wc_labels[i] = label;
+            }
+            break :blk dns.Name{ .labels = wc_labels[0 .. rrsig.labels + 1] };
+        } else rr.name;
+
+        const owner_len = writeCanonicalNameWire(buf[temp_pos..], owner_name) catch return error.BufferTooSmall;
         temp_pos += owner_len;
 
         if (temp_pos + 10 > buf.len) return error.BufferTooSmall;
@@ -1058,7 +1068,7 @@ test "buildSignedData produces correct header" {
     const rrsig = dns.RrsigData{
         .type_covered = .a,
         .algorithm = .ecdsap256sha256,
-        .labels = 2,
+        .labels = 3,
         .original_ttl = 300,
         .sig_expiration = 1700000000,
         .sig_inception = 1699000000,
@@ -1089,7 +1099,7 @@ test "buildSignedData produces correct header" {
     // Verify first 18 bytes of RRSIG header
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
     try testing.expectEqual(@as(u8, 13), signed[2]); // algorithm
-    try testing.expectEqual(@as(u8, 2), signed[3]); // labels
+    try testing.expectEqual(@as(u8, 3), signed[3]); // labels
     try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[4..8], .big)); // original_ttl
     try testing.expectEqual(@as(u32, 1700000000), mem.readInt(u32, signed[8..12], .big)); // expiration
     try testing.expectEqual(@as(u32, 1699000000), mem.readInt(u32, signed[12..16], .big)); // inception
@@ -1108,6 +1118,54 @@ test "buildSignedData produces correct header" {
     try testing.expectEqual(@as(u32, 300), mem.readInt(u32, signed[after_name + 4 ..][0..4], .big)); // original_ttl (not 200)
     try testing.expectEqual(@as(u16, 4), mem.readInt(u16, signed[after_name + 8 ..][0..2], .big)); // rdlength
     try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, signed[after_name + 10 ..][0..4]); // rdata
+}
+
+test "buildSignedData reconstructs wildcard owner name" {
+    // RFC 4035 §5.3.2: when rrsig.labels < owner label count, reconstruct wildcard
+    const signer_name = dns.Name{
+        .labels = &.{
+            @as([]const u8, "example"),
+            @as([]const u8, "com"),
+        },
+    };
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2, // wildcard: fewer than owner's 3 labels
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 12345,
+        .signer_name = signer_name,
+        .signature = &.{},
+    };
+
+    // Owner has 3 labels but RRSIG says 2 — wildcard expansion
+    const owner_name = dns.Name{
+        .labels = &.{
+            @as([]const u8, "foo"),
+            @as([]const u8, "example"),
+            @as([]const u8, "com"),
+        },
+    };
+
+    const rrset = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 200,
+        .rdata = .{ .a = .{ 93, 184, 216, 34 } },
+    }};
+
+    var buf: [4096]u8 = undefined;
+    const signed = try buildSignedData(&buf, rrsig, &rrset);
+
+    // After the RRSIG header (18 bytes) + signer name (13 bytes) = offset 31
+    const rr_start = 31;
+    // Owner in signed data must be *.example.com = \x01*\x07example\x03com\x00 (16 bytes)
+    // NOT \x03foo\x07example\x03com\x00 (17 bytes)
+    const expected_wc_owner = "\x01*\x07example\x03com\x00";
+    try testing.expectEqualSlices(u8, expected_wc_owner, signed[rr_start..][0..expected_wc_owner.len]);
 }
 
 test "ECDSA P-256 signature verification" {
