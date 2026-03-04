@@ -488,8 +488,8 @@ pub fn verifyRrsig(
     switch (rrsig.algorithm) {
         .rsasha256 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha256),
         .rsasha512 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha512),
-        .ecdsap256sha256 => try verifyEcdsaP256(rrsig.signature, signed_data, dnskey.public_key),
-        .ecdsap384sha384 => try verifyEcdsaP384(rrsig.signature, signed_data, dnskey.public_key),
+        .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, 32, rrsig.signature, signed_data, dnskey.public_key),
+        .ecdsap384sha384 => try verifyEcdsa(EcdsaP384, 48, rrsig.signature, signed_data, dnskey.public_key),
         .ed25519 => try verifyEd25519(rrsig.signature, signed_data, dnskey.public_key),
         else => return error.UnsupportedAlgorithm,
     }
@@ -533,33 +533,19 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     return error.InvalidKey;
 }
 
-/// Verify an ECDSA P-256/SHA-256 signature.
-fn verifyEcdsaP256(signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
-    // DNSSEC key: raw 64-byte x||y. Prepend 0x04 for SEC1 uncompressed.
-    if (key_data.len != 64) return error.InvalidKey;
-    if (signature.len != 64) return error.InvalidSignature;
+/// Verify an ECDSA signature (P-256 or P-384) given raw x||y key and r||s signature.
+fn verifyEcdsa(comptime Curve: type, comptime coord_len: comptime_int, signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
+    const key_len = coord_len * 2;
+    if (key_data.len != key_len) return error.InvalidKey;
+    if (signature.len != key_len) return error.InvalidSignature;
 
-    var sec1_key: [65]u8 = undefined;
+    // Prepend 0x04 for SEC1 uncompressed format
+    var sec1_key: [1 + key_len]u8 = undefined;
     sec1_key[0] = 0x04;
     @memcpy(sec1_key[1..], key_data);
 
-    const pub_key = EcdsaP256.PublicKey.fromSec1(&sec1_key) catch return error.InvalidKey;
-    const sig = EcdsaP256.Signature.fromBytes(signature[0..64].*);
-    sig.verify(msg, pub_key) catch return error.InvalidSignature;
-}
-
-/// Verify an ECDSA P-384/SHA-384 signature.
-fn verifyEcdsaP384(signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
-    // DNSSEC key: raw 96-byte x||y
-    if (key_data.len != 96) return error.InvalidKey;
-    if (signature.len != 96) return error.InvalidSignature;
-
-    var sec1_key: [97]u8 = undefined;
-    sec1_key[0] = 0x04;
-    @memcpy(sec1_key[1..], key_data);
-
-    const pub_key = EcdsaP384.PublicKey.fromSec1(&sec1_key) catch return error.InvalidKey;
-    const sig = EcdsaP384.Signature.fromBytes(signature[0..96].*);
+    const pub_key = Curve.PublicKey.fromSec1(&sec1_key) catch return error.InvalidKey;
+    const sig = Curve.Signature.fromBytes(signature[0..key_len].*);
     sig.verify(msg, pub_key) catch return error.InvalidSignature;
 }
 
@@ -604,6 +590,19 @@ fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(a.len, b.len);
 }
 
+// ── Range Checks ─────────────────────────────────────────────────────
+
+/// Check if `target` falls in the open range (low, high) with wrap-around.
+/// Works for both NSEC canonical name ordering and NSEC3 hash ordering.
+fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_high: std.math.Order) bool {
+    // low = cmp(low, target), so .lt means low < target
+    if (low == .lt and target_vs_high == .lt) return true;
+    if (low_vs_high == .gt or low_vs_high == .eq) {
+        if (low == .lt or target_vs_high == .lt) return true;
+    }
+    return false;
+}
+
 // ── NSEC Proofs ──────────────────────────────────────────────────────
 
 /// Check if an NSEC record proves that `qname` does not exist.
@@ -613,19 +612,11 @@ pub fn nsecProvesNameNonexistence(
     nsec: dns.NsecData,
     qname: dns.Name,
 ) bool {
-    const owner_vs_qname = canonicalNameOrder(nsec_owner, qname);
-    const qname_vs_next = canonicalNameOrder(qname, nsec.next_domain_name);
-    const owner_vs_next = canonicalNameOrder(nsec_owner, nsec.next_domain_name);
-
-    // Normal range: owner < qname < next
-    if (owner_vs_qname == .lt and qname_vs_next == .lt) return true;
-
-    // Wrap-around (last NSEC in zone): owner > next, and qname > owner or qname < next
-    if (owner_vs_next == .gt or owner_vs_next == .eq) {
-        if (owner_vs_qname == .lt or qname_vs_next == .lt) return true;
-    }
-
-    return false;
+    return inOpenRangeWrap(
+        canonicalNameOrder(nsec_owner, qname),
+        canonicalNameOrder(qname, nsec.next_domain_name),
+        canonicalNameOrder(nsec_owner, nsec.next_domain_name),
+    );
 }
 
 /// Check if an NSEC record proves that `qtype` does not exist at `qname`.
@@ -680,19 +671,11 @@ pub fn nsec3HashInRange(
     next_hash: []const u8,
     target_hash: []const u8,
 ) bool {
-    const owner_vs_target = mem.order(u8, owner_hash, target_hash);
-    const target_vs_next = mem.order(u8, target_hash, next_hash);
-    const owner_vs_next = mem.order(u8, owner_hash, next_hash);
-
-    // Normal range: owner < target < next
-    if (owner_vs_target == .lt and target_vs_next == .lt) return true;
-
-    // Wrap-around: owner > next, and (target > owner or target < next)
-    if (owner_vs_next == .gt or owner_vs_next == .eq) {
-        if (owner_vs_target == .lt or target_vs_next == .lt) return true;
-    }
-
-    return false;
+    return inOpenRangeWrap(
+        mem.order(u8, owner_hash, target_hash),
+        mem.order(u8, target_hash, next_hash),
+        mem.order(u8, owner_hash, next_hash),
+    );
 }
 
 // ── NSEC3 Owner Hash + Budgeted Hashing ──────────────────────────────
@@ -1197,10 +1180,10 @@ test "ECDSA P-256 signature verification" {
     const sig_bytes = sig.toBytes();
 
     // Should verify
-    try verifyEcdsaP256(&sig_bytes, msg, dnssec_key);
+    try verifyEcdsa(EcdsaP256, 32,&sig_bytes, msg, dnssec_key);
 
     // Wrong message should fail
-    try testing.expectError(error.InvalidSignature, verifyEcdsaP256(&sig_bytes, "wrong data", dnssec_key));
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32,&sig_bytes, "wrong data", dnssec_key));
 }
 
 test "Ed25519 signature verification" {
@@ -1221,9 +1204,9 @@ test "invalid key sizes are rejected" {
     const sig96 = [_]u8{0} ** 96;
 
     // ECDSA P-256: key must be 64 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsaP256(&sig64, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, 32,&sig64, msg, &.{ 0x01, 0x02 }));
     // ECDSA P-384: key must be 96 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsaP384(&sig96, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48,&sig96, msg, &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, msg, &.{ 0x01, 0x02 }));
 }
@@ -1512,20 +1495,7 @@ test "mixed NSEC/NSEC3 detection" {
     }};
     try testing.expect(!hasMixedNsecNsec3(&nsec_only));
 
-    const nsec3_only = [_]dns.ResourceRecord{.{
-        .name = name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0,
-            .iterations = 0,
-            .salt = &.{},
-            .next_hashed_owner = &([_]u8{0} ** 20),
-            .type_bit_maps = &.{},
-        } },
-    }};
+    const nsec3_only = [_]dns.ResourceRecord{makeNsec3Rr(name, &.{}, &([_]u8{0} ** 20), &.{})};
     try testing.expect(!hasMixedNsecNsec3(&nsec3_only));
 
     // Mixed — should be detected
@@ -1605,6 +1575,50 @@ fn makeNsec3OwnerName(
     return dns.Name{ .labels = labels_buf[0 .. 1 + zone_labels.len] };
 }
 
+const Nsec3OwnerBufs = struct {
+    enc: [32]u8 = undefined,
+    labels: [4][]const u8 = undefined,
+};
+
+fn makeNsec3Rr(
+    owner_name: dns.Name,
+    salt: []const u8,
+    next_hashed_owner: []const u8,
+    type_bit_maps: []const u8,
+) dns.ResourceRecord {
+    return .{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = salt,
+            .next_hashed_owner = next_hashed_owner,
+            .type_bit_maps = type_bit_maps,
+        } },
+    };
+}
+
+/// Build an NSEC3 RR whose range covers `target_hash` (owner = hash-1, next = hash+1).
+fn makeCoveringNsec3(
+    target_hash: [Sha1.digest_length]u8,
+    zone_labels: []const []const u8,
+    salt: []const u8,
+    bufs: *Nsec3OwnerBufs,
+    low: *[Sha1.digest_length]u8,
+    high: *[Sha1.digest_length]u8,
+) dns.ResourceRecord {
+    low.* = target_hash;
+    high.* = target_hash;
+    low[19] -|= 1;
+    high[19] +|= 1;
+    const owner = makeNsec3OwnerName(low.*, zone_labels, &bufs.enc, &bufs.labels);
+    return makeNsec3Rr(owner, salt, high, &.{});
+}
+
 test "base32hex decode/encode roundtrip" {
     // RFC 5155 Appendix B: "example" with salt aabbccdd, 12 iterations
     // Expected base32hex: 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM
@@ -1672,28 +1686,13 @@ test "NSEC3 NODATA - secure" {
     const salt: []const u8 = &.{};
     const hash = try nsec3Hash(qname, salt, 0);
 
-    var enc_buf: [32]u8 = undefined;
-    var labels_buf: [4][]const u8 = undefined;
-    const owner_name = makeNsec3OwnerName(hash, zone_labels, &enc_buf, &labels_buf);
+    var bufs: Nsec3OwnerBufs = .{};
+    const owner_name = makeNsec3OwnerName(hash, zone_labels, &bufs.enc, &bufs.labels);
 
-    // Bitmap: window 0, len 1, A(bit1=0x40) + NS(bit2=0x20) = 0x60
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = owner_name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0,
-            .iterations = 0,
-            .salt = salt,
-            .next_hashed_owner = &([_]u8{0xFF} ** 20),
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS
-        } },
-    }};
+    // Bitmap: A(bit1=0x40) + NS(bit2=0x20) = 0x60
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x60 })};
 
-    const status = validateNegativeProof(&authorities, qname, .aaaa, false);
-    try testing.expectEqual(SecurityStatus.secure, status);
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false));
 }
 
 test "NSEC3 NODATA - CNAME in bitmap" {
@@ -1701,138 +1700,54 @@ test "NSEC3 NODATA - CNAME in bitmap" {
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "alias"), @as([]const u8, "com") },
     };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
     const salt: []const u8 = &.{};
     const hash = try nsec3Hash(qname, salt, 0);
 
-    var enc_buf: [32]u8 = undefined;
-    var labels_buf: [4][]const u8 = undefined;
-    const owner_name = makeNsec3OwnerName(hash, zone_labels, &enc_buf, &labels_buf);
+    var bufs: Nsec3OwnerBufs = .{};
+    const owner_name = makeNsec3OwnerName(hash, &.{@as([]const u8, "com")}, &bufs.enc, &bufs.labels);
 
-    // Bitmap with CNAME (type 5): window 0, len 1, CNAME bit = 0x04
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = owner_name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0,
-            .iterations = 0,
-            .salt = salt,
-            .next_hashed_owner = &([_]u8{0xFF} ** 20),
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x04 }, // CNAME only
-        } },
-    }};
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x04 })};
 
-    const status = validateNegativeProof(&authorities, qname, .aaaa, false);
-    try testing.expectEqual(SecurityStatus.unchecked, status);
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false));
 }
 
 test "NSEC3 NXDOMAIN - closest encloser proof" {
-    // Query: nonexistent.example.com A (NXDOMAIN)
-    // Closest encloser = example.com
-    // Next closer = nonexistent.example.com
-    // Wildcard = *.example.com
-    // Need 3 NSEC3 records: CE match, NC cover, WC cover
+    // CE = example.com, NC = nonexistent.example.com, WC = *.example.com
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "nonexistent"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
     const ce_name = dns.Name{
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
-    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
-    const salt: []const u8 = &.{};
-
-    // Hash CE (example.com)
-    const ce_hash = try nsec3Hash(ce_name, salt, 0);
-    // Hash next closer (nonexistent.example.com = qname)
-    const nc_hash = try nsec3Hash(qname, salt, 0);
-    // Hash wildcard (*.example.com)
     const wc_name = dns.Name{
         .labels = &.{ @as([]const u8, "*"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
-    const wc_hash = try nsec3Hash(wc_name, salt, 0);
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
 
-    // NSEC3 #1: owner hash = CE hash (proves closest encloser exists)
-    var enc_buf1: [32]u8 = undefined;
-    var labels_buf1: [4][]const u8 = undefined;
-    const ce_owner = makeNsec3OwnerName(ce_hash, zone_labels, &enc_buf1, &labels_buf1);
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
 
-    // NSEC3 #2: covers NC hash (next closer doesn't exist)
-    // Pick owner < nc_hash < next
+    var bufs2: Nsec3OwnerBufs = .{};
     var nc_low: [20]u8 = undefined;
     var nc_high: [20]u8 = undefined;
-    @memcpy(&nc_low, &nc_hash);
-    @memcpy(&nc_high, &nc_hash);
-    nc_low[19] -|= 1; // wrapping subtract
-    nc_high[19] +|= 1; // wrapping add
-    var enc_buf2: [32]u8 = undefined;
-    var labels_buf2: [4][]const u8 = undefined;
-    const nc_owner = makeNsec3OwnerName(nc_low, zone_labels, &enc_buf2, &labels_buf2);
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
 
-    // NSEC3 #3: covers WC hash (wildcard doesn't exist)
+    var bufs3: Nsec3OwnerBufs = .{};
     var wc_low: [20]u8 = undefined;
     var wc_high: [20]u8 = undefined;
-    @memcpy(&wc_low, &wc_hash);
-    @memcpy(&wc_high, &wc_hash);
-    wc_low[19] -|= 1;
-    wc_high[19] +|= 1;
-    var enc_buf3: [32]u8 = undefined;
-    var labels_buf3: [4][]const u8 = undefined;
-    const wc_owner = makeNsec3OwnerName(wc_low, zone_labels, &enc_buf3, &labels_buf3);
+    const wc_rr = makeCoveringNsec3(try nsec3Hash(wc_name, salt, 0), zone_labels, salt, &bufs3, &wc_low, &wc_high);
 
     const authorities = [_]dns.ResourceRecord{
-        .{
-            .name = ce_owner,
-            .rtype = .nsec3,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
-                .flags = 0,
-                .iterations = 0,
-                .salt = salt,
-                .next_hashed_owner = &([_]u8{0xFF} ** 20),
-                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x40 }, // A
-            } },
-        },
-        .{
-            .name = nc_owner,
-            .rtype = .nsec3,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
-                .flags = 0,
-                .iterations = 0,
-                .salt = salt,
-                .next_hashed_owner = &nc_high,
-                .type_bit_maps = &.{},
-            } },
-        },
-        .{
-            .name = wc_owner,
-            .rtype = .nsec3,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
-                .flags = 0,
-                .iterations = 0,
-                .salt = salt,
-                .next_hashed_owner = &wc_high,
-                .type_bit_maps = &.{},
-            } },
-        },
+        makeNsec3Rr(ce_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+        nc_rr,
+        wc_rr,
     };
 
-    const status = validateNegativeProof(&authorities, qname, .a, true);
-    try testing.expectEqual(SecurityStatus.secure, status);
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true));
 }
 
 test "NSEC3 NXDOMAIN - missing wildcard cover" {
-    // Same as above but without the wildcard-covering NSEC3
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "gone"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -1842,57 +1757,21 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
     const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
     const salt: []const u8 = &.{};
 
-    const ce_hash = try nsec3Hash(ce_name, salt, 0);
-    const nc_hash = try nsec3Hash(qname, salt, 0);
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
 
-    var enc_buf1: [32]u8 = undefined;
-    var labels_buf1: [4][]const u8 = undefined;
-    const ce_owner = makeNsec3OwnerName(ce_hash, zone_labels, &enc_buf1, &labels_buf1);
-
+    var bufs2: Nsec3OwnerBufs = .{};
     var nc_low: [20]u8 = undefined;
     var nc_high: [20]u8 = undefined;
-    @memcpy(&nc_low, &nc_hash);
-    @memcpy(&nc_high, &nc_hash);
-    nc_low[19] -|= 1;
-    nc_high[19] +|= 1;
-    var enc_buf2: [32]u8 = undefined;
-    var labels_buf2: [4][]const u8 = undefined;
-    const nc_owner = makeNsec3OwnerName(nc_low, zone_labels, &enc_buf2, &labels_buf2);
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
 
     // Only CE match + NC cover, NO wildcard cover
     const authorities = [_]dns.ResourceRecord{
-        .{
-            .name = ce_owner,
-            .rtype = .nsec3,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
-                .flags = 0,
-                .iterations = 0,
-                .salt = salt,
-                .next_hashed_owner = &([_]u8{0xFF} ** 20),
-                .type_bit_maps = &.{},
-            } },
-        },
-        .{
-            .name = nc_owner,
-            .rtype = .nsec3,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
-                .flags = 0,
-                .iterations = 0,
-                .salt = salt,
-                .next_hashed_owner = &nc_high,
-                .type_bit_maps = &.{},
-            } },
-        },
+        makeNsec3Rr(ce_owner, salt, &([_]u8{0xFF} ** 20), &.{}),
+        nc_rr,
     };
 
-    const status = validateNegativeProof(&authorities, qname, .a, true);
-    try testing.expectEqual(SecurityStatus.unchecked, status);
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true));
 }
 
 test "classifyDelegation NSEC3 match" {
@@ -1902,69 +1781,33 @@ test "classifyDelegation NSEC3 match" {
     };
     const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
     const salt: []const u8 = &.{};
-    const child_hash = try nsec3Hash(child_zone, salt, 0);
 
-    var enc_buf: [32]u8 = undefined;
-    var labels_buf: [4][]const u8 = undefined;
-    const owner_name = makeNsec3OwnerName(child_hash, zone_labels, &enc_buf, &labels_buf);
+    var bufs: Nsec3OwnerBufs = .{};
+    const owner_name = makeNsec3OwnerName(try nsec3Hash(child_zone, salt, 0), zone_labels, &bufs.enc, &bufs.labels);
 
-    // Bitmap: NS only (no DS) — window 0, len 1, NS(bit2=0x20)
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = owner_name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0,
-            .iterations = 0,
-            .salt = salt,
-            .next_hashed_owner = &([_]u8{0xFF} ** 20),
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x20 }, // NS only, no DS
-        } },
-    }};
+    // NS only (no DS)
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x20 })};
 
     try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
 }
 
 test "classifyDelegation NSEC3 non-match" {
-    // Unrelated NSEC3 should not falsely prove insecure
     const child_zone = dns.Name{
         .labels = &.{ @as([]const u8, "signed"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
     const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
     const salt: []const u8 = &.{};
 
-    // Use a different name's hash as the NSEC3 owner
+    // Use a different name's hash — doesn't match child_zone
     const other_name = dns.Name{
         .labels = &.{ @as([]const u8, "other"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
-    const other_hash = try nsec3Hash(other_name, salt, 0);
+    var bufs: Nsec3OwnerBufs = .{};
+    const owner_name = makeNsec3OwnerName(try nsec3Hash(other_name, salt, 0), zone_labels, &bufs.enc, &bufs.labels);
 
-    var enc_buf: [32]u8 = undefined;
-    var labels_buf: [4][]const u8 = undefined;
-    const owner_name = makeNsec3OwnerName(other_hash, zone_labels, &enc_buf, &labels_buf);
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0} ** 20), &[_]u8{ 0x00, 0x01, 0x20 })};
 
-    // This NSEC3 doesn't match child_zone and doesn't cover it (no opt-out)
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = owner_name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0, // no opt-out
-            .iterations = 0,
-            .salt = salt,
-            .next_hashed_owner = &([_]u8{0} ** 20), // next < owner, wraps but may not cover
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x20 }, // NS only
-        } },
-    }};
-
-    // Falls through to the final .insecure (no DS, no proof) — this is the existing behavior
-    // for zones without any DS or valid NSEC proof
-    const result = classifyDelegation(&authorities, child_zone);
-    try testing.expectEqual(SecurityStatus.insecure, result);
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
 }
 
 test "NSEC3 hash budget exhaustion" {
@@ -1981,30 +1824,13 @@ test "NSEC3 hash budget exhaustion" {
     const salt: []const u8 = &.{};
 
     // One unrelated NSEC3 — will never match any ancestor, so budget gets exhausted
-    const unrelated_hash = [_]u8{0x42} ** 20;
-    var enc_buf: [32]u8 = undefined;
-    var labels_buf: [4][]const u8 = undefined;
+    var bufs: Nsec3OwnerBufs = .{};
     const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
-    const owner_name = makeNsec3OwnerName(unrelated_hash, zone_labels, &enc_buf, &labels_buf);
+    const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
 
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = owner_name,
-        .rtype = .nsec3,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
-            .flags = 0,
-            .iterations = 0,
-            .salt = salt,
-            .next_hashed_owner = &([_]u8{0x43} ** 20),
-            .type_bit_maps = &.{},
-        } },
-    }};
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    // NXDOMAIN with deep name — budget should be exhausted
-    const status = validateNegativeProof(&authorities, qname, .a, true);
-    try testing.expectEqual(SecurityStatus.insecure, status);
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────
