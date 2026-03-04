@@ -897,28 +897,13 @@ pub fn validateAnswerRrset(
     // Validate the main answer type
     if (validateRrsetForType(answers, qtype, dnskey_records, now_u32) == .bogus) return .bogus;
 
-    // If qtype != .cname and answers contain CNAME records, validate CNAME RRSIG too —
-    // but only if the CNAME is from the same zone as the main answer type.
-    // RFC 4035 §5.3.1: each RRset must be verified with its own zone's DNSKEYs.
-    // Cross-zone CNAMEs (e.g. CDN responses with CNAME + A from different zones)
-    // have different signer names and cannot be validated with the same DNSKEY set.
+    // If answers contain CNAME records, validate the CNAME RRset too.
+    // After bailiwick scrubbing, all answer records are from the same zone.
     if (qtype != .cname) {
-        var has_cname = false;
         for (answers) |rr| {
             if (rr.rtype == .cname) {
-                has_cname = true;
-                break;
-            }
-        }
-        if (has_cname) {
-            const main_rrsig = findRrsig(answers, qtype);
-            const cname_rrsig = findRrsig(answers, .cname);
-            const same_zone = if (main_rrsig != null and cname_rrsig != null)
-                main_rrsig.?.signer_name.eql(cname_rrsig.?.signer_name)
-            else
-                true; // no RRSIG to compare — validate as before
-            if (same_zone) {
                 if (validateRrsetForType(answers, .cname, dnskey_records, now_u32) == .bogus) return .bogus;
+                break;
             }
         }
     }
@@ -933,14 +918,30 @@ fn validateRrsetForType(
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
 ) SecurityStatus {
-    // Find RRSIG covering this type
-    const rrsig = findRrsig(answers, covered_type) orelse return .bogus;
+    // Find RRSIG covering this type and its owner name.
+    // An RRset is defined as same owner name + type + class (RFC 2181 §5),
+    // so we must filter by owner name to avoid mixing records from
+    // different RRsets (e.g., multiple CNAMEs in a chain).
+    var rrsig: dns.RrsigData = undefined;
+    var rrsig_owner: dns.Name = undefined;
+    {
+        var found = false;
+        for (answers) |rr| {
+            if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == covered_type) {
+                rrsig = rr.rdata.rrsig;
+                rrsig_owner = rr.name;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return .bogus;
+    }
 
-    // Filter answer records to only those matching the covered type
+    // Filter answer records to the RRset (same owner name AND type)
     var filtered: [64]dns.ResourceRecord = undefined;
     var filtered_count: usize = 0;
     for (answers) |rr| {
-        if (rr.rtype == covered_type and filtered_count < filtered.len) {
+        if (rr.rtype == covered_type and rr.name.eql(rrsig_owner) and filtered_count < filtered.len) {
             filtered[filtered_count] = rr;
             filtered_count += 1;
         }

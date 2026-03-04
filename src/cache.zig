@@ -443,7 +443,7 @@ pub const RRsetCache = struct {
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
-        self.storeRRsets(response.answers, authority_zone, false);
+        self.storeRRsets(response.answers, authority_zone, true);
         self.storeRRsets(response.authorities, authority_zone, false);
         self.storeRRsets(response.additionals, authority_zone, true);
     }

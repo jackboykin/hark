@@ -426,7 +426,23 @@ pub const RecursiveResolver = struct {
                     continue;
                 }
 
-                // ── Final query response handling (unchanged logic) ──
+                // ── Scrub out-of-bailiwick answer records ──
+                // Authoritative servers may include cross-zone records in answers
+                // (e.g., CNAME target's A/AAAA from a different zone). Discard
+                // them so validation only sees records from the queried zone.
+                if (is_final and parent_zone.labels.len > 0 and response.answers.len > 0) {
+                    const filtered = try allocator.alloc(dns.ResourceRecord, response.answers.len);
+                    var filtered_count: usize = 0;
+                    for (response.answers) |rr| {
+                        if (rr.name.isSubdomainOf(parent_zone)) {
+                            filtered[filtered_count] = rr;
+                            filtered_count += 1;
+                        }
+                    }
+                    response.answers = filtered[0..filtered_count];
+                }
+
+                // ── Final query response handling ──
 
                 // Classify response
                 if (response.header.rcode != .no_error) {
@@ -452,28 +468,18 @@ pub const RecursiveResolver = struct {
                                 break;
                             }
                         }
-                        // Detect cross-zone CNAME: target type records are from a
-                        // different zone than the CNAME (CDN responses like
-                        // apple.com → aaplimg.com → akamaiedge.net). fetchDnskey
-                        // would query the wrong servers, so we must follow the CNAME
-                        // through its own delegation chain instead.
-                        const cross_zone_detected = if (has_target_type and self.dnssec_enabled and security_state == .secure) blk: {
-                            const main_rrsig = dnssec.findRrsig(response.answers, qtype);
-                            const cname_rrsig = dnssec.findRrsig(response.answers, .cname);
-                            break :blk if (main_rrsig != null and cname_rrsig != null)
-                                !main_rrsig.?.signer_name.eql(cname_rrsig.?.signer_name)
-                            else
-                                false;
-                        } else false;
-
-                        const should_follow_cname = !has_target_type or cross_zone_detected;
+                        const should_follow_cname = !has_target_type;
 
                         if (should_follow_cname) {
                             // Validate CNAME RRset before following in secure zones
                             if (self.dnssec_enabled and security_state == .secure) {
                                 if (dnssec.findRrsig(response.answers, .cname) != null) {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
-                                        .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                                        .bogus => {
+                                            // BAD cache per RFC 9520: 1s negative entry
+                                            if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
+                                            return makeCachedMessage(&.{}, &.{}, .server_failure);
+                                        },
                                         .valid => {
                                             // Cache validated CNAME response
                                             if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -498,7 +504,11 @@ pub const RecursiveResolver = struct {
                     // Validate answer RRsets if in secure zone
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                            .bogus => {
+                                // BAD cache per RFC 9520: 1s negative entry
+                                if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
+                                return makeCachedMessage(&.{}, &.{}, .server_failure);
+                            },
                             .valid, .skip => {},
                         }
                     }
@@ -656,17 +666,7 @@ pub const RecursiveResolver = struct {
         const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
 
         // Find RRSIG in answers to get the signer zone
-        const rrsig = dnssec.findRrsig(response.answers, qtype) orelse {
-            // No RRSIG for a secure zone — check for CNAME RRSIG
-            if (qtype != .cname) {
-                if (dnssec.findRrsig(response.answers, .cname)) |_| {
-                    // CNAME answer — the final type RRSIG may be from a different zone.
-                    // For now, skip validation rather than bogus.
-                    return .skip;
-                }
-            }
-            return .bogus;
-        };
+        const rrsig = dnssec.findRrsig(response.answers, qtype) orelse return .bogus;
 
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
@@ -889,6 +889,16 @@ pub const RecursiveResolver = struct {
                         }
 
                         if (addr_count > 0) {
+                            // DNSSEC: only use this delegation if DS status is known.
+                            // If DS is a cache miss, another thread may not have cached
+                            // the insecure delegation yet. Stop here and let the referral
+                            // chain naturally discover the DNSSEC status.
+                            if (self.dnssec_enabled) {
+                                if (cache.lookup(allocator, zone_str, .ds, .in) == null) {
+                                    break;
+                                }
+                            }
+
                             const zone_name = try dns.parseDottedName(allocator, zone_str);
                             best = .{
                                 .addrs = addrs,
