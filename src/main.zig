@@ -281,15 +281,17 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         var rtt_cache = RttCache.init(gpa_alloc);
         defer rtt_cache.deinit();
 
-        var resolver = RecursiveResolver.initFull(&t, &tcp_t, &cache);
-        if (no_qmin) resolver.qname_minimisation = false;
-        resolver.dnssec_enabled = dnssec_enabled;
-        resolver.dnssec_aware = dnssec_enabled;
-        resolver.rtt_cache = &rtt_cache;
-        if (opportunistic) {
-            resolver.tls_transport = &tls_t;
-            resolver.encryption_state = &enc_state;
-        }
+        var resolver = RecursiveResolver{
+            .transport = &t,
+            .tcp_transport = &tcp_t,
+            .cache = &cache,
+            .qname_minimisation = !no_qmin,
+            .dnssec_enabled = dnssec_enabled,
+            .dnssec_aware = dnssec_enabled,
+            .rtt_cache = &rtt_cache,
+            .tls_transport = if (opportunistic) &tls_t else null,
+            .encryption_state = if (opportunistic) &enc_state else null,
+        };
         break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);

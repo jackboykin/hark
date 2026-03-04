@@ -500,15 +500,19 @@ const WorkerState = struct {
     fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
         switch (self.config.mode) {
             .recursive => {
-                var resolver = RecursiveResolver.initFull(self.udp_transport, self.tcp_transport, self.cache);
-                if (!self.config.qname_minimization) resolver.qname_minimisation = false;
-                // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
-                resolver.dnssec_aware = self.config.dnssec;
-                // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
-                resolver.dnssec_enabled = self.config.dnssec and !cd;
-                if (self.tls_transport) |tls_t| resolver.tls_transport = tls_t;
-                if (self.encryption_state) |enc| resolver.encryption_state = enc;
-                resolver.rtt_cache = self.rtt_cache;
+                var resolver = RecursiveResolver{
+                    .transport = self.udp_transport,
+                    .tcp_transport = self.tcp_transport,
+                    .cache = self.cache,
+                    .qname_minimisation = self.config.qname_minimization,
+                    // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
+                    .dnssec_aware = self.config.dnssec,
+                    // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
+                    .dnssec_enabled = self.config.dnssec and !cd,
+                    .tls_transport = self.tls_transport,
+                    .encryption_state = self.encryption_state,
+                    .rtt_cache = self.rtt_cache,
+                };
                 return try resolver.resolve(alloc, name, qtype);
             },
             .forward => {
