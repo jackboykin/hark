@@ -19,6 +19,7 @@ pub const VerifyError = error{
     InvalidKey,
     InvalidRData,
     BufferTooSmall,
+    SignatureExpired,
 };
 
 // ── Security Status ──────────────────────────────────────────────────
@@ -103,6 +104,7 @@ pub fn validateDnskeyRrset(
     dnskey_records: []const dns.ResourceRecord,
     ds_records: []const dns.DsData,
     zone_name: dns.Name,
+    now_u32: u32,
 ) VerifyError!void {
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
@@ -130,14 +132,14 @@ pub fn validateDnskeyRrset(
                     const dk = rr.rdata.dnskey;
                     if (keyTag(dk) == rrsig.key_tag) {
                         // This key signed the DNSKEY RRset — verify it
-                        verifyRrsig(rrsig, dk, filtered) catch continue;
+                        verifyRrsig(rrsig, dk, filtered, now_u32) catch continue;
                         return; // DNSKEY RRset is valid
                     }
                 }
                 continue;
             }
             // 3. Verify the RRSIG over the DNSKEY RRset using the KSK
-            verifyRrsig(rrsig, ksk, filtered) catch continue;
+            verifyRrsig(rrsig, ksk, filtered, now_u32) catch continue;
             return; // Success
         }
     }
@@ -451,12 +453,22 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
 
 // ── RRSIG Verification ───────────────────────────────────────────────
 
+/// RFC 1982 serial number "greater than" for 32-bit timestamps.
+fn serialAfter(s1: u32, s2: u32) bool {
+    return s1 != s2 and (s1 -% s2) < 0x80000000;
+}
+
 /// Verify an RRSIG signature against a DNSKEY and RRset.
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
     rrset: []const dns.ResourceRecord,
+    now_u32: u32,
 ) VerifyError!void {
+    // RFC 4035 §5.3.1: check signature validity period
+    if (serialAfter(rrsig.sig_inception, now_u32)) return error.SignatureExpired;
+    if (serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
+
     // Build the signed data
     var signed_data_buf: [65536]u8 = undefined;
     const signed_data = buildSignedData(&signed_data_buf, rrsig, rrset) catch return error.BufferTooSmall;
@@ -866,9 +878,10 @@ pub fn validateAnswerRrset(
     answers: []const dns.ResourceRecord,
     qtype: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
+    now_u32: u32,
 ) SecurityStatus {
     // Validate the main answer type
-    if (validateRrsetForType(answers, qtype, dnskey_records) == .bogus) return .bogus;
+    if (validateRrsetForType(answers, qtype, dnskey_records, now_u32) == .bogus) return .bogus;
 
     // If qtype != .cname and answers contain CNAME records, validate CNAME RRSIG too
     if (qtype != .cname) {
@@ -880,7 +893,7 @@ pub fn validateAnswerRrset(
             }
         }
         if (has_cname) {
-            if (validateRrsetForType(answers, .cname, dnskey_records) == .bogus) return .bogus;
+            if (validateRrsetForType(answers, .cname, dnskey_records, now_u32) == .bogus) return .bogus;
         }
     }
 
@@ -892,6 +905,7 @@ fn validateRrsetForType(
     answers: []const dns.ResourceRecord,
     covered_type: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
+    now_u32: u32,
 ) SecurityStatus {
     // Find RRSIG covering this type
     const rrsig = findRrsig(answers, covered_type) orelse return .bogus;
@@ -915,7 +929,7 @@ fn validateRrsetForType(
         if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
 
         // Try verification with this key
-        verifyRrsig(rrsig, dk, filtered[0..filtered_count]) catch continue;
+        verifyRrsig(rrsig, dk, filtered[0..filtered_count], now_u32) catch continue;
         return .secure; // Signature verified
     }
 
@@ -1916,4 +1930,78 @@ test "NSEC3 hash budget exhaustion" {
     // NXDOMAIN with deep name — budget should be exhausted
     const status = validateNegativeProof(&authorities, qname, .a, true);
     try testing.expectEqual(SecurityStatus.insecure, status);
+}
+
+// ── RRSIG expiration tests ──────────────────────────────────────────
+
+test "serialAfter: basic comparisons" {
+    // s1 > s2 in serial arithmetic
+    try testing.expect(serialAfter(10, 5));
+    // s1 < s2
+    try testing.expect(!serialAfter(5, 10));
+    // equal
+    try testing.expect(!serialAfter(5, 5));
+    // wrap-around: 0xFFFFFFFF is "before" 0x00000001
+    try testing.expect(serialAfter(0x00000001, 0xFFFFFFFF));
+    try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
+}
+
+test "verifyRrsig rejects expired signature" {
+    const signer_name = dns.Name{
+        .labels = &.{
+            @as([]const u8, "example"),
+            @as([]const u8, "com"),
+        },
+    };
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 12345,
+        .signer_name = signer_name,
+        .signature = &.{},
+    };
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const rrset = [_]dns.ResourceRecord{};
+
+    // now is after expiration
+    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1700000001));
+}
+
+test "verifyRrsig rejects not-yet-valid signature" {
+    const signer_name = dns.Name{
+        .labels = &.{
+            @as([]const u8, "example"),
+            @as([]const u8, "com"),
+        },
+    };
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 12345,
+        .signer_name = signer_name,
+        .signature = &.{},
+    };
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const rrset = [_]dns.ResourceRecord{};
+
+    // now is before inception
+    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1698999999));
 }

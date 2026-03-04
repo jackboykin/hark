@@ -600,6 +600,8 @@ pub const RecursiveResolver = struct {
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
 
+        const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+
         // Find RRSIG in answers to get the signer zone
         const rrsig = dnssec.findRrsig(response.answers, qtype) orelse {
             // No RRSIG for a secure zone — check for CNAME RRSIG
@@ -639,7 +641,7 @@ pub const RecursiveResolver = struct {
                             // The DNSKEY was already validated on the first (non-cached) fetch.
                             if (dnssec.findRrsig(dnskey_records, .dnskey) != null) {
                                 const zone_name = try dns.parseDottedName(allocator, signer_dotted);
-                                dnssec.validateDnskeyRrset(dnskey_records, ds_records[0..ds_count], zone_name) catch return .bogus;
+                                dnssec.validateDnskeyRrset(dnskey_records, ds_records[0..ds_count], zone_name, now_u32) catch return .bogus;
                             }
                         }
                     },
@@ -649,7 +651,7 @@ pub const RecursiveResolver = struct {
         }
 
         // Validate the answer RRsets
-        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records)) {
+        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32)) {
             .secure => {
                 response.header.ad = true;
                 return .valid;
