@@ -473,10 +473,7 @@ pub const RecursiveResolver = struct {
                             if (self.dnssec_enabled and security_state == .secure) {
                                 if (dnssec.findRrsig(response.answers, .cname) != null) {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
-                                        .bogus => {
-                                            if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                            return makeCachedMessage(&.{}, &.{}, .server_failure);
-                                        },
+                                        .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
                                         .valid => {
                                             // Cache validated CNAME response
                                             if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -501,11 +498,7 @@ pub const RecursiveResolver = struct {
                     // Validate answer RRsets if in secure zone
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => {
-                                // BAD cache per RFC 9520: 5-second negative entry
-                                if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                return makeCachedMessage(&.{}, &.{}, .server_failure);
-                            },
+                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
                             .valid, .skip => {},
                         }
                     }
