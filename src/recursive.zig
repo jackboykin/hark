@@ -277,20 +277,24 @@ pub const RecursiveResolver = struct {
                     // Record RTT on success
                     if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
 
-                    // Parse response
-                    response = try dns.parseMessage(allocator, response_data);
-
-                    // TC bit: retry same query over TCP
-                    if (response.header.tc) {
+                    // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
+                    if (dns.hasTcBit(response_data)) {
                         if (self.tcp_transport) |tcp| {
                             var tcp_buf: [65535]u8 = undefined;
                             if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
                                 response = try dns.parseMessage(allocator, tcp_data);
+                                got_response = true;
+                                if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                break;
                             } else |_| {
-                                // TCP failed — use truncated UDP response
+                                // TCP failed — ignore truncated response, try next server
                             }
                         }
+                        continue;
                     }
+
+                    // Parse response (TC=0 only)
+                    response = try dns.parseMessage(allocator, response_data);
 
                     got_response = true;
 

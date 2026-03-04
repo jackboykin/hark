@@ -16,6 +16,15 @@ pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{@intFromEnum(val)}) catch "?";
 }
 
+/// Check the TC (truncation) bit on raw wire data without full parsing.
+/// Used to detect truncated UDP responses before attempting parseMessage,
+/// which may fail with EndOfData on mid-record truncation (RFC 2181).
+pub fn hasTcBit(bytes: []const u8) bool {
+    if (bytes.len < header_len) return false;
+    const flags = mem.readInt(u16, bytes[2..4], .big);
+    return (flags >> 9) & 1 == 1;
+}
+
 // ── Constants ──────────────────────────────────────────────────────────
 
 pub const max_label_len = 63;
@@ -1694,6 +1703,54 @@ test "edge case: truncated question" {
     pkt[13] = 'a'; // but only 1 byte of data
 
     try testing.expectError(error.EndOfData, parseMessage(testing.allocator, &pkt));
+}
+
+test "hasTcBit detects truncation on mid-record truncated response" {
+    // Regression: a TC=1 UDP response truncated mid-record causes parseMessage
+    // to fail with EndOfData. hasTcBit must detect TC on the raw wire data so
+    // the resolver can fall back to TCP before attempting to parse.
+
+    // Build a response with qdcount=1, ancount=1, TC=1, but truncate the
+    // answer record mid-way so parseMessage cannot succeed.
+    var pkt: [32]u8 = undefined;
+    mem.writeInt(u16, pkt[0..2], 0x1234, .big); // id
+    mem.writeInt(u16, pkt[2..4], 0x8200, .big); // QR=1, TC=1
+    mem.writeInt(u16, pkt[4..6], 1, .big); // qdcount=1
+    mem.writeInt(u16, pkt[6..8], 1, .big); // ancount=1
+    mem.writeInt(u16, pkt[8..10], 0, .big);
+    mem.writeInt(u16, pkt[10..12], 0, .big);
+
+    // Question: \x07example\x03com\x00, type A, class IN
+    const qname = "\x07example\x03com\x00";
+    @memcpy(pkt[12..][0..qname.len], qname);
+    const qend = 12 + qname.len;
+    mem.writeInt(u16, pkt[qend..][0..2], 1, .big); // qtype=A
+    mem.writeInt(u16, pkt[qend + 2 ..][0..2], 1, .big); // qclass=IN
+
+    // Answer record starts but is truncated — only 2 bytes of a name pointer
+    const ans_start = qend + 4;
+    pkt[ans_start] = 0xC0; // compressed name pointer...
+    pkt[ans_start + 1] = 0x0C; // ...to offset 12
+
+    // Slice to just past the pointer — no type/class/ttl/rdlength/rdata
+    const truncated = pkt[0 .. ans_start + 2];
+
+    // hasTcBit works on the truncated wire data
+    try testing.expect(hasTcBit(truncated));
+
+    // parseMessage fails — this is the bug we're guarding against.
+    // Use an arena because parseMessage leaks partial allocations on error.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), truncated));
+
+    // Without TC bit, hasTcBit returns false
+    mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1, TC=0
+    try testing.expect(!hasTcBit(truncated));
+
+    // Too short for header → false
+    try testing.expect(!hasTcBit(pkt[0..4]));
+    try testing.expect(!hasTcBit(&[_]u8{}));
 }
 
 test "edge case: max-length label" {

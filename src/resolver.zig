@@ -45,22 +45,19 @@ pub const ForwardingResolver = struct {
         // Do53 path: UDP with TCP fallback on truncation
         const response_data = try self.transport.query(wire_query, query_id, upstream);
 
-        // Parse response
-        var response = try dns.parseMessage(allocator, response_data);
-
-        // TC bit: retry same query over TCP
-        if (response.header.tc) {
+        // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
+        if (dns.hasTcBit(response_data)) {
             if (self.tcp_transport) |tcp| {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
-                    response = try dns.parseMessage(allocator, tcp_data);
+                    return try dns.parseMessage(allocator, tcp_data);
                 } else |_| {
-                    // TCP failed — return truncated UDP response
+                    // TCP failed — fall through to parse truncated response as last resort
                 }
             }
         }
 
-        return response;
+        return try dns.parseMessage(allocator, response_data);
     }
 };
 
