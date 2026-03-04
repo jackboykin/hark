@@ -947,6 +947,13 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
     }
     const zc = zone_cut orelse return null;
 
+    // A valid referral always delegates to a child zone — the zone cut must
+    // be strictly deeper than the current parent zone.  If the authority
+    // section contains NS records for the same zone (or a parent), it is
+    // not a referral (e.g. a server returning its own NS records alongside
+    // a CNAME answer).  RFC 1034 §4.2.1, RFC 8499 §7.
+    if (zc.labels.len <= parent_zone.labels.len) return null;
+
     // Collect NS names at the zone cut
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;
@@ -1227,6 +1234,23 @@ test "extractReferral with AAAA glue returns IPv6 address" {
         },
         .no_glue => return error.TestUnexpectedResult,
     }
+}
+
+test "extractReferral rejects same-zone NS as non-referral" {
+    // A server returning NS records for its own zone (e.g. alongside a CNAME
+    // answer) is not a referral — the zone cut must be strictly deeper than
+    // the parent zone.  RFC 1034 §4.2.1, RFC 8499 §7.
+    const alloc = testing.allocator;
+    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    const zone_name = try makeName(alloc, &.{ "example", "com" });
+    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 192, 0, 2, 1 })});
+    defer dns.freeMessage(alloc, response);
+
+    const target = dns.Name{ .labels = &.{ "api", "example", "com" } };
+    // parent_zone == zone_cut → same zone, must return null
+    const parent_zone = dns.Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(extractReferral(response, target, parent_zone) == null);
 }
 
 // ── findCnameRecord / nameToDotted tests ──────────────────────────────
