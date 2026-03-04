@@ -128,6 +128,21 @@ pub const RecursiveResolver = struct {
                 server_count = deleg.count;
                 @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
                 parent_zone = deleg.zone;
+
+                // DNSSEC: when skipping referrals via cache, we miss classifyDelegation
+                // calls. Check for a cached negative DS to detect insecure delegations.
+                if (security_state == .secure and self.dnssec_enabled) {
+                    if (self.cache) |c| {
+                        const zone_fmt = deleg.zone.format();
+                        const zone_len = mem.indexOfScalar(u8, &zone_fmt, 0) orelse zone_fmt.len;
+                        if (c.lookup(allocator, zone_fmt[0..zone_len], .ds, .in)) |ds_result| {
+                            switch (ds_result) {
+                                .hit => {},
+                                .negative => security_state = .insecure,
+                            }
+                        }
+                    }
+                }
             }
 
             // QNAME minimization (RFC 9156): start probing one label past the
@@ -318,6 +333,7 @@ pub const RecursiveResolver = struct {
                         // DNSSEC: classify delegation security at referral
                         if (security_state == .secure) {
                             security_state = dnssec.classifyDelegation(response.authorities, zone_cut);
+                            cacheInsecureDelegation(self.cache, security_state, zone_cut, response.authorities);
                         }
 
                         switch (referral) {
@@ -438,6 +454,9 @@ pub const RecursiveResolver = struct {
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
                                 current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
+                                // Reset security state — CNAME target is in a new zone
+                                // with its own delegation chain from root
+                                security_state = if (self.dnssec_enabled) .secure else .unchecked;
                                 continue :cname_loop;
                             }
                         }
@@ -477,6 +496,7 @@ pub const RecursiveResolver = struct {
                     };
                     if (security_state == .secure) {
                         security_state = dnssec.classifyDelegation(response.authorities, zone_cut);
+                        cacheInsecureDelegation(self.cache, security_state, zone_cut, response.authorities);
                     }
                 }
 
@@ -853,6 +873,31 @@ pub const RecursiveResolver = struct {
         return best;
     }
 };
+
+// ── Insecure delegation caching ───────────────────────────────────────
+
+/// When classifyDelegation returns .insecure, cache a negative DS entry
+/// so that findClosestCachedDelegation can determine DNSSEC security state
+/// without re-walking the referral chain.
+fn cacheInsecureDelegation(
+    cache: ?*@import("cache.zig").RRsetCache,
+    security_state: dnssec.SecurityStatus,
+    zone_cut: dns.Name,
+    authorities: []const dns.ResourceRecord,
+) void {
+    if (security_state != .insecure) return;
+    const c = cache orelse return;
+
+    // Use minimum authority section TTL (from NSEC/NSEC3 proving no DS)
+    var neg_ttl: u32 = 3600;
+    for (authorities) |rr| {
+        if (rr.ttl > 0 and rr.ttl < neg_ttl) neg_ttl = rr.ttl;
+    }
+
+    const zone_fmt = zone_cut.format();
+    const zone_len = mem.indexOfScalar(u8, &zone_fmt, 0) orelse zone_fmt.len;
+    c.storeNegativeBare(zone_fmt[0..zone_len], .ds, .in, .no_error, neg_ttl);
+}
 
 // ── Response synthesis (for cache hits) ────────────────────────────────
 

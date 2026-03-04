@@ -515,6 +515,42 @@ pub const RRsetCache = struct {
         _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
+    /// Store a bare negative entry (no SOA required).
+    /// Used to cache insecure delegation status (negative DS) so that
+    /// cached delegation lookups can determine DNSSEC security state.
+    pub fn storeNegativeBare(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+        rcode: dns.RCode,
+        ttl: u32,
+    ) void {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
+        if (ttl == 0) return;
+
+        const alloc = self.counting.allocator();
+        const key_name = toLowerNameAlloc(alloc, name) catch return;
+        const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
+
+        self.removeAndFree(key);
+        self.evictIfNeeded();
+
+        const now = self.now_fn();
+        self.map.put(alloc, key, .{ .negative = .{
+            .rcode = rcode,
+            .expires_at = now + @as(i64, ttl),
+            .original_ttl = ttl,
+            .stored_at = now,
+            .soa = null,
+        } }) catch {
+            alloc.free(key_name);
+            return;
+        };
+        _ = self.negative_stores.fetchAdd(1, .monotonic);
+    }
+
     // ── Internal ──────────────────────────────────────────────────────
 
     fn storeRRsets(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, check_bailiwick: bool) void {
