@@ -332,8 +332,10 @@ pub fn buildSignedData(
         const rr_start = temp_pos;
 
         // RFC 4035 §5.3.2: reconstruct wildcard owner if labels < name label count
+        // wc_labels must live in the for-loop scope (not the if-block) so the
+        // Name slice returned via break :blk remains valid for writeCanonicalNameWire.
+        var wc_labels: [dns.max_label_count][]const u8 = undefined;
         const owner_name = if (rrsig.labels < rr.name.labels.len) blk: {
-            var wc_labels: [dns.max_label_count][]const u8 = undefined;
             wc_labels[0] = "*";
             const suffix = rr.name.labels[rr.name.labels.len - rrsig.labels ..];
             for (suffix, 1..) |label, i| {
@@ -883,7 +885,9 @@ fn validateNsec3NegativeProof(
 /// Validate answer RRsets against a DNSKEY set.
 /// Finds the RRSIG covering `qtype`, matches it to a DNSKEY by key_tag + algorithm,
 /// and verifies the signature. Per RFC 6840 §5.4, tries ALL matching DNSKEYs.
-/// Also validates CNAME RRSIG if the answer contains CNAMEs and qtype != .cname.
+/// Also validates CNAME RRSIG if the answer contains CNAMEs and qtype != .cname,
+/// but only when the CNAME RRSIG signer matches the main type's signer (same zone).
+/// Cross-zone CNAMEs (RFC 4035 §5.3.1) are skipped — they need their own zone's DNSKEYs.
 pub fn validateAnswerRrset(
     answers: []const dns.ResourceRecord,
     qtype: dns.RType,
@@ -893,7 +897,11 @@ pub fn validateAnswerRrset(
     // Validate the main answer type
     if (validateRrsetForType(answers, qtype, dnskey_records, now_u32) == .bogus) return .bogus;
 
-    // If qtype != .cname and answers contain CNAME records, validate CNAME RRSIG too
+    // If qtype != .cname and answers contain CNAME records, validate CNAME RRSIG too —
+    // but only if the CNAME is from the same zone as the main answer type.
+    // RFC 4035 §5.3.1: each RRset must be verified with its own zone's DNSKEYs.
+    // Cross-zone CNAMEs (e.g. CDN responses with CNAME + A from different zones)
+    // have different signer names and cannot be validated with the same DNSKEY set.
     if (qtype != .cname) {
         var has_cname = false;
         for (answers) |rr| {
@@ -903,7 +911,15 @@ pub fn validateAnswerRrset(
             }
         }
         if (has_cname) {
-            if (validateRrsetForType(answers, .cname, dnskey_records, now_u32) == .bogus) return .bogus;
+            const main_rrsig = findRrsig(answers, qtype);
+            const cname_rrsig = findRrsig(answers, .cname);
+            const same_zone = if (main_rrsig != null and cname_rrsig != null)
+                main_rrsig.?.signer_name.eql(cname_rrsig.?.signer_name)
+            else
+                true; // no RRSIG to compare — validate as before
+            if (same_zone) {
+                if (validateRrsetForType(answers, .cname, dnskey_records, now_u32) == .bogus) return .bogus;
+            }
         }
     }
 
