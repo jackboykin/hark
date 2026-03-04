@@ -60,7 +60,11 @@ pub const RecursiveResolver = struct {
     tcp_transport: ?*TcpTransport,
     cache: ?*RRsetCache,
     qname_minimisation: bool = true,
+    /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
     dnssec_enabled: bool = false,
+    /// Whether to request DNSSEC data (DO bit) — always true if server is DNSSEC-capable.
+    /// RFC 4035 §3.2.1: MUST set DO regardless of CD bit or per-query validation.
+    dnssec_aware: bool = false,
     tls_transport: ?*TlsTransport = null,
     encryption_state: ?*EncryptionStateCache = null,
     rtt_cache: ?*RttCache = null,
@@ -231,7 +235,7 @@ pub const RecursiveResolver = struct {
                     // Build iterative query (rd=false, EDNS0)
                     const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
                         .rd = false,
-                        .edns = .{ .do_bit = self.dnssec_enabled },
+                        .edns = .{ .do_bit = self.dnssec_aware },
                     });
 
                     // Serialize
@@ -256,7 +260,7 @@ pub const RecursiveResolver = struct {
                                 // Build padded query for TLS (RFC 8467 §4.1: 468 bytes)
                                 const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
                                     .rd = false,
-                                    .edns = .{ .do_bit = self.dnssec_enabled, .padding_target = 468 },
+                                    .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
                                 });
                                 var padded_buf: [dns.edns_udp_payload]u8 = undefined;
                                 const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);

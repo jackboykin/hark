@@ -392,7 +392,7 @@ const WorkerState = struct {
         const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
+        const response = self.resolveQuery(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
@@ -411,7 +411,7 @@ const WorkerState = struct {
         const wants_ad = (query.opt != null and query.opt.?.do_bit) or query.header.ad;
 
         var wire_buf: [65535]u8 = undefined;
-        if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.questions, response, query.opt != null, max_payload, wants_ad)) |wire| {
+        if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.header.cd, query.questions, response, query.opt != null, max_payload, wants_ad)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -482,7 +482,7 @@ const WorkerState = struct {
         const name_str = name_buf[0..name_len];
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveQuery(alloc, name_str, question.qtype) catch {
+        const response = self.resolveQuery(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
@@ -494,15 +494,18 @@ const WorkerState = struct {
         log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf4), elapsed_ms });
 
         const wants_ad_tcp = (query.opt != null and query.opt.?.do_bit) or query.header.ad;
-        return buildResponseWire(response_wire, query.header.id, query.header.rd, query.questions, response, query.opt != null, 65535, wants_ad_tcp);
+        return buildResponseWire(response_wire, query.header.id, query.header.rd, query.header.cd, query.questions, response, query.opt != null, 65535, wants_ad_tcp);
     }
 
-    fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType) !dns.Message {
+    fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
         switch (self.config.mode) {
             .recursive => {
                 var resolver = RecursiveResolver.initFull(self.udp_transport, self.tcp_transport, self.cache);
                 if (!self.config.qname_minimization) resolver.qname_minimisation = false;
-                resolver.dnssec_enabled = self.config.dnssec;
+                // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
+                resolver.dnssec_aware = self.config.dnssec;
+                // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
+                resolver.dnssec_enabled = self.config.dnssec and !cd;
                 if (self.tls_transport) |tls_t| resolver.tls_transport = tls_t;
                 if (self.encryption_state) |enc| resolver.encryption_state = enc;
                 resolver.rtt_cache = self.rtt_cache;
@@ -526,6 +529,7 @@ fn buildResponseWire(
     wire_buf: []u8,
     query_id: u16,
     rd: bool,
+    cd: bool,
     questions: []const dns.Question,
     response: dns.Message,
     client_edns: bool,
@@ -549,7 +553,7 @@ fn buildResponseWire(
             .tc = false,
             .rd = rd,
             .ra = true,
-            .z = 0, .ad = response.header.ad and client_wants_ad, .cd = false,
+            .z = 0, .ad = response.header.ad and client_wants_ad, .cd = cd,
             .rcode = response.header.rcode,
             .qd_count = @intCast(questions.len),
             .an_count = @intCast(response.answers.len),
@@ -827,7 +831,7 @@ test "buildResponseWire sets correct header fields" {
     };
 
     var buf: [512]u8 = undefined;
-    const wire = buildResponseWire(&buf, 0x1234, true, questions, response, false, 512, false).?;
+    const wire = buildResponseWire(&buf, 0x1234, true, false, questions, response, false, 512, false).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
@@ -873,7 +877,7 @@ test "buildResponseWire with EDNS0" {
     };
 
     var buf: [1232]u8 = undefined;
-    const wire = buildResponseWire(&buf, 0x5678, true, questions, response, true, 1232, false).?;
+    const wire = buildResponseWire(&buf, 0x5678, true, false, questions, response, true, 1232, false).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expect(parsed.opt != null);
