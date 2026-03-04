@@ -1,4 +1,7 @@
 .direnv/
+.envrc
+flake.nix
+flake.lock
 zig-cache/
 zig-out/
 .zig-cache/

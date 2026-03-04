@@ -1,3 +1,9 @@
+// This file is derived from the Zig standard library (lib/std/crypto/tls/Client.zig)
+// with ALPN extension support added for DNS-over-TLS (RFC 7301, RFC 9539).
+//
+// Original code copyright (c) Zig contributors, licensed under the MIT License.
+// See https://github.com/ziglang/zig/blob/master/LICENSE for the full license text.
+
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
