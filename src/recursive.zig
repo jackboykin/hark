@@ -270,7 +270,7 @@ pub const RecursiveResolver = struct {
                                     enc_state.recordSuccess(addr_key);
                                     response = try dns.parseMessage(allocator, tls_data);
                                     got_response = true;
-                                    if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                    if (self.cache) |c| c.storeReferralData(response, parent_zone);
                                     if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
                                     break;
                                 } else |err| {
@@ -303,7 +303,7 @@ pub const RecursiveResolver = struct {
                             if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
                                 response = try dns.parseMessage(allocator, tcp_data);
                                 got_response = true;
-                                if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                if (self.cache) |c| c.storeReferralData(response, parent_zone);
                                 break;
                             } else |_| {
                                 // TCP failed — ignore truncated response, try next server
@@ -317,8 +317,8 @@ pub const RecursiveResolver = struct {
 
                     got_response = true;
 
-                    // CACHE STORE: Cache all RRsets from this response
-                    if (self.cache) |c| c.storeResponse(response, parent_zone);
+                    // CACHE STORE: Cache referral data now; answers deferred until after validation
+                    if (self.cache) |c| c.storeReferralData(response, parent_zone);
 
                     break;
                 }
@@ -452,14 +452,12 @@ pub const RecursiveResolver = struct {
                                 break;
                             }
                         }
-                        // Follow CNAME when: no target type records, or target type
-                        // records are from a different zone (cross-zone CDN response).
-                        // Cross-zone answers have RRSIG signers that differ between the
-                        // CNAME and target type — fetchDnskey would query the wrong
-                        // servers, so resolve the target through its own delegation chain.
-                        const should_follow_cname = if (!has_target_type)
-                            true
-                        else if (self.dnssec_enabled and security_state == .secure) blk: {
+                        // Detect cross-zone CNAME: target type records are from a
+                        // different zone than the CNAME (CDN responses like
+                        // apple.com → aaplimg.com → akamaiedge.net). fetchDnskey
+                        // would query the wrong servers, so we must follow the CNAME
+                        // through its own delegation chain instead.
+                        const cross_zone_detected = if (has_target_type and self.dnssec_enabled and security_state == .secure) blk: {
                             const main_rrsig = dnssec.findRrsig(response.answers, qtype);
                             const cname_rrsig = dnssec.findRrsig(response.answers, .cname);
                             break :blk if (main_rrsig != null and cname_rrsig != null)
@@ -468,7 +466,25 @@ pub const RecursiveResolver = struct {
                                 false;
                         } else false;
 
+                        const should_follow_cname = !has_target_type or cross_zone_detected;
+
                         if (should_follow_cname) {
+                            // Validate CNAME RRset before following in secure zones
+                            if (self.dnssec_enabled and security_state == .secure) {
+                                if (dnssec.findRrsig(response.answers, .cname) != null) {
+                                    switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
+                                        .bogus => {
+                                            if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
+                                            return makeCachedMessage(&.{}, &.{}, .server_failure);
+                                        },
+                                        .valid => {
+                                            // Cache validated CNAME response
+                                            if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                        },
+                                        .skip => {},
+                                    }
+                                }
+                            }
                             if (findCnameRecord(response, target_name)) |cname_rr| {
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
@@ -485,10 +501,16 @@ pub const RecursiveResolver = struct {
                     // Validate answer RRsets if in secure zone
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                            .bogus => {
+                                // BAD cache per RFC 9520: 5-second negative entry
+                                if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
+                                return makeCachedMessage(&.{}, &.{}, .server_failure);
+                            },
                             .valid, .skip => {},
                         }
                     }
+                    // Answers validated (or DNSSEC off) — now safe to cache
+                    if (self.cache) |c| c.storeResponse(response, parent_zone);
 
                     return try withCnameChain(allocator, cname_chain.items, response);
                 }
