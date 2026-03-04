@@ -104,6 +104,19 @@ pub fn validateDnskeyRrset(
     ds_records: []const dns.DsData,
     zone_name: dns.Name,
 ) VerifyError!void {
+    // Filter to only DNSKEY records for signature verification.
+    // Response answers may include RRSIG records alongside DNSKEYs;
+    // including them in buildSignedData would corrupt the verification.
+    var dnskey_only: [64]dns.ResourceRecord = undefined;
+    var dnskey_count: usize = 0;
+    for (dnskey_records) |rr| {
+        if (rr.rtype == .dnskey and dnskey_count < dnskey_only.len) {
+            dnskey_only[dnskey_count] = rr;
+            dnskey_count += 1;
+        }
+    }
+    const filtered = dnskey_only[0..dnskey_count];
+
     // 1. Find a DNSKEY matching any DS record (this is the KSK)
     for (ds_records) |ds| {
         if (findMatchingDnskey(ds, dnskey_records, zone_name)) |ksk| {
@@ -117,14 +130,14 @@ pub fn validateDnskeyRrset(
                     const dk = rr.rdata.dnskey;
                     if (keyTag(dk) == rrsig.key_tag) {
                         // This key signed the DNSKEY RRset — verify it
-                        verifyRrsig(rrsig, dk, dnskey_records) catch continue;
+                        verifyRrsig(rrsig, dk, filtered) catch continue;
                         return; // DNSKEY RRset is valid
                     }
                 }
                 continue;
             }
             // 3. Verify the RRSIG over the DNSKEY RRset using the KSK
-            verifyRrsig(rrsig, ksk, dnskey_records) catch continue;
+            verifyRrsig(rrsig, ksk, filtered) catch continue;
             return; // Success
         }
     }
@@ -337,21 +350,20 @@ pub fn buildSignedData(
         }
     }.lessThan);
 
-    // The sorted RR wires are already in the buffer at scattered positions.
-    // We need to compact them contiguously starting at pos.
-    // Since they might overlap with the destination, copy to a stack buffer first.
-    // Actually, the sorted entries reference slices of buf[rr_buf_start..temp_pos].
-    // We need to copy them in order to buf[pos..].
-    // To avoid overlap issues, we'll copy if the source is ahead of destination.
-    var out_pos = pos;
+    // The sorted RR wires reference slices of buf[pos..temp_pos].
+    // Compacting them in-place would corrupt source data (earlier copies
+    // overwrite source positions of later entries). Copy to a temp buffer first.
+    var temp_buf: [65536]u8 = undefined;
+    var out_pos: usize = 0;
     for (rr_wires[0..rrset.len]) |wire| {
-        if (out_pos + wire.len > buf.len) return error.BufferTooSmall;
-        // Use memmove semantics since source and dest may overlap
-        std.mem.copyForwards(u8, buf[out_pos..][0..wire.len], wire);
+        if (out_pos + wire.len > temp_buf.len) return error.BufferTooSmall;
+        @memcpy(temp_buf[out_pos..][0..wire.len], wire);
         out_pos += wire.len;
     }
+    if (pos + out_pos > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[pos..][0..out_pos], temp_buf[0..out_pos]);
 
-    return buf[0..out_pos];
+    return buf[0 .. pos + out_pos];
 }
 
 /// Write canonical RDATA per RFC 4034 §6.2.
@@ -473,7 +485,8 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     const pub_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.InvalidKey;
 
     // Dispatch on modulus length at comptime
-    inline for ([_]usize{ 64, 128, 256, 384, 512 }) |mod_len| {
+    // 512-bit (64-byte) RSA omitted: broken key size, and SHA-512 DER exceeds modulus
+    inline for ([_]usize{ 128, 256, 384, 512 }) |mod_len| {
         if (modulus.len == mod_len) {
             const sig_array = signature[0..mod_len].*;
             rsa.PKCS1v1_5Signature.verify(mod_len, sig_array, msg, pub_key, Hash) catch
@@ -716,6 +729,72 @@ pub fn validateNegativeProof(
 
     // Could not prove — return unchecked (don't bogus, don't secure)
     return .unchecked;
+}
+
+// ── Answer RRset Validation ──────────────────────────────────────────
+
+/// Validate answer RRsets against a DNSKEY set.
+/// Finds the RRSIG covering `qtype`, matches it to a DNSKEY by key_tag + algorithm,
+/// and verifies the signature. Per RFC 6840 §5.4, tries ALL matching DNSKEYs.
+/// Also validates CNAME RRSIG if the answer contains CNAMEs and qtype != .cname.
+pub fn validateAnswerRrset(
+    answers: []const dns.ResourceRecord,
+    qtype: dns.RType,
+    dnskey_records: []const dns.ResourceRecord,
+) SecurityStatus {
+    // Validate the main answer type
+    if (validateRrsetForType(answers, qtype, dnskey_records) == .bogus) return .bogus;
+
+    // If qtype != .cname and answers contain CNAME records, validate CNAME RRSIG too
+    if (qtype != .cname) {
+        var has_cname = false;
+        for (answers) |rr| {
+            if (rr.rtype == .cname) {
+                has_cname = true;
+                break;
+            }
+        }
+        if (has_cname) {
+            if (validateRrsetForType(answers, .cname, dnskey_records) == .bogus) return .bogus;
+        }
+    }
+
+    return .secure;
+}
+
+/// Validate a single RRset type within the answers against DNSKEYs.
+fn validateRrsetForType(
+    answers: []const dns.ResourceRecord,
+    covered_type: dns.RType,
+    dnskey_records: []const dns.ResourceRecord,
+) SecurityStatus {
+    // Find RRSIG covering this type
+    const rrsig = findRrsig(answers, covered_type) orelse return .bogus;
+
+    // Filter answer records to only those matching the covered type
+    var filtered: [64]dns.ResourceRecord = undefined;
+    var filtered_count: usize = 0;
+    for (answers) |rr| {
+        if (rr.rtype == covered_type and filtered_count < filtered.len) {
+            filtered[filtered_count] = rr;
+            filtered_count += 1;
+        }
+    }
+    if (filtered_count == 0) return .bogus;
+
+    // RFC 6840 §5.4: try ALL matching DNSKEYs (key_tag + algorithm)
+    for (dnskey_records) |rr| {
+        if (rr.rtype != .dnskey) continue;
+        const dk = rr.rdata.dnskey;
+        if (keyTag(dk) != rrsig.key_tag) continue;
+        if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+
+        // Try verification with this key
+        verifyRrsig(rrsig, dk, filtered[0..filtered_count]) catch continue;
+        return .secure; // Signature verified
+    }
+
+    return .bogus; // No matching DNSKEY could verify
 }
 
 // ════════════════════════════════════════════════════════════════════════

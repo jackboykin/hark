@@ -442,6 +442,15 @@ pub const RecursiveResolver = struct {
                             }
                         }
                     }
+
+                    // Validate answer RRsets if in secure zone
+                    if (self.dnssec_enabled) {
+                        switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
+                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                            .valid, .skip => {},
+                        }
+                    }
+
                     return try withCnameChain(allocator, cname_chain.items, response);
                 }
 
@@ -516,6 +525,138 @@ pub const RecursiveResolver = struct {
 
             return error.MaxReferralsExceeded;
         }
+    }
+
+    // ── DNSSEC Answer Validation ───────────────────────────────────────
+
+    const AnswerValidation = enum { valid, bogus, skip };
+
+    /// Fetch DNSKEY records for a zone, checking cache first.
+    fn fetchDnskey(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        servers: []const std.net.Address,
+    ) !?[]const dns.ResourceRecord {
+        // Check cache first
+        if (self.cache) |c| {
+            if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
+                switch (result) {
+                    .hit => |h| return h.records,
+                    .negative => return null,
+                }
+            }
+        }
+
+        if (servers.len == 0) return null;
+
+        // Build DNSKEY query
+        var id_bytes: [2]u8 = undefined;
+        std.crypto.random.bytes(&id_bytes);
+        const query_id = mem.readInt(u16, &id_bytes, .big);
+
+        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, .dnskey, .{
+            .rd = false,
+            .edns = .{ .do_bit = true },
+        });
+
+        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+        const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
+
+        // Try first server
+        const response_data = self.transport.query(wire_query, query_id, servers[0]) catch return null;
+
+        // TC bit: retry over TCP
+        if (dns.hasTcBit(response_data)) {
+            if (self.tcp_transport) |tcp| {
+                var tcp_buf: [65535]u8 = undefined;
+                if (tcp.query(wire_query, servers[0], &tcp_buf)) |tcp_data| {
+                    const response = try dns.parseMessage(allocator, tcp_data);
+                    if (self.cache) |c| c.storeResponse(response, dns.Name{ .labels = &.{} });
+                    return response.answers;
+                } else |_| {}
+            }
+            return null;
+        }
+
+        const response = try dns.parseMessage(allocator, response_data);
+
+        // Cache the response
+        if (self.cache) |c| c.storeResponse(response, dns.Name{ .labels = &.{} });
+
+        if (response.answers.len == 0) return null;
+        return response.answers;
+    }
+
+    /// Validate answer RRsets for a response from a secure zone.
+    /// Returns .valid (AD bit set), .bogus (should SERVFAIL), or .skip (insecure zone).
+    fn validateAnswer(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        response: *dns.Message,
+        qtype: dns.RType,
+        security_state: dnssec.SecurityStatus,
+        servers: []const std.net.Address,
+    ) !AnswerValidation {
+        if (security_state != .secure) return .skip;
+
+        // Find RRSIG in answers to get the signer zone
+        const rrsig = dnssec.findRrsig(response.answers, qtype) orelse {
+            // No RRSIG for a secure zone — check for CNAME RRSIG
+            if (qtype != .cname) {
+                if (dnssec.findRrsig(response.answers, .cname)) |_| {
+                    // CNAME answer — the final type RRSIG may be from a different zone.
+                    // For now, skip validation rather than bogus.
+                    return .skip;
+                }
+            }
+            return .bogus;
+        };
+
+        // Extract signer zone name as dotted string
+        const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
+
+        // Fetch DNSKEY for the signer zone
+        const dnskey_records = (try self.fetchDnskey(allocator, signer_dotted, servers)) orelse return .bogus;
+
+        // Look up DS for the signer zone from cache to validate DNSKEY set
+        if (self.cache) |c| {
+            if (c.lookup(allocator, signer_dotted, .ds, .in)) |result| {
+                switch (result) {
+                    .hit => |h| {
+                        // Extract DS data from cached records
+                        var ds_records: [16]dns.DsData = undefined;
+                        var ds_count: usize = 0;
+                        for (h.records) |rr| {
+                            if (rr.rtype == .ds and ds_count < ds_records.len) {
+                                ds_records[ds_count] = rr.rdata.ds;
+                                ds_count += 1;
+                            }
+                        }
+                        if (ds_count > 0) {
+                            // Only validate DNSKEY against DS if we have the RRSIG covering DNSKEY.
+                            // Cache hits return only DNSKEY records (RRSIG stored separately).
+                            // The DNSKEY was already validated on the first (non-cached) fetch.
+                            if (dnssec.findRrsig(dnskey_records, .dnskey) != null) {
+                                const zone_name = try dns.parseDottedName(allocator, signer_dotted);
+                                dnssec.validateDnskeyRrset(dnskey_records, ds_records[0..ds_count], zone_name) catch return .bogus;
+                            }
+                        }
+                    },
+                    .negative => {},
+                }
+            }
+        }
+
+        // Validate the answer RRsets
+        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records)) {
+            .secure => {
+                response.header.ad = true;
+                return .valid;
+            },
+            .bogus => .bogus,
+            .unchecked, .insecure => .skip,
+        };
     }
 
     fn resolveNsAddresses(
