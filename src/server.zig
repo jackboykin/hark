@@ -397,11 +397,8 @@ const WorkerState = struct {
         var rcode_buf2: [24]u8 = undefined;
         log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf2), elapsed_ms });
 
-        // RFC 6840 §5.8: set AD only if client signalled DO or AD
-        const wants_ad = (query.opt != null and query.opt.?.do_bit) or query.header.ad;
-
         var wire_buf: [65535]u8 = undefined;
-        if (buildResponseWire(&wire_buf, query.header.id, query.header.rd, query.header.cd, query.questions, response, query.opt != null, max_payload, wants_ad)) |wire| {
+        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query, max_payload), response, alloc)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -483,8 +480,7 @@ const WorkerState = struct {
         var rcode_buf4: [24]u8 = undefined;
         log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf4), elapsed_ms });
 
-        const wants_ad_tcp = (query.opt != null and query.opt.?.do_bit) or query.header.ad;
-        return buildResponseWire(response_wire, query.header.id, query.header.rd, query.header.cd, query.questions, response, query.opt != null, 65535, wants_ad_tcp);
+        return buildResponseWire(response_wire, ResponseContext.fromQuery(query, 65535), response, alloc);
     }
 
     fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
@@ -539,78 +535,138 @@ const WorkerState = struct {
 
 // ── Response building ──────────────────────────────────────────────────
 
-fn buildResponseWire(
-    wire_buf: []u8,
+/// RFC 4035 §3.2.1: strip authenticating DNSSEC RRs (RRSIG, NSEC, NSEC3) when
+/// client didn't set the DO bit. Records whose type matches the QTYPE are kept
+/// in the answer section (explicit query for that type).
+fn stripDnssecRRs(alloc: mem.Allocator, records: []const dns.ResourceRecord, qtype: dns.RType, is_answer: bool) []const dns.ResourceRecord {
+    var count: usize = 0;
+    for (records) |rr| {
+        if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) {
+            continue;
+        }
+        count += 1;
+    }
+    if (count == records.len) return records;
+
+    const filtered = alloc.alloc(dns.ResourceRecord, count) catch return records;
+    var i: usize = 0;
+    for (records) |rr| {
+        if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) {
+            continue;
+        }
+        filtered[i] = rr;
+        i += 1;
+    }
+    return filtered;
+}
+
+fn isDnssecAuthRR(rtype: dns.RType) bool {
+    return switch (rtype) {
+        .rrsig, .nsec, .nsec3 => true,
+        else => false,
+    };
+}
+
+const ResponseContext = struct {
     query_id: u16,
     rd: bool,
     cd: bool,
     questions: []const dns.Question,
-    response: dns.Message,
     client_edns: bool,
-    max_payload: u16,
+    client_do: bool,
     client_wants_ad: bool,
+    max_payload: u16,
+
+    fn fromQuery(query: dns.Message, max_payload: u16) ResponseContext {
+        const client_do = query.opt != null and query.opt.?.do_bit;
+        return .{
+            .query_id = query.header.id,
+            .rd = query.header.rd,
+            .cd = query.header.cd,
+            .questions = query.questions,
+            .client_edns = query.opt != null,
+            .client_do = client_do,
+            // RFC 6840 §5.8: set AD only if client signalled DO or AD
+            .client_wants_ad = client_do or query.header.ad,
+            .max_payload = max_payload,
+        };
+    }
+};
+
+fn buildResponseWire(
+    wire_buf: []u8,
+    ctx: ResponseContext,
+    response: dns.Message,
+    alloc: mem.Allocator,
 ) ?[]const u8 {
-    const opt: ?dns.OptRecord = if (client_edns) .{
+    const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         .udp_payload_size = dns.edns_udp_payload,
         .extended_rcode = 0,
         .version = 0,
-        .do_bit = false,
+        .do_bit = ctx.client_do,
         .options = &.{},
     } else null;
 
+    const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
+
+    // RFC 4035 §3.2.1: strip authenticating DNSSEC RRs when client didn't set DO
+    const answers = if (!ctx.client_do) stripDnssecRRs(alloc, response.answers, qtype, true) else response.answers;
+    const authorities = if (!ctx.client_do) stripDnssecRRs(alloc, response.authorities, qtype, false) else response.authorities;
+    const additionals = if (!ctx.client_do) stripDnssecRRs(alloc, response.additionals, qtype, false) else response.additionals;
+
     var msg = dns.Message{
         .header = .{
-            .id = query_id,
+            .id = ctx.query_id,
             .qr = true,
             .opcode = .query,
             .aa = false,
             .tc = false,
-            .rd = rd,
+            .rd = ctx.rd,
             .ra = true,
-            .z = 0, .ad = response.header.ad and client_wants_ad, .cd = cd,
+            .z = 0, .ad = response.header.ad and ctx.client_wants_ad, .cd = ctx.cd,
             .rcode = response.header.rcode,
-            .qd_count = @intCast(questions.len),
-            .an_count = @intCast(response.answers.len),
-            .ns_count = @intCast(response.authorities.len),
-            .ar_count = @intCast(response.additionals.len),
+            .qd_count = @intCast(ctx.questions.len),
+            .an_count = @intCast(answers.len),
+            .ns_count = @intCast(authorities.len),
+            .ar_count = @intCast(additionals.len),
         },
-        .questions = questions,
-        .answers = response.answers,
-        .authorities = response.authorities,
-        .additionals = response.additionals,
+        .questions = ctx.questions,
+        .answers = answers,
+        .authorities = authorities,
+        .additionals = additionals,
         .opt = opt,
     };
 
     // Try full response
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= max_payload) return wire;
+        if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
     // Drop additionals
     msg.additionals = &.{};
     msg.header.ar_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= max_payload) return wire;
+        if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
     // Drop authorities
     msg.authorities = &.{};
     msg.header.ns_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= max_payload) return wire;
+        if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
     // TC bit with answers
     msg.header.tc = true;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= max_payload) return wire;
+        if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
     // TC with no answers
     msg.answers = &.{};
     msg.header.an_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        return wire[0..@min(wire.len, max_payload)];
+        return wire[0..@min(wire.len, ctx.max_payload)];
     } else |_| {}
 
     return null;
@@ -811,7 +867,16 @@ test "buildResponseWire sets correct header fields" {
     };
 
     var buf: [512]u8 = undefined;
-    const wire = buildResponseWire(&buf, 0x1234, true, false, questions, response, false, 512, false).?;
+    const wire = buildResponseWire(&buf, .{
+        .query_id = 0x1234,
+        .rd = true,
+        .cd = false,
+        .questions = questions,
+        .client_edns = false,
+        .client_do = false,
+        .client_wants_ad = false,
+        .max_payload = 512,
+    }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
@@ -857,7 +922,16 @@ test "buildResponseWire with EDNS0" {
     };
 
     var buf: [1232]u8 = undefined;
-    const wire = buildResponseWire(&buf, 0x5678, true, false, questions, response, true, 1232, false).?;
+    const wire = buildResponseWire(&buf, .{
+        .query_id = 0x5678,
+        .rd = true,
+        .cd = false,
+        .questions = questions,
+        .client_edns = true,
+        .client_do = false,
+        .client_wants_ad = false,
+        .max_payload = 1232,
+    }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expect(parsed.opt != null);
