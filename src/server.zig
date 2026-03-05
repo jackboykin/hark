@@ -16,6 +16,7 @@ const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const RRsetCache = @import("cache.zig").RRsetCache;
+const InFlightTable = @import("dedup.zig").InFlightTable;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Certificate = std.crypto.Certificate;
 
@@ -41,6 +42,7 @@ pub const Server = struct {
     allocator: mem.Allocator,
     cache: RRsetCache,
     rtt_cache: RttCache,
+    dedup: ?InFlightTable,
     ca_bundle: Certificate.Bundle,
     shutdown: std.atomic.Value(bool),
 
@@ -68,6 +70,7 @@ pub const Server = struct {
             .allocator = allocator,
             .cache = cache,
             .rtt_cache = rtt_cache,
+            .dedup = if (cfg.workers > 1) InFlightTable.init(allocator) else null,
             .ca_bundle = ca_bundle,
             .shutdown = std.atomic.Value(bool).init(false),
         };
@@ -77,6 +80,7 @@ pub const Server = struct {
         if (self.config.opportunistic) {
             self.ca_bundle.deinit(self.allocator);
         }
+        if (self.dedup) |*d| d.deinit();
         self.cache.deinit();
         self.rtt_cache.deinit();
     }
@@ -229,6 +233,7 @@ pub const Server = struct {
             .encryption_state = if (self.config.opportunistic) &enc_state else null,
             .cache = &self.cache,
             .rtt_cache = &self.rtt_cache,
+            .dedup = if (self.dedup) |*d| d else null,
             .shutdown = &self.shutdown,
         };
 
@@ -249,6 +254,7 @@ const WorkerState = struct {
     encryption_state: ?*EncryptionStateCache,
     cache: *RRsetCache,
     rtt_cache: *RttCache,
+    dedup: ?*InFlightTable,
     shutdown: *std.atomic.Value(bool),
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
@@ -379,7 +385,7 @@ const WorkerState = struct {
         const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveQuery(alloc, name_str, question.qtype, query.header.cd) catch {
+        const response = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
@@ -466,7 +472,7 @@ const WorkerState = struct {
         const name_str = name_buf[0..name_len];
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveQuery(alloc, name_str, question.qtype, query.header.cd) catch {
+        const response = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
@@ -479,6 +485,26 @@ const WorkerState = struct {
 
         const wants_ad_tcp = (query.opt != null and query.opt.?.do_bit) or query.header.ad;
         return buildResponseWire(response_wire, query.header.id, query.header.rd, query.header.cd, query.questions, response, query.opt != null, 65535, wants_ad_tcp);
+    }
+
+    fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
+        var is_leader = true;
+        if (self.dedup) |dedup| {
+            switch (dedup.acquireOrWait(name, qtype)) {
+                .leader => {},
+                .follower => {
+                    is_leader = false;
+                },
+            }
+        }
+        errdefer if (is_leader) {
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
+        };
+        const response = try self.resolveQuery(alloc, name, qtype, cd);
+        if (is_leader) {
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
+        }
+        return response;
     }
 
     fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
