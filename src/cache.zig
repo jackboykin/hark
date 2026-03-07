@@ -145,11 +145,13 @@ pub const CacheLookupResult = union(enum) {
     hit: struct {
         records: []dns.ResourceRecord,
         remaining_ttl: u32,
+        needs_prefetch: bool = false,
     },
     negative: struct {
         rcode: dns.RCode,
         remaining_ttl: u32,
         soa: ?dns.ResourceRecord,
+        needs_prefetch: bool = false,
     },
 };
 
@@ -277,6 +279,39 @@ fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
     };
 }
 
+/// Apply min-TTL floor and max-TTL cap.
+fn clampTtl(min_ttl: u32, ttl: u32) u32 {
+    const effective = if (min_ttl > 0) @max(ttl, min_ttl) else ttl;
+    return @min(effective, max_cache_ttl);
+}
+
+/// Clone cached records into caller-owned ResourceRecords with a given TTL.
+fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ?[]dns.ResourceRecord {
+    const records = alloc.alloc(dns.ResourceRecord, cached.len) catch return null;
+    for (cached, 0..) |cr, i| {
+        records[i] = .{
+            .name = cloneName(alloc, cr.name) catch return null,
+            .rtype = cr.rtype,
+            .rclass = cr.rclass,
+            .ttl = ttl,
+            .rdata = cloneRData(alloc, cr.rdata) catch return null,
+        };
+    }
+    return records;
+}
+
+/// Clone an optional CachedRecord into a ResourceRecord with a given TTL.
+fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.ResourceRecord {
+    const s = cached orelse return null;
+    return dns.ResourceRecord{
+        .name = cloneName(alloc, s.name) catch return null,
+        .rtype = s.rtype,
+        .rclass = s.rclass,
+        .ttl = ttl,
+        .rdata = cloneRData(alloc, s.rdata) catch return null,
+    };
+}
+
 /// Lowercase src into dest, returning the written slice.
 fn lowerInto(dest: []u8, src: []const u8) []const u8 {
     for (src, 0..) |c, i| dest[i] = std.ascii.toLower(c);
@@ -311,23 +346,45 @@ pub const RRsetCache = struct {
     max_entries: u32,
     now_fn: *const fn () i64,
     mutex: ?std.Thread.Mutex = null,
+    serve_stale_ttl: u32 = 0,
+    min_ttl: u32 = 0,
+    prefetch: bool = false,
     hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     negative_stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub const CacheOptions = struct {
+        prefetch: bool = false,
+        serve_stale_ttl: u32 = 0,
+        min_ttl: u32 = 0,
+    };
 
     pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
+        return initWithOptions(backing, max_bytes, max_entries, .{});
+    }
+
+    pub fn initWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
         return .{
             .counting = CountingAllocator.init(backing, max_bytes),
             .map = .empty,
             .max_entries = max_entries,
             .now_fn = &defaultNowSeconds,
+            .prefetch = opts.prefetch,
+            .serve_stale_ttl = opts.serve_stale_ttl,
+            .min_ttl = opts.min_ttl,
         };
     }
 
     pub fn initThreadSafe(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
-        var c = init(backing, max_bytes, max_entries);
+        return initThreadSafeWithOptions(backing, max_bytes, max_entries, .{});
+    }
+
+    pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
+        var c = initWithOptions(backing, max_bytes, max_entries, opts);
         c.mutex = .{};
         return c;
     }
@@ -340,6 +397,8 @@ pub const RRsetCache = struct {
         stores: u64,
         negative_stores: u64,
         evictions: u64,
+        prefetch_eligible: u64,
+        stale_hits: u64,
     };
 
     pub fn getStats(self: *RRsetCache) Stats {
@@ -353,6 +412,8 @@ pub const RRsetCache = struct {
             .stores = self.stores.load(.monotonic),
             .negative_stores = self.negative_stores.load(.monotonic),
             .evictions = self.evictions.load(.monotonic),
+            .prefetch_eligible = self.prefetch_eligible.load(.monotonic),
+            .stale_hits = self.stale_hits.load(.monotonic),
         };
     }
 
@@ -392,52 +453,62 @@ pub const RRsetCache = struct {
 
         switch (entry) {
             .positive => |rrset| {
-                if (now >= rrset.expires_at) {
-                    self.removeAndFree(probe);
-                    _ = self.misses.fetchAdd(1, .monotonic);
-                    return null;
+                const is_expired = now >= rrset.expires_at;
+                if (is_expired) {
+                    if (self.serve_stale_ttl == 0 or (now - rrset.expires_at) >= self.serve_stale_ttl) {
+                        self.removeAndFree(probe);
+                        _ = self.misses.fetchAdd(1, .monotonic);
+                        return null;
+                    }
+                    // Stale but within window — serve with synthetic TTL (RFC 8767)
+                    const records = cloneRRset(caller_alloc, rrset.records, 30) orelse return null;
+                    _ = self.hits.fetchAdd(1, .monotonic);
+                    _ = self.stale_hits.fetchAdd(1, .monotonic);
+                    _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true } };
                 }
+
                 const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
                 const remaining = rrset.original_ttl - elapsed;
-
-                const records = caller_alloc.alloc(dns.ResourceRecord, rrset.records.len) catch return null;
-                for (rrset.records, 0..) |cr, i| {
-                    records[i] = .{
-                        .name = cloneName(caller_alloc, cr.name) catch return null,
-                        .rtype = cr.rtype,
-                        .rclass = cr.rclass,
-                        .ttl = remaining,
-                        .rdata = cloneRData(caller_alloc, cr.rdata) catch return null,
-                    };
-                }
+                const needs_prefetch = self.prefetch and (remaining * 10 <= rrset.original_ttl);
+                const records = cloneRRset(caller_alloc, rrset.records, remaining) orelse return null;
 
                 _ = self.hits.fetchAdd(1, .monotonic);
-                return .{ .hit = .{ .records = records, .remaining_ttl = remaining } };
+                if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+                return .{ .hit = .{ .records = records, .remaining_ttl = remaining, .needs_prefetch = needs_prefetch } };
             },
             .negative => |neg| {
-                if (now >= neg.expires_at) {
-                    self.removeAndFree(probe);
-                    _ = self.misses.fetchAdd(1, .monotonic);
-                    return null;
+                const is_expired = now >= neg.expires_at;
+                if (is_expired) {
+                    if (self.serve_stale_ttl == 0 or (now - neg.expires_at) >= self.serve_stale_ttl) {
+                        self.removeAndFree(probe);
+                        _ = self.misses.fetchAdd(1, .monotonic);
+                        return null;
+                    }
+                    const soa = cloneCachedRecord(caller_alloc, neg.soa, 30);
+                    _ = self.hits.fetchAdd(1, .monotonic);
+                    _ = self.stale_hits.fetchAdd(1, .monotonic);
+                    _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+                    return .{ .negative = .{
+                        .rcode = neg.rcode,
+                        .remaining_ttl = 30,
+                        .soa = soa,
+                        .needs_prefetch = true,
+                    } };
                 }
+
                 const elapsed: u32 = @intCast(@min(@max(now - neg.stored_at, 0), neg.original_ttl));
                 const remaining = neg.original_ttl - elapsed;
-
-                const soa = if (neg.soa) |s| blk: {
-                    break :blk dns.ResourceRecord{
-                        .name = cloneName(caller_alloc, s.name) catch return null,
-                        .rtype = s.rtype,
-                        .rclass = s.rclass,
-                        .ttl = remaining,
-                        .rdata = cloneRData(caller_alloc, s.rdata) catch return null,
-                    };
-                } else null;
+                const needs_prefetch = self.prefetch and (remaining * 10 <= neg.original_ttl);
+                const soa = cloneCachedRecord(caller_alloc, neg.soa, remaining);
 
                 _ = self.hits.fetchAdd(1, .monotonic);
+                if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
                 return .{ .negative = .{
                     .rcode = neg.rcode,
                     .remaining_ttl = remaining,
                     .soa = soa,
+                    .needs_prefetch = needs_prefetch,
                 } };
             },
         }
@@ -507,7 +578,7 @@ pub const RRsetCache = struct {
         self.evictIfNeeded();
 
         const now = self.now_fn();
-        const capped_ttl = @min(neg_ttl, max_cache_ttl);
+        const capped_ttl = clampTtl(self.min_ttl, neg_ttl);
         self.map.put(alloc, key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
@@ -546,7 +617,7 @@ pub const RRsetCache = struct {
         self.evictIfNeeded();
 
         const now = self.now_fn();
-        const capped_ttl = @min(ttl, max_cache_ttl);
+        const capped_ttl = clampTtl(self.min_ttl, ttl);
         self.map.put(alloc, key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
@@ -685,7 +756,7 @@ pub const RRsetCache = struct {
             self.evictIfNeeded();
 
             const now = self.now_fn();
-            const capped_ttl = @min(rr.ttl, max_cache_ttl);
+            const capped_ttl = clampTtl(self.min_ttl, rr.ttl);
             self.map.put(alloc, key, .{ .positive = .{
                 .records = final_records,
                 .expires_at = now + @as(i64, capped_ttl),
@@ -1071,6 +1142,190 @@ test "cache negative without SOA is not stored" {
     defer arena.deinit();
     const result = cache.lookup(arena.allocator(), "no-soa.example.com", .a, .in);
     try testing.expect(result == null);
+}
+
+test "cache prefetch flag at 10 percent TTL" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .prefetch = true });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "example", "com" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+
+    // At 50% TTL — no prefetch
+    test_time = 1150;
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| {
+                try testing.expectEqual(@as(u32, 150), h.remaining_ttl);
+                try testing.expectEqual(false, h.needs_prefetch);
+
+            },
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
+
+    // At 5% TTL (remaining=15 out of 300, 15*10=150 <= 300) — prefetch
+    test_time = 1285;
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| {
+                try testing.expectEqual(@as(u32, 15), h.remaining_ttl);
+                try testing.expectEqual(true, h.needs_prefetch);
+
+            },
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "cache prefetch disabled by default" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc); // default: prefetch=false
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "example", "com" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+
+    // At 5% TTL — still no prefetch (disabled)
+    test_time = 1285;
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| try testing.expectEqual(false, h.needs_prefetch),
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "cache serve stale within window" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "stale", "test" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+
+    // Expired but within stale window
+    test_time = 1100; // 40s past expiry
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "stale.test", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| {
+                try testing.expectEqual(@as(u32, 30), h.remaining_ttl); // synthetic TTL
+
+                try testing.expectEqual(true, h.needs_prefetch);
+            },
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
+
+    try testing.expectEqual(@as(u64, 1), cache.getStats().stale_hits);
+}
+
+test "cache serve stale beyond window returns null" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "stale2", "test" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+
+    // Beyond stale window (60s TTL + 3600s stale = 3660s)
+    test_time = 1000 + 60 + 3601;
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "stale2.test", .a, .in);
+        try testing.expect(result == null);
+    }
+}
+
+test "cache min TTL floor" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .min_ttl = 300 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "cdn", "test" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+
+    // Should be cached with TTL=300, not 60
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "cdn.test", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| try testing.expectEqual(@as(u32, 300), h.remaining_ttl),
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Should still be available after original 60s TTL
+    test_time = 1100;
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = cache.lookup(arena.allocator(), "cdn.test", .a, .in);
+        try testing.expect(result != null);
+        switch (result.?) {
+            .hit => |h| try testing.expectEqual(@as(u32, 200), h.remaining_ttl),
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "cache stats tracking" {

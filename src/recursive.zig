@@ -68,36 +68,61 @@ pub const RecursiveResolver = struct {
     tls_transport: ?*TlsTransport = null,
     encryption_state: ?*EncryptionStateCache = null,
     rtt_cache: ?*RttCache = null,
+    bypass_cache: bool = false,
 
-    pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !dns.Message {
+    pub const ResolveResult = struct {
+        message: dns.Message,
+        prefetch_name: ?[]const u8 = null,
+        prefetch_qtype: dns.RType = .a,
+    };
+
+    pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         return self.resolveImpl(allocator, name, qtype, 0);
     }
 
     const max_resolve_depth = 3;
 
-    fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!dns.Message {
+    fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
         var current_name: []const u8 = name;
         var cname_count: usize = 0;
         var total_probes: usize = 0;
         var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        var prefetch_name: ?[]const u8 = null;
 
         // DNSSEC chain of trust state — starts as secure at root
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
 
         cname_loop: while (true) {
             // CACHE CHECK 1: Do we already have a cached answer?
-            if (self.cache) |c| {
-                if (c.lookup(allocator, current_name, qtype, .in)) |result| {
-                    switch (result) {
-                        .hit => |h| return try withCnameChain(allocator, cname_chain.items, makeCachedMessage(h.records, &.{}, .no_error)),
-                        .negative => |n| {
-                            const authorities = if (n.soa) |soa| blk: {
-                                const auths = try allocator.alloc(dns.ResourceRecord, 1);
-                                auths[0] = soa;
-                                break :blk auths;
-                            } else &[_]dns.ResourceRecord{};
-                            return try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, n.rcode));
-                        },
+            if (!self.bypass_cache) {
+                if (self.cache) |c| {
+                    if (c.lookup(allocator, current_name, qtype, .in)) |result| {
+                        const needs_prefetch = switch (result) {
+                            .hit => |h| h.needs_prefetch,
+                            .negative => |n| n.needs_prefetch,
+                        };
+                        if (needs_prefetch and cname_count == 0) {
+                            prefetch_name = name;
+                        }
+                        switch (result) {
+                            .hit => |h| return .{
+                                .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(h.records, &.{}, .no_error)),
+                                .prefetch_name = prefetch_name,
+                                .prefetch_qtype = qtype,
+                            },
+                            .negative => |n| {
+                                const authorities = if (n.soa) |soa| blk: {
+                                    const auths = try allocator.alloc(dns.ResourceRecord, 1);
+                                    auths[0] = soa;
+                                    break :blk auths;
+                                } else &[_]dns.ResourceRecord{};
+                                return .{
+                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, n.rcode)),
+                                    .prefetch_name = prefetch_name,
+                                    .prefetch_qtype = qtype,
+                                };
+                            },
+                        }
                     }
                 }
             }
@@ -398,10 +423,10 @@ pub const RecursiveResolver = struct {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
                             },
                             .skip_cache => {},
-                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                            .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
                         }
                     }
-                    return try withCnameChain(allocator, cname_chain.items, response);
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
 
                 if (response.answers.len > 0) {
@@ -422,7 +447,7 @@ pub const RecursiveResolver = struct {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
                                         .bogus => {
                                             if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                            return makeCachedMessage(&.{}, &.{}, .server_failure);
+                                            return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) };
                                         },
                                         .valid => {
                                             if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -447,13 +472,13 @@ pub const RecursiveResolver = struct {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
                             .bogus => {
                                 if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                return makeCachedMessage(&.{}, &.{}, .server_failure);
+                                return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) };
                             },
                             .valid, .skip => {},
                         }
                     }
 
-                    return try withCnameChain(allocator, cname_chain.items, response);
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
 
                 // Check for referral (NS records in authority section)
@@ -465,10 +490,10 @@ pub const RecursiveResolver = struct {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
                             },
                             .skip_cache => {},
-                            .bogus => return makeCachedMessage(&.{}, &.{}, .server_failure),
+                            .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
                         }
                     }
-                    return try withCnameChain(allocator, cname_chain.items, response);
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };
 
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
@@ -673,8 +698,8 @@ pub const RecursiveResolver = struct {
                 continue;
             };
             // Resolve A records
-            if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |ns_response| {
-                for (ns_response.answers) |rr| {
+            if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |ns_result| {
+                for (ns_result.message.answers) |rr| {
                     if (rr.rtype == .a and count < max_servers_per_level) {
                         addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
                         count += 1;
@@ -684,8 +709,8 @@ pub const RecursiveResolver = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
             }
             // Resolve AAAA records
-            if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |ns6_response| {
-                for (ns6_response.answers) |rr| {
+            if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |ns6_result| {
+                for (ns6_result.message.answers) |rr| {
                     if (rr.rtype == .aaaa and count < max_servers_per_level) {
                         addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
                         count += 1;
@@ -1450,7 +1475,7 @@ test "recursive resolve example.com A from root hints" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const response = resolver.resolve(arena.allocator(), "example.com", .a) catch |err| switch (err) {
+    const result = resolver.resolve(arena.allocator(), "example.com", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
         error.ReferralLoop => return error.SkipZigTest,
@@ -1459,13 +1484,13 @@ test "recursive resolve example.com A from root hints" {
         else => return err,
     };
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
-    try testing.expect(response.answers.len > 0);
+    try testing.expect(result.message.header.qr);
+    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
+    try testing.expect(result.message.answers.len > 0);
 
     // Verify we got an A record
     var found_a = false;
-    for (response.answers) |rr| {
+    for (result.message.answers) |rr| {
         if (rr.rtype == .a) {
             found_a = true;
             break;
@@ -1491,7 +1516,7 @@ test "recursive resolve nonexistent domain returns name_error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const response = resolver.resolve(arena.allocator(), "this-domain-does-not-exist-xyzzy.example.com", .a) catch |err| switch (err) {
+    const result = resolver.resolve(arena.allocator(), "this-domain-does-not-exist-xyzzy.example.com", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
         error.ReferralLoop => return error.SkipZigTest,
@@ -1500,7 +1525,7 @@ test "recursive resolve nonexistent domain returns name_error" {
         else => return err,
     };
 
-    try testing.expectEqual(dns.RCode.name_error, response.header.rcode);
+    try testing.expectEqual(dns.RCode.name_error, result.message.header.rcode);
 }
 
 test "recursive resolve domain with glueless NS" {
@@ -1522,7 +1547,7 @@ test "recursive resolve domain with glueless NS" {
     defer arena.deinit();
 
     // ietf.org uses ns0.amsl.com etc. — glueless from .org zone
-    const response = resolver.resolve(arena.allocator(), "ietf.org", .a) catch |err| switch (err) {
+    const result = resolver.resolve(arena.allocator(), "ietf.org", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
         error.ReferralLoop => return error.SkipZigTest,
@@ -1531,12 +1556,12 @@ test "recursive resolve domain with glueless NS" {
         else => return err,
     };
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
-    try testing.expect(response.answers.len > 0);
+    try testing.expect(result.message.header.qr);
+    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
+    try testing.expect(result.message.answers.len > 0);
 
     var found_a = false;
-    for (response.answers) |rr| {
+    for (result.message.answers) |rr| {
         if (rr.rtype == .a) {
             found_a = true;
             break;
@@ -1563,7 +1588,7 @@ test "recursive resolve with CNAME chain" {
     defer arena.deinit();
 
     // www.github.com is a CNAME to github.github.io
-    const response = resolver.resolve(arena.allocator(), "www.github.com", .a) catch |err| switch (err) {
+    const result = resolver.resolve(arena.allocator(), "www.github.com", .a) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest,
         error.NoGlueRecords => return error.SkipZigTest,
         error.ReferralLoop => return error.SkipZigTest,
@@ -1572,13 +1597,13 @@ test "recursive resolve with CNAME chain" {
         else => return err,
     };
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
-    try testing.expect(response.answers.len > 0);
+    try testing.expect(result.message.header.qr);
+    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
+    try testing.expect(result.message.answers.len > 0);
 
     var found_a = false;
     var found_cname = false;
-    for (response.answers) |rr| {
+    for (result.message.answers) |rr| {
         if (rr.rtype == .a) found_a = true;
         if (rr.rtype == .cname) found_cname = true;
     }

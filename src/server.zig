@@ -10,7 +10,8 @@ const max_operations = @import("event_loop.zig").max_operations;
 const OperationId = @import("event_loop.zig").OperationId;
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
-const RecursiveResolver = @import("recursive.zig").RecursiveResolver;
+const recursive = @import("recursive.zig");
+const RecursiveResolver = recursive.RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
@@ -47,10 +48,15 @@ pub const Server = struct {
     shutdown: std.atomic.Value(bool),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig) !Server {
+        const cache_opts = RRsetCache.CacheOptions{
+            .prefetch = cfg.prefetch,
+            .serve_stale_ttl = cfg.serve_stale_ttl,
+            .min_ttl = cfg.min_ttl,
+        };
         const cache = if (cfg.workers > 1)
-            RRsetCache.initThreadSafe(allocator, cfg.cache_size, cfg.cache_entries)
+            RRsetCache.initThreadSafeWithOptions(allocator, cfg.cache_size, cfg.cache_entries, cache_opts)
         else
-            RRsetCache.init(allocator, cfg.cache_size, cfg.cache_entries);
+            RRsetCache.initWithOptions(allocator, cfg.cache_size, cfg.cache_entries, cache_opts);
 
         const rtt_cache = if (cfg.workers > 1)
             RttCache.initThreadSafe(allocator)
@@ -153,8 +159,8 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions", .{
-            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions,
+        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions, {d} prefetch-eligible, {d} stale", .{
+            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.prefetch_eligible, stats.stale_hits,
         });
     }
 
@@ -401,7 +407,7 @@ const WorkerState = struct {
         const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
+        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
@@ -411,11 +417,16 @@ const WorkerState = struct {
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
-        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf2), elapsed_ms });
+        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
 
         var wire_buf: [65535]u8 = undefined;
-        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query, max_payload), response, alloc)) |wire| {
+        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query, max_payload), result.message, alloc)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
+        }
+
+        // Inline prefetch: client already has their response, refresh cache
+        if (result.prefetch_name) |prefetch_name| {
+            self.doPrefetch(prefetch_name, result.prefetch_qtype);
         }
     }
 
@@ -450,33 +461,44 @@ const WorkerState = struct {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             var response_wire: [65535]u8 = undefined;
-            const wire = self.processQuery(arena.allocator(), query_buf[0..msg_len], &response_wire) orelse return;
+            const qr = self.processQuery(arena.allocator(), query_buf[0..msg_len], &response_wire) orelse return;
 
             // Write length-prefixed response
             var len_prefix: [2]u8 = undefined;
-            mem.writeInt(u16, &len_prefix, @intCast(wire.len), .big);
+            mem.writeInt(u16, &len_prefix, @intCast(qr.wire.len), .big);
             tcpWriteAllBlocking(client_fd, &len_prefix) orelse return;
-            tcpWriteAllBlocking(client_fd, wire) orelse return;
+            tcpWriteAllBlocking(client_fd, qr.wire) orelse return;
+
+            // Inline prefetch after response is sent to client
+            if (qr.prefetch_name) |prefetch_name| {
+                self.doPrefetch(prefetch_name, qr.prefetch_qtype);
+            }
         }
     }
 
-    fn processQuery(self: *WorkerState, alloc: mem.Allocator, data: []const u8, response_wire: []u8) ?[]const u8 {
+    const TcpQueryResult = struct {
+        wire: []const u8,
+        prefetch_name: ?[]const u8 = null,
+        prefetch_qtype: dns.RType = .a,
+    };
+
+    fn processQuery(self: *WorkerState, alloc: mem.Allocator, data: []const u8, response_wire: []u8) ?TcpQueryResult {
         const query = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                return serializeErrorResponse(response_wire, id, .format_error, false, &.{});
+                return if (serializeErrorResponse(response_wire, id, .format_error, false, &.{})) |w| .{ .wire = w } else null;
             }
             return null;
         };
 
         if (query.header.opcode != .query) {
-            return serializeErrorResponse(response_wire, query.header.id, .not_implemented, query.header.rd, query.questions);
+            return if (serializeErrorResponse(response_wire, query.header.id, .not_implemented, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         }
         if (query.questions.len != 1) {
-            return serializeErrorResponse(response_wire, query.header.id, .format_error, query.header.rd, query.questions);
+            return if (serializeErrorResponse(response_wire, query.header.id, .format_error, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         }
         if (query.questions[0].qclass != .in) {
-            return serializeErrorResponse(response_wire, query.header.id, .refused, query.header.rd, query.questions);
+            return if (serializeErrorResponse(response_wire, query.header.id, .refused, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         }
 
         const question = query.questions[0];
@@ -485,21 +507,26 @@ const WorkerState = struct {
         const name_str = name_buf[0..name_len];
 
         const start_ns = std.time.nanoTimestamp();
-        const response = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
+        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
-            return serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions);
+            return if (serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
         var qtype_buf4: [24]u8 = undefined;
         var rcode_buf4: [24]u8 = undefined;
-        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, response.header.rcode, &rcode_buf4), elapsed_ms });
+        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf4), elapsed_ms });
 
-        return buildResponseWire(response_wire, ResponseContext.fromQuery(query, 65535), response, alloc);
+        const wire = buildResponseWire(response_wire, ResponseContext.fromQuery(query, 65535), result.message, alloc) orelse return null;
+        return .{
+            .wire = wire,
+            .prefetch_name = result.prefetch_name,
+            .prefetch_qtype = result.prefetch_qtype,
+        };
     }
 
-    fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
+    fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !recursive.RecursiveResolver.ResolveResult {
         var is_leader = true;
         if (self.dedup) |dedup| {
             switch (dedup.acquireOrWait(name, qtype)) {
@@ -512,14 +539,14 @@ const WorkerState = struct {
         errdefer if (is_leader) {
             if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
         };
-        const response = try self.resolveQuery(alloc, name, qtype, cd);
+        const result = try self.resolveQuery(alloc, name, qtype, cd, false);
         if (is_leader) {
             if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
         }
-        return response;
+        return result;
     }
 
-    fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !dns.Message {
+    fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool, bypass_cache: bool) !recursive.RecursiveResolver.ResolveResult {
         switch (self.config.mode) {
             .recursive => {
                 var resolver = RecursiveResolver{
@@ -534,6 +561,7 @@ const WorkerState = struct {
                     .tls_transport = self.tls_transport,
                     .encryption_state = self.encryption_state,
                     .rtt_cache = self.rtt_cache,
+                    .bypass_cache = bypass_cache,
                 };
                 return try resolver.resolve(alloc, name, qtype);
             },
@@ -543,9 +571,18 @@ const WorkerState = struct {
                     self.config.upstreams[0]
                 else
                     std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
-                return try resolver.resolve(alloc, name, qtype, upstream);
+                const msg = try resolver.resolve(alloc, name, qtype, upstream);
+                return .{ .message = msg };
             },
         }
+    }
+
+    fn doPrefetch(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType) void {
+        // Inline prefetch: resolve with bypass_cache to refresh the entry.
+        // Dedup table coalesces concurrent prefetches for the same (name, qtype).
+        var prefetch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer prefetch_arena.deinit();
+        _ = self.resolveQuery(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true) catch {};
     }
 };
 

@@ -12,6 +12,9 @@ pub const ServerConfig = struct {
     upstreams: []std.net.Address,
     cache_size: usize,
     cache_entries: u32,
+    prefetch: bool,
+    serve_stale_ttl: u32,
+    min_ttl: u32,
     dnssec: bool,
     qname_minimization: bool,
     opportunistic: bool,
@@ -53,6 +56,9 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .upstreams = empty_upstreams,
         .cache_size = 16 * 1024 * 1024,
         .cache_entries = 10_000,
+        .prefetch = false,
+        .serve_stale_ttl = 0,
+        .min_ttl = 0,
         .dnssec = false,
         .qname_minimization = true,
         .opportunistic = false,
@@ -110,6 +116,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (cache.getInteger("entries")) |e| {
             cfg.cache_entries = @intCast(@max(0, @min(e, std.math.maxInt(u32))));
+        }
+        if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
+        if (cache.getInteger("serve-stale-ttl")) |s| {
+            cfg.serve_stale_ttl = @intCast(@max(0, @min(s, std.math.maxInt(u32))));
+        }
+        if (cache.getInteger("min-ttl")) |m| {
+            cfg.min_ttl = @intCast(@max(0, @min(m, std.math.maxInt(u32))));
         }
     }
 
@@ -309,6 +322,29 @@ test "invalid worker count" {
         \\workers = 0
     );
     try testing.expectError(error.InvalidWorkerCount, result);
+}
+
+test "cache prefetch and stale config" {
+    var cfg = try parseConfig(testing.allocator,
+        \\[cache]
+        \\prefetch = true
+        \\serve-stale-ttl = 3600
+        \\min-ttl = 300
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(true, cfg.prefetch);
+    try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
+    try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
+}
+
+test "cache prefetch defaults to off" {
+    var cfg = try parseConfig(testing.allocator, "");
+    defer cfg.deinit();
+
+    try testing.expectEqual(false, cfg.prefetch);
+    try testing.expectEqual(@as(u32, 0), cfg.serve_stale_ttl);
+    try testing.expectEqual(@as(u32, 0), cfg.min_ttl);
 }
 
 test "logging config" {

@@ -292,10 +292,11 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             .tls_transport = if (opportunistic) &tls_t else null,
             .encryption_state = if (opportunistic) &enc_state else null,
         };
-        break :blk resolver.resolve(arena.allocator(), name, qtype) catch |err| {
+        const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
+        break :blk result.message;
     };
 
     var stdout_buf: [4096]u8 = undefined;
