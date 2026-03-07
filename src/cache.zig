@@ -656,11 +656,10 @@ pub const RRsetCache = struct {
             // Check if we already processed this (name, type) group
             const name_fmt = rr.name.format();
             const name_len = mem.indexOfScalar(u8, &name_fmt, 0) orelse name_fmt.len;
+            var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+            const lower_name = lowerNameBuf(&lower_buf, name_fmt[0..name_len]) orelse continue;
             var nh = std.hash.Wyhash.init(0);
-            for (name_fmt[0..name_len]) |c| {
-                const low: [1]u8 = .{std.ascii.toLower(c)};
-                nh.update(&low);
-            }
+            nh.update(lower_name);
             const name_hash = nh.final();
 
             var already = false;
@@ -684,8 +683,8 @@ pub const RRsetCache = struct {
                 }
             }
 
-            // Build the key
-            const key_name = toLowerNameAlloc(alloc, name_fmt[0..name_len]) catch continue;
+            // Build the key (lower_name is already lowercased in stack buffer)
+            const key_name = alloc.dupe(u8, lower_name) catch continue;
             const key = CacheKey{ .name = key_name, .rtype = rr.rtype, .rclass = rr.rclass };
 
             // Check if we already have a valid entry — don't overwrite

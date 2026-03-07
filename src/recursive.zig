@@ -87,6 +87,7 @@ pub const RecursiveResolver = struct {
         var cname_count: usize = 0;
         var total_probes: usize = 0;
         var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        defer cname_chain.deinit(allocator);
         var prefetch_name: ?[]const u8 = null;
 
         // DNSSEC chain of trust state — starts as secure at root

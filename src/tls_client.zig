@@ -1074,7 +1074,7 @@ fn prepareCiphertextRecord(
                         break :nonce @as(V, pv.client_iv) ^ operand;
                     };
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch std.math.maxInt(u64);
                 }
             },
             .tls_1_2 => {
@@ -1116,7 +1116,7 @@ fn prepareCiphertextRecord(
                     const auth_tag = ciphertext_buf[ciphertext_end..][0..P.mac_length];
                     ciphertext_end += P.mac_length;
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_write_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch std.math.maxInt(u64);
                 }
             },
             else => unreachable,
