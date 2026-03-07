@@ -92,6 +92,8 @@ pub const UdpTransport = struct {
                         switch (c.result) {
                             .recv => |r| {
                                 if (r.err != null) continue;
+                                // Validate source address matches upstream (RFC 5452)
+                                if (!addressMatchesUpstream(r.addr, upstream)) continue;
                                 // Check DNS ID matches
                                 if (r.data.len >= 2) {
                                     const resp_id = mem.readInt(u16, r.data[0..2], .big);
@@ -139,6 +141,16 @@ pub const UdpTransport = struct {
         self.loop.flush();
     }
 };
+
+/// Compare response source IP against expected upstream IP (ignoring port).
+fn addressMatchesUpstream(response: std.net.Address, upstream: std.net.Address) bool {
+    if (response.any.family != upstream.any.family) return false;
+    return switch (response.any.family) {
+        posix.AF.INET => response.in.sa.addr == upstream.in.sa.addr,
+        posix.AF.INET6 => mem.eql(u8, &response.in6.sa.addr, &upstream.in6.sa.addr),
+        else => false,
+    };
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 

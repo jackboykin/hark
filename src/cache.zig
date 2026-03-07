@@ -4,6 +4,10 @@ const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
 
+/// Maximum TTL for cached entries (1 week). Prevents unreasonably long
+/// cache lifetimes from malicious or misconfigured responses.
+const max_cache_ttl: u32 = 604_800;
+
 // ── Counting allocator ────────────────────────────────────────────────
 // Wraps a backing allocator and tracks total bytes allocated.
 // Refuses allocations that would exceed a byte cap.
@@ -442,12 +446,12 @@ pub const RRsetCache = struct {
     // ── Store ─────────────────────────────────────────────────────────
 
     /// Cache all RRsets from a DNS response. Applies bailiwick filtering
-    /// to the additional section.
+    /// to all sections to prevent cache poisoning.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
         self.storeRRsets(response.answers, authority_zone, true);
-        self.storeRRsets(response.authorities, authority_zone, false);
+        self.storeRRsets(response.authorities, authority_zone, true);
         self.storeRRsets(response.additionals, authority_zone, true);
     }
 
@@ -503,10 +507,11 @@ pub const RRsetCache = struct {
         self.evictIfNeeded();
 
         const now = self.now_fn();
+        const capped_ttl = @min(neg_ttl, max_cache_ttl);
         self.map.put(alloc, key, .{ .negative = .{
             .rcode = rcode,
-            .expires_at = now + @as(i64, neg_ttl),
-            .original_ttl = neg_ttl,
+            .expires_at = now + @as(i64, capped_ttl),
+            .original_ttl = capped_ttl,
             .stored_at = now,
             .soa = cached_soa,
         } }) catch {
@@ -541,10 +546,11 @@ pub const RRsetCache = struct {
         self.evictIfNeeded();
 
         const now = self.now_fn();
+        const capped_ttl = @min(ttl, max_cache_ttl);
         self.map.put(alloc, key, .{ .negative = .{
             .rcode = rcode,
-            .expires_at = now + @as(i64, ttl),
-            .original_ttl = ttl,
+            .expires_at = now + @as(i64, capped_ttl),
+            .original_ttl = capped_ttl,
             .stored_at = now,
             .soa = null,
         } }) catch {
@@ -679,10 +685,11 @@ pub const RRsetCache = struct {
             self.evictIfNeeded();
 
             const now = self.now_fn();
+            const capped_ttl = @min(rr.ttl, max_cache_ttl);
             self.map.put(alloc, key, .{ .positive = .{
                 .records = final_records,
-                .expires_at = now + @as(i64, rr.ttl),
-                .original_ttl = rr.ttl,
+                .expires_at = now + @as(i64, capped_ttl),
+                .original_ttl = capped_ttl,
                 .stored_at = now,
             } }) catch {
                 for (final_records) |cr| {

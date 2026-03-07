@@ -75,7 +75,7 @@ pub const InFlightTable = struct {
             // Another worker is resolving this — wait for completion.
             while (self.map.get(key)) |entry| {
                 if (entry.completed) break;
-                self.condition.timedWait(&self.mutex, 5 * std.time.ns_per_s) catch break;
+                self.condition.timedWait(&self.mutex, 2 * std.time.ns_per_s) catch break;
             }
             // Entry may have been removed by leader, or we timed out — either way, follower.
             return .follower;

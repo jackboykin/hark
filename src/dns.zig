@@ -736,6 +736,7 @@ pub const Parser = struct {
                 const name_start = self.pos;
                 const signer_name = try self.parseName(allocator);
                 const name_len = self.pos - name_start;
+                if (18 + name_len > rdlength) return error.InvalidRDataLength;
                 const sig_len = rdlength - 18 - name_len;
                 const sig_data = try self.readSlice(sig_len);
                 const signature = allocator.dupe(u8, sig_data) catch return error.OutOfMemory;
@@ -784,6 +785,7 @@ pub const Parser = struct {
                 const name_start = self.pos;
                 const next_domain_name = try self.parseName(allocator);
                 const name_len = self.pos - name_start;
+                if (name_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec = .{
                     .next_domain_name = next_domain_name,
                     .type_bit_maps = try self.dupSlice(allocator, rdlength - name_len),
@@ -2507,4 +2509,82 @@ test "safeTagName handles known and unknown enum values" {
     // Unknown RCode
     const rcode7: RCode = @enumFromInt(7);
     try testing.expectEqualStrings("7", safeTagName(RCode, rcode7, &buf));
+}
+
+test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
+    // Craft a packet where the RRSIG signer name extends past the declared rdlength.
+    // Before the fix this would cause an unsigned integer underflow (panic/UB).
+    var pkt: [512]u8 = undefined;
+    testHeader(&pkt, .{});
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 46, .big); // RRSIG
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // TTL
+    pos += 4;
+
+    // Signer name "example.com." = 13 bytes on wire. 18 + 13 = 31, but set rdlength = 20.
+    const signer_wire = "\x07example\x03com\x00";
+    const rdlen: u16 = 20; // too small: 18 + signer_wire.len = 31
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    // Write the 18-byte fixed fields
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // type_covered = A
+    pos += 2;
+    pkt[pos] = 13; // algorithm
+    pos += 1;
+    pkt[pos] = 2; // labels
+    pos += 1;
+    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // original_ttl
+    pos += 4;
+    mem.writeInt(u32, pkt[pos..][0..4], 1700000000, .big); // sig_expiration
+    pos += 4;
+    mem.writeInt(u32, pkt[pos..][0..4], 1699000000, .big); // sig_inception
+    pos += 4;
+    mem.writeInt(u16, pkt[pos..][0..2], 12345, .big); // key_tag
+    pos += 2;
+    // Signer name extends past rdlength boundary
+    @memcpy(pkt[pos..][0..signer_wire.len], signer_wire);
+    pos += signer_wire.len;
+
+    // Use arena to avoid leak detection on partial-parse error paths
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseMessage(arena.allocator(), pkt[0..pos]);
+    try testing.expectError(error.InvalidRDataLength, result);
+}
+
+test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" {
+    // Craft a packet where the NSEC next domain name extends past the declared rdlength.
+    var pkt: [512]u8 = undefined;
+    testHeader(&pkt, .{});
+
+    var pos: usize = 12;
+    const rrname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], 47, .big); // NSEC
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // TTL
+    pos += 4;
+
+    // next domain "host.example.com." = 22 bytes, but set rdlength = 5
+    const next_domain_wire = "\x04host\x07example\x03com\x00";
+    const rdlen: u16 = 5; // too small for the domain name
+    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
+    pos += 2;
+    @memcpy(pkt[pos..][0..next_domain_wire.len], next_domain_wire);
+    pos += next_domain_wire.len;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = parseMessage(arena.allocator(), pkt[0..pos]);
+    try testing.expectError(error.InvalidRDataLength, result);
 }

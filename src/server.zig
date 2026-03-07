@@ -22,7 +22,7 @@ const Certificate = std.crypto.Certificate;
 
 const log = std.log.scoped(.server);
 
-const tcp_idle_timeout_ms: u32 = 10_000;
+const tcp_idle_timeout_ms: u32 = 5_000;
 
 // ── Context tags for the event loop ────────────────────────────────────
 
@@ -106,6 +106,16 @@ pub const Server = struct {
             var addr_buf: [64]u8 = undefined;
             const addr_str = formatAddress(addr, &addr_buf);
             log.info("listening on {s} (UDP+TCP)", .{addr_str});
+        }
+
+        if (self.config.mode == .recursive) {
+            for (listen_addrs) |addr| {
+                if (isNonLoopback(addr)) {
+                    log.warn("listening on a non-loopback address with recursion enabled — " ++
+                        "this server is an open resolver; consider adding access controls", .{});
+                    break;
+                }
+            }
         }
 
         if (workers <= 1) {
@@ -272,7 +282,10 @@ const WorkerState = struct {
         for (udp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
-            udp_ops[i] = self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i])) catch null;
+            udp_ops[i] = self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i])) catch |err| blk: {
+                log.err("failed to register UDP recvFrom: {s}", .{@errorName(err)});
+                break :blk null;
+            };
         }
 
         // Register accept for each TCP socket
@@ -312,7 +325,10 @@ const WorkerState = struct {
                         if (!self.shutdown.load(.acquire)) {
                             // Find which index this ctx belongs to and re-register
                             const idx = ctxIndex(&udp_ctxs, n, ctx) orelse break;
-                            udp_ops[idx] = self.loop.recvFrom(ctx.fd, @ptrCast(ctx)) catch break;
+                            udp_ops[idx] = self.loop.recvFrom(ctx.fd, @ptrCast(ctx)) catch |err| {
+                                log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
+                                break;
+                            };
                         }
                     },
                     .tcp_accept => {
@@ -755,6 +771,22 @@ fn formatAddress(addr: std.net.Address, buf: []u8) []const u8 {
             }) catch "<address>";
         },
         else => return "<unknown>",
+    }
+}
+
+fn isNonLoopback(addr: std.net.Address) bool {
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            return bytes[0] != 127; // 127.0.0.0/8
+        },
+        posix.AF.INET6 => {
+            const a = addr.in6.sa.addr;
+            // ::1 is the only IPv6 loopback
+            const loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            return !mem.eql(u8, &a, &loopback);
+        },
+        else => return true,
     }
 }
 
