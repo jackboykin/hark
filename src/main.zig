@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const hark = @import("hark");
 const dns = hark.dns;
 const EventLoop = hark.event_loop.EventLoop;
@@ -258,7 +259,11 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     }, ca_bundle);
 
     // Cache: 16MB cap, 10k max entries
-    var cache = RRsetCache.init(gpa_alloc, 16 * 1024 * 1024, 10_000);
+    const cache_alloc = if (builtin.single_threaded)
+        gpa_alloc
+    else
+        std.heap.smp_allocator;
+    var cache = RRsetCache.init(cache_alloc, 16 * 1024 * 1024, 10_000);
     defer cache.deinit();
 
     // DNS message data uses arena

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const posix = std.posix;
 const linux = std.os.linux;
@@ -53,10 +54,14 @@ pub const Server = struct {
             .serve_stale_ttl = cfg.serve_stale_ttl,
             .min_ttl = cfg.min_ttl,
         };
-        const cache = if (cfg.workers > 1)
-            RRsetCache.initThreadSafeWithOptions(allocator, cfg.cache_size, cfg.cache_entries, cache_opts)
+        const cache_alloc = if (builtin.single_threaded)
+            allocator
         else
-            RRsetCache.initWithOptions(allocator, cfg.cache_size, cfg.cache_entries, cache_opts);
+            std.heap.smp_allocator;
+        const cache = if (cfg.workers > 1)
+            RRsetCache.initThreadSafeWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts)
+        else
+            RRsetCache.initWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts);
 
         const rtt_cache = if (cfg.workers > 1)
             RttCache.initThreadSafe(allocator)
@@ -307,9 +312,23 @@ const WorkerState = struct {
             null;
 
         var completions: [max_operations]Completion = undefined;
+        var last_stats_ns: i128 = std.time.nanoTimestamp();
+        const stats_interval_ns: i128 = 60 * std.time.ns_per_s;
 
         while (!self.shutdown.load(.acquire)) {
             const results = self.loop.tick(&completions) catch break;
+
+            // Periodic cache stats logging
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - last_stats_ns >= stats_interval_ns) {
+                const stats = self.cache.getStats();
+                const hit_total = stats.hits + stats.misses;
+                const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
+                log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions", .{
+                    stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions,
+                });
+                last_stats_ns = now_ns;
+            }
 
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));

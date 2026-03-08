@@ -392,6 +392,7 @@ pub const RRsetCache = struct {
     pub const Stats = struct {
         entries: u32,
         memory_bytes: usize,
+        max_bytes: usize,
         hits: u64,
         misses: u64,
         stores: u64,
@@ -407,6 +408,7 @@ pub const RRsetCache = struct {
         return .{
             .entries = @intCast(self.map.count()),
             .memory_bytes = self.counting.current_bytes,
+            .max_bytes = self.counting.max_bytes,
             .hits = self.hits.load(.monotonic),
             .misses = self.misses.load(.monotonic),
             .stores = self.stores.load(.monotonic),
