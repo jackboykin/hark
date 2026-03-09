@@ -293,7 +293,10 @@ pub const RecursiveResolver = struct {
                             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
                             continue; // try next server
                         },
-                        else => return err,
+                        else => {
+                            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+                            continue;
+                        },
                     };
                     const elapsed_us = std.time.microTimestamp() - query_start;
 
