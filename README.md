@@ -5,14 +5,17 @@ Runs on Linux with io_uring. Zero external dependencies.
 
 ## Features
 
-- Full recursive resolution from the root, with QNAME minimization
+- DNS-over-TLS with opportunistic encryption to authoritatives (RFC 9539)
+- Background TLS probing with connection pooling
 - DNSSEC validation (RSA-SHA256/512, ECDSA P-256/P-384, Ed25519)
+- Full recursive resolution from the root, with QNAME minimization
 - In-memory RRset cache with RFC 2308 negative caching
-- DNS-over-TLS with opportunistic encryption (RFC 9539)
-- UDP and TCP transport with EDNS0
-- Forwarding mode as an alternative to recursion
+- Cache prefetch and serve-stale (RFC 8767)
+- Query deduplication across workers (singleflight)
 - Multi-threaded server mode with `SO_REUSEPORT`
 - RTT-based nameserver selection
+- UDP and TCP transport with EDNS0
+- Forwarding mode as an alternative to recursion
 
 ## Building
 
@@ -30,6 +33,7 @@ Resolve a name recursively (the default):
 ```
 hark query example.com AAAA
 hark query --dnssec example.com
+hark query --opportunistic example.com
 ```
 
 Forward to an upstream resolver instead:
@@ -41,7 +45,7 @@ hark query --forward example.com
 Run as a server (UDP + TCP, TOML config):
 
 ```
-hark serve --config /etc/hark/config.toml
+hark serve --config /etc/hark/hark.toml
 ```
 
 Dump a raw DNS packet from stdin:
@@ -50,21 +54,44 @@ Dump a raw DNS packet from stdin:
 hark dump < packet.bin
 ```
 
+## Configuration
+
+```toml
+[server]
+listen = ["127.0.0.1:53", "[::1]:53"]
+workers = 4
+
+[resolver]
+mode = "recursive"          # or "forward"
+dnssec = true
+qname-minimization = true
+opportunistic = true        # RFC 9539 encrypted transport to authoritatives
+
+[cache]
+prefetch = true
+serve-stale-ttl = 3600      # seconds to serve expired entries (RFC 8767)
+min-ttl = 300                # floor for aggressive CDN TTLs
+
+[logging]
+queries = true
+```
+
+All fields are optional — defaults are localhost:53, recursive mode, DNSSEC off, workers = CPU count.
+
 ## Architecture
 
 ```
               ┌───────────────────────────┐
  clients ───► │   Server (UDP/TCP)        │
-              │   DoT listeners           │
               └─────────────┬─────────────┘
                             │
               ┌─────────────▼─────────────┐
               │   Query Pipeline          │
               │                           │
-              │   Cache lookup            │
+              │   Deduplication           │
+              │   Cache lookup / prefetch │
               │   QNAME minimization      │
               │   Recursive resolution    │
-              │   Forwarding fallback     │
               │   DNSSEC validation       │
               │                           │
               └─────────────┬─────────────┘
@@ -75,6 +102,7 @@ hark dump < packet.bin
               │   TCP fallback            │
               │   EDNS0 payload sizing    │
               │   DoT / RFC 9539          │
+              │   TLS connection pool     │
               └─────────────┬─────────────┘
                             │
               ┌─────────────▼─────────────┐
