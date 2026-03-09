@@ -7,7 +7,7 @@ const UdpTransport = hark.transport.UdpTransport;
 const TcpTransport = hark.tcp_transport.TcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
 const ConnectionPool = hark.connection_pool.ConnectionPool;
-const EncryptionStateCache = hark.encryption_state.EncryptionStateCache;
+const EncryptedNsCache = hark.encrypted_ns.EncryptedNsCache;
 const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RttCache = hark.ns_rtt.RttCache;
@@ -280,8 +280,15 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
     } else blk: {
-        var enc_state = EncryptionStateCache.init(gpa_alloc);
-        defer enc_state.deinit();
+        var enc_ns = EncryptedNsCache.init(gpa_alloc);
+        var enc_pool = ConnectionPool.init(gpa_alloc);
+        defer {
+            enc_ns.awaitProbes();
+            enc_pool.deinit();
+            enc_ns.deinit();
+        }
+
+        if (opportunistic) tls_t.pool = &enc_pool;
 
         var rtt_cache = RttCache.init(gpa_alloc);
         defer rtt_cache.deinit();
@@ -295,7 +302,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             .dnssec_aware = dnssec_enabled,
             .rtt_cache = &rtt_cache,
             .tls_transport = if (opportunistic) &tls_t else null,
-            .encryption_state = if (opportunistic) &enc_state else null,
+            .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
         };
         const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});

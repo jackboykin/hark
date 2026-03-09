@@ -6,8 +6,8 @@ const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const encryption_state = @import("encryption_state.zig");
-const EncryptionStateCache = encryption_state.EncryptionStateCache;
+const encrypted_ns = @import("encrypted_ns.zig");
+const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const cache_mod = @import("cache.zig");
@@ -66,7 +66,7 @@ pub const RecursiveResolver = struct {
     /// RFC 4035 §3.2.1: MUST set DO regardless of CD bit or per-query validation.
     dnssec_aware: bool = false,
     tls_transport: ?*TlsTransport = null,
-    encryption_state: ?*EncryptionStateCache = null,
+    encrypted_ns_cache: ?*EncryptedNsCache = null,
     rtt_cache: ?*RttCache = null,
     bypass_cache: bool = false,
 
@@ -257,40 +257,31 @@ pub const RecursiveResolver = struct {
 
                     // ── RFC 9539: Opportunistic encrypted query ──
                     if (self.tls_transport) |tls_t| {
-                        if (self.encryption_state) |enc_state| {
-                            const enc_status = enc_state.getStatus(addr_key);
-                            const should_try_tls = switch (enc_status) {
-                                .unknown => true, // probe with short timeout
-                                .success => true, // known good, full timeout
-                                .failed, .timeout => false, // in damping period, skip
-                            };
-                            if (should_try_tls) {
-                                const tls_timeout: u32 = if (enc_status == .success)
-                                    encryption_state.opportunistic_timeout_ms // 4s for known-good
-                                else
-                                    encryption_state.probe_timeout_ms; // 500ms for unknown
+                        if (self.encrypted_ns_cache) |oc| {
+                            const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+                            switch (oc.getStatus(tls_key)) {
+                                .capable => {
+                                    // Known-good server → try encrypted (pool or new connection)
+                                    const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                                        .rd = false,
+                                        .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
+                                    });
+                                    var padded_buf: [dns.edns_udp_payload]u8 = undefined;
+                                    const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-                                // Build padded query for TLS (RFC 8467 §4.1: 468 bytes)
-                                const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
-                                    .rd = false,
-                                    .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
-                                });
-                                var padded_buf: [dns.edns_udp_payload]u8 = undefined;
-                                const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
-
-                                var tls_response_buf: [65535]u8 = undefined;
-                                if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, tls_timeout)) |tls_data| {
-                                    enc_state.recordSuccess(addr_key);
-                                    response = try dns.parseMessage(allocator, tls_data);
-                                    got_response = true;
-                                    if (self.cache) |c| c.storeResponse(response, parent_zone);
-                                    if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
-                                    break;
-                                } else |err| {
-                                    const was_timeout = (err == error.Timeout);
-                                    enc_state.recordFailure(addr_key, was_timeout);
-                                    // Fall through to Do53
-                                }
+                                    var tls_response_buf: [65535]u8 = undefined;
+                                    if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
+                                        response = try dns.parseMessage(allocator, tls_data);
+                                        got_response = true;
+                                        if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
+                                        break;
+                                    } else |_| {
+                                        // Fall through to Do53
+                                    }
+                                },
+                                .unknown => {}, // First contact → Do53 now, probe after
+                                .probing, .failed => {}, // Skip, go straight to Do53
                             }
                         }
                     }
@@ -337,6 +328,19 @@ pub const RecursiveResolver = struct {
                 }
 
                 if (!got_response) return error.Timeout;
+
+                // ── Fire background OTE probe after Do53 success ──
+                if (self.encrypted_ns_cache) |oc| {
+                    if (self.tls_transport) |tls_t| {
+                        for (server_order) |si| {
+                            const srv = servers[si];
+                            const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
+                            if (oc.claimProbe(tls_key)) {
+                                tls_t.probeInBackground(srv, oc);
+                            }
+                        }
+                    }
+                }
 
                 // ── Probe response handling (non-final queries) ──
                 if (!is_final) {

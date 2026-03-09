@@ -2,10 +2,9 @@ const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
 const net = std.net;
-const tls = std.crypto.tls;
-const Certificate = std.crypto.Certificate;
 const Allocator = mem.Allocator;
 const testing = std.testing;
+const VendoredTlsClient = @import("tls_client.zig");
 
 // ── AddressKey ───────────────────────────────────────────────────────
 
@@ -13,6 +12,17 @@ pub const AddressKey = struct {
     family: u8,
     addr: [16]u8,
     port: u16,
+
+    /// Create a key from an address, overriding the port.
+    pub fn fromAddressWithPort(address: net.Address, port: u16) AddressKey {
+        var addr = address;
+        switch (addr.any.family) {
+            posix.AF.INET => addr.in.setPort(port),
+            posix.AF.INET6 => addr.in6.setPort(port),
+            else => {},
+        }
+        return fromAddress(addr);
+    }
 
     pub fn fromAddress(address: net.Address) AddressKey {
         var key = AddressKey{ .family = 0, .addr = .{0} ** 16, .port = 0 };
@@ -41,14 +51,14 @@ pub const PooledConnection = struct {
     stream: net.Stream,
     net_reader: net.Stream.Reader,
     net_writer: net.Stream.Writer,
-    tls_client: tls.Client,
+    tls_client: VendoredTlsClient,
     last_used: i64,
 
     // Inline buffers — stable addresses since struct is heap-allocated.
-    net_read_buf: [tls.Client.min_buffer_len]u8,
-    net_write_buf: [tls.Client.min_buffer_len]u8,
-    tls_read_buf: [tls.Client.min_buffer_len]u8,
-    tls_write_buf: [tls.Client.min_buffer_len]u8,
+    net_read_buf: [VendoredTlsClient.min_buffer_len]u8,
+    net_write_buf: [VendoredTlsClient.min_buffer_len]u8,
+    tls_read_buf: [VendoredTlsClient.min_buffer_len]u8,
+    tls_write_buf: [VendoredTlsClient.min_buffer_len]u8,
 
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
@@ -71,6 +81,7 @@ const max_entries_default: usize = 32;
 pub const ConnectionPool = struct {
     allocator: Allocator,
     entries: std.AutoHashMap(AddressKey, *PooledConnection),
+    mutex: std.Thread.Mutex = .{},
     max_idle_sec: i64 = 30,
     max_entries: usize = max_entries_default,
     now_fn: *const fn () i64 = &defaultNow,
@@ -83,6 +94,8 @@ pub const ConnectionPool = struct {
     }
 
     pub fn deinit(self: *ConnectionPool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             entry.value_ptr.*.destroyBroken(self.allocator);
@@ -93,8 +106,11 @@ pub const ConnectionPool = struct {
     /// Retrieve a cached connection for the given key. Returns null if
     /// no connection exists or the cached entry has expired.
     pub fn acquire(self: *ConnectionPool, key: AddressKey) ?*PooledConnection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Opportunistic sweep of idle connections
-        self.evictIdle();
+        self.evictIdleLocked();
 
         const kv = self.entries.fetchRemove(key) orelse return null;
         const conn = kv.value;
@@ -115,26 +131,39 @@ pub const ConnectionPool = struct {
             conn.destroyBroken(self.allocator);
             return;
         }
+        self.mutex.lock();
+        defer self.mutex.unlock();
         conn.last_used = self.now_fn();
-        self.entries.put(key, conn) catch {
-            conn.destroyBroken(self.allocator);
-        };
+        self.putReplaceLocked(key, conn);
     }
 
     /// Store a newly established connection in the pool.
     pub fn store(self: *ConnectionPool, key: AddressKey, conn: *PooledConnection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Evict if at capacity
         if (self.entries.count() >= self.max_entries) {
-            self.evictOldest();
+            self.evictOldestLocked();
         }
         conn.last_used = self.now_fn();
-        self.entries.put(key, conn) catch {
+        self.putReplaceLocked(key, conn);
+    }
+
+    /// Insert conn, destroying any previous connection for the same key.
+    /// Caller must hold mutex.
+    fn putReplaceLocked(self: *ConnectionPool, key: AddressKey, conn: *PooledConnection) void {
+        const result = self.entries.fetchPut(key, conn) catch {
             conn.destroyBroken(self.allocator);
+            return;
         };
+        if (result) |old| {
+            old.value.destroyBroken(self.allocator);
+        }
     }
 
     /// Remove all connections that have been idle longer than max_idle_sec.
-    pub fn evictIdle(self: *ConnectionPool) void {
+    /// Caller must hold mutex.
+    fn evictIdleLocked(self: *ConnectionPool) void {
         const now = self.now_fn();
         var to_remove: [max_entries_default]AddressKey = undefined;
         var remove_count: usize = 0;
@@ -156,7 +185,7 @@ pub const ConnectionPool = struct {
         }
     }
 
-    fn evictOldest(self: *ConnectionPool) void {
+    fn evictOldestLocked(self: *ConnectionPool) void {
         var oldest_key: ?AddressKey = null;
         var oldest_time: i64 = std.math.maxInt(i64);
 

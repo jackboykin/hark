@@ -2,7 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
 const net = std.net;
-const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 const Allocator = mem.Allocator;
 const testing = std.testing;
@@ -15,7 +14,8 @@ const ConnectionPool = pool_mod.ConnectionPool;
 const PooledConnection = pool_mod.PooledConnection;
 const AddressKey = pool_mod.AddressKey;
 const VendoredTlsClient = @import("tls_client.zig");
-const encryption_state = @import("encryption_state.zig");
+const encrypted_ns_mod = @import("encrypted_ns.zig");
+const EncryptedNsCache = encrypted_ns_mod.EncryptedNsCache;
 
 pub const TlsConfig = struct {
     connect_timeout_ms: u32 = 5000,
@@ -42,13 +42,7 @@ pub const TlsTransport = struct {
     }
 
     pub fn query(self: *TlsTransport, wire_query: []const u8, server: net.Address, response_buf: []u8) ![]const u8 {
-        // Compute pool key with TLS port override
-        var tls_server = server;
-        switch (tls_server.any.family) {
-            posix.AF.INET => tls_server.in.setPort(self.config.port),
-            posix.AF.INET6 => tls_server.in6.setPort(self.config.port),
-            else => return error.UnsupportedAddressFamily,
-        }
+        const tls_server = toPort(server, self.config.port) orelse return error.UnsupportedAddressFamily;
         const key = AddressKey.fromAddress(tls_server);
 
         // ── Try pooled connection first ──
@@ -82,10 +76,9 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// Establish a TCP connection via io_uring, switch to blocking mode,
-    /// perform TLS handshake, and return a heap-allocated PooledConnection.
-    fn connectAndHandshake(self: *TlsTransport, tls_server: net.Address) !*PooledConnection {
-        // ── Phase 1: TCP connect via io_uring ──
+    /// TCP connect via io_uring + switch to blocking mode with socket timeouts.
+    /// Returns a connected, blocking socket. Caller owns the fd.
+    fn connectTcp(self: *TlsTransport, tls_server: net.Address, connect_timeout_ms: u32, rw_timeout_ms: u32) !posix.fd_t {
         const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
         const sock = try posix.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
@@ -94,7 +87,7 @@ pub const TlsTransport = struct {
         var timeout_ctx = Ctx{ .tag = .timeout };
 
         const connect_op = try self.loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
-        const timeout_op = try self.loop.setTimeout(self.config.connect_timeout_ms, @ptrCast(&timeout_ctx));
+        const timeout_op = try self.loop.setTimeout(connect_timeout_ms, @ptrCast(&timeout_ctx));
 
         connect_loop: while (true) {
             var completions: [max_operations]Completion = undefined;
@@ -123,19 +116,26 @@ pub const TlsTransport = struct {
             }
         }
 
-        // ── Phase 2: Switch to blocking mode with socket timeouts ──
+        // Switch to blocking mode with socket timeouts
         const current_flags = try posix.fcntl(sock, posix.F.GETFL, 0);
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = try posix.fcntl(sock, posix.F.SETFL, current_flags & ~nonblock_bit);
 
-        const timeout_sec: i64 = @intCast(self.config.response_timeout_ms / 1000);
-        const timeout_usec: i64 = @intCast(@as(u64, self.config.response_timeout_ms % 1000) * 1000);
-        const recv_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        const send_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&recv_timeout));
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&send_timeout));
+        const timeout_sec: i64 = @intCast(rw_timeout_ms / 1000);
+        const timeout_usec: i64 = @intCast(@as(u64, rw_timeout_ms % 1000) * 1000);
+        const rw_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&rw_timeout));
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&rw_timeout));
 
-        // ── Phase 3: Allocate PooledConnection and perform TLS handshake ──
+        return sock;
+    }
+
+    /// Establish a TCP connection via io_uring, perform TLS handshake,
+    /// and return a heap-allocated PooledConnection.
+    fn connectAndHandshake(self: *TlsTransport, tls_server: net.Address) !*PooledConnection {
+        const sock = try self.connectTcp(tls_server, self.config.connect_timeout_ms, self.config.response_timeout_ms);
+        errdefer posix.close(sock);
+
         const conn = try self.allocator.create(PooledConnection);
         errdefer self.allocator.destroy(conn);
 
@@ -151,7 +151,7 @@ pub const TlsTransport = struct {
             return error.StrictModeRequiresHostname;
         }
 
-        conn.tls_client = tls.Client.init(conn.net_reader.interface(), &conn.net_writer.interface, .{
+        conn.tls_client = VendoredTlsClient.init(conn.net_reader.interface(), &conn.net_writer.interface, .{
             .host = if (self.config.skip_verification)
                 .no_verification
             else if (self.config.server_name) |sn|
@@ -164,125 +164,155 @@ pub const TlsTransport = struct {
                 .{ .bundle = self.ca_bundle },
             .read_buffer = &conn.tls_read_buf,
             .write_buffer = &conn.tls_write_buf,
-        }) catch {
-            posix.close(sock);
-            self.allocator.destroy(conn);
-            return error.TlsHandshakeFailed;
-        };
+        }) catch return error.TlsHandshakeFailed;
 
         return conn;
     }
 
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
     /// no SNI, 4-second connect timeout, immediate fallback on any failure.
+    /// Tries pooled connection first, pools new connections on success.
     pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: net.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
-        var tls_server = server;
-        switch (tls_server.any.family) {
-            posix.AF.INET => tls_server.in.setPort(self.config.port),
-            posix.AF.INET6 => tls_server.in6.setPort(self.config.port),
-            else => return error.UnsupportedAddressFamily,
-        }
+        const tls_server = toPort(server, self.config.port) orelse return error.UnsupportedAddressFamily;
+        const addr_key = AddressKey.fromAddress(tls_server);
 
-        // ── Phase 1: TCP connect via io_uring (4s timeout per RFC 9539 §4.3) ──
-        const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
-        const sock = try posix.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        defer posix.close(sock);
-
-        var connect_ctx = Ctx{ .tag = .connect };
-        var timeout_ctx = Ctx{ .tag = .timeout };
-
-        const connect_op = try self.loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
-        const timeout_op = try self.loop.setTimeout(timeout_ms, @ptrCast(&timeout_ctx));
-
-        connect_loop: while (true) {
-            var completions: [max_operations]Completion = undefined;
-            const results = try self.loop.tick(&completions);
-            for (results) |c| {
-                const ctx: *Ctx = @ptrCast(@alignCast(c.context));
-                switch (ctx.tag) {
-                    .connect => {
-                        if (c.result.connect.err != null) {
-                            self.loop.cancel(timeout_op) catch {};
-                            self.loop.flush();
-                            return error.ConnectFailed;
-                        }
-                        self.loop.cancel(timeout_op) catch {};
-                        self.loop.flush();
-                        break :connect_loop;
-                    },
-                    .timeout => {
-                        if (c.result.timeout.expired) {
-                            self.loop.cancel(connect_op) catch {};
-                            self.loop.flush();
-                            return error.Timeout;
-                        }
-                    },
+        // ── Try pooled connection first ──
+        if (self.pool) |pool| {
+            if (pool.acquire(addr_key)) |conn| {
+                if (queryOnConnection(conn, wire_query, response_buf)) |data| {
+                    pool.release(addr_key, conn, true);
+                    return data;
+                } else |_| {
+                    pool.release(addr_key, conn, false);
+                    // Fall through to new connection
                 }
             }
         }
 
-        // ── Phase 2: Switch to blocking mode ──
-        const current_flags = try posix.fcntl(sock, posix.F.GETFL, 0);
-        const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-        _ = try posix.fcntl(sock, posix.F.SETFL, current_flags & ~nonblock_bit);
+        // ── New connection: TCP connect via io_uring ──
+        const conn = try self.connectAndHandshakeOpportunistic(tls_server, timeout_ms);
 
-        const timeout_sec: i64 = @intCast(timeout_ms / 1000);
-        const timeout_usec: i64 = @intCast(@as(u64, timeout_ms % 1000) * 1000);
-        const recv_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        const send_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&recv_timeout));
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&send_timeout));
+        const data = queryOnConnection(conn, wire_query, response_buf) catch |err| {
+            conn.destroyBroken(self.allocator);
+            return err;
+        };
 
-        // ── Phase 3: TLS handshake with vendored client (ALPN "dot") ──
+        // Store in pool or close
+        if (self.pool) |pool| {
+            pool.store(addr_key, conn);
+        } else {
+            conn.closeAndDestroy(self.allocator);
+        }
+
+        return data;
+    }
+
+    /// Establish an opportunistic TLS connection (ALPN "dot", no cert, no SNI)
+    /// and return a heap-allocated PooledConnection.
+    fn connectAndHandshakeOpportunistic(self: *TlsTransport, tls_server: net.Address, timeout_ms: u32) !*PooledConnection {
+        const sock = try self.connectTcp(tls_server, timeout_ms, timeout_ms);
+        errdefer posix.close(sock);
+        return self.initOpportunisticConnection(sock);
+    }
+
+    /// Allocate a PooledConnection from a connected socket and perform an
+    /// opportunistic TLS handshake (ALPN "dot", no cert, no SNI).
+    fn initOpportunisticConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
+        const conn = try self.allocator.create(PooledConnection);
+        errdefer self.allocator.destroy(conn);
+
         const stream = net.Stream{ .handle = sock };
-
-        var net_read_buf: [VendoredTlsClient.min_buffer_len]u8 = undefined;
-        var net_write_buf: [VendoredTlsClient.min_buffer_len]u8 = undefined;
-        var net_reader = net.Stream.Reader.init(stream, &net_read_buf);
-        var net_writer = net.Stream.Writer.init(stream, &net_write_buf);
-
-        var tls_read_buf: [VendoredTlsClient.min_buffer_len]u8 = undefined;
-        var tls_write_buf: [VendoredTlsClient.min_buffer_len]u8 = undefined;
+        conn.sock = sock;
+        conn.stream = stream;
+        conn.last_used = 0;
+        conn.net_reader = net.Stream.Reader.init(stream, &conn.net_read_buf);
+        conn.net_writer = net.Stream.Writer.init(stream, &conn.net_write_buf);
 
         // RFC 9539 §4.6.3.3: SHOULD NOT send SNI
         // RFC 9539 §4.6.3.4: MUST accept any certificate
         // RFC 9539 §4.4: MUST include ALPN "dot"
-        var tls_client = VendoredTlsClient.init(net_reader.interface(), &net_writer.interface, .{
+        conn.tls_client = VendoredTlsClient.init(conn.net_reader.interface(), &conn.net_writer.interface, .{
             .host = .no_verification,
             .ca = .no_verification,
-            .read_buffer = &tls_read_buf,
-            .write_buffer = &tls_write_buf,
+            .read_buffer = &conn.tls_read_buf,
+            .write_buffer = &conn.tls_write_buf,
             .alpn = "dot",
-        }) catch {
-            return error.TlsHandshakeFailed;
+        }) catch return error.TlsHandshakeFailed;
+
+        return conn;
+    }
+
+    /// Fire a background probe for a nameserver. Detached thread does blocking
+    /// TCP connect + TLS handshake. On success, the connection is pooled.
+    pub fn probeInBackground(self: *TlsTransport, server: net.Address, enc_ns_cache: *EncryptedNsCache) void {
+        const tls_server = toPort(server, self.config.port) orelse return;
+        const addr_key = AddressKey.fromAddress(tls_server);
+
+        // Cap concurrent probe threads
+        const current = enc_ns_cache.active_probes.load(.seq_cst);
+        if (current >= encrypted_ns_mod.max_probes) return;
+
+        _ = enc_ns_cache.active_probes.fetchAdd(1, .seq_cst);
+        const thread = std.Thread.spawn(.{}, probeThread, .{ self, tls_server, addr_key, enc_ns_cache }) catch {
+            enc_ns_cache.markFailed(addr_key);
+            _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
+            return;
+        };
+        thread.detach();
+    }
+
+    fn probeThread(self: *TlsTransport, tls_server: net.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
+        defer _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
+        if (enc_ns_cache.shutting_down.load(.seq_cst)) return;
+
+        const probe_timeout_sec: i64 = 4;
+
+        // ── Blocking TCP connect ──
+        const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
+        const sock = posix.socket(af, posix.SOCK.STREAM, 0) catch {
+            enc_ns_cache.markFailed(addr_key);
+            return;
         };
 
-        // ── Phase 4: Send length-prefixed DNS query ──
-        if (wire_query.len > dns.max_udp_payload) return error.QueryTooLarge;
-        const msg_len: u16 = @intCast(wire_query.len);
-        var len_prefix: [2]u8 = undefined;
-        mem.writeInt(u16, &len_prefix, msg_len, .big);
+        // Set connect timeout via SO_SNDTIMEO
+        const snd_timeout = posix.timeval{ .sec = probe_timeout_sec, .usec = 0 };
+        const rcv_timeout = posix.timeval{ .sec = probe_timeout_sec, .usec = 0 };
+        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&snd_timeout)) catch {};
+        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&rcv_timeout)) catch {};
 
-        tls_client.writer.writeAll(&len_prefix) catch return error.TlsSendFailed;
-        tls_client.writer.writeAll(wire_query) catch return error.TlsSendFailed;
-        tls_client.writer.flush() catch return error.TlsSendFailed;
-        net_writer.interface.flush() catch return error.TlsSendFailed;
+        posix.connect(sock, &tls_server.any, tls_server.getOsSockLen()) catch {
+            enc_ns_cache.markFailed(addr_key);
+            posix.close(sock);
+            return;
+        };
 
-        // ── Phase 5: Receive length-prefixed DNS response ──
-        var resp_len_buf: [2]u8 = undefined;
-        tls_client.reader.readSliceAll(&resp_len_buf) catch return error.TlsRecvFailed;
-        const resp_len = mem.readInt(u16, &resp_len_buf, .big);
+        // ── TLS handshake ──
+        const conn = self.initOpportunisticConnection(sock) catch {
+            enc_ns_cache.markFailed(addr_key);
+            posix.close(sock);
+            return;
+        };
 
-        if (resp_len == 0 or resp_len > response_buf.len) return error.InvalidLength;
-
-        tls_client.reader.readSliceAll(response_buf[0..resp_len]) catch return error.TlsRecvFailed;
-
-        // ── Phase 6: Clean shutdown ──
-        tls_client.end() catch {};
-
-        return response_buf[0..resp_len];
+        // Success — mark capable and pool the connection
+        enc_ns_cache.markCapable(addr_key);
+        if (self.pool) |pool| {
+            pool.store(addr_key, conn);
+        } else {
+            conn.closeAndDestroy(self.allocator);
+        }
     }
 };
+
+/// Return a copy of `addr` with the port overridden, or null for unsupported families.
+fn toPort(addr: net.Address, port: u16) ?net.Address {
+    var out = addr;
+    switch (out.any.family) {
+        posix.AF.INET => out.in.setPort(port),
+        posix.AF.INET6 => out.in6.setPort(port),
+        else => return null,
+    }
+    return out;
+}
 
 /// Send a length-prefixed DNS query over an established TLS connection
 /// and read the length-prefixed response.

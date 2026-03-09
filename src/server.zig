@@ -15,7 +15,9 @@ const recursive = @import("recursive.zig");
 const RecursiveResolver = recursive.RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const EncryptionStateCache = @import("encryption_state.zig").EncryptionStateCache;
+const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
+const pool_mod = @import("connection_pool.zig");
+const ConnectionPool = pool_mod.ConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
@@ -46,6 +48,8 @@ pub const Server = struct {
     rtt_cache: RttCache,
     dedup: ?InFlightTable,
     ca_bundle: Certificate.Bundle,
+    encrypted_ns_cache: ?EncryptedNsCache,
+    enc_pool: ?ConnectionPool,
     shutdown: std.atomic.Value(bool),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig) !Server {
@@ -83,11 +87,18 @@ pub const Server = struct {
             .rtt_cache = rtt_cache,
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator) else null,
             .ca_bundle = ca_bundle,
+            .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator) else null,
+            .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator) else null,
             .shutdown = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.encrypted_ns_cache) |*oc| {
+            oc.awaitProbes();
+            oc.deinit();
+        }
+        if (self.enc_pool) |*pool| pool.deinit();
         if (self.config.opportunistic) {
             self.ca_bundle.deinit(self.allocator);
         }
@@ -238,10 +249,9 @@ pub const Server = struct {
             return;
         }
 
-        // Per-worker TLS transport + encryption state (opportunistic encryption)
+        // Per-worker TLS transport (shares encrypted_ns_cache + pool across workers)
         var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle);
-        var enc_state = EncryptionStateCache.init(self.allocator);
-        defer if (self.config.opportunistic) enc_state.deinit();
+        if (self.enc_pool) |*pool| tls_transport.pool = pool;
 
         // Worker state
         var ws = WorkerState{
@@ -251,7 +261,7 @@ pub const Server = struct {
             .udp_transport = &udp_transport,
             .tcp_transport = &tcp_transport,
             .tls_transport = if (self.config.opportunistic) &tls_transport else null,
-            .encryption_state = if (self.config.opportunistic) &enc_state else null,
+            .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
             .cache = &self.cache,
             .rtt_cache = &self.rtt_cache,
             .dedup = if (self.dedup) |*d| d else null,
@@ -272,7 +282,7 @@ const WorkerState = struct {
     udp_transport: *UdpTransport,
     tcp_transport: *TcpTransport,
     tls_transport: ?*TlsTransport,
-    encryption_state: ?*EncryptionStateCache,
+    encrypted_ns_cache: ?*EncryptedNsCache,
     cache: *RRsetCache,
     rtt_cache: *RttCache,
     dedup: ?*InFlightTable,
@@ -578,7 +588,7 @@ const WorkerState = struct {
                     // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
                     .dnssec_enabled = self.config.dnssec and !cd,
                     .tls_transport = self.tls_transport,
-                    .encryption_state = self.encryption_state,
+                    .encrypted_ns_cache = self.encrypted_ns_cache,
                     .rtt_cache = self.rtt_cache,
                     .bypass_cache = bypass_cache,
                 };
