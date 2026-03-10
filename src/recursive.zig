@@ -357,7 +357,7 @@ pub const RecursiveResolver = struct {
                     if (response.header.rcode == .name_error) {
                         // Probe NXDOMAIN — relaxed mode: cache negative and stop minimising
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
-                        switch (validateNegativeResponse(security_state, response.authorities, probe_name, query_type, true)) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true)) {
                             .proceed => {
                                 if (response.header.aa) {
                                     if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities);
@@ -388,7 +388,7 @@ pub const RecursiveResolver = struct {
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
                     {
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
-                        switch (validateNegativeResponse(security_state, response.authorities, probe_name, query_type, false)) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false)) {
                             .proceed => {
                                 if (response.header.aa) {
                                     if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities);
@@ -426,7 +426,7 @@ pub const RecursiveResolver = struct {
                 // Classify response
                 if (response.header.rcode != .no_error) {
                     if (response.header.rcode == .name_error and response.header.aa) {
-                        switch (validateNegativeResponse(security_state, response.authorities, target_name, qtype, true)) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true)) {
                             .proceed => {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
                             },
@@ -493,7 +493,7 @@ pub const RecursiveResolver = struct {
                 const referral = extractReferral(response, target_name, parent_zone) orelse {
                     // NODATA: no answers, no referral. Cache only if authoritative.
                     if (response.header.aa) {
-                        switch (validateNegativeResponse(security_state, response.authorities, target_name, qtype, false)) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false)) {
                             .proceed => {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
                             },
@@ -536,8 +536,13 @@ pub const RecursiveResolver = struct {
 
         // DNSSEC: classify delegation security at referral
         if (security_state.* == .secure) {
-            security_state.* = dnssec.classifyDelegation(authorities, zone_cut);
-            cacheInsecureDelegation(self.cache, security_state.*, zone_cut, authorities);
+            const auth_status = self.verifyAuthoritySigs(allocator, authorities);
+            if (auth_status == .secure) {
+                security_state.* = dnssec.classifyDelegation(authorities, zone_cut);
+                cacheInsecureDelegation(self.cache, security_state.*, zone_cut, authorities);
+            }
+            // If not .secure: keep security_state as .secure — will validate at child level.
+            // This prevents forged NSEC from downgrading a signed zone to insecure.
         }
 
         // Resolve server addresses
@@ -687,6 +692,55 @@ pub const RecursiveResolver = struct {
             .bogus => .bogus,
             .unchecked, .insecure => .skip,
         };
+    }
+
+    /// Verify RRSIG signatures over NSEC/NSEC3 records in authorities
+    /// using cached DNSKEY for the signer zone.
+    fn verifyAuthoritySigs(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        authorities: []const dns.ResourceRecord,
+    ) dnssec.SecurityStatus {
+        // Find RRSIG signer_name in authorities
+        var signer_name: ?dns.Name = null;
+        for (authorities) |rr| {
+            if (rr.rtype == .rrsig) {
+                signer_name = rr.rdata.rrsig.signer_name;
+                break;
+            }
+        }
+        const signer = signer_name orelse return .unchecked;
+
+        // Look up that zone's DNSKEY from cache (no network fetch)
+        const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
+        const c = self.cache orelse return .unchecked;
+        const result = c.lookup(allocator, signer_dotted, .dnskey, .in) orelse return .unchecked;
+        const dnskey_records = switch (result) {
+            .hit => |h| h.records,
+            .negative => return .unchecked,
+        };
+
+        const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32);
+    }
+
+    /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.
+    fn verifiedNegativeResponse(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        security_state: dnssec.SecurityStatus,
+        authorities: []const dns.ResourceRecord,
+        qname: dns.Name,
+        qtype: dns.RType,
+        is_nxdomain: bool,
+    ) NegativeValidation {
+        if (security_state != .secure) return .proceed;
+
+        const auth_status = self.verifyAuthoritySigs(allocator, authorities);
+        if (auth_status == .bogus) return .bogus;
+        if (auth_status != .secure) return .skip_cache;
+
+        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain);
     }
 
     fn resolveNsAddresses(

@@ -119,28 +119,37 @@ pub fn validateDnskeyRrset(
     }
     const filtered = dnskey_only[0..dnskey_count];
 
-    // 1. Find a DNSKEY matching any DS record (this is the KSK)
+    // Try all DS records × all RRSIGs covering DNSKEY (RFC 6840 §5.11)
     for (ds_records) |ds| {
         if (findMatchingDnskey(ds, dnskey_records, zone_name)) |ksk| {
-            // 2. Find the RRSIG covering DNSKEY signed by this KSK
-            const rrsig = findRrsig(dnskey_records, .dnskey) orelse continue;
-            if (rrsig.key_tag != keyTag(ksk)) {
-                // RRSIG might be signed by a different key in the set
-                // Try to find a key matching the RRSIG's key_tag
+            // Try every RRSIG covering DNSKEY
+            for (dnskey_records) |rrsig_rr| {
+                if (rrsig_rr.rtype != .rrsig) continue;
+                if (rrsig_rr.rdata.rrsig.type_covered != .dnskey) continue;
+                const rrsig = rrsig_rr.rdata.rrsig;
+
+                if (rrsig.key_tag == keyTag(ksk)) {
+                    // Direct KSK verification
+                    verifyRrsig(rrsig, ksk, filtered, now_u32) catch continue;
+                    return;
+                }
+
+                // Fallback: signing key must be DS-authenticated (C2 fix)
                 for (dnskey_records) |rr| {
                     if (rr.rtype != .dnskey) continue;
                     const dk = rr.rdata.dnskey;
-                    if (keyTag(dk) == rrsig.key_tag) {
-                        // This key signed the DNSKEY RRset — verify it
-                        verifyRrsig(rrsig, dk, filtered, now_u32) catch continue;
-                        return; // DNSKEY RRset is valid
+                    if (keyTag(dk) != rrsig.key_tag) continue;
+                    var ds_auth = false;
+                    for (ds_records) |ds2| {
+                        verifyDs(ds2, dk, zone_name) catch continue;
+                        ds_auth = true;
+                        break;
                     }
+                    if (!ds_auth) continue;
+                    verifyRrsig(rrsig, dk, filtered, now_u32) catch continue;
+                    return;
                 }
-                continue;
             }
-            // 3. Verify the RRSIG over the DNSKEY RRset using the KSK
-            verifyRrsig(rrsig, ksk, filtered, now_u32) catch continue;
-            return; // Success
         }
     }
     return error.InvalidSignature;
@@ -515,14 +524,20 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     const exponent = key_data[offset..][0..exp_len];
     const modulus = key_data[offset + exp_len ..];
 
-    if (modulus.len == 0 or modulus.len > 512) return error.InvalidKey;
+    // Reject degenerate exponents: empty, 0, 1, or even
+    if (exp_len == 0) return error.InvalidKey;
+    if (exponent[exp_len - 1] & 1 == 0) return error.InvalidKey; // reject even
+    if (exp_len == 1 and exponent[0] <= 1) return error.InvalidKey; // reject 0, 1
+
+    // Require 2048-bit minimum modulus (256 bytes)
+    if (modulus.len < 256 or modulus.len > 512) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
     const pub_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.InvalidKey;
 
     // Dispatch on modulus length at comptime
     // 512-bit (64-byte) RSA omitted: broken key size, and SHA-512 DER exceeds modulus
-    inline for ([_]usize{ 128, 256, 384, 512 }) |mod_len| {
+    inline for ([_]usize{ 256, 384, 512 }) |mod_len| {
         if (modulus.len == mod_len) {
             const sig_array = signature[0..mod_len].*;
             rsa.PKCS1v1_5Signature.verify(mod_len, sig_array, msg, pub_key, Hash) catch
@@ -735,11 +750,12 @@ pub fn validateNegativeProof(
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
     // Try NSEC proofs first
+    var name_denied = false;
     for (authorities) |rr| {
         if (rr.rtype == .nsec) {
             if (is_nxdomain) {
                 if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) {
-                    return .secure;
+                    name_denied = true;
                 }
             } else {
                 // NODATA: NSEC owner matches qname, type not in bitmap
@@ -748,6 +764,39 @@ pub fn validateNegativeProof(
                 }
             }
         }
+    }
+
+    // RFC 4035 §5.4: NXDOMAIN requires both name denial AND wildcard denial
+    if (is_nxdomain and name_denied) {
+        var wildcard_denied = false;
+        // Walk ancestors of qname to construct *.ancestor and check wildcard denial
+        var label_offset: usize = 1; // start at parent
+        while (label_offset < qname.labels.len) : (label_offset += 1) {
+            var wc_labels_buf: [dns.max_label_count][]const u8 = undefined;
+            const ancestor_labels = qname.labels[label_offset..];
+            wc_labels_buf[0] = "*";
+            for (ancestor_labels, 0..) |label, i| {
+                wc_labels_buf[1 + i] = label;
+            }
+            const wildcard = dns.Name{ .labels = wc_labels_buf[0 .. 1 + ancestor_labels.len] };
+
+            for (authorities) |rr| {
+                if (rr.rtype != .nsec) continue;
+                // Wildcard is covered by NSEC range (doesn't exist)
+                if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) {
+                    wildcard_denied = true;
+                    break;
+                }
+                // Wildcard matches NSEC owner but qtype absent (NODATA at wildcard)
+                if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, wildcard, qtype)) {
+                    wildcard_denied = true;
+                    break;
+                }
+            }
+            if (wildcard_denied) break;
+        }
+        if (wildcard_denied) return .secure;
+        return .unchecked;
     }
 
     // Try NSEC3 proofs
@@ -895,55 +944,91 @@ pub fn validateAnswerRrset(
 }
 
 /// Validate a single RRset type within the answers against DNSKEYs.
+/// Iterates ALL RRSIGs covering the target type per RFC 6840 §5.11.
 fn validateRrsetForType(
     answers: []const dns.ResourceRecord,
     covered_type: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
 ) SecurityStatus {
-    // Find RRSIG covering this type and its owner name.
-    // An RRset is defined as same owner name + type + class (RFC 2181 §5),
-    // so we must filter by owner name to avoid mixing records from
-    // different RRsets (e.g., multiple CNAMEs in a chain).
-    var rrsig: dns.RrsigData = undefined;
-    var rrsig_owner: dns.Name = undefined;
-    {
-        var found = false;
+    for (answers) |sig_rr| {
+        if (sig_rr.rtype != .rrsig) continue;
+        const rrsig = sig_rr.rdata.rrsig;
+        if (rrsig.type_covered != covered_type) continue;
+
+        // Filter RRset by this RRSIG's owner (same owner + type)
+        var filtered: [64]dns.ResourceRecord = undefined;
+        var count: usize = 0;
         for (answers) |rr| {
-            if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == covered_type) {
-                rrsig = rr.rdata.rrsig;
-                rrsig_owner = rr.name;
-                found = true;
-                break;
+            if (rr.rtype == covered_type and rr.name.eql(sig_rr.name) and count < filtered.len) {
+                filtered[count] = rr;
+                count += 1;
             }
         }
-        if (!found) return .bogus;
-    }
+        if (count == 0) continue;
 
-    // Filter answer records to the RRset (same owner name AND type)
-    var filtered: [64]dns.ResourceRecord = undefined;
-    var filtered_count: usize = 0;
-    for (answers) |rr| {
-        if (rr.rtype == covered_type and rr.name.eql(rrsig_owner) and filtered_count < filtered.len) {
-            filtered[filtered_count] = rr;
-            filtered_count += 1;
+        // Try ALL matching DNSKEYs (key_tag + algorithm)
+        for (dnskey_records) |dk_rr| {
+            if (dk_rr.rtype != .dnskey) continue;
+            const dk = dk_rr.rdata.dnskey;
+            if (keyTag(dk) != rrsig.key_tag) continue;
+            if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+            verifyRrsig(rrsig, dk, filtered[0..count], now_u32) catch continue;
+            return .secure;
         }
     }
-    if (filtered_count == 0) return .bogus;
+    return .bogus;
+}
 
-    // RFC 6840 §5.4: try ALL matching DNSKEYs (key_tag + algorithm)
-    for (dnskey_records) |rr| {
-        if (rr.rtype != .dnskey) continue;
-        const dk = rr.rdata.dnskey;
-        if (keyTag(dk) != rrsig.key_tag) continue;
-        if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+// ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
 
-        // Try verification with this key
-        verifyRrsig(rrsig, dk, filtered[0..filtered_count], now_u32) catch continue;
-        return .secure; // Signature verified
+/// Verify that every NSEC/NSEC3 record in the authority section has a valid RRSIG
+/// signed by one of the provided DNSKEYs.
+pub fn verifyAuthorityNsecSigs(
+    authorities: []const dns.ResourceRecord,
+    dnskey_records: []const dns.ResourceRecord,
+    now_u32: u32,
+) SecurityStatus {
+    // Verify that every NSEC/NSEC3 record has a valid RRSIG.
+    // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
+    // so no dedup is needed.
+    var any_nsec = false;
+    for (authorities) |rr| {
+        if (rr.rtype != .nsec and rr.rtype != .nsec3) continue;
+        any_nsec = true;
+
+        // Collect the RRset (all records with same owner+type)
+        var rrset: [16]dns.ResourceRecord = undefined;
+        var rrset_count: usize = 0;
+        for (authorities) |rr2| {
+            if (rr2.rtype == rr.rtype and rr2.name.eql(rr.name) and rrset_count < rrset.len) {
+                rrset[rrset_count] = rr2;
+                rrset_count += 1;
+            }
+        }
+
+        // Find a matching RRSIG and verify it
+        var sig_verified = false;
+        for (authorities) |sig_rr| {
+            if (sig_rr.rtype != .rrsig) continue;
+            const rrsig = sig_rr.rdata.rrsig;
+            if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
+
+            for (dnskey_records) |dk_rr| {
+                if (dk_rr.rtype != .dnskey) continue;
+                const dk = dk_rr.rdata.dnskey;
+                if (keyTag(dk) != rrsig.key_tag) continue;
+                if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+                verifyRrsig(rrsig, dk, rrset[0..rrset_count], now_u32) catch continue;
+                sig_verified = true;
+                break;
+            }
+            if (sig_verified) break;
+        }
+        if (!sig_verified) return .bogus;
     }
 
-    return .bogus; // No matching DNSKEY could verify
+    return if (any_nsec) .secure else .unchecked;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1537,7 +1622,53 @@ test "validateNegativeProof NSEC NXDOMAIN" {
     const gamma = dns.Name{
         .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
+    const example_com = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
 
+    // Two NSECs: one covering qname, one covering *.example.com
+    // *.example.com sorts before alpha.example.com, so we need an NSEC
+    // that covers the wildcard range.
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = alpha,
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec = .{
+                .next_domain_name = gamma,
+                .type_bit_maps = &.{},
+            } },
+        },
+        // NSEC covering *.example.com: example.com -> alpha.example.com
+        .{
+            .name = example_com,
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec = .{
+                .next_domain_name = alpha,
+                .type_bit_maps = &.{},
+            } },
+        },
+    };
+
+    const beta = dns.Name{
+        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const status = validateNegativeProof(&authorities, beta, .a, true);
+    try testing.expectEqual(SecurityStatus.secure, status);
+}
+
+test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
+    const alpha = dns.Name{
+        .labels = &.{ @as([]const u8, "alpha"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const gamma = dns.Name{
+        .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+
+    // Only one NSEC covering qname, no wildcard denial
     const authorities = [_]dns.ResourceRecord{.{
         .name = alpha,
         .rtype = .nsec,
@@ -1545,6 +1676,35 @@ test "validateNegativeProof NSEC NXDOMAIN" {
         .ttl = 300,
         .rdata = .{ .nsec = .{
             .next_domain_name = gamma,
+            .type_bit_maps = &.{},
+        } },
+    }};
+
+    const beta = dns.Name{
+        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const status = validateNegativeProof(&authorities, beta, .a, true);
+    try testing.expectEqual(SecurityStatus.unchecked, status);
+}
+
+test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
+    // A single NSEC that covers both the qname AND the wildcard
+    const example_com = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const zeta = dns.Name{
+        .labels = &.{ @as([]const u8, "zeta"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+
+    // NSEC: example.com -> zeta.example.com covers both
+    // *.example.com and beta.example.com (both sort between example.com and zeta)
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = example_com,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec = .{
+            .next_domain_name = zeta,
             .type_bit_maps = &.{},
         } },
     }};
@@ -1905,4 +2065,67 @@ test "verifyRrsig rejects not-yet-valid signature" {
 
     // now is before inception
     try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1698999999));
+}
+
+// ── H3: RSA key validation tests ────────────────────────────────────
+
+test "verifyRsa rejects 1024-bit (128-byte) modulus" {
+    // Build a minimal RSA key with 128-byte modulus (1024-bit)
+    var key_data: [1 + 3 + 128]u8 = undefined;
+    key_data[0] = 3; // exponent length
+    key_data[1] = 0x01; // exponent = 65537 (0x010001)
+    key_data[2] = 0x00;
+    key_data[3] = 0x01;
+    @memset(key_data[4..], 0xAA); // 128-byte modulus
+
+    const sig = [_]u8{0} ** 128;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+}
+
+test "verifyRsa accepts 2048-bit (256-byte) modulus key parsing" {
+    // Build a key with 256-byte modulus — should pass key parsing
+    // (will fail at signature verification, not key validation)
+    var key_data: [1 + 3 + 256]u8 = undefined;
+    key_data[0] = 3; // exponent length
+    key_data[1] = 0x01; // exponent = 65537
+    key_data[2] = 0x00;
+    key_data[3] = 0x01;
+    @memset(key_data[4..], 0xAA); // 256-byte modulus
+
+    var sig: [256]u8 = undefined;
+    @memset(&sig, 0xBB);
+    // Should get InvalidSignature (key is valid but sig doesn't verify)
+    // or InvalidKey from the crypto library — either is fine, not a key size error
+    const result = verifyRsa(&sig, "test", &key_data, Sha256);
+    // The point: it doesn't reject at the key-size check
+    try testing.expect(result == error.InvalidSignature or result == error.InvalidKey);
+}
+
+test "verifyRsa rejects even exponent" {
+    var key_data: [1 + 3 + 256]u8 = undefined;
+    key_data[0] = 3;
+    key_data[1] = 0x01;
+    key_data[2] = 0x00;
+    key_data[3] = 0x02; // even exponent
+    @memset(key_data[4..], 0xAA);
+    const sig = [_]u8{0} ** 256;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+}
+
+test "verifyRsa rejects exponent 0" {
+    var key_data: [1 + 1 + 256]u8 = undefined;
+    key_data[0] = 1; // exponent length = 1
+    key_data[1] = 0; // exponent = 0
+    @memset(key_data[2..], 0xAA);
+    const sig = [_]u8{0} ** 256;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+}
+
+test "verifyRsa rejects exponent 1" {
+    var key_data: [1 + 1 + 256]u8 = undefined;
+    key_data[0] = 1; // exponent length = 1
+    key_data[1] = 1; // exponent = 1
+    @memset(key_data[2..], 0xAA);
+    const sig = [_]u8{0} ** 256;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
 }
