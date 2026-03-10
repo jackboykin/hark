@@ -116,7 +116,11 @@ pub const EventLoop = struct {
         const self = try allocator.create(EventLoop);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.ring = try linux.IoUring.init(max_operations, 0);
+        var params = std.mem.zeroes(linux.io_uring_params);
+        params.flags = linux.IORING_SETUP_CQSIZE;
+        params.cq_entries = max_operations * 4;
+        self.ring = try linux.IoUring.init_params(max_operations, &params);
+        std.debug.assert(params.features & linux.IORING_FEAT_NODROP != 0);
         self.free_count = max_operations;
         for (0..max_operations) |i| {
             self.slots[i] = Slot.init();
@@ -299,17 +303,20 @@ pub const EventLoop = struct {
     fn reapCompletions(self: *EventLoop, buf: []Completion) ![]Completion {
         var cqes: [max_operations]linux.io_uring_cqe = undefined;
         const count = try self.ring.copy_cqes(&cqes, 0);
-        const n = @min(count, buf.len);
 
         var out: usize = 0;
         for (cqes[0..count]) |cqe| {
             // Skip cancel completions
             if (cqe.user_data == std.math.maxInt(u64)) continue;
-            if (out >= n) break;
 
             const id: OperationId = @intCast(cqe.user_data);
             const slot = &self.slots[id];
             if (!slot.active) continue;
+
+            if (out >= buf.len) {
+                self.freeSlot(id);
+                continue;
+            }
 
             const completion = &buf[out];
             completion.context = slot.context;
