@@ -175,8 +175,10 @@ pub const Name = struct {
                 buf[pos] = '.';
                 pos += 1;
             }
-            @memcpy(buf[pos..][0..label.len], label);
-            pos += label.len;
+            for (label) |byte| {
+                buf[pos] = if (byte >= 0x21 and byte <= 0x7e) byte else '?';
+                pos += 1;
+            }
         }
         buf[pos] = 0;
         return buf;
@@ -685,15 +687,18 @@ pub const Parser = struct {
                 const data = try self.readSlice(16);
                 return .{ .aaaa = data[0..16].* };
             },
-            .ns => return .{ .ns = try self.parseName(allocator) },
-            .cname => return .{ .cname = try self.parseName(allocator) },
-            .ptr => return .{ .ptr = try self.parseName(allocator) },
+            .ns => return .{ .ns = try self.parseNameRdata(allocator, rdlength) },
+            .cname => return .{ .cname = try self.parseNameRdata(allocator, rdlength) },
+            .ptr => return .{ .ptr = try self.parseNameRdata(allocator, rdlength) },
             .mx => {
+                const rdata_end = self.pos + rdlength;
                 const preference = try self.readU16();
                 const exchange = try self.parseName(allocator);
+                if (self.pos != rdata_end) return error.FormatError;
                 return .{ .mx = .{ .preference = preference, .exchange = exchange } };
             },
             .soa => {
+                const rdata_end = self.pos + rdlength;
                 const mname = try self.parseName(allocator);
                 const rname = try self.parseName(allocator);
                 const serial = try self.readU32();
@@ -701,6 +706,7 @@ pub const Parser = struct {
                 const retry = try self.readU32();
                 const expire = try self.readU32();
                 const minimum = try self.readU32();
+                if (self.pos != rdata_end) return error.FormatError;
                 return .{ .soa = .{
                     .mname = mname,
                     .rname = rname,
@@ -716,6 +722,7 @@ pub const Parser = struct {
                 var strings: ArrayList([]const u8) = .empty;
                 while (self.pos < rdata_end) {
                     const str_len: usize = try self.readU8();
+                    if (self.pos + str_len > rdata_end) return error.FormatError;
                     const str_data = try self.readSlice(str_len);
                     const duped = allocator.dupe(u8, str_data) catch return error.OutOfMemory;
                     strings.append(allocator, duped) catch return error.OutOfMemory;
@@ -831,6 +838,14 @@ pub const Parser = struct {
             },
         }
     }
+
+    /// Parse a single-name RDATA (NS, CNAME, PTR) with rdlength validation.
+    fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
+        const rdata_end = self.pos + rdlength;
+        const name = try self.parseName(allocator);
+        if (self.pos != rdata_end) return error.FormatError;
+        return name;
+    }
 };
 
 // ── EDNS option parsing ────────────────────────────────────────────────
@@ -844,11 +859,12 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
         const code = mem.readInt(u16, rdata[pos..][0..2], .big);
         const length = mem.readInt(u16, rdata[pos + 2 ..][0..2], .big);
         pos += 4;
-        if (pos + length > rdata.len) break;
+        if (pos + length > rdata.len) return error.FormatError;
         const data = allocator.dupe(u8, rdata[pos..][0..length]) catch return error.OutOfMemory;
         options.append(allocator, .{ .code = code, .data = data }) catch return error.OutOfMemory;
         pos += length;
     }
+    if (pos != rdata.len) return error.FormatError;
     return options.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
@@ -886,7 +902,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
                 .extended_rcode = @intCast(rr.ttl >> 24),
                 .version = @intCast((rr.ttl >> 16) & 0xFF),
                 .do_bit = (rr.ttl & 0x8000) != 0,
-                .options = parseEdnsOptions(allocator, rr.rdata.unknown) catch &.{},
+                .options = try parseEdnsOptions(allocator, rr.rdata.unknown),
             };
         } else {
             additionals.append(allocator, rr) catch return error.OutOfMemory;

@@ -41,12 +41,19 @@ pub const UdpTransport = struct {
         const sock = try posix.socket(af, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
 
-        const bind_addr = if (af == posix.AF.INET6)
-            std.net.Address.initIp6(.{0} ** 16, 0, 0, 0)
-        else
-            std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
-        try posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen());
-
+        // RFC 5452: use crypto PRNG for source port selection
+        for (0..16) |_| {
+            const port = std.crypto.random.intRangeAtMost(u16, 1024, 65535);
+            const addr = anyAddr(af, port);
+            posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+                error.AddressInUse => continue,
+                else => return err,
+            };
+            return sock;
+        }
+        // Fallback: let kernel assign ephemeral port
+        const addr = anyAddr(af, 0);
+        try posix.bind(sock, &addr.any, addr.getOsSockLen());
         return sock;
     }
 
@@ -141,6 +148,13 @@ pub const UdpTransport = struct {
         self.loop.flush();
     }
 };
+
+fn anyAddr(af: u32, port: u16) std.net.Address {
+    return if (af == posix.AF.INET6)
+        std.net.Address.initIp6(.{0} ** 16, port, 0, 0)
+    else
+        std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+}
 
 /// Compare response source IP against expected upstream IP (ignoring port).
 fn addressMatchesUpstream(response: std.net.Address, upstream: std.net.Address) bool {

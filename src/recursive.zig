@@ -272,6 +272,7 @@ pub const RecursiveResolver = struct {
                                     var tls_response_buf: [65535]u8 = undefined;
                                     if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
                                         response = try dns.parseMessage(allocator, tls_data);
+                                        if (!response.header.qr) continue; // skip non-responses
                                         got_response = true;
                                         if (self.cache) |c| c.storeResponse(response, parent_zone);
                                         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
@@ -309,6 +310,7 @@ pub const RecursiveResolver = struct {
                             var tcp_buf: [65535]u8 = undefined;
                             if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
                                 response = try dns.parseMessage(allocator, tcp_data);
+                                if (!response.header.qr) continue; // skip non-responses
                                 got_response = true;
                                 if (self.cache) |c| c.storeResponse(response, parent_zone);
                                 break;
@@ -321,6 +323,7 @@ pub const RecursiveResolver = struct {
 
                     // Parse response (TC=0 only)
                     response = try dns.parseMessage(allocator, response_data);
+                    if (!response.header.qr) continue; // skip non-responses
 
                     got_response = true;
 
@@ -618,6 +621,7 @@ pub const RecursiveResolver = struct {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, servers[0], &tcp_buf)) |tcp_data| {
                     const response = try dns.parseMessage(allocator, tcp_data);
+                    if (!response.header.qr) return null;
                     if (self.cache) |c| c.storeResponse(response, authority_zone);
                     return response.answers;
                 } else |_| {}
@@ -626,6 +630,7 @@ pub const RecursiveResolver = struct {
         }
 
         const response = try dns.parseMessage(allocator, response_data);
+        if (!response.header.qr) return null;
 
         // Cache the response
         if (self.cache) |c| c.storeResponse(response, authority_zone);

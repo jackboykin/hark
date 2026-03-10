@@ -112,7 +112,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
         if (cache.getInteger("size")) |s| {
-            cfg.cache_size = @intCast(@max(0, s));
+            cfg.cache_size = @intCast(@max(0, @min(s, std.math.maxInt(usize))));
         }
         if (cache.getInteger("entries")) |e| {
             cfg.cache_entries = @intCast(@max(0, @min(e, std.math.maxInt(u32))));

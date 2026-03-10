@@ -39,7 +39,9 @@ pub const ForwardingResolver = struct {
         if (self.tls_transport) |tls_t| {
             var response_buf: [65535]u8 = undefined;
             const response_data = try tls_t.query(wire_query, upstream, &response_buf);
-            return try dns.parseMessage(allocator, response_data);
+            const msg = try dns.parseMessage(allocator, response_data);
+            if (!msg.header.qr) return error.FormatError;
+            return msg;
         }
 
         // Do53 path: UDP with TCP fallback on truncation
@@ -50,14 +52,18 @@ pub const ForwardingResolver = struct {
             if (self.tcp_transport) |tcp| {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
-                    return try dns.parseMessage(allocator, tcp_data);
+                    const msg = try dns.parseMessage(allocator, tcp_data);
+                    if (!msg.header.qr) return error.FormatError;
+                    return msg;
                 } else |_| {
                     // TCP failed — fall through to parse truncated response as last resort
                 }
             }
         }
 
-        return try dns.parseMessage(allocator, response_data);
+        const msg = try dns.parseMessage(allocator, response_data);
+        if (!msg.header.qr) return error.FormatError;
+        return msg;
     }
 };
 
