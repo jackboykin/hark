@@ -537,9 +537,14 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
 
     const pub_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.InvalidKey;
 
-    // Dispatch on modulus length at comptime
-    // 512-bit (64-byte) RSA omitted: broken key size, and SHA-512 DER exceeds modulus
-    inline for ([_]usize{ 128, 256, 384, 512 }) |mod_len| {
+    // Dispatch on modulus length at comptime. Zig's RSA implementation needs
+    // the modulus size as a comptime parameter. Cover every 8-byte-aligned
+    // size from 128 to 512 — RSA keys are always a multiple of 64 bits.
+    inline for (comptime blk: {
+        var sizes: [(512 - 128) / 8 + 1]usize = undefined;
+        for (0..sizes.len) |i| sizes[i] = 128 + i * 8;
+        break :blk sizes;
+    }) |mod_len| {
         if (modulus.len == mod_len) {
             const sig_array = signature[0..mod_len].*;
             rsa.PKCS1v1_5Signature.verify(mod_len, sig_array, msg, pub_key, Hash) catch
