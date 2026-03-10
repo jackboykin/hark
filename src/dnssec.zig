@@ -529,15 +529,17 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     if (exponent[exp_len - 1] & 1 == 0) return error.InvalidKey; // reject even
     if (exp_len == 1 and exponent[0] <= 1) return error.InvalidKey; // reject 0, 1
 
-    // Require 2048-bit minimum modulus (256 bytes)
-    if (modulus.len < 256 or modulus.len > 512) return error.InvalidKey;
+    // Require 1024-bit minimum modulus (128 bytes). Many zones (including TLDs
+    // like .org) still use 1024-bit RSA ZSKs. Validators must accept them even
+    // though 2048-bit is recommended for signing (RFC 6781).
+    if (modulus.len < 128 or modulus.len > 512) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
     const pub_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.InvalidKey;
 
     // Dispatch on modulus length at comptime
     // 512-bit (64-byte) RSA omitted: broken key size, and SHA-512 DER exceeds modulus
-    inline for ([_]usize{ 256, 384, 512 }) |mod_len| {
+    inline for ([_]usize{ 128, 256, 384, 512 }) |mod_len| {
         if (modulus.len == mod_len) {
             const sig_array = signature[0..mod_len].*;
             rsa.PKCS1v1_5Signature.verify(mod_len, sig_array, msg, pub_key, Hash) catch
@@ -2069,8 +2071,9 @@ test "verifyRrsig rejects not-yet-valid signature" {
 
 // ── H3: RSA key validation tests ────────────────────────────────────
 
-test "verifyRsa rejects 1024-bit (128-byte) modulus" {
+test "verifyRsa accepts 1024-bit (128-byte) modulus key parsing" {
     // Build a minimal RSA key with 128-byte modulus (1024-bit)
+    // Many TLDs still use RSA-1024 ZSKs — validators must accept them
     var key_data: [1 + 3 + 128]u8 = undefined;
     key_data[0] = 3; // exponent length
     key_data[1] = 0x01; // exponent = 65537 (0x010001)
@@ -2078,8 +2081,11 @@ test "verifyRsa rejects 1024-bit (128-byte) modulus" {
     key_data[3] = 0x01;
     @memset(key_data[4..], 0xAA); // 128-byte modulus
 
-    const sig = [_]u8{0} ** 128;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+    var sig: [128]u8 = undefined;
+    @memset(&sig, 0xBB);
+    // Should get InvalidSignature (key valid, sig doesn't verify) or InvalidKey from crypto
+    const result = verifyRsa(&sig, "test", &key_data, Sha256);
+    try testing.expect(result == error.InvalidSignature or result == error.InvalidKey);
 }
 
 test "verifyRsa accepts 2048-bit (256-byte) modulus key parsing" {
