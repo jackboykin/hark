@@ -360,7 +360,7 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities);
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone);
                                 }
                             },
                             .skip_cache => {},
@@ -391,7 +391,7 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities);
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone);
                                 }
                             },
                             .skip_cache => {},
@@ -428,7 +428,7 @@ pub const RecursiveResolver = struct {
                     if (response.header.rcode == .name_error and response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers[0..server_count])) {
                             .proceed => {
-                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities);
+                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone);
                             },
                             .skip_cache => {},
                             .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
@@ -495,7 +495,7 @@ pub const RecursiveResolver = struct {
                     if (response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
                             .proceed => {
-                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities);
+                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone);
                             },
                             .skip_cache => {},
                             .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
@@ -606,6 +606,9 @@ pub const RecursiveResolver = struct {
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
 
+        // Parse zone name for bailiwick filtering in storeResponse
+        const authority_zone = try dns.parseDottedName(allocator, zone_name);
+
         // Try first server
         const response_data = self.transport.query(wire_query, query_id, servers[0]) catch return null;
 
@@ -615,7 +618,7 @@ pub const RecursiveResolver = struct {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, servers[0], &tcp_buf)) |tcp_data| {
                     const response = try dns.parseMessage(allocator, tcp_data);
-                    if (self.cache) |c| c.storeResponse(response, dns.Name{ .labels = &.{} });
+                    if (self.cache) |c| c.storeResponse(response, authority_zone);
                     return response.answers;
                 } else |_| {}
             }
@@ -625,7 +628,7 @@ pub const RecursiveResolver = struct {
         const response = try dns.parseMessage(allocator, response_data);
 
         // Cache the response
-        if (self.cache) |c| c.storeResponse(response, dns.Name{ .labels = &.{} });
+        if (self.cache) |c| c.storeResponse(response, authority_zone);
 
         if (response.answers.len == 0) return null;
         return response.answers;

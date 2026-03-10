@@ -537,6 +537,7 @@ pub const RRsetCache = struct {
         rclass: dns.RClass,
         rcode: dns.RCode,
         authorities: []const dns.ResourceRecord,
+        authority_zone: dns.Name,
     ) void {
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
@@ -549,6 +550,21 @@ pub const RRsetCache = struct {
             }
         }
         const soa = soa_record orelse return; // No SOA = don't cache
+
+        // Validate SOA is from a parent zone of the queried name (RFC 2308 §3).
+        // Reject cross-zone SOA injection (e.g., SOA for "other.net." in response
+        // to "www.example.com" is not a valid parent).
+        {
+            // Use a stack buffer to avoid charging temporary validation work
+            // against the counting allocator's cache memory budget.
+            var fba_buf: [512]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+            const queried = dns.parseDottedName(fba.allocator(), name) catch return;
+            if (!queried.isSubdomainOf(soa.name)) return;
+            // AuthS3 (draft-qiu-dnsop-enhanced-bailiwick): SOA must also be
+            // within the delegation chain, not above the zone cut.
+            if (authority_zone.labels.len > 0 and !soa.name.isSubdomainOf(authority_zone)) return;
+        }
 
         // TTL = min(SOA record TTL, SOA MINIMUM field) per RFC 2308 §5
         const neg_ttl = @min(soa.ttl, soa.rdata.soa.minimum);
@@ -1032,7 +1048,7 @@ test "cache negative NXDOMAIN" {
         alloc.free(authorities);
     }
 
-    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities);
+    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1046,6 +1062,147 @@ test "cache negative NXDOMAIN" {
         },
         .hit => return error.TestUnexpectedResult,
     }
+}
+
+test "storeNegative rejects cross-zone SOA" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // SOA for "other.net" — not a parent of "www.example.com"
+    const soa_name = try makeTestName(alloc, &.{ "other", "net" });
+    const mname = try makeTestName(alloc, &.{ "ns1", "other", "net" });
+    const rname = try makeTestName(alloc, &.{ "admin", "other", "net" });
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = soa_name,
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 900,
+        .rdata = .{ .soa = .{
+            .mname = mname,
+            .rname = rname,
+            .serial = 2024010101,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = 600,
+        } },
+    };
+    defer {
+        for (authorities) |rr| {
+            dns.freeName(alloc, rr.name);
+            dns.freeRData(alloc, rr.rdata);
+        }
+        alloc.free(authorities);
+    }
+
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "www.example.com", .a, .in);
+    try testing.expect(result == null); // rejected — SOA not a parent
+}
+
+test "storeNegative accepts parent-zone SOA" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // SOA for "com" — valid parent of "www.example.com"
+    const soa_name = try makeTestName(alloc, &.{ "com" });
+    const mname = try makeTestName(alloc, &.{ "ns1", "com" });
+    const rname = try makeTestName(alloc, &.{ "admin", "com" });
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = soa_name,
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 900,
+        .rdata = .{ .soa = .{
+            .mname = mname,
+            .rname = rname,
+            .serial = 2024010101,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = 600,
+        } },
+    };
+    defer {
+        for (authorities) |rr| {
+            dns.freeName(alloc, rr.name);
+            dns.freeRData(alloc, rr.rdata);
+        }
+        alloc.free(authorities);
+    }
+
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "www.example.com", .a, .in);
+    try testing.expect(result != null); // accepted — "com" is a parent
+    switch (result.?) {
+        .negative => |n| {
+            try testing.expectEqual(dns.RCode.name_error, n.rcode);
+        },
+        .hit => return error.TestUnexpectedResult,
+    }
+}
+
+test "storeNegative rejects SOA above zone cut" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // SOA for "com" is a valid parent of "www.example.com", but the zone cut
+    // is "example.com" — a rogue child server should not inject parent SOA.
+    const soa_name = try makeTestName(alloc, &.{"com"});
+    const mname = try makeTestName(alloc, &.{ "ns1", "com" });
+    const rname = try makeTestName(alloc, &.{ "admin", "com" });
+    const zone_cut = try makeTestName(alloc, &.{ "example", "com" });
+    defer dns.freeName(alloc, zone_cut);
+
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = soa_name,
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 900,
+        .rdata = .{ .soa = .{
+            .mname = mname,
+            .rname = rname,
+            .serial = 2024010101,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = 600,
+        } },
+    };
+    defer {
+        for (authorities) |rr| {
+            dns.freeName(alloc, rr.name);
+            dns.freeRData(alloc, rr.rdata);
+        }
+        alloc.free(authorities);
+    }
+
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "www.example.com", .a, .in);
+    try testing.expect(result == null); // rejected — SOA "com" is above zone cut "example.com"
 }
 
 test "cache eviction when full" {
@@ -1137,7 +1294,7 @@ test "cache negative without SOA is not stored" {
     defer cache.deinit();
 
     // No SOA in authority
-    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{});
+    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} });
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
