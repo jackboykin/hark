@@ -11,6 +11,9 @@ const damping_sec: i64 = 3600;
 /// How long a .capable result persists before re-probing (3 days, per RFC 9539).
 const persistence_sec: i64 = 3 * 24 * 3600;
 
+/// How long a .probing entry is valid before expiring to .unknown (RFC 9539 §4.2).
+const probe_timeout_sec: i64 = 30;
+
 /// Maximum number of cached entries.
 const max_entries: usize = 256;
 
@@ -64,7 +67,7 @@ pub const EncryptedNsCache = struct {
         const entry = self.entries.get(key) orelse return .unknown;
         return switch (entry.status) {
             .capable => if (self.now_fn() - entry.last_probe >= persistence_sec) .unknown else .capable,
-            .probing => .probing,
+            .probing => if (self.now_fn() - entry.last_probe >= probe_timeout_sec) .unknown else .probing,
             .failed => if (self.now_fn() - entry.last_probe >= damping_sec) .unknown else .failed,
             .unknown => .unknown,
         };
@@ -81,7 +84,7 @@ pub const EncryptedNsCache = struct {
         if (self.entries.get(key)) |entry| {
             switch (entry.status) {
                 .capable => if (now - entry.last_probe < persistence_sec) return false,
-                .probing => return false,
+                .probing => if (now - entry.last_probe < probe_timeout_sec) return false,
                 .failed => if (now - entry.last_probe < damping_sec) return false,
                 .unknown => {},
             }
@@ -121,6 +124,17 @@ pub const EncryptedNsCache = struct {
             .last_probe = self.now_fn(),
             .failure_count = if (count < 255) count + 1 else 255,
         }) catch {};
+    }
+
+    /// Revert a .probing entry to .unknown (probe was never attempted).
+    pub fn revertProbing(self: *EncryptedNsCache, key: AddressKey) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.entries.get(key)) |entry| {
+            if (entry.status == .probing) {
+                _ = self.entries.fetchRemove(key);
+            }
+        }
     }
 
     /// Block until all background probes have completed (for shutdown).
@@ -307,4 +321,27 @@ test "EncryptedNsCache capable expires after persistence_sec" {
 
     // Should allow re-probing
     try testing.expect(cache.claimProbe(key));
+}
+
+test "EncryptedNsCache revertProbing clears probing entry" {
+    var cache = EncryptedNsCache.init(testing.allocator);
+    defer cache.deinit();
+
+    const key = makeKey(.{ 4, 4, 4, 4 });
+    try testing.expect(cache.claimProbe(key));
+    try testing.expectEqual(ServerStatus.probing, cache.getStatus(key));
+
+    cache.revertProbing(key);
+    try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
+}
+
+test "EncryptedNsCache revertProbing is no-op for capable" {
+    var cache = EncryptedNsCache.init(testing.allocator);
+    defer cache.deinit();
+
+    const key = makeKey(.{ 5, 5, 5, 5 });
+    cache.markCapable(key);
+
+    cache.revertProbing(key);
+    try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 }

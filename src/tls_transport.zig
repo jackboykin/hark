@@ -253,11 +253,15 @@ pub const TlsTransport = struct {
         const tls_server = toPort(server, self.config.port) orelse return;
         const addr_key = AddressKey.fromAddress(tls_server);
 
-        // Cap concurrent probe threads
-        const current = enc_ns_cache.active_probes.load(.seq_cst);
-        if (current >= encrypted_ns_mod.max_probes) return;
-
-        _ = enc_ns_cache.active_probes.fetchAdd(1, .seq_cst);
+        // Cap concurrent probe threads (CAS loop to avoid TOCTOU overcount)
+        while (true) {
+            const current = enc_ns_cache.active_probes.load(.seq_cst);
+            if (current >= encrypted_ns_mod.max_probes) {
+                enc_ns_cache.revertProbing(addr_key);
+                return;
+            }
+            if (enc_ns_cache.active_probes.cmpxchgStrong(current, current + 1, .seq_cst, .seq_cst) == null) break;
+        }
         const thread = std.Thread.spawn(.{}, probeThread, .{ self, tls_server, addr_key, enc_ns_cache }) catch {
             enc_ns_cache.markFailed(addr_key);
             _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
@@ -268,7 +272,10 @@ pub const TlsTransport = struct {
 
     fn probeThread(self: *TlsTransport, tls_server: net.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
         defer _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
-        if (enc_ns_cache.shutting_down.load(.seq_cst)) return;
+        if (enc_ns_cache.shutting_down.load(.seq_cst)) {
+            enc_ns_cache.revertProbing(addr_key);
+            return;
+        }
 
         const probe_timeout_sec: i64 = 4;
 
@@ -485,4 +492,54 @@ test "TlsTransport connection pooling reuses connection" {
     try testing.expect(response.header.qr);
     try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
     try testing.expect(response.answers.len > 0);
+}
+
+test "probeInBackground reverts .probing when max_probes hit" {
+    var enc_ns_cache = EncryptedNsCache.init(testing.allocator);
+    defer enc_ns_cache.deinit();
+
+    const server = net.Address.initIp4(.{ 10, 0, 0, 1 }, 53);
+    const tls_server = toPort(server, 853).?;
+    const addr_key = AddressKey.fromAddress(tls_server);
+
+    // Claim the probe slot (sets .probing)
+    try testing.expect(enc_ns_cache.claimProbe(addr_key));
+    try testing.expectEqual(encrypted_ns_mod.ServerStatus.probing, enc_ns_cache.getStatus(addr_key));
+
+    // Saturate active_probes so the guard triggers
+    enc_ns_cache.active_probes.store(encrypted_ns_mod.max_probes, .seq_cst);
+
+    // probeInBackground should hit the max_probes guard and revert.
+    // Safe to use undefined: returns before spawning a thread or accessing other fields.
+    var tls_t: TlsTransport = undefined;
+    tls_t.config = .{};
+    tls_t.probeInBackground(server, &enc_ns_cache);
+
+    try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
+}
+
+test "probeThread reverts .probing on shutdown" {
+    var enc_ns_cache = EncryptedNsCache.init(testing.allocator);
+    defer enc_ns_cache.deinit();
+
+    const server = net.Address.initIp4(.{ 10, 0, 0, 2 }, 53);
+    const tls_server = toPort(server, 853).?;
+    const addr_key = AddressKey.fromAddress(tls_server);
+
+    // Claim the probe slot
+    try testing.expect(enc_ns_cache.claimProbe(addr_key));
+
+    // Signal shutdown before spawning
+    enc_ns_cache.shutting_down.store(true, .seq_cst);
+
+    // Safe to use undefined: shutdown flag forces early return before accessing other fields.
+    var tls_t: TlsTransport = undefined;
+    tls_t.config = .{};
+    tls_t.probeInBackground(server, &enc_ns_cache);
+
+    // Wait for the detached thread to finish
+    while (enc_ns_cache.active_probes.load(.seq_cst) > 0)
+        std.Thread.sleep(1_000_000);
+
+    try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
 }
