@@ -16,6 +16,7 @@ const AddressKey = pool_mod.AddressKey;
 const VendoredTlsClient = @import("tls_client.zig");
 const encrypted_ns_mod = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns_mod.EncryptedNsCache;
+const log = std.log.scoped(.tls_transport);
 
 pub const TlsConfig = struct {
     connect_timeout_ms: u32 = 5000,
@@ -151,6 +152,10 @@ pub const TlsTransport = struct {
             return error.StrictModeRequiresHostname;
         }
 
+        if (!self.config.skip_verification and self.config.server_name == null) {
+            log.warn("TLS server_name not configured — certificate verification disabled; set server_name for authentication or skip_verification to suppress this warning", .{});
+        }
+
         conn.tls_client = VendoredTlsClient.init(conn.net_reader.interface(), &conn.net_writer.interface, .{
             .host = if (self.config.skip_verification)
                 .no_verification
@@ -158,7 +163,7 @@ pub const TlsTransport = struct {
                 .{ .explicit = sn }
             else
                 .no_verification,
-            .ca = if (self.config.skip_verification)
+            .ca = if (self.config.skip_verification or self.config.server_name == null)
                 .no_verification
             else
                 .{ .bundle = self.ca_bundle },

@@ -615,14 +615,23 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             const et = all_extd.decode(tls.ExtensionType);
                             const ext_size = all_extd.decode(u16);
                             const extd = try all_extd.sub(ext_size);
-                            _ = extd;
                             switch (et) {
                                 .server_name => {},
                                 .application_layer_protocol_negotiation => {
-                                    // Parse ALPN response (RFC 7301 §3.2).
-                                    // Server echoes back the selected protocol.
-                                    // We just acknowledge it — no verification needed
-                                    // for opportunistic encryption (RFC 9539 §4.6.3.4).
+                                    // RFC 7301 §3.2: validate server's selected protocol.
+                                    if (options.alpn) |expected| {
+                                        var alpn_d = extd;
+                                        try alpn_d.ensure(3);
+                                        const proto_list_len = alpn_d.decode(u16);
+                                        const name_len = alpn_d.decode(u8);
+                                        if (proto_list_len != @as(u16, 1) + name_len)
+                                            return error.TlsIllegalParameter;
+                                        try alpn_d.ensure(name_len);
+                                        const selected = alpn_d.slice(name_len);
+                                        if (!mem.eql(u8, selected, expected)) {
+                                            return error.TlsIllegalParameter;
+                                        }
+                                    }
                                 },
                                 else => {},
                             }

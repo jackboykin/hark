@@ -269,6 +269,10 @@ pub const Server = struct {
         };
 
         ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
+
+        // Ensure background probe threads that captured &tls_transport complete
+        // before the stack-allocated TlsTransport is destroyed.
+        if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
     }
 };
 
