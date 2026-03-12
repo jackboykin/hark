@@ -612,31 +612,67 @@ pub const RecursiveResolver = struct {
         // Parse zone name for bailiwick filtering in storeResponse
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
-        // Try first server
-        const response_data = self.transport.query(wire_query, query_id, servers[0]) catch return null;
+        // Try up to 3 servers from the delegation set
+        const max_dnskey_servers = 3;
+        const try_count = @min(servers.len, max_dnskey_servers);
 
-        // TC bit: retry over TCP
-        if (dns.hasTcBit(response_data)) {
-            if (self.tcp_transport) |tcp| {
-                var tcp_buf: [65535]u8 = undefined;
-                if (tcp.query(wire_query, servers[0], &tcp_buf)) |tcp_data| {
-                    const response = try dns.parseMessage(allocator, tcp_data);
-                    if (!response.header.qr) return null;
-                    if (self.cache) |c| c.storeResponse(response, authority_zone);
-                    return response.answers;
-                } else |_| {}
+        for (servers[0..try_count], 0..) |server, i| {
+            const addr_key = AddressKey.fromAddress(server);
+
+            // Skip dead servers unless it's the last in our list
+            if (self.rtt_cache) |rc| {
+                if (rc.isDead(addr_key) and i + 1 < try_count) continue;
             }
-            return null;
+
+            // Per-server timeout from RTT cache, or default
+            const timeout: u32 = if (self.rtt_cache) |rc|
+                rc.getTimeout(addr_key)
+            else
+                self.transport.config.timeout_ms;
+
+            const query_start = std.time.microTimestamp();
+            const response_data = self.transport.queryWithTimeout(wire_query, query_id, server, timeout) catch {
+                if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+                continue;
+            };
+            const elapsed_us = std.time.microTimestamp() - query_start;
+
+            // TC bit: retry over TCP
+            if (dns.hasTcBit(response_data)) {
+                if (self.tcp_transport) |tcp| {
+                    var tcp_buf: [65535]u8 = undefined;
+                    if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
+                        const response = dns.parseMessage(allocator, tcp_data) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => continue,
+                        };
+                        if (!response.header.qr) continue;
+                        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
+                        if (self.cache) |c| c.storeResponse(response, authority_zone);
+                        if (response.answers.len == 0) continue;
+                        return response.answers;
+                    } else |_| {
+                        // TCP failed — try next server
+                    }
+                }
+                continue;
+            }
+
+            const response = dns.parseMessage(allocator, response_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            if (!response.header.qr) continue;
+
+            if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
+
+            // Cache the response
+            if (self.cache) |c| c.storeResponse(response, authority_zone);
+
+            if (response.answers.len == 0) continue;
+            return response.answers;
         }
-
-        const response = try dns.parseMessage(allocator, response_data);
-        if (!response.header.qr) return null;
-
-        // Cache the response
-        if (self.cache) |c| c.storeResponse(response, authority_zone);
-
-        if (response.answers.len == 0) return null;
-        return response.answers;
+        return null;
     }
 
     /// Validate answer RRsets for a response from a secure zone.
