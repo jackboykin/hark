@@ -521,6 +521,7 @@ pub const RRsetCache = struct {
     /// Cache all RRsets from a DNS response. Applies bailiwick filtering
     /// to all sections to prevent cache poisoning.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
+        if (response.header.rcode != .no_error) return;
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
         self.storeRRsets(response.answers, authority_zone, true);

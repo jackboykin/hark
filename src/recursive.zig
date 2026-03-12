@@ -53,6 +53,15 @@ const max_servers_per_level = 26;
 const max_cname_chain = 8;
 const max_minimise_count = 10;
 
+/// Parse a DNS message, propagating OOM and converting other parse
+/// errors to null so callers can skip malformed responses.
+fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory}!?dns.Message {
+    return dns.parseMessage(allocator, data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
 pub const RecursiveResolver = struct {
@@ -271,7 +280,7 @@ pub const RecursiveResolver = struct {
 
                                     var tls_response_buf: [65535]u8 = undefined;
                                     if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
-                                        response = try dns.parseMessage(allocator, tls_data);
+                                        response = try tryParseMessage(allocator, tls_data) orelse continue;
                                         if (!response.header.qr) continue; // skip non-responses
                                         got_response = true;
                                         if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -309,7 +318,7 @@ pub const RecursiveResolver = struct {
                         if (self.tcp_transport) |tcp| {
                             var tcp_buf: [65535]u8 = undefined;
                             if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
-                                response = try dns.parseMessage(allocator, tcp_data);
+                                response = try tryParseMessage(allocator, tcp_data) orelse continue;
                                 if (!response.header.qr) continue; // skip non-responses
                                 got_response = true;
                                 if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -322,7 +331,7 @@ pub const RecursiveResolver = struct {
                     }
 
                     // Parse response (TC=0 only)
-                    response = try dns.parseMessage(allocator, response_data);
+                    response = try tryParseMessage(allocator, response_data) orelse continue;
                     if (!response.header.qr) continue; // skip non-responses
 
                     got_response = true;
@@ -642,11 +651,9 @@ pub const RecursiveResolver = struct {
                 if (self.tcp_transport) |tcp| {
                     var tcp_buf: [65535]u8 = undefined;
                     if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
-                        const response = dns.parseMessage(allocator, tcp_data) catch |err| switch (err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            else => continue,
-                        };
+                        const response = try tryParseMessage(allocator, tcp_data) orelse continue;
                         if (!response.header.qr) continue;
+                        if (response.header.rcode != .no_error) continue;
                         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
                         if (self.cache) |c| c.storeResponse(response, authority_zone);
                         if (response.answers.len == 0) continue;
@@ -658,11 +665,9 @@ pub const RecursiveResolver = struct {
                 continue;
             }
 
-            const response = dns.parseMessage(allocator, response_data) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
-            };
+            const response = try tryParseMessage(allocator, response_data) orelse continue;
             if (!response.header.qr) continue;
+            if (response.header.rcode != .no_error) continue;
 
             if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
 
