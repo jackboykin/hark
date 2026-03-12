@@ -359,11 +359,14 @@ pub const RecursiveResolver = struct {
 
                 // ── Probe response handling (non-final queries) ──
                 if (!is_final) {
-                    // Check for referral first — applies to probes too
-                    if (extractReferral(response, target_name, parent_zone)) |referral| {
-                        try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
-                        minimise_label_count = parent_zone.labels.len + 1;
-                        continue;
+                    // Check for referral — only from successful responses (error responses
+                    // may contain NS records in authority that are not valid delegations)
+                    if (response.header.rcode == .no_error) {
+                        if (extractReferral(response, target_name, parent_zone)) |referral| {
+                            try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
+                            minimise_label_count = parent_zone.labels.len + 1;
+                            continue;
+                        }
                     }
 
                     if (response.header.rcode == .name_error) {
@@ -385,8 +388,8 @@ pub const RecursiveResolver = struct {
                         continue;
                     }
 
-                    if (response.header.rcode == .server_failure or response.header.rcode == .refused) {
-                        // Probe SERVFAIL/REFUSED — stop minimising, send full QNAME
+                    if (response.header.rcode != .no_error and response.header.rcode != .name_error) {
+                        // Probe error (SERVFAIL, REFUSED, FORMERR, etc.) — stop minimising, send full QNAME
                         minimise_label_count = target_name.labels.len;
                         continue;
                     }
