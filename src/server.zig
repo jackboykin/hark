@@ -595,6 +595,7 @@ const WorkerState = struct {
                     .encrypted_ns_cache = self.encrypted_ns_cache,
                     .rtt_cache = self.rtt_cache,
                     .bypass_cache = bypass_cache,
+                    .dedup = self.dedup,
                 };
                 return try resolver.resolve(alloc, name, qtype);
             },

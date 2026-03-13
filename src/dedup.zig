@@ -66,6 +66,13 @@ pub const InFlightTable = struct {
     /// Returns `.leader` if this is the first request — caller must call `releaseLeader` when done.
     /// Returns `.follower` if another worker is already resolving — blocks until the leader finishes.
     pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType) AcquireResult {
+        return self.acquireOrWaitWithTimeout(name, qtype, 2 * std.time.ns_per_s);
+    }
+
+    /// Like `acquireOrWait` but with a caller-specified timeout.
+    /// DNSKEY fetches use a longer timeout (6s) because cold-cache DNSSEC
+    /// chains (root → TLD → SLD → DNSKEY) can take 3-5s.
+    pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, timeout_ns: u64) AcquireResult {
         const key = DedupKey.init(name, qtype) orelse return .leader;
 
         self.mutex.lock();
@@ -75,7 +82,7 @@ pub const InFlightTable = struct {
             // Another worker is resolving this — wait for completion.
             while (self.map.get(key)) |entry| {
                 if (entry.completed) break;
-                self.condition.timedWait(&self.mutex, 2 * std.time.ns_per_s) catch break;
+                self.condition.timedWait(&self.mutex, timeout_ns) catch break;
             }
             // Entry may have been removed by leader, or we timed out — either way, follower.
             return .follower;
@@ -205,7 +212,7 @@ test "timeout when leader never releases" {
 
     _ = table.acquireOrWait("example.com", .a);
 
-    // Spawn a follower that will time out (the 5s timeout in acquireOrWait)
+    // Spawn a follower that will time out (the 2s timeout in acquireOrWait)
     // For test speed, we test the mechanism: put an entry and let follower see it
     const t = try std.Thread.spawn(.{}, struct {
         fn run(tbl: *InFlightTable) void {
@@ -219,4 +226,15 @@ test "timeout when leader never releases" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
     table.releaseLeader("example.com", .a);
     t.join();
+}
+
+test "acquireOrWaitWithTimeout uses custom timeout" {
+    var table = InFlightTable.init(testing.allocator);
+    defer table.deinit();
+
+    _ = table.acquireOrWait("example.com", .a);
+    // Same-thread follower: timedWait times out immediately since no one will signal.
+    const r = table.acquireOrWaitWithTimeout("example.com", .a, 1);
+    try testing.expectEqual(.follower, r);
+    table.releaseLeader("example.com", .a);
 }

@@ -12,6 +12,7 @@ const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
+const InFlightTable = @import("dedup.zig").InFlightTable;
 
 // ── Root Hints ─────────────────────────────────────────────────────────
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
@@ -78,6 +79,7 @@ pub const RecursiveResolver = struct {
     encrypted_ns_cache: ?*EncryptedNsCache = null,
     rtt_cache: ?*RttCache = null,
     bypass_cache: bool = false,
+    dedup: ?*InFlightTable = null,
 
     pub const ResolveResult = struct {
         message: dns.Message,
@@ -402,7 +404,7 @@ pub const RecursiveResolver = struct {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone);
                             },
                             .skip_cache => {},
-                            .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
+                            .bogus => return self.bogusServfail(current_name, qtype),
                         }
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
@@ -424,10 +426,7 @@ pub const RecursiveResolver = struct {
                             if (self.dnssec_enabled and security_state == .secure) {
                                 if (dnssec.findRrsig(response.answers, .cname) != null) {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
-                                        .bogus => {
-                                            if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                            return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) };
-                                        },
+                                        .bogus => return self.bogusServfail(current_name, qtype),
                                         .valid => {
                                             if (self.cache) |c| c.storeResponse(response, parent_zone);
                                         },
@@ -454,10 +453,7 @@ pub const RecursiveResolver = struct {
                     // Validate answer RRsets if in secure zone
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => {
-                                if (self.cache) |c| c.storeNegativeBare(current_name, qtype, .in, .server_failure, 5);
-                                return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) };
-                            },
+                            .bogus => return self.bogusServfail(current_name, qtype),
                             .valid, .skip => {},
                         }
                     }
@@ -474,7 +470,7 @@ pub const RecursiveResolver = struct {
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone);
                             },
                             .skip_cache => {},
-                            .bogus => return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) },
+                            .bogus => return self.bogusServfail(current_name, qtype),
                         }
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
@@ -595,16 +591,33 @@ pub const RecursiveResolver = struct {
 
     // ── DNSSEC Answer Validation ───────────────────────────────────────
 
+    /// RFC 9520 §3.2: minimum negative-cache TTL for DNSSEC validation failures.
+    const dnssec_bogus_ttl: u32 = 1;
+
+    /// Dedup follower timeout for DNSKEY fetches. Cold-cache DNSSEC chains
+    /// (root → TLD → SLD → DNSKEY) can take 3-5s; 6s provides headroom.
+    const dnskey_dedup_timeout_ns: u64 = 6 * std.time.ns_per_s;
+
     const AnswerValidation = enum { valid, bogus, skip };
 
+    /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
+    /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
+    fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
+        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl);
+        return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure) };
+    }
+
     /// Fetch DNSKEY records for a zone, checking cache first.
+    /// Uses the dedup table to coalesce concurrent DNSKEY fetches for the
+    /// same zone — prevents N parallel queries from each firing their own
+    /// DNSKEY network request on cold cache.
     fn fetchDnskey(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
         servers: []const std.net.Address,
     ) !?[]const dns.ResourceRecord {
-        // Check cache first
+        // Fast path: cache hit — no dedup needed.
         if (self.cache) |c| {
             if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
                 switch (result) {
@@ -613,6 +626,45 @@ pub const RecursiveResolver = struct {
                 }
             }
         }
+
+        // Dedup: coalesce concurrent DNSKEY fetches for the same zone.
+        if (self.dedup) |dedup| {
+            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, dnskey_dedup_timeout_ns)) {
+                .leader => {
+                    // We're the leader — do the actual fetch, then release.
+                    defer dedup.releaseLeader(zone_name, .dnskey);
+                    return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+                },
+                .follower => {
+                    // Leader finished (or timed out). Re-check cache — leader
+                    // should have populated it on success.
+                    if (self.cache) |c| {
+                        if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
+                            switch (result) {
+                                .hit => |h| return h.records,
+                                .negative => return null,
+                            }
+                        }
+                    }
+                    // Cache still empty — leader failed. Fall through to our
+                    // own fetch as a retry (DNSKEY may now be reachable).
+                    return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+                },
+            }
+        }
+
+        // No dedup table (single-threaded mode) — fetch directly.
+        return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+    }
+
+    /// Actual network fetch for DNSKEY records. Separated from fetchDnskey
+    /// so that dedup leader/follower paths can both call it.
+    fn fetchDnskeyNetwork(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        servers: []const std.net.Address,
+    ) !?[]const dns.ResourceRecord {
         const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true) orelse return null;
         if (resp.answers.len == 0) return null;
         return resp.answers;
