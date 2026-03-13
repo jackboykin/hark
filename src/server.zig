@@ -440,10 +440,10 @@ const WorkerState = struct {
         const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = std.time.nanoTimestamp();
-        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
+        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
-            log.warn("{s} {s} SERVFAIL {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms });
+            log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             sendErrorUdp(sock, query.header.id, .server_failure, query.header.rd, query.questions, client_addr);
             return;
         };
@@ -540,10 +540,10 @@ const WorkerState = struct {
         const name_str = name_buf[0..name_len];
 
         const start_ns = std.time.nanoTimestamp();
-        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch {
+        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
-            log.warn("{s} {s} SERVFAIL {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms });
+            log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms, @errorName(err) });
             return if (serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));

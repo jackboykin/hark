@@ -290,48 +290,11 @@ pub const RecursiveResolver = struct {
                     }
 
                     // ── Do53: UDP with TCP fallback ──
-                    const query_start = std.time.microTimestamp();
-                    const response_data = self.transport.queryWithTimeout(wire_query, query_id, server, per_server_timeout) catch |err| switch (err) {
-                        error.Timeout => {
-                            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
-                            continue; // try next server
-                        },
-                        else => {
-                            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
-                            continue;
-                        },
-                    };
-                    const elapsed_us = std.time.microTimestamp() - query_start;
-
-                    // Record RTT on success
-                    if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
-
-                    // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
-                    if (dns.hasTcBit(response_data)) {
-                        if (self.tcp_transport) |tcp| {
-                            var tcp_buf: [65535]u8 = undefined;
-                            if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
-                                response = try tryParseMessage(allocator, tcp_data) orelse continue;
-                                if (!response.header.qr) continue; // skip non-responses
-                                got_response = true;
-                                if (self.cache) |c| c.storeResponse(response, parent_zone);
-                                break;
-                            } else |_| {
-                                // TCP failed — ignore truncated response, try next server
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Parse response (TC=0 only)
-                    response = try tryParseMessage(allocator, response_data) orelse continue;
-                    if (!response.header.qr) continue; // skip non-responses
-
+                    response = try self.queryServerUdp(
+                        allocator, wire_query, query_id, server, per_server_timeout,
+                    ) orelse continue;
                     got_response = true;
-
-                    // CACHE STORE: Cache all RRsets from this response
                     if (self.cache) |c| c.storeResponse(response, parent_zone);
-
                     break;
                 }
 
@@ -477,7 +440,12 @@ pub const RecursiveResolver = struct {
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
                                 current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
-                                security_state = if (self.dnssec_enabled) .secure else .unchecked;
+                                // Re-resolve CNAME target from root with fresh security state.
+                                // Preserve .insecure: an unauthenticated CNAME could redirect
+                                // anywhere, so the answer must not carry AD (RFC 4035 §3.2.3).
+                                if (security_state != .insecure) {
+                                    security_state = if (self.dnssec_enabled) .secure else .unchecked;
+                                }
                                 continue :cname_loop;
                             }
                         }
@@ -581,6 +549,50 @@ pub const RecursiveResolver = struct {
         @memcpy(servers.*[0..addrs.count], addrs.addrs[0..addrs.count]);
     }
 
+    // ── UDP+TCP query helper ──────────────────────────────────────────
+
+    /// Send a UDP query to a single server with TC-bit TCP fallback and RTT tracking.
+    /// Returns the parsed response, or null on failure (timeout, parse error, etc.).
+    fn queryServerUdp(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        wire_query: []const u8,
+        query_id: u16,
+        server: std.net.Address,
+        timeout: u32,
+    ) error{OutOfMemory}!?dns.Message {
+        const addr_key = AddressKey.fromAddress(server);
+        const query_start = std.time.microTimestamp();
+
+        const response_data = self.transport.queryWithTimeout(
+            wire_query, query_id, server, timeout,
+        ) catch {
+            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+            return null;
+        };
+        const elapsed_us = std.time.microTimestamp() - query_start;
+
+        // Record liveness — truncated responses still prove server is alive
+        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
+
+        // TC bit: retry over TCP (RFC 2181 — ignore truncated data)
+        if (dns.hasTcBit(response_data)) {
+            if (self.tcp_transport) |tcp| {
+                var tcp_buf: [65535]u8 = undefined;
+                if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
+                    const response = try tryParseMessage(allocator, tcp_data) orelse return null;
+                    if (!response.header.qr) return null;
+                    return response;
+                } else |_| {}
+            }
+            return null;
+        }
+
+        const response = try tryParseMessage(allocator, response_data) orelse return null;
+        if (!response.header.qr) return null;
+        return response;
+    }
+
     // ── DNSSEC Answer Validation ───────────────────────────────────────
 
     const AnswerValidation = enum { valid, bogus, skip };
@@ -601,82 +613,89 @@ pub const RecursiveResolver = struct {
                 }
             }
         }
+        const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true) orelse return null;
+        if (resp.answers.len == 0) return null;
+        return resp.answers;
+    }
 
+    /// Query authoritative servers for a specific RRset, with RTT tracking
+    /// and dead-server skipping.  Returns the full message so callers that
+    /// need the authority section (e.g. DS probes) can use it.
+    fn fetchRRset(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        qtype: dns.RType,
+        servers: []const std.net.Address,
+        max_servers: usize,
+        do_bit: bool,
+    ) !?dns.Message {
         if (servers.len == 0) return null;
 
-        // Build DNSKEY query
         var id_bytes: [2]u8 = undefined;
         std.crypto.random.bytes(&id_bytes);
         const query_id = mem.readInt(u16, &id_bytes, .big);
 
-        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, .dnskey, .{
+        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
             .rd = false,
-            .edns = .{ .do_bit = true },
+            .edns = .{ .do_bit = do_bit },
         });
 
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
 
-        // Parse zone name for bailiwick filtering in storeResponse
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
-        // Try up to 3 servers from the delegation set
-        const max_dnskey_servers = 3;
-        const try_count = @min(servers.len, max_dnskey_servers);
-
+        const try_count = @min(servers.len, max_servers);
         for (servers[0..try_count], 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
-            // Skip dead servers unless it's the last in our list
             if (self.rtt_cache) |rc| {
                 if (rc.isDead(addr_key) and i + 1 < try_count) continue;
             }
 
-            // Per-server timeout from RTT cache, or default
             const timeout: u32 = if (self.rtt_cache) |rc|
                 rc.getTimeout(addr_key)
             else
                 self.transport.config.timeout_ms;
 
-            const query_start = std.time.microTimestamp();
-            const response_data = self.transport.queryWithTimeout(wire_query, query_id, server, timeout) catch {
-                if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
-                continue;
-            };
-            const elapsed_us = std.time.microTimestamp() - query_start;
-
-            // TC bit: retry over TCP
-            if (dns.hasTcBit(response_data)) {
-                if (self.tcp_transport) |tcp| {
-                    var tcp_buf: [65535]u8 = undefined;
-                    if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
-                        const response = try tryParseMessage(allocator, tcp_data) orelse continue;
-                        if (!response.header.qr) continue;
-                        if (response.header.rcode != .no_error) continue;
-                        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
-                        if (self.cache) |c| c.storeResponse(response, authority_zone);
-                        if (response.answers.len == 0) continue;
-                        return response.answers;
-                    } else |_| {
-                        // TCP failed — try next server
-                    }
-                }
-                continue;
-            }
-
-            const response = try tryParseMessage(allocator, response_data) orelse continue;
-            if (!response.header.qr) continue;
+            const response = try self.queryServerUdp(
+                allocator, wire_query, query_id, server, timeout,
+            ) orelse continue;
             if (response.header.rcode != .no_error) continue;
-
-            if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
-
-            // Cache the response
             if (self.cache) |c| c.storeResponse(response, authority_zone);
-
-            if (response.answers.len == 0) continue;
-            return response.answers;
+            return response;
         }
         return null;
+    }
+
+    /// Refresh expired DS status by querying parent servers directly.
+    /// Returns true if DS status was re-established in cache, false if
+    /// probe failed (caller should fall back to referral re-walk).
+    fn reproveDelegationSecurity(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        parent_servers: []const std.net.Address,
+    ) bool {
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware) catch return false) orelse return false;
+        const zone = dns.parseDottedName(allocator, zone_name) catch return false;
+
+        // Positive DS — zone is signed (already cached by fetchRRset)
+        for (response.answers) |rr| {
+            if (rr.rtype == .ds) return true;
+        }
+
+        // No DS — verify NSEC/NSEC3 proof and cache insecure delegation
+        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
+        if (auth_status == .secure) {
+            const status = dnssec.classifyDelegation(response.authorities, zone);
+            if (status == .insecure) {
+                cacheInsecureDelegation(self.cache, status, zone, response.authorities);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Validate answer RRsets for a response from a secure zone.
@@ -941,11 +960,22 @@ pub const RecursiveResolver = struct {
                         if (try self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count])) |res| {
                             // DNSSEC: only use this delegation if DS status is known.
                             // If DS is a cache miss, another thread may not have cached
-                            // the insecure delegation yet. Stop here and let the referral
-                            // chain naturally discover the DNSSEC status.
+                            // the insecure delegation yet. Try a targeted DS re-probe
+                            // using the parent delegation's servers (like Unbound's key
+                            // cache refresh) before falling back to referral re-walk.
                             if (self.dnssec_enabled) {
                                 if (cache.lookup(allocator, zone_str, .ds, .in) == null) {
-                                    break;
+                                    const reprobed = if (best) |parent_deleg|
+                                        self.reproveDelegationSecurity(
+                                            allocator,
+                                            zone_str,
+                                            parent_deleg.addrs[0..parent_deleg.count],
+                                        )
+                                    else
+                                        false;
+                                    if (!reprobed) break;
+                                    // DS status re-established — re-check before using
+                                    if (cache.lookup(allocator, zone_str, .ds, .in) == null) break;
                                 }
                             }
 

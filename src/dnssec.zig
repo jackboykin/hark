@@ -155,6 +155,15 @@ pub fn validateDnskeyRrset(
     return error.InvalidSignature;
 }
 
+/// RFC 6840 §4.4: an NSEC/NSEC3 type bitmap proves an insecure delegation
+/// when DS is absent, NS is present (proving delegation), and SOA is absent
+/// (proving this is the parent-zone record, not a child-zone apex record).
+fn isInsecureDelegationProof(type_bit_maps: []const u8) bool {
+    return !dns.typeBitmapContains(type_bit_maps, .ds) and
+        dns.typeBitmapContains(type_bit_maps, .ns) and
+        !dns.typeBitmapContains(type_bit_maps, .soa);
+}
+
 /// Check if a referral has DS records proving the child is signed,
 /// or NSEC/NSEC3 records proving DS absence (insecure delegation).
 pub fn classifyDelegation(
@@ -175,11 +184,11 @@ pub fn classifyDelegation(
     // No DS — check for NSEC/NSEC3 proof of DS absence
     for (authorities) |rr| {
         if (rr.rtype == .nsec) {
-            // NSEC owner matches child zone and DS not in type bitmap
             if (rr.name.eql(child_zone)) {
-                if (!dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .ds)) {
-                    return .insecure;
-                }
+                if (isInsecureDelegationProof(rr.rdata.nsec.type_bit_maps)) return .insecure;
+                // Not a valid delegation proof (RFC 6840 §4.4) — keep .secure
+                // so unsigned child zones correctly SERVFAIL.
+                return .secure;
             }
         }
         if (rr.rtype == .nsec3) {
@@ -187,11 +196,10 @@ pub fn classifyDelegation(
             if (nsec3.iterations > max_nsec3_iterations) continue;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
             const child_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
-            // Exact match: NSEC3 owner == hash(child_zone), DS absent
             if (mem.eql(u8, &owner_hash, &child_hash)) {
-                if (!dns.typeBitmapContains(nsec3.type_bit_maps, .ds)) {
-                    return .insecure;
-                }
+                if (isInsecureDelegationProof(nsec3.type_bit_maps)) return .insecure;
+                // NSEC3 matches but doesn't prove insecure delegation (RFC 6840 §4.4).
+                return .secure;
             }
             // Opt-Out cover: child_hash in range and Opt-Out flag set
             if (nsec3.flags & 1 != 0) {
@@ -1381,6 +1389,31 @@ test "classifyDelegation with no DS and no proof" {
     }};
 
     try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+}
+
+test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
+    const child_zone = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const next = dns.Name{
+        .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
+    };
+
+    // Both must return .secure — forces validation, unsigned child will SERVFAIL
+    const cases = [_][]const u8{
+        &[_]u8{ 0x00, 0x01, 0x22 }, // NS + SOA (child-zone apex, not parent delegation)
+        &[_]u8{ 0x00, 0x01, 0x40 }, // A only (no NS — not a delegation point)
+    };
+    for (cases) |type_bit_maps| {
+        const authorities = [_]dns.ResourceRecord{.{
+            .name = child_zone,
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 86400,
+            .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = type_bit_maps } },
+        }};
+        try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
+    }
 }
 
 test "findRrsig finds matching RRSIG" {
