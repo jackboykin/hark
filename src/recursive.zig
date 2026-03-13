@@ -159,15 +159,8 @@ pub const RecursiveResolver = struct {
                 // DNSSEC: when skipping referrals via cache, we miss classifyDelegation
                 // calls. Check for a cached negative DS to detect insecure delegations.
                 if (security_state == .secure and self.dnssec_enabled) {
-                    if (self.cache) |c| {
-                        const zs = nameToSlice(deleg.zone);
-                        if (c.lookup(allocator, zs.buf[0..zs.len], .ds, .in)) |ds_result| {
-                            switch (ds_result) {
-                                .hit => {},
-                                .negative => security_state = .insecure,
-                            }
-                        }
-                    }
+                    if (hasCachedInsecureDelegation(self.cache, allocator, deleg.zone))
+                        security_state = .insecure;
                 }
             }
 
@@ -556,8 +549,11 @@ pub const RecursiveResolver = struct {
             if (auth_status == .secure) {
                 security_state.* = dnssec.classifyDelegation(authorities, zone_cut);
                 cacheInsecureDelegation(self.cache, security_state.*, zone_cut, authorities);
+            } else if (auth_status == .unchecked) {
+                if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut))
+                    security_state.* = .insecure;
             }
-            // If .bogus or .unchecked: keep .secure — prevents forged NSEC downgrade.
+            // .bogus: keep .secure — prevents forged NSEC downgrade.
         }
 
         // Resolve server addresses
@@ -972,6 +968,16 @@ pub const RecursiveResolver = struct {
 };
 
 // ── Insecure delegation caching ───────────────────────────────────────
+
+fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zone: dns.Name) bool {
+    const c = cache orelse return false;
+    const zs = nameToSlice(zone);
+    const ds_result = c.lookup(allocator, zs.buf[0..zs.len], .ds, .in) orelse return false;
+    return switch (ds_result) {
+        .negative => true,
+        .hit => false,
+    };
+}
 
 /// When classifyDelegation returns .insecure, cache a negative DS entry
 /// so that findClosestCachedDelegation can determine DNSSEC security state
