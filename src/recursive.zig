@@ -633,7 +633,7 @@ pub const RecursiveResolver = struct {
                 .leader => {
                     // We're the leader — do the actual fetch, then release.
                     defer dedup.releaseLeader(zone_name, .dnskey);
-                    return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+                    return self.fetchAndValidateDnskey(allocator, zone_name, servers);
                 },
                 .follower => {
                     // Leader finished (or timed out). Re-check cache — leader
@@ -648,25 +648,62 @@ pub const RecursiveResolver = struct {
                     }
                     // Cache still empty — leader failed. Fall through to our
                     // own fetch as a retry (DNSKEY may now be reachable).
-                    return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+                    return self.fetchAndValidateDnskey(allocator, zone_name, servers);
                 },
             }
         }
 
         // No dedup table (single-threaded mode) — fetch directly.
-        return self.fetchDnskeyNetwork(allocator, zone_name, servers);
+        return self.fetchAndValidateDnskey(allocator, zone_name, servers);
     }
 
-    /// Actual network fetch for DNSKEY records. Separated from fetchDnskey
-    /// so that dedup leader/follower paths can both call it.
-    fn fetchDnskeyNetwork(
+    /// Fetch DNSKEY from network, validate against cached DS (RFC 4035 §5.3),
+    /// and only cache after validation passes.
+    fn fetchAndValidateDnskey(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
         servers: []const std.net.Address,
     ) !?[]const dns.ResourceRecord {
-        const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true) orelse return null;
+        // Network fetch — don't cache yet (RFC 4035 §5.3: validate first)
+        const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true, false) orelse return null;
         if (resp.answers.len == 0) return null;
+
+        const zone_parsed = try dns.parseDottedName(allocator, zone_name);
+
+        // Validate DNSKEY against cached DS before caching
+        if (self.cache) |c| {
+            if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
+                switch (result) {
+                    .hit => |h| {
+                        var ds_records: [16]dns.DsData = undefined;
+                        var ds_count: usize = 0;
+                        for (h.records) |rr| {
+                            if (rr.rtype == .ds and ds_count < ds_records.len) {
+                                ds_records[ds_count] = rr.rdata.ds;
+                                ds_count += 1;
+                            }
+                        }
+                        if (ds_count > 0) {
+                            if (dnssec.findRrsig(resp.answers, .dnskey) != null) {
+                                const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+                                dnssec.validateDnskeyRrset(
+                                    resp.answers,
+                                    ds_records[0..ds_count],
+                                    zone_parsed,
+                                    now_u32,
+                                ) catch return null; // Validation failed — don't cache
+                            }
+                        }
+                    },
+                    .negative => {},
+                }
+            }
+        }
+
+        // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation
+        if (self.cache) |c| c.storeResponse(resp, zone_parsed);
+
         return resp.answers;
     }
 
@@ -681,6 +718,7 @@ pub const RecursiveResolver = struct {
         servers: []const std.net.Address,
         max_servers: usize,
         do_bit: bool,
+        store_response: bool,
     ) !?dns.Message {
         if (servers.len == 0) return null;
 
@@ -715,7 +753,9 @@ pub const RecursiveResolver = struct {
                 allocator, wire_query, query_id, server, timeout,
             ) orelse continue;
             if (response.header.rcode != .no_error) continue;
-            if (self.cache) |c| c.storeResponse(response, authority_zone);
+            if (store_response) {
+                if (self.cache) |c| c.storeResponse(response, authority_zone);
+            }
             return response;
         }
         return null;
@@ -730,7 +770,7 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         parent_servers: []const std.net.Address,
     ) bool {
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware) catch return false) orelse return false;
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, true) catch return false) orelse return false;
         const zone = dns.parseDottedName(allocator, zone_name) catch return false;
 
         // Positive DS — zone is signed (already cached by fetchRRset)
@@ -770,37 +810,8 @@ pub const RecursiveResolver = struct {
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
 
-        // Fetch DNSKEY for the signer zone
+        // Fetch DNSKEY for the signer zone (validated against DS before caching — RFC 4035 §5.3)
         const dnskey_records = (try self.fetchDnskey(allocator, signer_dotted, servers)) orelse return .bogus;
-
-        // Look up DS for the signer zone from cache to validate DNSKEY set
-        if (self.cache) |c| {
-            if (c.lookup(allocator, signer_dotted, .ds, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        // Extract DS data from cached records
-                        var ds_records: [16]dns.DsData = undefined;
-                        var ds_count: usize = 0;
-                        for (h.records) |rr| {
-                            if (rr.rtype == .ds and ds_count < ds_records.len) {
-                                ds_records[ds_count] = rr.rdata.ds;
-                                ds_count += 1;
-                            }
-                        }
-                        if (ds_count > 0) {
-                            // Only validate DNSKEY against DS if we have the RRSIG covering DNSKEY.
-                            // Cache hits return only DNSKEY records (RRSIG stored separately).
-                            // The DNSKEY was already validated on the first (non-cached) fetch.
-                            if (dnssec.findRrsig(dnskey_records, .dnskey) != null) {
-                                const zone_name = try dns.parseDottedName(allocator, signer_dotted);
-                                dnssec.validateDnskeyRrset(dnskey_records, ds_records[0..ds_count], zone_name, now_u32) catch return .bogus;
-                            }
-                        }
-                    },
-                    .negative => {},
-                }
-            }
-        }
 
         // Validate the answer RRsets
         return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32)) {

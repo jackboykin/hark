@@ -632,7 +632,17 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        self.removeAndFree(key);
+        // Don't overwrite non-expired positive entries — consistent with storeRRsets behavior
+        if (self.map.get(key)) |existing| {
+            switch (existing) {
+                .positive => |p| if (self.now_fn() < p.expires_at) {
+                    alloc.free(key_name);
+                    return;
+                },
+                .negative => {},
+            }
+            self.removeAndFree(key);
+        }
         self.evictIfNeeded();
 
         const now = self.now_fn();

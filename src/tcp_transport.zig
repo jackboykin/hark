@@ -69,8 +69,8 @@ pub const TcpTransport = struct {
         }
 
         // ── Phase 2: Send length-prefixed query ──
-        var send_buf: [2 + dns.max_udp_payload]u8 = undefined;
-        if (wire_query.len > dns.max_udp_payload) return error.QueryTooLarge;
+        var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
+        if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
         const msg_len: u16 = @intCast(wire_query.len);
         mem.writeInt(u16, send_buf[0..2], msg_len, .big);
         @memcpy(send_buf[2..][0..wire_query.len], wire_query);
