@@ -307,6 +307,8 @@ pub const TlsTransport = struct {
 
         // Success — mark capable and pool the connection
         enc_ns_cache.markCapable(addr_key);
+        var addr_buf: [64]u8 = undefined;
+        log.info("server {s} supports DoT (RFC 9539)", .{formatAddr(tls_server, &addr_buf)});
         if (self.pool) |pool| {
             pool.store(addr_key, conn);
         } else {
@@ -351,6 +353,28 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     conn.tls_client.reader.readSliceAll(response_buf[0..resp_len]) catch return error.TlsRecvFailed;
 
     return response_buf[0..resp_len];
+}
+
+fn formatAddr(addr: net.Address, buf: []u8) []const u8 {
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort(),
+            }) catch "?";
+        },
+        posix.AF.INET6 => {
+            const a = addr.in6.sa.addr;
+            return std.fmt.bufPrint(buf, "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}", .{
+                mem.readInt(u16, a[0..2], .big),  mem.readInt(u16, a[2..4], .big),
+                mem.readInt(u16, a[4..6], .big),  mem.readInt(u16, a[6..8], .big),
+                mem.readInt(u16, a[8..10], .big), mem.readInt(u16, a[10..12], .big),
+                mem.readInt(u16, a[12..14], .big), mem.readInt(u16, a[14..16], .big),
+                addr.getPort(),
+            }) catch "?";
+        },
+        else => return "?",
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
