@@ -110,6 +110,18 @@ const CacheKeyContext = struct {
     }
 };
 
+// ── Security status ───────────────────────────────────────────────────
+
+/// DNSSEC validation status for cached RRsets.
+/// Intentionally a subset of dnssec.SecurityStatus: the cache only stores
+/// .secure (validated) or .insecure (provably unsigned); validation
+/// failures (.bogus) are never cached — they produce immediate SERVFAIL.
+pub const SecurityStatus = enum {
+    unchecked,
+    secure,
+    insecure,
+};
+
 // ── Cache entry types ─────────────────────────────────────────────────
 
 const CachedRecord = struct {
@@ -124,6 +136,7 @@ const CachedRRset = struct {
     expires_at: i64,
     original_ttl: u32,
     stored_at: i64,
+    security_status: SecurityStatus = .unchecked,
 };
 
 const NegativeEntry = struct {
@@ -132,6 +145,7 @@ const NegativeEntry = struct {
     original_ttl: u32,
     stored_at: i64,
     soa: ?CachedRecord,
+    security_status: SecurityStatus = .unchecked,
 };
 
 const CacheEntry = union(enum) {
@@ -146,12 +160,14 @@ pub const CacheLookupResult = union(enum) {
         records: []dns.ResourceRecord,
         remaining_ttl: u32,
         needs_prefetch: bool = false,
+        security_status: SecurityStatus = .unchecked,
     },
     negative: struct {
         rcode: dns.RCode,
         remaining_ttl: u32,
         soa: ?dns.ResourceRecord,
         needs_prefetch: bool = false,
+        security_status: SecurityStatus = .unchecked,
     },
 };
 
@@ -467,7 +483,7 @@ pub const RRsetCache = struct {
                     _ = self.hits.fetchAdd(1, .monotonic);
                     _ = self.stale_hits.fetchAdd(1, .monotonic);
                     _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true } };
+                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true, .security_status = rrset.security_status } };
                 }
 
                 const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
@@ -477,7 +493,7 @@ pub const RRsetCache = struct {
 
                 _ = self.hits.fetchAdd(1, .monotonic);
                 if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                return .{ .hit = .{ .records = records, .remaining_ttl = remaining, .needs_prefetch = needs_prefetch } };
+                return .{ .hit = .{ .records = records, .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .security_status = rrset.security_status } };
             },
             .negative => |neg| {
                 const is_expired = now >= neg.expires_at;
@@ -496,6 +512,7 @@ pub const RRsetCache = struct {
                         .remaining_ttl = 30,
                         .soa = soa,
                         .needs_prefetch = true,
+                        .security_status = neg.security_status,
                     } };
                 }
 
@@ -511,6 +528,7 @@ pub const RRsetCache = struct {
                     .remaining_ttl = remaining,
                     .soa = soa,
                     .needs_prefetch = needs_prefetch,
+                    .security_status = neg.security_status,
                 } };
             },
         }
@@ -539,6 +557,7 @@ pub const RRsetCache = struct {
         rcode: dns.RCode,
         authorities: []const dns.ResourceRecord,
         authority_zone: dns.Name,
+        security_status: SecurityStatus,
     ) void {
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
@@ -604,6 +623,7 @@ pub const RRsetCache = struct {
             .original_ttl = capped_ttl,
             .stored_at = now,
             .soa = cached_soa,
+            .security_status = security_status,
         } }) catch {
             dns.freeName(alloc, cached_soa.name);
             dns.freeRData(alloc, cached_soa.rdata);
@@ -658,6 +678,28 @@ pub const RRsetCache = struct {
             return;
         };
         _ = self.negative_stores.fetchAdd(1, .monotonic);
+    }
+
+    /// Update the DNSSEC security status of an existing cache entry.
+    /// Called after DNSSEC validation succeeds to mark cached data as
+    /// authenticated (RFC 4035 §3.2.3).
+    pub fn updateSecurityStatus(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+        status: SecurityStatus,
+    ) void {
+        if (self.mutex) |*m| m.lock();
+        defer if (self.mutex) |*m| m.unlock();
+        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return;
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        const entry = self.map.getPtr(probe) orelse return;
+        switch (entry.*) {
+            .positive => |*rrset| rrset.security_status = status,
+            .negative => |*neg| neg.security_status = status,
+        }
     }
 
     // ── Internal ──────────────────────────────────────────────────────
@@ -1059,7 +1101,7 @@ test "cache negative NXDOMAIN" {
         alloc.free(authorities);
     }
 
-    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
+    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1111,7 +1153,7 @@ test "storeNegative rejects cross-zone SOA" {
         alloc.free(authorities);
     }
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1155,7 +1197,7 @@ test "storeNegative accepts parent-zone SOA" {
         alloc.free(authorities);
     }
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} });
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1208,7 +1250,7 @@ test "storeNegative rejects SOA above zone cut" {
         alloc.free(authorities);
     }
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut);
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1305,7 +1347,7 @@ test "cache negative without SOA is not stored" {
     defer cache.deinit();
 
     // No SOA in authority
-    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} });
+    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
