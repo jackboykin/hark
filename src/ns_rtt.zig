@@ -9,7 +9,8 @@ const AddressKey = @import("connection_pool.zig").AddressKey;
 /// Initial timeout for unknown servers (Unbound 376, Knot 400).
 pub const initial_timeout_ms: u32 = 400;
 
-/// Minimum RTO after EWMA (Unbound).
+/// Minimum RTO floor. With the rttvar floor (srtt/4) guaranteeing
+/// jitter headroom, this only catches degenerate sub-millisecond RTTs.
 const min_timeout_ms: u32 = 50;
 
 /// Maximum RTO cap (Knot).
@@ -202,15 +203,18 @@ pub const RttCache = struct {
 };
 
 fn computeTimeout(state: RttState) u32 {
-    // RTO = srtt + 4 * rttvar, with backoff for consecutive timeouts
-    const base_us = state.srtt_us + 4 * state.rttvar_us;
+    // RTO = srtt + 4 * rttvar (RFC 6298), but never tighter than 2× the
+    // smoothed RTT. Without this floor, consistent RTTs drive rttvar → 0
+    // and the timeout converges to exactly the RTT — any jitter causes
+    // a timeout that cascades into repeated failures.
+    const base_us = @max(state.srtt_us + 4 * state.rttvar_us, 2 * state.srtt_us);
     const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
 
     // Exponential backoff: double per consecutive timeout, capped
     const shift: u5 = @intCast(@min(state.consecutive_timeouts, max_backoff_shifts));
     const backed_off = @as(u64, base_ms) << shift;
 
-    return @intCast(@min(backed_off, max_timeout_ms));
+    return @intCast(@max(min_timeout_ms, @min(backed_off, max_timeout_ms)));
 }
 
 fn fisherYatesShuffle(items: []usize) void {
@@ -255,7 +259,8 @@ test "recordSuccess updates EWMA" {
 
     const key = testAddr(1);
 
-    // First sample: srtt = 100ms, rttvar = 50ms
+    // First sample: srtt = 100ms, rttvar = 50ms → RTO = 300
+    // rttvar floor = srtt/4 = 25ms, actual rttvar = 50ms > 25ms, no effect
     cache.recordSuccess(key, 100_000);
     try testing.expectEqual(@as(u32, 300), cache.getTimeout(key)); // 100 + 4*50
 

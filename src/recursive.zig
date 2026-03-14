@@ -80,6 +80,9 @@ pub const RecursiveResolver = struct {
     rtt_cache: ?*RttCache = null,
     bypass_cache: bool = false,
     dedup: ?*InFlightTable = null,
+    /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
+    /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
+    resolving_ds: bool = false,
 
     pub const ResolveResult = struct {
         message: dns.Message,
@@ -279,7 +282,8 @@ pub const RecursiveResolver = struct {
                                         if (!response.header.qr) continue; // skip non-responses
                                         got_response = true;
                                         if (self.cache) |c| c.storeResponse(response, parent_zone);
-                                        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, 0);
+                                        // Don't update UDP RTT cache from TLS — different transport
+                                        // latency would poison UDP timeout estimates.
                                         break;
                                     } else |_| {
                                         // Fall through to Do53
@@ -782,8 +786,12 @@ pub const RecursiveResolver = struct {
     }
 
     /// Re-fetch DS for a zone by finding the parent zone's NS in cache
-    /// and querying them. Returns true if DS is now in cache.
+    /// and querying them. Falls back to resolving NS addresses from the
+    /// network when cached addresses have expired (simultaneous DS+DNSKEY
+    /// TTL expiry). Returns true if DS is now in cache.
     fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) bool {
+        if (self.resolving_ds) return false; // re-entrancy guard
+
         // Derive parent zone: strip first label (e.g. "example.com" → "com")
         const dot_pos = mem.indexOfScalar(u8, zone_name, '.') orelse return false;
         if (dot_pos + 1 >= zone_name.len) return false; // TLD — parent is root
@@ -802,7 +810,13 @@ pub const RecursiveResolver = struct {
                 ns_count += 1;
             }
         }
-        const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch return false) orelse return false;
+        // Try cached addresses first; fall back to network resolution when
+        // addresses have expired alongside DS/DNSKEY (common with equal TTLs).
+        const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch null) orelse blk: {
+            self.resolving_ds = true;
+            defer self.resolving_ds = false;
+            break :blk (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return false;
+        };
         return self.reproveDelegationSecurity(allocator, zone_name, addrs.addrs[0..addrs.count]);
     }
 
@@ -818,8 +832,12 @@ pub const RecursiveResolver = struct {
         const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, true) catch return false) orelse return false;
         const zone = dns.parseDottedName(allocator, zone_name) catch return false;
 
-        // Positive DS — zone is signed (already cached by fetchRRset)
+        // Positive DS — zone is signed (already cached by fetchRRset).
+        // Check both answers (direct DS query) and authorities (referral-style response).
         for (response.answers) |rr| {
+            if (rr.rtype == .ds) return true;
+        }
+        for (response.authorities) |rr| {
             if (rr.rtype == .ds) return true;
         }
 
