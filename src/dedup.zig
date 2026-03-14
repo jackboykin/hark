@@ -10,10 +10,11 @@ const DedupKey = struct {
     name_buf: [dns.max_name_len + 1]u8 = undefined,
     name_len: u8 = 0,
     qtype: dns.RType = .a,
+    flags: u8 = 0,
 
-    pub fn init(name: []const u8, qtype: dns.RType) ?DedupKey {
+    pub fn init(name: []const u8, qtype: dns.RType, flags: u8) ?DedupKey {
         if (name.len > dns.max_name_len + 1) return null;
-        var key = DedupKey{ .qtype = qtype, .name_len = @intCast(name.len) };
+        var key = DedupKey{ .qtype = qtype, .name_len = @intCast(name.len), .flags = flags };
         for (name, 0..) |c, i| {
             key.name_buf[i] = std.ascii.toLower(c);
         }
@@ -27,11 +28,13 @@ const DedupKeyContext = struct {
         var h = std.hash.Wyhash.init(0);
         h.update(key.name_buf[0..key.name_len]);
         h.update(mem.asBytes(&key.qtype));
+        h.update(mem.asBytes(&key.flags));
         return h.final();
     }
 
     pub fn eql(_: @This(), a: DedupKey, b: DedupKey) bool {
         return a.qtype == b.qtype and
+            a.flags == b.flags and
             a.name_len == b.name_len and
             mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]);
     }
@@ -65,15 +68,15 @@ pub const InFlightTable = struct {
     /// Try to become the leader for this (name, qtype) pair.
     /// Returns `.leader` if this is the first request — caller must call `releaseLeader` when done.
     /// Returns `.follower` if another worker is already resolving — blocks until the leader finishes.
-    pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType) AcquireResult {
-        return self.acquireOrWaitWithTimeout(name, qtype, 2 * std.time.ns_per_s);
+    pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) AcquireResult {
+        return self.acquireOrWaitWithTimeout(name, qtype, flags, 2 * std.time.ns_per_s);
     }
 
     /// Like `acquireOrWait` but with a caller-specified timeout.
     /// DNSKEY fetches use a longer timeout (6s) because cold-cache DNSSEC
     /// chains (root → TLD → SLD → DNSKEY) can take 3-5s.
-    pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, timeout_ns: u64) AcquireResult {
-        const key = DedupKey.init(name, qtype) orelse return .leader;
+    pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, timeout_ns: u64) AcquireResult {
+        const key = DedupKey.init(name, qtype, flags) orelse return .leader;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -95,8 +98,8 @@ pub const InFlightTable = struct {
 
     /// Called by the leader when resolution is complete. Wakes all waiting followers
     /// and removes the entry so subsequent requests start fresh.
-    pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType) void {
-        const key = DedupKey.init(name, qtype) orelse return;
+    pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) void {
+        const key = DedupKey.init(name, qtype, flags) orelse return;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -116,10 +119,10 @@ test "leader for new key" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    const result = table.acquireOrWait("example.com", .a);
+    const result = table.acquireOrWait("example.com", .a, 0);
     try testing.expectEqual(.leader, result);
 
-    table.releaseLeader("example.com", .a);
+    table.releaseLeader("example.com", .a, 0);
     try testing.expectEqual(@as(u32, 0), table.map.count());
 }
 
@@ -127,34 +130,34 @@ test "different qtypes are independent" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    const r1 = table.acquireOrWait("example.com", .a);
-    const r2 = table.acquireOrWait("example.com", .aaaa);
+    const r1 = table.acquireOrWait("example.com", .a, 0);
+    const r2 = table.acquireOrWait("example.com", .aaaa, 0);
     try testing.expectEqual(.leader, r1);
     try testing.expectEqual(.leader, r2);
 
-    table.releaseLeader("example.com", .a);
-    table.releaseLeader("example.com", .aaaa);
+    table.releaseLeader("example.com", .a, 0);
+    table.releaseLeader("example.com", .aaaa, 0);
 }
 
 test "different names are independent" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    const r1 = table.acquireOrWait("a.example.com", .a);
-    const r2 = table.acquireOrWait("b.example.com", .a);
+    const r1 = table.acquireOrWait("a.example.com", .a, 0);
+    const r2 = table.acquireOrWait("b.example.com", .a, 0);
     try testing.expectEqual(.leader, r1);
     try testing.expectEqual(.leader, r2);
 
-    table.releaseLeader("a.example.com", .a);
-    table.releaseLeader("b.example.com", .a);
+    table.releaseLeader("a.example.com", .a, 0);
+    table.releaseLeader("b.example.com", .a, 0);
 }
 
 test "case insensitive dedup" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    const key1 = DedupKey.init("EXAMPLE.COM", .a);
-    const key2 = DedupKey.init("example.com", .a);
+    const key1 = DedupKey.init("EXAMPLE.COM", .a, 0);
+    const key2 = DedupKey.init("example.com", .a, 0);
     try testing.expect(key1 != null);
     try testing.expect(key2 != null);
     try testing.expect(DedupKeyContext.eql(.{}, key1.?, key2.?));
@@ -164,7 +167,7 @@ test "follower waits for leader" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    const leader_result = table.acquireOrWait("example.com", .a);
+    const leader_result = table.acquireOrWait("example.com", .a, 0);
     try testing.expectEqual(.leader, leader_result);
 
     var follower_done = std.atomic.Value(bool).init(false);
@@ -172,7 +175,7 @@ test "follower waits for leader" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn run(tbl: *InFlightTable, done: *std.atomic.Value(bool), result: *std.atomic.Value(u8)) void {
-            const r = tbl.acquireOrWait("example.com", .a);
+            const r = tbl.acquireOrWait("example.com", .a, 0);
             result.store(@intFromEnum(r), .release);
             done.store(true, .release);
         }
@@ -183,7 +186,7 @@ test "follower waits for leader" {
     try testing.expectEqual(false, follower_done.load(.acquire));
 
     // Release — follower should wake
-    table.releaseLeader("example.com", .a);
+    table.releaseLeader("example.com", .a, 0);
     t.join();
 
     try testing.expectEqual(true, follower_done.load(.acquire));
@@ -195,14 +198,14 @@ test "entry cleaned up after leader and followers finish" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    _ = table.acquireOrWait("example.com", .a);
-    table.releaseLeader("example.com", .a);
+    _ = table.acquireOrWait("example.com", .a, 0);
+    table.releaseLeader("example.com", .a, 0);
     try testing.expectEqual(@as(u32, 0), table.map.count());
 
     // Can immediately become leader again
-    const r = table.acquireOrWait("example.com", .a);
+    const r = table.acquireOrWait("example.com", .a, 0);
     try testing.expectEqual(.leader, r);
-    table.releaseLeader("example.com", .a);
+    table.releaseLeader("example.com", .a, 0);
 }
 
 test "timeout when leader never releases" {
@@ -210,21 +213,21 @@ test "timeout when leader never releases" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    _ = table.acquireOrWait("example.com", .a);
+    _ = table.acquireOrWait("example.com", .a, 0);
 
     // Spawn a follower that will time out (the 2s timeout in acquireOrWait)
     // For test speed, we test the mechanism: put an entry and let follower see it
     const t = try std.Thread.spawn(.{}, struct {
         fn run(tbl: *InFlightTable) void {
             // This will block until timeout (5s) then return .follower
-            const r = tbl.acquireOrWait("example.com", .a);
+            const r = tbl.acquireOrWait("example.com", .a, 0);
             std.debug.assert(r == .follower);
         }
     }.run, .{&table});
 
     // Release after a short delay so the test doesn't take 5s
     std.Thread.sleep(100 * std.time.ns_per_ms);
-    table.releaseLeader("example.com", .a);
+    table.releaseLeader("example.com", .a, 0);
     t.join();
 }
 
@@ -232,9 +235,22 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
     var table = InFlightTable.init(testing.allocator);
     defer table.deinit();
 
-    _ = table.acquireOrWait("example.com", .a);
+    _ = table.acquireOrWait("example.com", .a, 0);
     // Same-thread follower: timedWait times out immediately since no one will signal.
-    const r = table.acquireOrWaitWithTimeout("example.com", .a, 1);
+    const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, 1);
     try testing.expectEqual(.follower, r);
-    table.releaseLeader("example.com", .a);
+    table.releaseLeader("example.com", .a, 0);
+}
+
+test "different flags are independent" {
+    var table = InFlightTable.init(testing.allocator);
+    defer table.deinit();
+
+    const r1 = table.acquireOrWait("example.com", .a, 0);
+    const r2 = table.acquireOrWait("example.com", .a, 1);
+    try testing.expectEqual(.leader, r1);
+    try testing.expectEqual(.leader, r2);
+
+    table.releaseLeader("example.com", .a, 0);
+    table.releaseLeader("example.com", .a, 1);
 }

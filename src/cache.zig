@@ -478,12 +478,14 @@ pub const RRsetCache = struct {
                         _ = self.misses.fetchAdd(1, .monotonic);
                         return null;
                     }
-                    // Stale but within window — serve with synthetic TTL (RFC 8767)
+                    // Stale but within window — serve with synthetic TTL (RFC 8767).
+                    // Clear security status: RRSIGs may have expired since caching,
+                    // so the resolver cannot vouch for authenticity (RFC 4035 §3.2.3).
                     const records = cloneRRset(caller_alloc, rrset.records, 30) orelse return null;
                     _ = self.hits.fetchAdd(1, .monotonic);
                     _ = self.stale_hits.fetchAdd(1, .monotonic);
                     _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true, .security_status = rrset.security_status } };
+                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true, .security_status = .unchecked } };
                 }
 
                 const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
@@ -498,7 +500,10 @@ pub const RRsetCache = struct {
             .negative => |neg| {
                 const is_expired = now >= neg.expires_at;
                 if (is_expired) {
-                    if (self.serve_stale_ttl == 0 or (now - neg.expires_at) >= self.serve_stale_ttl) {
+                    // Never serve-stale for SERVFAIL entries — their short TTL
+                    // (e.g. 1s for DNSSEC bogus) is intentional and serve-stale
+                    // would extend failure duration beyond design intent.
+                    if (self.serve_stale_ttl == 0 or neg.rcode == .server_failure or (now - neg.expires_at) >= self.serve_stale_ttl) {
                         self.removeAndFree(probe);
                         _ = self.misses.fetchAdd(1, .monotonic);
                         return null;
@@ -512,7 +517,7 @@ pub const RRsetCache = struct {
                         .remaining_ttl = 30,
                         .soa = soa,
                         .needs_prefetch = true,
-                        .security_status = neg.security_status,
+                        .security_status = .unchecked,
                     } };
                 }
 
@@ -652,10 +657,12 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        // Don't overwrite non-expired positive entries — consistent with storeRRsets behavior
+        // Don't overwrite non-expired validated positive entries — but DO overwrite
+        // .unchecked entries so that DNSSEC validation failures (bogusServfail)
+        // can replace pre-validation cached data (RFC 9520 §3.4).
         if (self.map.get(key)) |existing| {
             switch (existing) {
-                .positive => |p| if (self.now_fn() < p.expires_at) {
+                .positive => |p| if (self.now_fn() < p.expires_at and p.security_status != .unchecked) {
                     alloc.free(key_name);
                     return;
                 },
@@ -666,7 +673,9 @@ pub const RRsetCache = struct {
         self.evictIfNeeded();
 
         const now = self.now_fn();
-        const capped_ttl = clampTtl(self.min_ttl, ttl);
+        // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
+        // DNSSEC SERVFAIL). Only cap at max_cache_ttl.
+        const capped_ttl = @min(ttl, max_cache_ttl);
         self.map.put(alloc, key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),

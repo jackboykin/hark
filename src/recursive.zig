@@ -333,7 +333,7 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, .unchecked);
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                 }
                             },
                             .skip_cache => {},
@@ -364,7 +364,7 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, .unchecked);
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                 }
                             },
                             .skip_cache => {},
@@ -428,7 +428,10 @@ pub const RecursiveResolver = struct {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
                                         .bogus => return self.bogusServfail(current_name, qtype),
                                         .valid => {
-                                            if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                            if (self.cache) |c| {
+                                                c.storeResponse(response, parent_zone);
+                                                c.updateSecurityStatus(current_name, .cname, .in, .secure);
+                                            }
                                         },
                                         .skip => {},
                                     }
@@ -632,10 +635,10 @@ pub const RecursiveResolver = struct {
 
         // Dedup: coalesce concurrent DNSKEY fetches for the same zone.
         if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, dnskey_dedup_timeout_ns)) {
+            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, dnskey_dedup_timeout_ns)) {
                 .leader => {
                     // We're the leader — do the actual fetch, then release.
-                    defer dedup.releaseLeader(zone_name, .dnskey);
+                    defer dedup.releaseLeader(zone_name, .dnskey, 0);
                     return self.fetchAndValidateDnskey(allocator, zone_name, servers);
                 },
                 .follower => {
@@ -649,9 +652,27 @@ pub const RecursiveResolver = struct {
                             }
                         }
                     }
-                    // Cache still empty — leader failed. Fall through to our
-                    // own fetch as a retry (DNSKEY may now be reachable).
-                    return self.fetchAndValidateDnskey(allocator, zone_name, servers);
+                    // Cache still empty — leader failed. Re-acquire dedup so only
+                    // one follower retries (prevents thundering herd). Shorter
+                    // timeout: leader's partial work warmed intermediate caches.
+                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, dnskey_dedup_timeout_ns / 2)) {
+                        .leader => {
+                            defer dedup.releaseLeader(zone_name, .dnskey, 0);
+                            return self.fetchAndValidateDnskey(allocator, zone_name, servers);
+                        },
+                        .follower => {
+                            // Another follower is already retrying — check cache once more.
+                            if (self.cache) |c| {
+                                if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
+                                    switch (result) {
+                                        .hit => |h| return h.records,
+                                        .negative => return null,
+                                    }
+                                }
+                            }
+                            return null;
+                        },
+                    }
                 },
             }
         }
@@ -679,35 +700,24 @@ pub const RecursiveResolver = struct {
             if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
-                        var ds_records: [16]dns.DsData = undefined;
-                        var ds_count: usize = 0;
-                        for (h.records) |rr| {
-                            if (rr.rtype == .ds and ds_count < ds_records.len) {
-                                ds_records[ds_count] = rr.rdata.ds;
-                                ds_count += 1;
-                            }
-                        }
-                        if (ds_count > 0) {
-                            if (dnssec.findRrsig(resp.answers, .dnskey) != null) {
-                                const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
-                                dnssec.validateDnskeyRrset(
-                                    resp.answers,
-                                    ds_records[0..ds_count],
-                                    zone_parsed,
-                                    now_u32,
-                                ) catch return null; // Validation failed — don't cache
-                            }
-                        }
+                        validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed) catch return null;
                     },
                     .negative => {}, // Insecure delegation — no DS validation needed
                 }
             } else {
-                // DS not in cache. For non-root zones, we cannot validate the
-                // DNSKEY without the parent DS (RFC 4035 §5.2). Return null
-                // to force SERVFAIL; the next query will re-walk from root and
-                // pick up the DS during referral following.
+                // DS not in cache (evicted or cold start). For non-root zones,
+                // re-fetch DS from the parent zone's NS before giving up
+                // (RFC 4035 §5.2). All major resolvers (Unbound, BIND, PowerDNS)
+                // re-fetch rather than returning bogus for transient cache misses.
                 // Root zone (empty name) is exempt — it's the trust anchor.
-                if (zone_name.len > 0) return null;
+                if (zone_name.len > 0) {
+                    if (!self.fetchDsFromParent(allocator, zone_name)) return null;
+                    const ds_result = c.lookup(allocator, zone_name, .ds, .in) orelse return null;
+                    switch (ds_result) {
+                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed) catch return null,
+                        .negative => return null, // Re-probe established insecure — caller's security_state is stale
+                    }
+                }
             }
         }
 
@@ -769,6 +779,31 @@ pub const RecursiveResolver = struct {
             return response;
         }
         return null;
+    }
+
+    /// Re-fetch DS for a zone by finding the parent zone's NS in cache
+    /// and querying them. Returns true if DS is now in cache.
+    fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) bool {
+        // Derive parent zone: strip first label (e.g. "example.com" → "com")
+        const dot_pos = mem.indexOfScalar(u8, zone_name, '.') orelse return false;
+        if (dot_pos + 1 >= zone_name.len) return false; // TLD — parent is root
+        const parent_zone = zone_name[dot_pos + 1 ..];
+
+        const cache = self.cache orelse return false;
+        const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return false) {
+            .hit => |h| h,
+            .negative => return false,
+        };
+        var ns_names: [max_servers_per_level]dns.Name = undefined;
+        var ns_count: usize = 0;
+        for (ns_hit.records) |rr| {
+            if (rr.rtype == .ns and ns_count < max_servers_per_level) {
+                ns_names[ns_count] = rr.rdata.ns;
+                ns_count += 1;
+            }
+        }
+        const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch return false) orelse return false;
+        return self.reproveDelegationSecurity(allocator, zone_name, addrs.addrs[0..addrs.count]);
     }
 
     /// Refresh expired DS status by querying parent servers directly.
@@ -1102,6 +1137,34 @@ fn cacheInsecureDelegation(
 
     const zs = nameToSlice(zone_cut);
     c.storeNegativeBare(zs.buf[0..zs.len], .ds, .in, .no_error, neg_ttl);
+}
+
+/// Validate DNSKEY answers against cached DS records (RFC 4035 §5.2).
+/// Extracts DS data from cache hit records and calls dnssec.validateDnskeyRrset.
+fn validateDnskeyAgainstDs(
+    dnskey_answers: []const dns.ResourceRecord,
+    ds_records_rr: []const dns.ResourceRecord,
+    zone_parsed: dns.Name,
+) !void {
+    var ds_records: [16]dns.DsData = undefined;
+    var ds_count: usize = 0;
+    for (ds_records_rr) |rr| {
+        if (rr.rtype == .ds and ds_count < ds_records.len) {
+            ds_records[ds_count] = rr.rdata.ds;
+            ds_count += 1;
+        }
+    }
+    if (ds_count > 0) {
+        if (dnssec.findRrsig(dnskey_answers, .dnskey) != null) {
+            const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+            try dnssec.validateDnskeyRrset(
+                dnskey_answers,
+                ds_records[0..ds_count],
+                zone_parsed,
+                now_u32,
+            );
+        }
+    }
 }
 
 /// Map dnssec validation status to the cache-tier subset (no .bogus).

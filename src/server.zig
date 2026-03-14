@@ -560,9 +560,10 @@ const WorkerState = struct {
     }
 
     fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !recursive.RecursiveResolver.ResolveResult {
+        const cd_flag: u8 = @intFromBool(cd);
         var is_leader = true;
         if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWait(name, qtype)) {
+            switch (dedup.acquireOrWait(name, qtype, cd_flag)) {
                 .leader => {},
                 .follower => {
                     is_leader = false;
@@ -570,11 +571,11 @@ const WorkerState = struct {
             }
         }
         errdefer if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
         };
         const result = try self.resolveQuery(alloc, name, qtype, cd, false);
         if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype);
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
         }
         return result;
     }
@@ -612,8 +613,9 @@ const WorkerState = struct {
     }
 
     fn doPrefetch(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType) void {
-        // Inline prefetch: resolve with bypass_cache to refresh the entry.
-        // Dedup table coalesces concurrent prefetches for the same (name, qtype).
+        // Synchronous prefetch: resolve with bypass_cache to refresh the entry.
+        // Runs on the worker thread because io_uring is not thread-safe —
+        // spawning a thread would race on the per-worker EventLoop.
         var prefetch_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer prefetch_arena.deinit();
         _ = self.resolveQuery(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true) catch {};
