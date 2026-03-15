@@ -505,6 +505,7 @@ pub fn verifyRrsig(
     const signed_data = buildSignedData(&signed_data_buf, rrsig, rrset) catch return error.BufferTooSmall;
 
     switch (rrsig.algorithm) {
+        .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha1),
         .rsasha256 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha256),
         .rsasha512 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha512),
         .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, 32, rrsig.signature, signed_data, dnskey.public_key),
