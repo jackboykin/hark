@@ -1254,8 +1254,11 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     return 0;
                 },
                 .user_canceled => {
-                    // TODO: handle server-side closures
-                    return failRead(c, error.TlsUnexpectedMessage);
+                    // RFC 8446 §6.1: user_canceled may precede close_notify.
+                    // Treat as connection closure to avoid spinning if the
+                    // server omits the subsequent close_notify.
+                    c.received_close_notify = true;
+                    return 0;
                 },
                 else => {
                     c.alert = alert;

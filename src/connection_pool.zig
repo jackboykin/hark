@@ -63,6 +63,7 @@ pub const PooledConnection = struct {
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
         self.tls_client.end() catch {};
+        self.tls_client.output.flush() catch {};
         posix.close(self.sock);
         allocator.destroy(self);
     }
