@@ -46,25 +46,27 @@ pub const TcpTransport = struct {
         connect_loop: while (true) {
             var completions: [max_operations]Completion = undefined;
             const results = try self.loop.tick(&completions);
+            var connect_result: ?@import("event_loop.zig").ConnectResult = null;
+            var timed_out = false;
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
-                    .connect => {
-                        if (c.result.connect.err != null) {
-                            cancelAndFlush(self.loop, timeout_op);
-                            return error.ConnectFailed;
-                        }
-                        cancelAndFlush(self.loop, timeout_op);
-                        break :connect_loop;
-                    },
-                    .timeout => {
-                        if (c.result.timeout.expired) {
-                            cancelAndFlush(self.loop, connect_op);
-                            return error.Timeout;
-                        }
-                    },
+                    .connect => connect_result = c.result.connect,
+                    .timeout => timed_out = c.result.timeout.expired,
                     else => {},
                 }
+            }
+            // Prefer connect result over timeout when both arrive in same batch
+            if (connect_result) |cr| {
+                if (cr.err != null) {
+                    cancelAndFlush(self.loop, timeout_op);
+                    return error.ConnectFailed;
+                }
+                cancelAndFlush(self.loop, timeout_op);
+                break :connect_loop;
+            } else if (timed_out) {
+                cancelAndFlush(self.loop, connect_op);
+                return error.Timeout;
             }
         }
 
