@@ -315,6 +315,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
             var end = pos + 1;
             while (end < inner.len) {
                 if (inner[end] == '\\') {
+                    if (end + 1 >= inner.len) break;
                     end += 2;
                     continue;
                 }

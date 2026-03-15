@@ -36,6 +36,7 @@ pub const ConfigError = error{
     InvalidUpstreamAddress,
     InvalidMode,
     InvalidPort,
+    InvalidValue,
     InvalidWorkerCount,
     ForwardingRequiresUpstreams,
     OutOfMemory,
@@ -81,7 +82,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     if (parsed.table.getTable("server")) |server| {
         if (server.getStringArray("listen")) |addrs| {
             allocator.free(cfg.listen);
-            cfg.listen = try parseAddressList(allocator, addrs, 53);
+            cfg.listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
         }
         if (server.getInteger("workers")) |w| {
             if (w < 1 or w > 65535) return error.InvalidWorkerCount;
@@ -102,7 +103,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (resolver.getStringArray("upstreams")) |addrs| {
             allocator.free(cfg.upstreams);
-            cfg.upstreams = try parseAddressList(allocator, addrs, 53);
+            cfg.upstreams = try parseAddressList(allocator, addrs, 53, error.InvalidUpstreamAddress);
         }
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
@@ -112,17 +113,21 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
         if (cache.getInteger("size")) |s| {
-            cfg.cache_size = @intCast(@max(0, @min(s, std.math.maxInt(usize))));
+            if (s < 0) return error.InvalidValue;
+            cfg.cache_size = @intCast(@min(s, std.math.maxInt(usize)));
         }
         if (cache.getInteger("entries")) |e| {
-            cfg.cache_entries = @intCast(@max(0, @min(e, std.math.maxInt(u32))));
+            if (e < 0) return error.InvalidValue;
+            cfg.cache_entries = @intCast(@min(e, std.math.maxInt(u32)));
         }
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (cache.getInteger("serve-stale-ttl")) |s| {
-            cfg.serve_stale_ttl = @intCast(@max(0, @min(s, std.math.maxInt(u32))));
+            if (s < 0) return error.InvalidValue;
+            cfg.serve_stale_ttl = @intCast(@min(s, std.math.maxInt(u32)));
         }
         if (cache.getInteger("min-ttl")) |m| {
-            cfg.min_ttl = @intCast(@max(0, @min(m, std.math.maxInt(u32))));
+            if (m < 0) return error.InvalidValue;
+            cfg.min_ttl = @intCast(@min(m, std.math.maxInt(u32)));
         }
     }
 
@@ -149,12 +154,12 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
     return parseConfig(allocator, contents);
 }
 
-fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16) ConfigError![]std.net.Address {
+fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]std.net.Address {
     const addrs = allocator.alloc(std.net.Address, strs.len) catch return error.OutOfMemory;
     errdefer allocator.free(addrs);
 
     for (strs, 0..) |s, i| {
-        addrs[i] = parseAddress(s, default_port) orelse return error.InvalidListenAddress;
+        addrs[i] = parseAddress(s, default_port) orelse return err;
     }
     return addrs;
 }
