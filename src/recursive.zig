@@ -961,7 +961,7 @@ pub const RecursiveResolver = struct {
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
 
-        const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
+        const now_u32 = epochNowU32();
 
         // Find RRSIG in answers to get the signer zone
         const rrsig = dnssec.findRrsig(response.answers, qtype) orelse return .bogus;
@@ -1006,7 +1006,7 @@ pub const RecursiveResolver = struct {
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
-        const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
+        const now_u32 = epochNowU32();
         return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32);
     }
 
@@ -1285,7 +1285,7 @@ fn validateDnskeyAgainstDs(
     }
     if (ds_count > 0) {
         if (dnssec.findRrsig(dnskey_answers, .dnskey) != null) {
-            const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
+            const now_u32 = epochNowU32();
             try dnssec.validateDnskeyRrset(
                 dnskey_answers,
                 ds_records[0..ds_count],
@@ -1338,6 +1338,14 @@ fn nameToSlice(name: dns.Name) struct { buf: [dns.max_name_len + 1]u8, len: usiz
     const buf = name.format();
     const len = mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
     return .{ .buf = buf, .len = len };
+}
+
+/// Returns current epoch time as u32 for DNSSEC signature validation.
+/// Uses wall clock (not monotonic) because RRSIG inception/expiration
+/// are defined as epoch seconds (RFC 4034 §3.1.5). Truncation gives
+/// correct serial number arithmetic wrapping behavior.
+fn epochNowU32() u32 {
+    return @truncate(@as(u64, @intCast(std.time.timestamp())));
 }
 
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {

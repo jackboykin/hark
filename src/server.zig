@@ -345,16 +345,6 @@ const WorkerState = struct {
                 last_stats_ns = now_ns;
             }
 
-            // Retry re-registration for any listeners that previously failed
-            for (0..n) |i| {
-                if (udp_ops[i] == null) {
-                    udp_ops[i] = self.loop.recvFrom(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
-                }
-                if (tcp_ops[i] == null) {
-                    tcp_ops[i] = self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])) catch null;
-                }
-            }
-
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
@@ -400,6 +390,17 @@ const WorkerState = struct {
                             };
                         }
                     },
+                }
+            }
+
+            // Retry re-registration for any listeners that failed above.
+            // Placed after completion processing so freshly freed slots are available.
+            for (0..n) |i| {
+                if (udp_ops[i] == null) {
+                    udp_ops[i] = self.loop.recvFrom(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
+                }
+                if (tcp_ops[i] == null) {
+                    tcp_ops[i] = self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])) catch null;
                 }
             }
         }

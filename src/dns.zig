@@ -927,6 +927,10 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
 
 // ── Serializer ─────────────────────────────────────────────────────────
 
+fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
+    return std.math.cast(T, val) orelse error.InvalidRDataLength;
+}
+
 pub const Serializer = struct {
     buf: []u8,
     pos: usize,
@@ -998,7 +1002,7 @@ pub const Serializer = struct {
         const rdata_len = self.pos - rdata_start;
 
         // Patch rdlength
-        mem.writeInt(u16, self.buf[rdlength_pos..][0..2], std.math.cast(u16, rdata_len) orelse return error.InvalidRDataLength, .big);
+        mem.writeInt(u16, self.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
     }
 
     pub fn writeRData(self: *Serializer, rdata: RData) Error!void {
@@ -1023,7 +1027,7 @@ pub const Serializer = struct {
             },
             .txt => |txt| {
                 for (txt.strings) |s| {
-                    try self.writeU8(std.math.cast(u8, s.len) orelse return error.InvalidRDataLength);
+                    try self.writeU8(try castOrRDataErr(u8, s.len));
                     try self.writeSlice(s);
                 }
             },
@@ -1058,9 +1062,9 @@ pub const Serializer = struct {
                 try self.writeU8(nsec3.hash_algorithm);
                 try self.writeU8(nsec3.flags);
                 try self.writeU16(nsec3.iterations);
-                try self.writeU8(std.math.cast(u8, nsec3.salt.len) orelse return error.InvalidRDataLength);
+                try self.writeU8(try castOrRDataErr(u8, nsec3.salt.len));
                 try self.writeSlice(nsec3.salt);
-                try self.writeU8(std.math.cast(u8, nsec3.next_hashed_owner.len) orelse return error.InvalidRDataLength);
+                try self.writeU8(try castOrRDataErr(u8, nsec3.next_hashed_owner.len));
                 try self.writeSlice(nsec3.next_hashed_owner);
                 try self.writeSlice(nsec3.type_bit_maps);
             },
@@ -1068,7 +1072,7 @@ pub const Serializer = struct {
                 try self.writeU8(nsec3p.hash_algorithm);
                 try self.writeU8(nsec3p.flags);
                 try self.writeU16(nsec3p.iterations);
-                try self.writeU8(std.math.cast(u8, nsec3p.salt.len) orelse return error.InvalidRDataLength);
+                try self.writeU8(try castOrRDataErr(u8, nsec3p.salt.len));
                 try self.writeSlice(nsec3p.salt);
             },
             .unknown => |data| try self.writeSlice(data),
@@ -1102,7 +1106,7 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 
         // Compute RDLENGTH: existing options + optional padding
         var rdlength: u16 = 0;
-        for (opt.options) |o| rdlength += 4 + (std.math.cast(u16, o.data.len) orelse return error.InvalidRDataLength);
+        for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
 
         // EDNS0 padding (RFC 7830, option code 12): pad total message to padding_target
         var padding_len: u16 = 0;

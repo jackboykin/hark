@@ -3,9 +3,11 @@ const posix = std.posix;
 const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
-const EventLoop = @import("event_loop.zig").EventLoop;
-const Completion = @import("event_loop.zig").Completion;
-const max_operations = @import("event_loop.zig").max_operations;
+const event_loop = @import("event_loop.zig");
+const EventLoop = event_loop.EventLoop;
+const Completion = event_loop.Completion;
+const ConnectResult = event_loop.ConnectResult;
+const max_operations = event_loop.max_operations;
 
 pub const TcpConfig = struct {
     connect_timeout_ms: u32 = 5000,
@@ -46,7 +48,7 @@ pub const TcpTransport = struct {
         connect_loop: while (true) {
             var completions: [max_operations]Completion = undefined;
             const results = try self.loop.tick(&completions);
-            var connect_result: ?@import("event_loop.zig").ConnectResult = null;
+            var connect_result: ?ConnectResult = null;
             var timed_out = false;
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));

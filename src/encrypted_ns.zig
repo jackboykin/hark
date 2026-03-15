@@ -164,7 +164,8 @@ pub const EncryptedNsCache = struct {
     }
 
     fn defaultNow() i64 {
-        return std.time.timestamp();
+        const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
+        return ts.sec;
     }
 };
 

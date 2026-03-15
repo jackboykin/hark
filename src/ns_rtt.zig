@@ -228,8 +228,13 @@ fn fisherYatesShuffle(items: []usize) void {
     }
 }
 
+/// Returns monotonic milliseconds (CLOCK_BOOTTIME on Linux), matching
+/// the time source used by the cache (cache.zig:defaultNowSeconds).
+/// Wall-clock time (milliTimestamp) is subject to NTP jumps which can
+/// corrupt RTT EWMA state or extend dead-server windows.
 fn defaultNowMs() i64 {
-    return std.time.milliTimestamp();
+    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
+    return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
