@@ -1191,6 +1191,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const pv = &p.tls_1_3;
                 const P = @TypeOf(p.*);
                 const ad = input.take(tls.record_header_len) catch unreachable; // already peeked
+                if (record_len < P.AEAD.tag_length) return failRead(c, error.TlsDecodeError);
                 const ciphertext_len = record_len - P.AEAD.tag_length;
                 const ciphertext = input.take(ciphertext_len) catch unreachable; // already peeked
                 const auth_tag = (input.takeArray(P.AEAD.tag_length) catch unreachable).*; // already peeked
@@ -1206,11 +1207,13 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     return failRead(c, error.TlsBadRecordMac);
                 // TODO use scalar, non-slice version
                 const msg = mem.trimRight(u8, cleartext, "\x00");
+                if (msg.len == 0) return failRead(c, error.TlsDecodeError);
                 break :cleartext .{ msg.len - 1, @enumFromInt(msg[msg.len - 1]) };
             },
             .tls_1_2 => {
                 const pv = &p.tls_1_2;
                 const P = @TypeOf(p.*);
+                if (record_len < P.record_iv_length + P.mac_length) return failRead(c, error.TlsDecodeError);
                 const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
                 const ad_header = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ad = mem.toBytes(big(c.read_seq)) ++
