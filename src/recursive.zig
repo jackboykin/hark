@@ -250,6 +250,7 @@ pub const RecursiveResolver = struct {
                 var got_response = false;
                 var response: dns.Message = undefined;
                 var last_server_failure: ?dns.Message = null;
+                var responding_server: ?std.net.Address = null;
 
                 for (server_order, 0..) |server_idx, server_i| {
                     const server = servers[server_idx];
@@ -297,9 +298,12 @@ pub const RecursiveResolver = struct {
                                     if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
                                         if (try tryParseMessage(allocator, tls_data)) |tls_response| {
                                             if (tls_response.header.qr and
-                                                !tls_response.header.rcode.isServerError() and
                                                 tls_response.header.rcode != .format_error)
                                             {
+                                                if (tls_response.header.rcode.isServerError()) {
+                                                    last_server_failure = tls_response;
+                                                    continue; // Try next server, don't repeat over Do53
+                                                }
                                                 response = tls_response;
                                                 got_response = true;
                                                 if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -332,6 +336,7 @@ pub const RecursiveResolver = struct {
                     }
 
                     got_response = true;
+                    responding_server = server;
                     if (self.cache) |c| c.storeResponse(response, parent_zone);
                     break;
                 }
@@ -346,16 +351,13 @@ pub const RecursiveResolver = struct {
                     }
                 }
 
-                // Fire background OTE probes (skip if we fell back to a SERVFAIL)
-                if (!response.header.rcode.isServerError()) {
+                // Fire background OTE probe for the server that responded
+                if (responding_server) |srv| {
                     if (self.encrypted_ns_cache) |oc| {
                         if (self.tls_transport) |tls_t| {
-                            for (server_order) |si| {
-                                const srv = servers[si];
-                                const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
-                                if (oc.claimProbe(tls_key)) {
-                                    tls_t.probeInBackground(srv, oc);
-                                }
+                            const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
+                            if (oc.claimProbe(tls_key)) {
+                                tls_t.probeInBackground(srv, oc);
                             }
                         }
                     }
