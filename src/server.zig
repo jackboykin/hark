@@ -634,12 +634,19 @@ const WorkerState = struct {
             },
             .forward => {
                 var resolver = ForwardingResolver.initWithTcp(self.udp_transport, self.tcp_transport);
-                const upstream = if (self.config.upstreams.len > 0)
-                    self.config.upstreams[0]
+                const upstreams = if (self.config.upstreams.len > 0)
+                    self.config.upstreams
                 else
-                    std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
-                const msg = try resolver.resolve(alloc, name, qtype, upstream);
-                return .{ .message = msg };
+                    &[_]std.net.Address{std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53)};
+                var last_err: anyerror = error.Timeout;
+                for (upstreams) |upstream| {
+                    const msg = resolver.resolve(alloc, name, qtype, upstream) catch |err| {
+                        last_err = err;
+                        continue;
+                    };
+                    return .{ .message = msg };
+                }
+                return last_err;
             },
         }
     }
