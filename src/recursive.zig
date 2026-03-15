@@ -85,14 +85,32 @@ pub const RecursiveResolver = struct {
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
     resolving_ds: bool = false,
 
+    /// DNSKEY zone needing proactive refresh — stored in fixed buffer (not arena)
+    /// to survive past the per-query arena lifetime. Set by fetchDnskey, propagated
+    /// to ResolveResult for async refresh by the server layer.
+    pending_dnskey_prefetch: ?[]const u8 = null,
+    pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
+
+    /// Non-last server timeout cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2s).
+    const failover_timeout_cap: u32 = 2000;
+
+    fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.config.timeout_ms;
+        return if (is_last) base else @min(base, failover_timeout_cap);
+    }
+
     pub const ResolveResult = struct {
         message: dns.Message,
         prefetch_name: ?[]const u8 = null,
         prefetch_qtype: dns.RType = .a,
+        /// DNSKEY zone needing async refresh (TTL < 10%). Server handles after responding.
+        prefetch_dnskey_zone: ?[]const u8 = null,
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
-        return self.resolveImpl(allocator, name, qtype, 0);
+        var result = try self.resolveImpl(allocator, name, qtype, 0);
+        result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
+        return result;
     }
 
     const max_resolve_depth = 3;
@@ -223,30 +241,28 @@ pub const RecursiveResolver = struct {
                 const server_order = if (self.rtt_cache) |rc|
                     rc.selectServers(servers[0..server_count], &order_buf)
                 else blk: {
-                    for (0..server_count) |idx| order_buf[idx] = idx;
                     fisherYatesShuffle(std.net.Address, servers[0..server_count]);
                     for (0..server_count) |idx| order_buf[idx] = idx;
                     break :blk order_buf[0..server_count];
                 };
 
-                // Try each server until one responds
+                // Try each server until one responds with a useful answer
                 var got_response = false;
                 var response: dns.Message = undefined;
+                var last_server_failure: ?dns.Message = null;
 
-                for (server_order) |server_idx| {
+                for (server_order, 0..) |server_idx, server_i| {
                     const server = servers[server_idx];
                     const addr_key = AddressKey.fromAddress(server);
 
-                    // Skip dead servers unless it's our last resort
+                    const is_last_server = (server_i + 1 >= server_order.len);
+
+                    // Skip dead servers unless last (fallback when all are dead)
                     if (self.rtt_cache) |rc| {
-                        if (rc.isDead(addr_key) and server_order.len > 1) continue;
+                        if (rc.isDead(addr_key) and !is_last_server) continue;
                     }
 
-                    // Per-server timeout from RTT cache, or default
-                    const per_server_timeout: u32 = if (self.rtt_cache) |rc|
-                        rc.getTimeout(addr_key)
-                    else
-                        self.transport.config.timeout_ms;
+                    const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
                     // Generate random query ID
                     var id_bytes: [2]u8 = undefined;
@@ -279,15 +295,22 @@ pub const RecursiveResolver = struct {
 
                                     var tls_response_buf: [65535]u8 = undefined;
                                     if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
-                                        response = try tryParseMessage(allocator, tls_data) orelse continue;
-                                        if (!response.header.qr) continue; // skip non-responses
-                                        got_response = true;
-                                        if (self.cache) |c| c.storeResponse(response, parent_zone);
-                                        // Don't update UDP RTT cache from TLS — different transport
-                                        // latency would poison UDP timeout estimates.
-                                        break;
+                                        if (try tryParseMessage(allocator, tls_data)) |tls_response| {
+                                            if (tls_response.header.qr and
+                                                !tls_response.header.rcode.isServerError() and
+                                                tls_response.header.rcode != .format_error)
+                                            {
+                                                response = tls_response;
+                                                got_response = true;
+                                                if (self.cache) |c| c.storeResponse(response, parent_zone);
+                                                // Don't update UDP RTT cache from TLS — different transport
+                                                // latency would poison UDP timeout estimates.
+                                                break;
+                                            }
+                                        }
+                                        // TLS error/unparseable — fall through to Do53
                                     } else |_| {
-                                        // Fall through to Do53
+                                        // TLS connection failed — fall through to Do53
                                     }
                                 },
                                 .unknown => {}, // First contact → Do53 now, probe after
@@ -300,21 +323,39 @@ pub const RecursiveResolver = struct {
                     response = try self.queryServerUdp(
                         allocator, wire_query, query_id, server, per_server_timeout,
                     ) orelse continue;
+
+                    // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
+                    // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
+                    if (response.header.rcode.isServerError()) {
+                        last_server_failure = response;
+                        continue;
+                    }
+
                     got_response = true;
                     if (self.cache) |c| c.storeResponse(response, parent_zone);
                     break;
                 }
 
-                if (!got_response) return error.Timeout;
+                // Fall back to last SERVFAIL/REFUSED if all servers failed
+                if (!got_response) {
+                    if (last_server_failure) |sf| {
+                        response = sf;
+                        got_response = true;
+                    } else {
+                        return error.Timeout;
+                    }
+                }
 
-                // ── Fire background OTE probe after Do53 success ──
-                if (self.encrypted_ns_cache) |oc| {
-                    if (self.tls_transport) |tls_t| {
-                        for (server_order) |si| {
-                            const srv = servers[si];
-                            const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
-                            if (oc.claimProbe(tls_key)) {
-                                tls_t.probeInBackground(srv, oc);
+                // Fire background OTE probes (skip if we fell back to a SERVFAIL)
+                if (!response.header.rcode.isServerError()) {
+                    if (self.encrypted_ns_cache) |oc| {
+                        if (self.tls_transport) |tls_t| {
+                            for (server_order) |si| {
+                                const srv = servers[si];
+                                const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
+                                if (oc.claimProbe(tls_key)) {
+                                    tls_t.probeInBackground(srv, oc);
+                                }
                             }
                         }
                     }
@@ -611,6 +652,10 @@ pub const RecursiveResolver = struct {
     /// (root → TLD → SLD → DNSKEY) can take 3-5s; 6s provides headroom.
     const dnskey_dedup_timeout_ns: u64 = 6 * std.time.ns_per_s;
 
+    /// Dedup follower timeout for DS fetches. DS queries go to already-known
+    /// parent servers (no chain walk), so 3s is sufficient.
+    const ds_dedup_timeout_ns: u64 = 3 * std.time.ns_per_s;
+
     const AnswerValidation = enum { valid, bogus, skip };
 
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
@@ -634,7 +679,14 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| {
             if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
                 switch (result) {
-                    .hit => |h| return h.records,
+                    .hit => |h| {
+                        // Signal near-expiry DNSKEY for async refresh after responding.
+                        if (h.needs_prefetch and self.pending_dnskey_prefetch == null) {
+                            @memcpy(self.pending_dnskey_buf[0..zone_name.len], zone_name);
+                            self.pending_dnskey_prefetch = self.pending_dnskey_buf[0..zone_name.len];
+                        }
+                        return h.records;
+                    },
                     .negative => return null,
                 }
             }
@@ -771,10 +823,7 @@ pub const RecursiveResolver = struct {
                 if (rc.isDead(addr_key) and i + 1 < try_count) continue;
             }
 
-            const timeout: u32 = if (self.rtt_cache) |rc|
-                rc.getTimeout(addr_key)
-            else
-                self.transport.config.timeout_ms;
+            const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
 
             const response = try self.queryServerUdp(
                 allocator, wire_query, query_id, server, timeout,
@@ -824,9 +873,51 @@ pub const RecursiveResolver = struct {
     }
 
     /// Refresh expired DS status by querying parent servers directly.
-    /// Returns true if DS status was re-established in cache, false if
-    /// probe failed (caller should fall back to referral re-walk).
+    /// Uses dedup to coalesce concurrent fetches. Returns true if DS is now in cache.
     fn reproveDelegationSecurity(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        parent_servers: []const std.net.Address,
+    ) bool {
+        // Fast path: DS already in cache (another thread may have fetched it).
+        if (self.cache) |c| {
+            if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+        }
+
+        // Dedup: coalesce concurrent DS fetches for the same zone.
+        if (self.dedup) |dedup| {
+            switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, ds_dedup_timeout_ns)) {
+                .leader => {
+                    defer dedup.releaseLeader(zone_name, .ds, 0);
+                    return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
+                },
+                .follower => {
+                    // Leader finished — re-check cache.
+                    if (self.cache) |c| {
+                        if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+                    }
+                    // Cache still empty — leader failed. One follower retries.
+                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, ds_dedup_timeout_ns / 2)) {
+                        .leader => {
+                            defer dedup.releaseLeader(zone_name, .ds, 0);
+                            return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
+                        },
+                        .follower => {
+                            if (self.cache) |c| {
+                                if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+                            }
+                            return false;
+                        },
+                    }
+                },
+            }
+        }
+
+        return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
+    }
+
+    fn reproveDelegationSecurityImpl(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
@@ -947,18 +1038,28 @@ pub const RecursiveResolver = struct {
 
         var addrs: [max_servers_per_level]std.net.Address = undefined;
         var count: usize = 0;
+        var resolved_ns_count: usize = 0;
+        // Fetch policy (Unbound-style): resolve more NS names at shallow depths
+        // to warm cache for sibling queries. At least 1 at all depths.
+        const ns_fetch_limit: usize = switch (depth) {
+            0 => 3,
+            1 => 2,
+            else => 1,
+        };
 
         for (ns_names) |ns_name| {
             const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 continue;
             };
+            var found_for_this_ns = false;
             // Resolve A records
             if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |ns_result| {
                 for (ns_result.message.answers) |rr| {
                     if (rr.rtype == .a and count < max_servers_per_level) {
                         addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
                         count += 1;
+                        found_for_this_ns = true;
                     }
                 }
             } else |err| {
@@ -970,12 +1071,16 @@ pub const RecursiveResolver = struct {
                     if (rr.rtype == .aaaa and count < max_servers_per_level) {
                         addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
                         count += 1;
+                        found_for_this_ns = true;
                     }
                 }
             } else |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
             }
-            if (count > 0) break; // one working NS is enough
+            if (found_for_this_ns) {
+                resolved_ns_count += 1;
+                if (resolved_ns_count >= ns_fetch_limit) break;
+            }
         }
 
         if (count == 0) return null;
@@ -985,7 +1090,9 @@ pub const RecursiveResolver = struct {
     const NsAddrResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize };
     const DelegationResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize, zone: dns.Name };
 
-    /// Check cache for A records of NS names, avoiding network queries.
+    /// Check cache for A/AAAA records of NS names, avoiding network queries.
+    /// Collects addresses from all cached NS names (cache lookups are free)
+    /// for better server diversity.
     fn lookupCachedNsAddresses(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1024,7 +1131,6 @@ pub const RecursiveResolver = struct {
                     .negative => {},
                 }
             }
-            if (count > 0) break;
         }
 
         if (count == 0) return null;

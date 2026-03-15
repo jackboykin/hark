@@ -461,6 +461,10 @@ const WorkerState = struct {
         if (result.prefetch_name) |prefetch_name| {
             self.doPrefetch(prefetch_name, result.prefetch_qtype);
         }
+        // Refresh near-expiry DNSKEY (covers answer TTL >> DNSKEY TTL gap)
+        if (result.prefetch_dnskey_zone) |zone| {
+            self.doPrefetch(zone, .dnskey);
+        }
     }
 
     fn handleTcpClient(self: *WorkerState, client_fd: posix.fd_t) void {
@@ -506,6 +510,9 @@ const WorkerState = struct {
             if (qr.prefetch_name) |prefetch_name| {
                 self.doPrefetch(prefetch_name, qr.prefetch_qtype);
             }
+            if (qr.prefetch_dnskey_zone) |zone| {
+                self.doPrefetch(zone, .dnskey);
+            }
         }
     }
 
@@ -513,6 +520,7 @@ const WorkerState = struct {
         wire: []const u8,
         prefetch_name: ?[]const u8 = null,
         prefetch_qtype: dns.RType = .a,
+        prefetch_dnskey_zone: ?[]const u8 = null,
     };
 
     fn processQuery(self: *WorkerState, alloc: mem.Allocator, data: []const u8, response_wire: []u8) ?TcpQueryResult {
@@ -556,6 +564,7 @@ const WorkerState = struct {
             .wire = wire,
             .prefetch_name = result.prefetch_name,
             .prefetch_qtype = result.prefetch_qtype,
+            .prefetch_dnskey_zone = result.prefetch_dnskey_zone,
         };
     }
 
@@ -598,7 +607,12 @@ const WorkerState = struct {
                     .bypass_cache = bypass_cache,
                     .dedup = self.dedup,
                 };
-                return try resolver.resolve(alloc, name, qtype);
+                var result = try resolver.resolve(alloc, name, qtype);
+                // Dupe into arena before stack-allocated resolver goes out of scope
+                if (result.prefetch_dnskey_zone) |z| {
+                    result.prefetch_dnskey_zone = alloc.dupe(u8, z) catch null;
+                }
+                return result;
             },
             .forward => {
                 var resolver = ForwardingResolver.initWithTcp(self.udp_transport, self.tcp_transport);

@@ -51,6 +51,12 @@ pub const RCode = enum(u4) {
     not_implemented = 4,
     refused = 5,
     _,
+
+    /// Server-side error (SERVFAIL/REFUSED) — the server received the query
+    /// but couldn't or wouldn't answer. Used for lame detection (RFC 4697).
+    pub fn isServerError(self: RCode) bool {
+        return self == .server_failure or self == .refused;
+    }
 };
 
 pub const RType = enum(u16) {
