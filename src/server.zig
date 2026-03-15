@@ -27,6 +27,7 @@ const Certificate = std.crypto.Certificate;
 const log = std.log.scoped(.server);
 
 const tcp_idle_timeout_ms: u32 = 5_000;
+const max_tcp_queries_per_conn: u32 = 128;
 
 // ── Context tags for the event loop ────────────────────────────────────
 
@@ -498,7 +499,9 @@ const WorkerState = struct {
         posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch return;
         posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&tv)) catch return;
 
-        while (!self.shutdown.load(.acquire)) {
+        var tcp_queries: u32 = 0;
+        while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
+            tcp_queries += 1;
             // Read 2-byte length prefix
             var len_buf: [2]u8 = undefined;
             tcpReadExactBlocking(client_fd, &len_buf) orelse return;
