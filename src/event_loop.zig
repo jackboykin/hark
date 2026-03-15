@@ -158,6 +158,7 @@ pub const EventLoop = struct {
 
     pub fn setTimeout(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
         const id = try self.initOp(.timeout, context);
+        errdefer self.freeSlot(id);
         const slot = &self.slots[id];
         slot.timeout_spec = .{
             .sec = @intCast(ms / 1000),
@@ -172,6 +173,7 @@ pub const EventLoop = struct {
 
     pub fn sendTo(self: *EventLoop, fd: posix.fd_t, data: []const u8, dest: std.net.Address, context: *anyopaque) !OperationId {
         const id = try self.initOp(.send, context);
+        errdefer self.freeSlot(id);
         const slot = &self.slots[id];
 
         slot.iov_const[0] = .{ .base = data.ptr, .len = data.len };
@@ -196,6 +198,7 @@ pub const EventLoop = struct {
 
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.recv, context);
+        errdefer self.freeSlot(id);
         const slot = &self.slots[id];
 
         slot.iov[0] = .{ .base = &slot.recv_buf, .len = recv_buf_size };
@@ -220,6 +223,7 @@ pub const EventLoop = struct {
 
     pub fn connect(self: *EventLoop, fd: posix.fd_t, dest: std.net.Address, context: *anyopaque) !OperationId {
         const id = try self.initOp(.connect, context);
+        errdefer self.freeSlot(id);
         const slot = &self.slots[id];
         slot.addr = dest;
         slot.addr_len = dest.getOsSockLen();
@@ -232,6 +236,7 @@ pub const EventLoop = struct {
 
     pub fn tcpSend(self: *EventLoop, fd: posix.fd_t, data: []const u8, context: *anyopaque) !OperationId {
         const id = try self.initOp(.tcp_send, context);
+        errdefer self.freeSlot(id);
         var sqe = try self.ring.get_sqe();
         sqe.prep_send(fd, data, 0);
         sqe.user_data = id;
@@ -240,6 +245,7 @@ pub const EventLoop = struct {
 
     pub fn tcpRecv(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.tcp_recv, context);
+        errdefer self.freeSlot(id);
         var sqe = try self.ring.get_sqe();
         sqe.prep_recv(fd, &self.slots[id].recv_buf, 0);
         sqe.user_data = id;
@@ -248,6 +254,7 @@ pub const EventLoop = struct {
 
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.accept, context);
+        errdefer self.freeSlot(id);
         const slot = &self.slots[id];
         slot.addr = std.mem.zeroes(std.net.Address);
         slot.addr_len = @sizeOf(std.net.Address);
@@ -260,6 +267,7 @@ pub const EventLoop = struct {
 
     pub fn read(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.read, context);
+        errdefer self.freeSlot(id);
         var sqe = try self.ring.get_sqe();
         sqe.prep_read(fd, &self.slots[id].recv_buf, 0);
         sqe.user_data = id;

@@ -344,6 +344,16 @@ const WorkerState = struct {
                 last_stats_ns = now_ns;
             }
 
+            // Retry re-registration for any listeners that previously failed
+            for (0..n) |i| {
+                if (udp_ops[i] == null) {
+                    udp_ops[i] = self.loop.recvFrom(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
+                }
+                if (tcp_ops[i] == null) {
+                    tcp_ops[i] = self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])) catch null;
+                }
+            }
+
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
@@ -363,10 +373,11 @@ const WorkerState = struct {
                         }
                         if (!self.shutdown.load(.acquire)) {
                             // Find which index this ctx belongs to and re-register
-                            const idx = ctxIndex(&udp_ctxs, n, ctx) orelse break;
+                            const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
                             udp_ops[idx] = self.loop.recvFrom(ctx.fd, @ptrCast(ctx)) catch |err| {
                                 log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
-                                break;
+                                udp_ops[idx] = null;
+                                continue;
                             };
                         }
                     },
@@ -380,8 +391,12 @@ const WorkerState = struct {
                             else => {},
                         }
                         if (!self.shutdown.load(.acquire)) {
-                            const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse break;
-                            tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch break;
+                            const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
+                            tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch |err| {
+                                log.err("failed to re-register TCP accept: {s}", .{@errorName(err)});
+                                tcp_ops[idx] = null;
+                                continue;
+                            };
                         }
                     },
                 }
