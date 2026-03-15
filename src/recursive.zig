@@ -959,7 +959,7 @@ pub const RecursiveResolver = struct {
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
 
-        const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+        const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
 
         // Find RRSIG in answers to get the signer zone
         const rrsig = dnssec.findRrsig(response.answers, qtype) orelse return .bogus;
@@ -1004,7 +1004,7 @@ pub const RecursiveResolver = struct {
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
-        const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+        const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32);
     }
 
@@ -1283,7 +1283,7 @@ fn validateDnskeyAgainstDs(
     }
     if (ds_count > 0) {
         if (dnssec.findRrsig(dnskey_answers, .dnskey) != null) {
-            const now_u32: u32 = @intCast(@as(u64, @intCast(std.time.timestamp())));
+            const now_u32: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
             try dnssec.validateDnskeyRrset(
                 dnskey_answers,
                 ds_records[0..ds_count],
