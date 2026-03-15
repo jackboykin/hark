@@ -13,6 +13,7 @@ const RttCache = @import("ns_rtt.zig").RttCache;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
+const log = std.log.scoped(.resolver);
 
 // ── Root Hints ─────────────────────────────────────────────────────────
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
@@ -589,7 +590,9 @@ pub const RecursiveResolver = struct {
                     const response = try tryParseMessage(allocator, tcp_data) orelse return null;
                     if (!response.header.qr) return null;
                     return response;
-                } else |_| {}
+                } else |err| {
+                    log.warn("TCP fallback failed: {s}", .{@errorName(err)});
+                }
             }
             return null;
         }

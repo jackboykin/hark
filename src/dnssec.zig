@@ -336,11 +336,11 @@ pub fn buildSignedData(
     const name_len = writeCanonicalNameWire(buf[pos..], rrsig.signer_name) catch return error.BufferTooSmall;
     pos += name_len;
 
-    // 2. Build canonical RRset entries, sorted by wire form
+    // 2. Build canonical RRset entries, sorted by RDATA (RFC 4034 §6.3)
     // Each entry: canonical_owner_wire || type(2) || class(2) || original_ttl(4) || rdlength(2) || canonical_rdata
-    // We build them into a temp area, sort, then append
-    var rr_wires: [64][]const u8 = undefined;
-    if (rrset.len > rr_wires.len) return error.BufferTooSmall;
+    const SortEntry = struct { wire: []const u8, rdata: []const u8 };
+    var entries: [64]SortEntry = undefined;
+    if (rrset.len > entries.len) return error.BufferTooSmall;
 
     // Use remaining buffer space for individual RR wire data
     var temp_pos = pos;
@@ -383,25 +383,27 @@ pub fn buildSignedData(
         const rdata_len = temp_pos - rdata_start;
         mem.writeInt(u16, buf[rdlen_pos..][0..2], @intCast(rdata_len), .big);
 
-        rr_wires[idx] = buf[rr_start..temp_pos];
+        entries[idx] = .{ .wire = buf[rr_start..temp_pos], .rdata = buf[rdata_start..temp_pos] };
     }
 
-    // Sort RR wires by raw bytes
-    mem.sortUnstable([]const u8, rr_wires[0..rrset.len], {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return mem.order(u8, a, b) == .lt;
+    // RFC 4034 §6.3: within an RRset, sort by RDATA (owner/type/class/TTL
+    // are identical). Must not include rdlength — it would mis-order records
+    // of different sizes (e.g. mixed 1024/2048-bit DNSKEY).
+    mem.sortUnstable(SortEntry, entries[0..rrset.len], {}, struct {
+        fn lessThan(_: void, a: SortEntry, b: SortEntry) bool {
+            return mem.order(u8, a.rdata, b.rdata) == .lt;
         }
     }.lessThan);
 
-    // The sorted RR wires reference slices of buf[pos..temp_pos].
+    // The sorted entries reference slices of buf[pos..temp_pos].
     // Compacting them in-place would corrupt source data (earlier copies
     // overwrite source positions of later entries). Copy to a temp buffer first.
     var temp_buf: [65536]u8 = undefined;
     var out_pos: usize = 0;
-    for (rr_wires[0..rrset.len]) |wire| {
-        if (out_pos + wire.len > temp_buf.len) return error.BufferTooSmall;
-        @memcpy(temp_buf[out_pos..][0..wire.len], wire);
-        out_pos += wire.len;
+    for (entries[0..rrset.len]) |entry| {
+        if (out_pos + entry.wire.len > temp_buf.len) return error.BufferTooSmall;
+        @memcpy(temp_buf[out_pos..][0..entry.wire.len], entry.wire);
+        out_pos += entry.wire.len;
     }
     if (pos + out_pos > buf.len) return error.BufferTooSmall;
     @memcpy(buf[pos..][0..out_pos], temp_buf[0..out_pos]);
