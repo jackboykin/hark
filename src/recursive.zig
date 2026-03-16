@@ -444,6 +444,19 @@ pub const RecursiveResolver = struct {
 
                 // ── Final query response handling ──
 
+                // DNSSEC: when the server is authoritative for both parent and
+                // child zones, it answers directly without a referral, so
+                // classifyDelegation never ran.  Establish delegation security
+                // before validation/NXDOMAIN/NODATA (RFC 4035 §5.2).
+                if (self.dnssec_enabled and security_state == .secure and
+                    target_name.labels.len > parent_zone.labels.len and
+                    response.header.aa and !hasSignedRecords(response))
+                {
+                    security_state = self.ensureDelegationSecurity(
+                        allocator, target_name, &.{}, servers[0..server_count],
+                    );
+                }
+
                 // Classify response
                 if (response.header.rcode != .no_error) {
                     if (response.header.rcode == .name_error and response.header.aa) {
@@ -560,18 +573,9 @@ pub const RecursiveResolver = struct {
             .no_glue => |ng| ng.zone_cut,
         };
 
-        // DNSSEC: classify delegation security at referral (RFC 4035 §5.2)
-        // Verify authority NSEC/NSEC3 signatures before accepting insecure classification.
+        // DNSSEC: classify delegation security (RFC 4035 §5.2)
         if (security_state.* == .secure) {
-            const auth_status = self.verifyAuthoritySigs(allocator, authorities, servers.*[0..server_count.*]);
-            if (auth_status == .secure) {
-                security_state.* = dnssec.classifyDelegation(authorities, zone_cut);
-                cacheInsecureDelegation(self.cache, security_state.*, zone_cut, authorities);
-            } else if (auth_status == .unchecked) {
-                if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut))
-                    security_state.* = .insecure;
-            }
-            // .bogus: keep .secure — prevents forged NSEC downgrade.
+            security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, servers.*[0..server_count.*]);
         }
 
         // Resolve server addresses
@@ -597,6 +601,34 @@ pub const RecursiveResolver = struct {
         parent_zone.* = zone_cut;
         server_count.* = addrs.count;
         @memcpy(servers.*[0..addrs.count], addrs.addrs[0..addrs.count]);
+    }
+
+    // ── Delegation security ────────────────────────────────────────────
+
+    /// Determine delegation security for a zone cut (RFC 4035 §5.2).
+    /// Tries verified NSEC/NSEC3 from referral authorities first, then
+    /// falls back to cached/fetched DS status from parent servers.
+    fn ensureDelegationSecurity(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_cut: dns.Name,
+        authorities: []const dns.ResourceRecord,
+        parent_servers: []const std.net.Address,
+    ) dnssec.SecurityStatus {
+        if (authorities.len > 0) {
+            const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
+            if (auth_status == .secure) {
+                const status = dnssec.classifyDelegation(authorities, zone_cut);
+                cacheInsecureDelegation(self.cache, status, zone_cut, authorities);
+                return status;
+            }
+            if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
+        }
+        // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
+        const zs = nameToSlice(zone_cut);
+        if (!self.reproveDelegationSecurity(allocator, zs.buf[0..zs.len], parent_servers))
+            return .secure;
+        return if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut)) .insecure else .secure;
     }
 
     // ── UDP+TCP query helper ──────────────────────────────────────────
@@ -847,9 +879,12 @@ pub const RecursiveResolver = struct {
         if (self.resolving_ds) return false; // re-entrancy guard
 
         // Derive parent zone: strip first label (e.g. "example.com" → "com")
-        const dot_pos = mem.indexOfScalar(u8, zone_name, '.') orelse return false;
-        if (dot_pos + 1 >= zone_name.len) return false; // TLD — parent is root
-        const parent_zone = zone_name[dot_pos + 1 ..];
+        // TLDs have no dot — parent is root, query root hints (RFC 4035 §3.1.4.1).
+        const pos = mem.indexOfScalar(u8, zone_name, '.') orelse
+            return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
+        if (pos + 1 >= zone_name.len) // trailing dot (e.g. "com.")
+            return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
+        const parent_zone = zone_name[pos + 1 ..];
 
         const cache = self.cache orelse return false;
         const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return false) {
@@ -1387,6 +1422,13 @@ const ReferralResult = union(enum) {
         zone_cut: dns.Name,
     },
 };
+
+/// Returns true if the response contains any RRSIG records (signed zone).
+fn hasSignedRecords(response: dns.Message) bool {
+    for (response.answers) |rr| if (rr.rtype == .rrsig) return true;
+    for (response.authorities) |rr| if (rr.rtype == .rrsig) return true;
+    return false;
+}
 
 fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Name) ?ReferralResult {
     // Find the most specific zone cut: NS owner where target is a subdomain
