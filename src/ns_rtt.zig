@@ -16,9 +16,6 @@ const min_timeout_ms: u32 = 50;
 /// Maximum RTO cap (Knot).
 const max_timeout_ms: u32 = 10_000;
 
-/// RTT band for "equally good" servers (Unbound).
-const rtt_band_ms: u32 = 400;
-
 /// Consecutive timeouts before marking dead (Knot).
 const dead_threshold: u8 = 4;
 
@@ -129,77 +126,6 @@ pub const RttCache = struct {
         return state.dead_until_ms > self.now_fn();
     }
 
-    /// Unbound-style RTT-band selection: find best RTT, randomly pick
-    /// among servers within best + rtt_band_ms, dead servers last.
-    /// Returns a slice of `order_buf` containing indices into `servers`.
-    pub fn selectServers(
-        self: *RttCache,
-        servers: []const std.net.Address,
-        order_buf: *[max_order]usize,
-    ) []usize {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
-
-        const now = self.now_fn();
-        var live_count: usize = 0;
-        var dead_count: usize = 0;
-        var best_timeout: u32 = std.math.maxInt(u32);
-
-        // Partition: live servers first, dead servers at the end
-        for (servers, 0..) |server, i| {
-            const key = AddressKey.fromAddress(server);
-            const state = self.entries.get(key);
-            const is_dead = if (state) |s| s.dead_until_ms > now else false;
-
-            if (is_dead) {
-                order_buf[max_order - 1 - dead_count] = i;
-                dead_count += 1;
-            } else {
-                order_buf[live_count] = i;
-                live_count += 1;
-                const t = if (state) |s| computeTimeout(s) else initial_timeout_ms;
-                if (t < best_timeout) best_timeout = t;
-            }
-        }
-
-        // Shuffle live servers within the RTT band to the front
-        // (Fisher-Yates on the "good" subset, then append "worse" live, then dead)
-        const band_limit = best_timeout +| rtt_band_ms;
-        var good_count: usize = 0;
-
-        // Classify live servers as "good" (within band) or "worse"
-        for (0..live_count) |j| {
-            const idx = order_buf[j];
-            const key = AddressKey.fromAddress(servers[idx]);
-            const state = self.entries.get(key);
-            const t = if (state) |s| computeTimeout(s) else initial_timeout_ms;
-            if (t <= band_limit) {
-                // Swap into the good partition
-                const tmp = order_buf[good_count];
-                order_buf[good_count] = order_buf[j];
-                order_buf[j] = tmp;
-                good_count += 1;
-            }
-        }
-
-        // Shuffle the "good" set
-        fisherYatesShuffle(order_buf[0..good_count]);
-
-        // Shuffle the dead servers too (avoid always hitting the same one first)
-        if (dead_count > 0) {
-            // Copy dead indices from the end into contiguous positions after live
-            var dead_buf: [max_order]usize = undefined;
-            for (0..dead_count) |d| {
-                dead_buf[d] = order_buf[max_order - 1 - d];
-            }
-            fisherYatesShuffle(dead_buf[0..dead_count]);
-            @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
-        }
-
-        return order_buf[0 .. live_count + dead_count];
-    }
-
-    const max_order = 26; // max_servers_per_level (13 IPv4 + 13 IPv6)
 };
 
 fn computeTimeout(state: RttState) u32 {
@@ -215,17 +141,6 @@ fn computeTimeout(state: RttState) u32 {
     const backed_off = @as(u64, base_ms) << shift;
 
     return @intCast(@max(min_timeout_ms, @min(backed_off, max_timeout_ms)));
-}
-
-fn fisherYatesShuffle(items: []usize) void {
-    if (items.len <= 1) return;
-    var i: usize = items.len - 1;
-    while (i > 0) : (i -= 1) {
-        const j = std.crypto.random.uintLessThan(usize, i + 1);
-        const tmp = items[i];
-        items[i] = items[j];
-        items[j] = tmp;
-    }
 }
 
 /// Returns monotonic milliseconds (CLOCK_BOOTTIME on Linux), matching
@@ -300,55 +215,3 @@ test "recordTimeout increments consecutive count and marks dead" {
     try testing.expect(!cache.isDead(key));
 }
 
-test "selectServers puts dead servers last" {
-    var cache = RttCache.init(testing.allocator);
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const servers = [_]std.net.Address{
-        std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53),
-        std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 53),
-        std.net.Address.initIp4(.{ 10, 0, 0, 3 }, 53),
-    };
-
-    const key1 = AddressKey.fromAddress(servers[0]);
-
-    // Make server 1 dead
-    cache.recordSuccess(key1, 100_000);
-    for (0..dead_threshold) |_| cache.recordTimeout(key1);
-    try testing.expect(cache.isDead(key1));
-
-    var order_buf: [RttCache.max_order]usize = undefined;
-    const order = cache.selectServers(&servers, &order_buf);
-
-    try testing.expectEqual(@as(usize, 3), order.len);
-    // Dead server (index 0) should be last
-    try testing.expectEqual(@as(usize, 0), order[order.len - 1]);
-}
-
-test "selectServers prefers lower RTT within band" {
-    var cache = RttCache.init(testing.allocator);
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const servers = [_]std.net.Address{
-        std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53), // slow: 2000ms RTT
-        std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 53), // fast: 10ms RTT
-    };
-
-    // Record a slow server
-    cache.recordSuccess(AddressKey.fromAddress(servers[0]), 2_000_000);
-    // Record a fast server
-    cache.recordSuccess(AddressKey.fromAddress(servers[1]), 10_000);
-
-    var order_buf: [RttCache.max_order]usize = undefined;
-    const order = cache.selectServers(&servers, &order_buf);
-
-    try testing.expectEqual(@as(usize, 2), order.len);
-    // Fast server (index 1) should come before slow server (index 0)
-    // because slow server is outside the RTT band
-    try testing.expectEqual(@as(usize, 1), order[0]);
-    try testing.expectEqual(@as(usize, 0), order[1]);
-}

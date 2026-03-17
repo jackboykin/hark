@@ -10,6 +10,7 @@ const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
+const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
@@ -79,6 +80,7 @@ pub const RecursiveResolver = struct {
     tls_transport: ?*TlsTransport = null,
     encrypted_ns_cache: ?*EncryptedNsCache = null,
     rtt_cache: ?*RttCache = null,
+    ns_selector: ?*NsSelector = null,
     bypass_cache: bool = false,
     dedup: ?*InFlightTable = null,
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
@@ -236,10 +238,10 @@ pub const RecursiveResolver = struct {
                     }
                 }
 
-                // Order servers: RTT-band selection if available, Fisher-Yates otherwise
+                // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
                 var order_buf: [max_servers_per_level]usize = undefined;
-                const server_order = if (self.rtt_cache) |rc|
-                    rc.selectServers(servers[0..server_count], &order_buf)
+                const server_order = if (self.ns_selector) |ns|
+                    ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
                 else blk: {
                     fisherYatesShuffle(std.net.Address, servers[0..server_count]);
                     for (0..server_count) |idx| order_buf[idx] = idx;
@@ -307,8 +309,8 @@ pub const RecursiveResolver = struct {
                                                 response = tls_response;
                                                 got_response = true;
                                                 if (self.cache) |c| c.storeResponse(response, parent_zone);
-                                                // Don't update UDP RTT cache from TLS — different transport
-                                                // latency would poison UDP timeout estimates.
+                                                // Don't update RTT cache or NS selector from TLS —
+                                                // different transport latency would poison Do53 estimates.
                                                 break;
                                             }
                                         }
@@ -324,17 +326,27 @@ pub const RecursiveResolver = struct {
                     }
 
                     // ── Do53: UDP with TCP fallback ──
+                    const do53_start = monotonicMicros();
                     response = try self.queryServerUdp(
                         allocator, wire_query, query_id, server, per_server_timeout,
-                    ) orelse continue;
+                    ) orelse {
+                        if (self.ns_selector) |ns|
+                            ns.recordOutcome(parent_zone, server, .timeout, 0);
+                        continue;
+                    };
+                    const do53_elapsed = monotonicMicros() - do53_start;
 
                     // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
                     // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
                     if (response.header.rcode.isServerError()) {
+                        if (self.ns_selector) |ns|
+                            ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
                         last_server_failure = response;
                         continue;
                     }
 
+                    if (self.ns_selector) |ns|
+                        ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
                     got_response = true;
                     responding_server = server;
                     if (self.cache) |c| c.storeResponse(response, parent_zone);
@@ -487,7 +499,11 @@ pub const RecursiveResolver = struct {
                             if (self.dnssec_enabled and security_state == .secure) {
                                 if (dnssec.findRrsig(response.answers, .cname) != null) {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
-                                        .bogus => return self.bogusServfail(current_name, qtype),
+                                        .bogus => {
+                                            if (self.ns_selector) |ns| if (responding_server) |srv|
+                                                ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                                            return self.bogusServfail(current_name, qtype);
+                                        },
                                         .valid => {
                                             if (self.cache) |c| {
                                                 c.storeResponse(response, parent_zone);
@@ -517,7 +533,11 @@ pub const RecursiveResolver = struct {
                     // Validate answer RRsets if in secure zone
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => return self.bogusServfail(current_name, qtype),
+                            .bogus => {
+                                if (self.ns_selector) |ns| if (responding_server) |srv|
+                                    ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                                return self.bogusServfail(current_name, qtype);
+                            },
                             .valid => {
                                 if (self.cache) |c| c.updateSecurityStatus(current_name, qtype, .in, .secure);
                             },
@@ -644,7 +664,7 @@ pub const RecursiveResolver = struct {
         timeout: u32,
     ) error{OutOfMemory}!?dns.Message {
         const addr_key = AddressKey.fromAddress(server);
-        const query_start = std.time.microTimestamp();
+        const query_start = monotonicMicros();
 
         const response_data = self.transport.queryWithTimeout(
             wire_query, query_id, server, timeout,
@@ -652,7 +672,7 @@ pub const RecursiveResolver = struct {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
             return null;
         };
-        const elapsed_us = std.time.microTimestamp() - query_start;
+        const elapsed_us = monotonicMicros() - query_start;
 
         // Record liveness — truncated responses still prove server is alive
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
@@ -1373,6 +1393,13 @@ fn nameToSlice(name: dns.Name) struct { buf: [dns.max_name_len + 1]u8, len: usiz
     const buf = name.format();
     const len = mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
     return .{ .buf = buf, .len = len };
+}
+
+/// Monotonic microseconds (CLOCK_BOOTTIME) for elapsed-time measurement.
+/// Immune to NTP jumps, unlike std.time.microTimestamp (CLOCK_REALTIME).
+fn monotonicMicros() i64 {
+    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
+    return ts.sec * std.time.us_per_s + @divTrunc(ts.nsec, std.time.ns_per_us);
 }
 
 /// Returns current epoch time as u32 for DNSSEC signature validation.

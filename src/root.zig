@@ -14,6 +14,7 @@ pub const toml = @import("toml.zig");
 pub const config = @import("config.zig");
 pub const server = @import("server.zig");
 pub const ns_rtt = @import("ns_rtt.zig");
+pub const ns_selector = @import("ns_selector.zig");
 pub const dedup = @import("dedup.zig");
 
 test {
@@ -33,5 +34,6 @@ test {
     _ = config;
     _ = server;
     _ = ns_rtt;
+    _ = ns_selector;
     _ = dedup;
 }

@@ -7,13 +7,13 @@ Runs on Linux with io_uring. Zero external dependencies.
 
 - DNS-over-TLS with opportunistic encryption to authoritatives (RFC 9539)
 - Background TLS probing with connection pooling
-- DNSSEC validation (RSA-SHA256/512, ECDSA P-256/P-384, Ed25519)
+- DNSSEC validation (RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519)
 - Full recursive resolution from the root, with QNAME minimization
 - In-memory RRset cache with RFC 2308 negative caching
 - Cache prefetch and serve-stale (RFC 8767)
 - Query deduplication across workers (singleflight)
 - Multi-threaded server mode with `SO_REUSEPORT`
-- RTT-based nameserver selection
+- Thompson Sampling nameserver selection (per-zone, discounted)
 - UDP and TCP transport with EDNS0
 - Forwarding mode as an alternative to recursion
 

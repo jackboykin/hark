@@ -19,6 +19,7 @@ const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
 const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
+const NsSelector = @import("ns_selector.zig").NsSelector;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
 const ServerConfig = @import("config.zig").ServerConfig;
@@ -47,6 +48,7 @@ pub const Server = struct {
     allocator: mem.Allocator,
     cache: RRsetCache,
     rtt_cache: RttCache,
+    ns_selector: NsSelector,
     dedup: ?InFlightTable,
     ca_bundle: Certificate.Bundle,
     encrypted_ns_cache: ?EncryptedNsCache,
@@ -73,6 +75,11 @@ pub const Server = struct {
         else
             RttCache.init(allocator);
 
+        const ns_selector = if (cfg.workers > 1)
+            NsSelector.initThreadSafe(allocator)
+        else
+            NsSelector.init(allocator);
+
         var ca_bundle: Certificate.Bundle = .{};
         if (cfg.opportunistic) {
             ca_bundle.rescan(allocator) catch |err| {
@@ -86,6 +93,7 @@ pub const Server = struct {
             .allocator = allocator,
             .cache = cache,
             .rtt_cache = rtt_cache,
+            .ns_selector = ns_selector,
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator) else null,
             .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator) else null,
@@ -106,6 +114,7 @@ pub const Server = struct {
         if (self.dedup) |*d| d.deinit();
         self.cache.deinit();
         self.rtt_cache.deinit();
+        self.ns_selector.deinit();
     }
 
     pub fn run(self: *Server) !void {
@@ -265,6 +274,7 @@ pub const Server = struct {
             .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
             .cache = &self.cache,
             .rtt_cache = &self.rtt_cache,
+            .ns_selector = &self.ns_selector,
             .dedup = if (self.dedup) |*d| d else null,
             .shutdown = &self.shutdown,
         };
@@ -290,6 +300,7 @@ const WorkerState = struct {
     encrypted_ns_cache: ?*EncryptedNsCache,
     cache: *RRsetCache,
     rtt_cache: *RttCache,
+    ns_selector: *NsSelector,
     dedup: ?*InFlightTable,
     shutdown: *std.atomic.Value(bool),
 
@@ -623,6 +634,7 @@ const WorkerState = struct {
                     .tls_transport = self.tls_transport,
                     .encrypted_ns_cache = self.encrypted_ns_cache,
                     .rtt_cache = self.rtt_cache,
+                    .ns_selector = self.ns_selector,
                     .bypass_cache = bypass_cache,
                     .dedup = self.dedup,
                 };
