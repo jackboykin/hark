@@ -14,6 +14,7 @@ const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
+const NsecCache = @import("nsec_cache.zig").NsecCache;
 const log = std.log.scoped(.resolver);
 
 // ── Root Hints ─────────────────────────────────────────────────────────
@@ -83,6 +84,7 @@ pub const RecursiveResolver = struct {
     ns_selector: ?*NsSelector = null,
     bypass_cache: bool = false,
     dedup: ?*InFlightTable = null,
+    nsec_cache: ?*NsecCache = null,
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
     resolving_ds: bool = false,
@@ -163,11 +165,29 @@ pub const RecursiveResolver = struct {
                 }
             }
 
+            const target_name = try dns.parseDottedName(allocator, current_name);
+
+            // NSEC CACHE: synthesize negative responses from cached NSEC proofs (RFC 8198).
+            // Skip if CD bit set (Appendix A) or cache bypassed.
+            if (!self.bypass_cache and self.dnssec_enabled) {
+                if (self.nsec_cache) |nc| {
+                    if (nc.lookupSuffixes(allocator, target_name, qtype, current_name)) |synth| {
+                        const rcode: dns.RCode = switch (synth.rcode) {
+                            .nxdomain => .name_error,
+                            .nodata => .no_error,
+                        };
+                        return .{
+                            .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                            .prefetch_name = prefetch_name,
+                            .prefetch_qtype = qtype,
+                        };
+                    }
+                }
+            }
+
             var servers: [max_servers_per_level]std.net.Address = undefined;
             var server_count: usize = root_hints.len;
             @memcpy(servers[0..root_hints.len], &root_hints);
-
-            const target_name = try dns.parseDottedName(allocator, current_name);
 
             var seen_zones: [max_referrals]dns.Name = undefined;
             var seen_zone_count: usize = 0;
@@ -480,7 +500,10 @@ pub const RecursiveResolver = struct {
                     if (response.header.rcode == .name_error and response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers[0..server_count])) {
                             .proceed => {
-                                if (security_state == .secure) response.header.ad = true;
+                                if (security_state == .secure) {
+                                    response.header.ad = true;
+                                    self.storeNsec(response.authorities, parent_zone);
+                                }
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                             },
                             .skip_cache => {},
@@ -564,7 +587,10 @@ pub const RecursiveResolver = struct {
                     if (response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
                             .proceed => {
-                                if (security_state == .secure) response.header.ad = true;
+                                if (security_state == .secure) {
+                                    response.header.ad = true;
+                                    self.storeNsec(response.authorities, parent_zone);
+                                }
                                 if (self.cache) |c| {
                                     c.storeResponse(response, parent_zone);
                                     c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
@@ -664,6 +690,13 @@ pub const RecursiveResolver = struct {
         if (!self.reproveDelegationSecurity(allocator, zs.buf[0..zs.len], parent_servers))
             return .secure;
         return if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut)) .insecure else .secure;
+    }
+
+    /// Store validated NSEC records in the aggressive NSEC cache.
+    fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name) void {
+        if (self.nsec_cache) |nc| {
+            nc.storeFromAuthority(authorities, zone);
+        }
     }
 
     // ── UDP+TCP query helper ──────────────────────────────────────────

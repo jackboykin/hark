@@ -3,89 +3,91 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
+// ── Counting allocator ────────────────────────────────────────────────
+// Wraps a backing allocator and tracks total bytes allocated.
+// Refuses allocations that would exceed a byte cap.
+
+pub const CountingAllocator = struct {
+    backing: Allocator,
+    current_bytes: std.atomic.Value(usize),
+    max_bytes: usize,
+
+    pub fn init(backing: Allocator, max_bytes: usize) CountingAllocator {
+        return .{ .backing = backing, .current_bytes = std.atomic.Value(usize).init(0), .max_bytes = max_bytes };
+    }
+
+    pub fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = countingAlloc,
+        .resize = countingResize,
+        .free = countingFree,
+        .remap = countingRemap,
+    };
+
+    fn reserveBytes(self: *CountingAllocator, len: usize) bool {
+        while (true) {
+            const current = self.current_bytes.load(.monotonic);
+            if (current + len > self.max_bytes) return false;
+            if (self.current_bytes.cmpxchgWeak(current, current + len, .monotonic, .monotonic) == null) return true;
+        }
+    }
+
+    fn countingAlloc(ctx: *anyopaque, len: usize, alignment: mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.reserveBytes(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            _ = self.current_bytes.fetchSub(len, .monotonic);
+            return null;
+        };
+        return ptr;
+    }
+
+    fn countingResize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len) {
+            if (!self.reserveBytes(new_len - buf.len)) return false;
+            if (!self.backing.rawResize(buf, alignment, new_len, ret_addr)) {
+                _ = self.current_bytes.fetchSub(new_len - buf.len, .monotonic);
+                return false;
+            }
+        } else {
+            if (!self.backing.rawResize(buf, alignment, new_len, ret_addr)) return false;
+            _ = self.current_bytes.fetchSub(buf.len - new_len, .monotonic);
+        }
+        return true;
+    }
+
+    fn countingRemap(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len) {
+            if (!self.reserveBytes(new_len - buf.len)) return null;
+            const ptr = self.backing.rawRemap(buf, alignment, new_len, ret_addr) orelse {
+                _ = self.current_bytes.fetchSub(new_len - buf.len, .monotonic);
+                return null;
+            };
+            return ptr;
+        } else {
+            const ptr = self.backing.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
+            _ = self.current_bytes.fetchSub(buf.len - new_len, .monotonic);
+            return ptr;
+        }
+    }
+
+    fn countingFree(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.current_bytes.fetchSub(buf.len, .monotonic);
+        self.backing.rawFree(buf, alignment, ret_addr);
+    }
+};
 
 /// Maximum TTL for cached entries (1 week). Prevents unreasonably long
 /// cache lifetimes from malicious or misconfigured responses.
 const max_cache_ttl: u32 = 604_800;
 
-// ── Counting allocator ────────────────────────────────────────────────
-// Wraps a backing allocator and tracks total bytes allocated.
-// Refuses allocations that would exceed a byte cap.
-
-const CountingAllocator = struct {
-    backing: Allocator,
-    current_bytes: usize,
-    max_bytes: usize,
-
-    fn init(backing: Allocator, max_bytes: usize) CountingAllocator {
-        return .{ .backing = backing, .current_bytes = 0, .max_bytes = max_bytes };
-    }
-
-    fn allocator(self: *CountingAllocator) Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .free = free,
-        .remap = remap,
-    };
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
-        if (self.current_bytes + len > self.max_bytes) return null;
-        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
-        self.current_bytes += len;
-        return ptr;
-    }
-
-    fn resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
-        if (new_len > buf.len) {
-            const delta = new_len - buf.len;
-            if (self.current_bytes + delta > self.max_bytes) return false;
-        }
-        if (self.backing.rawResize(buf, alignment, new_len, ret_addr)) {
-            if (new_len > buf.len) {
-                self.current_bytes += new_len - buf.len;
-            } else {
-                self.current_bytes -= buf.len - new_len;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    fn remap(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
-        if (new_len > buf.len) {
-            const delta = new_len - buf.len;
-            if (self.current_bytes + delta > self.max_bytes) return null;
-        }
-        const ptr = self.backing.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
-        if (new_len > buf.len) {
-            self.current_bytes += new_len - buf.len;
-        } else {
-            self.current_bytes -= buf.len - new_len;
-        }
-        return ptr;
-    }
-
-    fn free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, ret_addr: usize) void {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
-        self.current_bytes -= buf.len;
-        self.backing.rawFree(buf, alignment, ret_addr);
-    }
-};
-
-// ── Time ──────────────────────────────────────────────────────────────
-
-/// Returns monotonic seconds (CLOCK_BOOTTIME on Linux).
-fn defaultNowSeconds() i64 {
-    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
-    return ts.sec;
-}
+const defaultNowSeconds = dns.monotonicNowSeconds;
 
 // ── Cache key ─────────────────────────────────────────────────────────
 
@@ -173,19 +175,9 @@ pub const CacheLookupResult = union(enum) {
 
 // ── Deep copy helpers ─────────────────────────────────────────────────
 
-fn cloneName(alloc: Allocator, name: dns.Name) !dns.Name {
-    const labels = try alloc.alloc([]const u8, name.labels.len);
-    errdefer alloc.free(labels);
-    var initialized: usize = 0;
-    errdefer for (labels[0..initialized]) |l| alloc.free(l);
-    for (name.labels, 0..) |label, i| {
-        labels[i] = try alloc.dupe(u8, label);
-        initialized += 1;
-    }
-    return .{ .labels = labels };
-}
+const cloneName = dns.cloneName;
 
-fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
+pub fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
     return switch (rdata) {
         .a => |v| .{ .a = v },
         .aaaa => |v| .{ .aaaa = v },
@@ -329,10 +321,7 @@ fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.Res
 }
 
 /// Lowercase src into dest, returning the written slice.
-fn lowerInto(dest: []u8, src: []const u8) []const u8 {
-    for (src, 0..) |c, i| dest[i] = std.ascii.toLower(c);
-    return dest[0..src.len];
-}
+const lowerInto = dns.lowerNameIntoBuf;
 
 /// Lowercase a name into a stack buffer for lookup. Returns null if name too long.
 fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
@@ -423,7 +412,7 @@ pub const RRsetCache = struct {
         defer if (self.mutex) |*m| m.unlock();
         return .{
             .entries = @intCast(self.map.count()),
-            .memory_bytes = self.counting.current_bytes,
+            .memory_bytes = self.counting.current_bytes.load(.monotonic),
             .max_bytes = self.counting.max_bytes,
             .hits = self.hits.load(.monotonic),
             .misses = self.misses.load(.monotonic),

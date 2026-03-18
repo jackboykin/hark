@@ -1962,7 +1962,38 @@ test "EDNS0: buildQuery without edns has no opt" {
     try testing.expectEqual(@as(u16, 0), ar_count);
 }
 
-// ── Test helper: free all allocations from a parsed message ────────────
+// ── Time ──────────────────────────────────────────────────────────────
+
+/// Monotonic seconds (CLOCK_BOOTTIME). Immune to NTP jumps.
+/// Shared by all caches for consistent expiration.
+pub fn monotonicNowSeconds() i64 {
+    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
+    return ts.sec;
+}
+
+// ── Name helpers ──────────────────────────────────────────────────────
+
+/// Lowercase a DNS name string into a caller-provided buffer.
+/// Asserts name.len <= buf.len (caller must ensure sufficient space).
+pub fn lowerNameIntoBuf(buf: []u8, name: []const u8) []const u8 {
+    std.debug.assert(name.len <= buf.len);
+    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..name.len];
+}
+
+// ── Name memory management ─────────────────────────────────────────────
+
+pub fn cloneName(allocator: Allocator, name: Name) !Name {
+    const labels = try allocator.alloc([]const u8, name.labels.len);
+    errdefer allocator.free(labels);
+    var initialized: usize = 0;
+    errdefer for (labels[0..initialized]) |l| allocator.free(l);
+    for (name.labels, 0..) |label, i| {
+        labels[i] = try allocator.dupe(u8, label);
+        initialized += 1;
+    }
+    return .{ .labels = labels };
+}
 
 pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);

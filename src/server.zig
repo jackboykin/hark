@@ -22,6 +22,7 @@ const RttCache = @import("ns_rtt.zig").RttCache;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
+const NsecCache = @import("nsec_cache.zig").NsecCache;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Certificate = std.crypto.Certificate;
 
@@ -53,6 +54,7 @@ pub const Server = struct {
     ca_bundle: Certificate.Bundle,
     encrypted_ns_cache: ?EncryptedNsCache,
     enc_pool: ?ConnectionPool,
+    nsec_cache: ?NsecCache,
     shutdown: std.atomic.Value(bool),
     worker_errors: std.atomic.Value(u32),
 
@@ -99,6 +101,13 @@ pub const Server = struct {
             .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator) else null,
+            .nsec_cache = if (cfg.dnssec) blk: {
+                const nsec_alloc = if (builtin.single_threaded) allocator else std.heap.smp_allocator;
+                break :blk if (cfg.workers > 1)
+                    NsecCache.initThreadSafe(nsec_alloc, NsecCache.default_max_bytes)
+                else
+                    NsecCache.init(nsec_alloc, NsecCache.default_max_bytes);
+            } else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
         };
@@ -114,6 +123,7 @@ pub const Server = struct {
             self.ca_bundle.deinit(self.allocator);
         }
         if (self.dedup) |*d| d.deinit();
+        if (self.nsec_cache) |*nc| nc.deinit();
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
@@ -196,6 +206,14 @@ pub const Server = struct {
         log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions, {d} prefetch-eligible, {d} stale", .{
             stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.prefetch_eligible, stats.stale_hits,
         });
+        if (self.nsec_cache) |*nc| {
+            const ns = nc.getStats();
+            const ns_total = ns.hits + ns.misses;
+            const ns_pct: u64 = if (ns_total > 0) ns.hits * 100 / ns_total else 0;
+            log.info("nsec cache: {d} zones, {d} bytes, {d} hits, {d} misses ({d}% hit rate)", .{
+                ns.zones, ns.memory_bytes, ns.hits, ns.misses, ns_pct,
+            });
+        }
     }
 
     fn workerThread(self: *Server, listen_addrs: []const std.net.Address) void {
@@ -288,6 +306,7 @@ pub const Server = struct {
             .rtt_cache = &self.rtt_cache,
             .ns_selector = &self.ns_selector,
             .dedup = if (self.dedup) |*d| d else null,
+            .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .shutdown = &self.shutdown,
         };
 
@@ -314,6 +333,7 @@ const WorkerState = struct {
     rtt_cache: *RttCache,
     ns_selector: *NsSelector,
     dedup: ?*InFlightTable,
+    nsec_cache: ?*NsecCache,
     shutdown: *std.atomic.Value(bool),
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
@@ -649,6 +669,7 @@ const WorkerState = struct {
                     .ns_selector = self.ns_selector,
                     .bypass_cache = bypass_cache,
                     .dedup = self.dedup,
+                    .nsec_cache = if (self.config.dnssec and !cd) self.nsec_cache else null,
                 };
                 var result = try resolver.resolve(alloc, name, qtype);
                 // Dupe into arena before stack-allocated resolver goes out of scope
