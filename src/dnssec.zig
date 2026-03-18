@@ -799,13 +799,9 @@ pub fn validateNegativeProof(
         // Walk ancestors of qname to construct *.ancestor and check wildcard denial
         var label_offset: usize = 1; // start at parent
         while (label_offset < qname.labels.len) : (label_offset += 1) {
-            var wc_labels_buf: [dns.max_label_count][]const u8 = undefined;
-            const ancestor_labels = qname.labels[label_offset..];
-            wc_labels_buf[0] = "*";
-            for (ancestor_labels, 0..) |label, i| {
-                wc_labels_buf[1 + i] = label;
-            }
-            const wildcard = dns.Name{ .labels = wc_labels_buf[0 .. 1 + ancestor_labels.len] };
+            var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+            const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
+            const wildcard = dns.makeWildcardName(&wc_labels_buf, ancestor) orelse continue;
 
             for (authorities) |rr| {
                 if (rr.rtype != .nsec) continue;
@@ -844,7 +840,7 @@ fn validateNsec3NegativeProof(
     for (authorities) |rr| {
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
-            if (nsec3.iterations > max_nsec3_iterations) return .insecure;
+            if (nsec3.iterations > max_nsec3_iterations) return .bogus;
             salt = nsec3.salt;
             iterations = nsec3.iterations;
             found_nsec3 = true;
@@ -857,7 +853,7 @@ fn validateNsec3NegativeProof(
 
     if (!is_nxdomain) {
         // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
-        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) orelse return .insecure;
+        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) orelse return .bogus;
         for (authorities) |rr| {
             if (rr.rtype != .nsec3) continue;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
@@ -882,7 +878,7 @@ fn validateNsec3NegativeProof(
     while (label_offset < qname.labels.len) : (label_offset += 1) {
         // Build ancestor name from qname.labels[label_offset..]
         const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) orelse return .insecure;
+        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) orelse return .bogus;
 
         for (authorities) |rr| {
             if (rr.rtype != .nsec3) continue;
@@ -901,17 +897,13 @@ fn validateNsec3NegativeProof(
 
     // Next closer name: CE + one label toward qname = qname.labels[ce_offset - 1..]
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) orelse return .insecure;
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) orelse return .bogus;
 
     // Wildcard at closest encloser: *.CE
-    var wc_labels_buf: [dns.max_label_count][]const u8 = undefined;
-    const ce_labels = qname.labels[ce_offset..];
-    wc_labels_buf[0] = "*";
-    for (ce_labels, 0..) |label, i| {
-        wc_labels_buf[1 + i] = label;
-    }
-    const wildcard = dns.Name{ .labels = wc_labels_buf[0 .. 1 + ce_labels.len] };
-    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) orelse return .insecure;
+    var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+    const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
+    const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
+    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) orelse return .bogus;
 
     // Verify: some NSEC3 covers the next-closer hash
     var nc_covered = false;
@@ -2042,7 +2034,38 @@ test "NSEC3 hash budget exhaustion" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true));
+}
+
+test "NSEC3 high-iteration returns bogus" {
+    // Iterations > 150 → .bogus (RFC 9276 §4: fail closed, don't downgrade to insecure)
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "www"), @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const salt: []const u8 = &.{};
+    var bufs: Nsec3OwnerBufs = .{};
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
+
+    // NSEC3 with iterations=200 (exceeds max_nsec3_iterations=150)
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = 1,
+            .flags = 0,
+            .iterations = 200,
+            .salt = salt,
+            .next_hashed_owner = &([_]u8{0x43} ** 20),
+            .type_bit_maps = &.{},
+        } },
+    }};
+
+    // Both NXDOMAIN and NODATA should return .bogus
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, false));
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────

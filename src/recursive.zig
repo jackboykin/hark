@@ -172,15 +172,24 @@ pub const RecursiveResolver = struct {
             if (!self.bypass_cache and self.dnssec_enabled) {
                 if (self.nsec_cache) |nc| {
                     if (nc.lookupSuffixes(allocator, target_name, qtype, current_name)) |synth| {
-                        const rcode: dns.RCode = switch (synth.rcode) {
-                            .nxdomain => .name_error,
-                            .nodata => .no_error,
-                        };
-                        return .{
-                            .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, &.{synth.soa}, rcode, true)),
-                            .prefetch_name = prefetch_name,
-                            .prefetch_qtype = qtype,
-                        };
+                        switch (synth.rcode) {
+                            .nxdomain, .nodata => |rc| {
+                                const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
+                                return .{
+                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                                    .prefetch_name = prefetch_name,
+                                    .prefetch_qtype = qtype,
+                                };
+                            },
+                            .wildcard_match => {
+                                // RFC 8198 §5.3: synthesize answer from cached wildcard RRset.
+                                // Copy wildcard_name (thread-local buffer) into arena.
+                                if (try self.tryWildcardSynth(allocator, synth.wildcard_name, synth.soa, target_name, qtype, cname_chain.items)) |result| {
+                                    return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
+                                }
+                                // Wildcard RRset not in cache — fall through to upstream (RFC 8198 §5.3 MUST)
+                            },
+                        }
                     }
                 }
             }
@@ -576,7 +585,14 @@ pub const RecursiveResolver = struct {
                             .skip => {},
                         }
                     }
-                    if (self.cache) |c| c.storeResponseWithStatus(response, parent_zone, answer_status);
+                    if (self.cache) |c| {
+                        c.storeResponseWithStatus(response, parent_zone, answer_status);
+                        // Store wildcard RRsets for aggressive NSEC synthesis (RFC 8198 §5.3).
+                        // Detect wildcard expansion: RRSIG labels < owner name labels.
+                        if (answer_status == .secure and self.nsec_cache != null) {
+                            self.storeWildcardRRsets(response.answers, qtype);
+                        }
+                    }
 
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -692,10 +708,95 @@ pub const RecursiveResolver = struct {
         return if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut)) .insecure else .secure;
     }
 
+    /// Try to synthesize a wildcard answer from the main RRset cache.
+    /// Returns a synthesized message on success, or null to fall through to upstream.
+    fn tryWildcardSynth(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        wildcard_name: ?[]const u8,
+        soa: dns.ResourceRecord,
+        target_name: dns.Name,
+        qtype: dns.RType,
+        cname_chain_items: []const dns.ResourceRecord,
+    ) !?dns.Message {
+        const wc_dotted = wildcard_name orelse return null;
+        const c = self.cache orelse return null;
+        const wc_result = c.lookup(allocator, wc_dotted, qtype, .in) orelse return null;
+        switch (wc_result) {
+            .hit => |h| {
+                // Rewrite owner names from *.example.com to the queried name (RFC 4592 §2.2)
+                for (h.records) |*rr| {
+                    rr.name = dns.cloneName(allocator, target_name) catch return null;
+                }
+                return try withCnameChain(allocator, cname_chain_items, makeCachedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
+            },
+            .negative => return null,
+        }
+    }
+
     /// Store validated NSEC records in the aggressive NSEC cache.
     fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name) void {
         if (self.nsec_cache) |nc| {
             nc.storeFromAuthority(authorities, zone);
+        }
+    }
+
+    /// Detect wildcard expansion in validated answers and store the wildcard RRset
+    /// in the main cache under the wildcard name (e.g. *.example.com) for later
+    /// synthesis by the NSEC cache (RFC 8198 §5.3).
+    fn storeWildcardRRsets(
+        self: *RecursiveResolver,
+        answers: []const dns.ResourceRecord,
+        qtype: dns.RType,
+    ) void {
+        // Find RRSIG for qtype to detect wildcard expansion
+        const rrsig = dnssec.findRrsig(answers, qtype) orelse return;
+        const rrsig_labels = rrsig.labels;
+
+        // Single pass: detect wildcard expansion from the first expanded answer record,
+        // then collect all qtype records + covering RRSIGs with wildcard owner name.
+        var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+        var wildcard_owner: ?dns.Name = null;
+        var wc_records: [16]dns.ResourceRecord = undefined;
+        var wc_count: usize = 0;
+        for (answers) |ans_rr| {
+            if (wc_count >= wc_records.len) break;
+            // Detect wildcard from first answer record where RRSIG labels < owner labels
+            if (wildcard_owner == null and ans_rr.rtype == qtype and ans_rr.name.labels.len > rrsig_labels) {
+                const ce = dns.Name{ .labels = ans_rr.name.labels[ans_rr.name.labels.len - rrsig_labels ..] };
+                wildcard_owner = dns.makeWildcardName(&wc_labels_buf, ce);
+            }
+            const wco = wildcard_owner orelse continue;
+            const dominated = ans_rr.rtype == qtype or
+                (ans_rr.rtype == .rrsig and ans_rr.rdata.rrsig.type_covered == qtype);
+            if (dominated) {
+                wc_records[wc_count] = ans_rr;
+                wc_records[wc_count].name = wco;
+                wc_count += 1;
+            }
+        }
+        if (wc_count == 0) return;
+
+        // Store in main cache under wildcard name with .secure status
+        // The zone for bailiwick is the signer zone (closest encloser parent)
+        const signer_zone = rrsig.signer_name;
+        if (self.cache) |c| {
+            c.storeResponseWithStatus(.{
+                .header = .{
+                    .id = 0, .qr = true, .opcode = .query, .aa = true,
+                    .tc = false, .rd = false, .ra = false,
+                    .z = 0, .ad = false, .cd = false,
+                    .rcode = .no_error,
+                    .qd_count = 0,
+                    .an_count = @intCast(wc_count),
+                    .ns_count = 0,
+                    .ar_count = 0,
+                },
+                .questions = &.{},
+                .answers = wc_records[0..wc_count],
+                .authorities = &.{},
+                .additionals = &.{},
+            }, signer_zone, .secure);
         }
     }
 

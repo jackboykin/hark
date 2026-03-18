@@ -1995,6 +1995,17 @@ pub fn cloneName(allocator: Allocator, name: Name) !Name {
     return .{ .labels = labels };
 }
 
+/// Build a wildcard name (*.closest-encloser) from a closest encloser name
+/// into a caller-provided label buffer. Returns null if CE has too many labels.
+pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser: Name) ?Name {
+    if (closest_encloser.labels.len >= buf.len) return null;
+    buf[0] = "*";
+    for (closest_encloser.labels, 0..) |label, i| {
+        buf[1 + i] = label;
+    }
+    return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
+}
+
 pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);

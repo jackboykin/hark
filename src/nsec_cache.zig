@@ -213,8 +213,11 @@ pub const SynthResult = struct {
     rcode: RCode,
     /// SOA for authority section (RFC 2308 §3), cloned into caller's allocator.
     soa: dns.ResourceRecord,
+    /// For wildcard_match: dotted wildcard name for RRset cache lookup (e.g. "*.example.com").
+    /// Points to thread-local buffer — caller must consume before next NSEC cache call.
+    wildcard_name: ?[]const u8 = null,
 
-    pub const RCode = enum { nxdomain, nodata };
+    pub const RCode = enum { nxdomain, nodata, wildcard_match };
 };
 
 pub const NsecCache = struct {
@@ -411,23 +414,38 @@ pub const NsecCache = struct {
 
         const cached_soa = &(list.soa orelse return null);
 
-        if (tryNxdomain(list, qname, now)) {
-            const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
-            _ = self.hits.fetchAdd(1, .monotonic);
-            return .{ .rcode = .nxdomain, .soa = soa };
-        }
-        if (list.findExact(qname, now)) |nsec| {
-            // Don't synthesize NODATA if CNAME exists — query must follow the
-            // CNAME chain (RFC 1034 §3.6.2, RFC 4035 §2.5).
-            if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
-                return null;
-            if (!dns.typeBitmapContains(nsec.type_bit_maps, qtype)) {
-                const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
-                _ = self.hits.fetchAdd(1, .monotonic);
-                return .{ .rcode = .nodata, .soa = soa };
+        // Parent-zone depth guard: if qname is >1 label deeper than the zone,
+        // a non-delegation NSEC range from this zone could falsely cover names
+        // in a child zone (e.g., a .com NSEC covering nnn.example.com).
+        // Verify the direct-child ancestor is covered (proving it doesn't exist,
+        // so no delegation is possible). DS queries are exempt (always answered
+        // by the parent zone).
+        const zone_label_count = zoneLabelsLen(zone_lower);
+        if (qname.labels.len > zone_label_count + 1 and qtype != .ds) {
+            const direct_child = dns.Name{ .labels = qname.labels[qname.labels.len - zone_label_count - 1 ..] };
+            if (list.findCovering(direct_child, now) == null) {
+                return null; // can't prove no delegation exists
             }
         }
-        return null;
+
+        const rcode: SynthResult.RCode, const wc_name: ?[]const u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
+            .nxdomain => .{ .nxdomain, null },
+            .wildcard_nodata => .{ .nodata, null },
+            .wildcard_match => |wc| .{ .wildcard_match, wc },
+            .unknown => nodata: {
+                const nsec = list.findExact(qname, now) orelse return null;
+                // Don't synthesize NODATA if CNAME exists — query must follow the
+                // CNAME chain (RFC 1034 §3.6.2, RFC 4035 §2.5).
+                if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
+                    return null;
+                if (!dns.typeBitmapContains(nsec.type_bit_maps, qtype))
+                    break :nodata .{ .nodata, null };
+                return null;
+            },
+        };
+        const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
+        _ = self.hits.fetchAdd(1, .monotonic);
+        return .{ .rcode = rcode, .soa = soa, .wildcard_name = wc_name };
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
@@ -442,27 +460,58 @@ pub const NsecCache = struct {
     }
 };
 
-fn tryNxdomain(list: *const ZoneNsecList, qname: dns.Name, now: i64) bool {
-    // (a) Find NSEC covering qname
-    _ = list.findCovering(qname, now) orelse return false;
+/// Count labels in a dotted zone name (e.g., "example.com" → 2, "" → 0).
+fn zoneLabelsLen(zone_lower: []const u8) usize {
+    if (zone_lower.len == 0) return 0;
+    var count: usize = 1;
+    for (zone_lower) |c| {
+        if (c == '.') count += 1;
+    }
+    return count;
+}
 
-    // (b) Determine closest encloser, then prove wildcard doesn't exist
-    const ce = findClosestEncloser(list, qname, now) orelse return false;
+/// Result of name non-existence proof (RFC 8198 §5.3).
+const NameNonExistence = union(enum) {
+    nxdomain, // name and wildcard both don't exist
+    wildcard_nodata, // name doesn't exist, wildcard exists but lacks qtype
+    wildcard_match: []const u8, // name doesn't exist, wildcard exists and has qtype — dotted wildcard name
+    unknown, // can't prove anything
+};
+
+fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RType, now: i64) NameNonExistence {
+    // (a) Find NSEC covering qname
+    _ = list.findCovering(qname, now) orelse return .unknown;
+
+    // (b) Determine closest encloser, then check wildcard
+    const ce = findClosestEncloser(list, qname, now) orelse return .unknown;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
-    wc_labels_buf[0] = "*";
-    if (ce.labels.len >= wc_labels_buf.len) return false;
-    for (ce.labels, 0..) |label, i| {
-        wc_labels_buf[i + 1] = label;
+    const wildcard_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unknown;
+
+    // Check if wildcard exists
+    if (list.findExact(wildcard_name, now)) |wc_nsec| {
+        // Wildcard exists — check type bitmap for synthesis
+        // CNAME at wildcard: must follow CNAME upstream, can't synthesize here
+        if (qtype != .cname and dns.typeBitmapContains(wc_nsec.type_bit_maps, .cname))
+            return .unknown;
+        if (!dns.typeBitmapContains(wc_nsec.type_bit_maps, qtype)) {
+            return .wildcard_nodata;
+        }
+        // Wildcard has the queried type — format the dotted name for RRset cache lookup
+        const wc_fmt = wildcard_name.format();
+        const wc_len = mem.indexOfScalar(u8, &wc_fmt, 0) orelse wc_fmt.len;
+        // Store in a comptime-known max-size buffer on the list's existing memory
+        // Use a thread-local buffer since we're under shared lock
+        const S = struct {
+            threadlocal var buf: [dns.max_name_len + 1]u8 = undefined;
+        };
+        @memcpy(S.buf[0..wc_len], wc_fmt[0..wc_len]);
+        return .{ .wildcard_match = S.buf[0..wc_len] };
     }
-    const wildcard_name = dns.Name{ .labels = wc_labels_buf[0 .. ce.labels.len + 1] };
 
-    // Wildcard exists → can't synthesize NXDOMAIN
-    if (list.findExact(wildcard_name, now) != null) return false;
-
-    // Prove wildcard name is covered by an NSEC
-    _ = list.findCovering(wildcard_name, now) orelse return false;
-    return true;
+    // Prove wildcard name is covered by an NSEC (doesn't exist)
+    _ = list.findCovering(wildcard_name, now) orelse return .unknown;
+    return .nxdomain;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -665,10 +714,14 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
     }, example_zone);
 
-    // "foo.example.com" — name doesn't exist, but wildcard does → no NXDOMAIN
+    // "foo.example.com" — name doesn't exist, wildcard exists with A
+    // → wildcard_match (not NXDOMAIN). Caller synthesizes from RRset cache.
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
     defer dns.freeName(alloc, qname);
-    try testing.expect(nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") == null);
+    const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
+    defer freeSoaRecord(alloc, @constCast(&result.soa));
+    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    try testing.expect(result.wildcard_name != null);
 }
 
 test "NSEC cache: apex NODATA via full-name zone check" {
@@ -764,4 +817,167 @@ test "NSEC cache: wrap-around NSEC chain" {
     const alpha = try dns.parseDottedName(alloc, "alpha.example.com");
     defer dns.freeName(alloc, alpha);
     try expectSynth(alloc, nc.lookupSuffixes(alloc, alpha, .a, "alpha.example.com"), .nxdomain);
+}
+
+test "NSEC cache: parent-zone depth check prevents cross-zone coverage" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // Store NSECs in the "com" zone where the range covers deep child names
+    // but the direct child ancestor (example.com) is NOT covered by any NSEC.
+    // This means we can't prove "example.com" doesn't exist → can't rule out delegation.
+    const com_zone = dns.Name{ .labels = &.{"com"} };
+    const bitmap = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_host = &[_]u8{ 0, 2, 0x40, 0x01 };
+
+    const com_soa = dns.ResourceRecord{
+        .name = com_zone,
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .soa = .{
+            .mname = com_zone,
+            .rname = com_zone,
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = 300,
+        } },
+    };
+
+    // NSECs: com → aaa.com, ggg.com → zzz.com
+    // Gap: aaa.com to ggg.com is NOT covered — example.com falls in this gap.
+    // But ggg.com → zzz.com covers "nnn.example.com" in canonical order.
+    const com_owner = try dns.parseDottedName(alloc, "com");
+    const aaa_next = try dns.parseDottedName(alloc, "aaa.com");
+    const ggg_owner = try dns.parseDottedName(alloc, "ggg.com");
+    const zzz_next = try dns.parseDottedName(alloc, "zzz.com");
+    defer dns.freeName(alloc, com_owner);
+    defer dns.freeName(alloc, aaa_next);
+    defer dns.freeName(alloc, ggg_owner);
+    defer dns.freeName(alloc, zzz_next);
+
+    nc.storeFromAuthority(&.{
+        com_soa,
+        .{ .name = com_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = aaa_next, .type_bit_maps = bitmap } } },
+        .{ .name = ggg_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = zzz_next, .type_bit_maps = bitmap_host } } },
+    }, com_zone);
+
+    // nnn.com (1 label deeper than zone) — should work, no depth issue
+    const nnn_com = try dns.parseDottedName(alloc, "nnn.com");
+    defer dns.freeName(alloc, nnn_com);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, nnn_com, .a, "nnn.com"), .nxdomain);
+
+    // nnn.example.com (2 labels deeper than "com" zone) — depth check should reject
+    // because "example.com" is NOT covered by any NSEC (falls in gap aaa.com→ggg.com)
+    const deep_name = try dns.parseDottedName(alloc, "nnn.example.com");
+    defer dns.freeName(alloc, deep_name);
+    try testing.expect(nc.lookupSuffixes(alloc, deep_name, .a, "nnn.example.com") == null);
+
+    // DS queries are exempt from the depth check (parent zone answers them)
+    try testing.expect(nc.lookupSuffixes(alloc, deep_name, .ds, "nnn.example.com") == null);
+}
+
+test "NSEC cache: wildcard NODATA synthesis" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // Zone has: example.com NSEC *.example.com, *.example.com NSEC z.example.com
+    // Wildcard exists with A and MX but NOT TXT
+    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A, NS
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex_owner = try dns.parseDottedName(alloc, "example.com");
+    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
+    const z_name = try dns.parseDottedName(alloc, "z.example.com");
+    defer dns.freeName(alloc, apex_owner);
+    defer dns.freeName(alloc, wc_name);
+    defer dns.freeName(alloc, z_name);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
+        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
+    }, example_zone);
+
+    // "foo.example.com" doesn't exist, wildcard exists but lacks TXT → NODATA
+    const qname = try dns.parseDottedName(alloc, "foo.example.com");
+    defer dns.freeName(alloc, qname);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .txt, "foo.example.com"), .nodata);
+}
+
+test "NSEC cache: wildcard match returns wildcard_match" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // Wildcard has A (bitmap includes type 1)
+    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A=1, NS=2 present
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex_owner = try dns.parseDottedName(alloc, "example.com");
+    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
+    const z_name = try dns.parseDottedName(alloc, "z.example.com");
+    defer dns.freeName(alloc, apex_owner);
+    defer dns.freeName(alloc, wc_name);
+    defer dns.freeName(alloc, z_name);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
+        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
+    }, example_zone);
+
+    // "foo.example.com" A — wildcard has A → wildcard_match
+    const qname = try dns.parseDottedName(alloc, "foo.example.com");
+    defer dns.freeName(alloc, qname);
+    const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
+    defer freeSoaRecord(alloc, @constCast(&result.soa));
+    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    try testing.expect(result.wildcard_name != null);
+}
+
+test "NSEC cache: wildcard CNAME suppression" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // Wildcard bitmap has CNAME(5) — query for A should return unknown (follow CNAME upstream)
+    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_wc = &[_]u8{ 0, 6, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03 }; // CNAME(5), RRSIG(46), NSEC(47)
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex_owner = try dns.parseDottedName(alloc, "example.com");
+    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
+    const z_name = try dns.parseDottedName(alloc, "z.example.com");
+    defer dns.freeName(alloc, apex_owner);
+    defer dns.freeName(alloc, wc_name);
+    defer dns.freeName(alloc, z_name);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
+        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
+    }, example_zone);
+
+    // A query when wildcard has CNAME → must NOT synthesize (follow CNAME upstream)
+    const qname = try dns.parseDottedName(alloc, "foo.example.com");
+    defer dns.freeName(alloc, qname);
+    try testing.expect(nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") == null);
+}
+
+test "zoneLabelsLen" {
+    try testing.expectEqual(@as(usize, 0), zoneLabelsLen(""));
+    try testing.expectEqual(@as(usize, 1), zoneLabelsLen("com"));
+    try testing.expectEqual(@as(usize, 2), zoneLabelsLen("example.com"));
+    try testing.expectEqual(@as(usize, 3), zoneLabelsLen("sub.example.com"));
 }
