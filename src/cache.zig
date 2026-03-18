@@ -544,12 +544,20 @@ pub const RRsetCache = struct {
     /// Cache all RRsets from a DNS response. Applies bailiwick filtering
     /// to all sections to prevent cache poisoning.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
+        self.storeResponseWithStatus(response, authority_zone, .unchecked);
+    }
+
+    /// Cache answer RRsets with an explicit security status, and
+    /// authorities/additionals with .unchecked (delegation data).
+    /// Used by validate-then-store to cache with the correct status
+    /// directly, avoiding the unchecked→secure race window.
+    pub fn storeResponseWithStatus(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
         if (response.header.rcode != .no_error) return;
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
-        self.storeRRsets(response.answers, authority_zone, true);
-        self.storeRRsets(response.authorities, authority_zone, true);
-        self.storeRRsets(response.additionals, authority_zone, true);
+        self.storeRRsetsImpl(response.answers, authority_zone, true, status);
+        self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
+        self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
     }
 
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
@@ -639,8 +647,8 @@ pub const RRsetCache = struct {
     }
 
     /// Store a bare negative entry (no SOA required).
-    /// Used to cache insecure delegation status (negative DS) so that
-    /// cached delegation lookups can determine DNSSEC security state.
+    /// Used to cache insecure delegation status (negative DS) and
+    /// DNSSEC validation failures (bogus SERVFAIL).
     pub fn storeNegativeBare(
         self: *RRsetCache,
         name: []const u8,
@@ -648,6 +656,7 @@ pub const RRsetCache = struct {
         rclass: dns.RClass,
         rcode: dns.RCode,
         ttl: u32,
+        security_status: SecurityStatus,
     ) void {
         if (self.mutex) |*m| m.lock();
         defer if (self.mutex) |*m| m.unlock();
@@ -682,6 +691,7 @@ pub const RRsetCache = struct {
             .original_ttl = capped_ttl,
             .stored_at = now,
             .soa = null,
+            .security_status = security_status,
         } }) catch {
             alloc.free(key_name);
             return;
@@ -689,31 +699,10 @@ pub const RRsetCache = struct {
         _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
-    /// Update the DNSSEC security status of an existing cache entry.
-    /// Called after DNSSEC validation succeeds to mark cached data as
-    /// authenticated (RFC 4035 §3.2.3).
-    pub fn updateSecurityStatus(
-        self: *RRsetCache,
-        name: []const u8,
-        rtype: dns.RType,
-        rclass: dns.RClass,
-        status: SecurityStatus,
-    ) void {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
-        const lower_name = lowerNameBuf(&lower_buf, name) orelse return;
-        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const entry = self.map.getPtr(probe) orelse return;
-        switch (entry.*) {
-            .positive => |*rrset| rrset.security_status = status,
-            .negative => |*neg| neg.security_status = status,
-        }
-    }
-
     // ── Internal ──────────────────────────────────────────────────────
 
-    fn storeRRsets(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, check_bailiwick: bool) void {
+    fn storeRRsetsImpl(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, check_bailiwick: bool, status: SecurityStatus) void {
+        if (records.len == 0) return;
         const alloc = self.counting.allocator();
 
         // Track which (name, type) groups we've already processed in this batch
@@ -841,6 +830,7 @@ pub const RRsetCache = struct {
                 .expires_at = now + @as(i64, capped_ttl),
                 .original_ttl = capped_ttl,
                 .stored_at = now,
+                .security_status = status,
             } }) catch {
                 for (final_records) |cr| {
                     dns.freeName(alloc, cr.name);

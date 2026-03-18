@@ -309,7 +309,6 @@ pub const RecursiveResolver = struct {
                                                 }
                                                 response = tls_response;
                                                 got_response = true;
-                                                if (self.cache) |c| c.storeResponse(response, parent_zone);
                                                 // Don't update RTT cache or NS selector from TLS —
                                                 // different transport latency would poison Do53 estimates.
                                                 break;
@@ -353,7 +352,6 @@ pub const RecursiveResolver = struct {
                         ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
                     got_response = true;
                     responding_server = server;
-                    if (self.cache) |c| c.storeResponse(response, parent_zone);
                     break;
                 }
 
@@ -385,6 +383,7 @@ pub const RecursiveResolver = struct {
                     // may contain NS records in authority that are not valid delegations)
                     if (response.header.rcode == .no_error) {
                         if (extractReferral(response, target_name, parent_zone)) |referral| {
+                            if (self.cache) |c| c.storeResponse(response, parent_zone);
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
                             minimise_label_count = parent_zone.labels.len + 1;
                             continue;
@@ -428,7 +427,10 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                    if (self.cache) |c| {
+                                        c.storeResponse(response, parent_zone);
+                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                    }
                                 }
                             },
                             .skip_cache => {},
@@ -501,6 +503,7 @@ pub const RecursiveResolver = struct {
 
                         if (!has_target_type) {
                             // Validate CNAME RRset before following in secure zones
+                            var cname_status: cache_mod.SecurityStatus = .unchecked;
                             if (self.dnssec_enabled and security_state == .secure) {
                                 if (dnssec.findRrsig(response.answers, .cname) != null) {
                                     switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
@@ -510,16 +513,15 @@ pub const RecursiveResolver = struct {
                                             return self.bogusServfail(current_name, qtype);
                                         },
                                         .valid => {
-                                            if (self.cache) |c| {
-                                                c.storeResponse(response, parent_zone);
-                                                c.updateSecurityStatus(current_name, .cname, .in, .secure);
-                                            }
+                                            cname_status = .secure;
                                         },
                                         .skip => {},
                                     }
                                 }
                             }
                             if (findCnameRecord(response, target_name)) |cname_rr| {
+                                // Store before following CNAME — won't reach final answer validation
+                                if (self.cache) |c| c.storeResponseWithStatus(response, parent_zone, cname_status);
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
@@ -532,10 +534,12 @@ pub const RecursiveResolver = struct {
                                 }
                                 continue :cname_loop;
                             }
+                            // No CNAME found — fall through to final answer validation
                         }
                     }
 
                     // Validate answer RRsets if in secure zone
+                    var answer_status: cache_mod.SecurityStatus = .unchecked;
                     if (self.dnssec_enabled) {
                         switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
                             .bogus => {
@@ -544,11 +548,12 @@ pub const RecursiveResolver = struct {
                                 return self.bogusServfail(current_name, qtype);
                             },
                             .valid => {
-                                if (self.cache) |c| c.updateSecurityStatus(current_name, qtype, .in, .secure);
+                                answer_status = .secure;
                             },
                             .skip => {},
                         }
                     }
+                    if (self.cache) |c| c.storeResponseWithStatus(response, parent_zone, answer_status);
 
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -560,7 +565,10 @@ pub const RecursiveResolver = struct {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
                             .proceed => {
                                 if (security_state == .secure) response.header.ad = true;
-                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                if (self.cache) |c| {
+                                    c.storeResponse(response, parent_zone);
+                                    c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                }
                             },
                             .skip_cache => {},
                             .bogus => return self.bogusServfail(current_name, qtype),
@@ -569,6 +577,7 @@ pub const RecursiveResolver = struct {
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };
 
+                if (self.cache) |c| c.storeResponse(response, parent_zone);
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
                 minimise_label_count = parent_zone.labels.len + 1;
             }
@@ -721,7 +730,7 @@ pub const RecursiveResolver = struct {
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
-        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl);
+        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked);
         return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
@@ -1332,7 +1341,7 @@ fn cacheInsecureDelegation(
     }
 
     const zs = nameToSlice(zone_cut);
-    c.storeNegativeBare(zs.buf[0..zs.len], .ds, .in, .no_error, neg_ttl);
+    c.storeNegativeBare(zs.buf[0..zs.len], .ds, .in, .no_error, neg_ttl, .insecure);
 }
 
 /// Validate DNSKEY answers against cached DS records (RFC 4035 §5.2).
