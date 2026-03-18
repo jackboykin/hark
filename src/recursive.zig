@@ -300,7 +300,8 @@ pub const RecursiveResolver = struct {
                                     if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
                                         if (try tryParseMessage(allocator, tls_data)) |tls_response| {
                                             if (tls_response.header.qr and
-                                                tls_response.header.rcode != .format_error)
+                                                tls_response.header.rcode != .format_error and
+                                                validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
                                             {
                                                 if (tls_response.header.rcode.isServerError()) {
                                                     last_server_failure = tls_response;
@@ -335,6 +336,9 @@ pub const RecursiveResolver = struct {
                         continue;
                     };
                     const do53_elapsed = monotonicMicros() - do53_start;
+
+                    // RFC 5452 §9.1: question section must match original query
+                    if (!validateQuestionMatch(response, query_msg.questions[0].name, query_type)) continue;
 
                     // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
                     // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
@@ -474,6 +478,7 @@ pub const RecursiveResolver = struct {
                     if (response.header.rcode == .name_error and response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers[0..server_count])) {
                             .proceed => {
+                                if (security_state == .secure) response.header.ad = true;
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                             },
                             .skip_cache => {},
@@ -554,6 +559,7 @@ pub const RecursiveResolver = struct {
                     if (response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
                             .proceed => {
+                                if (security_state == .secure) response.header.ad = true;
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                             },
                             .skip_cache => {},
@@ -830,6 +836,10 @@ pub const RecursiveResolver = struct {
                         .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed) catch return null,
                         .negative => return null, // Re-probe established insecure — caller's security_state is stale
                     }
+                } else {
+                    // Root zone: validate against hardcoded trust anchor
+                    const now_u32 = epochNowU32();
+                    dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32) catch return null;
                 }
             }
         }
@@ -882,6 +892,8 @@ pub const RecursiveResolver = struct {
             const response = try self.queryServerUdp(
                 allocator, wire_query, query_id, server, timeout,
             ) orelse continue;
+            // RFC 5452 §9.1: question section must match original query
+            if (!validateQuestionMatch(response, query_msg.questions[0].name, qtype)) continue;
             if (response.header.rcode != .no_error) continue;
             if (store_response) {
                 if (self.cache) |c| c.storeResponse(response, authority_zone);
@@ -1413,6 +1425,14 @@ fn epochNowU32() u32 {
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
     const s = nameToSlice(name);
     return allocator.dupe(u8, s.buf[0..s.len]);
+}
+
+/// RFC 5452 §9.1: verify response question matches the original query.
+/// Mismatch MUST be considered invalid (possible cache poisoning attempt).
+fn validateQuestionMatch(response: dns.Message, expected_name: dns.Name, expected_type: dns.RType) bool {
+    if (response.questions.len == 0) return false;
+    const q = response.questions[0];
+    return q.qtype == expected_type and q.qclass == .in and q.name.eql(expected_name);
 }
 
 fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord {

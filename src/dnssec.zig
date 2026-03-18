@@ -182,6 +182,7 @@ pub fn classifyDelegation(
     if (has_ds) return .secure;
 
     // No DS — check for NSEC/NSEC3 proof of DS absence
+    var had_nsec3_high_iterations = false;
     for (authorities) |rr| {
         if (rr.rtype == .nsec) {
             if (rr.name.eql(child_zone)) {
@@ -193,7 +194,10 @@ pub fn classifyDelegation(
         }
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
-            if (nsec3.iterations > max_nsec3_iterations) continue;
+            if (nsec3.iterations > max_nsec3_iterations) {
+                had_nsec3_high_iterations = true;
+                continue;
+            }
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
             const child_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
             if (mem.eql(u8, &owner_hash, &child_hash)) {
@@ -209,6 +213,11 @@ pub fn classifyDelegation(
             }
         }
     }
+
+    // RFC 9276 §4: high-iteration NSEC3 MUST NOT downgrade to insecure.
+    // SERVFAIL (return .secure) prevents attacker-injected high-iteration
+    // NSEC3 from bypassing DNSSEC validation for the child zone.
+    if (had_nsec3_high_iterations) return .secure;
 
     // No DS and no NSEC proof — indeterminate, treat as insecure (don't ServFail)
     return .insecure;

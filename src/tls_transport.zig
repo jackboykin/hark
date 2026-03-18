@@ -167,6 +167,7 @@ pub const TlsTransport = struct {
                 .no_verification
             else
                 .{ .bundle = self.ca_bundle },
+            .alpn = "dot", // RFC 9539 §4.4: DoT queries MUST use ALPN "dot"
             .read_buffer = &conn.tls_read_buf,
             .write_buffer = &conn.tls_write_buf,
         }) catch return error.TlsHandshakeFailed;

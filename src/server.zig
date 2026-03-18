@@ -54,6 +54,7 @@ pub const Server = struct {
     encrypted_ns_cache: ?EncryptedNsCache,
     enc_pool: ?ConnectionPool,
     shutdown: std.atomic.Value(bool),
+    worker_errors: std.atomic.Value(u32),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig) !Server {
         const cache_opts = RRsetCache.CacheOptions{
@@ -99,6 +100,7 @@ pub const Server = struct {
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator) else null,
             .shutdown = std.atomic.Value(bool).init(false),
+            .worker_errors = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -181,6 +183,12 @@ pub const Server = struct {
             for (threads) |t| t.join();
         }
 
+        // Check for worker failures
+        const failed = self.worker_errors.load(.monotonic);
+        if (failed > 0) {
+            log.warn("{d} worker(s) failed to initialize — running with degraded capacity", .{failed});
+        }
+
         // Log cache stats on shutdown
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
@@ -198,6 +206,7 @@ pub const Server = struct {
         // Per-thread EventLoop for server accept/recv
         const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
             return;
         };
         defer server_loop.destroy();
@@ -207,6 +216,7 @@ pub const Server = struct {
         // server's pending accept/signalfd operations.
         const transport_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create transport event loop: {s}", .{@errorName(err)});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
             return;
         };
         defer transport_loop.destroy();
@@ -214,6 +224,7 @@ pub const Server = struct {
         // Per-thread outbound transport (uses its own loop)
         var udp_transport = UdpTransport.init(transport_loop, .{}) catch |err| {
             log.err("worker failed to create UDP transport: {s}", .{@errorName(err)});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
             return;
         };
         defer udp_transport.deinit();
@@ -256,6 +267,7 @@ pub const Server = struct {
         }
         if (!any_ok) {
             log.err("worker failed to bind any listen address", .{});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
             return;
         }
 
