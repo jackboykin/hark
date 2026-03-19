@@ -5,15 +5,16 @@ Runs on Linux with io_uring. Zero external dependencies.
 
 ## Features
 
-- DNS-over-TLS with opportunistic encryption to authoritatives (RFC 9539)
-- Background TLS probing with connection pooling
-- DNSSEC validation (RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519)
-- Full recursive resolution from the root, with QNAME minimization
-- In-memory RRset cache with RFC 2308 negative caching
-- Cache prefetch and serve-stale (RFC 8767)
-- Query deduplication across workers (singleflight)
-- Multi-threaded server mode with `SO_REUSEPORT`
-- Thompson Sampling nameserver selection (per-zone, discounted)
+- **Concurrent resolution** — per-worker thread pool with blocking sockets; main thread stays on io_uring for client I/O
+- **Staggered NS racing** — query two nameservers with adaptive delay, take first response (RFC 5452 safe)
+- **DNSSEC validation** — RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519; validate-then-store; dedicated key cache
+- **Aggressive NSEC negative caching** — synthesize NXDOMAIN/NODATA from cached NSEC records with wildcard synthesis (RFC 8198)
+- **DNS-over-TLS** — opportunistic encryption to authoritatives (RFC 9539) with background probing and connection pooling
+- **Full recursive resolution** from root hints with QNAME minimization
+- **In-memory RRset cache** with RwLock, RFC 2308 negative caching, prefetch, serve-stale (RFC 8767)
+- **Thompson Sampling** nameserver selection (per-zone, discounted)
+- **Query deduplication** across workers (singleflight)
+- **Multi-threaded server** with `SO_REUSEPORT`, per-query memory cap
 - UDP and TCP transport with EDNS0
 - Forwarding mode as an alternative to recursion
 
@@ -60,12 +61,14 @@ hark dump < packet.bin
 [server]
 listen = ["127.0.0.1:53", "[::1]:53"]
 workers = 4
+resolution-threads = 4      # pool threads per worker for concurrent resolution
 
 [resolver]
 mode = "recursive"          # or "forward"
 dnssec = true
 qname-minimization = true
 opportunistic = true        # RFC 9539 encrypted transport to authoritatives
+stagger-ms = 150             # staggered NS racing delay (0 to disable)
 
 [cache]
 prefetch = true
@@ -76,31 +79,33 @@ min-ttl = 300                # floor for aggressive CDN TTLs
 queries = true
 ```
 
-All fields are optional — defaults are localhost:53, recursive mode, DNSSEC off, workers = CPU count.
+All fields are optional — defaults are localhost:53, recursive mode, DNSSEC off, workers = CPU count, 4 resolution threads per worker.
 
 ## Architecture
 
 ```
               ┌───────────────────────────┐
- clients ───► │   Server (UDP/TCP)        │
+ clients ───► │  Server (io_uring accept) │
               └─────────────┬─────────────┘
-                            │
+                            │ work queue
               ┌─────────────▼─────────────┐
-              │   Query Pipeline          │
+              │   Resolution Pool         │
+              │   (blocking sockets)      │
               │                           │
               │   Deduplication           │
-              │   Cache lookup / prefetch │
+              │   Cache lookup (RwLock)   │
               │   QNAME minimization      │
+              │   Staggered NS racing     │
               │   Recursive resolution    │
               │   DNSSEC validation       │
+              │   Async prefetch          │
               │                           │
               └─────────────┬─────────────┘
                             │
               ┌─────────────▼─────────────┐
               │   Transport               │
-              │   UDP / io_uring          │
+              │   UDP (connected sockets) │
               │   TCP fallback            │
-              │   EDNS0 payload sizing    │
               │   DoT / RFC 9539          │
               │   TLS connection pool     │
               └─────────────┬─────────────┘
@@ -112,6 +117,6 @@ All fields are optional — defaults are localhost:53, recursive mode, DNSSEC of
 
 ## Design
 
-- **Linux-first** — io_uring for all network I/O. Portability is not a goal.
+- **Linux-first** — io_uring for client I/O, blocking sockets for upstream queries. Portability is not a goal.
 - **Zero dependencies** — stdlib only. No vendored C, no package manager.
 - **Tested** — fuzzed parsers, integration tests against live DNS, leak detection via `std.testing.allocator`.

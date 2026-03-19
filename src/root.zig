@@ -18,6 +18,7 @@ pub const ns_selector = @import("ns_selector.zig");
 pub const dedup = @import("dedup.zig");
 pub const nsec_cache = @import("nsec_cache.zig");
 pub const counting_allocator = @import("counting_allocator.zig");
+pub const blocking_transport = @import("blocking_transport.zig");
 
 test {
     _ = dns;
@@ -40,4 +41,5 @@ test {
     _ = dedup;
     _ = nsec_cache;
     _ = counting_allocator;
+    _ = blocking_transport;
 }

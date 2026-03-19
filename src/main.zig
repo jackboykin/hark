@@ -271,7 +271,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver.initWithTcp(&t, &tcp_t);
+        var resolver = ForwardingResolver.initWithTcp(.{ .uring = &t }, .{ .uring = &tcp_t });
         if (dot_mode) {
             resolver.tls_transport = &tls_t;
         }
@@ -294,8 +294,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{
-            .transport = &t,
-            .tcp_transport = &tcp_t,
+            .transport = .{ .uring = &t },
+            .tcp_transport = .{ .uring = &tcp_t },
             .cache = &cache,
             .qname_minimisation = !no_qmin,
             .dnssec_enabled = dnssec_enabled,

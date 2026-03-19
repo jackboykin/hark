@@ -25,12 +25,76 @@ const InFlightTable = @import("dedup.zig").InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const ServerConfig = @import("config.zig").ServerConfig;
+const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
+const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
+const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
+const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const Certificate = std.crypto.Certificate;
 
 const log = std.log.scoped(.server);
 
 const tcp_idle_timeout_ms: u32 = 5_000;
 const max_tcp_queries_per_conn: u32 = 128;
+
+const work_queue_capacity = 256;
+
+// ── Work Queue for resolution thread pool ─────────────────────────────
+
+const WorkItem = struct {
+    query_buf: [4096]u8 = undefined,
+    query_len: u16 = 0,
+    client_addr: std.net.Address = undefined,
+    sock_fd: posix.fd_t = -1,
+    protocol: Protocol = .udp,
+    const Protocol = enum { udp, tcp };
+};
+
+const WorkQueue = struct {
+    items: [work_queue_capacity]WorkItem = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+    shutdown: bool = false,
+
+    fn push(self: *WorkQueue, data: []const u8, client_addr: std.net.Address, sock_fd: posix.fd_t, protocol: WorkItem.Protocol) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count >= work_queue_capacity) return false;
+        if (data.len > 4096) return false;
+        const item = &self.items[self.tail];
+        @memcpy(item.query_buf[0..data.len], data);
+        item.query_len = @intCast(data.len);
+        item.client_addr = client_addr;
+        item.sock_fd = sock_fd;
+        item.protocol = protocol;
+        self.tail = (self.tail + 1) % work_queue_capacity;
+        self.count += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    fn pop(self: *WorkQueue) ?WorkItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.count == 0 and !self.shutdown) {
+            self.not_empty.wait(&self.mutex);
+        }
+        if (self.count == 0) return null;
+        const item = self.items[self.head];
+        self.head = (self.head + 1) % work_queue_capacity;
+        self.count -= 1;
+        return item;
+    }
+
+    fn signalShutdown(self: *WorkQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.shutdown = true;
+        self.not_empty.broadcast();
+    }
+};
 
 // ── Context tags for the event loop ────────────────────────────────────
 
@@ -311,6 +375,8 @@ pub const Server = struct {
         var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle);
         if (self.enc_pool) |*pool| tls_transport.pool = pool;
 
+        var queue = WorkQueue{};
+
         // Worker state
         var ws = WorkerState{
             .config = &self.config,
@@ -327,9 +393,37 @@ pub const Server = struct {
             .dedup = if (self.dedup) |*d| d else null,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .shutdown = &self.shutdown,
+            .queue = &queue,
+            .ca_bundle = self.ca_bundle,
         };
 
+        const pool_size = self.config.resolution_threads;
+        const pool_threads = self.allocator.alloc(std.Thread, pool_size) catch |err| {
+            log.err("failed to allocate pool threads: {s}", .{@errorName(err)});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer self.allocator.free(pool_threads);
+
+        var spawned: usize = 0;
+        for (pool_threads) |*pt| {
+            pt.* = std.Thread.spawn(.{}, WorkerState.poolThread, .{&ws}) catch |err| {
+                log.err("failed to spawn pool thread: {s}", .{@errorName(err)});
+                break;
+            };
+            spawned += 1;
+        }
+
+        if (spawned == 0) {
+            log.err("no pool threads spawned", .{});
+            _ = self.worker_errors.fetchAdd(1, .monotonic);
+            return;
+        }
+
         ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
+
+        queue.signalShutdown();
+        for (pool_threads[0..spawned]) |pt| pt.join();
 
         // Ensure background probe threads that captured &tls_transport complete
         // before the stack-allocated TlsTransport is destroyed.
@@ -355,6 +449,8 @@ const WorkerState = struct {
     dedup: ?*InFlightTable,
     nsec_cache: ?*NsecCache,
     shutdown: *std.atomic.Value(bool),
+    queue: *WorkQueue,
+    ca_bundle: Certificate.Bundle,
 
     /// Create a per-query memory cap. When the limit is hit, arena returns
     /// OutOfMemory and existing error handling sends SERVFAIL.
@@ -492,66 +588,24 @@ const WorkerState = struct {
     }
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: std.net.Address) void {
-        var cap = self.queryCap();
-        var arena = std.heap.ArenaAllocator.init(cap.allocator());
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        const query = dns.parseMessage(alloc, data) catch {
-            if (data.len >= 2) {
-                const id = mem.readInt(u16, data[0..2], .big);
-                sendErrorUdp(sock, id, .format_error, false, &.{}, client_addr);
-            }
-            return;
-        };
-
-        if (query.header.opcode != .query) {
-            sendErrorUdp(sock, query.header.id, .not_implemented, query.header.rd, query.questions, client_addr);
+        if (data.len < 12) return;
+        const id = mem.readInt(u16, data[0..2], .big);
+        const rd = data[2] & 0x01 != 0; // RFC 1035 §4.1.1: echo RD in response
+        // Pre-validate from raw header bytes to avoid wasting pool threads
+        // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
+        const opcode: u4 = @truncate(data[2] >> 3);
+        if (opcode != 0) { // Only QUERY (0) supported
+            sendErrorUdp(sock, id, .not_implemented, rd, &.{}, client_addr);
             return;
         }
-
-        if (query.questions.len != 1) {
-            sendErrorUdp(sock, query.header.id, .format_error, query.header.rd, query.questions, client_addr);
+        const qdcount = mem.readInt(u16, data[4..6], .big);
+        if (qdcount != 1) {
+            sendErrorUdp(sock, id, .format_error, rd, &.{}, client_addr);
             return;
         }
-
-        if (query.questions[0].qclass != .in) {
-            sendErrorUdp(sock, query.header.id, .refused, query.header.rd, query.questions, client_addr);
-            return;
-        }
-
-        const question = query.questions[0];
-        const name_buf = question.name.format();
-        const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
-        const name_str = name_buf[0..name_len];
-
-        const max_payload: u16 = if (query.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
-
-        const start_ns = std.time.nanoTimestamp();
-        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
-            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-            var qtype_buf1: [24]u8 = undefined;
-            log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
-            sendErrorUdp(sock, query.header.id, .server_failure, query.header.rd, query.questions, client_addr);
-            return;
-        };
-        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
-        var qtype_buf2: [24]u8 = undefined;
-        var rcode_buf2: [24]u8 = undefined;
-        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
-
-        var wire_buf: [65535]u8 = undefined;
-        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query, max_payload), result.message, alloc)) |wire| {
-            sendUdpResponse(sock, wire, client_addr);
-        }
-
-        // Inline prefetch: client already has their response, refresh cache
-        if (result.prefetch_name) |prefetch_name| {
-            self.doPrefetch(prefetch_name, result.prefetch_qtype);
-        }
-        // Refresh near-expiry DNSKEY (covers answer TTL >> DNSKEY TTL gap)
-        if (result.prefetch_dnskey_zone) |zone| {
-            self.doPrefetch(zone, .dnskey);
+        if (!self.queue.push(data, client_addr, sock, .udp)) {
+            log.warn("resolution queue full, dropping query", .{});
+            sendErrorUdp(sock, id, .server_failure, rd, &.{}, client_addr);
         }
     }
 
@@ -565,11 +619,9 @@ const WorkerState = struct {
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = posix.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
 
-        const timeout_sec: i64 = @intCast(tcp_idle_timeout_ms / 1000);
-        const timeout_usec: i64 = @intCast(@as(u64, tcp_idle_timeout_ms % 1000) * 1000);
-        const tv = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch return;
-        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&tv)) catch return;
+        const setSocketTimeout = @import("blocking_transport.zig").setSocketTimeout;
+        setSocketTimeout(client_fd, posix.SO.RCVTIMEO, tcp_idle_timeout_ms);
+        setSocketTimeout(client_fd, posix.SO.SNDTIMEO, tcp_idle_timeout_ms);
 
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
@@ -660,43 +712,37 @@ const WorkerState = struct {
     }
 
     fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !recursive.RecursiveResolver.ResolveResult {
-        const cd_flag: u8 = @intFromBool(cd);
-        var is_leader = true;
-        if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWait(name, qtype, cd_flag)) {
-                .leader => {},
-                .follower => {
-                    is_leader = false;
-                },
-            }
-        }
-        errdefer if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
-        };
-        const result = try self.resolveQuery(alloc, name, qtype, cd, false);
-        if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
-        }
-        return result;
+        return self.resolveWithDedupUsing(alloc, name, qtype, cd, .{ .uring = self.udp_transport }, .{ .uring = self.tcp_transport }, self.tls_transport);
     }
 
-    fn resolveQuery(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool, bypass_cache: bool) !recursive.RecursiveResolver.ResolveResult {
+    fn resolveQueryWith(
+        self: *WorkerState,
+        alloc: mem.Allocator,
+        name: []const u8,
+        qtype: dns.RType,
+        cd: bool,
+        bypass_cache: bool,
+        udp: AnyUdpTransport,
+        tcp: AnyTcpTransport,
+        tls: ?*TlsTransport,
+    ) !recursive.RecursiveResolver.ResolveResult {
         switch (self.config.mode) {
             .recursive => {
                 var resolver = RecursiveResolver{
-                    .transport = self.udp_transport,
-                    .tcp_transport = self.tcp_transport,
+                    .transport = udp,
+                    .tcp_transport = tcp,
                     .cache = self.cache,
                     .qname_minimisation = self.config.qname_minimization,
                     // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
                     .dnssec_aware = self.config.dnssec,
                     // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
                     .dnssec_enabled = self.config.dnssec and !cd,
-                    .tls_transport = self.tls_transport,
+                    .tls_transport = tls,
                     .encrypted_ns_cache = self.encrypted_ns_cache,
                     .rtt_cache = self.rtt_cache,
                     .ns_selector = self.ns_selector,
                     .bypass_cache = bypass_cache,
+                    .stagger_ms = self.config.stagger_ms,
                     .dedup = self.dedup,
                     .nsec_cache = if (self.config.dnssec and !cd) self.nsec_cache else null,
                     .key_cache = if (self.config.dnssec) self.key_cache else null,
@@ -709,7 +755,7 @@ const WorkerState = struct {
                 return result;
             },
             .forward => {
-                var resolver = ForwardingResolver.initWithTcp(self.udp_transport, self.tcp_transport);
+                var resolver = ForwardingResolver.initWithTcp(udp, tcp);
                 const upstreams = if (self.config.upstreams.len > 0)
                     self.config.upstreams
                 else
@@ -728,14 +774,145 @@ const WorkerState = struct {
     }
 
     fn doPrefetch(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType) void {
-        // Synchronous prefetch: resolve with bypass_cache to refresh the entry.
-        // Runs on the worker thread because io_uring is not thread-safe —
-        // spawning a thread would race on the per-worker EventLoop.
+        self.doPrefetchWith(prefetch_name, prefetch_qtype, .{ .uring = self.udp_transport }, .{ .uring = self.tcp_transport }, self.tls_transport);
+    }
+
+    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: AnyUdpTransport, tcp: AnyTcpTransport, tls: ?*TlsTransport) void {
         var cap = self.queryCap();
         var prefetch_arena = std.heap.ArenaAllocator.init(cap.allocator());
         defer prefetch_arena.deinit();
-        _ = self.resolveQuery(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true) catch {};
+        _ = self.resolveQueryWith(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true, udp, tcp, tls) catch {};
     }
+
+    /// Resolution thread pool entry point.
+    fn poolThread(self: *WorkerState) void {
+        var udp_t = BlockingUdpTransport.init(.{});
+        var tcp_t = BlockingTcpTransport.init(.{});
+
+        // Pool threads use queryOpportunisticBlocking (blocking TCP connect),
+        // so no EventLoop is needed. Passing null ensures connectTcp panics
+        // if accidentally called from a pool thread.
+        var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
+            var t = TlsTransport.init(null, self.allocator, .{}, self.ca_bundle);
+            if (self.tls_transport) |main_tls| {
+                t.pool = main_tls.pool;
+            }
+            break :blk t;
+        } else null;
+
+        while (self.queue.pop()) |item| {
+            switch (item.protocol) {
+                .udp => self.processUdpQuery(
+                    item.sock_fd,
+                    item.query_buf[0..item.query_len],
+                    item.client_addr,
+                    &udp_t,
+                    &tcp_t,
+                    if (tls_t) |*t| t else null,
+                ),
+                .tcp => {}, // TCP clients still handled on io_uring worker thread (handleTcpClient)
+            }
+        }
+    }
+
+    fn processUdpQuery(
+        self: *WorkerState,
+        sock: posix.fd_t,
+        data: []const u8,
+        client_addr: std.net.Address,
+        udp_t: *BlockingUdpTransport,
+        tcp_t: *BlockingTcpTransport,
+        tls_t: ?*TlsTransport,
+    ) void {
+        var cap = self.queryCap();
+        var arena = std.heap.ArenaAllocator.init(cap.allocator());
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const query_msg = dns.parseMessage(alloc, data) catch {
+            if (data.len >= 2) {
+                const id = mem.readInt(u16, data[0..2], .big);
+                sendErrorUdp(sock, id, .format_error, false, &.{}, client_addr);
+            }
+            return;
+        };
+
+        if (query_msg.header.opcode != .query) {
+            sendErrorUdp(sock, query_msg.header.id, .not_implemented, query_msg.header.rd, query_msg.questions, client_addr);
+            return;
+        }
+        if (query_msg.questions.len != 1) {
+            sendErrorUdp(sock, query_msg.header.id, .format_error, query_msg.header.rd, query_msg.questions, client_addr);
+            return;
+        }
+        if (query_msg.questions[0].qclass != .in) {
+            sendErrorUdp(sock, query_msg.header.id, .refused, query_msg.header.rd, query_msg.questions, client_addr);
+            return;
+        }
+
+        const question = query_msg.questions[0];
+        const name_buf = question.name.format();
+        const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
+        const name_str = name_buf[0..name_len];
+
+        const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
+
+        const start_ns = std.time.nanoTimestamp();
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t) catch |err| {
+            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+            var qtype_buf1: [24]u8 = undefined;
+            log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
+            sendErrorUdp(sock, query_msg.header.id, .server_failure, query_msg.header.rd, query_msg.questions, client_addr);
+            return;
+        };
+        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+        var qtype_buf2: [24]u8 = undefined;
+        var rcode_buf2: [24]u8 = undefined;
+        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
+
+        var wire_buf: [65535]u8 = undefined;
+        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
+            sendUdpResponse(sock, wire, client_addr);
+        }
+
+        if (result.prefetch_name) |prefetch_name| {
+            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t);
+        }
+        if (result.prefetch_dnskey_zone) |zone| {
+            self.doPrefetchWith(zone, .dnskey, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t);
+        }
+    }
+
+    fn resolveWithDedupUsing(
+        self: *WorkerState,
+        alloc: mem.Allocator,
+        name: []const u8,
+        qtype: dns.RType,
+        cd: bool,
+        udp: AnyUdpTransport,
+        tcp: AnyTcpTransport,
+        tls: ?*TlsTransport,
+    ) !recursive.RecursiveResolver.ResolveResult {
+        const cd_flag: u8 = @intFromBool(cd);
+        var is_leader = true;
+        if (self.dedup) |dedup| {
+            switch (dedup.acquireOrWait(name, qtype, cd_flag)) {
+                .leader => {},
+                .follower => {
+                    is_leader = false;
+                },
+            }
+        }
+        errdefer if (is_leader) {
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
+        };
+        const result = try self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
+        if (is_leader) {
+            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
+        }
+        return result;
+    }
+
 };
 
 // ── Response building ──────────────────────────────────────────────────
@@ -1050,7 +1227,7 @@ test "server init thread-safe cache when workers > 1" {
     var server = try Server.init(testing.allocator, cfg);
     defer server.deinit();
 
-    try testing.expect(server.cache.mutex != null);
+    try testing.expect(server.cache.rwlock != null);
 }
 
 test "buildResponseWire sets correct header fields" {

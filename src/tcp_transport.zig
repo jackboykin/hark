@@ -8,10 +8,24 @@ const EventLoop = event_loop.EventLoop;
 const Completion = event_loop.Completion;
 const ConnectResult = event_loop.ConnectResult;
 const max_operations = event_loop.max_operations;
+const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 
 pub const TcpConfig = struct {
     connect_timeout_ms: u32 = 5000,
     response_timeout_ms: u32 = 10000,
+};
+
+/// Transport-agnostic TCP interface for resolvers.
+pub const AnyTcpTransport = union(enum) {
+    uring: *TcpTransport,
+    blocking: *BlockingTcpTransport,
+
+    pub fn query(self: AnyTcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8) ![]const u8 {
+        return switch (self) {
+            .uring => |t| t.query(wire_query, server, response_buf),
+            .blocking => |t| t.query(wire_query, server, response_buf),
+        };
+    }
 };
 
 const Tag = enum { connect, timeout, send, recv };

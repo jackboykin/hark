@@ -32,13 +32,13 @@ const Tag = enum { connect, timeout };
 const Ctx = struct { tag: Tag };
 
 pub const TlsTransport = struct {
-    loop: *EventLoop,
+    loop: ?*EventLoop,
     allocator: Allocator,
     config: TlsConfig,
     ca_bundle: Certificate.Bundle,
     pool: ?*ConnectionPool = null,
 
-    pub fn init(loop: *EventLoop, allocator: Allocator, config: TlsConfig, ca_bundle: Certificate.Bundle) TlsTransport {
+    pub fn init(loop: ?*EventLoop, allocator: Allocator, config: TlsConfig, ca_bundle: Certificate.Bundle) TlsTransport {
         return .{ .loop = loop, .allocator = allocator, .config = config, .ca_bundle = ca_bundle };
     }
 
@@ -77,9 +77,10 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// TCP connect via io_uring + switch to blocking mode with socket timeouts.
-    /// Returns a connected, blocking socket. Caller owns the fd.
+    /// TCP connect via io_uring, then switch to blocking mode with socket timeouts.
+    /// Requires a non-null EventLoop; pool threads must use connectTcpBlocking.
     fn connectTcp(self: *TlsTransport, tls_server: net.Address, connect_timeout_ms: u32, rw_timeout_ms: u32) !posix.fd_t {
+        const loop = self.loop orelse unreachable; // pool threads must use connectTcpBlocking
         const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
         const sock = try posix.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
@@ -87,29 +88,29 @@ pub const TlsTransport = struct {
         var connect_ctx = Ctx{ .tag = .connect };
         var timeout_ctx = Ctx{ .tag = .timeout };
 
-        const connect_op = try self.loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
-        const timeout_op = try self.loop.setTimeout(connect_timeout_ms, @ptrCast(&timeout_ctx));
+        const connect_op = try loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
+        const timeout_op = try loop.setTimeout(connect_timeout_ms, @ptrCast(&timeout_ctx));
 
         connect_loop: while (true) {
             var completions: [max_operations]Completion = undefined;
-            const results = try self.loop.tick(&completions);
+            const results = try loop.tick(&completions);
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
                     .connect => {
                         if (c.result.connect.err != null) {
-                            self.loop.cancel(timeout_op) catch {};
-                            self.loop.flush();
+                            loop.cancel(timeout_op) catch {};
+                            loop.flush();
                             return error.ConnectFailed;
                         }
-                        self.loop.cancel(timeout_op) catch {};
-                        self.loop.flush();
+                        loop.cancel(timeout_op) catch {};
+                        loop.flush();
                         break :connect_loop;
                     },
                     .timeout => {
                         if (c.result.timeout.expired) {
-                            self.loop.cancel(connect_op) catch {};
-                            self.loop.flush();
+                            loop.cancel(connect_op) catch {};
+                            loop.flush();
                             return error.Timeout;
                         }
                     },
@@ -122,11 +123,9 @@ pub const TlsTransport = struct {
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = try posix.fcntl(sock, posix.F.SETFL, current_flags & ~nonblock_bit);
 
-        const timeout_sec: i64 = @intCast(rw_timeout_ms / 1000);
-        const timeout_usec: i64 = @intCast(@as(u64, rw_timeout_ms % 1000) * 1000);
-        const rw_timeout = posix.timeval{ .sec = timeout_sec, .usec = timeout_usec };
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&rw_timeout));
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&rw_timeout));
+        const setSocketTimeout = @import("blocking_transport.zig").setSocketTimeout;
+        setSocketTimeout(sock, posix.SO.RCVTIMEO, rw_timeout_ms);
+        setSocketTimeout(sock, posix.SO.SNDTIMEO, rw_timeout_ms);
 
         return sock;
     }
@@ -178,6 +177,7 @@ pub const TlsTransport = struct {
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
     /// no SNI, 4-second connect timeout, immediate fallback on any failure.
     /// Tries pooled connection first, pools new connections on success.
+    /// Auto-detects io_uring vs blocking connect based on whether self.loop is set.
     pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: net.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
         const tls_server = toPort(server, self.config.port) orelse return error.UnsupportedAddressFamily;
         const addr_key = AddressKey.fromAddress(tls_server);
@@ -190,20 +190,22 @@ pub const TlsTransport = struct {
                     return data;
                 } else |_| {
                     pool.release(addr_key, conn, false);
-                    // Fall through to new connection
                 }
             }
         }
 
-        // ── New connection: TCP connect via io_uring ──
-        const conn = try self.connectAndHandshakeOpportunistic(tls_server, timeout_ms);
+        // ── New connection: blocking if no EventLoop, io_uring otherwise ──
+        const conn = if (self.loop == null) blk: {
+            const sock = try connectTcpBlocking(tls_server, timeout_ms);
+            errdefer posix.close(sock);
+            break :blk try self.initOpportunisticConnection(sock);
+        } else try self.connectAndHandshakeOpportunistic(tls_server, timeout_ms);
 
         const data = queryOnConnection(conn, wire_query, response_buf) catch |err| {
             conn.destroyBroken(self.allocator);
             return err;
         };
 
-        // Store in pool or close
         if (self.pool) |pool| {
             pool.store(addr_key, conn);
         } else {
@@ -248,6 +250,17 @@ pub const TlsTransport = struct {
         return conn;
     }
 
+    fn connectTcpBlocking(tls_server: net.Address, timeout_ms: u32) !posix.fd_t {
+        const setSocketTimeout = @import("blocking_transport.zig").setSocketTimeout;
+        const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
+        const sock = try posix.socket(af, posix.SOCK.STREAM, 0);
+        errdefer posix.close(sock);
+        setSocketTimeout(sock, posix.SO.SNDTIMEO, timeout_ms);
+        setSocketTimeout(sock, posix.SO.RCVTIMEO, timeout_ms);
+        posix.connect(sock, &tls_server.any, tls_server.getOsSockLen()) catch return error.ConnectFailed;
+        return sock;
+    }
+
     /// Fire a background probe for a nameserver. Detached thread does blocking
     /// TCP connect + TLS handshake. On success, the connection is pooled.
     pub fn probeInBackground(self: *TlsTransport, server: net.Address, enc_ns_cache: *EncryptedNsCache) void {
@@ -278,24 +291,8 @@ pub const TlsTransport = struct {
             return;
         }
 
-        const probe_timeout_sec: i64 = 4;
-
-        // ── Blocking TCP connect ──
-        const af: u32 = if (tls_server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
-        const sock = posix.socket(af, posix.SOCK.STREAM, 0) catch {
+        const sock = connectTcpBlocking(tls_server, 4000) catch {
             enc_ns_cache.markFailed(addr_key);
-            return;
-        };
-
-        // Set connect timeout via SO_SNDTIMEO
-        const snd_timeout = posix.timeval{ .sec = probe_timeout_sec, .usec = 0 };
-        const rcv_timeout = posix.timeval{ .sec = probe_timeout_sec, .usec = 0 };
-        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&snd_timeout)) catch {};
-        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&rcv_timeout)) catch {};
-
-        posix.connect(sock, &tls_server.any, tls_server.getOsSockLen()) catch {
-            enc_ns_cache.markFailed(addr_key);
-            posix.close(sock);
             return;
         };
 

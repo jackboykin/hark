@@ -6,9 +6,37 @@ const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
+const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 
 pub const QueryResult = struct {
     response_data: []const u8,
+};
+
+/// Transport-agnostic UDP interface for resolvers.
+pub const AnyUdpTransport = union(enum) {
+    uring: *UdpTransport,
+    blocking: *BlockingUdpTransport,
+
+    pub fn getTimeoutMs(self: AnyUdpTransport) u32 {
+        return switch (self) {
+            .uring => |t| t.config.timeout_ms,
+            .blocking => |t| t.config.timeout_ms,
+        };
+    }
+
+    pub fn query(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+        return switch (self) {
+            .uring => |t| t.query(wire_query, query_id, upstream),
+            .blocking => |t| t.query(wire_query, query_id, upstream),
+        };
+    }
+
+    pub fn queryWithTimeout(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address, timeout_ms: u32) ![]const u8 {
+        return switch (self) {
+            .uring => |t| t.queryWithTimeout(wire_query, query_id, upstream, timeout_ms),
+            .blocking => |t| t.queryWithTimeout(wire_query, query_id, upstream, timeout_ms),
+        };
+    }
 };
 
 pub const Config = struct {
@@ -37,24 +65,7 @@ pub const UdpTransport = struct {
     /// Create a fresh UDP socket bound to a random ephemeral port (RFC 5452
     /// source-port randomization).  The caller must close the returned fd.
     fn openSocket(dest: std.net.Address) !posix.fd_t {
-        const af: u32 = dest.any.family;
-        const sock = try posix.socket(af, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(sock);
-
-        // RFC 5452: use crypto PRNG for source port selection
-        for (0..16) |_| {
-            const port = std.crypto.random.intRangeAtMost(u16, 1024, 65535);
-            const addr = anyAddr(af, port);
-            posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-                error.AddressInUse => continue,
-                else => return err,
-            };
-            return sock;
-        }
-        // Fallback: let kernel assign ephemeral port
-        const addr = anyAddr(af, 0);
-        try posix.bind(sock, &addr.any, addr.getOsSockLen());
-        return sock;
+        return openUdpSocket(dest, true);
     }
 
     pub fn query(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
@@ -149,15 +160,37 @@ pub const UdpTransport = struct {
     }
 };
 
-fn anyAddr(af: u32, port: u16) std.net.Address {
+/// Create a UDP socket bound to a random ephemeral port (RFC 5452).
+/// Set nonblock=true for io_uring, false for blocking transport.
+pub fn openUdpSocket(dest: std.net.Address, nonblock: bool) !posix.fd_t {
+    const af: u32 = dest.any.family;
+    const flags: u32 = posix.SOCK.DGRAM | if (nonblock) @as(u32, posix.SOCK.NONBLOCK) else 0;
+    const sock = try posix.socket(af, flags, 0);
+    errdefer posix.close(sock);
+
+    for (0..16) |_| {
+        const port = std.crypto.random.intRangeAtMost(u16, 1024, 65535);
+        const addr = anyAddr(af, port);
+        posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+            error.AddressInUse => continue,
+            else => return err,
+        };
+        return sock;
+    }
+    const addr = anyAddr(af, 0);
+    try posix.bind(sock, &addr.any, addr.getOsSockLen());
+    return sock;
+}
+
+pub fn anyAddr(af: u32, port: u16) std.net.Address {
     return if (af == posix.AF.INET6)
         std.net.Address.initIp6(.{0} ** 16, port, 0, 0)
     else
         std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
 }
 
-/// Compare response source IP against expected upstream IP (ignoring port).
-fn addressMatchesUpstream(response: std.net.Address, upstream: std.net.Address) bool {
+/// Compare two addresses by IP, ignoring port.
+pub fn addressMatchesUpstream(response: std.net.Address, upstream: std.net.Address) bool {
     if (response.any.family != upstream.any.family) return false;
     return switch (response.any.family) {
         posix.AF.INET => response.in.sa.addr == upstream.in.sa.addr,

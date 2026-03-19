@@ -4,7 +4,9 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
+const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
+const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
@@ -69,8 +71,8 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
 pub const RecursiveResolver = struct {
-    transport: *UdpTransport,
-    tcp_transport: ?*TcpTransport = null,
+    transport: AnyUdpTransport,
+    tcp_transport: ?AnyTcpTransport = null,
     cache: ?*RRsetCache = null,
     qname_minimisation: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
@@ -86,6 +88,9 @@ pub const RecursiveResolver = struct {
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
+    /// Staggered NS racing interval in ms (0 = disabled).
+    stagger_ms: u32 = 0,
+
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
     resolving_ds: bool = false,
@@ -107,7 +112,7 @@ pub const RecursiveResolver = struct {
     const failover_timeout_cap: u32 = 2000;
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.config.timeout_ms;
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.getTimeoutMs();
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
@@ -290,7 +295,17 @@ pub const RecursiveResolver = struct {
                 var last_server_failure: ?dns.Message = null;
                 var responding_server: ?std.net.Address = null;
 
+                // ── Staggered NS racing (blocking transport only) ──
+                if (self.transport == .blocking and server_order.len >= 2 and self.stagger_ms > 0) {
+                    if (try self.tryStaggeredQuery(allocator, query_name, query_type, &servers, server_order, parent_zone)) |stag| {
+                        response = stag.message;
+                        got_response = true;
+                        responding_server = stag.server;
+                    }
+                }
+
                 for (server_order, 0..) |server_idx, server_i| {
+                    if (got_response) break;
                     const server = servers[server_idx];
                     const addr_key = AddressKey.fromAddress(server);
 
@@ -858,6 +873,101 @@ pub const RecursiveResolver = struct {
         if (!response.header.qr) return null;
         return response;
     }
+
+    // ── Staggered NS Racing ─────────────────────────────────────────────
+
+    const StaggeredResponse = struct {
+        message: dns.Message,
+        server: std.net.Address,
+    };
+
+    fn tryStaggeredQuery(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        query_name: []const u8,
+        query_type: dns.RType,
+        servers: *[max_servers_per_level]std.net.Address,
+        server_order: []const usize,
+        parent_zone: dns.Name,
+    ) error{OutOfMemory}!?StaggeredResponse {
+        const bt = switch (self.transport) {
+            .blocking => |t| t,
+            else => return null,
+        };
+
+        var s0_idx: ?usize = null;
+        var s1_idx: ?usize = null;
+        for (server_order) |idx| {
+            const addr_key = AddressKey.fromAddress(servers[idx]);
+            if (self.rtt_cache) |rc| {
+                if (rc.isDead(addr_key)) continue;
+            }
+            if (s0_idx == null) {
+                s0_idx = idx;
+            } else if (s1_idx == null) {
+                if (!addressMatchesUpstream(servers[idx], servers[s0_idx.?])) {
+                    s1_idx = idx;
+                    break;
+                }
+            }
+        }
+
+        const idx0 = s0_idx orelse return null;
+        const idx1 = s1_idx orelse return null;
+
+        const stagger = if (self.rtt_cache) |rc| blk: {
+            const rtt = rc.getTimeout(AddressKey.fromAddress(servers[idx0]));
+            break :blk @min(300, @max(50, rtt));
+        } else self.stagger_ms;
+
+        const overall_timeout = self.transport.getTimeoutMs();
+
+        var id_bytes0: [2]u8 = undefined;
+        var id_bytes1: [2]u8 = undefined;
+        std.crypto.random.bytes(&id_bytes0);
+        std.crypto.random.bytes(&id_bytes1);
+        const qid0 = mem.readInt(u16, &id_bytes0, .big);
+        const qid1 = mem.readInt(u16, &id_bytes1, .big);
+
+        // Build and serialize once, copy + patch ID for the second leg
+        const msg0 = dns.buildQueryWithOptions(allocator, qid0, query_name, query_type, .{
+            .rd = false, .edns = .{ .do_bit = self.dnssec_aware },
+        }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+        var wire0: [dns.edns_udp_payload]u8 = undefined;
+        const w0 = dns.serializeMessage(&wire0, msg0) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else null;
+        var wire1: [dns.edns_udp_payload]u8 = undefined;
+        @memcpy(wire1[0..w0.len], w0);
+        mem.writeInt(u16, wire1[0..2], qid1, .big);
+        const w1 = wire1[0..w0.len];
+
+        const query_start = monotonicMicros();
+
+        const stag_result = bt.queryStaggered(
+            .{ w0, w1 },
+            .{ qid0, qid1 },
+            .{ servers[idx0], servers[idx1] },
+            stagger,
+            overall_timeout,
+        ) catch return null;
+
+        const elapsed_us = monotonicMicros() - query_start;
+        const responding_idx = if (stag_result.responding_idx == 0) idx0 else idx1;
+        const responding_addr = servers[responding_idx];
+        const addr_key = AddressKey.fromAddress(responding_addr);
+
+        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
+        if (self.ns_selector) |ns| {
+            ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
+        }
+
+        const resp = try tryParseMessage(allocator, stag_result.response_data) orelse return null;
+        if (!resp.header.qr) return null;
+
+        return .{ .message = resp, .server = responding_addr };
+    }
+
+    const addressMatchesUpstream = @import("transport.zig").addressMatchesUpstream;
 
     // ── DNSSEC Answer Validation ───────────────────────────────────────
 
@@ -2159,7 +2269,7 @@ test "recursive resolve example.com A from root hints" {
     var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = &transport };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2200,7 +2310,7 @@ test "recursive resolve nonexistent domain returns name_error" {
     var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = &transport };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2230,7 +2340,7 @@ test "recursive resolve domain with glueless NS" {
     var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = &transport };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2271,7 +2381,7 @@ test "recursive resolve with CNAME chain" {
     var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = &transport };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

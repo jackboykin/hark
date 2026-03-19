@@ -22,6 +22,8 @@ pub const ServerConfig = struct {
     query_memory_limit: usize,
     opportunistic: bool,
     workers: u16,
+    resolution_threads: u16,
+    stagger_ms: u32,
     log_queries: bool,
 
     allocator: Allocator,
@@ -70,6 +72,8 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .query_memory_limit = 2 * 1024 * 1024,
         .opportunistic = false,
         .workers = @intCast(@max(1, std.Thread.getCpuCount() catch 1)),
+        .resolution_threads = 4,
+        .stagger_ms = 150,
         .log_queries = false,
         .allocator = allocator,
     };
@@ -94,6 +98,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             if (w < 1 or w > 65535) return error.InvalidWorkerCount;
             cfg.workers = @intCast(w);
         }
+        if (server.getInteger("resolution-threads")) |rt| {
+            if (rt < 1 or rt > 256) return error.InvalidWorkerCount;
+            cfg.resolution_threads = @intCast(rt);
+        }
     }
 
     // [resolver] section
@@ -117,6 +125,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getInteger("query-memory-limit")) |q| {
             if (q < 0) return error.InvalidValue;
             cfg.query_memory_limit = @intCast(@min(q, std.math.maxInt(usize)));
+        }
+        if (resolver.getInteger("stagger-ms")) |s| {
+            if (s < 0) return error.InvalidValue;
+            cfg.stagger_ms = @intCast(@min(s, 1000));
         }
     }
 

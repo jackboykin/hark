@@ -5,20 +5,22 @@ const posix = std.posix;
 const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const UdpTransport = @import("transport.zig").UdpTransport;
+const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
+const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const Config = @import("transport.zig").Config;
 
 pub const ForwardingResolver = struct {
-    transport: *UdpTransport,
-    tcp_transport: ?*TcpTransport,
+    transport: AnyUdpTransport,
+    tcp_transport: ?AnyTcpTransport,
     tls_transport: ?*TlsTransport,
 
-    pub fn init(transport: *UdpTransport) ForwardingResolver {
+    pub fn init(transport: AnyUdpTransport) ForwardingResolver {
         return .{ .transport = transport, .tcp_transport = null, .tls_transport = null };
     }
 
-    pub fn initWithTcp(transport: *UdpTransport, tcp: *TcpTransport) ForwardingResolver {
+    pub fn initWithTcp(transport: AnyUdpTransport, tcp: AnyTcpTransport) ForwardingResolver {
         return .{ .transport = transport, .tcp_transport = tcp, .tls_transport = null };
     }
 
@@ -83,7 +85,7 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = ForwardingResolver.init(&transport);
+    var resolver = ForwardingResolver.init(.{ .uring = &transport });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

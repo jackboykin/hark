@@ -273,7 +273,7 @@ pub const RRsetCache = struct {
     map: std.HashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, 80),
     max_entries: u32,
     now_fn: *const fn () i64,
-    mutex: ?std.Thread.Mutex = null,
+    rwlock: ?std.Thread.RwLock = null,
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     prefetch: bool = false,
@@ -318,7 +318,7 @@ pub const RRsetCache = struct {
 
     pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
         var c = initWithOptions(backing, max_bytes, max_entries, opts);
-        c.mutex = .{};
+        c.rwlock = .{};
         return c;
     }
 
@@ -336,8 +336,8 @@ pub const RRsetCache = struct {
     };
 
     pub fn getStats(self: *RRsetCache) Stats {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
+        if (self.rwlock) |*rw| rw.lockShared();
+        defer if (self.rwlock) |*rw| rw.unlockShared();
         return .{
             .entries = @intCast(self.map.count()),
             .memory_bytes = self.counting.current_bytes.load(.monotonic),
@@ -374,8 +374,8 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
+        if (self.rwlock) |*rw| rw.lockShared();
+        defer if (self.rwlock) |*rw| rw.unlockShared();
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
@@ -391,7 +391,9 @@ pub const RRsetCache = struct {
                 const is_expired = now >= rrset.expires_at;
                 if (is_expired) {
                     if (self.serve_stale_ttl == 0 or (now - rrset.expires_at) >= self.serve_stale_ttl) {
-                        self.removeAndFree(probe);
+                        // Deferred eviction: under shared read lock we cannot mutate the map.
+                        // Expired entries linger until the next write path calls evictIfNeeded().
+                        // Compliant with RFC 8767.
                         _ = self.misses.fetchAdd(1, .monotonic);
                         return null;
                     }
@@ -421,7 +423,7 @@ pub const RRsetCache = struct {
                     // (e.g. 1s for DNSSEC bogus) is intentional and serve-stale
                     // would extend failure duration beyond design intent.
                     if (self.serve_stale_ttl == 0 or neg.rcode == .server_failure or (now - neg.expires_at) >= self.serve_stale_ttl) {
-                        self.removeAndFree(probe);
+                        // Deferred eviction: expired entry stays until next write.
                         _ = self.misses.fetchAdd(1, .monotonic);
                         return null;
                     }
@@ -470,8 +472,8 @@ pub const RRsetCache = struct {
     /// directly, avoiding the unchecked→secure race window.
     pub fn storeResponseWithStatus(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
         if (response.header.rcode != .no_error) return;
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
+        if (self.rwlock) |*rw| rw.lock();
+        defer if (self.rwlock) |*rw| rw.unlock();
         self.storeRRsetsImpl(response.answers, authority_zone, true, status);
         self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
         self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
@@ -489,8 +491,8 @@ pub const RRsetCache = struct {
         authority_zone: dns.Name,
         security_status: SecurityStatus,
     ) void {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
+        if (self.rwlock) |*rw| rw.lock();
+        defer if (self.rwlock) |*rw| rw.unlock();
         // Find SOA in authority section — required per RFC 2308
         var soa_record: ?dns.ResourceRecord = null;
         for (authorities) |rr| {
@@ -575,8 +577,8 @@ pub const RRsetCache = struct {
         ttl: u32,
         security_status: SecurityStatus,
     ) void {
-        if (self.mutex) |*m| m.lock();
-        defer if (self.mutex) |*m| m.unlock();
+        if (self.rwlock) |*rw| rw.lock();
+        defer if (self.rwlock) |*rw| rw.unlock();
         if (ttl == 0) return;
 
         const alloc = self.counting.allocator();
@@ -774,7 +776,33 @@ pub const RRsetCache = struct {
     }
 
     fn evictIfNeeded(self: *RRsetCache) void {
-        if (self.map.count() < self.max_entries) return;
+        const count = self.map.count();
+        if (count < self.max_entries) {
+            // Below capacity — opportunistically sweep one expired entry when
+            // above 75% full. Compensates for deferred eviction under RwLock:
+            // lookup() no longer removes expired entries, so they accumulate
+            // until a write path runs. This sweep provides gradual cleanup.
+            if (count < self.max_entries / 4 * 3) return;
+            const now = self.now_fn();
+            const alloc = self.counting.allocator();
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                const expired = switch (entry.value_ptr.*) {
+                    .positive => |p| now >= p.expires_at,
+                    .negative => |n| now >= n.expires_at,
+                };
+                if (expired) {
+                    const key = entry.key_ptr.*;
+                    const val = entry.value_ptr.*;
+                    self.map.removeByPtr(entry.key_ptr);
+                    freeKey(alloc, key);
+                    freeEntry(alloc, val);
+                    _ = self.evictions.fetchAdd(1, .monotonic);
+                    return;
+                }
+            }
+            return;
+        }
 
         const alloc = self.counting.allocator();
         const now = self.now_fn();
@@ -799,9 +827,9 @@ pub const RRsetCache = struct {
 
         // No expired entries: evict random
         var it2 = self.map.iterator();
-        const count = self.map.count();
-        if (count == 0) return;
-        const target = std.crypto.random.uintLessThan(u32, @intCast(count));
+        const rand_count = self.map.count();
+        if (rand_count == 0) return;
+        const target = std.crypto.random.uintLessThan(u32, @intCast(rand_count));
         var idx: u32 = 0;
         while (it2.next()) |entry| {
             if (idx == target) {
