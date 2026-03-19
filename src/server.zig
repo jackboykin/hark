@@ -23,6 +23,7 @@ const NsSelector = @import("ns_selector.zig").NsSelector;
 const RRsetCache = @import("cache.zig").RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
+const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Certificate = std.crypto.Certificate;
 
@@ -355,6 +356,13 @@ const WorkerState = struct {
     nsec_cache: ?*NsecCache,
     shutdown: *std.atomic.Value(bool),
 
+    /// Create a per-query memory cap. When the limit is hit, arena returns
+    /// OutOfMemory and existing error handling sends SERVFAIL.
+    fn queryCap(self: *WorkerState) CountingAllocator {
+        const limit = self.config.query_memory_limit;
+        return CountingAllocator.init(self.allocator, if (limit > 0) limit else std.math.maxInt(usize));
+    }
+
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
         const n = udp_socks.len;
 
@@ -484,7 +492,8 @@ const WorkerState = struct {
     }
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: std.net.Address) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var cap = self.queryCap();
+        var arena = std.heap.ArenaAllocator.init(cap.allocator());
         defer arena.deinit();
         const alloc = arena.allocator();
 
@@ -576,7 +585,8 @@ const WorkerState = struct {
             tcpReadExactBlocking(client_fd, query_buf[0..msg_len]) orelse return;
 
             // Process query (resolution uses transport_loop, not server_loop)
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            var cap = self.queryCap();
+            var arena = std.heap.ArenaAllocator.init(cap.allocator());
             defer arena.deinit();
             var response_wire: [65535]u8 = undefined;
             const qr = self.processQuery(arena.allocator(), query_buf[0..msg_len], &response_wire) orelse return;
@@ -721,7 +731,8 @@ const WorkerState = struct {
         // Synchronous prefetch: resolve with bypass_cache to refresh the entry.
         // Runs on the worker thread because io_uring is not thread-safe —
         // spawning a thread would race on the per-worker EventLoop.
-        var prefetch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        var cap = self.queryCap();
+        var prefetch_arena = std.heap.ArenaAllocator.init(cap.allocator());
         defer prefetch_arena.deinit();
         _ = self.resolveQuery(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true) catch {};
     }

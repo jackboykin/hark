@@ -19,6 +19,7 @@ pub const ServerConfig = struct {
     min_ttl: u32,
     dnssec: bool,
     qname_minimization: bool,
+    query_memory_limit: usize,
     opportunistic: bool,
     workers: u16,
     log_queries: bool,
@@ -66,6 +67,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .min_ttl = 0,
         .dnssec = false,
         .qname_minimization = true,
+        .query_memory_limit = 2 * 1024 * 1024,
         .opportunistic = false,
         .workers = @intCast(@max(1, std.Thread.getCpuCount() catch 1)),
         .log_queries = false,
@@ -112,6 +114,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
+        if (resolver.getInteger("query-memory-limit")) |q| {
+            if (q < 0) return error.InvalidValue;
+            cfg.query_memory_limit = @intCast(@min(q, std.math.maxInt(usize)));
+        }
     }
 
     // [cache] section

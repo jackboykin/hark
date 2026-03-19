@@ -5,7 +5,7 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const cache_mod = @import("cache.zig");
-const CountingAllocator = cache_mod.CountingAllocator;
+const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 
 /// Maximum effective TTL for synthesized responses (RFC 9077 §3).
 const max_aggressive_ttl: u32 = 10800;

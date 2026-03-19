@@ -2006,6 +2006,14 @@ pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser:
     return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
 }
 
+/// RFC 5452 §9.1 / RFC 9619: verify response question section echoes the
+/// original query. QDCOUNT must be exactly 1 for standard queries (OPCODE=0).
+pub fn validateQuestionMatch(response: Message, expected_name: Name, expected_type: RType) bool {
+    if (response.questions.len != 1) return false;
+    const q = response.questions[0];
+    return q.qtype == expected_type and q.qclass == .in and q.name.eql(expected_name);
+}
+
 pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);

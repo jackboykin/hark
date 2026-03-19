@@ -337,7 +337,7 @@ pub const RecursiveResolver = struct {
                                         if (try tryParseMessage(allocator, tls_data)) |tls_response| {
                                             if (tls_response.header.qr and
                                                 tls_response.header.rcode != .format_error and
-                                                validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
+                                                dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
                                             {
                                                 if (tls_response.header.rcode.isServerError()) {
                                                     last_server_failure = tls_response;
@@ -373,7 +373,7 @@ pub const RecursiveResolver = struct {
                     const do53_elapsed = monotonicMicros() - do53_start;
 
                     // RFC 5452 §9.1: question section must match original query
-                    if (!validateQuestionMatch(response, query_msg.questions[0].name, query_type)) continue;
+                    if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, query_type)) continue;
 
                     // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
                     // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
@@ -1053,7 +1053,7 @@ pub const RecursiveResolver = struct {
                 allocator, wire_query, query_id, server, timeout,
             ) orelse continue;
             // RFC 5452 §9.1: question section must match original query
-            if (!validateQuestionMatch(response, query_msg.questions[0].name, qtype)) continue;
+            if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, qtype)) continue;
             if (response.header.rcode != .no_error) continue;
             if (store_response) {
                 if (self.cache) |c| c.storeResponse(response, authority_zone);
@@ -1603,14 +1603,6 @@ fn epochNowU32() u32 {
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
     const s = nameToSlice(name);
     return allocator.dupe(u8, s.buf[0..s.len]);
-}
-
-/// RFC 5452 §9.1: verify response question matches the original query.
-/// Mismatch MUST be considered invalid (possible cache poisoning attempt).
-fn validateQuestionMatch(response: dns.Message, expected_name: dns.Name, expected_type: dns.RType) bool {
-    if (response.questions.len == 0) return false;
-    const q = response.questions[0];
-    return q.qtype == expected_type and q.qclass == .in and q.name.eql(expected_name);
 }
 
 fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord {

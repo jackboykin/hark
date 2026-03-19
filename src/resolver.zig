@@ -35,12 +35,14 @@ pub const ForwardingResolver = struct {
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
+        const expected_name = query_msg.questions[0].name;
+
         // DoT path: send directly over TLS (already TCP-based, no TC-bit fallback needed)
         if (self.tls_transport) |tls_t| {
             var response_buf: [65535]u8 = undefined;
             const response_data = try tls_t.query(wire_query, upstream, &response_buf);
             const msg = try dns.parseMessage(allocator, response_data);
-            if (!msg.header.qr) return error.FormatError;
+            if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
             return msg;
         }
 
@@ -53,7 +55,7 @@ pub const ForwardingResolver = struct {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
-                    if (!msg.header.qr) return error.FormatError;
+                    if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
                     return msg;
                 } else |_| {
                     // TCP failed — fall through to parse truncated response as last resort
@@ -62,7 +64,7 @@ pub const ForwardingResolver = struct {
         }
 
         const msg = try dns.parseMessage(allocator, response_data);
-        if (!msg.header.qr) return error.FormatError;
+        if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
         return msg;
     }
 };
