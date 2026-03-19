@@ -12,6 +12,8 @@ pub const ServerConfig = struct {
     upstreams: []std.net.Address,
     cache_size: usize,
     cache_entries: u32,
+    key_cache_size: usize,
+    key_cache_entries: u32,
     prefetch: bool,
     serve_stale_ttl: u32,
     min_ttl: u32,
@@ -57,6 +59,8 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .upstreams = empty_upstreams,
         .cache_size = 16 * 1024 * 1024,
         .cache_entries = 10_000,
+        .key_cache_size = 4 * 1024 * 1024,
+        .key_cache_entries = 2_000,
         .prefetch = false,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
@@ -119,6 +123,14 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (cache.getInteger("entries")) |e| {
             if (e < 0) return error.InvalidValue;
             cfg.cache_entries = @intCast(@min(e, std.math.maxInt(u32)));
+        }
+        if (cache.getInteger("key-cache-size")) |s| {
+            if (s < 0) return error.InvalidValue;
+            cfg.key_cache_size = @intCast(@min(s, std.math.maxInt(usize)));
+        }
+        if (cache.getInteger("key-cache-entries")) |e| {
+            if (e < 0) return error.InvalidValue;
+            cfg.key_cache_entries = @intCast(@min(e, std.math.maxInt(u32)));
         }
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (cache.getInteger("serve-stale-ttl")) |s| {

@@ -85,6 +85,7 @@ pub const RecursiveResolver = struct {
     bypass_cache: bool = false,
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
+    key_cache: ?*RRsetCache = null,
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
     resolving_ds: bool = false,
@@ -94,6 +95,13 @@ pub const RecursiveResolver = struct {
     /// to ResolveResult for async refresh by the server layer.
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
+
+    /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
+    fn keyCache(self: *RecursiveResolver) ?*RRsetCache {
+        if (self.key_cache) |kc| return kc;
+        std.debug.assert(!self.dnssec_enabled or self.cache != null);
+        return self.cache;
+    }
 
     /// Non-last server timeout cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2s).
     const failover_timeout_cap: u32 = 2000;
@@ -183,8 +191,7 @@ pub const RecursiveResolver = struct {
                             },
                             .wildcard_match => {
                                 // RFC 8198 §5.3: synthesize answer from cached wildcard RRset.
-                                // Copy wildcard_name (thread-local buffer) into arena.
-                                if (try self.tryWildcardSynth(allocator, synth.wildcard_name, synth.soa, target_name, qtype, cname_chain.items)) |result| {
+                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, target_name, qtype, cname_chain.items)) |result| {
                                     return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
                                 }
                                 // Wildcard RRset not in cache — fall through to upstream (RFC 8198 §5.3 MUST)
@@ -214,7 +221,7 @@ pub const RecursiveResolver = struct {
                 // DNSSEC: when skipping referrals via cache, we miss classifyDelegation
                 // calls. Check for a cached negative DS to detect insecure delegations.
                 if (security_state == .secure and self.dnssec_enabled) {
-                    if (hasCachedInsecureDelegation(self.cache, allocator, deleg.zone))
+                    if (hasCachedInsecureDelegation(self.keyCache(), allocator, deleg.zone))
                         security_state = .insecure;
                 }
             }
@@ -696,7 +703,7 @@ pub const RecursiveResolver = struct {
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
             if (auth_status == .secure) {
                 const status = dnssec.classifyDelegation(authorities, zone_cut);
-                cacheInsecureDelegation(self.cache, status, zone_cut, authorities);
+                cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities);
                 return status;
             }
             if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
@@ -705,7 +712,7 @@ pub const RecursiveResolver = struct {
         const zs = nameToSlice(zone_cut);
         if (!self.reproveDelegationSecurity(allocator, zs.buf[0..zs.len], parent_servers))
             return .secure;
-        return if (hasCachedInsecureDelegation(self.cache, allocator, zone_cut)) .insecure else .secure;
+        return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
     }
 
     /// Try to synthesize a wildcard answer from the main RRset cache.
@@ -713,21 +720,27 @@ pub const RecursiveResolver = struct {
     fn tryWildcardSynth(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
-        wildcard_name: ?[]const u8,
+        ce_label_count: u8,
         soa: dns.ResourceRecord,
         target_name: dns.Name,
         qtype: dns.RType,
         cname_chain_items: []const dns.ResourceRecord,
     ) !?dns.Message {
-        const wc_dotted = wildcard_name orelse return null;
+        if (ce_label_count == 0 or target_name.labels.len < ce_label_count) return null;
+        // Build *.CE from qname labels and format as dotted string for cache lookup
+        const ce = dns.Name{ .labels = target_name.labels[target_name.labels.len - ce_label_count ..] };
+        var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+        const wc_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return null;
+        const wc_s = nameToSlice(wc_name);
+        const wc_dotted = wc_s.buf[0..wc_s.len];
+
         const c = self.cache orelse return null;
         const wc_result = c.lookup(allocator, wc_dotted, qtype, .in) orelse return null;
         switch (wc_result) {
             .hit => |h| {
-                // Rewrite owner names from *.example.com to the queried name (RFC 4592 §2.2)
-                for (h.records) |*rr| {
-                    rr.name = dns.cloneName(allocator, target_name) catch return null;
-                }
+                // Rewrite owner names to the queried name (RFC 4592 §2.2).
+                // target_name is arena-allocated and outlives the response — direct assignment.
+                for (h.records) |*rr| rr.name = target_name;
                 return try withCnameChain(allocator, cname_chain_items, makeCachedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
             },
             .negative => return null,
@@ -757,7 +770,7 @@ pub const RecursiveResolver = struct {
         // then collect all qtype records + covering RRSIGs with wildcard owner name.
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         var wildcard_owner: ?dns.Name = null;
-        var wc_records: [16]dns.ResourceRecord = undefined;
+        var wc_records: [16]dns.ResourceRecord = undefined; // typical wildcard RRsets are 1-3 records; silently caps at 16
         var wc_count: usize = 0;
         for (answers) |ans_rr| {
             if (wc_count >= wc_records.len) break;
@@ -878,8 +891,10 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         servers: []const std.net.Address,
     ) !?[]const dns.ResourceRecord {
+        const kc = self.keyCache();
+
         // Fast path: cache hit — no dedup needed.
-        if (self.cache) |c| {
+        if (kc) |c| {
             if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
@@ -906,7 +921,7 @@ pub const RecursiveResolver = struct {
                 .follower => {
                     // Leader finished (or timed out). Re-check cache — leader
                     // should have populated it on success.
-                    if (self.cache) |c| {
+                    if (kc) |c| {
                         if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
                             switch (result) {
                                 .hit => |h| return h.records,
@@ -924,7 +939,7 @@ pub const RecursiveResolver = struct {
                         },
                         .follower => {
                             // Another follower is already retrying — check cache once more.
-                            if (self.cache) |c| {
+                            if (kc) |c| {
                                 if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
                                     switch (result) {
                                         .hit => |h| return h.records,
@@ -958,7 +973,8 @@ pub const RecursiveResolver = struct {
         const zone_parsed = try dns.parseDottedName(allocator, zone_name);
 
         // Validate DNSKEY against cached DS before caching (RFC 4035 §5.2)
-        if (self.cache) |c| {
+        const kc = self.keyCache();
+        if (kc) |c| {
             if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
@@ -987,8 +1003,9 @@ pub const RecursiveResolver = struct {
             }
         }
 
-        // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation
-        if (self.cache) |c| c.storeResponse(resp, zone_parsed);
+        // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation.
+        // Store only answers to avoid polluting the key cache with NS/glue.
+        if (kc) |c| c.storeResponseWithStatus(answersOnly(resp), zone_parsed, .unchecked);
 
         return resp.answers;
     }
@@ -1092,8 +1109,10 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         parent_servers: []const std.net.Address,
     ) bool {
+        const kc = self.keyCache();
+
         // Fast path: DS already in cache (another thread may have fetched it).
-        if (self.cache) |c| {
+        if (kc) |c| {
             if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
         }
 
@@ -1106,7 +1125,7 @@ pub const RecursiveResolver = struct {
                 },
                 .follower => {
                     // Leader finished — re-check cache.
-                    if (self.cache) |c| {
+                    if (kc) |c| {
                         if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
                     }
                     // Cache still empty — leader failed. One follower retries.
@@ -1116,7 +1135,7 @@ pub const RecursiveResolver = struct {
                             return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
                         },
                         .follower => {
-                            if (self.cache) |c| {
+                            if (kc) |c| {
                                 if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
                             }
                             return false;
@@ -1135,10 +1154,15 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         parent_servers: []const std.net.Address,
     ) bool {
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, true) catch return false) orelse return false;
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return false) orelse return false;
         const zone = dns.parseDottedName(allocator, zone_name) catch return false;
 
-        // Positive DS — zone is signed (already cached by fetchRRset).
+        // Cache DS response: main cache for NS/glue (skip_key_types skips DS),
+        // key cache for DS only (avoid polluting with NS/glue).
+        if (self.cache) |c| c.storeResponse(response, zone);
+        if (self.key_cache) |kc| kc.storeResponseWithStatus(answersOnly(response), zone, .unchecked);
+
+        // Positive DS — zone is signed.
         // Check both answers (direct DS query) and authorities (referral-style response).
         for (response.answers) |rr| {
             if (rr.rtype == .ds) return true;
@@ -1152,7 +1176,7 @@ pub const RecursiveResolver = struct {
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone);
             if (status == .insecure) {
-                cacheInsecureDelegation(self.cache, status, zone, response.authorities);
+                cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
                 return true;
             }
         }
@@ -1411,7 +1435,8 @@ pub const RecursiveResolver = struct {
                             // using the parent delegation's servers (like Unbound's key
                             // cache refresh) before falling back to referral re-walk.
                             if (self.dnssec_enabled) {
-                                if (cache.lookup(allocator, zone_str, .ds, .in) == null) {
+                                const ds_cache = self.keyCache() orelse break;
+                                if (ds_cache.lookup(allocator, zone_str, .ds, .in) == null) {
                                     const reprobed = if (best) |parent_deleg|
                                         self.reproveDelegationSecurity(
                                             allocator,
@@ -1422,7 +1447,7 @@ pub const RecursiveResolver = struct {
                                         false;
                                     if (!reprobed) break;
                                     // DS status re-established — re-check before using
-                                    if (cache.lookup(allocator, zone_str, .ds, .in) == null) break;
+                                    if (ds_cache.lookup(allocator, zone_str, .ds, .in) == null) break;
                                 }
                             }
 
@@ -1548,6 +1573,16 @@ fn nameToSlice(name: dns.Name) struct { buf: [dns.max_name_len + 1]u8, len: usiz
     const buf = name.format();
     const len = mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
     return .{ .buf = buf, .len = len };
+}
+
+/// Strip authority/additional sections from a message for targeted cache stores.
+fn answersOnly(msg: dns.Message) dns.Message {
+    var m = msg;
+    m.authorities = &.{};
+    m.additionals = &.{};
+    m.header.ns_count = 0;
+    m.header.ar_count = 0;
+    return m;
 }
 
 /// Monotonic microseconds (CLOCK_BOOTTIME) for elapsed-time measurement.

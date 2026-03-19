@@ -213,9 +213,9 @@ pub const SynthResult = struct {
     rcode: RCode,
     /// SOA for authority section (RFC 2308 §3), cloned into caller's allocator.
     soa: dns.ResourceRecord,
-    /// For wildcard_match: dotted wildcard name for RRset cache lookup (e.g. "*.example.com").
-    /// Points to thread-local buffer — caller must consume before next NSEC cache call.
-    wildcard_name: ?[]const u8 = null,
+    /// For wildcard_match: label count of the closest encloser. Caller reconstructs
+    /// *.CE from the qname it already has (CE is the last ce_label_count labels).
+    ce_label_count: u8 = 0,
 
     pub const RCode = enum { nxdomain, nodata, wildcard_match };
 };
@@ -423,15 +423,15 @@ pub const NsecCache = struct {
         const zone_label_count = zoneLabelsLen(zone_lower);
         if (qname.labels.len > zone_label_count + 1 and qtype != .ds) {
             const direct_child = dns.Name{ .labels = qname.labels[qname.labels.len - zone_label_count - 1 ..] };
-            if (list.findCovering(direct_child, now) == null) {
+            if (list.findCovering(direct_child, now) == null and list.findExact(direct_child, now) == null) {
                 return null; // can't prove no delegation exists
             }
         }
 
-        const rcode: SynthResult.RCode, const wc_name: ?[]const u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
-            .nxdomain => .{ .nxdomain, null },
-            .wildcard_nodata => .{ .nodata, null },
-            .wildcard_match => |wc| .{ .wildcard_match, wc },
+        const rcode: SynthResult.RCode, const ce_len: u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
+            .nxdomain => .{ .nxdomain, 0 },
+            .wildcard_nodata => .{ .nodata, 0 },
+            .wildcard_match => |ce| .{ .wildcard_match, ce },
             .unknown => nodata: {
                 const nsec = list.findExact(qname, now) orelse return null;
                 // Don't synthesize NODATA if CNAME exists — query must follow the
@@ -439,13 +439,13 @@ pub const NsecCache = struct {
                 if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
                     return null;
                 if (!dns.typeBitmapContains(nsec.type_bit_maps, qtype))
-                    break :nodata .{ .nodata, null };
+                    break :nodata .{ .nodata, 0 };
                 return null;
             },
         };
         const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
         _ = self.hits.fetchAdd(1, .monotonic);
-        return .{ .rcode = rcode, .soa = soa, .wildcard_name = wc_name };
+        return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len };
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
@@ -474,7 +474,7 @@ fn zoneLabelsLen(zone_lower: []const u8) usize {
 const NameNonExistence = union(enum) {
     nxdomain, // name and wildcard both don't exist
     wildcard_nodata, // name doesn't exist, wildcard exists but lacks qtype
-    wildcard_match: []const u8, // name doesn't exist, wildcard exists and has qtype — dotted wildcard name
+    wildcard_match: u8, // name doesn't exist, wildcard has qtype — CE label count
     unknown, // can't prove anything
 };
 
@@ -497,16 +497,7 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
         if (!dns.typeBitmapContains(wc_nsec.type_bit_maps, qtype)) {
             return .wildcard_nodata;
         }
-        // Wildcard has the queried type — format the dotted name for RRset cache lookup
-        const wc_fmt = wildcard_name.format();
-        const wc_len = mem.indexOfScalar(u8, &wc_fmt, 0) orelse wc_fmt.len;
-        // Store in a comptime-known max-size buffer on the list's existing memory
-        // Use a thread-local buffer since we're under shared lock
-        const S = struct {
-            threadlocal var buf: [dns.max_name_len + 1]u8 = undefined;
-        };
-        @memcpy(S.buf[0..wc_len], wc_fmt[0..wc_len]);
-        return .{ .wildcard_match = S.buf[0..wc_len] };
+        return .{ .wildcard_match = @intCast(ce.labels.len) };
     }
 
     // Prove wildcard name is covered by an NSEC (doesn't exist)
@@ -721,7 +712,7 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
     const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
     defer freeSoaRecord(alloc, @constCast(&result.soa));
     try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
-    try testing.expect(result.wildcard_name != null);
+    try testing.expect(result.ce_label_count > 0);
 }
 
 test "NSEC cache: apex NODATA via full-name zone check" {
@@ -942,7 +933,7 @@ test "NSEC cache: wildcard match returns wildcard_match" {
     const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
     defer freeSoaRecord(alloc, @constCast(&result.soa));
     try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
-    try testing.expect(result.wildcard_name != null);
+    try testing.expect(result.ce_label_count > 0);
 }
 
 test "NSEC cache: wildcard CNAME suppression" {

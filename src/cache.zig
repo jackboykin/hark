@@ -354,6 +354,8 @@ pub const RRsetCache = struct {
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     prefetch: bool = false,
+    /// When true, storeRRsetsImpl skips .dnskey and .ds records (routed to key cache).
+    skip_key_types: bool = false,
     hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -366,6 +368,8 @@ pub const RRsetCache = struct {
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
         min_ttl: u32 = 0,
+        /// Skip .dnskey and .ds records in storeRRsetsImpl (routed to key cache).
+        skip_key_types: bool = false,
     };
 
     pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
@@ -381,6 +385,7 @@ pub const RRsetCache = struct {
             .prefetch = opts.prefetch,
             .serve_stale_ttl = opts.serve_stale_ttl,
             .min_ttl = opts.min_ttl,
+            .skip_key_types = opts.skip_key_types,
         };
     }
 
@@ -710,6 +715,10 @@ pub const RRsetCache = struct {
             if (rr.rtype == .soa) continue;
             // Skip OPT pseudo-records (belt-and-suspenders; parseMessage excludes them)
             if (rr.rtype == .opt) continue;
+            // Skip standalone RRSIG — bundled with their signed RRset instead
+            if (rr.rtype == .rrsig) continue;
+            // Skip DNSKEY/DS when configured (routed to dedicated key cache)
+            if (self.skip_key_types and (rr.rtype == .dnskey or rr.rtype == .ds)) continue;
 
             // Check if we already processed this (name, type) group
             const name_fmt = rr.name.format();

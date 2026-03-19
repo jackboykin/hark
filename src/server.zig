@@ -55,6 +55,7 @@ pub const Server = struct {
     encrypted_ns_cache: ?EncryptedNsCache,
     enc_pool: ?ConnectionPool,
     nsec_cache: ?NsecCache,
+    key_cache: ?RRsetCache,
     shutdown: std.atomic.Value(bool),
     worker_errors: std.atomic.Value(u32),
 
@@ -63,6 +64,7 @@ pub const Server = struct {
             .prefetch = cfg.prefetch,
             .serve_stale_ttl = cfg.serve_stale_ttl,
             .min_ttl = cfg.min_ttl,
+            .skip_key_types = cfg.dnssec,
         };
         const cache_alloc = if (builtin.single_threaded)
             allocator
@@ -108,6 +110,12 @@ pub const Server = struct {
                 else
                     NsecCache.init(nsec_alloc, NsecCache.default_max_bytes);
             } else null,
+            .key_cache = if (cfg.dnssec) blk: {
+                break :blk if (cfg.workers > 1)
+                    RRsetCache.initThreadSafe(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries)
+                else
+                    RRsetCache.init(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries);
+            } else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
         };
@@ -124,6 +132,7 @@ pub const Server = struct {
         }
         if (self.dedup) |*d| d.deinit();
         if (self.nsec_cache) |*nc| nc.deinit();
+        if (self.key_cache) |*kc| kc.deinit();
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
@@ -206,6 +215,14 @@ pub const Server = struct {
         log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions, {d} prefetch-eligible, {d} stale", .{
             stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.prefetch_eligible, stats.stale_hits,
         });
+        if (self.key_cache) |*kc| {
+            const ks = kc.getStats();
+            const k_total = ks.hits + ks.misses;
+            const k_pct: u64 = if (k_total > 0) ks.hits * 100 / k_total else 0;
+            log.info("key cache: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate)", .{
+                ks.entries, ks.memory_bytes, ks.hits, ks.misses, k_pct,
+            });
+        }
         if (self.nsec_cache) |*nc| {
             const ns = nc.getStats();
             const ns_total = ns.hits + ns.misses;
@@ -303,6 +320,7 @@ pub const Server = struct {
             .tls_transport = if (self.config.opportunistic) &tls_transport else null,
             .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
             .cache = &self.cache,
+            .key_cache = if (self.key_cache) |*kc| kc else null,
             .rtt_cache = &self.rtt_cache,
             .ns_selector = &self.ns_selector,
             .dedup = if (self.dedup) |*d| d else null,
@@ -330,6 +348,7 @@ const WorkerState = struct {
     tls_transport: ?*TlsTransport,
     encrypted_ns_cache: ?*EncryptedNsCache,
     cache: *RRsetCache,
+    key_cache: ?*RRsetCache,
     rtt_cache: *RttCache,
     ns_selector: *NsSelector,
     dedup: ?*InFlightTable,
@@ -670,6 +689,7 @@ const WorkerState = struct {
                     .bypass_cache = bypass_cache,
                     .dedup = self.dedup,
                     .nsec_cache = if (self.config.dnssec and !cd) self.nsec_cache else null,
+                    .key_cache = if (self.config.dnssec) self.key_cache else null,
                 };
                 var result = try resolver.resolve(alloc, name, qtype);
                 // Dupe into arena before stack-allocated resolver goes out of scope
