@@ -961,6 +961,9 @@ pub const RecursiveResolver = struct {
             ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
         }
 
+        // TC bit: fall through to sequential path which handles TCP retry
+        if (dns.hasTcBit(stag_result.response_data)) return null;
+
         const resp = try tryParseMessage(allocator, stag_result.response_data) orelse return null;
         if (!resp.header.qr) return null;
 
