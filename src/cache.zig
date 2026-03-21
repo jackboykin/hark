@@ -10,6 +10,9 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 /// cache lifetimes from malicious or misconfigured responses.
 const max_cache_ttl: u32 = 604_800;
 
+/// Max records per RRset in single-pass store (DNS wire format bounds the total).
+const max_rrset_collect: usize = 64;
+
 const defaultNowSeconds = dns.monotonicNowSeconds;
 
 // ── Cache key ─────────────────────────────────────────────────────────
@@ -22,15 +25,15 @@ const CacheKey = struct {
 };
 
 const CacheKeyContext = struct {
-    pub fn hash(_: @This(), key: CacheKey) u64 {
+    pub fn hash(_: @This(), key: CacheKey) u32 {
         var h = std.hash.Wyhash.init(0);
         h.update(key.name);
         h.update(mem.asBytes(&key.rtype));
         h.update(mem.asBytes(&key.rclass));
-        return h.final();
+        return @truncate(h.final());
     }
 
-    pub fn eql(_: @This(), a: CacheKey, b: CacheKey) bool {
+    pub fn eql(_: @This(), a: CacheKey, b: CacheKey, _: usize) bool {
         return a.rtype == b.rtype and a.rclass == b.rclass and mem.eql(u8, a.name, b.name);
     }
 };
@@ -270,7 +273,7 @@ fn nameToLowerDotted(alloc: Allocator, name: dns.Name) ![]const u8 {
 
 pub const RRsetCache = struct {
     counting: CountingAllocator,
-    map: std.HashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, 80),
+    map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true),
     max_entries: u32,
     now_fn: *const fn () i64,
     rwlock: ?std.Thread.RwLock = null,
@@ -279,6 +282,9 @@ pub const RRsetCache = struct {
     prefetch: bool = false,
     /// When true, storeRRsetsImpl skips .dnskey and .ds records (routed to key cache).
     skip_key_types: bool = false,
+    /// SIEVE eviction state: per-entry visited flag and circular scan pointer.
+    visited: ?[]std.atomic.Value(u8) = null,
+    hand: u32 = 0,
     hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -300,6 +306,11 @@ pub const RRsetCache = struct {
     }
 
     pub fn initWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
+        // Allocate SIEVE visited flags from backing allocator (not counted against cache budget).
+        const visited: ?[]std.atomic.Value(u8) = if (backing.alloc(std.atomic.Value(u8), max_entries)) |v| blk: {
+            for (v) |*slot| slot.* = std.atomic.Value(u8).init(0);
+            break :blk v;
+        } else |_| null;
         return .{
             .counting = CountingAllocator.init(backing, max_bytes),
             .map = .empty,
@@ -309,6 +320,7 @@ pub const RRsetCache = struct {
             .serve_stale_ttl = opts.serve_stale_ttl,
             .min_ttl = opts.min_ttl,
             .skip_key_types = opts.skip_key_types,
+            .visited = visited,
         };
     }
 
@@ -353,13 +365,15 @@ pub const RRsetCache = struct {
     }
 
     pub fn deinit(self: *RRsetCache) void {
-        var it = self.map.iterator();
         const alloc = self.counting.allocator();
-        while (it.next()) |entry| {
-            freeKey(alloc, entry.key_ptr.*);
-            freeEntry(alloc, entry.value_ptr.*);
+        const keys = self.map.keys();
+        const vals = self.map.values();
+        for (0..self.map.count()) |i| {
+            freeKey(alloc, keys[i]);
+            freeEntry(alloc, vals[i]);
         }
         self.map.deinit(alloc);
+        if (self.visited) |v| self.counting.backing.free(v);
     }
 
     // ── Lookup ────────────────────────────────────────────────────────
@@ -379,10 +393,13 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const entry = self.map.get(probe) orelse {
+        const idx = self.map.getIndex(probe) orelse {
             _ = self.misses.fetchAdd(1, .monotonic);
             return null;
         };
+        // SIEVE: mark as recently accessed (atomic store, safe under shared read lock)
+        self.markVisited(idx);
+        const entry = self.map.values()[idx];
 
         const now = self.now_fn();
 
@@ -667,13 +684,18 @@ pub const RRsetCache = struct {
                 processed_count += 1;
             }
 
-            // Count matching records in this section
-            var count: usize = 0;
+            // Single-pass collect into stack buffer (avoids double scan).
+            var match_buf: [max_rrset_collect]dns.ResourceRecord = undefined;
+            var match_count: usize = 0;
             for (records) |other| {
                 if (other.rtype == rr.rtype and other.rclass == rr.rclass and rr.name.eql(other.name)) {
-                    count += 1;
+                    if (match_count < match_buf.len) {
+                        match_buf[match_count] = other;
+                    }
+                    match_count += 1;
                 }
             }
+            const collect_count = @min(match_count, match_buf.len);
 
             // Build the key (lower_name is already lowercased in stack buffer)
             const key_name = alloc.dupe(u8, lower_name) catch continue;
@@ -694,32 +716,29 @@ pub const RRsetCache = struct {
                 self.removeAndFree(key);
             }
 
-            // Deep-copy the RRset
-            const cached_records = alloc.alloc(CachedRecord, count) catch {
+            // Deep-copy from stack buffer
+            const cached_records = alloc.alloc(CachedRecord, collect_count) catch {
                 alloc.free(key_name);
                 continue;
             };
             var idx: usize = 0;
-            for (records) |other| {
-                if (other.rtype == rr.rtype and other.rclass == rr.rclass and rr.name.eql(other.name)) {
-                    const cloned_name = cloneName(alloc, other.name) catch break;
-                    const cloned_rdata = cloneRData(alloc, other.rdata) catch {
-                        dns.freeName(alloc, cloned_name);
-                        break;
-                    };
-                    cached_records[idx] = .{
-                        .name = cloned_name,
-                        .rtype = other.rtype,
-                        .rclass = other.rclass,
-                        .rdata = cloned_rdata,
-                    };
-                    idx += 1;
-                }
+            for (match_buf[0..collect_count]) |other| {
+                const cloned_name = cloneName(alloc, other.name) catch break;
+                const cloned_rdata = cloneRData(alloc, other.rdata) catch {
+                    dns.freeName(alloc, cloned_name);
+                    break;
+                };
+                cached_records[idx] = .{
+                    .name = cloned_name,
+                    .rtype = other.rtype,
+                    .rclass = other.rclass,
+                    .rdata = cloned_rdata,
+                };
+                idx += 1;
             }
 
-            if (idx == 0 or idx < count) {
-                // idx==0: no records cloned; idx<count: partial clone failure —
-                // don't cache an incomplete RRset.
+            if (idx == 0 or idx < collect_count) {
+                // Partial clone failure — don't cache an incomplete RRset.
                 for (cached_records[0..idx]) |cr| {
                     dns.freeName(alloc, cr.name);
                     dns.freeRData(alloc, cr.rdata);
@@ -729,37 +748,22 @@ pub const RRsetCache = struct {
                 continue;
             }
 
-            // Shrink allocation to actual count so freeEntry gets correct size
-            const final_records = if (idx < count)
-                alloc.realloc(cached_records, idx) catch {
-                    // realloc shrink failed — free everything and skip
-                    for (cached_records[0..idx]) |cr| {
-                        dns.freeName(alloc, cr.name);
-                        dns.freeRData(alloc, cr.rdata);
-                    }
-                    alloc.free(cached_records);
-                    alloc.free(key_name);
-                    continue;
-                }
-            else
-                cached_records;
-
             self.evictIfNeeded();
 
             const now = self.now_fn();
             const capped_ttl = clampTtl(self.min_ttl, rr.ttl);
             self.map.put(alloc, key, .{ .positive = .{
-                .records = final_records,
+                .records = cached_records,
                 .expires_at = now + @as(i64, capped_ttl),
                 .original_ttl = capped_ttl,
                 .stored_at = now,
                 .security_status = status,
             } }) catch {
-                for (final_records) |cr| {
+                for (cached_records) |cr| {
                     dns.freeName(alloc, cr.name);
                     dns.freeRData(alloc, cr.rdata);
                 }
-                alloc.free(final_records);
+                alloc.free(cached_records);
                 alloc.free(key_name);
                 continue;
             };
@@ -768,81 +772,95 @@ pub const RRsetCache = struct {
     }
 
     fn removeAndFree(self: *RRsetCache, key: CacheKey) void {
-        const alloc = self.counting.allocator();
-        if (self.map.fetchRemove(key)) |kv| {
-            freeKey(alloc, kv.key);
-            freeEntry(alloc, kv.value);
+        const idx = self.map.getIndex(key) orelse return;
+        self.removeAtIndex(self.counting.allocator(), idx);
+    }
+
+    inline fn markVisited(self: *RRsetCache, i: usize) void {
+        if (self.visited) |v| if (i < v.len) v[i].store(1, .monotonic);
+    }
+
+    inline fn clearVisited(self: *RRsetCache, i: usize) void {
+        if (self.visited) |v| if (i < v.len) v[i].store(0, .monotonic);
+    }
+
+    inline fn isVisited(self: *RRsetCache, i: usize) bool {
+        const v = self.visited orelse return false;
+        return i < v.len and v[i].load(.monotonic) != 0;
+    }
+
+    /// Swap-remove entry at index: fixup visited flag, free key/value, clamp hand.
+    fn removeAtIndex(self: *RRsetCache, alloc: Allocator, i: usize) void {
+        const key = self.map.keys()[i];
+        const val = self.map.values()[i];
+        const last = self.map.count() - 1;
+        if (i != last) {
+            if (self.visited) |v| if (i < v.len and last < v.len) {
+                v[i].store(v[last].load(.monotonic), .monotonic);
+            };
         }
+        self.map.swapRemoveAt(i);
+        freeKey(alloc, key);
+        freeEntry(alloc, val);
+        if (self.hand >= self.map.count()) self.hand = 0;
     }
 
     fn evictIfNeeded(self: *RRsetCache) void {
-        const count = self.map.count();
+        const count: u32 = @intCast(self.map.count());
         if (count < self.max_entries) {
-            // Below capacity — opportunistically sweep one expired entry when
-            // above 75% full. Compensates for deferred eviction under RwLock:
-            // lookup() no longer removes expired entries, so they accumulate
-            // until a write path runs. This sweep provides gradual cleanup.
             if (count < self.max_entries / 4 * 3) return;
-            const now = self.now_fn();
-            const alloc = self.counting.allocator();
-            var it = self.map.iterator();
-            while (it.next()) |entry| {
-                const expired = switch (entry.value_ptr.*) {
-                    .positive => |p| now >= p.expires_at,
-                    .negative => |n| now >= n.expires_at,
-                };
-                if (expired) {
-                    const key = entry.key_ptr.*;
-                    const val = entry.value_ptr.*;
-                    self.map.removeByPtr(entry.key_ptr);
-                    freeKey(alloc, key);
-                    freeEntry(alloc, val);
-                    _ = self.evictions.fetchAdd(1, .monotonic);
-                    return;
-                }
-            }
+            self.sweepExpired(count);
             return;
         }
+        self.sieveEvict(count);
+    }
 
-        const alloc = self.counting.allocator();
+    /// Probe a bounded number of entries from the SIEVE hand, evicting the first
+    /// expired one. Clears visited flags as it goes for gradual SIEVE decay.
+    fn sweepExpired(self: *RRsetCache, count: u32) void {
+        if (count == 0) return;
         const now = self.now_fn();
-
-        // First: try to evict an expired entry
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            const expired = switch (entry.value_ptr.*) {
+        const alloc = self.counting.allocator();
+        var probes: u32 = 0;
+        while (probes < 8) : (probes += 1) {
+            if (self.hand >= count) self.hand = 0;
+            const i = self.hand;
+            self.hand += 1;
+            self.clearVisited(i);
+            const expired = switch (self.map.values()[i]) {
                 .positive => |p| now >= p.expires_at,
                 .negative => |n| now >= n.expires_at,
             };
             if (expired) {
-                const key = entry.key_ptr.*;
-                const val = entry.value_ptr.*;
-                self.map.removeByPtr(entry.key_ptr);
-                freeKey(alloc, key);
-                freeEntry(alloc, val);
+                self.removeAtIndex(alloc, i);
                 _ = self.evictions.fetchAdd(1, .monotonic);
+                self.hand = if (i < self.map.count()) @intCast(i) else 0;
                 return;
             }
         }
+    }
 
-        // No expired entries: evict random
-        var it2 = self.map.iterator();
-        const rand_count = self.map.count();
-        if (rand_count == 0) return;
-        const target = std.crypto.random.uintLessThan(u32, @intCast(rand_count));
-        var idx: u32 = 0;
-        while (it2.next()) |entry| {
-            if (idx == target) {
-                const key = entry.key_ptr.*;
-                const val = entry.value_ptr.*;
-                self.map.removeByPtr(entry.key_ptr);
-                freeKey(alloc, key);
-                freeEntry(alloc, val);
+    /// SIEVE eviction: scan from hand, give visited entries a second chance,
+    /// evict the first unvisited entry. Amortized O(1).
+    fn sieveEvict(self: *RRsetCache, count: u32) void {
+        const alloc = self.counting.allocator();
+        var probes: u32 = 0;
+        while (probes < count) : (probes += 1) {
+            if (self.hand >= count) self.hand = 0;
+            const i = self.hand;
+            if (self.isVisited(i)) {
+                self.clearVisited(i);
+                self.hand += 1;
+            } else {
+                self.removeAtIndex(alloc, i);
                 _ = self.evictions.fetchAdd(1, .monotonic);
                 return;
             }
-            idx += 1;
         }
+        // All visited (flags now cleared) — evict at hand
+        if (self.hand >= count) self.hand = 0;
+        self.removeAtIndex(alloc, self.hand);
+        _ = self.evictions.fetchAdd(1, .monotonic);
     }
 
     fn freeKey(alloc: Allocator, key: CacheKey) void {

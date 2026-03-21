@@ -67,20 +67,23 @@ pub const root_ds_records = [_]dns.DsData{
 // ── DNSKEY Validation Helpers ────────────────────────────────────────
 
 /// Find a DNSKEY in a set that matches a DS record.
-/// Returns the matching DNSKEY or null.
+/// Returns the matching DNSKEY and its index, or null.
+/// Uses pre-computed key tags to avoid redundant keyTag() calls.
 pub fn findMatchingDnskey(
     ds: dns.DsData,
     dnskeys: []const dns.ResourceRecord,
     owner_name: dns.Name,
-) ?dns.DnskeyData {
-    for (dnskeys) |rr| {
+    precomputed_tags: []const u16,
+) ?struct { dnskey: dns.DnskeyData, index: usize } {
+    for (dnskeys, 0..) |rr, i| {
         if (rr.rtype != .dnskey) continue;
         const dk = rr.rdata.dnskey;
-        if (keyTag(dk) != ds.key_tag) continue;
+        const tag = if (i < precomputed_tags.len) precomputed_tags[i] else keyTag(dk);
+        if (tag != ds.key_tag) continue;
         if (@intFromEnum(dk.algorithm) != @intFromEnum(ds.algorithm)) continue;
         // Verify DS hash matches
         verifyDs(ds, dk, owner_name) catch continue;
-        return dk;
+        return .{ .dnskey = dk, .index = i };
     }
     return null;
 }
@@ -119,26 +122,37 @@ pub fn validateDnskeyRrset(
     }
     const filtered = dnskey_only[0..dnskey_count];
 
+    // Pre-compute key tags to avoid redundant recomputation across nested loops.
+    var key_tags: [64]u16 = undefined;
+    for (dnskey_records, 0..) |rr, i| {
+        if (i >= key_tags.len) break;
+        key_tags[i] = if (rr.rtype == .dnskey) keyTag(rr.rdata.dnskey) else 0;
+    }
+    const tags = key_tags[0..@min(dnskey_records.len, key_tags.len)];
+
     // Try all DS records × all RRSIGs covering DNSKEY (RFC 6840 §5.11)
     for (ds_records) |ds| {
-        if (findMatchingDnskey(ds, dnskey_records, zone_name)) |ksk| {
+        if (findMatchingDnskey(ds, dnskey_records, zone_name, tags)) |ksk_match| {
+            const ksk = ksk_match.dnskey;
+            const ksk_tag = tags[ksk_match.index];
             // Try every RRSIG covering DNSKEY
             for (dnskey_records) |rrsig_rr| {
                 if (rrsig_rr.rtype != .rrsig) continue;
                 if (rrsig_rr.rdata.rrsig.type_covered != .dnskey) continue;
                 const rrsig = rrsig_rr.rdata.rrsig;
 
-                if (rrsig.key_tag == keyTag(ksk)) {
+                if (rrsig.key_tag == ksk_tag) {
                     // Direct KSK verification
                     verifyRrsig(rrsig, ksk, filtered, now_u32) catch continue;
                     return;
                 }
 
                 // Fallback: signing key must be DS-authenticated (C2 fix)
-                for (dnskey_records) |rr| {
+                for (dnskey_records, 0..) |rr, i| {
                     if (rr.rtype != .dnskey) continue;
                     const dk = rr.rdata.dnskey;
-                    if (keyTag(dk) != rrsig.key_tag) continue;
+                    const dk_tag = if (i < tags.len) tags[i] else keyTag(dk);
+                    if (dk_tag != rrsig.key_tag) continue;
                     var ds_auth = false;
                     for (ds_records) |ds2| {
                         verifyDs(ds2, dk, zone_name) catch continue;
@@ -183,6 +197,13 @@ pub fn classifyDelegation(
 
     // No DS — check for NSEC/NSEC3 proof of DS absence
     var had_nsec3_high_iterations = false;
+
+    // All NSEC3 records in a response share the same salt/iterations (RFC 9276),
+    // so the child zone hash can be computed once and reused across all records.
+    var cached_hash: ?[Sha1.digest_length]u8 = null;
+    var cached_salt: []const u8 = &.{};
+    var cached_iterations: u16 = 0;
+
     for (authorities) |rr| {
         if (rr.rtype == .nsec) {
             if (rr.name.eql(child_zone)) {
@@ -199,7 +220,21 @@ pub fn classifyDelegation(
                 continue;
             }
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
-            const child_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
+
+            // Reuse cached hash if salt/iterations match, otherwise recompute.
+            const child_hash = blk: {
+                if (cached_hash) |h| {
+                    if (cached_iterations == nsec3.iterations and
+                        mem.eql(u8, cached_salt, nsec3.salt))
+                        break :blk h;
+                }
+                const new_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
+                cached_hash = new_hash;
+                cached_salt = nsec3.salt;
+                cached_iterations = nsec3.iterations;
+                break :blk new_hash;
+            };
+
             if (mem.eql(u8, &owner_hash, &child_hash)) {
                 if (isInsecureDelegationProof(nsec3.type_bit_maps)) return .insecure;
                 // NSEC3 matches but doesn't prove insecure delegation (RFC 6840 §4.4).
