@@ -387,8 +387,11 @@ pub const RecursiveResolver = struct {
                     };
                     const do53_elapsed = monotonicMicros() - do53_start;
 
-                    // RFC 5452 §9.1: question section must match original query
-                    if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, query_type)) continue;
+                    // RFC 5452 §9.1: question section must match original query.
+                    // RFC 9619: FORMERR may omit question section (QDCOUNT=0).
+                    if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, query_type)) {
+                        if (response.header.rcode != .format_error) continue;
+                    }
 
                     // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
                     // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).

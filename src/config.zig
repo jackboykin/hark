@@ -43,6 +43,7 @@ pub const ConfigError = error{
     InvalidPort,
     InvalidValue,
     InvalidWorkerCount,
+    InvalidQueryMemoryLimit,
     ForwardingRequiresUpstreams,
     OutOfMemory,
 };
@@ -124,7 +125,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
         if (resolver.getInteger("query-memory-limit")) |q| {
             if (q < 0) return error.InvalidValue;
-            cfg.query_memory_limit = @intCast(@min(q, std.math.maxInt(usize)));
+            const val: usize = @intCast(@min(q, std.math.maxInt(usize)));
+            if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
+            cfg.query_memory_limit = val;
         }
         if (resolver.getInteger("stagger-ms")) |s| {
             if (s < 0) return error.InvalidValue;

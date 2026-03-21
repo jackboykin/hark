@@ -27,8 +27,9 @@ pub const CountingAllocator = struct {
     fn reserveBytes(self: *CountingAllocator, len: usize) bool {
         while (true) {
             const current = self.current_bytes.load(.monotonic);
-            if (current + len > self.max_bytes) return false;
-            if (self.current_bytes.cmpxchgWeak(current, current + len, .monotonic, .monotonic) == null) return true;
+            const sum, const overflow = @addWithOverflow(current, len);
+            if (overflow != 0 or sum > self.max_bytes) return false;
+            if (self.current_bytes.cmpxchgWeak(current, sum, .monotonic, .monotonic) == null) return true;
         }
     }
 

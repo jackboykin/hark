@@ -44,7 +44,13 @@ pub const ForwardingResolver = struct {
             var response_buf: [65535]u8 = undefined;
             const response_data = try tls_t.query(wire_query, upstream, &response_buf);
             const msg = try dns.parseMessage(allocator, response_data);
-            if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
+            if (!msg.header.qr) return error.FormatError;
+            if (!dns.validateQuestionMatch(msg, expected_name, qtype)) {
+                // RFC 9619 / Unbound model: error responses (FORMERR, SERVFAIL, REFUSED)
+                // may omit the question section. Accept them — nothing to poison.
+                // Reject NOERROR/NXDOMAIN with missing questions (suspicious).
+                if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
+            }
             return msg;
         }
 
@@ -57,7 +63,10 @@ pub const ForwardingResolver = struct {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
-                    if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
+                    if (!msg.header.qr) return error.FormatError;
+                    if (!dns.validateQuestionMatch(msg, expected_name, qtype)) {
+                        if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
+                    }
                     return msg;
                 } else |_| {
                     // TCP failed — fall through to parse truncated response as last resort
@@ -66,7 +75,10 @@ pub const ForwardingResolver = struct {
         }
 
         const msg = try dns.parseMessage(allocator, response_data);
-        if (!msg.header.qr or !dns.validateQuestionMatch(msg, expected_name, qtype)) return error.FormatError;
+        if (!msg.header.qr) return error.FormatError;
+        if (!dns.validateQuestionMatch(msg, expected_name, qtype)) {
+            if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
+        }
         return msg;
     }
 };
