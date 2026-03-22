@@ -50,13 +50,15 @@ pub const AcquireResult = enum { leader, follower };
 
 pub const InFlightTable = struct {
     map: std.HashMapUnmanaged(DedupKey, EntryState, DedupKeyContext, 80),
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    condition: std.Io.Condition = std.Io.Condition.init,
+    io: std.Io,
     allocator: mem.Allocator,
 
-    pub fn init(allocator: mem.Allocator) InFlightTable {
+    pub fn init(allocator: mem.Allocator, io: std.Io) InFlightTable {
         return .{
             .map = .empty,
+            .io = io,
             .allocator = allocator,
         };
     }
@@ -78,16 +80,20 @@ pub const InFlightTable = struct {
     pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, timeout_ns: u64) AcquireResult {
         const key = DedupKey.init(name, qtype, flags) orelse return .leader;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.map.getPtr(key)) |_| {
             // Another worker is resolving this — wait for completion.
+            // The condition is shared across all entries, so any key's
+            // releaseLeader broadcast wakes us to recheck the deadline.
+            const monotonic = @import("monotonic.zig");
+            const deadline = monotonic.nowNs() +| @as(i128, timeout_ns);
             while (self.map.get(key)) |entry| {
                 if (entry.completed) break;
-                self.condition.timedWait(&self.mutex, timeout_ns) catch break;
+                if (monotonic.nowNs() >= deadline) break;
+                self.condition.waitUncancelable(self.io, &self.mutex);
             }
-            // Entry may have been removed by leader, or we timed out — either way, follower.
             return .follower;
         }
 
@@ -101,13 +107,13 @@ pub const InFlightTable = struct {
     pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) void {
         const key = DedupKey.init(name, qtype, flags) orelse return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.map.getPtr(key)) |entry| {
             entry.completed = true;
         }
-        self.condition.broadcast();
+        self.condition.broadcast(self.io);
         // Remove entry so followers see null and break out, and future requests start fresh.
         _ = self.map.remove(key);
     }
@@ -116,7 +122,7 @@ pub const InFlightTable = struct {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "leader for new key" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const result = table.acquireOrWait("example.com", .a, 0);
@@ -127,7 +133,7 @@ test "leader for new key" {
 }
 
 test "different qtypes are independent" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const r1 = table.acquireOrWait("example.com", .a, 0);
@@ -140,7 +146,7 @@ test "different qtypes are independent" {
 }
 
 test "different names are independent" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const r1 = table.acquireOrWait("a.example.com", .a, 0);
@@ -153,7 +159,7 @@ test "different names are independent" {
 }
 
 test "case insensitive dedup" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const key1 = DedupKey.init("EXAMPLE.COM", .a, 0);
@@ -164,7 +170,7 @@ test "case insensitive dedup" {
 }
 
 test "follower waits for leader" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const leader_result = table.acquireOrWait("example.com", .a, 0);
@@ -182,7 +188,10 @@ test "follower waits for leader" {
     }.run, .{ &table, &follower_done, &follower_result });
 
     // Give follower time to block
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    {
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
     try testing.expectEqual(false, follower_done.load(.acquire));
 
     // Release — follower should wake
@@ -195,7 +204,7 @@ test "follower waits for leader" {
 }
 
 test "entry cleaned up after leader and followers finish" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     _ = table.acquireOrWait("example.com", .a, 0);
@@ -210,7 +219,7 @@ test "entry cleaned up after leader and followers finish" {
 
 test "timeout when leader never releases" {
     // Use a very short timeout by testing the condition variable directly
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     _ = table.acquireOrWait("example.com", .a, 0);
@@ -226,13 +235,16 @@ test "timeout when leader never releases" {
     }.run, .{&table});
 
     // Release after a short delay so the test doesn't take 5s
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    {
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
     table.releaseLeader("example.com", .a, 0);
     t.join();
 }
 
 test "acquireOrWaitWithTimeout uses custom timeout" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     _ = table.acquireOrWait("example.com", .a, 0);
@@ -243,7 +255,7 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
 }
 
 test "different flags are independent" {
-    var table = InFlightTable.init(testing.allocator);
+    var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     const r1 = table.acquireOrWait("example.com", .a, 0);

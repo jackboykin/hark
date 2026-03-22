@@ -190,7 +190,7 @@ const InitError = error{
 /// `host` is only borrowed during this function call.
 ///
 /// `input` is asserted to have buffer capacity at least `min_buffer_len`.
-pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client {
+pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitError!Client {
     assert(input.buffer.len >= min_buffer_len);
     const host = switch (options.host) {
         .no_verification => "",
@@ -209,13 +209,13 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     const alpn_extension_len: usize = if (options.alpn != null) alpn_ext_header.len + alpn_name.len else 0;
 
     var random_buffer: [176]u8 = undefined;
-    crypto.random.bytes(&random_buffer);
+    io.random(&random_buffer);
     const client_hello_rand = random_buffer[0..32].*;
     var key_seq: u64 = 0;
     var server_hello_rand: [32]u8 = undefined;
     const legacy_session_id = random_buffer[32..64].*;
 
-    var key_share = KeyShare.init(random_buffer[64..176].*) catch |err| switch (err) {
+    var key_share = KeyShare.init(random_buffer[64..176].*, io) catch |err| switch (err) {
         // Only possible to happen if the seed is all zeroes.
         error.IdentityElement => return error.InsufficientEntropy,
     };
@@ -353,7 +353,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
-    const now_sec = std.time.timestamp();
+    const now_sec = @import("monotonic.zig").wallclockSec();
 
     var cleartext_fragment_start: usize = 0;
     var cleartext_fragment_end: usize = 0;
@@ -362,6 +362,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         // Ensure the input buffer pointer is stable in this scope.
         input.rebase(tls.max_ciphertext_record_len) catch |err| switch (err) {
             error.EndOfStream => {}, // We have assurance the remainder of stream can be buffered.
+            error.ReadFailed => return error.ReadFailed,
         };
         const record_header = input.peek(tls.record_header_len) catch |err| switch (err) {
             error.EndOfStream => return error.TlsConnectionTruncated,
@@ -1206,7 +1207,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_key) catch
                     return failRead(c, error.TlsBadRecordMac);
                 // TODO use scalar, non-slice version
-                const msg = mem.trimRight(u8, cleartext, "\x00");
+                const msg = mem.trimEnd(u8, cleartext, "\x00");
                 if (msg.len == 0) return failRead(c, error.TlsDecodeError);
                 break :cleartext .{ msg.len - 1, @enumFromInt(msg[msg.len - 1]) };
             },
@@ -1383,9 +1384,9 @@ const KeyShare = struct {
         crypto.dh.X25519.shared_length,
     );
 
-    fn init(seed: [112]u8) error{IdentityElement}!KeyShare {
+    fn init(seed: [112]u8, io: std.Io) error{IdentityElement}!KeyShare {
         return .{
-            .ml_kem768_kp = .generate(),
+            .ml_kem768_kp = .generate(io),
             .secp256r1_kp = try .generateDeterministic(seed[0..32].*),
             .secp384r1_kp = try .generateDeterministic(seed[32..80].*),
             .x25519_kp = try .generateDeterministic(seed[80..112].*),

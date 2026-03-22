@@ -1,7 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
-const net = std.net;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const openUdpSocket = @import("transport.zig").openUdpSocket;
@@ -9,6 +8,8 @@ const monotonic = @import("monotonic.zig");
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 const TcpPooledConnection = @import("tcp_connection_pool.zig").TcpPooledConnection;
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
 
 pub const Config = struct {
     timeout_ms: u32 = 5000,
@@ -20,22 +21,23 @@ pub const Config = struct {
 /// address filtering (RFC 5452) and uses SO_RCVTIMEO for timeouts.
 pub const BlockingUdpTransport = struct {
     config: Config,
+    io: std.Io,
     response_buf: [4096]u8 = undefined,
 
-    pub fn init(config: Config) BlockingUdpTransport {
-        return .{ .config = config };
+    pub fn init(config: Config, io: std.Io) BlockingUdpTransport {
+        return .{ .config = config, .io = io };
     }
 
-    pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+    pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address) ![]const u8 {
         return self.queryWithTimeout(wire_query, query_id, upstream, self.config.timeout_ms);
     }
 
-    pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address, timeout_ms: u32) ![]const u8 {
-        const sock = try openSocket(upstream);
-        defer posix.close(sock);
+    pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32) ![]const u8 {
+        const sock = try self.openSocket(upstream);
+        defer sys.close(sock);
 
         // Connect to server — kernel rejects spoofed source addresses (RFC 5452).
-        try posix.connect(sock, &upstream.any, upstream.getOsSockLen());
+        try na.connectTo(sock, &upstream);
 
         // Retransmit interval: 1/3 of overall timeout, at least 50ms
         const retransmit_ms = @max(50, timeout_ms / 3);
@@ -44,7 +46,7 @@ pub const BlockingUdpTransport = struct {
         setRecvTimeout(sock, retransmit_ms);
 
         // Send initial query
-        _ = posix.send(sock, wire_query, 0) catch return error.Timeout;
+        _ = sys.send(sock, wire_query, 0) catch return error.Timeout;
 
         const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
         var retransmits_left: u32 = self.config.retransmit_count;
@@ -53,14 +55,14 @@ pub const BlockingUdpTransport = struct {
             const remaining_ns = deadline_ns - monotonic.nowNs();
             if (remaining_ns <= 0) return error.Timeout;
 
-            const n = posix.recv(sock, &self.response_buf, 0) catch |err| switch (err) {
+            const n = sys.recv(sock, &self.response_buf, 0) catch |err| switch (err) {
                 error.WouldBlock => {
                     // Timeout on recv — retransmit or fail
                     if (retransmits_left == 0) return error.Timeout;
                     retransmits_left -= 1;
 
                     // Retransmit
-                    _ = posix.send(sock, wire_query, 0) catch return error.Timeout;
+                    _ = sys.send(sock, wire_query, 0) catch return error.Timeout;
 
                     // Adjust timeout to min(retransmit_ms, remaining)
                     const remain_ms = @as(u32, @intCast(@min(
@@ -98,15 +100,15 @@ pub const BlockingUdpTransport = struct {
         self: *BlockingUdpTransport,
         wire_queries: [2][]const u8,
         query_ids: [2]u16,
-        servers: [2]std.net.Address,
+        servers: [2]na.Address,
         stagger_ms: u32,
         overall_timeout_ms: u32,
     ) !StaggeredResult {
         // Open and connect socket for server[0]
-        const sock0 = try openSocket(servers[0]);
-        defer posix.close(sock0);
-        posix.connect(sock0, &servers[0].any, servers[0].getOsSockLen()) catch return error.Timeout;
-        _ = posix.send(sock0, wire_queries[0], 0) catch return error.Timeout;
+        const sock0 = try self.openSocket(servers[0]);
+        defer sys.close(sock0);
+        na.connectTo(sock0, &servers[0]) catch return error.Timeout;
+        _ = sys.send(sock0, wire_queries[0], 0) catch return error.Timeout;
 
         const deadline_ns = monotonic.nowNs() + @as(i128, overall_timeout_ms) * 1_000_000;
 
@@ -128,10 +130,10 @@ pub const BlockingUdpTransport = struct {
         const remaining_ns = deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return error.Timeout;
 
-        const sock1 = try openSocket(servers[1]);
-        defer posix.close(sock1);
-        posix.connect(sock1, &servers[1].any, servers[1].getOsSockLen()) catch return error.Timeout;
-        _ = posix.send(sock1, wire_queries[1], 0) catch return error.Timeout;
+        const sock1 = try self.openSocket(servers[1]);
+        defer sys.close(sock1);
+        na.connectTo(sock1, &servers[1]) catch return error.Timeout;
+        _ = sys.send(sock1, wire_queries[1], 0) catch return error.Timeout;
 
         // Phase 3: poll both sockets for remaining time
         while (true) {
@@ -164,15 +166,15 @@ pub const BlockingUdpTransport = struct {
 
     /// Try to receive a valid DNS response. Returns byte count or null.
     fn tryRecv(self: *BlockingUdpTransport, sock: posix.fd_t, expected_id: u16) ?usize {
-        const n = posix.recv(sock, &self.response_buf, posix.MSG.DONTWAIT) catch return null;
+        const n = sys.recv(sock, &self.response_buf, posix.MSG.DONTWAIT) catch return null;
         if (n < 2) return null;
         const resp_id = mem.readInt(u16, self.response_buf[0..2], .big);
         if (resp_id != expected_id) return null;
         return n;
     }
 
-    fn openSocket(dest: std.net.Address) !posix.fd_t {
-        return openUdpSocket(dest, false);
+    fn openSocket(self: *BlockingUdpTransport, dest: na.Address) !posix.fd_t {
+        return openUdpSocket(dest, false, self.io);
     }
 };
 
@@ -191,16 +193,16 @@ pub const BlockingTcpTransport = struct {
         return .{ .config = config };
     }
 
-    pub fn query(self: *BlockingTcpTransport, wire_query: []const u8, server: net.Address, response_buf: []u8) ![]const u8 {
+    pub fn query(self: *BlockingTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
         const sock = try self.connectTcp(server);
-        defer posix.close(sock);
+        defer sys.close(sock);
         const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
         return sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns);
     }
 
     /// Query with TCP connection pooling. Tries a pooled connection first,
     /// falls back to a fresh connection, and stores it for reuse on success.
-    pub fn queryPooled(self: *BlockingTcpTransport, wire_query: []const u8, server: net.Address, response_buf: []u8, pool: *TcpConnectionPool) ![]const u8 {
+    pub fn queryPooled(self: *BlockingTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, pool: *TcpConnectionPool) ![]const u8 {
         const key = AddressKey.fromAddress(server);
         const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
 
@@ -217,13 +219,13 @@ pub const BlockingTcpTransport = struct {
         // Fresh connection
         const sock = try self.connectTcp(server);
         const data = sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns) catch |err| {
-            posix.close(sock);
+            sys.close(sock);
             return err;
         };
 
         // Store in pool for reuse
         const new_conn = pool.allocator.create(TcpPooledConnection) catch {
-            posix.close(sock);
+            sys.close(sock);
             return data;
         };
         new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
@@ -231,12 +233,12 @@ pub const BlockingTcpTransport = struct {
         return data;
     }
 
-    fn connectTcp(self: *BlockingTcpTransport, server: net.Address) !posix.fd_t {
-        const af: u32 = if (server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
-        const sock = try posix.socket(af, posix.SOCK.STREAM, 0);
-        errdefer posix.close(sock);
-        setSocketTimeout(sock, posix.SO.SNDTIMEO, self.config.connect_timeout_ms);
-        posix.connect(sock, &server.any, server.getOsSockLen()) catch return error.ConnectFailed;
+    fn connectTcp(self: *BlockingTcpTransport, server: na.Address) !posix.fd_t {
+        const af: u32 = na.afU32(server);
+        const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
+        errdefer sys.close(sock);
+        sys.setSocketTimeout(sock, posix.SO.SNDTIMEO, self.config.connect_timeout_ms);
+        na.connectTo(sock, &server) catch return error.ConnectFailed;
         return sock;
     }
 
@@ -254,7 +256,7 @@ pub const BlockingTcpTransport = struct {
         var bytes_sent: usize = 0;
         while (bytes_sent < total_send) {
             try updateTimeout(sock, deadline_ns);
-            const n = posix.write(sock, send_buf[bytes_sent..total_send]) catch return error.SendFailed;
+            const n = sys.write(sock, send_buf[bytes_sent..total_send]) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
         }
@@ -265,7 +267,7 @@ pub const BlockingTcpTransport = struct {
 
         while (len_filled < 2) {
             try updateTimeout(sock, deadline_ns);
-            const n = posix.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
+            const n = sys.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             len_filled += n;
         }
@@ -276,7 +278,7 @@ pub const BlockingTcpTransport = struct {
         var body_filled: usize = 0;
         while (body_filled < body_len) {
             try updateTimeout(sock, deadline_ns);
-            const n = posix.read(sock, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
+            const n = sys.read(sock, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             body_filled += n;
         }
@@ -293,23 +295,14 @@ pub const BlockingTcpTransport = struct {
             std.math.maxInt(u32),
         ));
         if (remaining_ms == 0) return error.Timeout;
-        setSocketTimeout(sock, posix.SO.RCVTIMEO, remaining_ms);
-        setSocketTimeout(sock, posix.SO.SNDTIMEO, remaining_ms);
+        sys.setSocketTimeouts(sock, remaining_ms);
     }
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn setRecvTimeout(sock: posix.fd_t, ms: u32) void {
-    setSocketTimeout(sock, posix.SO.RCVTIMEO, ms);
-}
-
-pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
-    const timeout = posix.timeval{
-        .sec = @intCast(ms / 1000),
-        .usec = @intCast(@as(u64, ms % 1000) * 1000),
-    };
-    posix.setsockopt(sock, posix.SOL.SOCKET, opt, mem.asBytes(&timeout)) catch {};
+    sys.setSocketTimeout(sock, posix.SO.RCVTIMEO, ms);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -320,19 +313,20 @@ fn skipIfNotLinux() !void {
 
 test "BlockingUdpTransport loopback query" {
     try skipIfNotLinux();
+    const io = testing.io;
 
-    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 });
+    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
     // Create a mock "server" socket
-    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(server_sock);
+    const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
     // Get server address
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(server_sock);
 
     // Build a DNS query
     const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a);
@@ -353,18 +347,19 @@ test "BlockingUdpTransport loopback query" {
 
 test "BlockingUdpTransport timeout" {
     try skipIfNotLinux();
+    const io = testing.io;
 
-    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 100, .retransmit_count = 0 });
+    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 100, .retransmit_count = 0 }, io);
 
     // Create a server socket that never responds (black hole)
-    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(server_sock);
+    const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(server_sock);
 
     const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a);
     defer dns.freeMessage(testing.allocator, msg);
@@ -377,22 +372,22 @@ test "BlockingUdpTransport timeout" {
 
 test "BlockingUdpTransport IPv6 loopback query" {
     try skipIfNotLinux();
+    const io = testing.io;
 
-    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 });
+    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    const server_sock = posix.socket(posix.AF.INET6, posix.SOCK.DGRAM, 0) catch |err| switch (err) {
+    const server_sock = sys.socket(posix.AF.INET6, posix.SOCK.DGRAM, 0) catch |err| switch (err) {
         error.AddressFamilyNotSupported => return error.SkipZigTest,
         else => return err,
     };
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp6(.{0} ** 16, 0, 0, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    defer sys.close(server_sock);
+    const server_bind = na.initIp6(.{0} ** 16, 0, 0, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
-    const port = server_addr.getPort();
-    server_addr = std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
+    const port = (try na.getSockName(server_sock)).getPort();
+    const server_addr = na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
 
     const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa);
     defer dns.freeMessage(testing.allocator, msg);
@@ -417,13 +412,13 @@ fn echoServerThread(sock: posix.fd_t) void {
     if (poll_result == 0) return;
 
     var recv_buf: [512]u8 = undefined;
-    var client_addr: std.net.Address = std.mem.zeroes(std.net.Address);
-    var client_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    const n = posix.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
+    var client_addr: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
+    var client_addr_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    const n = sys.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
     if (n < 2) return;
 
     var resp: [512]u8 = undefined;
     @memcpy(resp[0..n], recv_buf[0..n]);
     resp[2] |= 0x80;
-    _ = posix.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
+    _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
 }

@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const testing = std.testing;
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
 
 pub const max_operations = 64;
 const recv_buf_size = 4096;
@@ -32,7 +34,7 @@ pub const SendResult = struct {
 
 pub const RecvResult = struct {
     data: []const u8,
-    addr: std.net.Address,
+    addr: na.Address,
     err: ?anyerror,
 };
 
@@ -55,7 +57,7 @@ pub const TcpRecvResult = struct {
 
 pub const AcceptResult = struct {
     fd: posix.fd_t,
-    addr: std.net.Address,
+    addr: na.Address,
     err: ?anyerror,
 };
 
@@ -77,7 +79,7 @@ const Slot = struct {
     // Storage for send/recv (must have pointer stability until CQE)
     iov: [1]posix.iovec,
     iov_const: [1]posix.iovec_const,
-    addr: std.net.Address,
+    addr: na.PosixAddress,
     addr_len: posix.socklen_t,
     msghdr: posix.msghdr,
     msghdr_const: posix.msghdr_const,
@@ -171,14 +173,13 @@ pub const EventLoop = struct {
         return id;
     }
 
-    pub fn sendTo(self: *EventLoop, fd: posix.fd_t, data: []const u8, dest: std.net.Address, context: *anyopaque) !OperationId {
+    pub fn sendTo(self: *EventLoop, fd: posix.fd_t, data: []const u8, dest: na.Address, context: *anyopaque) !OperationId {
         const id = try self.initOp(.send, context);
         errdefer self.freeSlot(id);
         const slot = &self.slots[id];
 
         slot.iov_const[0] = .{ .base = data.ptr, .len = data.len };
-        slot.addr = dest;
-        slot.addr_len = dest.getOsSockLen();
+        slot.addr_len = na.toSockaddr(&dest, &slot.addr);
 
         slot.msghdr_const = .{
             .name = @ptrCast(&slot.addr),
@@ -202,8 +203,8 @@ pub const EventLoop = struct {
         const slot = &self.slots[id];
 
         slot.iov[0] = .{ .base = &slot.recv_buf, .len = recv_buf_size };
-        slot.addr = std.mem.zeroes(std.net.Address);
-        slot.addr_len = @sizeOf(std.net.Address);
+        slot.addr = std.mem.zeroes(na.PosixAddress);
+        slot.addr_len = @sizeOf(na.PosixAddress);
 
         slot.msghdr = .{
             .name = @ptrCast(&slot.addr),
@@ -221,12 +222,11 @@ pub const EventLoop = struct {
         return id;
     }
 
-    pub fn connect(self: *EventLoop, fd: posix.fd_t, dest: std.net.Address, context: *anyopaque) !OperationId {
+    pub fn connect(self: *EventLoop, fd: posix.fd_t, dest: na.Address, context: *anyopaque) !OperationId {
         const id = try self.initOp(.connect, context);
         errdefer self.freeSlot(id);
         const slot = &self.slots[id];
-        slot.addr = dest;
-        slot.addr_len = dest.getOsSockLen();
+        slot.addr_len = na.toSockaddr(&dest, &slot.addr);
 
         var sqe = try self.ring.get_sqe();
         sqe.prep_connect(fd, &slot.addr.any, slot.addr_len);
@@ -256,8 +256,8 @@ pub const EventLoop = struct {
         const id = try self.initOp(.accept, context);
         errdefer self.freeSlot(id);
         const slot = &self.slots[id];
-        slot.addr = std.mem.zeroes(std.net.Address);
-        slot.addr_len = @sizeOf(std.net.Address);
+        slot.addr = std.mem.zeroes(na.PosixAddress);
+        slot.addr_len = @sizeOf(na.PosixAddress);
 
         var sqe = try self.ring.get_sqe();
         sqe.prep_accept(listen_fd, @ptrCast(&slot.addr.any), &slot.addr_len, 0);
@@ -338,19 +338,19 @@ pub const EventLoop = struct {
                         const len: usize = @intCast(cqe.res);
                         completion.result = .{ .recv = .{
                             .data = slot.recv_buf[0..len],
-                            .addr = slot.addr,
+                            .addr = na.fromSockaddr(&slot.addr),
                             .err = null,
                         } };
                     } else if (isCancelled(cqe)) {
                         completion.result = .{ .recv = .{
                             .data = &.{},
-                            .addr = slot.addr,
+                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = error.Cancelled,
                         } };
                     } else {
                         completion.result = .{ .recv = .{
                             .data = &.{},
-                            .addr = slot.addr,
+                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = error.RecvFailed,
                         } };
                     }
@@ -399,19 +399,19 @@ pub const EventLoop = struct {
                     if (cqe.res >= 0) {
                         completion.result = .{ .accept = .{
                             .fd = @intCast(cqe.res),
-                            .addr = slot.addr,
+                            .addr = na.fromSockaddr(&slot.addr),
                             .err = null,
                         } };
                     } else if (isCancelled(cqe)) {
                         completion.result = .{ .accept = .{
                             .fd = -1,
-                            .addr = slot.addr,
+                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = error.Cancelled,
                         } };
                     } else {
                         completion.result = .{ .accept = .{
                             .fd = -1,
-                            .addr = slot.addr,
+                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = error.AcceptFailed,
                         } };
                     }
@@ -491,19 +491,19 @@ test "EventLoop sendTo/recvFrom loopback" {
     defer loop.destroy();
 
     // Create two UDP sockets
-    const sock_a = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(sock_a);
-    const sock_b = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(sock_b);
+    const sock_a = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock_a);
+    const sock_b = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock_b);
 
     // Bind sock_b to localhost ephemeral port
-    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(sock_b, &bind_addr.any, bind_addr.getOsSockLen());
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(sock_b, &bind_pa.any, bind_len);
 
     // Get the actual port assigned
-    var dest_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(sock_b, @ptrCast(&dest_addr), &addr_len);
+    const dest_addr = try na.getSockName(sock_b);
 
     const payload = "hello io_uring";
     var send_ctx: u8 = 1;
@@ -548,26 +548,28 @@ test "EventLoop recvFrom with external sender (server pattern)" {
     defer loop.destroy();
 
     // Create a "server" UDP socket (like the server does)
-    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(server_sock);
-    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(server_sock, &bind_addr.any, bind_addr.getOsSockLen());
+    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(server_sock);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(server_sock, &bind_pa.any, bind_len);
 
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(server_sock);
 
     // Also create a TCP listen socket (like server does)
-    const tcp_sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(tcp_sock);
-    const tcp_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(tcp_sock, &tcp_bind.any, tcp_bind.getOsSockLen());
-    try posix.listen(tcp_sock, 1);
+    const tcp_sock = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tcp_sock);
+    const tcp_bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var tcp_bind_pa: na.PosixAddress = undefined;
+    const tcp_bind_len = na.toSockaddr(&tcp_bind_na, &tcp_bind_pa);
+    try sys.bind(tcp_sock, &tcp_bind_pa.any, tcp_bind_len);
+    try sys.listen(tcp_sock, 1);
 
     // Create a pipe to simulate signalfd (non-seekable fd)
-    const pipe_fds = try posix.pipe2(.{ .NONBLOCK = true });
-    defer posix.close(pipe_fds[0]);
-    defer posix.close(pipe_fds[1]);
+    const pipe_fds = try sys.pipe();
+    defer sys.close(pipe_fds[0]);
+    defer sys.close(pipe_fds[1]);
 
     // Submit recvFrom + accept + read (like serveLoop does)
     var recv_ctx: u8 = 1;
@@ -580,10 +582,12 @@ test "EventLoop recvFrom with external sender (server pattern)" {
     // Send data from a separate thread using plain posix (external client)
     const payload = "external DNS query";
     const SenderThread = struct {
-        fn run(addr: std.net.Address, data: []const u8) void {
-            const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
-            defer posix.close(sock);
-            _ = posix.sendto(sock, data, 0, &addr.any, addr.getOsSockLen()) catch return;
+        fn run(addr: na.Address, data: []const u8) void {
+            const sock = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+            defer sys.close(sock);
+            var pa: na.PosixAddress = undefined;
+            const sa_len = na.toSockaddr(&addr, &pa);
+            _ = sys.sendto(sock, data, 0, &pa.any, sa_len) catch return;
         }
     };
     const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, payload });
@@ -630,10 +634,12 @@ test "EventLoop cancel pending recvFrom" {
     const loop = try createTestLoop();
     defer loop.destroy();
 
-    const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(sock);
-    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen());
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(sock, &bind_pa.any, bind_len);
 
     var ctx: u8 = 99;
     const recv_id = try loop.recvFrom(sock, @ptrCast(&ctx));
@@ -663,15 +669,15 @@ test "EventLoop TCP connect/send/recv loopback" {
     defer loop.destroy();
 
     // Create a TCP listener
-    const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(listener);
-    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(listener, &bind_addr.any, bind_addr.getOsSockLen());
-    try posix.listen(listener, 1);
+    const listener = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(listener);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(listener, &bind_pa.any, bind_len);
+    try sys.listen(listener, 1);
 
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(listener, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(listener);
 
     // Server thread: accept, read, echo back, close
     const ServerThread = struct {
@@ -684,10 +690,10 @@ test "EventLoop TCP connect/send/recv loopback" {
             const poll_result = std.posix.poll(&polls, 2000) catch return;
             if (poll_result == 0) return;
 
-            var client_addr: std.net.Address = std.mem.zeroes(std.net.Address);
-            var client_len: posix.socklen_t = @sizeOf(std.net.Address);
-            const client = posix.accept(sock, @ptrCast(&client_addr), &client_len, 0) catch return;
-            defer posix.close(client);
+            var client_pa: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
+            var client_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            const client = sys.accept(sock, @ptrCast(&client_pa), &client_len, 0) catch return;
+            defer sys.close(client);
 
             var buf: [4096]u8 = undefined;
             // Poll for data on the accepted connection
@@ -699,17 +705,17 @@ test "EventLoop TCP connect/send/recv loopback" {
             const cpoll_result = std.posix.poll(&cpoll, 2000) catch return;
             if (cpoll_result == 0) return;
 
-            const n = posix.read(client, &buf) catch return;
+            const n = sys.read(client, &buf) catch return;
             if (n == 0) return;
-            _ = posix.write(client, buf[0..n]) catch return;
+            _ = sys.write(client, buf[0..n]) catch return;
         }
     };
 
     const thread = try std.Thread.spawn(.{}, ServerThread.run, .{listener});
 
     // Client: connect, send, recv
-    const client = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(client);
+    const client = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(client);
 
     var connect_ctx: u8 = 1;
     var send_ctx: u8 = 2;

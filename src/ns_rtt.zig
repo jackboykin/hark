@@ -3,6 +3,7 @@ const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 const AddressKey = @import("connection_pool.zig").AddressKey;
+const na = @import("net_address.zig");
 
 // ── Constants (Unbound/Knot consensus) ───────────────────────────────
 
@@ -38,7 +39,8 @@ const RttState = struct {
 
 pub const RttCache = struct {
     entries: std.AutoHashMap(AddressKey, RttState),
-    mutex: ?std.Thread.Mutex,
+    mutex: ?std.Io.Mutex,
+    io: std.Io = undefined,
     now_fn: *const fn () i64,
 
     pub fn init(allocator: Allocator) RttCache {
@@ -49,10 +51,11 @@ pub const RttCache = struct {
         };
     }
 
-    pub fn initThreadSafe(allocator: Allocator) RttCache {
+    pub fn initThreadSafe(allocator: Allocator, io: std.Io) RttCache {
         return .{
             .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
+            .io = io,
             .now_fn = &@import("monotonic.zig").nowMs,
         };
     }
@@ -63,8 +66,8 @@ pub const RttCache = struct {
 
     /// Return the recommended timeout in ms for this server.
     pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const state = self.entries.get(key) orelse return initial_timeout_ms;
         return computeTimeout(state);
@@ -72,8 +75,8 @@ pub const RttCache = struct {
 
     /// Record a successful response with measured RTT (microseconds).
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const gop = self.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -96,8 +99,8 @@ pub const RttCache = struct {
 
     /// Record a timeout for this server (exponential backoff + dead marking).
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const gop = self.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -119,8 +122,8 @@ pub const RttCache = struct {
 
     /// Check whether the server is currently marked dead.
     pub fn isDead(self: *RttCache, key: AddressKey) bool {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const state = self.entries.get(key) orelse return false;
         return state.dead_until_ms > self.now_fn();
@@ -152,7 +155,7 @@ fn testNowMs() i64 {
 }
 
 fn testAddr(last_octet: u8) AddressKey {
-    return AddressKey.fromAddress(std.net.Address.initIp4(.{ 10, 0, 0, last_octet }, 53));
+    return AddressKey.fromAddress(na.initIp4(.{ 10, 0, 0, last_octet }, 53));
 }
 
 test "getTimeout returns initial for unknown server" {

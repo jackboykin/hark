@@ -8,6 +8,8 @@ const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const rand = @import("rand.zig");
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
 
 pub const QueryResult = struct {
     response_data: []const u8,
@@ -25,14 +27,14 @@ pub const AnyUdpTransport = union(enum) {
         };
     }
 
-    pub fn query(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+    pub fn query(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address) ![]const u8 {
         return switch (self) {
             .uring => |t| t.query(wire_query, query_id, upstream),
             .blocking => |t| t.query(wire_query, query_id, upstream),
         };
     }
 
-    pub fn queryWithTimeout(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address, timeout_ms: u32) ![]const u8 {
+    pub fn queryWithTimeout(self: AnyUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32) ![]const u8 {
         return switch (self) {
             .uring => |t| t.queryWithTimeout(wire_query, query_id, upstream, timeout_ms),
             .blocking => |t| t.queryWithTimeout(wire_query, query_id, upstream, timeout_ms),
@@ -54,9 +56,10 @@ const Context = struct {
 pub const UdpTransport = struct {
     loop: *EventLoop,
     config: Config,
+    io: std.Io,
 
-    pub fn init(loop: *EventLoop, config: Config) !UdpTransport {
-        return .{ .loop = loop, .config = config };
+    pub fn init(loop: *EventLoop, config: Config, io: std.Io) !UdpTransport {
+        return .{ .loop = loop, .config = config, .io = io };
     }
 
     pub fn deinit(self: *UdpTransport) void {
@@ -65,19 +68,19 @@ pub const UdpTransport = struct {
 
     /// Create a fresh UDP socket bound to a random ephemeral port (RFC 5452
     /// source-port randomization).  The caller must close the returned fd.
-    fn openSocket(dest: std.net.Address) !posix.fd_t {
-        return openUdpSocket(dest, true);
+    fn openSocket(dest: na.Address, io: std.Io) !posix.fd_t {
+        return openUdpSocket(dest, true, io);
     }
 
-    pub fn query(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address) ![]const u8 {
+    pub fn query(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address) ![]const u8 {
         return self.queryWithTimeout(wire_query, query_id, upstream, self.config.timeout_ms);
     }
 
     /// Like `query`, but with a caller-specified overall timeout in milliseconds.
-    pub fn queryWithTimeout(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: std.net.Address, timeout_ms: u32) ![]const u8 {
+    pub fn queryWithTimeout(self: *UdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32) ![]const u8 {
         // Per-query socket for source-port randomization (RFC 5452)
-        const sock = try openSocket(upstream);
-        errdefer posix.close(sock);
+        const sock = try openSocket(upstream, self.io);
+        errdefer sys.close(sock);
 
         var recv_ctx = Context{ .tag = .recv };
         var retransmit_ctx = Context{ .tag = .retransmit };
@@ -122,7 +125,7 @@ pub const UdpTransport = struct {
                                         self.loop.cancel(overall_op) catch {};
                                         // Drain remaining completions
                                         self.drainPending();
-                                        posix.close(sock);
+                                        sys.close(sock);
                                         return r.data;
                                     }
                                 }
@@ -163,41 +166,36 @@ pub const UdpTransport = struct {
 
 /// Create a UDP socket bound to a random ephemeral port (RFC 5452).
 /// Set nonblock=true for io_uring, false for blocking transport.
-pub fn openUdpSocket(dest: std.net.Address, nonblock: bool) !posix.fd_t {
-    const af: u32 = dest.any.family;
+pub fn openUdpSocket(dest: na.Address, nonblock: bool, io: std.Io) !posix.fd_t {
+    const af: u32 = na.afU32(dest);
     const flags: u32 = posix.SOCK.DGRAM | if (nonblock) @as(u32, posix.SOCK.NONBLOCK) else 0;
-    const sock = try posix.socket(af, flags, 0);
-    errdefer posix.close(sock);
+    const sock = try sys.socket(af, flags, 0);
+    errdefer sys.close(sock);
 
     for (0..16) |_| {
-        const port = rand.ephemeralPort();
+        const port = rand.ephemeralPort(io);
         const addr = anyAddr(af, port);
-        posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        na.bindTo(sock, &addr) catch |err| switch (err) {
             error.AddressInUse => continue,
             else => return err,
         };
         return sock;
     }
     const addr = anyAddr(af, 0);
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
+    try na.bindTo(sock, &addr);
     return sock;
 }
 
-pub fn anyAddr(af: u32, port: u16) std.net.Address {
+pub fn anyAddr(af: u32, port: u16) na.Address {
     return if (af == posix.AF.INET6)
-        std.net.Address.initIp6(.{0} ** 16, port, 0, 0)
+        na.initIp6(.{0} ** 16, port, 0, 0)
     else
-        std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+        na.initIp4(.{ 0, 0, 0, 0 }, port);
 }
 
 /// Compare two addresses by IP, ignoring port.
-pub fn addressMatchesUpstream(response: std.net.Address, upstream: std.net.Address) bool {
-    if (response.any.family != upstream.any.family) return false;
-    return switch (response.any.family) {
-        posix.AF.INET => response.in.sa.addr == upstream.in.sa.addr,
-        posix.AF.INET6 => mem.eql(u8, &response.in6.sa.addr, &upstream.in6.sa.addr),
-        else => false,
-    };
+pub fn addressMatchesUpstream(response: na.Address, upstream: na.Address) bool {
+    return na.ipEqual(response, upstream);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -208,25 +206,26 @@ fn skipIfNotLinux() !void {
 
 test "UdpTransport loopback query" {
     try skipIfNotLinux();
+    const io = testing.io;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
 
-    var transport = try UdpTransport.init(loop, .{});
+    var transport = try UdpTransport.init(loop, .{}, io);
     defer transport.deinit();
 
     // Create a mock "server" socket
-    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(server_sock);
+    const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
     // Get server address
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(server_sock);
 
     // Build a DNS query
     const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a);
@@ -247,9 +246,9 @@ test "UdpTransport loopback query" {
             if (poll_result == 0) return;
 
             var recv_buf: [512]u8 = undefined;
-            var client_addr: std.net.Address = std.mem.zeroes(std.net.Address);
-            var client_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-            const n = posix.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
+            var client_addr: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
+            var client_addr_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            const n = sys.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
             if (n < 2) return;
 
             // Build a simple response: copy the query and set QR bit
@@ -257,7 +256,7 @@ test "UdpTransport loopback query" {
             @memcpy(resp[0..n], recv_buf[0..n]);
             resp[2] |= 0x80;
 
-            _ = posix.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
+            _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
         }
     };
 
@@ -276,30 +275,30 @@ test "UdpTransport loopback query" {
 
 test "UdpTransport IPv6 loopback query" {
     try skipIfNotLinux();
+    const io = testing.io;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     defer loop.destroy();
 
-    var transport = try UdpTransport.init(loop, .{});
+    var transport = try UdpTransport.init(loop, .{}, io);
     defer transport.deinit();
 
     // Create a mock IPv6 "server" socket
-    const server_sock = posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0) catch |err| switch (err) {
+    const server_sock = sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0) catch |err| switch (err) {
         error.AddressFamilyNotSupported => return error.SkipZigTest,
         else => return err,
     };
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp6(.{0} ** 16, 0, 0, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    defer sys.close(server_sock);
+    const server_bind = na.initIp6(.{0} ** 16, 0, 0, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
     // Get server address and set to ::1
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
-    const port = server_addr.getPort();
-    server_addr = std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
+    const port = (try na.getSockName(server_sock)).getPort();
+    const server_addr = na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
 
     // Build a DNS query
     const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa);
@@ -319,16 +318,16 @@ test "UdpTransport IPv6 loopback query" {
             if (poll_result == 0) return;
 
             var recv_buf: [512]u8 = undefined;
-            var client_addr: std.net.Address = std.mem.zeroes(std.net.Address);
-            var client_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-            const n = posix.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
+            var client_addr: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
+            var client_addr_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            const n = sys.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
             if (n < 2) return;
 
             var resp: [512]u8 = undefined;
             @memcpy(resp[0..n], recv_buf[0..n]);
             resp[2] |= 0x80;
 
-            _ = posix.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
+            _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
         }
     };
 
@@ -345,6 +344,7 @@ test "UdpTransport IPv6 loopback query" {
 
 test "UdpTransport timeout" {
     try skipIfNotLinux();
+    const io = testing.io;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
@@ -356,18 +356,18 @@ test "UdpTransport timeout" {
         .timeout_ms = 100,
         .retransmit_ms = 30,
         .max_retries = 1,
-    });
+    }, io);
     defer transport.deinit();
 
     // Create a server socket that never responds (black hole)
-    const server_sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(server_sock);
-    const server_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(server_sock, &server_bind.any, server_bind.getOsSockLen());
+    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(server_sock);
+    const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
+    try sys.bind(server_sock, &bind_storage.any, bind_len);
 
-    var server_addr: std.net.Address = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(server_sock, @ptrCast(&server_addr), &addr_len);
+    const server_addr = try na.getSockName(server_sock);
 
     const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a);
     defer dns.freeMessage(testing.allocator, msg);

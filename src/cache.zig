@@ -276,7 +276,8 @@ pub const RRsetCache = struct {
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true),
     max_entries: u32,
     now_fn: *const fn () i64,
-    rwlock: ?std.Thread.RwLock = null,
+    rwlock: ?std.Io.RwLock = null,
+    io: std.Io = undefined,
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     prefetch: bool = false,
@@ -324,13 +325,14 @@ pub const RRsetCache = struct {
         };
     }
 
-    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
-        return initThreadSafeWithOptions(backing, max_bytes, max_entries, .{});
+    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, max_entries: u32, io: std.Io) RRsetCache {
+        return initThreadSafeWithOptions(backing, max_bytes, max_entries, .{}, io);
     }
 
-    pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
+    pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions, io: std.Io) RRsetCache {
         var c = initWithOptions(backing, max_bytes, max_entries, opts);
-        c.rwlock = .{};
+        c.rwlock = std.Io.RwLock.init;
+        c.io = io;
         return c;
     }
 
@@ -348,8 +350,8 @@ pub const RRsetCache = struct {
     };
 
     pub fn getStats(self: *RRsetCache) Stats {
-        if (self.rwlock) |*rw| rw.lockShared();
-        defer if (self.rwlock) |*rw| rw.unlockShared();
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
         return .{
             .entries = @intCast(self.map.count()),
             .memory_bytes = self.counting.current_bytes.load(.monotonic),
@@ -388,8 +390,8 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
-        if (self.rwlock) |*rw| rw.lockShared();
-        defer if (self.rwlock) |*rw| rw.unlockShared();
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
@@ -489,8 +491,8 @@ pub const RRsetCache = struct {
     /// directly, avoiding the unchecked→secure race window.
     pub fn storeResponseWithStatus(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
         if (response.header.rcode != .no_error) return;
-        if (self.rwlock) |*rw| rw.lock();
-        defer if (self.rwlock) |*rw| rw.unlock();
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
         self.storeRRsetsImpl(response.answers, authority_zone, true, status);
         self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
         self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
@@ -508,8 +510,8 @@ pub const RRsetCache = struct {
         authority_zone: dns.Name,
         security_status: SecurityStatus,
     ) void {
-        if (self.rwlock) |*rw| rw.lock();
-        defer if (self.rwlock) |*rw| rw.unlock();
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
         // Find SOA in authority section — required per RFC 2308
         var soa_record: ?dns.ResourceRecord = null;
         for (authorities) |rr| {
@@ -594,8 +596,8 @@ pub const RRsetCache = struct {
         ttl: u32,
         security_status: SecurityStatus,
     ) void {
-        if (self.rwlock) |*rw| rw.lock();
-        defer if (self.rwlock) |*rw| rw.unlock();
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
         if (ttl == 0) return;
 
         const alloc = self.counting.allocator();

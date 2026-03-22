@@ -10,6 +10,8 @@ const ConnectResult = event_loop.ConnectResult;
 const max_operations = event_loop.max_operations;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
 
 pub const TcpConfig = struct {
     connect_timeout_ms: u32 = 5000,
@@ -21,7 +23,7 @@ pub const AnyTcpTransport = union(enum) {
     uring: *TcpTransport,
     blocking: *BlockingTcpTransport,
 
-    pub fn query(self: AnyTcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8) ![]const u8 {
+    pub fn query(self: AnyTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
         return switch (self) {
             .uring => |t| t.query(wire_query, server, response_buf),
             .blocking => |t| t.query(wire_query, server, response_buf),
@@ -30,7 +32,7 @@ pub const AnyTcpTransport = union(enum) {
 
     /// Query with optional TCP connection pooling. Falls back to unpooled
     /// query for io_uring transport or when pool is null.
-    pub fn queryPooled(self: AnyTcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8, pool: ?*TcpConnectionPool) ![]const u8 {
+    pub fn queryPooled(self: AnyTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, pool: ?*TcpConnectionPool) ![]const u8 {
         return switch (self) {
             .blocking => |t| if (pool) |p|
                 t.queryPooled(wire_query, server, response_buf, p)
@@ -57,11 +59,11 @@ pub const TcpTransport = struct {
         return .{ .loop = loop, .config = config };
     }
 
-    pub fn query(self: *TcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8) ![]const u8 {
+    pub fn query(self: *TcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
         // Create TCP socket matching server address family
-        const af: u32 = if (server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
-        const sock = try posix.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        defer posix.close(sock);
+        const af: u32 = na.afU32(server);
+        const sock = try sys.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        defer sys.close(sock);
 
         var connect_ctx = Ctx{ .tag = .connect };
         var timeout_ctx = Ctx{ .tag = .timeout };
@@ -231,7 +233,7 @@ test "TcpTransport query 8.8.8.8 for example.com A" {
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const server = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
+    const server = na.initIp4(.{ 8, 8, 8, 8 }, 53);
     var response_buf: [65535]u8 = undefined;
 
     const response_data = tcp.query(wire_query, server, &response_buf) catch |err| switch (err) {

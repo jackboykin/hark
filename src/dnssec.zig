@@ -1309,7 +1309,7 @@ test "buildSignedData reconstructs wildcard owner name" {
 
 test "ECDSA P-256 signature verification" {
     // Generate a real key pair and sign some data
-    const key_pair = EcdsaP256.KeyPair.generate();
+    const key_pair = EcdsaP256.KeyPair.generate(testing.io);
     const pub_bytes = key_pair.public_key.toUncompressedSec1();
     // DNSSEC key is raw 64-byte x||y (without 0x04 prefix)
     const dnssec_key = pub_bytes[1..65];
@@ -1326,7 +1326,7 @@ test "ECDSA P-256 signature verification" {
 }
 
 test "Ed25519 signature verification" {
-    const key_pair = Ed25519.KeyPair.generate();
+    const key_pair = Ed25519.KeyPair.generate(testing.io);
     const pub_bytes = key_pair.public_key.toBytes();
 
     const msg = "test Ed25519 DNSSEC data";

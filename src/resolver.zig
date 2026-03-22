@@ -11,11 +11,13 @@ const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const Config = @import("transport.zig").Config;
+const na = @import("net_address.zig");
 
 pub const ForwardingResolver = struct {
     transport: AnyUdpTransport,
-    tcp_transport: ?AnyTcpTransport,
-    tls_transport: ?*TlsTransport,
+    tcp_transport: ?AnyTcpTransport = null,
+    tls_transport: ?*TlsTransport = null,
+    io: std.Io = undefined,
 
     pub fn init(transport: AnyUdpTransport) ForwardingResolver {
         return .{ .transport = transport, .tcp_transport = null, .tls_transport = null };
@@ -25,8 +27,8 @@ pub const ForwardingResolver = struct {
         return .{ .transport = transport, .tcp_transport = tcp, .tls_transport = null };
     }
 
-    pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: std.net.Address) !dns.Message {
-        const query_id = rand.queryId();
+    pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: na.Address) !dns.Message {
+        const query_id = rand.queryId(self.io);
 
         // Build query message (with EDNS0)
         const query_msg = try dns.buildQueryWithOptions(allocator, query_id, name, qtype, .{ .edns = .{} });
@@ -85,6 +87,7 @@ pub const ForwardingResolver = struct {
 
 test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const io = testing.io;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
@@ -92,15 +95,15 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     };
     defer loop.destroy();
 
-    var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
+    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = ForwardingResolver.init(.{ .uring = &transport });
+    var resolver = ForwardingResolver{ .transport = .{ .uring = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const upstream = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
+    const upstream = na.initIp4(.{ 8, 8, 8, 8 }, 53);
     const response = resolver.resolve(arena.allocator(), "example.com", .a, upstream) catch |err| switch (err) {
         error.Timeout => return error.SkipZigTest, // no network
         else => return err,

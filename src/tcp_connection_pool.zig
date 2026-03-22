@@ -1,11 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
-const net = std.net;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const pool_mod = @import("connection_pool.zig");
 const AddressKey = pool_mod.AddressKey;
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
 
 // ── TcpPooledConnection ─────────────────────────────────────────────
 
@@ -16,7 +17,7 @@ pub const TcpPooledConnection = struct {
     max_queries: u16 = 200,
 
     pub fn destroyBroken(self: *TcpPooledConnection, allocator: Allocator) void {
-        posix.close(self.sock);
+        sys.close(self.sock);
         allocator.destroy(self);
     }
 
@@ -40,9 +41,9 @@ pub const TcpConnectionPool = pool_mod.ConnectionPool(TcpPooledConnection);
 // ── Tests ────────────────────────────────────────────────────────────
 
 fn createTestConnection(allocator: Allocator) !*TcpPooledConnection {
-    const dev_null = try posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
-    const sock = try posix.dup(dev_null);
-    posix.close(dev_null);
+    const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    const sock = try sys.dup(dev_null);
+    sys.close(dev_null);
 
     const conn = try allocator.create(TcpPooledConnection);
     conn.* = .{
@@ -63,11 +64,11 @@ test "TcpConnectionPool store and acquire" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var pool = TcpConnectionPool.init(testing.allocator);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &now_fn.now;
     defer pool.deinit();
 
-    const key = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestConnection(testing.allocator);
     pool.store(key, conn);
 
@@ -90,12 +91,12 @@ test "TcpConnectionPool idle eviction" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var pool = TcpConnectionPool.init(testing.allocator);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &now_fn.now;
     pool.max_idle_sec = 10;
     defer pool.deinit();
 
-    const key = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestConnection(testing.allocator);
     pool.store(key, conn);
     try testing.expect(pool.entries.count() == 1);
@@ -116,24 +117,24 @@ test "TcpConnectionPool max entries eviction" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var pool = TcpConnectionPool.init(testing.allocator);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &now_fn.now;
     pool.max_entries = 2;
     defer pool.deinit();
 
     const conn1 = try createTestConnection(testing.allocator);
-    const key1 = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const key1 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     pool.store(key1, conn1);
 
     fake_time = 1001;
     const conn2 = try createTestConnection(testing.allocator);
-    const key2 = AddressKey.fromAddress(net.Address.initIp4(.{ 8, 8, 8, 8 }, 53));
+    const key2 = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 53));
     pool.store(key2, conn2);
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
 
     fake_time = 1002;
     const conn3 = try createTestConnection(testing.allocator);
-    const key3 = AddressKey.fromAddress(net.Address.initIp4(.{ 9, 9, 9, 9 }, 53));
+    const key3 = AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 53));
     pool.store(key3, conn3);
 
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
@@ -141,10 +142,10 @@ test "TcpConnectionPool max entries eviction" {
 }
 
 test "TcpConnectionPool release not alive frees connection" {
-    var pool = TcpConnectionPool.init(testing.allocator);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     defer pool.deinit();
 
-    const key = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestConnection(testing.allocator);
 
     pool.release(key, conn, false);
@@ -161,11 +162,11 @@ test "TcpConnectionPool max queries eviction" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var pool = TcpConnectionPool.init(testing.allocator);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &now_fn.now;
     defer pool.deinit();
 
-    const key = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestConnection(testing.allocator);
     conn.max_queries = 3;
     pool.store(key, conn);

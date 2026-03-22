@@ -3,13 +3,15 @@ const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 const toml = @import("toml.zig");
+const net_addr = @import("net_address.zig");
+const Address = net_addr.Address;
 
 // ── ServerConfig ───────────────────────────────────────────────────────
 
 pub const ServerConfig = struct {
-    listen: []std.net.Address,
+    listen: []Address,
     mode: Mode,
-    upstreams: []std.net.Address,
+    upstreams: []Address,
     cache_size: usize,
     cache_entries: u32,
     key_cache_size: usize,
@@ -51,11 +53,11 @@ pub const ConfigError = error{
 // ── Defaults ───────────────────────────────────────────────────────────
 
 fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
-    const listen = allocator.alloc(std.net.Address, 2) catch return error.OutOfMemory;
-    listen[0] = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 53);
-    listen[1] = std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
+    const listen = allocator.alloc(Address, 2) catch return error.OutOfMemory;
+    listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
+    listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
-    const empty_upstreams = allocator.alloc(std.net.Address, 0) catch return error.OutOfMemory;
+    const empty_upstreams = allocator.alloc(Address, 0) catch return error.OutOfMemory;
 
     return .{
         .listen = listen,
@@ -178,17 +180,32 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 }
 
 pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const sys = @import("sys.zig");
+    const posix = std.posix;
+    // Null-terminate path for openat syscall
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+    const fd = try sys.open(path_z, posix.O{}, 0);
+    defer sys.close(fd);
 
-    const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(contents);
+    var contents = std.ArrayList(u8).empty;
+    defer contents.deinit(allocator);
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try sys.read(fd, &read_buf);
+        if (n == 0) break;
+        contents.appendSlice(allocator, read_buf[0..n]) catch return error.OutOfMemory;
+        if (contents.items.len > 1024 * 1024) return error.OutOfMemory;
+    }
 
-    return parseConfig(allocator, contents);
+    return parseConfig(allocator, contents.items);
 }
 
-fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]std.net.Address {
-    const addrs = allocator.alloc(std.net.Address, strs.len) catch return error.OutOfMemory;
+fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]Address {
+    const addrs = allocator.alloc(Address, strs.len) catch return error.OutOfMemory;
     errdefer allocator.free(addrs);
 
     for (strs, 0..) |s, i| {
@@ -197,7 +214,7 @@ fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port
     return addrs;
 }
 
-pub fn parseAddress(s: []const u8, default_port: u16) ?std.net.Address {
+pub fn parseAddress(s: []const u8, default_port: u16) ?Address {
     // IPv6 with brackets: [::1]:53 or [::1]
     if (s.len > 0 and s[0] == '[') {
         const close = mem.indexOfScalar(u8, s, ']') orelse return null;
@@ -206,8 +223,8 @@ pub fn parseAddress(s: []const u8, default_port: u16) ?std.net.Address {
             std.fmt.parseInt(u16, s[close + 2 ..], 10) catch return null
         else
             default_port;
-        const addr = std.net.Ip6Address.parse(ip6_str, port) catch return null;
-        return std.net.Address.initIp6(addr.sa.addr, port, 0, 0);
+        const ip6 = net_addr.Ip6.parse(ip6_str, port) catch return null;
+        return net_addr.initIp6(ip6.bytes, port, 0, 0);
     }
 
     // Check for IPv4 with port: 1.2.3.4:53
@@ -227,18 +244,18 @@ pub fn parseAddress(s: []const u8, default_port: u16) ?std.net.Address {
         const port_str = s[last_colon + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
         const ip4 = parseIpv4(ip_str) orelse return null;
-        return std.net.Address.initIp4(ip4, port);
+        return net_addr.initIp4(ip4, port);
     }
 
     if (colon_count > 1) {
         // Bare IPv6 without brackets
-        const addr = std.net.Ip6Address.parse(s, default_port) catch return null;
-        return std.net.Address.initIp6(addr.sa.addr, default_port, 0, 0);
+        const ip6 = net_addr.Ip6.parse(s, default_port) catch return null;
+        return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
     }
 
     // Plain IPv4 (no port)
     const ip4 = parseIpv4(s) orelse return null;
-    return std.net.Address.initIp4(ip4, default_port);
+    return net_addr.initIp4(ip4, default_port);
 }
 
 fn parseIpv4(s: []const u8) ?[4]u8 {

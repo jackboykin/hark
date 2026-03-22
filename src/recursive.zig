@@ -15,6 +15,7 @@ const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
+const na = @import("net_address.zig");
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
@@ -27,35 +28,35 @@ const log = std.log.scoped(.resolver);
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
 // Source: https://www.internic.net/domain/named.root
 
-pub const root_hints: [26]std.net.Address = .{
+pub const root_hints: [26]na.Address = .{
     // IPv4
-    std.net.Address.initIp4(.{ 198, 41, 0, 4 }, 53), // a
-    std.net.Address.initIp4(.{ 170, 247, 170, 2 }, 53), // b
-    std.net.Address.initIp4(.{ 192, 33, 4, 12 }, 53), // c
-    std.net.Address.initIp4(.{ 199, 7, 91, 13 }, 53), // d
-    std.net.Address.initIp4(.{ 192, 203, 230, 10 }, 53), // e
-    std.net.Address.initIp4(.{ 192, 5, 5, 241 }, 53), // f
-    std.net.Address.initIp4(.{ 192, 112, 36, 4 }, 53), // g
-    std.net.Address.initIp4(.{ 198, 97, 190, 53 }, 53), // h
-    std.net.Address.initIp4(.{ 192, 36, 148, 17 }, 53), // i
-    std.net.Address.initIp4(.{ 192, 58, 128, 30 }, 53), // j
-    std.net.Address.initIp4(.{ 193, 0, 14, 129 }, 53), // k
-    std.net.Address.initIp4(.{ 199, 7, 83, 42 }, 53), // l
-    std.net.Address.initIp4(.{ 202, 12, 27, 33 }, 53), // m
+    na.initIp4(.{ 198, 41, 0, 4 }, 53), // a
+    na.initIp4(.{ 170, 247, 170, 2 }, 53), // b
+    na.initIp4(.{ 192, 33, 4, 12 }, 53), // c
+    na.initIp4(.{ 199, 7, 91, 13 }, 53), // d
+    na.initIp4(.{ 192, 203, 230, 10 }, 53), // e
+    na.initIp4(.{ 192, 5, 5, 241 }, 53), // f
+    na.initIp4(.{ 192, 112, 36, 4 }, 53), // g
+    na.initIp4(.{ 198, 97, 190, 53 }, 53), // h
+    na.initIp4(.{ 192, 36, 148, 17 }, 53), // i
+    na.initIp4(.{ 192, 58, 128, 30 }, 53), // j
+    na.initIp4(.{ 193, 0, 14, 129 }, 53), // k
+    na.initIp4(.{ 199, 7, 83, 42 }, 53), // l
+    na.initIp4(.{ 202, 12, 27, 33 }, 53), // m
     // IPv6
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
-    std.net.Address.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d }, 53, 0, 0), // d
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e }, 53, 0, 0), // e
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f }, 53, 0, 0), // f
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d, 0x0d }, 53, 0, 0), // g
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // h
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x07, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // i
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0x0c, 0x27, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // j
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x07, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 }, 53, 0, 0), // k
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 }, 53, 0, 0), // l
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
+    na.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d }, 53, 0, 0), // d
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e }, 53, 0, 0), // e
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f }, 53, 0, 0), // f
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d, 0x0d }, 53, 0, 0), // g
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // h
+    na.initIp6(.{ 0x20, 0x01, 0x07, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // i
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0x0c, 0x27, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // j
+    na.initIp6(.{ 0x20, 0x01, 0x07, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 }, 53, 0, 0), // k
+    na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 }, 53, 0, 0), // l
+    na.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
 };
 
 const max_referrals = 10;
@@ -77,6 +78,7 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory
 pub const RecursiveResolver = struct {
     transport: AnyUdpTransport,
     tcp_transport: ?AnyTcpTransport = null,
+    io: std.Io = undefined,
     cache: ?*RRsetCache = null,
     qname_minimisation: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
@@ -215,7 +217,7 @@ pub const RecursiveResolver = struct {
                 }
             }
 
-            var servers: [max_servers_per_level]std.net.Address = undefined;
+            var servers: [max_servers_per_level]na.Address = undefined;
             var server_count: usize = root_hints.len;
             @memcpy(servers[0..root_hints.len], &root_hints);
 
@@ -293,7 +295,7 @@ pub const RecursiveResolver = struct {
                 const server_order = if (self.ns_selector) |ns|
                     ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
                 else blk: {
-                    rand.shuffle(std.net.Address, servers[0..server_count]);
+                    rand.shuffle(na.Address, self.io, servers[0..server_count]);
                     for (0..server_count) |idx| order_buf[idx] = idx;
                     break :blk order_buf[0..server_count];
                 };
@@ -302,7 +304,7 @@ pub const RecursiveResolver = struct {
                 var got_response = false;
                 var response: dns.Message = undefined;
                 var last_server_failure: ?dns.Message = null;
-                var responding_server: ?std.net.Address = null;
+                var responding_server: ?na.Address = null;
 
                 // ── Staggered NS racing (blocking transport only) ──
                 if (self.transport == .blocking and server_order.len >= 2 and self.stagger_ms > 0) {
@@ -327,7 +329,7 @@ pub const RecursiveResolver = struct {
 
                     const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
-                    const query_id = rand.queryId();
+                    const query_id = rand.queryId(self.io);
 
                     // Build iterative query (rd=false, EDNS0)
                     const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
@@ -671,7 +673,7 @@ pub const RecursiveResolver = struct {
         depth: usize,
         security_state: *dnssec.SecurityStatus,
         parent_zone: *dns.Name,
-        servers: *[max_servers_per_level]std.net.Address,
+        servers: *[max_servers_per_level]na.Address,
         server_count: *usize,
         seen_zones: *[max_referrals]dns.Name,
         seen_zone_count: *usize,
@@ -721,7 +723,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         zone_cut: dns.Name,
         authorities: []const dns.ResourceRecord,
-        parent_servers: []const std.net.Address,
+        parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
         if (authorities.len > 0) {
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
@@ -846,7 +848,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         wire_query: []const u8,
         query_id: u16,
-        server: std.net.Address,
+        server: na.Address,
         timeout: u32,
     ) error{OutOfMemory}!?dns.Message {
         const addr_key = AddressKey.fromAddress(server);
@@ -887,7 +889,7 @@ pub const RecursiveResolver = struct {
 
     const StaggeredResponse = struct {
         message: dns.Message,
-        server: std.net.Address,
+        server: na.Address,
     };
 
     fn tryStaggeredQuery(
@@ -895,7 +897,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         query_name: []const u8,
         query_type: dns.RType,
-        servers: *[max_servers_per_level]std.net.Address,
+        servers: *[max_servers_per_level]na.Address,
         server_order: []const usize,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
@@ -931,8 +933,8 @@ pub const RecursiveResolver = struct {
 
         const overall_timeout = self.transport.getTimeoutMs();
 
-        const qid0 = rand.queryId();
-        const qid1 = rand.queryId();
+        const qid0 = rand.queryId(self.io);
+        const qid1 = rand.queryId(self.io);
 
         // Build and serialize once, copy + patch ID for the second leg
         const msg0 = dns.buildQueryWithOptions(allocator, qid0, query_name, query_type, .{
@@ -1007,7 +1009,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
-        servers: []const std.net.Address,
+        servers: []const na.Address,
     ) !?[]const dns.ResourceRecord {
         const kc = self.keyCache();
 
@@ -1082,7 +1084,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
-        servers: []const std.net.Address,
+        servers: []const na.Address,
     ) !?[]const dns.ResourceRecord {
         // Network fetch — don't cache yet (RFC 4035 §5.3: validate first)
         const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true, false) orelse return null;
@@ -1136,14 +1138,14 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         zone_name: []const u8,
         qtype: dns.RType,
-        servers: []const std.net.Address,
+        servers: []const na.Address,
         max_servers: usize,
         do_bit: bool,
         store_response: bool,
     ) !?dns.Message {
         if (servers.len == 0) return null;
 
-        const query_id = rand.queryId();
+        const query_id = rand.queryId(self.io);
 
         const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
             .rd = false,
@@ -1223,7 +1225,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
-        parent_servers: []const std.net.Address,
+        parent_servers: []const na.Address,
     ) bool {
         const kc = self.keyCache();
 
@@ -1268,7 +1270,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
-        parent_servers: []const std.net.Address,
+        parent_servers: []const na.Address,
     ) bool {
         const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return false) orelse return false;
         const zone = dns.parseDottedName(allocator, zone_name) catch return false;
@@ -1307,7 +1309,7 @@ pub const RecursiveResolver = struct {
         response: *dns.Message,
         qtype: dns.RType,
         security_state: dnssec.SecurityStatus,
-        servers: []const std.net.Address,
+        servers: []const na.Address,
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
 
@@ -1340,7 +1342,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         authorities: []const dns.ResourceRecord,
-        parent_servers: []const std.net.Address,
+        parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
         // Find RRSIG signer_name in authorities
         var signer_name: ?dns.Name = null;
@@ -1369,7 +1371,7 @@ pub const RecursiveResolver = struct {
         qname: dns.Name,
         qtype: dns.RType,
         is_nxdomain: bool,
-        zone_servers: []const std.net.Address,
+        zone_servers: []const na.Address,
     ) NegativeValidation {
         if (security_state != .secure) return .proceed;
 
@@ -1414,7 +1416,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         ns_name: dns.Name,
         depth: usize,
-        addrs: *[max_servers_per_level]std.net.Address,
+        addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!bool {
         const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
@@ -1425,7 +1427,7 @@ pub const RecursiveResolver = struct {
         if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |r| {
             for (r.message.answers) |rr| {
                 if (rr.rtype == .a and count.* < max_servers_per_level) {
-                    addrs[count.*] = std.net.Address.initIp4(rr.rdata.a, 53);
+                    addrs[count.*] = na.initIp4(rr.rdata.a, 53);
                     count.* += 1;
                     found = true;
                 }
@@ -1436,7 +1438,7 @@ pub const RecursiveResolver = struct {
         if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |r| {
             for (r.message.answers) |rr| {
                 if (rr.rtype == .aaaa and count.* < max_servers_per_level) {
-                    addrs[count.*] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                    addrs[count.*] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
                     count.* += 1;
                     found = true;
                 }
@@ -1454,7 +1456,7 @@ pub const RecursiveResolver = struct {
         depth: usize,
         ns_fetch_limit: usize,
     ) !?NsAddrResult {
-        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
         var resolved_ns_count: usize = 0;
 
@@ -1478,7 +1480,7 @@ pub const RecursiveResolver = struct {
         depth: usize,
         ns_fetch_limit: usize,
     ) !?NsAddrResult {
-        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
         var resolved_ns_count: usize = 0;
 
@@ -1548,12 +1550,12 @@ pub const RecursiveResolver = struct {
         ns_name: dns.Name,
         depth: usize,
         // Output
-        addrs: [max_servers_per_level]std.net.Address = undefined,
+        addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
         oom: bool = false,
 
         fn run(ctx: *NsThreadCtx) void {
-            var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{});
+            var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{}, ctx.parent.io);
             var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
             // Clone parent resolver, override transport and per-query mutable state.
             // Inherits all shared caches/config — new fields on RecursiveResolver
@@ -1577,8 +1579,8 @@ pub const RecursiveResolver = struct {
         }
     };
 
-    const NsAddrResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize };
-    const DelegationResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize, zone: dns.Name };
+    const NsAddrResult = struct { addrs: [max_servers_per_level]na.Address, count: usize };
+    const DelegationResult = struct { addrs: [max_servers_per_level]na.Address, count: usize, zone: dns.Name };
 
     /// Check cache for A/AAAA records of NS names, avoiding network queries.
     /// Collects addresses from all cached NS names (cache lookups are free)
@@ -1590,7 +1592,7 @@ pub const RecursiveResolver = struct {
     ) !?NsAddrResult {
         const cache = self.cache orelse return null;
 
-        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
 
         for (ns_names) |ns_name| {
@@ -1600,7 +1602,7 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         for (h.records) |rr| {
                             if (rr.rtype == .a and count < max_servers_per_level) {
-                                addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
+                                addrs[count] = na.initIp4(rr.rdata.a, 53);
                                 count += 1;
                             }
                         }
@@ -1613,7 +1615,7 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         for (h.records) |rr| {
                             if (rr.rtype == .aaaa and count < max_servers_per_level) {
-                                addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                                addrs[count] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
                                 count += 1;
                             }
                         }
@@ -1844,7 +1846,7 @@ fn answersOnly(msg: dns.Message) dns.Message {
 /// are defined as epoch seconds (RFC 4034 §3.1.5). Truncation gives
 /// correct serial number arithmetic wrapping behavior.
 fn epochNowU32() u32 {
-    return @truncate(@as(u64, @intCast(std.time.timestamp())));
+    return @truncate(@as(u64, @intCast(monotonic.wallclockSec())));
 }
 
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
@@ -1876,7 +1878,7 @@ fn withCnameChain(allocator: mem.Allocator, chain: []const dns.ResourceRecord, r
 
 const ReferralResult = union(enum) {
     referral: struct {
-        addrs: [max_servers_per_level]std.net.Address,
+        addrs: [max_servers_per_level]na.Address,
         count: usize,
         zone_cut: dns.Name, // borrows from response (valid for caller's scope)
     },
@@ -1928,7 +1930,7 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
     }
 
     // Match glue A/AAAA records with bailiwick check
-    var glue_addrs: [max_servers_per_level]std.net.Address = undefined;
+    var glue_addrs: [max_servers_per_level]na.Address = undefined;
     var glue_count: usize = 0;
     for (response.additionals) |rr| {
         const is_a = rr.rtype == .a;
@@ -1944,9 +1946,9 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
             if (ns_name.eql(rr.name)) {
                 if (glue_count < max_servers_per_level) {
                     if (is_a) {
-                        glue_addrs[glue_count] = std.net.Address.initIp4(rr.rdata.a, 53);
+                        glue_addrs[glue_count] = na.initIp4(rr.rdata.a, 53);
                     } else {
-                        glue_addrs[glue_count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                        glue_addrs[glue_count] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
                     }
                     glue_count += 1;
                 }
@@ -2067,8 +2069,8 @@ test "extractReferral with NS and glue A records" {
     switch (result) {
         .referral => |ref| {
             try testing.expectEqual(@as(usize, 1), ref.count);
-            const expected = std.net.Address.initIp4(.{ 192, 0, 2, 1 }, 53);
-            try testing.expectEqual(expected.in.sa.addr, ref.addrs[0].in.sa.addr);
+            const expected = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+            try testing.expectEqual(expected.ip4.bytes, ref.addrs[0].ip4.bytes);
             try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
             try testing.expect(ref.zone_cut.eql(zone_name));
         },
@@ -2179,8 +2181,8 @@ test "extractReferral with AAAA glue returns IPv6 address" {
         .referral => |ref| {
             try testing.expectEqual(@as(usize, 1), ref.count);
             try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
-            const expected = std.net.Address.initIp6(ipv6, 53, 0, 0);
-            try testing.expectEqual(expected.in6.sa.addr, ref.addrs[0].in6.sa.addr);
+            const expected = na.initIp6(ipv6, 53, 0, 0);
+            try testing.expectEqual(expected.ip6.bytes, ref.addrs[0].ip6.bytes);
         },
         .no_glue => return error.TestUnexpectedResult,
     }
@@ -2385,6 +2387,7 @@ fn skipIfNotLinux() !void {
 
 test "recursive resolve example.com A from root hints" {
     try skipIfNotLinux();
+    const io = testing.io;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
@@ -2392,10 +2395,10 @@ test "recursive resolve example.com A from root hints" {
     };
     defer loop.destroy();
 
-    var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
+    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2426,6 +2429,7 @@ test "recursive resolve example.com A from root hints" {
 
 test "recursive resolve nonexistent domain returns name_error" {
     try skipIfNotLinux();
+    const io = testing.io;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
@@ -2433,10 +2437,10 @@ test "recursive resolve nonexistent domain returns name_error" {
     };
     defer loop.destroy();
 
-    var transport = UdpTransport.init(loop, .{}) catch return error.SkipZigTest;
+    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2455,6 +2459,7 @@ test "recursive resolve nonexistent domain returns name_error" {
 
 test "recursive resolve domain with glueless NS" {
     try skipIfNotLinux();
+    const io = testing.io;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
@@ -2463,10 +2468,10 @@ test "recursive resolve domain with glueless NS" {
     defer loop.destroy();
 
     // Shorter timeouts: glueless path issues many sub-queries
-    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }) catch return error.SkipZigTest;
+    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }, io) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2497,6 +2502,7 @@ test "recursive resolve domain with glueless NS" {
 
 test "recursive resolve with CNAME chain" {
     try skipIfNotLinux();
+    const io = testing.io;
 
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
@@ -2504,10 +2510,10 @@ test "recursive resolve with CNAME chain" {
     };
     defer loop.destroy();
 
-    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }) catch return error.SkipZigTest;
+    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }, io) catch return error.SkipZigTest;
     defer transport.deinit();
 
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport } };
+    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

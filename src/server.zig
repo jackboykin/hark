@@ -4,6 +4,7 @@ const mem = std.mem;
 const posix = std.posix;
 const linux = std.os.linux;
 const testing = std.testing;
+const Io = std.Io;
 const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
@@ -31,6 +32,9 @@ const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransp
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 const Certificate = std.crypto.Certificate;
+const na = @import("net_address.zig");
+const sys = @import("sys.zig");
+const monotonic = @import("monotonic.zig");
 
 const log = std.log.scoped(.server);
 
@@ -44,7 +48,7 @@ const work_queue_capacity = 256;
 const WorkItem = struct {
     query_buf: [4096]u8 = undefined,
     query_len: u16 = 0,
-    client_addr: std.net.Address = undefined,
+    client_addr: na.Address = na.initIp4(.{ 0, 0, 0, 0 }, 0),
     sock_fd: posix.fd_t = -1,
     protocol: Protocol = .udp,
     const Protocol = enum { udp, tcp };
@@ -55,13 +59,14 @@ const WorkQueue = struct {
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
-    mutex: std.Thread.Mutex = .{},
-    not_empty: std.Thread.Condition = .{},
+    mutex: Io.Mutex = Io.Mutex.init,
+    not_empty: Io.Condition = Io.Condition.init,
+    io: Io,
     shutdown: bool = false,
 
-    fn push(self: *WorkQueue, data: []const u8, client_addr: std.net.Address, sock_fd: posix.fd_t, protocol: WorkItem.Protocol) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: WorkItem.Protocol) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.count >= work_queue_capacity) return false;
         if (data.len > 4096) return false;
         const item = &self.items[self.tail];
@@ -72,15 +77,15 @@ const WorkQueue = struct {
         item.protocol = protocol;
         self.tail = (self.tail + 1) % work_queue_capacity;
         self.count += 1;
-        self.not_empty.signal();
+        self.not_empty.signal(self.io);
         return true;
     }
 
     fn pop(self: *WorkQueue) ?WorkItem {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         while (self.count == 0 and !self.shutdown) {
-            self.not_empty.wait(&self.mutex);
+            self.not_empty.waitUncancelable(self.io, &self.mutex);
         }
         if (self.count == 0) return null;
         const item = self.items[self.head];
@@ -90,10 +95,10 @@ const WorkQueue = struct {
     }
 
     fn signalShutdown(self: *WorkQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.shutdown = true;
-        self.not_empty.broadcast();
+        self.not_empty.broadcast(self.io);
     }
 };
 
@@ -113,6 +118,7 @@ const max_listen_addrs = 8;
 pub const Server = struct {
     config: ServerConfig,
     allocator: mem.Allocator,
+    io: Io,
     cache: RRsetCache,
     rtt_cache: RttCache,
     ns_selector: NsSelector,
@@ -125,7 +131,7 @@ pub const Server = struct {
     shutdown: std.atomic.Value(bool),
     worker_errors: std.atomic.Value(u32),
 
-    pub fn init(allocator: mem.Allocator, cfg: ServerConfig) !Server {
+    pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         const cache_opts = RRsetCache.CacheOptions{
             .prefetch = cfg.prefetch,
             .serve_stale_ttl = cfg.serve_stale_ttl,
@@ -137,23 +143,23 @@ pub const Server = struct {
         else
             std.heap.smp_allocator;
         const cache = if (cfg.workers > 1)
-            RRsetCache.initThreadSafeWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts)
+            RRsetCache.initThreadSafeWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts, io)
         else
             RRsetCache.initWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts);
 
         const rtt_cache = if (cfg.workers > 1)
-            RttCache.initThreadSafe(allocator)
+            RttCache.initThreadSafe(allocator, io)
         else
             RttCache.init(allocator);
 
         const ns_selector = if (cfg.workers > 1)
-            NsSelector.initThreadSafe(allocator)
+            NsSelector.initThreadSafe(allocator, io)
         else
-            NsSelector.init(allocator);
+            NsSelector.init(allocator, io);
 
         var ca_bundle: Certificate.Bundle = .{};
         if (cfg.opportunistic) {
-            ca_bundle.rescan(allocator) catch |err| {
+            ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch |err| {
                 log.err("failed to load CA certificates: {s}", .{@errorName(err)});
                 return err;
             };
@@ -162,23 +168,24 @@ pub const Server = struct {
         return .{
             .config = cfg,
             .allocator = allocator,
+            .io = io,
             .cache = cache,
             .rtt_cache = rtt_cache,
             .ns_selector = ns_selector,
-            .dedup = if (cfg.workers > 1) InFlightTable.init(allocator) else null,
+            .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
             .ca_bundle = ca_bundle,
-            .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator) else null,
-            .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator) else null,
+            .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
+            .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) blk: {
                 const nsec_alloc = if (builtin.single_threaded) allocator else std.heap.smp_allocator;
                 break :blk if (cfg.workers > 1)
-                    NsecCache.initThreadSafe(nsec_alloc, NsecCache.default_max_bytes)
+                    NsecCache.initThreadSafe(nsec_alloc, NsecCache.default_max_bytes, io)
                 else
                     NsecCache.init(nsec_alloc, NsecCache.default_max_bytes);
             } else null,
             .key_cache = if (cfg.dnssec) blk: {
                 break :blk if (cfg.workers > 1)
-                    RRsetCache.initThreadSafe(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries)
+                    RRsetCache.initThreadSafe(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries, io)
                 else
                     RRsetCache.init(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries);
             } else null,
@@ -205,10 +212,10 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        const listen_addrs: []const std.net.Address = if (self.config.listen.len > 0)
+        const listen_addrs: []const na.Address = if (self.config.listen.len > 0)
             self.config.listen
         else
-            &.{std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 53)};
+            &.{na.initIp4(.{ 127, 0, 0, 1 }, 53)};
 
         if (listen_addrs.len > max_listen_addrs) {
             log.err("too many listen addresses ({d}), maximum is {d}", .{ listen_addrs.len, max_listen_addrs });
@@ -219,11 +226,11 @@ pub const Server = struct {
 
         // Block signals before spawning threads so all workers inherit the mask
         const sig_fd = setupSignalFd() catch -1;
-        defer if (sig_fd >= 0) posix.close(sig_fd);
+        defer if (sig_fd >= 0) sys.close(sig_fd);
 
         for (listen_addrs) |addr| {
             var addr_buf: [64]u8 = undefined;
-            const addr_str = formatAddress(addr, &addr_buf);
+            const addr_str = na.format(addr, &addr_buf);
             log.info("listening on {s} (UDP+TCP)", .{addr_str});
         }
 
@@ -299,11 +306,11 @@ pub const Server = struct {
         }
     }
 
-    fn workerThread(self: *Server, listen_addrs: []const std.net.Address) void {
+    fn workerThread(self: *Server, listen_addrs: []const na.Address) void {
         self.runWorker(listen_addrs, -1, true);
     }
 
-    fn runWorker(self: *Server, listen_addrs: []const std.net.Address, sig_fd: posix.fd_t, reuseport: bool) void {
+    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) void {
         // Per-thread EventLoop for server accept/recv
         const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
@@ -323,7 +330,7 @@ pub const Server = struct {
         defer transport_loop.destroy();
 
         // Per-thread outbound transport (uses its own loop)
-        var udp_transport = UdpTransport.init(transport_loop, .{}) catch |err| {
+        var udp_transport = UdpTransport.init(transport_loop, .{}, self.io) catch |err| {
             log.err("worker failed to create UDP transport: {s}", .{@errorName(err)});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
             return;
@@ -337,13 +344,13 @@ pub const Server = struct {
         var tcp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
 
         defer for (0..listen_addrs.len) |i| {
-            if (udp_socks[i] >= 0) posix.close(udp_socks[i]);
-            if (tcp_socks[i] >= 0) posix.close(tcp_socks[i]);
+            if (udp_socks[i] >= 0) sys.close(udp_socks[i]);
+            if (tcp_socks[i] >= 0) sys.close(tcp_socks[i]);
         };
 
         for (listen_addrs, 0..) |addr, i| {
             var addr_buf: [64]u8 = undefined;
-            const addr_str = formatAddress(addr, &addr_buf);
+            const addr_str = na.format(addr, &addr_buf);
 
             udp_socks[i] = createSocket(addr, posix.SOCK.DGRAM, reuseport, false) catch |err| {
                 log.warn("failed to create UDP socket for {s}: {s}", .{ addr_str, @errorName(err) });
@@ -352,7 +359,7 @@ pub const Server = struct {
 
             tcp_socks[i] = createSocket(addr, posix.SOCK.STREAM, reuseport, true) catch |err| {
                 log.warn("failed to create TCP socket for {s}: {s}", .{ addr_str, @errorName(err) });
-                posix.close(udp_socks[i]);
+                sys.close(udp_socks[i]);
                 udp_socks[i] = -1;
                 continue;
             };
@@ -373,19 +380,20 @@ pub const Server = struct {
         }
 
         // Per-worker TLS transport (shares encrypted_ns_cache + pool across workers)
-        var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle);
+        var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle, self.io);
         if (self.enc_pool) |*pool| tls_transport.pool = pool;
 
-        var queue = WorkQueue{};
+        var queue = WorkQueue{ .io = self.io };
 
         // Per-worker Do53 TCP connection pool (RFC 7766)
-        var do53_tcp_pool = TcpConnectionPool.init(self.allocator);
+        var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
         defer do53_tcp_pool.deinit();
 
         // Worker state
         var ws = WorkerState{
             .config = &self.config,
             .allocator = self.allocator,
+            .io = self.io,
             .loop = server_loop,
             .udp_transport = &udp_transport,
             .tcp_transport = &tcp_transport,
@@ -443,6 +451,7 @@ pub const Server = struct {
 const WorkerState = struct {
     config: *const ServerConfig,
     allocator: mem.Allocator,
+    io: Io,
     loop: *EventLoop,
     udp_transport: *UdpTransport,
     tcp_transport: *TcpTransport,
@@ -500,14 +509,14 @@ const WorkerState = struct {
             null;
 
         var completions: [max_operations]Completion = undefined;
-        var last_stats_ns: i128 = std.time.nanoTimestamp();
+        var last_stats_ns: i128 = monotonic.nowNs();
         const stats_interval_ns: i128 = 60 * std.time.ns_per_s;
 
         while (!self.shutdown.load(.acquire)) {
             const results = self.loop.tick(&completions) catch break;
 
             // Periodic cache stats logging
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = monotonic.nowNs();
             if (now_ns - last_stats_ns >= stats_interval_ns) {
                 const stats = self.cache.getStats();
                 const hit_total = stats.hits + stats.misses;
@@ -587,14 +596,14 @@ const WorkerState = struct {
         self.loop.flush();
     }
 
-    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: std.net.Address) void {
+    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [512]u8 = undefined;
         if (serializeErrorResponse(&wire_buf, id, rcode, rd, questions)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
     }
 
-    fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: std.net.Address) void {
+    fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
         if (data.len < 12) return;
         const id = mem.readInt(u16, data[0..2], .big);
         const rd = data[2] & 0x01 != 0; // RFC 1035 §4.1.1: echo RD in response
@@ -617,18 +626,16 @@ const WorkerState = struct {
     }
 
     fn handleTcpClient(self: *WorkerState, client_fd: posix.fd_t) void {
-        defer posix.close(client_fd);
+        defer sys.close(client_fd);
 
         // Switch accepted fd to blocking mode with idle timeout.
         // This avoids calling tick() on the server_loop, which would steal
         // completions for accept/recvFrom/signalfd and cause a deadlock.
-        const flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch return;
+        const flags = sys.fcntl(client_fd, posix.F.GETFL, 0) catch return;
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-        _ = posix.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
+        _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
 
-        const setSocketTimeout = @import("blocking_transport.zig").setSocketTimeout;
-        setSocketTimeout(client_fd, posix.SO.RCVTIMEO, tcp_idle_timeout_ms);
-        setSocketTimeout(client_fd, posix.SO.SNDTIMEO, tcp_idle_timeout_ms);
+        sys.setSocketTimeouts(client_fd, tcp_idle_timeout_ms);
 
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
@@ -697,14 +704,14 @@ const WorkerState = struct {
         const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
         const name_str = name_buf[0..name_len];
 
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = monotonic.nowNs();
         const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
-            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+            const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf3: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms, @errorName(err) });
             return if (serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
         };
-        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+        const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf4: [24]u8 = undefined;
         var rcode_buf4: [24]u8 = undefined;
         log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf4), elapsed_ms });
@@ -738,6 +745,7 @@ const WorkerState = struct {
                 var resolver = RecursiveResolver{
                     .transport = udp,
                     .tcp_transport = tcp,
+                    .io = self.io,
                     .cache = self.cache,
                     .qname_minimisation = self.config.qname_minimization,
                     // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
@@ -766,10 +774,11 @@ const WorkerState = struct {
             },
             .forward => {
                 var resolver = ForwardingResolver.initWithTcp(udp, tcp);
+                resolver.io = self.io;
                 const upstreams = if (self.config.upstreams.len > 0)
                     self.config.upstreams
                 else
-                    &[_]std.net.Address{std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53)};
+                    &[_]na.Address{na.initIp4(.{ 8, 8, 8, 8 }, 53)};
                 var last_err: anyerror = error.Timeout;
                 for (upstreams) |upstream| {
                     const msg = resolver.resolve(alloc, name, qtype, upstream) catch |err| {
@@ -796,14 +805,14 @@ const WorkerState = struct {
 
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) void {
-        var udp_t = BlockingUdpTransport.init(.{});
+        var udp_t = BlockingUdpTransport.init(.{}, self.io);
         var tcp_t = BlockingTcpTransport.init(.{});
 
         // Pool threads use queryOpportunisticBlocking (blocking TCP connect),
         // so no EventLoop is needed. Passing null ensures connectTcp panics
         // if accidentally called from a pool thread.
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
-            var t = TlsTransport.init(null, self.allocator, .{}, self.ca_bundle);
+            var t = TlsTransport.init(null, self.allocator, .{}, self.ca_bundle, self.io);
             if (self.tls_transport) |main_tls| {
                 t.pool = main_tls.pool;
             }
@@ -829,7 +838,7 @@ const WorkerState = struct {
         self: *WorkerState,
         sock: posix.fd_t,
         data: []const u8,
-        client_addr: std.net.Address,
+        client_addr: na.Address,
         udp_t: *BlockingUdpTransport,
         tcp_t: *BlockingTcpTransport,
         tls_t: ?*TlsTransport,
@@ -867,15 +876,15 @@ const WorkerState = struct {
 
         const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = monotonic.nowNs();
         const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t) catch |err| {
-            const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+            const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             sendErrorUdp(sock, query_msg.header.id, .server_failure, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         };
-        const elapsed_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000));
+        const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
         log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
@@ -1094,7 +1103,7 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
 fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8) ?void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = posix.read(fd, buf[total..]) catch return null;
+        const n = sys.read(fd, buf[total..]) catch return null;
         if (n == 0) return null; // connection closed
         total += n;
     }
@@ -1103,15 +1112,17 @@ fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8) ?void {
 fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8) ?void {
     var total: usize = 0;
     while (total < data.len) {
-        const n = posix.write(fd, data[total..]) catch return null;
+        const n = sys.write(fd, data[total..]) catch return null;
         total += n;
     }
 }
 
-fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: std.net.Address) void {
+fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: na.Address) void {
     // Use direct sendto instead of io_uring to avoid consuming server CQEs
     // (accept, signalfd) that might arrive during the send.
-    _ = posix.sendto(sock, data, 0, &dest.any, dest.getOsSockLen()) catch return;
+    var storage: na.PosixAddress = undefined;
+    const sa_len = na.toSockaddr(&dest, &storage);
+    _ = sys.sendto(sock, data, 0, &storage.any, sa_len) catch return;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1123,51 +1134,18 @@ fn ctxIndex(ctxs: *const [max_listen_addrs]Ctx, n: usize, target: *const Ctx) ?u
     return null;
 }
 
-fn formatAddress(addr: std.net.Address, buf: []u8) []const u8 {
-    switch (addr.any.family) {
-        posix.AF.INET => {
-            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort(),
-            }) catch "<address>";
-        },
-        posix.AF.INET6 => {
-            const port = addr.getPort();
-            const a = addr.in6.sa.addr;
-            return std.fmt.bufPrint(buf, "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}", .{
-                mem.readInt(u16, a[0..2], .big),
-                mem.readInt(u16, a[2..4], .big),
-                mem.readInt(u16, a[4..6], .big),
-                mem.readInt(u16, a[6..8], .big),
-                mem.readInt(u16, a[8..10], .big),
-                mem.readInt(u16, a[10..12], .big),
-                mem.readInt(u16, a[12..14], .big),
-                mem.readInt(u16, a[14..16], .big),
-                port,
-            }) catch "<address>";
-        },
-        else => return "<unknown>",
-    }
-}
-
-fn isNonLoopback(addr: std.net.Address) bool {
-    switch (addr.any.family) {
-        posix.AF.INET => {
-            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            return bytes[0] != 127; // 127.0.0.0/8
-        },
-        posix.AF.INET6 => {
-            const a = addr.in6.sa.addr;
-            // ::1 is the only IPv6 loopback
+fn isNonLoopback(a: na.Address) bool {
+    switch (a) {
+        .ip4 => |v4| return v4.bytes[0] != 127,
+        .ip6 => |v6| {
             const loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-            return !mem.eql(u8, &a, &loopback);
+            return !mem.eql(u8, &v6.bytes, &loopback);
         },
-        else => return true,
     }
 }
 
-fn setV6Only(sock: posix.fd_t, family: u16) !void {
-    if (family == posix.AF.INET6) {
+fn setV6Only(sock: posix.fd_t, af: u32) !void {
+    if (af == posix.AF.INET6) {
         const v6only: c_int = 1;
         try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(v6only));
     }
@@ -1175,19 +1153,20 @@ fn setV6Only(sock: posix.fd_t, family: u16) !void {
 
 // ── Socket creation ────────────────────────────────────────────────────
 
-fn createSocket(addr: std.net.Address, sock_type: u32, reuseport: bool, listen: bool) !posix.fd_t {
-    const sock = try posix.socket(addr.any.family, sock_type | posix.SOCK.NONBLOCK, 0);
-    errdefer posix.close(sock);
+fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: bool) !posix.fd_t {
+    const af = na.afU32(addr);
+    const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK, 0);
+    errdefer sys.close(sock);
 
-    try setV6Only(sock, addr.any.family);
+    try setV6Only(sock, af);
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     if (reuseport) {
         try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
     }
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
-    if (listen) {
-        try posix.listen(sock, 128);
+    try na.bindTo(sock, &addr);
+    if (listen_flag) {
+        try sys.listen(sock, 128);
     }
 
     return sock;
@@ -1219,7 +1198,7 @@ test "server init and deinit" {
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
 
-    var server = try Server.init(testing.allocator, cfg);
+    var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
 
     try testing.expectEqual(false, server.shutdown.load(.acquire));
@@ -1234,7 +1213,7 @@ test "server init thread-safe cache when workers > 1" {
     ) catch return error.SkipZigTest;
     defer cfg.deinit();
 
-    var server = try Server.init(testing.allocator, cfg);
+    var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
 
     try testing.expect(server.cache.rwlock != null);
@@ -1380,40 +1359,31 @@ test "serializeErrorResponse with no question (parse failure)" {
 }
 
 test "createSocket UDP binds to ephemeral port" {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
     const sock = createSocket(addr, posix.SOCK.DGRAM, false, false) catch return error.SkipZigTest;
-    defer posix.close(sock);
+    defer sys.close(sock);
 
-    var bound: std.net.Address = undefined;
-    var len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(sock, @ptrCast(&bound), &len);
-    try testing.expect(bound.getPort() > 0);
+    try testing.expect((try na.getSockName(sock)).getPort() > 0);
 }
 
 test "createSocket TCP binds and listens" {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
     const sock = createSocket(addr, posix.SOCK.STREAM, false, true) catch return error.SkipZigTest;
-    defer posix.close(sock);
+    defer sys.close(sock);
 
-    var bound: std.net.Address = undefined;
-    var len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(sock, @ptrCast(&bound), &len);
-    try testing.expect(bound.getPort() > 0);
+    try testing.expect((try na.getSockName(sock)).getPort() > 0);
 }
 
 test "createSocket UDP reuseport allows multiple binds" {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
     const sock1 = createSocket(addr, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
-    defer posix.close(sock1);
+    defer sys.close(sock1);
 
     // Get the actual port
-    var bound: std.net.Address = undefined;
-    var len: posix.socklen_t = @sizeOf(std.net.Address);
-    try posix.getsockname(sock1, @ptrCast(&bound), &len);
-    const port = bound.getPort();
+    const port = (try na.getSockName(sock1)).getPort();
 
     // Second socket on same port should succeed with SO_REUSEPORT
-    const addr2 = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const addr2 = na.initIp4(.{ 127, 0, 0, 1 }, port);
     const sock2 = createSocket(addr2, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
-    defer posix.close(sock2);
+    defer sys.close(sock2);
 }

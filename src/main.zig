@@ -13,6 +13,7 @@ const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RttCache = hark.ns_rtt.RttCache;
 const RRsetCache = hark.cache.RRsetCache;
 const Certificate = std.crypto.Certificate;
+const Io = std.Io;
 const Server = hark.server.Server;
 const ServerConfig = hark.config.ServerConfig;
 
@@ -38,7 +39,7 @@ fn logFn(
     var pos: usize = 0;
 
     // Timestamp
-    const secs: u64 = @intCast(std.time.timestamp());
+    const secs: u64 = @intCast(hark.monotonic.wallclockSec());
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
     const ds = es.getDaySeconds();
     const yd = es.getEpochDay().calculateYearDay();
@@ -59,21 +60,23 @@ fn logFn(
     const msg = std.fmt.bufPrint(buf[pos..], format ++ "\n", args) catch return;
     pos += msg.len;
 
-    // Write atomically to stderr
-    const stderr = std.debug.lockStderrWriter(buf[pos..]);
-    defer std.debug.unlockStderrWriter();
-    nosuspend stderr.writeAll(buf[0..pos]) catch {};
+    // Write to stderr
+    std.debug.print("{s}", .{buf[0..pos]});
 }
 
 const log = std.log;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_list = std.ArrayList([:0]const u8).empty;
+    defer args_list.deinit(allocator);
+    while (args_iter.next()) |arg| {
+        args_list.append(allocator, arg) catch break;
+    }
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
@@ -82,11 +85,11 @@ pub fn main() !void {
 
     const command = args[1];
     if (std.mem.eql(u8, command, "dump")) {
-        return runDump(allocator);
+        return runDump(allocator, io);
     } else if (std.mem.eql(u8, command, "query")) {
-        return runQuery(allocator, args[2..]);
+        return runQuery(allocator, args[2..], io);
     } else if (std.mem.eql(u8, command, "serve")) {
-        return runServe(allocator, args[2..]);
+        return runServe(allocator, args[2..], io);
     } else {
         log.err("unknown command: {s}", .{command});
         printUsage();
@@ -124,13 +127,13 @@ fn printUsage() void {
     , .{});
 }
 
-fn runDump(gpa_alloc: std.mem.Allocator) !void {
+fn runDump(gpa_alloc: std.mem.Allocator, io: Io) !void {
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var stdin_buf: [4096]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
     const input = stdin_reader.interface.allocRemaining(allocator, @enumFromInt(dns.max_udp_payload * 4)) catch |err| {
         log.err("failed to read stdin: {}", .{err});
         std.process.exit(1);
@@ -147,7 +150,7 @@ fn runDump(gpa_alloc: std.mem.Allocator) !void {
     };
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     dns.printMessage(msg, stdout) catch |err| {
@@ -158,7 +161,7 @@ fn runDump(gpa_alloc: std.mem.Allocator) !void {
     stdout.flush() catch {};
 }
 
-fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
+fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     if (args.len == 0) {
         log.err("query requires a domain name", .{});
         printUsage();
@@ -167,7 +170,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     const name = args[0];
     var qtype: dns.RType = .a;
-    var upstream_addr = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53);
+    var upstream_addr = hark.net_address.initIp4(.{ 8, 8, 8, 8 }, 53);
     var forward_mode = false;
     var dot_mode = false;
     var dot_host: ?[]const u8 = null;
@@ -227,7 +230,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer loop.destroy();
 
-    var t = UdpTransport.init(loop, .{}) catch |err| {
+    var t = UdpTransport.init(loop, .{}, io) catch |err| {
         log.err("failed to create UDP socket: {}", .{err});
         std.process.exit(1);
     };
@@ -244,7 +247,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var ca_bundle: Certificate.Bundle = .{};
     var ca_bundle_loaded = false;
     if (dot_mode) {
-        ca_bundle.rescan(gpa_alloc) catch {
+        ca_bundle.rescan(gpa_alloc, io, Io.Timestamp.now(io, .real)) catch {
             log.err("failed to load system CA certificates", .{});
             std.process.exit(1);
         };
@@ -256,7 +259,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     var tls_t = TlsTransport.init(loop, gpa_alloc, .{
         .server_name = dot_host,
         .strict = dot_strict,
-    }, ca_bundle);
+    }, ca_bundle, io);
 
     // Cache: 16MB cap, 10k max entries
     const cache_alloc = if (builtin.single_threaded)
@@ -272,6 +275,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     const response = if (forward_mode) blk: {
         var resolver = ForwardingResolver.initWithTcp(.{ .uring = &t }, .{ .uring = &tcp_t });
+        resolver.io = io;
         if (dot_mode) {
             resolver.tls_transport = &tls_t;
         }
@@ -280,8 +284,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
     } else blk: {
-        var enc_ns = EncryptedNsCache.init(gpa_alloc);
-        var enc_pool = ConnectionPool.init(gpa_alloc);
+        var enc_ns = EncryptedNsCache.init(gpa_alloc, io);
+        var enc_pool = ConnectionPool.init(gpa_alloc, io);
         defer {
             enc_ns.awaitProbes();
             enc_pool.deinit();
@@ -303,6 +307,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
             .rtt_cache = &rtt_cache,
             .tls_transport = if (opportunistic) &tls_t else null,
             .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
+            .io = io,
         };
         const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});
@@ -312,7 +317,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     };
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     dns.printMessage(response, stdout) catch |err| {
@@ -332,7 +337,7 @@ fn parseRType(s: []const u8) ?dns.RType {
     return result;
 }
 
-fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
+fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     // Parse serve flags
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
@@ -374,7 +379,7 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Start server
-    var server = Server.init(gpa_alloc, cfg) catch |err| {
+    var server = Server.init(gpa_alloc, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
         std.process.exit(1);
     };

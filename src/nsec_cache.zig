@@ -222,7 +222,8 @@ pub const SynthResult = struct {
 
 pub const NsecCache = struct {
     zones: std.StringHashMapUnmanaged(ZoneNsecList),
-    rwlock: ?std.Thread.RwLock,
+    rwlock: ?std.Io.RwLock,
+    io: std.Io = undefined,
     counting: CountingAllocator,
     now_fn: *const fn () i64,
     hits: std.atomic.Value(u64),
@@ -244,9 +245,10 @@ pub const NsecCache = struct {
         };
     }
 
-    pub fn initThreadSafe(backing: Allocator, max_bytes: usize) NsecCache {
+    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, io: std.Io) NsecCache {
         var nc = init(backing, max_bytes);
-        nc.rwlock = .{};
+        nc.rwlock = std.Io.RwLock.init;
+        nc.io = io;
         return nc;
     }
 
@@ -318,8 +320,8 @@ pub const NsecCache = struct {
         var cached_soa: ?dns.ResourceRecord = if (soa_rr) |sr| cloneSoaRecord(alloc, sr) catch null else null;
 
         // Take write lock only for zone lookup + sorted insert
-        if (self.rwlock) |*rw| rw.lock();
-        defer if (self.rwlock) |*rw| rw.unlock();
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
 
         const list = self.getOrCreateZone(alloc, zone_lower) orelse {
             for (cloned[0..clone_count]) |*e| freeEntry(alloc, e);
@@ -382,8 +384,8 @@ pub const NsecCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const name_lower = dns.lowerNameIntoBuf(&lower_buf, dotted_name);
 
-        if (self.rwlock) |*rw| rw.lockShared();
-        defer if (self.rwlock) |*rw| rw.unlockShared();
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
 
         // Check the full name as a zone (handles apex NODATA, e.g. query
         // for example.com when zone "example.com" has a matching NSEC).
@@ -449,8 +451,8 @@ pub const NsecCache = struct {
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
-        if (self.rwlock) |*rw| rw.lockShared();
-        defer if (self.rwlock) |*rw| rw.unlockShared();
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
         return .{
             .hits = self.hits.load(.monotonic),
             .misses = self.misses.load(.monotonic),

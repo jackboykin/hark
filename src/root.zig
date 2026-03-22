@@ -22,6 +22,8 @@ pub const counting_allocator = @import("counting_allocator.zig");
 pub const blocking_transport = @import("blocking_transport.zig");
 pub const rand = @import("rand.zig");
 pub const monotonic = @import("monotonic.zig");
+pub const sys = @import("sys.zig");
+pub const net_address = @import("net_address.zig");
 
 test {
     _ = dns;
@@ -48,4 +50,6 @@ test {
     _ = blocking_transport;
     _ = rand;
     _ = monotonic;
+    _ = sys;
+    _ = net_address;
 }

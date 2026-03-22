@@ -7,6 +7,7 @@ const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const dns = @import("dns.zig");
 const rand = @import("rand.zig");
+const na = @import("net_address.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -72,21 +73,24 @@ const ArmState = struct {
 
 pub const NsSelector = struct {
     arms: std.AutoHashMap(ArmKey, ArmState),
-    mutex: ?std.Thread.Mutex,
+    mutex: ?std.Io.Mutex,
+    io: std.Io = undefined,
     gamma: f32,
 
-    pub fn init(allocator: Allocator) NsSelector {
+    pub fn init(allocator: Allocator, io: std.Io) NsSelector {
         return .{
             .arms = std.AutoHashMap(ArmKey, ArmState).init(allocator),
             .mutex = null,
+            .io = io,
             .gamma = default_gamma,
         };
     }
 
-    pub fn initThreadSafe(allocator: Allocator) NsSelector {
+    pub fn initThreadSafe(allocator: Allocator, io: std.Io) NsSelector {
         return .{
             .arms = std.AutoHashMap(ArmKey, ArmState).init(allocator),
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
+            .io = io,
             .gamma = default_gamma,
         };
     }
@@ -101,12 +105,12 @@ pub const NsSelector = struct {
     pub fn selectServers(
         self: *NsSelector,
         zone: dns.Name,
-        servers: []const std.net.Address,
+        servers: []const na.Address,
         rtt_cache: ?*RttCache,
         order_buf: *[max_order]usize,
     ) []usize {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const zh = zoneHash(zone);
 
@@ -132,7 +136,7 @@ pub const NsSelector = struct {
             const state = self.arms.get(arm_key) orelse ArmState{};
 
             order_buf[live_count] = i;
-            samples[live_count] = betaSample(state.alpha, state.beta);
+            samples[live_count] = betaSample(self.io, state.alpha, state.beta);
             live_count += 1;
         }
 
@@ -145,7 +149,7 @@ pub const NsSelector = struct {
             for (0..dead_count) |d| {
                 dead_buf[d] = order_buf[max_order - 1 - d];
             }
-            rand.shuffle(usize, dead_buf[0..dead_count]);
+            rand.shuffle(usize, self.io, dead_buf[0..dead_count]);
             @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
         }
 
@@ -156,12 +160,12 @@ pub const NsSelector = struct {
     pub fn recordOutcome(
         self: *NsSelector,
         zone: dns.Name,
-        server: std.net.Address,
+        server: na.Address,
         outcome: Outcome,
         elapsed_us: i64,
     ) void {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const arm_key = ArmKey{
             .zone_hash = zoneHash(zone),
@@ -177,9 +181,9 @@ pub const NsSelector = struct {
 
     /// Return the confidence score (Beta mean) for a server in a zone.
     /// Returns null if no observations exist.
-    pub fn confidence(self: *NsSelector, zone: dns.Name, server: std.net.Address) ?f32 {
-        if (self.mutex) |*mtx| mtx.lock();
-        defer if (self.mutex) |*mtx| mtx.unlock();
+    pub fn confidence(self: *NsSelector, zone: dns.Name, server: na.Address) ?f32 {
+        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
         const arm_key = ArmKey{
             .zone_hash = zoneHash(zone),
@@ -192,7 +196,7 @@ pub const NsSelector = struct {
     // ── Internal ─────────────────────────────────────────────────────
 
     /// Apply discount γ to all arms matching this zone and server set.
-    fn discountZone(self: *NsSelector, zh: u64, servers: []const std.net.Address) void {
+    fn discountZone(self: *NsSelector, zh: u64, servers: []const na.Address) void {
         for (servers) |server| {
             const arm_key = ArmKey{ .zone_hash = zh, .addr_key = AddressKey.fromAddress(server) };
             if (self.arms.getPtr(arm_key)) |state| {
@@ -226,16 +230,16 @@ fn zoneHash(name: dns.Name) u64 {
 // Gamma(α,1) via Marsaglia-Tsang (2000) for α ≥ 1.
 // Our α, β are always ≥ 1.0 due to the prior floor.
 
-fn betaSample(alpha: f32, beta: f32) f32 {
-    const x = gammaSample(alpha);
-    const y = gammaSample(beta);
+fn betaSample(io: std.Io, alpha: f32, beta: f32) f32 {
+    const x = gammaSample(io, alpha);
+    const y = gammaSample(io, beta);
     const sum = x + y;
     if (sum <= 0) return 0.5; // degenerate — return prior mean
     return x / sum;
 }
 
 /// Marsaglia-Tsang method for Gamma(α, 1) where α ≥ 1.
-fn gammaSample(alpha: f32) f32 {
+fn gammaSample(io: std.Io, alpha: f32) f32 {
     std.debug.assert(alpha >= 1.0);
 
     const d = alpha - 1.0 / 3.0;
@@ -247,13 +251,13 @@ fn gammaSample(alpha: f32) f32 {
 
         // Rejection: draw normal x such that v = (1 + c*x)³ > 0
         while (true) {
-            x = normalSample();
+            x = normalSample(io);
             v = 1.0 + c * x;
             if (v > 0) break;
         }
         v = v * v * v;
 
-        const u = rand.uniformFloat();
+        const u = rand.uniformFloat(io);
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
         // Slow accept
@@ -262,9 +266,9 @@ fn gammaSample(alpha: f32) f32 {
 }
 
 /// Standard normal via Box-Muller transform.
-fn normalSample() f32 {
-    const r1 = rand.uniformFloat();
-    const r2 = rand.uniformFloat();
+fn normalSample(io: std.Io) f32 {
+    const r1 = rand.uniformFloat(io);
+    const r2 = rand.uniformFloat(io);
     // Avoid log(0)
     const safe_r1 = @max(r1, 1e-10);
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);
@@ -332,26 +336,26 @@ test "beta sample in range" {
     // Draw many samples, all should be in (0, 1)
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        const s = betaSample(1.0, 1.0);
+        const s = betaSample(testing.io, 1.0, 1.0);
         try testing.expect(s >= 0.0 and s <= 1.0);
     }
     // Skewed distribution: alpha >> beta → samples mostly near 1.0
     var sum: f32 = 0;
     i = 0;
     while (i < 1000) : (i += 1) {
-        sum += betaSample(100.0, 1.0);
+        sum += betaSample(testing.io, 100.0, 1.0);
     }
     try testing.expect(sum / 1000.0 > 0.9);
 }
 
 test "selectServers basic ordering" {
-    var sel = NsSelector.init(testing.allocator);
+    var sel = NsSelector.init(testing.allocator, testing.io);
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "example", "com" } };
-    const servers = [_]std.net.Address{
-        std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53),
-        std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 53),
+    const servers = [_]na.Address{
+        na.initIp4(.{ 10, 0, 0, 1 }, 53),
+        na.initIp4(.{ 10, 0, 0, 2 }, 53),
     };
 
     // Record: server 0 is terrible, server 1 is great
@@ -372,14 +376,14 @@ test "selectServers basic ordering" {
 }
 
 test "discount causes re-exploration" {
-    var sel = NsSelector.init(testing.allocator);
+    var sel = NsSelector.init(testing.allocator, testing.io);
     defer sel.deinit();
     sel.gamma = 0.9; // Aggressive discount for test
 
     const zone = dns.Name{ .labels = &.{ "test", "com" } };
-    const servers = [_]std.net.Address{
-        std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53),
-        std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 53),
+    const servers = [_]na.Address{
+        na.initIp4(.{ 10, 0, 0, 1 }, 53),
+        na.initIp4(.{ 10, 0, 0, 2 }, 53),
     };
 
     // Make server 0 look bad initially
@@ -401,11 +405,11 @@ test "discount causes re-exploration" {
 }
 
 test "recordOutcome updates state" {
-    var sel = NsSelector.init(testing.allocator);
+    var sel = NsSelector.init(testing.allocator, testing.io);
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "example", "com" } };
-    const server = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53);
+    const server = na.initIp4(.{ 10, 0, 0, 1 }, 53);
 
     sel.recordOutcome(zone, server, .success, 50_000);
     const c = sel.confidence(zone, server).?;
@@ -415,21 +419,21 @@ test "recordOutcome updates state" {
 }
 
 test "confidence returns null for unknown" {
-    var sel = NsSelector.init(testing.allocator);
+    var sel = NsSelector.init(testing.allocator, testing.io);
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "unknown", "com" } };
-    const server = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 53);
+    const server = na.initIp4(.{ 10, 0, 0, 99 }, 53);
     try testing.expectEqual(@as(?f32, null), sel.confidence(zone, server));
 }
 
 test "per-zone isolation" {
-    var sel = NsSelector.init(testing.allocator);
+    var sel = NsSelector.init(testing.allocator, testing.io);
     defer sel.deinit();
 
     const zone_a = dns.Name{ .labels = &.{ "a", "com" } };
     const zone_b = dns.Name{ .labels = &.{ "b", "com" } };
-    const server = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 53);
+    const server = na.initIp4(.{ 10, 0, 0, 1 }, 53);
 
     // Same server, different zones — independent state
     for (0..20) |_| sel.recordOutcome(zone_a, server, .success, 10_000);

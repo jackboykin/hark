@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
-const net = std.net;
+const na = @import("net_address.zig");
 const posix = std.posix;
 const AddressKey = @import("connection_pool.zig").AddressKey;
 
@@ -43,27 +43,29 @@ const NsEntry = struct {
 
 pub const EncryptedNsCache = struct {
     entries: std.AutoHashMap(AddressKey, NsEntry),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    io: std.Io,
     active_probes: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     now_fn: *const fn () i64 = &defaultNow,
 
-    pub fn init(allocator: Allocator) EncryptedNsCache {
+    pub fn init(allocator: Allocator, io: std.Io) EncryptedNsCache {
         return .{
             .entries = std.AutoHashMap(AddressKey, NsEntry).init(allocator),
+            .io = io,
         };
     }
 
     pub fn deinit(self: *EncryptedNsCache) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.entries.deinit();
     }
 
     /// Return the current status for a nameserver.
     pub fn getStatus(self: *EncryptedNsCache, key: AddressKey) ServerStatus {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const entry = self.entries.get(key) orelse return .unknown;
         return switch (entry.status) {
             .capable => if (self.now_fn() - entry.last_probe >= persistence_sec) .unknown else .capable,
@@ -77,8 +79,8 @@ pub const EncryptedNsCache = struct {
     /// should fire the probe (sets status to .probing). Returns false if
     /// already probing, already capable, or in damping window.
     pub fn claimProbe(self: *EncryptedNsCache, key: AddressKey) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const now = self.now_fn();
 
         if (self.entries.get(key)) |entry| {
@@ -104,8 +106,8 @@ pub const EncryptedNsCache = struct {
 
     /// Mark a server as TLS-capable (probe succeeded).
     pub fn markCapable(self: *EncryptedNsCache, key: AddressKey) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.entries.put(key, .{
             .status = .capable,
             .last_probe = self.now_fn(),
@@ -115,8 +117,8 @@ pub const EncryptedNsCache = struct {
 
     /// Mark a server as failed (probe failed). Increments failure_count.
     pub fn markFailed(self: *EncryptedNsCache, key: AddressKey) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const existing = self.entries.get(key);
         const count = if (existing) |e| e.failure_count else 0;
         self.entries.put(key, .{
@@ -128,8 +130,8 @@ pub const EncryptedNsCache = struct {
 
     /// Revert a .probing entry to .unknown (probe was never attempted).
     pub fn revertProbing(self: *EncryptedNsCache, key: AddressKey) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.entries.get(key)) |entry| {
             if (entry.status == .probing) {
                 _ = self.entries.fetchRemove(key);
@@ -141,7 +143,8 @@ pub const EncryptedNsCache = struct {
     pub fn awaitProbes(self: *EncryptedNsCache) void {
         self.shutting_down.store(true, .seq_cst);
         while (self.active_probes.load(.seq_cst) > 0) {
-            std.Thread.sleep(1_000_000); // 1ms
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null); // 1ms
         }
     }
 
@@ -171,18 +174,18 @@ pub const EncryptedNsCache = struct {
 // ── Tests ─────────────────────────────────────────────────────────────
 
 fn makeKey(ip: [4]u8) AddressKey {
-    return AddressKey.fromAddress(net.Address.initIp4(ip, 853));
+    return AddressKey.fromAddress(na.initIp4(ip, 853));
 }
 
 test "EncryptedNsCache unknown address returns unknown" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(makeKey(.{ 1, 1, 1, 1 })));
 }
 
 test "EncryptedNsCache markCapable and getStatus" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
@@ -200,7 +203,7 @@ test "EncryptedNsCache markFailed with damping" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     cache.now_fn = &now_fn.now;
     defer cache.deinit();
 
@@ -217,7 +220,7 @@ test "EncryptedNsCache markFailed with damping" {
 }
 
 test "EncryptedNsCache claimProbe dedup" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 9, 9, 9, 9 });
@@ -240,7 +243,7 @@ test "EncryptedNsCache claimProbe respects damping" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     cache.now_fn = &now_fn.now;
     defer cache.deinit();
 
@@ -257,7 +260,7 @@ test "EncryptedNsCache claimProbe respects damping" {
 }
 
 test "EncryptedNsCache claimProbe skips capable" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
@@ -268,7 +271,7 @@ test "EncryptedNsCache claimProbe skips capable" {
 }
 
 test "EncryptedNsCache failure count increments" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 10, 0, 0, 1 });
@@ -281,7 +284,7 @@ test "EncryptedNsCache failure count increments" {
 }
 
 test "EncryptedNsCache capable after failed" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 0, 0, 1 });
@@ -301,7 +304,7 @@ test "EncryptedNsCache capable expires after persistence_sec" {
     };
     now_fn.time_ptr = &fake_time;
 
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     cache.now_fn = &now_fn.now;
     defer cache.deinit();
 
@@ -324,7 +327,7 @@ test "EncryptedNsCache capable expires after persistence_sec" {
 }
 
 test "EncryptedNsCache revertProbing clears probing entry" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 4, 4, 4, 4 });
@@ -336,7 +339,7 @@ test "EncryptedNsCache revertProbing clears probing entry" {
 }
 
 test "EncryptedNsCache revertProbing is no-op for capable" {
-    var cache = EncryptedNsCache.init(testing.allocator);
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 5, 5, 5, 5 });
