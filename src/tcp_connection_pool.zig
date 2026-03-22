@@ -4,7 +4,8 @@ const mem = std.mem;
 const net = std.net;
 const Allocator = mem.Allocator;
 const testing = std.testing;
-const AddressKey = @import("connection_pool.zig").AddressKey;
+const pool_mod = @import("connection_pool.zig");
+const AddressKey = pool_mod.AddressKey;
 
 // ── TcpPooledConnection ─────────────────────────────────────────────
 
@@ -12,143 +13,29 @@ pub const TcpPooledConnection = struct {
     sock: posix.fd_t,
     last_used: i64,
     query_count: u16,
+    max_queries: u16 = 200,
 
-    pub fn closeAndDestroy(self: *TcpPooledConnection, allocator: Allocator) void {
+    pub fn destroyBroken(self: *TcpPooledConnection, allocator: Allocator) void {
         posix.close(self.sock);
         allocator.destroy(self);
+    }
+
+    pub fn isExpired(self: *const TcpPooledConnection) bool {
+        return self.query_count >= self.max_queries;
+    }
+
+    pub fn recordUse(self: *TcpPooledConnection) void {
+        self.query_count +|= 1;
+    }
+
+    pub fn initCounters(self: *TcpPooledConnection) void {
+        self.query_count = 1;
     }
 };
 
 // ── TcpConnectionPool ───────────────────────────────────────────────
 
-const max_entries_default: usize = 32;
-
-pub const TcpConnectionPool = struct {
-    allocator: Allocator,
-    entries: std.AutoHashMap(AddressKey, *TcpPooledConnection),
-    mutex: std.Thread.Mutex = .{},
-    max_idle_sec: i64 = 30,
-    max_entries: usize = max_entries_default,
-    max_queries: u16 = 200,
-    now_fn: *const fn () i64 = &defaultNow,
-
-    pub fn init(allocator: Allocator) TcpConnectionPool {
-        return .{
-            .allocator = allocator,
-            .entries = std.AutoHashMap(AddressKey, *TcpPooledConnection).init(allocator),
-        };
-    }
-
-    pub fn deinit(self: *TcpConnectionPool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var iter = self.entries.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.*.closeAndDestroy(self.allocator);
-        }
-        self.entries.deinit();
-    }
-
-    /// Retrieve a cached connection for the given key. Returns null if
-    /// no connection exists, the entry has expired, or the query cap is hit.
-    pub fn acquire(self: *TcpConnectionPool, key: AddressKey) ?*TcpPooledConnection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Opportunistic idle sweep only when pool is above half capacity
-        if (self.entries.count() >= self.max_entries / 2) self.evictIdleLocked();
-
-        const kv = self.entries.fetchRemove(key) orelse return null;
-        const conn = kv.value;
-
-        const now = self.now_fn();
-        if (now - conn.last_used > self.max_idle_sec or conn.query_count >= self.max_queries) {
-            conn.closeAndDestroy(self.allocator);
-            return null;
-        }
-
-        return conn;
-    }
-
-    /// Return a connection to the pool (alive=true) or discard it (alive=false).
-    pub fn release(self: *TcpConnectionPool, key: AddressKey, conn: *TcpPooledConnection, alive: bool) void {
-        if (!alive) {
-            conn.closeAndDestroy(self.allocator);
-            return;
-        }
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        conn.last_used = self.now_fn();
-        conn.query_count +|= 1;
-        self.putReplaceLocked(key, conn);
-    }
-
-    /// Store a newly established connection in the pool.
-    pub fn store(self: *TcpConnectionPool, key: AddressKey, conn: *TcpPooledConnection) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.entries.count() >= self.max_entries) {
-            self.evictOldestLocked();
-        }
-        conn.last_used = self.now_fn();
-        conn.query_count = 1;
-        self.putReplaceLocked(key, conn);
-    }
-
-    fn putReplaceLocked(self: *TcpConnectionPool, key: AddressKey, conn: *TcpPooledConnection) void {
-        const result = self.entries.fetchPut(key, conn) catch {
-            conn.closeAndDestroy(self.allocator);
-            return;
-        };
-        if (result) |old| {
-            old.value.closeAndDestroy(self.allocator);
-        }
-    }
-
-    fn evictIdleLocked(self: *TcpConnectionPool) void {
-        const now = self.now_fn();
-        var to_remove: [max_entries_default]AddressKey = undefined;
-        var remove_count: usize = 0;
-
-        var iter = self.entries.iterator();
-        while (iter.next()) |entry| {
-            if (now - entry.value_ptr.*.last_used > self.max_idle_sec) {
-                to_remove[remove_count] = entry.key_ptr.*;
-                remove_count += 1;
-                if (remove_count >= max_entries_default) break;
-            }
-        }
-
-        for (to_remove[0..remove_count]) |k| {
-            if (self.entries.fetchRemove(k)) |kv| {
-                kv.value.closeAndDestroy(self.allocator);
-            }
-        }
-    }
-
-    fn evictOldestLocked(self: *TcpConnectionPool) void {
-        var oldest_key: ?AddressKey = null;
-        var oldest_time: i64 = std.math.maxInt(i64);
-
-        var iter = self.entries.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.*.last_used < oldest_time) {
-                oldest_time = entry.value_ptr.*.last_used;
-                oldest_key = entry.key_ptr.*;
-            }
-        }
-
-        if (oldest_key) |k| {
-            if (self.entries.fetchRemove(k)) |kv| {
-                kv.value.closeAndDestroy(self.allocator);
-            }
-        }
-    }
-
-    fn defaultNow() i64 {
-        return @import("monotonic.zig").nowSec();
-    }
-};
+pub const TcpConnectionPool = pool_mod.ConnectionPool(TcpPooledConnection);
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -276,11 +163,11 @@ test "TcpConnectionPool max queries eviction" {
 
     var pool = TcpConnectionPool.init(testing.allocator);
     pool.now_fn = &now_fn.now;
-    pool.max_queries = 3;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(net.Address.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestConnection(testing.allocator);
+    conn.max_queries = 3;
     pool.store(key, conn);
 
     // Simulate repeated releases to bump query_count
