@@ -45,7 +45,7 @@ pub const RttCache = struct {
         return .{
             .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
             .mutex = null,
-            .now_fn = &defaultNowMs,
+            .now_fn = &@import("monotonic.zig").nowMs,
         };
     }
 
@@ -53,7 +53,7 @@ pub const RttCache = struct {
         return .{
             .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
             .mutex = .{},
-            .now_fn = &defaultNowMs,
+            .now_fn = &@import("monotonic.zig").nowMs,
         };
     }
 
@@ -141,15 +141,6 @@ fn computeTimeout(state: RttState) u32 {
     const backed_off = @as(u64, base_ms) << shift;
 
     return @intCast(@max(min_timeout_ms, @min(backed_off, max_timeout_ms)));
-}
-
-/// Returns monotonic milliseconds (CLOCK_BOOTTIME on Linux), matching
-/// the time source used by the cache (cache.zig:defaultNowSeconds).
-/// Wall-clock time (milliTimestamp) is subject to NTP jumps which can
-/// corrupt RTT EWMA state or extend dead-server windows.
-fn defaultNowMs() i64 {
-    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
-    return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

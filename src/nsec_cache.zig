@@ -238,7 +238,7 @@ pub const NsecCache = struct {
             .zones = .empty,
             .rwlock = null,
             .counting = CountingAllocator.init(backing, max_bytes),
-            .now_fn = &dns.monotonicNowSeconds,
+            .now_fn = &@import("monotonic.zig").nowSec,
             .hits = std.atomic.Value(u64).init(0),
             .misses = std.atomic.Value(u64).init(0),
         };

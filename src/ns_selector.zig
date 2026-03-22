@@ -6,6 +6,7 @@ const Allocator = mem.Allocator;
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const dns = @import("dns.zig");
+const rand = @import("rand.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -144,7 +145,7 @@ pub const NsSelector = struct {
             for (0..dead_count) |d| {
                 dead_buf[d] = order_buf[max_order - 1 - d];
             }
-            fisherYatesShuffle(dead_buf[0..dead_count]);
+            rand.shuffle(usize, dead_buf[0..dead_count]);
             @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
         }
 
@@ -252,7 +253,7 @@ fn gammaSample(alpha: f32) f32 {
         }
         v = v * v * v;
 
-        const u = uniformSample();
+        const u = rand.uniformFloat();
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
         // Slow accept
@@ -262,20 +263,11 @@ fn gammaSample(alpha: f32) f32 {
 
 /// Standard normal via Box-Muller transform.
 fn normalSample() f32 {
-    const r1 = uniformSample();
-    const r2 = uniformSample();
+    const r1 = rand.uniformFloat();
+    const r2 = rand.uniformFloat();
     // Avoid log(0)
     const safe_r1 = @max(r1, 1e-10);
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);
-}
-
-/// Uniform(0,1) from crypto random.
-fn uniformSample() f32 {
-    var buf: [4]u8 = undefined;
-    std.crypto.random.bytes(&buf);
-    const bits: u32 = mem.readInt(u32, &buf, .little);
-    // Map [0, 2^32) → (0, 1) — exclude exact 0
-    return (@as(f32, @floatFromInt(bits)) + 0.5) / 4294967296.0;
 }
 
 // ── Sorting ──────────────────────────────────────────────────────────
@@ -295,17 +287,6 @@ fn sortByScoreDesc(indices: []usize, scores: []f32) void {
         }
         indices[j] = key_idx;
         scores[j] = key_score;
-    }
-}
-
-fn fisherYatesShuffle(items: []usize) void {
-    if (items.len <= 1) return;
-    var i: usize = items.len - 1;
-    while (i > 0) : (i -= 1) {
-        const j = std.crypto.random.uintLessThan(usize, i + 1);
-        const tmp = items[i];
-        items[i] = items[j];
-        items[j] = tmp;
     }
 }
 

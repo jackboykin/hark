@@ -13,7 +13,7 @@ const max_cache_ttl: u32 = 604_800;
 /// Max records per RRset in single-pass store (DNS wire format bounds the total).
 const max_rrset_collect: usize = 64;
 
-const defaultNowSeconds = dns.monotonicNowSeconds;
+const defaultNowSeconds = @import("monotonic.zig").nowSec;
 
 // ── Cache key ─────────────────────────────────────────────────────────
 

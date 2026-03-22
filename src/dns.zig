@@ -2,7 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
-const ArrayList = std.ArrayList;
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -600,7 +600,7 @@ pub const Parser = struct {
     }
 
     pub fn parseName(self: *Parser, allocator: Allocator) Error!Name {
-        var labels: ArrayList([]const u8) = .empty;
+        var labels: ArrayListUnmanaged([]const u8) = .empty;
         var total_len: usize = 0;
         var jumps: usize = 0;
         const max_jumps = 32;
@@ -725,7 +725,7 @@ pub const Parser = struct {
             },
             .txt => {
                 const rdata_end = self.pos + rdlength;
-                var strings: ArrayList([]const u8) = .empty;
+                var strings: ArrayListUnmanaged([]const u8) = .empty;
                 while (self.pos < rdata_end) {
                     const str_len: usize = try self.readU8();
                     if (self.pos + str_len > rdata_end) return error.FormatError;
@@ -859,7 +859,7 @@ pub const Parser = struct {
 fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsOption {
     if (rdata.len == 0) return &.{};
 
-    var options: ArrayList(EdnsOption) = .empty;
+    var options: ArrayListUnmanaged(EdnsOption) = .empty;
     var pos: usize = 0;
     while (pos + 4 <= rdata.len) {
         const code = mem.readInt(u16, rdata[pos..][0..2], .big);
@@ -882,22 +882,22 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const hdr = Header.parse(bytes[0..12]);
     var parser = Parser{ .msg = bytes, .pos = 12 };
 
-    var questions: ArrayList(Question) = .empty;
+    var questions: ArrayListUnmanaged(Question) = .empty;
     for (0..hdr.qd_count) |_| {
         questions.append(allocator, try parser.parseQuestion(allocator)) catch return error.OutOfMemory;
     }
 
-    var answers: ArrayList(ResourceRecord) = .empty;
+    var answers: ArrayListUnmanaged(ResourceRecord) = .empty;
     for (0..hdr.an_count) |_| {
         answers.append(allocator, try parser.parseResourceRecord(allocator)) catch return error.OutOfMemory;
     }
 
-    var authorities: ArrayList(ResourceRecord) = .empty;
+    var authorities: ArrayListUnmanaged(ResourceRecord) = .empty;
     for (0..hdr.ns_count) |_| {
         authorities.append(allocator, try parser.parseResourceRecord(allocator)) catch return error.OutOfMemory;
     }
 
-    var additionals: ArrayList(ResourceRecord) = .empty;
+    var additionals: ArrayListUnmanaged(ResourceRecord) = .empty;
     var opt: ?OptRecord = null;
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
@@ -1960,15 +1960,6 @@ test "EDNS0: buildQuery without edns has no opt" {
     // ar_count should be 0
     const ar_count = mem.readInt(u16, wire[10..12], .big);
     try testing.expectEqual(@as(u16, 0), ar_count);
-}
-
-// ── Time ──────────────────────────────────────────────────────────────
-
-/// Monotonic seconds (CLOCK_BOOTTIME). Immune to NTP jumps.
-/// Shared by all caches for consistent expiration.
-pub fn monotonicNowSeconds() i64 {
-    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
-    return ts.sec;
 }
 
 // ── Name helpers ──────────────────────────────────────────────────────

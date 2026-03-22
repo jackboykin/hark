@@ -172,10 +172,9 @@ pub const ConnectionPool = struct {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             if (now - entry.value_ptr.*.last_used > self.max_idle_sec) {
-                if (remove_count < max_entries_default) {
-                    to_remove[remove_count] = entry.key_ptr.*;
-                    remove_count += 1;
-                }
+                to_remove[remove_count] = entry.key_ptr.*;
+                remove_count += 1;
+                if (remove_count >= max_entries_default) break;
             }
         }
 
@@ -206,8 +205,7 @@ pub const ConnectionPool = struct {
     }
 
     fn defaultNow() i64 {
-        const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
-        return ts.sec;
+        return @import("monotonic.zig").nowSec();
     }
 };
 

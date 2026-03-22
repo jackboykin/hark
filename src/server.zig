@@ -29,6 +29,7 @@ const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
+const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 const Certificate = std.crypto.Certificate;
 
 const log = std.log.scoped(.server);
@@ -377,6 +378,10 @@ pub const Server = struct {
 
         var queue = WorkQueue{};
 
+        // Per-worker Do53 TCP connection pool (RFC 7766)
+        var do53_tcp_pool = TcpConnectionPool.init(self.allocator);
+        defer do53_tcp_pool.deinit();
+
         // Worker state
         var ws = WorkerState{
             .config = &self.config,
@@ -395,6 +400,7 @@ pub const Server = struct {
             .shutdown = &self.shutdown,
             .queue = &queue,
             .ca_bundle = self.ca_bundle,
+            .tcp_pool = &do53_tcp_pool,
         };
 
         const pool_size = self.config.resolution_threads;
@@ -451,6 +457,7 @@ const WorkerState = struct {
     shutdown: *std.atomic.Value(bool),
     queue: *WorkQueue,
     ca_bundle: Certificate.Bundle,
+    tcp_pool: ?*TcpConnectionPool = null,
 
     /// Create a per-query memory cap. When the limit is hit, arena returns
     /// OutOfMemory and existing error handling sends SERVFAIL.
@@ -744,6 +751,9 @@ const WorkerState = struct {
                     .bypass_cache = bypass_cache,
                     .stagger_ms = self.config.stagger_ms,
                     .dedup = self.dedup,
+                    .tcp_pool = self.tcp_pool,
+                    .gpa = self.allocator,
+                    .query_memory_limit = self.config.query_memory_limit,
                     .nsec_cache = if (self.config.dnssec and !cd) self.nsec_cache else null,
                     .key_cache = if (self.config.dnssec) self.key_cache else null,
                 };

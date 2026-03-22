@@ -11,7 +11,11 @@ const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
+const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
+const rand = @import("rand.zig");
+const monotonic = @import("monotonic.zig");
+const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
@@ -88,6 +92,11 @@ pub const RecursiveResolver = struct {
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
+    tcp_pool: ?*TcpConnectionPool = null,
+    /// Persistent allocator for helper thread arenas (parallel NS resolution).
+    gpa: ?mem.Allocator = null,
+    /// Per-query memory cap in bytes (for helper thread arenas).
+    query_memory_limit: usize = 2 * 1024 * 1024,
     /// Staggered NS racing interval in ms (0 = disabled).
     stagger_ms: u32 = 0,
 
@@ -284,7 +293,7 @@ pub const RecursiveResolver = struct {
                 const server_order = if (self.ns_selector) |ns|
                     ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
                 else blk: {
-                    fisherYatesShuffle(std.net.Address, servers[0..server_count]);
+                    rand.shuffle(std.net.Address, servers[0..server_count]);
                     for (0..server_count) |idx| order_buf[idx] = idx;
                     break :blk order_buf[0..server_count];
                 };
@@ -318,10 +327,7 @@ pub const RecursiveResolver = struct {
 
                     const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
-                    // Generate random query ID
-                    var id_bytes: [2]u8 = undefined;
-                    std.crypto.random.bytes(&id_bytes);
-                    const query_id = mem.readInt(u16, &id_bytes, .big);
+                    const query_id = rand.queryId();
 
                     // Build iterative query (rd=false, EDNS0)
                     const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
@@ -377,7 +383,7 @@ pub const RecursiveResolver = struct {
                     }
 
                     // ── Do53: UDP with TCP fallback ──
-                    const do53_start = monotonicMicros();
+                    const do53_start = monotonic.nowUs();
                     response = try self.queryServerUdp(
                         allocator, wire_query, query_id, server, per_server_timeout,
                     ) orelse {
@@ -385,7 +391,7 @@ pub const RecursiveResolver = struct {
                             ns.recordOutcome(parent_zone, server, .timeout, 0);
                         continue;
                     };
-                    const do53_elapsed = monotonicMicros() - do53_start;
+                    const do53_elapsed = monotonic.nowUs() - do53_start;
 
                     // RFC 5452 §9.1: question section must match original query.
                     // RFC 9619: FORMERR may omit question section (QDCOUNT=0).
@@ -844,7 +850,7 @@ pub const RecursiveResolver = struct {
         timeout: u32,
     ) error{OutOfMemory}!?dns.Message {
         const addr_key = AddressKey.fromAddress(server);
-        const query_start = monotonicMicros();
+        const query_start = monotonic.nowUs();
 
         const response_data = self.transport.queryWithTimeout(
             wire_query, query_id, server, timeout,
@@ -852,7 +858,7 @@ pub const RecursiveResolver = struct {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
             return null;
         };
-        const elapsed_us = monotonicMicros() - query_start;
+        const elapsed_us = monotonic.nowUs() - query_start;
 
         // Record liveness — truncated responses still prove server is alive
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
@@ -861,7 +867,7 @@ pub const RecursiveResolver = struct {
         if (dns.hasTcBit(response_data)) {
             if (self.tcp_transport) |tcp| {
                 var tcp_buf: [65535]u8 = undefined;
-                if (tcp.query(wire_query, server, &tcp_buf)) |tcp_data| {
+                if (tcp.queryPooled(wire_query, server, &tcp_buf, self.tcp_pool)) |tcp_data| {
                     const response = try tryParseMessage(allocator, tcp_data) orelse return null;
                     if (!response.header.qr) return null;
                     return response;
@@ -925,12 +931,8 @@ pub const RecursiveResolver = struct {
 
         const overall_timeout = self.transport.getTimeoutMs();
 
-        var id_bytes0: [2]u8 = undefined;
-        var id_bytes1: [2]u8 = undefined;
-        std.crypto.random.bytes(&id_bytes0);
-        std.crypto.random.bytes(&id_bytes1);
-        const qid0 = mem.readInt(u16, &id_bytes0, .big);
-        const qid1 = mem.readInt(u16, &id_bytes1, .big);
+        const qid0 = rand.queryId();
+        const qid1 = rand.queryId();
 
         // Build and serialize once, copy + patch ID for the second leg
         const msg0 = dns.buildQueryWithOptions(allocator, qid0, query_name, query_type, .{
@@ -944,7 +946,7 @@ pub const RecursiveResolver = struct {
         mem.writeInt(u16, wire1[0..2], qid1, .big);
         const w1 = wire1[0..w0.len];
 
-        const query_start = monotonicMicros();
+        const query_start = monotonic.nowUs();
 
         const stag_result = bt.queryStaggered(
             .{ w0, w1 },
@@ -954,7 +956,7 @@ pub const RecursiveResolver = struct {
             overall_timeout,
         ) catch return null;
 
-        const elapsed_us = monotonicMicros() - query_start;
+        const elapsed_us = monotonic.nowUs() - query_start;
         const responding_idx = if (stag_result.responding_idx == 0) idx0 else idx1;
         const responding_addr = servers[responding_idx];
         const addr_key = AddressKey.fromAddress(responding_addr);
@@ -1141,9 +1143,7 @@ pub const RecursiveResolver = struct {
     ) !?dns.Message {
         if (servers.len == 0) return null;
 
-        var id_bytes: [2]u8 = undefined;
-        std.crypto.random.bytes(&id_bytes);
-        const query_id = mem.readInt(u16, &id_bytes, .big);
+        const query_id = rand.queryId();
 
         const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
             .rd = false,
@@ -1388,9 +1388,6 @@ pub const RecursiveResolver = struct {
     ) !?NsAddrResult {
         if (depth >= max_resolve_depth) return null;
 
-        var addrs: [max_servers_per_level]std.net.Address = undefined;
-        var count: usize = 0;
-        var resolved_ns_count: usize = 0;
         // Fetch policy (Unbound-style): resolve more NS names at shallow depths
         // to warm cache for sibling queries. At least 1 at all depths.
         const ns_fetch_limit: usize = switch (depth) {
@@ -1399,37 +1396,70 @@ pub const RecursiveResolver = struct {
             else => 1,
         };
 
+        // Parallel path: race 2 NS names concurrently when on blocking transport
+        // with at least 2 NS names and fetch_limit > 1.
+        if (ns_fetch_limit > 1 and ns_names.len >= 2 and self.gpa != null and
+            self.transport == .blocking)
+        {
+            return self.resolveNsAddressesParallel(allocator, ns_names, depth, ns_fetch_limit);
+        }
+
+        return self.resolveNsAddressesSerial(allocator, ns_names, depth, ns_fetch_limit);
+    }
+
+    /// Resolve A + AAAA for a single NS name, appending addresses to addrs[count..].
+    /// Returns the number of addresses added, or error.OutOfMemory.
+    fn resolveNsName(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        ns_name: dns.Name,
+        depth: usize,
+        addrs: *[max_servers_per_level]std.net.Address,
+        count: *usize,
+    ) error{OutOfMemory}!bool {
+        const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return false;
+        };
+        var found = false;
+        if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |r| {
+            for (r.message.answers) |rr| {
+                if (rr.rtype == .a and count.* < max_servers_per_level) {
+                    addrs[count.*] = std.net.Address.initIp4(rr.rdata.a, 53);
+                    count.* += 1;
+                    found = true;
+                }
+            }
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+        }
+        if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |r| {
+            for (r.message.answers) |rr| {
+                if (rr.rtype == .aaaa and count.* < max_servers_per_level) {
+                    addrs[count.*] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                    count.* += 1;
+                    found = true;
+                }
+            }
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+        }
+        return found;
+    }
+
+    fn resolveNsAddressesSerial(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        ns_names: []const dns.Name,
+        depth: usize,
+        ns_fetch_limit: usize,
+    ) !?NsAddrResult {
+        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var count: usize = 0;
+        var resolved_ns_count: usize = 0;
+
         for (ns_names) |ns_name| {
-            const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                continue;
-            };
-            var found_for_this_ns = false;
-            // Resolve A records
-            if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |ns_result| {
-                for (ns_result.message.answers) |rr| {
-                    if (rr.rtype == .a and count < max_servers_per_level) {
-                        addrs[count] = std.net.Address.initIp4(rr.rdata.a, 53);
-                        count += 1;
-                        found_for_this_ns = true;
-                    }
-                }
-            } else |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-            }
-            // Resolve AAAA records
-            if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |ns6_result| {
-                for (ns6_result.message.answers) |rr| {
-                    if (rr.rtype == .aaaa and count < max_servers_per_level) {
-                        addrs[count] = std.net.Address.initIp6(rr.rdata.aaaa, 53, 0, 0);
-                        count += 1;
-                        found_for_this_ns = true;
-                    }
-                }
-            } else |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-            }
-            if (found_for_this_ns) {
+            if (try self.resolveNsName(allocator, ns_name, depth, &addrs, &count)) {
                 resolved_ns_count += 1;
                 if (resolved_ns_count >= ns_fetch_limit) break;
             }
@@ -1438,6 +1468,114 @@ pub const RecursiveResolver = struct {
         if (count == 0) return null;
         return .{ .addrs = addrs, .count = count };
     }
+
+    /// Resolve NS[0] on the caller thread and NS[1] on a helper thread
+    /// concurrently. Falls back to serial for remaining NS names if needed.
+    fn resolveNsAddressesParallel(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        ns_names: []const dns.Name,
+        depth: usize,
+        ns_fetch_limit: usize,
+    ) !?NsAddrResult {
+        var addrs: [max_servers_per_level]std.net.Address = undefined;
+        var count: usize = 0;
+        var resolved_ns_count: usize = 0;
+
+        // Spawn helper thread for NS[1]
+        var helper_ctx = NsThreadCtx{ .parent = self, .ns_name = ns_names[1], .depth = depth };
+        const helper = std.Thread.spawn(
+            .{ .stack_size = 1 << 20 },
+            NsThreadCtx.run,
+            .{&helper_ctx},
+        ) catch null;
+        // Ensure helper is always joined before helper_ctx goes out of scope
+        defer if (helper) |h| h.join();
+
+        // Resolve NS[0] on caller thread
+        if (try self.resolveNsName(allocator, ns_names[0], depth, &addrs, &count)) {
+            resolved_ns_count += 1;
+        }
+
+        // Merge helper results (defer above ensures join happened)
+        if (helper != null) {
+            if (helper_ctx.oom) return error.OutOfMemory;
+            const hcount = helper_ctx.count;
+            if (hcount > 0) {
+                const space = max_servers_per_level - count;
+                const to_copy = @min(hcount, space);
+                @memcpy(addrs[count..][0..to_copy], helper_ctx.addrs[0..to_copy]);
+                count += to_copy;
+                resolved_ns_count += 1;
+            }
+        } else {
+            // Thread spawn failed — resolve NS[1] serially on caller
+            if (resolved_ns_count < ns_fetch_limit) {
+                const r = try self.resolveNsAddressesSerial(allocator, ns_names[1..], depth, ns_fetch_limit - resolved_ns_count);
+                if (r) |result| {
+                    const space = max_servers_per_level - count;
+                    const to_copy = @min(result.count, space);
+                    @memcpy(addrs[count..][0..to_copy], result.addrs[0..to_copy]);
+                    count += to_copy;
+                }
+                if (count == 0) return null;
+                return .{ .addrs = addrs, .count = count };
+            }
+        }
+
+        // Resolve remaining NS names serially if needed (ns_fetch_limit >= 3)
+        if (resolved_ns_count < ns_fetch_limit and ns_names.len > 2) {
+            for (ns_names[2..]) |ns_name| {
+                if (try self.resolveNsName(allocator, ns_name, depth, &addrs, &count)) {
+                    resolved_ns_count += 1;
+                    if (resolved_ns_count >= ns_fetch_limit) break;
+                }
+            }
+        }
+
+        if (count == 0) return null;
+        return .{ .addrs = addrs, .count = count };
+    }
+
+    /// Context for a helper thread resolving one NS name's A + AAAA records.
+    /// The ns_name is a shallow copy whose label pointers reference the caller's
+    /// arena; safe because the caller joins the helper before returning.
+    /// The parent pointer is read once at thread start to clone shared state
+    /// and config into a thread-local resolver; the pointer fields and config
+    /// on the parent are stable (set at init, never modified during resolution).
+    const NsThreadCtx = struct {
+        parent: *RecursiveResolver,
+        ns_name: dns.Name,
+        depth: usize,
+        // Output
+        addrs: [max_servers_per_level]std.net.Address = undefined,
+        count: usize = 0,
+        oom: bool = false,
+
+        fn run(ctx: *NsThreadCtx) void {
+            var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{});
+            var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
+            // Clone parent resolver, override transport and per-query mutable state.
+            // Inherits all shared caches/config — new fields on RecursiveResolver
+            // are automatically picked up.
+            var resolver = ctx.parent.*;
+            resolver.transport = .{ .blocking = &udp_t };
+            resolver.tcp_transport = .{ .blocking = &tcp_t };
+            resolver.gpa = null;
+            resolver.resolving_ds = false;
+            resolver.pending_dnskey_prefetch = null;
+
+            // Per-query memory cap (same as main query path)
+            var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
+            var arena = std.heap.ArenaAllocator.init(cap.allocator());
+            defer arena.deinit();
+
+            _ = resolver.resolveNsName(arena.allocator(), ctx.ns_name, ctx.depth, &ctx.addrs, &ctx.count) catch {
+                ctx.oom = true;
+                return;
+            };
+        }
+    };
 
     const NsAddrResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize };
     const DelegationResult = struct { addrs: [max_servers_per_level]std.net.Address, count: usize, zone: dns.Name };
@@ -1701,13 +1839,6 @@ fn answersOnly(msg: dns.Message) dns.Message {
     return m;
 }
 
-/// Monotonic microseconds (CLOCK_BOOTTIME) for elapsed-time measurement.
-/// Immune to NTP jumps, unlike std.time.microTimestamp (CLOCK_REALTIME).
-fn monotonicMicros() i64 {
-    const ts = std.posix.clock_gettime(.BOOTTIME) catch return 0;
-    return ts.sec * std.time.us_per_s + @divTrunc(ts.nsec, std.time.ns_per_us);
-}
-
 /// Returns current epoch time as u32 for DNSSEC signature validation.
 /// Uses wall clock (not monotonic) because RRSIG inception/expiration
 /// are defined as epoch seconds (RFC 4034 §3.1.5). Truncation gives
@@ -1853,17 +1984,6 @@ fn validateNegativeResponse(
         .bogus => .bogus,
         .unchecked, .insecure => .skip_cache,
     };
-}
-
-fn fisherYatesShuffle(comptime T: type, items: []T) void {
-    if (items.len <= 1) return;
-    var i: usize = items.len - 1;
-    while (i > 0) : (i -= 1) {
-        const j = std.crypto.random.uintLessThan(usize, i + 1);
-        const tmp = items[i];
-        items[i] = items[j];
-        items[j] = tmp;
-    }
 }
 
 // ════════════════════════════════════════════════════════════════════════

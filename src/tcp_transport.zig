@@ -9,6 +9,7 @@ const Completion = event_loop.Completion;
 const ConnectResult = event_loop.ConnectResult;
 const max_operations = event_loop.max_operations;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
+const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
 
 pub const TcpConfig = struct {
     connect_timeout_ms: u32 = 5000,
@@ -24,6 +25,18 @@ pub const AnyTcpTransport = union(enum) {
         return switch (self) {
             .uring => |t| t.query(wire_query, server, response_buf),
             .blocking => |t| t.query(wire_query, server, response_buf),
+        };
+    }
+
+    /// Query with optional TCP connection pooling. Falls back to unpooled
+    /// query for io_uring transport or when pool is null.
+    pub fn queryPooled(self: AnyTcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8, pool: ?*TcpConnectionPool) ![]const u8 {
+        return switch (self) {
+            .blocking => |t| if (pool) |p|
+                t.queryPooled(wire_query, server, response_buf, p)
+            else
+                t.query(wire_query, server, response_buf),
+            .uring => |t| t.query(wire_query, server, response_buf),
         };
     }
 };

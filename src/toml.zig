@@ -226,7 +226,7 @@ fn parseString(allocator: Allocator, raw: []const u8) ParseError![]const u8 {
     if (raw.len < 2 or raw[0] != '"') return error.InvalidSyntax;
 
     // Find closing quote
-    var result = std.ArrayList(u8).empty;
+    var result = std.ArrayListUnmanaged(u8).empty;
     defer result.deinit(allocator);
 
     var i: usize = 1;
@@ -298,7 +298,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
     }
 
     // Split array elements — need to handle quoted strings with commas
-    var items = std.ArrayList([]const u8).empty;
+    var items = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (items.items) |s| allocator.free(s);
         items.deinit(allocator);

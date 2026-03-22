@@ -1,9 +1,14 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
+const net = std.net;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const openUdpSocket = @import("transport.zig").openUdpSocket;
+const monotonic = @import("monotonic.zig");
+const AddressKey = @import("connection_pool.zig").AddressKey;
+const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
+const TcpPooledConnection = @import("tcp_connection_pool.zig").TcpPooledConnection;
 
 pub const Config = struct {
     timeout_ms: u32 = 5000,
@@ -41,11 +46,11 @@ pub const BlockingUdpTransport = struct {
         // Send initial query
         _ = posix.send(sock, wire_query, 0) catch return error.Timeout;
 
-        const deadline_ns = monotonicNs() + @as(i128, timeout_ms) * 1_000_000;
+        const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
         var retransmits_left: u32 = self.config.retransmit_count;
 
         while (true) {
-            const remaining_ns = deadline_ns - monotonicNs();
+            const remaining_ns = deadline_ns - monotonic.nowNs();
             if (remaining_ns <= 0) return error.Timeout;
 
             const n = posix.recv(sock, &self.response_buf, 0) catch |err| switch (err) {
@@ -86,7 +91,7 @@ pub const BlockingUdpTransport = struct {
     };
 
     /// Send a query to two nameservers with staggered timing, take first valid response.
-    /// Each leg uses a connected UDP socket with unique source port (RFC 5452 §9.2).
+    /// Each leg uses a connected UDP socket with unique source port (RFC 5452 §9.1).
     /// Only races queries to different server IPs — birthday attack surface is not amplified
     /// because each leg targets a different destination.
     pub fn queryStaggered(
@@ -103,7 +108,7 @@ pub const BlockingUdpTransport = struct {
         posix.connect(sock0, &servers[0].any, servers[0].getOsSockLen()) catch return error.Timeout;
         _ = posix.send(sock0, wire_queries[0], 0) catch return error.Timeout;
 
-        const deadline_ns = monotonicNs() + @as(i128, overall_timeout_ms) * 1_000_000;
+        const deadline_ns = monotonic.nowNs() + @as(i128, overall_timeout_ms) * 1_000_000;
 
         // Phase 1: wait stagger_ms for server[0]
         {
@@ -120,7 +125,7 @@ pub const BlockingUdpTransport = struct {
         }
 
         // Phase 2: server[0] didn't respond in stagger window — also query server[1]
-        const remaining_ns = deadline_ns - monotonicNs();
+        const remaining_ns = deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return error.Timeout;
 
         const sock1 = try openSocket(servers[1]);
@@ -130,7 +135,7 @@ pub const BlockingUdpTransport = struct {
 
         // Phase 3: poll both sockets for remaining time
         while (true) {
-            const remain_ns = deadline_ns - monotonicNs();
+            const remain_ns = deadline_ns - monotonic.nowNs();
             if (remain_ns <= 0) return error.Timeout;
             const remain_ms: i32 = @intCast(@min(@divFloor(remain_ns, 1_000_000), std.math.maxInt(i32)));
             if (remain_ms <= 0) return error.Timeout;
@@ -186,19 +191,58 @@ pub const BlockingTcpTransport = struct {
         return .{ .config = config };
     }
 
-    pub fn query(self: *BlockingTcpTransport, wire_query: []const u8, server: std.net.Address, response_buf: []u8) ![]const u8 {
-        // Create TCP socket
+    pub fn query(self: *BlockingTcpTransport, wire_query: []const u8, server: net.Address, response_buf: []u8) ![]const u8 {
+        const sock = try self.connectTcp(server);
+        defer posix.close(sock);
+        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
+        return sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns);
+    }
+
+    /// Query with TCP connection pooling. Tries a pooled connection first,
+    /// falls back to a fresh connection, and stores it for reuse on success.
+    pub fn queryPooled(self: *BlockingTcpTransport, wire_query: []const u8, server: net.Address, response_buf: []u8, pool: *TcpConnectionPool) ![]const u8 {
+        const key = AddressKey.fromAddress(server);
+        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
+
+        // Try pooled connection
+        if (pool.acquire(key)) |conn| {
+            if (sendAndReceiveTcp(conn.sock, wire_query, response_buf, deadline_ns)) |data| {
+                pool.release(key, conn, true);
+                return data;
+            } else |_| {
+                pool.release(key, conn, false);
+            }
+        }
+
+        // Fresh connection
+        const sock = try self.connectTcp(server);
+        const data = sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns) catch |err| {
+            posix.close(sock);
+            return err;
+        };
+
+        // Store in pool for reuse
+        const new_conn = pool.allocator.create(TcpPooledConnection) catch {
+            posix.close(sock);
+            return data;
+        };
+        new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
+        pool.store(key, new_conn);
+        return data;
+    }
+
+    fn connectTcp(self: *BlockingTcpTransport, server: net.Address) !posix.fd_t {
         const af: u32 = if (server.any.family == posix.AF.INET6) posix.AF.INET6 else posix.AF.INET;
         const sock = try posix.socket(af, posix.SOCK.STREAM, 0);
-        defer posix.close(sock);
-
-        // Set connect timeout via SO_SNDTIMEO
+        errdefer posix.close(sock);
         setSocketTimeout(sock, posix.SO.SNDTIMEO, self.config.connect_timeout_ms);
         posix.connect(sock, &server.any, server.getOsSockLen()) catch return error.ConnectFailed;
+        return sock;
+    }
 
-        // Total deadline for the entire query (slow-trickle mitigation)
-        const deadline_ns = monotonicNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
-
+    /// Send a length-prefixed DNS query and receive the response on an
+    /// already-connected TCP socket, enforcing an absolute deadline.
+    fn sendAndReceiveTcp(sock: posix.fd_t, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
         // ── Send length-prefixed query ──
         var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
         if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
@@ -219,7 +263,6 @@ pub const BlockingTcpTransport = struct {
         var len_buf: [2]u8 = undefined;
         var len_filled: usize = 0;
 
-        // Read 2-byte length prefix
         while (len_filled < 2) {
             try updateTimeout(sock, deadline_ns);
             const n = posix.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
@@ -230,7 +273,6 @@ pub const BlockingTcpTransport = struct {
         const body_len = mem.readInt(u16, &len_buf, .big);
         if (body_len == 0 or body_len > response_buf.len) return error.InvalidLength;
 
-        // Read response body
         var body_filled: usize = 0;
         while (body_filled < body_len) {
             try updateTimeout(sock, deadline_ns);
@@ -244,7 +286,7 @@ pub const BlockingTcpTransport = struct {
 
     /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
     fn updateTimeout(sock: posix.fd_t, deadline_ns: i128) !void {
-        const remaining_ns = deadline_ns - monotonicNs();
+        const remaining_ns = deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return error.Timeout;
         const remaining_ms: u32 = @intCast(@min(
             @divFloor(remaining_ns, 1_000_000),
@@ -258,7 +300,6 @@ pub const BlockingTcpTransport = struct {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-
 fn setRecvTimeout(sock: posix.fd_t, ms: u32) void {
     setSocketTimeout(sock, posix.SO.RCVTIMEO, ms);
 }
@@ -269,13 +310,6 @@ pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
         .usec = @intCast(@as(u64, ms % 1000) * 1000),
     };
     posix.setsockopt(sock, posix.SOL.SOCKET, opt, mem.asBytes(&timeout)) catch {};
-}
-
-/// Monotonic nanoseconds (CLOCK_BOOTTIME) for deadline tracking.
-/// Immune to NTP jumps, unlike std.time.timestamp (CLOCK_REALTIME).
-fn monotonicNs() i128 {
-    const ts = posix.clock_gettime(.BOOTTIME) catch return 0;
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

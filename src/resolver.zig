@@ -8,6 +8,7 @@ const UdpTransport = @import("transport.zig").UdpTransport;
 const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
 const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
+const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const Config = @import("transport.zig").Config;
 
@@ -25,10 +26,7 @@ pub const ForwardingResolver = struct {
     }
 
     pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: std.net.Address) !dns.Message {
-        // Generate random query ID
-        var id_bytes: [2]u8 = undefined;
-        std.crypto.random.bytes(&id_bytes);
-        const query_id = mem.readInt(u16, &id_bytes, .big);
+        const query_id = rand.queryId();
 
         // Build query message (with EDNS0)
         const query_msg = try dns.buildQueryWithOptions(allocator, query_id, name, qtype, .{ .edns = .{} });

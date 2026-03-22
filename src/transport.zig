@@ -7,6 +7,7 @@ const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
+const rand = @import("rand.zig");
 
 pub const QueryResult = struct {
     response_data: []const u8,
@@ -169,7 +170,7 @@ pub fn openUdpSocket(dest: std.net.Address, nonblock: bool) !posix.fd_t {
     errdefer posix.close(sock);
 
     for (0..16) |_| {
-        const port = std.crypto.random.intRangeAtMost(u16, 1024, 65535);
+        const port = rand.ephemeralPort();
         const addr = anyAddr(af, port);
         posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.AddressInUse => continue,
