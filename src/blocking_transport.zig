@@ -6,8 +6,8 @@ const dns = @import("dns.zig");
 const openUdpSocket = @import("transport.zig").openUdpSocket;
 const monotonic = @import("monotonic.zig");
 const AddressKey = @import("connection_pool.zig").AddressKey;
-const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
-const TcpPooledConnection = @import("tcp_connection_pool.zig").TcpPooledConnection;
+const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
+const TcpPooledConnection = @import("connection_pool.zig").TcpPooledConnection;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 

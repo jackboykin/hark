@@ -190,12 +190,6 @@ pub const Name = struct {
         return buf;
     }
 
-    pub fn toStr(self: Name) []const u8 {
-        // Returns a formatted representation; caller should use format() for stack buffer
-        _ = self;
-        return "<Name>";
-    }
-
     pub fn eql(a: Name, b: Name) bool {
         if (a.labels.len != b.labels.len) return false;
         for (a.labels, b.labels) |la, lb| {

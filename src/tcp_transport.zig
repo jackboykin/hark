@@ -9,7 +9,7 @@ const Completion = event_loop.Completion;
 const ConnectResult = event_loop.ConnectResult;
 const max_operations = event_loop.max_operations;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
-const TcpConnectionPool = @import("tcp_connection_pool.zig").TcpConnectionPool;
+const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 

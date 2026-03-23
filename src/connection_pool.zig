@@ -41,7 +41,35 @@ pub const AddressKey = struct {
     }
 };
 
-// ── PooledConnection ─────────────────────────────────────────────────
+// ── TcpPooledConnection ─────────────────────────────────────────────
+
+pub const TcpPooledConnection = struct {
+    sock: posix.fd_t,
+    last_used: i64,
+    query_count: u16,
+    max_queries: u16 = 200,
+
+    pub fn destroyBroken(self: *TcpPooledConnection, allocator: Allocator) void {
+        sys.close(self.sock);
+        allocator.destroy(self);
+    }
+
+    pub fn isExpired(self: *const TcpPooledConnection) bool {
+        return self.query_count >= self.max_queries;
+    }
+
+    pub fn recordUse(self: *TcpPooledConnection) void {
+        self.query_count +|= 1;
+    }
+
+    pub fn initCounters(self: *TcpPooledConnection) void {
+        self.query_count = 1;
+    }
+};
+
+pub const TcpConnectionPool = ConnectionPool(TcpPooledConnection);
+
+// ── PooledConnection (TLS) ──────────────────────────────────────────
 
 pub const PooledConnection = struct {
     sock: posix.fd_t,
@@ -381,4 +409,49 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
         .tls_write_buf = undefined,
     };
     return conn;
+}
+
+fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
+    const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    const sock = try sys.dup(dev_null);
+    sys.close(dev_null);
+
+    const conn = try allocator.create(TcpPooledConnection);
+    conn.* = .{
+        .sock = sock,
+        .last_used = 0,
+        .query_count = 0,
+    };
+    return conn;
+}
+
+test "TcpConnectionPool max queries eviction" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    defer pool.deinit();
+
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const conn = try createTestTcpConnection(testing.allocator);
+    conn.max_queries = 3;
+    pool.store(key, conn);
+
+    // Simulate repeated releases to bump query_count
+    const a1 = pool.acquire(key).?;
+    pool.release(key, a1, true); // query_count = 2
+    const a2 = pool.acquire(key).?;
+    pool.release(key, a2, true); // query_count = 3
+
+    // acquire should reject it due to max_queries (>= 3)
+    const result = pool.acquire(key);
+    try testing.expect(result == null);
+    try testing.expect(pool.entries.count() == 0);
 }

@@ -11,10 +11,6 @@ const rand = @import("rand.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 
-pub const QueryResult = struct {
-    response_data: []const u8,
-};
-
 /// Transport-agnostic UDP interface for resolvers.
 pub const AnyUdpTransport = union(enum) {
     uring: *UdpTransport,
