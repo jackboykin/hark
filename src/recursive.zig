@@ -5,7 +5,6 @@ const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const UdpTransport = @import("transport.zig").UdpTransport;
 const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
-const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const encrypted_ns = @import("encrypted_ns.zig");

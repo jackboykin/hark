@@ -1172,7 +1172,7 @@ fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: 
     return sock;
 }
 
-pub fn setupSignalFd() !posix.fd_t {
+fn setupSignalFd() !posix.fd_t {
     var mask = linux.sigemptyset();
     linux.sigaddset(&mask, linux.SIG.INT);
     linux.sigaddset(&mask, linux.SIG.TERM);

@@ -1,5 +1,5 @@
 /// Address type and helpers, replacing std.net.Address with std.Io.net.IpAddress.
-/// Provides initIp4/initIp6 constructors matching the old API, plus sockaddr
+/// Wraps std.Io.net.IpAddress with convenience constructors and sockaddr
 /// conversion for raw linux syscall usage (sys.zig).
 const std = @import("std");
 const posix = std.posix;

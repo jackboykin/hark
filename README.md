@@ -11,7 +11,8 @@ Runs on Linux with io_uring. Zero external dependencies.
 - **Aggressive NSEC negative caching** — synthesize NXDOMAIN/NODATA from cached NSEC records with wildcard synthesis (RFC 8198)
 - **DNS-over-TLS** — opportunistic encryption to authoritatives (RFC 9539) with background probing and connection pooling
 - **Full recursive resolution** from root hints with QNAME minimization
-- **In-memory RRset cache** with RwLock, RFC 2308 negative caching, prefetch, serve-stale (RFC 8767)
+- **TCP connection pooling** for upstream queries (RFC 7766)
+- **In-memory RRset cache** with SIEVE eviction, RFC 2308 negative caching, prefetch, serve-stale (RFC 8767)
 - **Thompson Sampling** nameserver selection (per-zone, discounted)
 - **Query deduplication** across workers (singleflight)
 - **Multi-threaded server** with `SO_REUSEPORT`, per-query memory cap
@@ -20,7 +21,7 @@ Runs on Linux with io_uring. Zero external dependencies.
 
 ## Building
 
-Requires Zig 0.15 and a Linux kernel with io_uring support.
+Requires Zig 0.16 and a Linux kernel with io_uring support.
 
 ```
 zig build
@@ -98,7 +99,7 @@ All fields are optional — defaults are localhost:53, recursive mode, DNSSEC of
               │   Staggered NS racing     │
               │   Recursive resolution    │
               │   DNSSEC validation       │
-              │   Async prefetch          │
+              │   Prefetch                │
               │                           │
               └─────────────┬─────────────┘
                             │

@@ -6,7 +6,6 @@ const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const UdpTransport = @import("transport.zig").UdpTransport;
 const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
-const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
