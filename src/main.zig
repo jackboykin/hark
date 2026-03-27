@@ -244,7 +244,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     }
 
     // Load CA bundle if DoT is enabled
-    var ca_bundle: Certificate.Bundle = .{};
+    var ca_bundle: Certificate.Bundle = .empty;
     var ca_bundle_loaded = false;
     if (dot_mode) {
         ca_bundle.rescan(gpa_alloc, io, Io.Timestamp.now(io, .real)) catch {

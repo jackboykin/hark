@@ -157,7 +157,7 @@ pub const Server = struct {
         else
             NsSelector.init(allocator, io);
 
-        var ca_bundle: Certificate.Bundle = .{};
+        var ca_bundle: Certificate.Bundle = .empty;
         if (cfg.opportunistic) {
             ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch |err| {
                 log.err("failed to load CA certificates: {s}", .{@errorName(err)});

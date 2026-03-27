@@ -365,7 +365,7 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     defer loop.destroy();
 
     // Load system CA bundle
-    var ca_bundle: Certificate.Bundle = .{};
+    var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
 
@@ -406,7 +406,7 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     };
     defer loop.destroy();
 
-    var ca_bundle: Certificate.Bundle = .{};
+    var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
 
@@ -446,7 +446,7 @@ test "TlsTransport connection pooling reuses connection" {
     };
     defer loop.destroy();
 
-    var ca_bundle: Certificate.Bundle = .{};
+    var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
 
