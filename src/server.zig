@@ -640,89 +640,66 @@ const WorkerState = struct {
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
             tcp_queries += 1;
-            // Read 2-byte length prefix
             var len_buf: [2]u8 = undefined;
             tcpReadExactBlocking(client_fd, &len_buf) orelse return;
             const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
-            // Read query body
             var query_buf: [65535]u8 = undefined;
             tcpReadExactBlocking(client_fd, query_buf[0..msg_len]) orelse return;
 
-            // Process query (resolution uses transport_loop, not server_loop)
             var cap = self.queryCap();
             var arena = std.heap.ArenaAllocator.init(cap.allocator());
             defer arena.deinit();
+            const alloc = arena.allocator();
             var response_wire: [65535]u8 = undefined;
-            const qr = self.processQuery(arena.allocator(), query_buf[0..msg_len], &response_wire) orelse return;
+            const data = query_buf[0..msg_len];
 
-            // Write length-prefixed response
-            var len_prefix: [2]u8 = undefined;
-            mem.writeInt(u16, &len_prefix, @intCast(qr.wire.len), .big);
-            tcpWriteAllBlocking(client_fd, &len_prefix) orelse return;
-            tcpWriteAllBlocking(client_fd, qr.wire) orelse return;
+            const query = dns.parseMessage(alloc, data) catch {
+                if (data.len >= 2) {
+                    const id = mem.readInt(u16, data[0..2], .big);
+                    const w = serializeErrorResponse(&response_wire, id, .format_error, false, &.{}) orelse return;
+                    tcpWriteMessage(client_fd, w) orelse return;
+                    continue;
+                }
+                return;
+            };
 
-            // Inline prefetch after response is sent to client
-            if (qr.prefetch_name) |prefetch_name| {
-                self.doPrefetch(prefetch_name, qr.prefetch_qtype);
+            if (validateQuery(query)) |rcode| {
+                const w = serializeErrorResponse(&response_wire, query.header.id, rcode, query.header.rd, query.questions) orelse return;
+                tcpWriteMessage(client_fd, w) orelse return;
+                continue;
             }
-            if (qr.prefetch_dnskey_zone) |zone| {
+
+            const question = query.questions[0];
+            const name_buf = question.name.format();
+            const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
+            const name_str = name_buf[0..name_len];
+
+            const start_ns = monotonic.nowNs();
+            const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
+                const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
+                var qtype_buf: [24]u8 = undefined;
+                log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
+                const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, query.header.rd, query.questions) orelse return;
+                tcpWriteMessage(client_fd, w) orelse return;
+                continue;
+            };
+            const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
+            var qtype_buf: [24]u8 = undefined;
+            var rcode_buf: [24]u8 = undefined;
+            log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
+
+            const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, 65535), result.message, alloc) orelse return;
+            tcpWriteMessage(client_fd, wire) orelse return;
+
+            if (result.prefetch_name) |prefetch_name| {
+                self.doPrefetch(prefetch_name, result.prefetch_qtype);
+            }
+            if (result.prefetch_dnskey_zone) |zone| {
                 self.doPrefetch(zone, .dnskey);
             }
         }
-    }
-
-    const TcpQueryResult = struct {
-        wire: []const u8,
-        prefetch_name: ?[]const u8 = null,
-        prefetch_qtype: dns.RType = .a,
-        prefetch_dnskey_zone: ?[]const u8 = null,
-    };
-
-    fn processQuery(self: *WorkerState, alloc: mem.Allocator, data: []const u8, response_wire: []u8) ?TcpQueryResult {
-        const query = dns.parseMessage(alloc, data) catch {
-            if (data.len >= 2) {
-                const id = mem.readInt(u16, data[0..2], .big);
-                return if (serializeErrorResponse(response_wire, id, .format_error, false, &.{})) |w| .{ .wire = w } else null;
-            }
-            return null;
-        };
-
-        if (query.header.opcode != .query) {
-            return if (serializeErrorResponse(response_wire, query.header.id, .not_implemented, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
-        }
-        if (query.questions.len != 1) {
-            return if (serializeErrorResponse(response_wire, query.header.id, .format_error, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
-        }
-        if (query.questions[0].qclass != .in) {
-            return if (serializeErrorResponse(response_wire, query.header.id, .refused, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
-        }
-
-        const question = query.questions[0];
-        const name_buf = question.name.format();
-        const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
-        const name_str = name_buf[0..name_len];
-
-        const start_ns = monotonic.nowNs();
-        const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
-            const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-            var qtype_buf3: [24]u8 = undefined;
-            log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf3), elapsed_ms, @errorName(err) });
-            return if (serializeErrorResponse(response_wire, query.header.id, .server_failure, query.header.rd, query.questions)) |w| .{ .wire = w } else null;
-        };
-        const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-        var qtype_buf4: [24]u8 = undefined;
-        var rcode_buf4: [24]u8 = undefined;
-        log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf4), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf4), elapsed_ms });
-
-        const wire = buildResponseWire(response_wire, ResponseContext.fromQuery(query, 65535), result.message, alloc) orelse return null;
-        return .{
-            .wire = wire,
-            .prefetch_name = result.prefetch_name,
-            .prefetch_qtype = result.prefetch_qtype,
-            .prefetch_dnskey_zone = result.prefetch_dnskey_zone,
-        };
     }
 
     fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !recursive.RecursiveResolver.ResolveResult {
@@ -766,7 +743,7 @@ const WorkerState = struct {
                     .key_cache = if (self.config.dnssec) self.key_cache else null,
                 };
                 var result = try resolver.resolve(alloc, name, qtype);
-                // Dupe into arena before stack-allocated resolver goes out of scope
+                // Dupe into arena — points into stack-local resolver.pending_dnskey_buf
                 if (result.prefetch_dnskey_zone) |z| {
                     result.prefetch_dnskey_zone = alloc.dupe(u8, z) catch null;
                 }
@@ -856,16 +833,8 @@ const WorkerState = struct {
             return;
         };
 
-        if (query_msg.header.opcode != .query) {
-            sendErrorUdp(sock, query_msg.header.id, .not_implemented, query_msg.header.rd, query_msg.questions, client_addr);
-            return;
-        }
-        if (query_msg.questions.len != 1) {
-            sendErrorUdp(sock, query_msg.header.id, .format_error, query_msg.header.rd, query_msg.questions, client_addr);
-            return;
-        }
-        if (query_msg.questions[0].qclass != .in) {
-            sendErrorUdp(sock, query_msg.header.id, .refused, query_msg.header.rd, query_msg.questions, client_addr);
+        if (validateQuery(query_msg)) |rcode| {
+            sendErrorUdp(sock, query_msg.header.id, rcode, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1115,6 +1084,20 @@ fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8) ?void {
         const n = sys.write(fd, data[total..]) catch return null;
         total += n;
     }
+}
+
+fn validateQuery(query: dns.Message) ?dns.RCode {
+    if (query.header.opcode != .query) return .not_implemented;
+    if (query.questions.len != 1) return .format_error;
+    if (query.questions[0].qclass != .in) return .refused;
+    return null;
+}
+
+fn tcpWriteMessage(fd: posix.fd_t, data: []const u8) ?void {
+    var len_prefix: [2]u8 = undefined;
+    mem.writeInt(u16, &len_prefix, @intCast(data.len), .big);
+    tcpWriteAllBlocking(fd, &len_prefix) orelse return null;
+    tcpWriteAllBlocking(fd, data) orelse return null;
 }
 
 fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: na.Address) void {

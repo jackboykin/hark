@@ -54,6 +54,7 @@ pub const ConfigError = error{
 
 fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     const listen = allocator.alloc(Address, 2) catch return error.OutOfMemory;
+    errdefer allocator.free(listen);
     listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
