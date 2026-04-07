@@ -111,6 +111,107 @@ pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
     try sys.bind(fd, &storage.any, sa_len);
 }
 
+/// Returns true if the address is in a private, reserved, or loopback range
+/// that should not be contacted during recursive resolution (DNS rebinding defense).
+pub fn isNonRoutableNs(addr: Address) bool {
+    return switch (addr) {
+        .ip4 => |v4| isNonRoutableIp4(v4.bytes),
+        .ip6 => |v6| isNonRoutableIp6(v6.bytes),
+    };
+}
+
+fn isNonRoutableIp4(b: [4]u8) bool {
+    if (b[0] == 0) return true; // 0.0.0.0/8  (this network)
+    if (b[0] == 10) return true; // 10.0.0.0/8  (RFC 1918)
+    if (b[0] == 127) return true; // 127.0.0.0/8 (loopback)
+    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local)
+    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12 (RFC 1918)
+    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC 1918)
+    if (b[0] >= 224) return true; // 224.0.0.0/4+ (multicast + reserved)
+    return false;
+}
+
+fn isNonRoutableIp6(b: [16]u8) bool {
+    return switch (b[0]) {
+        0x00 => isNonRoutableIp6Zero(b),
+        0xfc, 0xfd => true, // fc00::/7  (unique local)
+        0xfe => (b[1] & 0xc0) == 0x80, // fe80::/10 (link-local)
+        0xff => true, // ff00::/8  (multicast)
+        else => false,
+    };
+}
+
+fn isNonRoutableIp6Zero(b: [16]u8) bool {
+    // All addresses starting with 0x00: check for ::, ::1, and ::ffff:mapped
+    if (!mem.eql(u8, b[1..10], &([_]u8{0} ** 9))) return false;
+    if (b[10] == 0 and b[11] == 0) {
+        // :: (unspecified) or ::1 (loopback)
+        return mem.eql(u8, b[12..15], &([_]u8{0} ** 3)) and b[15] <= 1;
+    }
+    if (b[10] == 0xff and b[11] == 0xff) {
+        // ::ffff:0:0/96 (IPv4-mapped) — check the mapped IPv4 address
+        return isNonRoutableIp4(b[12..16].*);
+    }
+    return false;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "isNonRoutableNs blocks private/reserved IPv4" {
+    // Loopback
+    try testing.expect(isNonRoutableNs(initIp4(.{ 127, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 127, 255, 255, 255 }, 53)));
+    // RFC 1918
+    try testing.expect(isNonRoutableNs(initIp4(.{ 10, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 172, 16, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 172, 31, 255, 255 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 192, 168, 1, 1 }, 53)));
+    // Link-local
+    try testing.expect(isNonRoutableNs(initIp4(.{ 169, 254, 1, 1 }, 53)));
+    // This network
+    try testing.expect(isNonRoutableNs(initIp4(.{ 0, 0, 0, 0 }, 53)));
+    // Multicast
+    try testing.expect(isNonRoutableNs(initIp4(.{ 224, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 255, 255, 255, 255 }, 53)));
+}
+
+test "isNonRoutableNs allows routable IPv4" {
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 1, 1, 1, 1 }, 53)));
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 8, 8, 8, 8 }, 53)));
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 192, 0, 2, 1 }, 53)));
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 198, 51, 100, 1 }, 53)));
+    // 172.15.x and 172.32.x are routable
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 15, 255, 255 }, 53)));
+    try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 32, 0, 1 }, 53)));
+}
+
+test "isNonRoutableNs blocks private/reserved IPv6" {
+    // Loopback ::1
+    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 15 ++ .{1}, 53, 0, 0)));
+    // Unspecified ::
+    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 16, 53, 0, 0)));
+    // Unique local fc00::/7
+    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfc, 0 } ++ .{0} ** 14, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfd, 0x12 } ++ .{0} ** 14, 53, 0, 0)));
+    // Link-local fe80::/10
+    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfe, 0x80 } ++ .{0} ** 14, 53, 0, 0)));
+    // Multicast ff00::/8
+    try testing.expect(isNonRoutableNs(initIp6(.{ 0xff, 0x02 } ++ .{0} ** 14, 53, 0, 0)));
+    // IPv4-mapped ::ffff:127.0.0.1
+    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
+    // IPv4-mapped ::ffff:10.0.0.1
+    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 10, 0, 0, 1 }, 53, 0, 0)));
+}
+
+test "isNonRoutableNs allows routable IPv6" {
+    // 2001:db8::1 (documentation, but routable from resolver perspective)
+    try testing.expect(!isNonRoutableNs(initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ .{0} ** 11 ++ .{1}, 53, 0, 0)));
+    // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
+    try testing.expect(!isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
+}
+
 /// Compare two addresses by IP only, ignoring port.
 pub fn ipEqual(a: Address, b: Address) bool {
     return switch (a) {

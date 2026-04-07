@@ -266,6 +266,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         gpa_alloc
     else
         std.heap.smp_allocator;
+    hark.cache.randomizeHashSeed(io);
     var cache = RRsetCache.init(cache_alloc, 16 * 1024 * 1024, 10_000);
     defer cache.deinit();
 

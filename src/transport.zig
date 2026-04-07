@@ -78,6 +78,9 @@ pub const UdpTransport = struct {
         const sock = try openSocket(upstream, self.io);
         errdefer sys.close(sock);
 
+        // Connect to server — kernel rejects spoofed source addresses (RFC 5452).
+        try na.connectTo(sock, &upstream);
+
         var recv_ctx = Context{ .tag = .recv };
         var retransmit_ctx = Context{ .tag = .retransmit };
         var overall_ctx = Context{ .tag = .overall };

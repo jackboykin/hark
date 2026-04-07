@@ -1426,7 +1426,9 @@ pub const RecursiveResolver = struct {
         if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |r| {
             for (r.message.answers) |rr| {
                 if (rr.rtype == .a and count.* < max_servers_per_level) {
-                    addrs[count.*] = na.initIp4(rr.rdata.a, 53);
+                    const addr = na.initIp4(rr.rdata.a, 53);
+                    if (na.isNonRoutableNs(addr)) continue;
+                    addrs[count.*] = addr;
                     count.* += 1;
                     found = true;
                 }
@@ -1437,7 +1439,9 @@ pub const RecursiveResolver = struct {
         if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |r| {
             for (r.message.answers) |rr| {
                 if (rr.rtype == .aaaa and count.* < max_servers_per_level) {
-                    addrs[count.*] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                    const addr = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                    if (na.isNonRoutableNs(addr)) continue;
+                    addrs[count.*] = addr;
                     count.* += 1;
                     found = true;
                 }
@@ -1601,7 +1605,9 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         for (h.records) |rr| {
                             if (rr.rtype == .a and count < max_servers_per_level) {
-                                addrs[count] = na.initIp4(rr.rdata.a, 53);
+                                const addr = na.initIp4(rr.rdata.a, 53);
+                                if (na.isNonRoutableNs(addr)) continue;
+                                addrs[count] = addr;
                                 count += 1;
                             }
                         }
@@ -1614,7 +1620,9 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         for (h.records) |rr| {
                             if (rr.rtype == .aaaa and count < max_servers_per_level) {
-                                addrs[count] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                                const addr = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                                if (na.isNonRoutableNs(addr)) continue;
+                                addrs[count] = addr;
                                 count += 1;
                             }
                         }
@@ -1944,11 +1952,12 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
         for (ns_names[0..ns_count]) |ns_name| {
             if (ns_name.eql(rr.name)) {
                 if (glue_count < max_servers_per_level) {
-                    if (is_a) {
-                        glue_addrs[glue_count] = na.initIp4(rr.rdata.a, 53);
-                    } else {
-                        glue_addrs[glue_count] = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
-                    }
+                    const addr = if (is_a)
+                        na.initIp4(rr.rdata.a, 53)
+                    else
+                        na.initIp6(rr.rdata.aaaa, 53, 0, 0);
+                    if (na.isNonRoutableNs(addr)) break;
+                    glue_addrs[glue_count] = addr;
                     glue_count += 1;
                 }
                 break;
@@ -2113,12 +2122,26 @@ test "extractReferral case-insensitive glue matching" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "NS1", "EXAMPLE", "COM" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 10, 0, 0, 1 })});
+    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 198, 51, 100, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
     try testing.expect(result == .referral);
     try testing.expectEqual(@as(usize, 1), result.referral.count);
+}
+
+test "extractReferral rejects private IP glue (DNS rebinding defense)" {
+    const alloc = testing.allocator;
+    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    const zone_name = try makeName(alloc, &.{ "example", "com" });
+    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    // Glue pointing to loopback — must be rejected
+    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 127, 0, 0, 1 })});
+    defer dns.freeMessage(alloc, response);
+
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    // Private glue is dropped, so we should get no_glue (triggers glueless resolution)
+    try testing.expect(result == .no_glue);
 }
 
 test "extractReferral rejects out-of-zone glue" {

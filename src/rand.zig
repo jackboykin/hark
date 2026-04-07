@@ -10,6 +10,13 @@ pub fn queryId(io: Io) u16 {
     return mem.readInt(u16, &buf, .big);
 }
 
+/// Generate a random u64 hash seed.
+pub fn hashSeed(io: Io) u64 {
+    var buf: [8]u8 = undefined;
+    io.random(&buf);
+    return mem.readInt(u64, &buf, .little);
+}
+
 /// Generate a random ephemeral port in [1024, 65535]. Uses the full
 /// unprivileged range rather than the narrower IANA dynamic range
 /// [49152, 65535] to maximise source port entropy (~16 bits vs ~14)

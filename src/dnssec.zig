@@ -66,6 +66,12 @@ pub const root_ds_records = [_]dns.DsData{
 
 // ── DNSKEY Validation Helpers ────────────────────────────────────────
 
+/// RFC 4034 §2.1.1–2: a DNSKEY is usable for RRSIG verification only if
+/// the Zone Key flag (bit 7) is set and the protocol field is 3.
+fn isValidZoneKey(dk: dns.DnskeyData) bool {
+    return dk.isZoneKey() and dk.protocol == 3;
+}
+
 /// Find a DNSKEY in a set that matches a DS record.
 /// Returns the matching DNSKEY and its index, or null.
 /// Uses pre-computed key tags to avoid redundant keyTag() calls.
@@ -78,6 +84,7 @@ pub fn findMatchingDnskey(
     for (dnskeys, 0..) |rr, i| {
         if (rr.rtype != .dnskey) continue;
         const dk = rr.rdata.dnskey;
+        if (!isValidZoneKey(dk)) continue;
         const tag = if (i < precomputed_tags.len) precomputed_tags[i] else keyTag(dk);
         if (tag != ds.key_tag) continue;
         if (@intFromEnum(dk.algorithm) != @intFromEnum(ds.algorithm)) continue;
@@ -151,6 +158,7 @@ pub fn validateDnskeyRrset(
                 for (dnskey_records, 0..) |rr, i| {
                     if (rr.rtype != .dnskey) continue;
                     const dk = rr.rdata.dnskey;
+                    if (!isValidZoneKey(dk)) continue;
                     const dk_tag = if (i < tags.len) tags[i] else keyTag(dk);
                     if (dk_tag != rrsig.key_tag) continue;
                     var ds_auth = false;
@@ -1025,6 +1033,7 @@ fn validateRrsetForType(
         for (dnskey_records) |dk_rr| {
             if (dk_rr.rtype != .dnskey) continue;
             const dk = dk_rr.rdata.dnskey;
+            if (!isValidZoneKey(dk)) continue;
             if (keyTag(dk) != rrsig.key_tag) continue;
             if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
             verifyRrsig(rrsig, dk, filtered[0..count], now_u32) catch continue;
@@ -1071,6 +1080,7 @@ pub fn verifyAuthorityNsecSigs(
             for (dnskey_records) |dk_rr| {
                 if (dk_rr.rtype != .dnskey) continue;
                 const dk = dk_rr.rdata.dnskey;
+                if (!isValidZoneKey(dk)) continue;
                 if (keyTag(dk) != rrsig.key_tag) continue;
                 if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
                 verifyRrsig(rrsig, dk, rrset[0..rrset_count], now_u32) catch continue;
@@ -1104,6 +1114,20 @@ test "keyTag computation" {
     // ac += (1802 >> 16) & 0xFFFF = 0
     // tag = 1802 & 0xFFFF = 1802
     try testing.expectEqual(@as(u16, 1802), tag);
+}
+
+test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
+    // ZSK (flags=256, protocol=3) — valid
+    try testing.expect(isValidZoneKey(.{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
+    // KSK (flags=257, protocol=3) — valid (SEP + zone key)
+    try testing.expect(isValidZoneKey(.{ .flags = 257, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
+    // flags=0 — no zone key bit
+    try testing.expect(!isValidZoneKey(.{ .flags = 0, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
+    // SEP-only (flags=1) — no zone key bit
+    try testing.expect(!isValidZoneKey(.{ .flags = 1, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
+    // Wrong protocol
+    try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 0, .algorithm = .rsasha256, .public_key = &.{} }));
+    try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 1, .algorithm = .rsasha256, .public_key = &.{} }));
 }
 
 test "canonical name wire format" {

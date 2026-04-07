@@ -21,8 +21,10 @@ const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
 const RttCache = @import("ns_rtt.zig").RttCache;
 const NsSelector = @import("ns_selector.zig").NsSelector;
-const RRsetCache = @import("cache.zig").RRsetCache;
-const InFlightTable = @import("dedup.zig").InFlightTable;
+const cache_mod = @import("cache.zig");
+const RRsetCache = cache_mod.RRsetCache;
+const dedup_mod = @import("dedup.zig");
+const InFlightTable = dedup_mod.InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const ServerConfig = @import("config.zig").ServerConfig;
@@ -132,6 +134,10 @@ pub const Server = struct {
     worker_errors: std.atomic.Value(u32),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
+        // Randomize hash seeds for cache and dedup tables (hash collision attack defense).
+        cache_mod.randomizeHashSeed(io);
+        dedup_mod.randomizeHashSeed(io);
+
         const cache_opts = RRsetCache.CacheOptions{
             .prefetch = cfg.prefetch,
             .serve_stale_ttl = cfg.serve_stale_ttl,

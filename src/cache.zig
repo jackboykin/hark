@@ -3,6 +3,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
+const rand = @import("rand.zig");
 
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 
@@ -24,9 +25,17 @@ const CacheKey = struct {
     rclass: dns.RClass,
 };
 
+/// Hash seed randomized at startup to prevent hash collision attacks.
+/// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
+var hash_seed: u64 = 0;
+
+pub fn randomizeHashSeed(io: std.Io) void {
+    hash_seed = rand.hashSeed(io);
+}
+
 const CacheKeyContext = struct {
     pub fn hash(_: @This(), key: CacheKey) u32 {
-        var h = std.hash.Wyhash.init(0);
+        var h = std.hash.Wyhash.init(hash_seed);
         h.update(key.name);
         h.update(mem.asBytes(&key.rtype));
         h.update(mem.asBytes(&key.rclass));

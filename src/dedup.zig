@@ -23,9 +23,19 @@ const DedupKey = struct {
 
 };
 
+const rand = @import("rand.zig");
+
+/// Hash seed randomized at startup to prevent hash collision attacks.
+/// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
+var dedup_hash_seed: u64 = 0;
+
+pub fn randomizeHashSeed(io: std.Io) void {
+    dedup_hash_seed = rand.hashSeed(io);
+}
+
 const DedupKeyContext = struct {
     pub fn hash(_: @This(), key: DedupKey) u64 {
-        var h = std.hash.Wyhash.init(0);
+        var h = std.hash.Wyhash.init(dedup_hash_seed);
         h.update(key.name_buf[0..key.name_len]);
         h.update(mem.asBytes(&key.qtype));
         h.update(mem.asBytes(&key.flags));
