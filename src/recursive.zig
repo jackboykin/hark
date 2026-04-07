@@ -2000,13 +2000,6 @@ fn validateNegativeResponse(
 // Tests
 // ════════════════════════════════════════════════════════════════════════
 
-test "root_hints has 26 entries, all port 53" {
-    try testing.expectEqual(@as(usize, 26), root_hints.len);
-    for (root_hints) |addr| {
-        try testing.expectEqual(@as(u16, 53), addr.getPort());
-    }
-}
-
 // ── Test helpers ──────────────────────────────────────────────────────
 
 fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {

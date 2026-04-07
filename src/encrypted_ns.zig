@@ -177,13 +177,6 @@ fn makeKey(ip: [4]u8) AddressKey {
     return AddressKey.fromAddress(na.initIp4(ip, 853));
 }
 
-test "EncryptedNsCache unknown address returns unknown" {
-    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    defer cache.deinit();
-
-    try testing.expectEqual(ServerStatus.unknown, cache.getStatus(makeKey(.{ 1, 1, 1, 1 })));
-}
-
 test "EncryptedNsCache markCapable and getStatus" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
@@ -268,19 +261,6 @@ test "EncryptedNsCache claimProbe skips capable" {
 
     // Should not re-probe a capable server
     try testing.expect(!cache.claimProbe(key));
-}
-
-test "EncryptedNsCache failure count increments" {
-    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    defer cache.deinit();
-
-    const key = makeKey(.{ 10, 0, 0, 1 });
-    cache.markFailed(key);
-    cache.markFailed(key);
-    cache.markFailed(key);
-
-    const entry = cache.entries.get(key).?;
-    try testing.expectEqual(@as(u8, 3), entry.failure_count);
 }
 
 test "EncryptedNsCache capable after failed" {

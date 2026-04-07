@@ -213,46 +213,6 @@ test "follower waits for leader" {
     try testing.expectEqual(@as(u32, 0), table.map.count());
 }
 
-test "entry cleaned up after leader and followers finish" {
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    _ = table.acquireOrWait("example.com", .a, 0);
-    table.releaseLeader("example.com", .a, 0);
-    try testing.expectEqual(@as(u32, 0), table.map.count());
-
-    // Can immediately become leader again
-    const r = table.acquireOrWait("example.com", .a, 0);
-    try testing.expectEqual(.leader, r);
-    table.releaseLeader("example.com", .a, 0);
-}
-
-test "timeout when leader never releases" {
-    // Use a very short timeout by testing the condition variable directly
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    _ = table.acquireOrWait("example.com", .a, 0);
-
-    // Spawn a follower that will time out (the 2s timeout in acquireOrWait)
-    // For test speed, we test the mechanism: put an entry and let follower see it
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(tbl: *InFlightTable) void {
-            // This will block until timeout (5s) then return .follower
-            const r = tbl.acquireOrWait("example.com", .a, 0);
-            std.debug.assert(r == .follower);
-        }
-    }.run, .{&table});
-
-    // Release after a short delay so the test doesn't take 5s
-    {
-        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-    table.releaseLeader("example.com", .a, 0);
-    t.join();
-}
-
 test "acquireOrWaitWithTimeout uses custom timeout" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();

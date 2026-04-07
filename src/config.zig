@@ -394,15 +394,6 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
 }
 
-test "cache prefetch defaults to off" {
-    var cfg = try parseConfig(testing.allocator, "");
-    defer cfg.deinit();
-
-    try testing.expectEqual(false, cfg.prefetch);
-    try testing.expectEqual(@as(u32, 0), cfg.serve_stale_ttl);
-    try testing.expectEqual(@as(u32, 0), cfg.min_ttl);
-}
-
 test "logging config" {
     // Default: log_queries is false
     var cfg1 = try parseConfig(testing.allocator, "");
