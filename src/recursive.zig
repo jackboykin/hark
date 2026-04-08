@@ -1144,16 +1144,6 @@ pub const RecursiveResolver = struct {
     ) !?dns.Message {
         if (servers.len == 0) return null;
 
-        const query_id = rand.queryId(self.io);
-
-        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
-            .rd = false,
-            .edns = .{ .do_bit = do_bit },
-        });
-
-        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-        const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
-
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
         const try_count = @min(servers.len, max_servers);
@@ -1163,6 +1153,16 @@ pub const RecursiveResolver = struct {
             if (self.rtt_cache) |rc| {
                 if (rc.isDead(addr_key) and i + 1 < try_count) continue;
             }
+
+            // Fresh TXID per server to prevent cross-server ID prediction.
+            const query_id = rand.queryId(self.io);
+            const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
+                .rd = false,
+                .edns = .{ .do_bit = do_bit },
+            });
+
+            var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+            const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
 
             const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
 
@@ -1277,6 +1277,7 @@ pub const RecursiveResolver = struct {
         // Cache DS response: main cache for NS/glue (skip_key_types skips DS),
         // key cache for DS only (avoid polluting with NS/glue).
         if (self.cache) |c| c.storeResponse(response, zone);
+        // DS stored as .unchecked — validated indirectly via DNSKEY RRSIG.
         if (self.key_cache) |kc| kc.storeResponseWithStatus(answersOnly(response), zone, .unchecked);
 
         // Positive DS — zone is signed.
@@ -1317,6 +1318,12 @@ pub const RecursiveResolver = struct {
         // Find RRSIG in answers to get the signer zone
         const rrsig = dnssec.findRrsig(response.answers, qtype) orelse return .bogus;
 
+        // RFC 4034 §3.1.3: signer must be at or above the RRset owner name
+        for (response.answers) |rr| if (rr.rtype == qtype) {
+            if (!rr.name.isSubdomainOf(rrsig.signer_name)) return .bogus;
+            break;
+        };
+
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
 
@@ -1352,6 +1359,11 @@ pub const RecursiveResolver = struct {
             }
         }
         const signer = signer_name orelse return .unchecked;
+
+        // RFC 4034 §3.1.3: verify authority record owners are under the signer zone
+        for (authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
+            if (!rr.name.isSubdomainOf(signer)) return .unchecked;
+        };
 
         // Fetch DNSKEY from cache or parent servers
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
@@ -1782,15 +1794,14 @@ fn validateDnskeyAgainstDs(
         }
     }
     if (ds_count > 0) {
-        if (dnssec.findRrsig(dnskey_answers, .dnskey) != null) {
-            const now_u32 = epochNowU32();
-            try dnssec.validateDnskeyRrset(
-                dnskey_answers,
-                ds_records[0..ds_count],
-                zone_parsed,
-                now_u32,
-            );
-        }
+        // RFC 4035 §5.2: DNSKEY RRset MUST be self-signed.
+        const now_u32 = epochNowU32();
+        try dnssec.validateDnskeyRrset(
+            dnskey_answers,
+            ds_records[0..ds_count],
+            zone_parsed,
+            now_u32,
+        );
     }
 }
 

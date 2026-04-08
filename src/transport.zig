@@ -171,7 +171,7 @@ pub fn openUdpSocket(dest: na.Address, nonblock: bool, io: std.Io) !posix.fd_t {
     const sock = try sys.socket(af, flags, 0);
     errdefer sys.close(sock);
 
-    for (0..16) |_| {
+    for (0..64) |_| {
         const port = rand.ephemeralPort(io);
         const addr = anyAddr(af, port);
         na.bindTo(sock, &addr) catch |err| switch (err) {
@@ -180,9 +180,7 @@ pub fn openUdpSocket(dest: na.Address, nonblock: bool, io: std.Io) !posix.fd_t {
         };
         return sock;
     }
-    const addr = anyAddr(af, 0);
-    try na.bindTo(sock, &addr);
-    return sock;
+    return error.AddressInUse;
 }
 
 pub fn anyAddr(af: u32, port: u16) na.Address {

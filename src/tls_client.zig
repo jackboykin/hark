@@ -611,6 +611,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitE
                         try hsd.ensure(2);
                         const total_ext_size = hsd.decode(u16);
                         var all_extd = try hsd.sub(total_ext_size);
+                        var alpn_seen = false;
                         while (!all_extd.eof()) {
                             try all_extd.ensure(4);
                             const et = all_extd.decode(tls.ExtensionType);
@@ -619,6 +620,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitE
                             switch (et) {
                                 .server_name => {},
                                 .application_layer_protocol_negotiation => {
+                                    alpn_seen = true;
                                     // RFC 7301 §3.2: validate server's selected protocol.
                                     if (options.alpn) |expected| {
                                         var alpn_d = extd;
@@ -636,6 +638,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitE
                                 },
                                 else => {},
                             }
+                        }
+                        // RFC 7301 §3.2: if we requested ALPN, server MUST respond with it
+                        if (options.alpn != null and !alpn_seen) {
+                            return error.TlsIllegalParameter;
                         }
                         handshake_state = .certificate;
                     },
@@ -662,6 +668,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitE
                         const certs_size = hsd.decode(u24);
                         var certs_decoder = try hsd.sub(certs_size);
                         while (!certs_decoder.eof()) {
+                            if (cert_index >= 32) return error.TlsDecodeError;
                             try certs_decoder.ensure(3);
                             const cert_size = certs_decoder.decode(u24);
                             const certd = try certs_decoder.sub(cert_size);

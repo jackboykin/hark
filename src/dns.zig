@@ -804,11 +804,14 @@ pub const Parser = struct {
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
+                // Validate salt + hash_len byte fit within rdlength
+                if (5 + salt_len + 1 > rdlength) return error.InvalidRDataLength;
                 const salt = try self.dupSlice(allocator, salt_len);
                 const hash_len: usize = try self.readU8();
+                const consumed = 6 + salt_len + hash_len;
+                if (consumed > rdlength) return error.InvalidRDataLength;
                 const next_hashed_owner = try self.dupSlice(allocator, hash_len);
-                const consumed = 5 + salt_len + 1 + hash_len;
-                const bitmap_len = if (rdlength > consumed) rdlength - consumed else 0;
+                const bitmap_len = rdlength - consumed;
                 return .{ .nsec3 = .{
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
@@ -824,6 +827,7 @@ pub const Parser = struct {
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
+                if (5 + salt_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec3param = .{
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,

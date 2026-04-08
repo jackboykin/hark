@@ -257,13 +257,9 @@ pub fn classifyDelegation(
         }
     }
 
-    // RFC 9276 §4: high-iteration NSEC3 MUST NOT downgrade to insecure.
-    // SERVFAIL (return .secure) prevents attacker-injected high-iteration
-    // NSEC3 from bypassing DNSSEC validation for the child zone.
-    if (had_nsec3_high_iterations) return .secure;
-
-    // No DS and no NSEC proof — indeterminate, treat as insecure (don't ServFail)
-    return .insecure;
+    // No DS and no valid proof of absence — fail closed to SERVFAIL.
+    // Covers both high-iteration NSEC3 (RFC 9276 §4) and missing proof.
+    return .secure;
 }
 
 // ── Key Tag (RFC 4034 Appendix B) ────────────────────────────────────
@@ -1005,6 +1001,15 @@ pub fn validateAnswerRrset(
     return .secure;
 }
 
+/// RFC 6840 §5.11: supported RRSIG algorithms.
+fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
+    return switch (algo) {
+        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512,
+        .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
+        else => false,
+    };
+}
+
 /// Validate a single RRset type within the answers against DNSKEYs.
 /// Iterates ALL RRSIGs covering the target type per RFC 6840 §5.11.
 fn validateRrsetForType(
@@ -1013,10 +1018,13 @@ fn validateRrsetForType(
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
 ) SecurityStatus {
+    var had_unsupported_algo = false;
     for (answers) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
         const rrsig = sig_rr.rdata.rrsig;
         if (rrsig.type_covered != covered_type) continue;
+
+        if (!isSupportedAlgorithm(rrsig.algorithm)) { had_unsupported_algo = true; continue; }
 
         // Filter RRset by this RRSIG's owner (same owner + type)
         var filtered: [64]dns.ResourceRecord = undefined;
@@ -1040,7 +1048,8 @@ fn validateRrsetForType(
             return .secure;
         }
     }
-    return .bogus;
+    // RFC 6840 §5.11: all-unsupported algorithms → insecure, not bogus.
+    return if (had_unsupported_algo) .insecure else .bogus;
 }
 
 // ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
@@ -1072,10 +1081,13 @@ pub fn verifyAuthorityNsecSigs(
 
         // Find a matching RRSIG and verify it
         var sig_verified = false;
+        var had_unsupported_algo = false;
         for (authorities) |sig_rr| {
             if (sig_rr.rtype != .rrsig) continue;
             const rrsig = sig_rr.rdata.rrsig;
             if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
+
+            if (!isSupportedAlgorithm(rrsig.algorithm)) { had_unsupported_algo = true; continue; }
 
             for (dnskey_records) |dk_rr| {
                 if (dk_rr.rtype != .dnskey) continue;
@@ -1089,7 +1101,8 @@ pub fn verifyAuthorityNsecSigs(
             }
             if (sig_verified) break;
         }
-        if (!sig_verified) return .bogus;
+        // RFC 6840 §5.11: all-unsupported algorithms → insecure, not bogus.
+        if (!sig_verified) return if (had_unsupported_algo) .insecure else .bogus;
     }
 
     return if (any_nsec) .secure else .unchecked;
@@ -1150,46 +1163,75 @@ test "canonical name wire format" {
     try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
-test "DS hash verification - synthetic" {
-    // Build a DNSKEY, compute its DS, then verify
-    const dnskey = dns.DnskeyData{
-        .flags = 257,
-        .protocol = 3,
-        .algorithm = .rsasha256,
-        .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD },
-    };
-
-    const owner = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
-
-    // Compute expected digest: SHA-256(canonical_owner_wire || DNSKEY_RDATA)
+/// Compute SHA-256 DS digest for a DNSKEY: SHA-256(canonical_owner_wire || DNSKEY_RDATA).
+fn testDsDigest(owner: dns.Name, dnskey: dns.DnskeyData) ![Sha256.digest_length]u8 {
     var wire_buf: [1024]u8 = undefined;
     const name_len = try writeCanonicalNameWire(&wire_buf, owner);
     var pos = name_len;
-    mem.writeInt(u16, wire_buf[pos..][0..2], 257, .big); // flags
+    mem.writeInt(u16, wire_buf[pos..][0..2], dnskey.flags, .big);
     pos += 2;
-    wire_buf[pos] = 3; // protocol
+    wire_buf[pos] = dnskey.protocol;
     pos += 1;
-    wire_buf[pos] = 8; // algorithm
+    wire_buf[pos] = @intFromEnum(dnskey.algorithm);
     pos += 1;
     @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
     pos += dnskey.public_key.len;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(wire_buf[0..pos], &digest, .{});
+    return digest;
+}
 
-    var expected_digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(wire_buf[0..pos], &expected_digest, .{});
+const test_dnskey = dns.DnskeyData{
+    .flags = 257,
+    .protocol = 3,
+    .algorithm = .rsasha256,
+    .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD },
+};
+
+const test_owner = dns.Name{
+    .labels = &.{
+        @as([]const u8, "example"),
+        @as([]const u8, "com"),
+    },
+};
+
+test "DS hash verification - synthetic" {
+    var expected_digest = try testDsDigest(test_owner, test_dnskey);
 
     const ds = dns.DsData{
-        .key_tag = keyTag(dnskey),
+        .key_tag = keyTag(test_dnskey),
         .algorithm = .rsasha256,
         .digest_type = .sha256,
         .digest = &expected_digest,
     };
 
-    try verifyDs(ds, dnskey, owner);
+    try verifyDs(ds, test_dnskey, test_owner);
+}
+
+test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
+    // RFC 4035 §5.2: stripped RRSIG on DNSKEY must not bypass validation.
+    var digest = try testDsDigest(test_owner, test_dnskey);
+
+    const ds = dns.DsData{
+        .key_tag = keyTag(test_dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha256,
+        .digest = &digest,
+    };
+
+    // DNSKEY record with NO accompanying RRSIG — this is the attack vector
+    const dnskey_records = [_]dns.ResourceRecord{.{
+        .name = test_owner,
+        .rtype = .dnskey,
+        .rclass = .in,
+        .ttl = 86400,
+        .rdata = .{ .dnskey = test_dnskey },
+    }};
+
+    try testing.expectError(
+        error.InvalidSignature,
+        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000),
+    );
 }
 
 test "DS hash verification - wrong digest fails" {
@@ -1451,7 +1493,8 @@ test "classifyDelegation with no DS and no proof" {
         .rdata = .{ .ns = ns_name },
     }};
 
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+    // No DS and no NSEC/NSEC3 proof — indeterminate, fails closed to .secure
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
 }
 
 test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
@@ -2070,7 +2113,8 @@ test "classifyDelegation NSEC3 non-match" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0} ** 20), &[_]u8{ 0x00, 0x01, 0x20 })};
 
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+    // NSEC3 doesn't cover the child zone — indeterminate, fails closed to .secure
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
 }
 
 test "NSEC3 hash budget exhaustion" {

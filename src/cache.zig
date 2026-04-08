@@ -503,8 +503,11 @@ pub const RRsetCache = struct {
         if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
         defer if (self.rwlock) |*rw| rw.unlock(self.io);
         self.storeRRsetsImpl(response.answers, authority_zone, true, status);
-        self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
-        self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
+        // Skip authority/additional from positive responses (CVE-2025-11411).
+        if (response.answers.len == 0) {
+            self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
+            self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
+        }
     }
 
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
@@ -554,7 +557,10 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        // Remove existing entry if present
+        if (self.hasProtectedPositive(key)) {
+            alloc.free(key_name);
+            return;
+        }
         self.removeAndFree(key);
 
         const cached_soa_name = cloneName(alloc, soa.name) catch {
@@ -613,19 +619,11 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        // Don't overwrite non-expired validated positive entries — but DO overwrite
-        // .unchecked entries so that DNSSEC validation failures (bogusServfail)
-        // can replace pre-validation cached data (RFC 9520 §3.4).
-        if (self.map.get(key)) |existing| {
-            switch (existing) {
-                .positive => |p| if (self.now_fn() < p.expires_at and p.security_status != .unchecked) {
-                    alloc.free(key_name);
-                    return;
-                },
-                .negative => {},
-            }
-            self.removeAndFree(key);
+        if (self.hasProtectedPositive(key)) {
+            alloc.free(key_name);
+            return;
         }
+        self.removeAndFree(key);
         self.evictIfNeeded();
 
         const now = self.now_fn();
@@ -647,6 +645,15 @@ pub const RRsetCache = struct {
     }
 
     // ── Internal ──────────────────────────────────────────────────────
+
+    /// True if `key` has a non-expired validated positive entry (RFC 9520 §3.4).
+    fn hasProtectedPositive(self: *RRsetCache, key: CacheKey) bool {
+        const existing = self.map.get(key) orelse return false;
+        return switch (existing) {
+            .positive => |p| self.now_fn() < p.expires_at and p.security_status != .unchecked,
+            .negative => false,
+        };
+    }
 
     fn storeRRsetsImpl(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, check_bailiwick: bool, status: SecurityStatus) void {
         if (records.len == 0) return;

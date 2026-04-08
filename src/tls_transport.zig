@@ -153,7 +153,7 @@ pub const TlsTransport = struct {
         }
 
         if (!self.config.skip_verification and self.config.server_name == null) {
-            log.warn("TLS server_name not configured — certificate verification disabled; set server_name for authentication or skip_verification to suppress this warning", .{});
+            return error.ServerNameRequired;
         }
 
         conn.tls_client = VendoredTlsClient.init(&conn.net_reader.interface, &conn.net_writer.interface, .{
