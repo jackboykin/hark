@@ -873,35 +873,61 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const hdr = Header.parse(bytes[0..12]);
     var parser = Parser{ .msg = bytes, .pos = 12 };
 
+    // Cap pre-allocation against what the wire can physically contain.
+    // Prevents a small packet with inflated header counts from triggering
+    // a large allocation (counts are attacker-controlled u16, max 65535).
+    const payload = bytes.len - header_len;
+    const max_questions = payload / 5; // min question: 1 name + 2 type + 2 class
+    const max_rrs = payload / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
+
     var questions: ArrayList(Question) = .empty;
-    questions.ensureTotalCapacity(allocator, hdr.qd_count) catch return error.OutOfMemory;
-    errdefer questions.deinit(allocator);
+    questions.ensureTotalCapacity(allocator, @min(hdr.qd_count, max_questions)) catch return error.OutOfMemory;
+    errdefer {
+        for (questions.items) |q| freeName(allocator, q.name);
+        questions.deinit(allocator);
+    }
     for (0..hdr.qd_count) |_| {
-        questions.appendAssumeCapacity(try parser.parseQuestion(allocator));
+        const q = try parser.parseQuestion(allocator);
+        questions.append(allocator, q) catch {
+            freeName(allocator, q.name);
+            return error.OutOfMemory;
+        };
     }
 
     var answers: ArrayList(ResourceRecord) = .empty;
-    answers.ensureTotalCapacity(allocator, hdr.an_count) catch return error.OutOfMemory;
-    errdefer answers.deinit(allocator);
+    answers.ensureTotalCapacity(allocator, @min(hdr.an_count, max_rrs)) catch return error.OutOfMemory;
+    errdefer {
+        freeResourceRecordContents(allocator, answers.items);
+        answers.deinit(allocator);
+    }
     for (0..hdr.an_count) |_| {
-        answers.appendAssumeCapacity(try parser.parseResourceRecord(allocator));
+        try appendRr(&answers, allocator, try parser.parseResourceRecord(allocator));
     }
 
     var authorities: ArrayList(ResourceRecord) = .empty;
-    authorities.ensureTotalCapacity(allocator, hdr.ns_count) catch return error.OutOfMemory;
-    errdefer authorities.deinit(allocator);
+    authorities.ensureTotalCapacity(allocator, @min(hdr.ns_count, max_rrs)) catch return error.OutOfMemory;
+    errdefer {
+        freeResourceRecordContents(allocator, authorities.items);
+        authorities.deinit(allocator);
+    }
     for (0..hdr.ns_count) |_| {
-        authorities.appendAssumeCapacity(try parser.parseResourceRecord(allocator));
+        try appendRr(&authorities, allocator, try parser.parseResourceRecord(allocator));
     }
 
     var additionals: ArrayList(ResourceRecord) = .empty;
-    additionals.ensureTotalCapacity(allocator, hdr.ar_count) catch return error.OutOfMemory;
-    errdefer additionals.deinit(allocator);
+    additionals.ensureTotalCapacity(allocator, @min(hdr.ar_count, max_rrs)) catch return error.OutOfMemory;
+    errdefer {
+        freeResourceRecordContents(allocator, additionals.items);
+        additionals.deinit(allocator);
+    }
     var opt: ?OptRecord = null;
+    errdefer if (opt) |o| freeOpt(allocator, o);
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
         if (rr.rtype == .opt and opt == null) {
-            // Extract OPT pseudo-record fields (RFC 6891)
+            // OPT pseudo-record: extract fields, free the parsed RR shell
+            defer freeName(allocator, rr.name);
+            defer freeRData(allocator, rr.rdata);
             opt = .{
                 .udp_payload_size = @intFromEnum(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
@@ -910,7 +936,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
                 .options = try parseEdnsOptions(allocator, rr.rdata.unknown),
             };
         } else {
-            additionals.appendAssumeCapacity(rr);
+            try appendRr(&additionals, allocator, rr);
         }
     }
 
@@ -2058,11 +2084,23 @@ pub fn freeOpt(allocator: Allocator, opt: OptRecord) void {
     if (opt.options.len > 0) allocator.free(opt.options);
 }
 
-fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
+fn appendRr(list: *ArrayList(ResourceRecord), allocator: Allocator, rr: ResourceRecord) Error!void {
+    list.append(allocator, rr) catch {
+        freeName(allocator, rr.name);
+        freeRData(allocator, rr.rdata);
+        return error.OutOfMemory;
+    };
+}
+
+fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
     for (rrs) |rr| {
         freeName(allocator, rr.name);
         freeRData(allocator, rr.rdata);
     }
+}
+
+fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
+    freeResourceRecordContents(allocator, rrs);
     allocator.free(rrs);
 }
 
