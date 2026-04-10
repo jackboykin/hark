@@ -1066,9 +1066,6 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
             .ar_count = 0,
         },
         .questions = questions,
-        .answers = &.{},
-        .authorities = &.{},
-        .additionals = &.{},
     };
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
@@ -1152,6 +1149,11 @@ fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: 
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     if (reuseport) {
         try posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.REUSEPORT, &mem.toBytes(optval));
+    }
+    if (sock_type & posix.SOCK.DGRAM != 0) {
+        const bufsize: c_int = 1024 * 1024;
+        posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.RCVBUF, &mem.toBytes(bufsize)) catch {};
+        posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(bufsize)) catch {};
     }
     try na.bindTo(sock, &addr);
     if (listen_flag) {
@@ -1237,9 +1239,6 @@ test "buildResponseWire sets correct header fields" {
             .ar_count = 0,
         },
         .questions = &.{},
-        .answers = &.{},
-        .authorities = &.{},
-        .additionals = &.{},
     };
 
     var buf: [512]u8 = undefined;
@@ -1292,9 +1291,6 @@ test "buildResponseWire with EDNS0" {
             .ar_count = 0,
         },
         .questions = &.{},
-        .answers = &.{},
-        .authorities = &.{},
-        .additionals = &.{},
     };
 
     var buf: [1232]u8 = undefined;

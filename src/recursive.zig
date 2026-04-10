@@ -832,8 +832,6 @@ pub const RecursiveResolver = struct {
                 },
                 .questions = &.{},
                 .answers = wc_records[0..wc_count],
-                .authorities = &.{},
-                .additionals = &.{},
             }, signer_zone, .secure);
         }
     }
@@ -1836,7 +1834,6 @@ fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const d
         .questions = &.{},
         .answers = answers,
         .authorities = authorities,
-        .additionals = &.{},
     };
 }
 
@@ -2060,7 +2057,6 @@ fn makeResponse(alloc: mem.Allocator, authorities: []const dns.ResourceRecord, a
     return .{
         .header = makeHeader(@intCast(authorities.len), @intCast(additionals.len), 0),
         .questions = &.{},
-        .answers = &.{},
         .authorities = auths,
         .additionals = adds,
     };
@@ -2094,9 +2090,6 @@ test "extractReferral with no NS records returns null" {
     const response = dns.Message{
         .header = makeHeader(0, 0, 0),
         .questions = &.{},
-        .answers = &.{},
-        .authorities = &.{},
-        .additionals = &.{},
     };
     try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }) == null);
 }
@@ -2248,7 +2241,7 @@ test "findCnameRecord finds CNAME matching target" {
 
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = cname_target } };
-    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers, .authorities = &.{}, .additionals = &.{} };
+    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers };
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
@@ -2264,7 +2257,7 @@ test "findCnameRecord returns null when no CNAME present" {
 
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 93, 184, 216, 34 } } };
-    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers, .authorities = &.{}, .additionals = &.{} };
+    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers };
     defer dns.freeMessage(alloc, response);
 
     try testing.expect(findCnameRecord(response, dns.Name{ .labels = &.{ "example", "com" } }) == null);

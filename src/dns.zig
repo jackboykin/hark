@@ -448,9 +448,9 @@ pub const ResourceRecord = struct {
 pub const Message = struct {
     header: Header,
     questions: []const Question,
-    answers: []const ResourceRecord,
-    authorities: []const ResourceRecord,
-    additionals: []const ResourceRecord,
+    answers: []const ResourceRecord = &.{},
+    authorities: []const ResourceRecord = &.{},
+    additionals: []const ResourceRecord = &.{},
     opt: ?OptRecord = null,
 };
 
@@ -514,10 +514,6 @@ pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8
     const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
 
-    const empty_rr = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
-    const empty_rr2 = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
-    const empty_rr3 = allocator.alloc(ResourceRecord, 0) catch return error.OutOfMemory;
-
     return .{
         .header = .{
             .id = id,
@@ -535,9 +531,6 @@ pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8
             .ar_count = 0,
         },
         .questions = questions,
-        .answers = empty_rr,
-        .authorities = empty_rr2,
-        .additionals = empty_rr3,
         .opt = if (options.edns) |edns| .{
             .udp_payload_size = edns.udp_payload_size,
             .extended_rcode = 0,
@@ -881,21 +874,29 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     var parser = Parser{ .msg = bytes, .pos = 12 };
 
     var questions: ArrayList(Question) = .empty;
+    questions.ensureTotalCapacity(allocator, hdr.qd_count) catch return error.OutOfMemory;
+    errdefer questions.deinit(allocator);
     for (0..hdr.qd_count) |_| {
-        questions.append(allocator, try parser.parseQuestion(allocator)) catch return error.OutOfMemory;
+        questions.appendAssumeCapacity(try parser.parseQuestion(allocator));
     }
 
     var answers: ArrayList(ResourceRecord) = .empty;
+    answers.ensureTotalCapacity(allocator, hdr.an_count) catch return error.OutOfMemory;
+    errdefer answers.deinit(allocator);
     for (0..hdr.an_count) |_| {
-        answers.append(allocator, try parser.parseResourceRecord(allocator)) catch return error.OutOfMemory;
+        answers.appendAssumeCapacity(try parser.parseResourceRecord(allocator));
     }
 
     var authorities: ArrayList(ResourceRecord) = .empty;
+    authorities.ensureTotalCapacity(allocator, hdr.ns_count) catch return error.OutOfMemory;
+    errdefer authorities.deinit(allocator);
     for (0..hdr.ns_count) |_| {
-        authorities.append(allocator, try parser.parseResourceRecord(allocator)) catch return error.OutOfMemory;
+        authorities.appendAssumeCapacity(try parser.parseResourceRecord(allocator));
     }
 
     var additionals: ArrayList(ResourceRecord) = .empty;
+    additionals.ensureTotalCapacity(allocator, hdr.ar_count) catch return error.OutOfMemory;
+    errdefer additionals.deinit(allocator);
     var opt: ?OptRecord = null;
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
@@ -909,7 +910,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
                 .options = try parseEdnsOptions(allocator, rr.rdata.unknown),
             };
         } else {
-            additionals.append(allocator, rr) catch return error.OutOfMemory;
+            additionals.appendAssumeCapacity(rr);
         }
     }
 

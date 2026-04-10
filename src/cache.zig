@@ -935,8 +935,6 @@ fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
         },
         .questions = &.{},
         .answers = answers,
-        .authorities = &.{},
-        .additionals = &.{},
     };
 }
 
