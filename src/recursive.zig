@@ -111,6 +111,19 @@ pub const RecursiveResolver = struct {
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
+    /// Create a thread-local resolver clone with fresh transports. Shared
+    /// caches and config are inherited; transport and per-query mutable
+    /// state are reset so the clone is safe for independent resolution.
+    fn cloneForThread(self: *RecursiveResolver, udp: AnyUdpTransport, tcp: AnyTcpTransport) RecursiveResolver {
+        var resolver = self.*;
+        resolver.transport = udp;
+        resolver.tcp_transport = tcp;
+        resolver.gpa = null;
+        resolver.resolving_ds = false;
+        resolver.pending_dnskey_prefetch = null;
+        return resolver;
+    }
+
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
     fn keyCache(self: *RecursiveResolver) ?*RRsetCache {
         if (self.key_cache) |kc| return kc;
@@ -289,158 +302,9 @@ pub const RecursiveResolver = struct {
                     }
                 }
 
-                // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
-                var order_buf: [max_servers_per_level]usize = undefined;
-                const server_order = if (self.ns_selector) |ns|
-                    ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
-                else blk: {
-                    rand.shuffle(na.Address, self.io, servers[0..server_count]);
-                    for (0..server_count) |idx| order_buf[idx] = idx;
-                    break :blk order_buf[0..server_count];
-                };
-
-                // Try each server until one responds with a useful answer
-                var got_response = false;
-                var response: dns.Message = undefined;
-                var last_server_failure: ?dns.Message = null;
-                var responding_server: ?na.Address = null;
-
-                // ── Staggered NS racing (blocking transport only) ──
-                if (self.transport == .blocking and server_order.len >= 2 and self.stagger_ms > 0) {
-                    if (try self.tryStaggeredQuery(allocator, query_name, query_type, &servers, server_order, parent_zone)) |stag| {
-                        response = stag.message;
-                        got_response = true;
-                        responding_server = stag.server;
-                    }
-                }
-
-                for (server_order, 0..) |server_idx, server_i| {
-                    if (got_response) break;
-                    const server = servers[server_idx];
-                    const addr_key = AddressKey.fromAddress(server);
-
-                    const is_last_server = (server_i + 1 >= server_order.len);
-
-                    // Skip dead servers unless last (fallback when all are dead)
-                    if (self.rtt_cache) |rc| {
-                        if (rc.isDead(addr_key) and !is_last_server) continue;
-                    }
-
-                    const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
-
-                    const query_id = rand.queryId(self.io);
-
-                    // Build iterative query (rd=false, EDNS0)
-                    const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
-                        .rd = false,
-                        .edns = .{ .do_bit = self.dnssec_aware },
-                    });
-
-                    // Serialize
-                    var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-                    const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
-
-                    // ── RFC 9539: Opportunistic encrypted query ──
-                    if (self.tls_transport) |tls_t| {
-                        if (self.encrypted_ns_cache) |oc| {
-                            const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
-                            switch (oc.getStatus(tls_key)) {
-                                .capable => {
-                                    // Known-good server → try encrypted (pool or new connection)
-                                    const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
-                                        .rd = false,
-                                        .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
-                                    });
-                                    var padded_buf: [dns.edns_udp_payload]u8 = undefined;
-                                    const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
-
-                                    var tls_response_buf: [65535]u8 = undefined;
-                                    if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
-                                        if (try tryParseMessage(allocator, tls_data)) |tls_response| {
-                                            if (tls_response.header.qr and
-                                                tls_response.header.rcode != .format_error and
-                                                dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
-                                            {
-                                                if (tls_response.header.rcode.isServerError()) {
-                                                    last_server_failure = tls_response;
-                                                    continue; // Try next server, don't repeat over Do53
-                                                }
-                                                response = tls_response;
-                                                got_response = true;
-                                                // Don't update RTT cache or NS selector from TLS —
-                                                // different transport latency would poison Do53 estimates.
-                                                break;
-                                            }
-                                        }
-                                        // TLS error/unparseable — fall through to Do53
-                                    } else |_| {
-                                        // TLS connection failed — fall through to Do53
-                                    }
-                                },
-                                .unknown => {}, // First contact → Do53 now, probe after
-                                .probing, .failed => {}, // Skip, go straight to Do53
-                            }
-                        }
-                    }
-
-                    // ── Do53: UDP with TCP fallback ──
-                    const do53_start = monotonic.nowUs();
-                    response = try self.queryServerUdp(
-                        allocator,
-                        wire_query,
-                        query_id,
-                        server,
-                        per_server_timeout,
-                    ) orelse {
-                        if (self.ns_selector) |ns|
-                            ns.recordOutcome(parent_zone, server, .timeout, 0);
-                        continue;
-                    };
-                    const do53_elapsed = monotonic.nowUs() - do53_start;
-
-                    // RFC 5452 §9.1: question section must match original query.
-                    // RFC 9619: FORMERR may omit question section (QDCOUNT=0).
-                    if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, query_type)) {
-                        if (response.header.rcode != .format_error) continue;
-                    }
-
-                    // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
-                    // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
-                    if (response.header.rcode.isServerError()) {
-                        if (self.ns_selector) |ns|
-                            ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
-                        last_server_failure = response;
-                        continue;
-                    }
-
-                    if (self.ns_selector) |ns|
-                        ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
-                    got_response = true;
-                    responding_server = server;
-                    break;
-                }
-
-                // Fall back to last SERVFAIL/REFUSED if all servers failed
-                if (!got_response) {
-                    if (last_server_failure) |sf| {
-                        response = sf;
-                        got_response = true;
-                    } else {
-                        return error.Timeout;
-                    }
-                }
-
-                // Fire background OTE probe for the server that responded
-                if (responding_server) |srv| {
-                    if (self.encrypted_ns_cache) |oc| {
-                        if (self.tls_transport) |tls_t| {
-                            const tls_key = AddressKey.fromAddressWithPort(srv, tls_t.config.port);
-                            if (oc.claimProbe(tls_key)) {
-                                tls_t.probeInBackground(srv, oc);
-                            }
-                        }
-                    }
-                }
+                const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, &servers, server_count, parent_zone);
+                var response = sqr.message;
+                const responding_server = sqr.responding_server;
 
                 // ── Probe response handling (non-final queries) ──
                 if (!is_final) {
@@ -990,6 +854,162 @@ pub const RecursiveResolver = struct {
         if (!resp.header.qr) return null;
 
         return .{ .message = resp, .server = responding_addr };
+    }
+
+    // ── Authoritative Server Query ────────────────────────────────────
+
+    const ServerQueryResult = struct {
+        message: dns.Message,
+        responding_server: ?na.Address,
+    };
+
+    /// Query authoritative nameservers in selection order, with staggered
+    /// racing and opportunistic TLS. Returns the first useful response.
+    fn queryAuthoritativeServers(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        query_name: []const u8,
+        query_type: dns.RType,
+        servers: *[max_servers_per_level]na.Address,
+        server_count: usize,
+        parent_zone: dns.Name,
+    ) anyerror!ServerQueryResult {
+        // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
+        var order_buf: [max_servers_per_level]usize = undefined;
+        const server_order = if (self.ns_selector) |ns|
+            ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
+        else blk: {
+            rand.shuffle(na.Address, self.io, servers[0..server_count]);
+            for (0..server_count) |idx| order_buf[idx] = idx;
+            break :blk order_buf[0..server_count];
+        };
+
+        var last_server_failure: ?dns.Message = null;
+
+        // ── Staggered NS racing (blocking transport only) ──
+        if (self.transport == .blocking and server_order.len >= 2 and self.stagger_ms > 0) {
+            if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, server_order, parent_zone)) |stag| {
+                self.fireOteProbe(stag.server);
+                return .{ .message = stag.message, .responding_server = stag.server };
+            }
+        }
+
+        for (server_order, 0..) |server_idx, server_i| {
+            const server = servers[server_idx];
+            const addr_key = AddressKey.fromAddress(server);
+
+            const is_last_server = (server_i + 1 >= server_order.len);
+
+            // Skip dead servers unless last (fallback when all are dead)
+            if (self.rtt_cache) |rc| {
+                if (rc.isDead(addr_key) and !is_last_server) continue;
+            }
+
+            const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
+
+            const query_id = rand.queryId(self.io);
+
+            // Build iterative query (rd=false, EDNS0)
+            const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                .rd = false,
+                .edns = .{ .do_bit = self.dnssec_aware },
+            });
+
+            // Serialize
+            var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+            const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
+
+            // ── RFC 9539: Opportunistic encrypted query ──
+            if (self.tls_transport) |tls_t| {
+                if (self.encrypted_ns_cache) |oc| {
+                    const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+                    switch (oc.getStatus(tls_key)) {
+                        .capable => {
+                            // Known-good server → try encrypted (pool or new connection)
+                            const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                                .rd = false,
+                                .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
+                            });
+                            var padded_buf: [dns.edns_udp_payload]u8 = undefined;
+                            const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
+
+                            var tls_response_buf: [65535]u8 = undefined;
+                            if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
+                                if (try tryParseMessage(allocator, tls_data)) |tls_response| {
+                                    if (tls_response.header.qr and
+                                        tls_response.header.rcode != .format_error and
+                                        dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
+                                    {
+                                        if (tls_response.header.rcode.isServerError()) {
+                                            last_server_failure = tls_response;
+                                            continue; // Try next server, don't repeat over Do53
+                                        }
+                                        // Don't update RTT cache or NS selector from TLS —
+                                        // different transport latency would poison Do53 estimates.
+                                        return .{ .message = tls_response, .responding_server = null };
+                                    }
+                                }
+                                // TLS error/unparseable — fall through to Do53
+                            } else |_| {
+                                // TLS connection failed — fall through to Do53
+                            }
+                        },
+                        .unknown => {}, // First contact → Do53 now, probe after
+                        .probing, .failed => {}, // Skip, go straight to Do53
+                    }
+                }
+            }
+
+            // ── Do53: UDP with TCP fallback ──
+            const do53_start = monotonic.nowUs();
+            const response = try self.queryServerUdp(
+                allocator,
+                wire_query,
+                query_id,
+                server,
+                per_server_timeout,
+            ) orelse {
+                if (self.ns_selector) |ns|
+                    ns.recordOutcome(parent_zone, server, .timeout, 0);
+                continue;
+            };
+            const do53_elapsed = monotonic.nowUs() - do53_start;
+
+            // RFC 5452 §9.1: question section must match original query.
+            // RFC 9619: FORMERR may omit question section (QDCOUNT=0).
+            if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, query_type)) {
+                if (response.header.rcode != .format_error) continue;
+            }
+
+            // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
+            // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
+            if (response.header.rcode.isServerError()) {
+                if (self.ns_selector) |ns|
+                    ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
+                last_server_failure = response;
+                continue;
+            }
+
+            if (self.ns_selector) |ns|
+                ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
+            self.fireOteProbe(server);
+            return .{ .message = response, .responding_server = server };
+        }
+
+        // Fall back to last SERVFAIL/REFUSED if all servers failed
+        if (last_server_failure) |sf| {
+            return .{ .message = sf, .responding_server = null };
+        }
+        return error.Timeout;
+    }
+
+    fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
+        const oc = self.encrypted_ns_cache orelse return;
+        const tls_t = self.tls_transport orelse return;
+        const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+        if (oc.claimProbe(tls_key)) {
+            tls_t.probeInBackground(server, oc);
+        }
     }
 
     const addressMatchesUpstream = @import("transport.zig").addressMatchesUpstream;
@@ -1592,15 +1612,7 @@ pub const RecursiveResolver = struct {
         fn run(ctx: *NsThreadCtx) void {
             var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{}, ctx.parent.io);
             var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
-            // Clone parent resolver, override transport and per-query mutable state.
-            // Inherits all shared caches/config — new fields on RecursiveResolver
-            // are automatically picked up.
-            var resolver = ctx.parent.*;
-            resolver.transport = .{ .blocking = &udp_t };
-            resolver.tcp_transport = .{ .blocking = &tcp_t };
-            resolver.gpa = null;
-            resolver.resolving_ds = false;
-            resolver.pending_dnskey_prefetch = null;
+            var resolver = ctx.parent.cloneForThread(.{ .blocking = &udp_t }, .{ .blocking = &tcp_t });
 
             // Per-query memory cap (same as main query path)
             var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
