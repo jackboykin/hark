@@ -128,7 +128,6 @@ pub const RttCache = struct {
         const state = self.entries.get(key) orelse return false;
         return state.dead_until_ms > self.now_fn();
     }
-
 };
 
 fn computeTimeout(state: RttState) u32 {
@@ -208,4 +207,3 @@ test "recordTimeout increments consecutive count and marks dead" {
     test_now_ms = 1000 + dead_duration_ms + 1;
     try testing.expect(!cache.isDead(key));
 }
-

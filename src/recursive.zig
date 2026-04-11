@@ -386,7 +386,11 @@ pub const RecursiveResolver = struct {
                     // ── Do53: UDP with TCP fallback ──
                     const do53_start = monotonic.nowUs();
                     response = try self.queryServerUdp(
-                        allocator, wire_query, query_id, server, per_server_timeout,
+                        allocator,
+                        wire_query,
+                        query_id,
+                        server,
+                        per_server_timeout,
                     ) orelse {
                         if (self.ns_selector) |ns|
                             ns.recordOutcome(parent_zone, server, .timeout, 0);
@@ -532,7 +536,10 @@ pub const RecursiveResolver = struct {
                     response.header.aa and !hasSignedRecords(response))
                 {
                     security_state = self.ensureDelegationSecurity(
-                        allocator, target_name, &.{}, servers[0..server_count],
+                        allocator,
+                        target_name,
+                        &.{},
+                        servers[0..server_count],
                     );
                 }
 
@@ -821,9 +828,16 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| {
             c.storeResponseWithStatus(.{
                 .header = .{
-                    .id = 0, .qr = true, .opcode = .query, .aa = true,
-                    .tc = false, .rd = false, .ra = false,
-                    .z = 0, .ad = false, .cd = false,
+                    .id = 0,
+                    .qr = true,
+                    .opcode = .query,
+                    .aa = true,
+                    .tc = false,
+                    .rd = false,
+                    .ra = false,
+                    .z = 0,
+                    .ad = false,
+                    .cd = false,
                     .rcode = .no_error,
                     .qd_count = 0,
                     .an_count = @intCast(wc_count),
@@ -852,7 +866,10 @@ pub const RecursiveResolver = struct {
         const query_start = monotonic.nowUs();
 
         const response_data = self.transport.queryWithTimeout(
-            wire_query, query_id, server, timeout,
+            wire_query,
+            query_id,
+            server,
+            timeout,
         ) catch {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
             return null;
@@ -935,7 +952,8 @@ pub const RecursiveResolver = struct {
 
         // Build and serialize once, copy + patch ID for the second leg
         const msg0 = dns.buildQueryWithOptions(allocator, qid0, query_name, query_type, .{
-            .rd = false, .edns = .{ .do_bit = self.dnssec_aware },
+            .rd = false,
+            .edns = .{ .do_bit = self.dnssec_aware },
         }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
         var wire0: [dns.edns_udp_payload]u8 = undefined;
         const w0 = dns.serializeMessage(&wire0, msg0) catch |err|
@@ -1165,7 +1183,11 @@ pub const RecursiveResolver = struct {
             const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
 
             const response = try self.queryServerUdp(
-                allocator, wire_query, query_id, server, timeout,
+                allocator,
+                wire_query,
+                query_id,
+                server,
+                timeout,
             ) orelse continue;
             // RFC 5452 §9.1: question section must match original query
             if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, qtype)) continue;
@@ -1824,7 +1846,9 @@ fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const d
             .tc = false,
             .rd = false,
             .ra = true,
-            .z = 0, .ad = authenticated, .cd = false,
+            .z = 0,
+            .ad = authenticated,
+            .cd = false,
             .rcode = rcode,
             .qd_count = 0,
             .an_count = @intCast(answers.len),
@@ -2019,7 +2043,9 @@ fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {
         .tc = false,
         .rd = false,
         .ra = false,
-        .z = 0, .ad = false, .cd = false,
+        .z = 0,
+        .ad = false,
+        .cd = false,
         .rcode = .no_error,
         .qd_count = 0,
         .an_count = an_count,
@@ -2579,10 +2605,12 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
             .rtype = .nsec,
             .rclass = .in,
             .ttl = 3600,
-            .rdata = .{ .nsec = .{
-                .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
-                .type_bit_maps = &.{ 0, 1, 0x40 }, // window 0, len 1, A bit
-            } },
+            .rdata = .{
+                .nsec = .{
+                    .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+                    .type_bit_maps = &.{ 0, 1, 0x40 }, // window 0, len 1, A bit
+                },
+            },
         },
         .{
             .name = dns.Name{ .labels = &.{ "example", "com" } },
@@ -2612,10 +2640,12 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
             .rtype = .nsec,
             .rclass = .in,
             .ttl = 3600,
-            .rdata = .{ .nsec = .{
-                .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
-                .type_bit_maps = &.{ 0, 1, 0x02 }, // window 0, len 1, only SOA
-            } },
+            .rdata = .{
+                .nsec = .{
+                    .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+                    .type_bit_maps = &.{ 0, 1, 0x02 }, // window 0, len 1, only SOA
+                },
+            },
         },
     };
     try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false));
@@ -2627,4 +2657,3 @@ test "validateNegativeResponse returns skip_cache when no proof found in secure 
     try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, true));
     try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, false));
 }
-

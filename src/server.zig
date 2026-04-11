@@ -906,7 +906,6 @@ const WorkerState = struct {
         }
         return result;
     }
-
 };
 
 // ── Response building ──────────────────────────────────────────────────
@@ -999,7 +998,9 @@ fn buildResponseWire(
             .tc = false,
             .rd = ctx.rd,
             .ra = true,
-            .z = 0, .ad = response.header.ad and ctx.client_wants_ad, .cd = ctx.cd,
+            .z = 0,
+            .ad = response.header.ad and ctx.client_wants_ad,
+            .cd = ctx.cd,
             .rcode = response.header.rcode,
             .qd_count = @intCast(ctx.questions.len),
             .an_count = @intCast(answers.len),
@@ -1058,7 +1059,9 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
             .tc = false,
             .rd = rd,
             .ra = true,
-            .z = 0, .ad = false, .cd = false,
+            .z = 0,
+            .ad = false,
+            .cd = false,
             .rcode = rcode,
             .qd_count = @intCast(questions.len),
             .an_count = 0,
@@ -1231,7 +1234,9 @@ test "buildResponseWire sets correct header fields" {
             .tc = false,
             .rd = false,
             .ra = true,
-            .z = 0, .ad = false, .cd = false,
+            .z = 0,
+            .ad = false,
+            .cd = false,
             .rcode = .server_failure,
             .qd_count = 0,
             .an_count = 0,
@@ -1283,7 +1288,9 @@ test "buildResponseWire with EDNS0" {
             .tc = false,
             .rd = false,
             .ra = true,
-            .z = 0, .ad = false, .cd = false,
+            .z = 0,
+            .ad = false,
+            .cd = false,
             .rcode = .no_error,
             .qd_count = 0,
             .an_count = 0,

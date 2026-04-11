@@ -18,7 +18,6 @@ pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope } } };
 }
 
-
 /// PosixAddress union for sockaddr conversion (matches Io.Threaded.PosixAddress).
 pub const PosixAddress = extern union {
     any: posix.sockaddr,
@@ -88,8 +87,8 @@ pub fn format(addr: Address, buf: []u8) []const u8 {
             v4.bytes[0], v4.bytes[1], v4.bytes[2], v4.bytes[3], v4.port,
         }) catch "?",
         .ip6 => |v6| std.fmt.bufPrint(buf, "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}", .{
-            mem.readInt(u16, v6.bytes[0..2], .big),  mem.readInt(u16, v6.bytes[2..4], .big),
-            mem.readInt(u16, v6.bytes[4..6], .big),  mem.readInt(u16, v6.bytes[6..8], .big),
+            mem.readInt(u16, v6.bytes[0..2], .big),   mem.readInt(u16, v6.bytes[2..4], .big),
+            mem.readInt(u16, v6.bytes[4..6], .big),   mem.readInt(u16, v6.bytes[6..8], .big),
             mem.readInt(u16, v6.bytes[8..10], .big),  mem.readInt(u16, v6.bytes[10..12], .big),
             mem.readInt(u16, v6.bytes[12..14], .big), mem.readInt(u16, v6.bytes[14..16], .big),
             v6.port,

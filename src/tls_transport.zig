@@ -538,11 +538,10 @@ test "probeThread reverts .probing on shutdown" {
     tls_t.probeInBackground(server, &enc_ns_cache);
 
     // Wait for the detached thread to finish
-    while (enc_ns_cache.active_probes.load(.seq_cst) > 0)
-        {
-            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-            _ = std.os.linux.nanosleep(&ts, null);
-        }
+    while (enc_ns_cache.active_probes.load(.seq_cst) > 0) {
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
 
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
 }

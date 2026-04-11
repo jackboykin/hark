@@ -46,7 +46,7 @@ fn logFn(
     const md = yd.calculateMonthDay();
 
     const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z ", .{
-        yd.year, md.month.numeric(), @as(u9, md.day_index) + 1,
+        yd.year,              md.month.numeric(),      @as(u9, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch return;
     pos = ts.len;

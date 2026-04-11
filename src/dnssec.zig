@@ -1004,8 +1004,7 @@ pub fn validateAnswerRrset(
 /// RFC 6840 §5.11: supported RRSIG algorithms.
 fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
-        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512,
-        .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
+        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
         else => false,
     };
 }
@@ -1024,7 +1023,10 @@ fn validateRrsetForType(
         const rrsig = sig_rr.rdata.rrsig;
         if (rrsig.type_covered != covered_type) continue;
 
-        if (!isSupportedAlgorithm(rrsig.algorithm)) { had_unsupported_algo = true; continue; }
+        if (!isSupportedAlgorithm(rrsig.algorithm)) {
+            had_unsupported_algo = true;
+            continue;
+        }
 
         // Filter RRset by this RRSIG's owner (same owner + type)
         var filtered: [64]dns.ResourceRecord = undefined;
@@ -1087,7 +1089,10 @@ pub fn verifyAuthorityNsecSigs(
             const rrsig = sig_rr.rdata.rrsig;
             if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
 
-            if (!isSupportedAlgorithm(rrsig.algorithm)) { had_unsupported_algo = true; continue; }
+            if (!isSupportedAlgorithm(rrsig.algorithm)) {
+                had_unsupported_algo = true;
+                continue;
+            }
 
             for (dnskey_records) |dk_rr| {
                 if (dk_rr.rtype != .dnskey) continue;
@@ -1385,10 +1390,10 @@ test "ECDSA P-256 signature verification" {
     const sig_bytes = sig.toBytes();
 
     // Should verify
-    try verifyEcdsa(EcdsaP256, 32,&sig_bytes, msg, dnssec_key);
+    try verifyEcdsa(EcdsaP256, 32, &sig_bytes, msg, dnssec_key);
 
     // Wrong message should fail
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32,&sig_bytes, "wrong data", dnssec_key));
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32, &sig_bytes, "wrong data", dnssec_key));
 }
 
 test "Ed25519 signature verification" {
@@ -1409,9 +1414,9 @@ test "invalid key sizes are rejected" {
     const sig96 = [_]u8{0} ** 96;
 
     // ECDSA P-256: key must be 64 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, 32,&sig64, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, 32, &sig64, msg, &.{ 0x01, 0x02 }));
     // ECDSA P-384: key must be 96 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48,&sig96, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48, &sig96, msg, &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, msg, &.{ 0x01, 0x02 }));
 }
@@ -1455,15 +1460,17 @@ test "classifyDelegation with NSEC proving no DS" {
         .rtype = .nsec,
         .rclass = .in,
         .ttl = 86400,
-        .rdata = .{ .nsec = .{
-            .next_domain_name = dns.Name{
-                .labels = &.{
-                    @as([]const u8, "next"),
-                    @as([]const u8, "com"),
+        .rdata = .{
+            .nsec = .{
+                .next_domain_name = dns.Name{
+                    .labels = &.{
+                        @as([]const u8, "next"),
+                        @as([]const u8, "com"),
+                    },
                 },
+                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS, no DS
             },
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS, no DS
-        } },
+        },
     }};
 
     try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
@@ -1748,12 +1755,14 @@ test "validateNegativeProof NSEC NODATA" {
         .rtype = .nsec,
         .rclass = .in,
         .ttl = 300,
-        .rdata = .{ .nsec = .{
-            .next_domain_name = dns.Name{
-                .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
+        .rdata = .{
+            .nsec = .{
+                .next_domain_name = dns.Name{
+                    .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
+                },
+                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS
             },
-            .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS
-        } },
+        },
     }};
 
     // NODATA for AAAA should be proven secure
@@ -1988,7 +1997,7 @@ test "NSEC3 NODATA - secure" {
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
-    const zone_labels: []const []const u8 = &.{ @as([]const u8, "com") };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
     const salt: []const u8 = &.{};
     const hash = try nsec3Hash(qname, salt, 0);
 
@@ -2122,9 +2131,9 @@ test "NSEC3 hash budget exhaustion" {
     // but budget is 8, so should return insecure
     const qname = dns.Name{
         .labels = &.{
-            @as([]const u8, "a"), @as([]const u8, "b"), @as([]const u8, "c"),
-            @as([]const u8, "d"), @as([]const u8, "e"), @as([]const u8, "f"),
-            @as([]const u8, "g"), @as([]const u8, "h"), @as([]const u8, "i"),
+            @as([]const u8, "a"), @as([]const u8, "b"),       @as([]const u8, "c"),
+            @as([]const u8, "d"), @as([]const u8, "e"),       @as([]const u8, "f"),
+            @as([]const u8, "g"), @as([]const u8, "h"),       @as([]const u8, "i"),
             @as([]const u8, "j"), @as([]const u8, "example"), @as([]const u8, "com"),
         },
     };

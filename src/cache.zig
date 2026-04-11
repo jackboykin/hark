@@ -929,9 +929,21 @@ fn makeTestName(alloc: Allocator, comptime labels: []const []const u8) !dns.Name
 fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
     return .{
         .header = .{
-            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
-            .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error,
-            .qd_count = 0, .an_count = @intCast(answers.len), .ns_count = 0, .ar_count = 0,
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = true,
+            .tc = false,
+            .rd = false,
+            .ra = false,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 0,
+            .an_count = @intCast(answers.len),
+            .ns_count = 0,
+            .ar_count = 0,
         },
         .questions = &.{},
         .answers = answers,
@@ -1065,15 +1077,17 @@ test "cache negative NXDOMAIN" {
         .rtype = .soa,
         .rclass = .in,
         .ttl = 900,
-        .rdata = .{ .soa = .{
-            .mname = mname,
-            .rname = rname,
-            .serial = 2024010101,
-            .refresh = 3600,
-            .retry = 900,
-            .expire = 604800,
-            .minimum = 600, // min(900, 600) = 600
-        } },
+        .rdata = .{
+            .soa = .{
+                .mname = mname,
+                .rname = rname,
+                .serial = 2024010101,
+                .refresh = 3600,
+                .retry = 900,
+                .expire = 604800,
+                .minimum = 600, // min(900, 600) = 600
+            },
+        },
     };
     defer {
         for (authorities) |rr| {
@@ -1151,7 +1165,7 @@ test "storeNegative accepts parent-zone SOA" {
     defer cache.deinit();
 
     // SOA for "com" — valid parent of "www.example.com"
-    const soa_name = try makeTestName(alloc, &.{ "com" });
+    const soa_name = try makeTestName(alloc, &.{"com"});
     const mname = try makeTestName(alloc, &.{ "ns1", "com" });
     const rname = try makeTestName(alloc, &.{ "admin", "com" });
 
@@ -1364,7 +1378,6 @@ test "cache prefetch flag at 10 percent TTL" {
             .hit => |h| {
                 try testing.expectEqual(@as(u32, 150), h.remaining_ttl);
                 try testing.expectEqual(false, h.needs_prefetch);
-
             },
             .negative => return error.TestUnexpectedResult,
         }
@@ -1381,7 +1394,6 @@ test "cache prefetch flag at 10 percent TTL" {
             .hit => |h| {
                 try testing.expectEqual(@as(u32, 15), h.remaining_ttl);
                 try testing.expectEqual(true, h.needs_prefetch);
-
             },
             .negative => return error.TestUnexpectedResult,
         }
