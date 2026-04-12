@@ -245,6 +245,7 @@ pub const TlsTransport = struct {
             .read_buffer = &conn.tls_read_buf,
             .write_buffer = &conn.tls_write_buf,
             .alpn = "dot",
+            .alpn_required = false,
         }, self.io) catch return error.TlsHandshakeFailed;
 
         return conn;

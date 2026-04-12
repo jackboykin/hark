@@ -133,6 +133,10 @@ pub const Options = struct {
     /// ALPN protocol name to negotiate (e.g., "dot" for DNS-over-TLS).
     /// If non-null, the ClientHello includes an ALPN extension.
     alpn: ?[]const u8 = null,
+    /// When true (default), the handshake fails if the server does not echo
+    /// the requested ALPN. Set to false for opportunistic connections where
+    /// encryption matters more than protocol negotiation.
+    alpn_required: bool = true,
 };
 
 const InitError = error{
@@ -639,8 +643,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options, io: std.Io) InitE
                                 else => {},
                             }
                         }
-                        // RFC 7301 §3.2: if we requested ALPN, server MUST respond with it
-                        if (options.alpn != null and !alpn_seen) {
+                        // RFC 7301 §3.2: server MUST echo ALPN — waived for opportunistic TLS
+                        if (options.alpn != null and options.alpn_required and !alpn_seen) {
                             return error.TlsIllegalParameter;
                         }
                         handshake_state = .certificate;

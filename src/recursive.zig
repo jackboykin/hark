@@ -951,7 +951,7 @@ pub const RecursiveResolver = struct {
                                 }
                                 // TLS error/unparseable — fall through to Do53
                             } else |_| {
-                                // TLS connection failed — fall through to Do53
+                                oc.markFailed(tls_key);
                             }
                         },
                         .unknown => {}, // First contact → Do53 now, probe after
