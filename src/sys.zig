@@ -1,6 +1,12 @@
 /// Thin wrappers around std.os.linux.* syscalls with error handling.
 /// Replaces the removed std.posix socket functions in Zig 0.16.
 /// Matches the old posix.* signatures for mechanical migration.
+///
+/// sendto/recvfrom/write/read retry on EINTR internally. SIGINT/SIGTERM are
+/// blocked and delivered via signalfd, but other unblocked signals (SIGPIPE,
+/// profilers, etc.) can still interrupt blocking syscalls; looping avoids
+/// dropping in-flight queries. connect/accept surface Interrupted because
+/// retry semantics are context-dependent.
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -74,32 +80,36 @@ pub fn recv(fd: posix.fd_t, buf: []u8, flags: u32) !usize {
 }
 
 pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, len: posix.socklen_t) !usize {
-    const rc = linux.sendto(fd, buf.ptr, buf.len, flags, addr, len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => rc,
-        .AGAIN => error.WouldBlock,
-        .BADF, .NOTSOCK => unreachable,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .INTR => error.Interrupted,
-        .MSGSIZE => error.MessageTooBig,
-        .PIPE => error.BrokenPipe,
-        .NOMEM => error.SystemResources,
-        else => |e| posix.unexpectedErrno(e),
-    };
+    while (true) {
+        const rc = linux.sendto(fd, buf.ptr, buf.len, flags, addr, len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            .BADF, .NOTSOCK => unreachable,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .INTR => continue,
+            .MSGSIZE => error.MessageTooBig,
+            .PIPE => error.BrokenPipe,
+            .NOMEM => error.SystemResources,
+            else => |e| posix.unexpectedErrno(e),
+        };
+    }
 }
 
 pub fn recvfrom(fd: posix.fd_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) !usize {
-    const rc = linux.recvfrom(fd, buf.ptr, buf.len, flags, addr, len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => rc,
-        .AGAIN => error.WouldBlock,
-        .BADF, .NOTSOCK => unreachable,
-        .CONNREFUSED => error.ConnectionRefused,
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .CONNRESET => error.ConnectionResetByPeer,
-        else => |e| posix.unexpectedErrno(e),
-    };
+    while (true) {
+        const rc = linux.recvfrom(fd, buf.ptr, buf.len, flags, addr, len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            .BADF, .NOTSOCK => unreachable,
+            .CONNREFUSED => error.ConnectionRefused,
+            .INTR => continue,
+            .NOMEM => error.SystemResources,
+            .CONNRESET => error.ConnectionResetByPeer,
+            else => |e| posix.unexpectedErrno(e),
+        };
+    }
 }
 
 pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
@@ -113,31 +123,35 @@ pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t)
 }
 
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
-    const rc = linux.write(fd, buf.ptr, buf.len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => rc,
-        .AGAIN => error.WouldBlock,
-        .BADF => unreachable,
-        .INTR => error.Interrupted,
-        .IO => error.InputOutput,
-        .NOSPC => error.NoSpaceLeft,
-        .PIPE => error.BrokenPipe,
-        .NOMEM => error.SystemResources,
-        else => |e| posix.unexpectedErrno(e),
-    };
+    while (true) {
+        const rc = linux.write(fd, buf.ptr, buf.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            .BADF => unreachable,
+            .INTR => continue,
+            .IO => error.InputOutput,
+            .NOSPC => error.NoSpaceLeft,
+            .PIPE => error.BrokenPipe,
+            .NOMEM => error.SystemResources,
+            else => |e| posix.unexpectedErrno(e),
+        };
+    }
 }
 
 pub fn read(fd: posix.fd_t, buf: []u8) !usize {
-    const rc = linux.read(fd, buf.ptr, buf.len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => rc,
-        .AGAIN => error.WouldBlock,
-        .BADF => unreachable,
-        .INTR => error.Interrupted,
-        .IO => error.InputOutput,
-        .NOMEM => error.SystemResources,
-        else => |e| posix.unexpectedErrno(e),
-    };
+    while (true) {
+        const rc = linux.read(fd, buf.ptr, buf.len);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN => error.WouldBlock,
+            .BADF => unreachable,
+            .INTR => continue,
+            .IO => error.InputOutput,
+            .NOMEM => error.SystemResources,
+            else => |e| posix.unexpectedErrno(e),
+        };
+    }
 }
 
 pub fn open(path: [*:0]const u8, flags: std.posix.O, mode: std.posix.mode_t) !posix.fd_t {

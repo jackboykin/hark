@@ -229,16 +229,22 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 }
 
 /// Clone cached records into caller-owned ResourceRecords with a given TTL.
-fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ?[]dns.ResourceRecord {
-    const records = alloc.alloc(dns.ResourceRecord, cached.len) catch return null;
+fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
+    const records = try alloc.alloc(dns.ResourceRecord, cached.len);
+    errdefer alloc.free(records);
+    var done: usize = 0;
+    errdefer dns.freeResourceRecordContents(alloc, records[0..done]);
     for (cached, 0..) |cr, i| {
+        const cloned_name = try cloneName(alloc, cr.name);
+        errdefer dns.freeName(alloc, cloned_name);
         records[i] = .{
-            .name = cloneName(alloc, cr.name) catch return null,
+            .name = cloned_name,
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
-            .rdata = cloneRData(alloc, cr.rdata) catch return null,
+            .rdata = try cloneRData(alloc, cr.rdata),
         };
+        done = i + 1;
     }
     return records;
 }
@@ -246,12 +252,17 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ?[]dns.R
 /// Clone an optional CachedRecord into a ResourceRecord with a given TTL.
 fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.ResourceRecord {
     const s = cached orelse return null;
+    const cloned_name = cloneName(alloc, s.name) catch return null;
+    const cloned_rdata = cloneRData(alloc, s.rdata) catch {
+        dns.freeName(alloc, cloned_name);
+        return null;
+    };
     return dns.ResourceRecord{
-        .name = cloneName(alloc, s.name) catch return null,
+        .name = cloned_name,
         .rtype = s.rtype,
         .rclass = s.rclass,
         .ttl = ttl,
-        .rdata = cloneRData(alloc, s.rdata) catch return null,
+        .rdata = cloned_rdata,
     };
 }
 
@@ -428,7 +439,7 @@ pub const RRsetCache = struct {
                     // Stale but within window — serve with synthetic TTL (RFC 8767).
                     // Clear security status: RRSIGs may have expired since caching,
                     // so the resolver cannot vouch for authenticity (RFC 4035 §3.2.3).
-                    const records = cloneRRset(caller_alloc, rrset.records, 30) orelse return null;
+                    const records = cloneRRset(caller_alloc, rrset.records, 30) catch return null;
                     _ = self.hits.fetchAdd(1, .monotonic);
                     _ = self.stale_hits.fetchAdd(1, .monotonic);
                     _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
@@ -438,7 +449,7 @@ pub const RRsetCache = struct {
                 const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
                 const remaining = rrset.original_ttl - elapsed;
                 const needs_prefetch = self.prefetch and (remaining * 10 <= rrset.original_ttl);
-                const records = cloneRRset(caller_alloc, rrset.records, remaining) orelse return null;
+                const records = cloneRRset(caller_alloc, rrset.records, remaining) catch return null;
 
                 _ = self.hits.fetchAdd(1, .monotonic);
                 if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
@@ -596,6 +607,7 @@ pub const RRsetCache = struct {
             alloc.free(key_name);
             return;
         };
+        self.markLastVisited();
         _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
@@ -641,6 +653,7 @@ pub const RRsetCache = struct {
             alloc.free(key_name);
             return;
         };
+        self.markLastVisited();
         _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
@@ -785,6 +798,7 @@ pub const RRsetCache = struct {
                 alloc.free(key_name);
                 continue;
             };
+            self.markLastVisited();
             _ = self.stores.fetchAdd(1, .monotonic);
         }
     }
@@ -796,6 +810,13 @@ pub const RRsetCache = struct {
 
     inline fn markVisited(self: *RRsetCache, i: usize) void {
         if (self.visited) |v| if (i < v.len) v[i].store(1, .monotonic);
+    }
+
+    /// Mark the most recently inserted entry as visited. Callers MUST invoke
+    /// this only after a `map.put` that was a fresh insert (not an update),
+    /// so the new entry sits at the tail of the ordered map.
+    inline fn markLastVisited(self: *RRsetCache) void {
+        self.markVisited(self.map.count() - 1);
     }
 
     inline fn clearVisited(self: *RRsetCache, i: usize) void {

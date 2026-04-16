@@ -138,7 +138,13 @@ pub fn validateDnskeyRrset(
     const tags = key_tags[0..@min(dnskey_records.len, key_tags.len)];
 
     // Try all DS records × all RRSIGs covering DNSKEY (RFC 6840 §5.11)
-    for (ds_records) |ds| {
+    outer: for (ds_records) |ds| {
+        // RFC 6840 §5.2: if a SHA-256 DS covers the same key_tag, MUST NOT use SHA-1.
+        if (ds.digest_type == .sha1) {
+            for (ds_records) |ds2| {
+                if (ds2.digest_type == .sha256 and ds2.key_tag == ds.key_tag) continue :outer;
+            }
+        }
         if (findMatchingDnskey(ds, dnskey_records, zone_name, tags)) |ksk_match| {
             const ksk = ksk_match.dnskey;
             const ksk_tag = tags[ksk_match.index];
@@ -223,6 +229,9 @@ pub fn classifyDelegation(
         }
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
+            // Permissive: skip unsupported hash algos to let a sibling NSEC3
+            // still prove the zone insecure. Validation path is strict below.
+            if (nsec3.hash_algorithm != .sha1) continue;
             if (nsec3.iterations > max_nsec3_iterations) {
                 had_nsec3_high_iterations = true;
                 continue;
@@ -544,6 +553,12 @@ pub fn verifyRrsig(
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
 ) VerifyError!void {
+    // RFC 4034 §3.1.3: labels MUST NOT exceed the owner's non-root label count.
+    for (rrset) |rr| {
+        if (rrsig.labels > rr.name.labels.len) return error.InvalidSignature;
+        if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
+    }
+
     // RFC 4035 §5.3.1: check signature validity period
     if (serialAfter(rrsig.sig_inception, now_u32)) return error.SignatureExpired;
     if (serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
@@ -659,6 +674,18 @@ pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
     return std.math.order(a.labels.len, b.labels.len);
 }
 
+/// Number of trailing labels shared between two names (case-insensitive).
+/// Used to derive the closest encloser from an NSEC that covers qname.
+fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
+    const min_labels = @min(a.labels.len, b.labels.len);
+    for (0..min_labels) |i| {
+        const al = a.labels[a.labels.len - 1 - i];
+        const bl = b.labels[b.labels.len - 1 - i];
+        if (cmpLabelsCI(al, bl) != .eq) return i;
+    }
+    return min_labels;
+}
+
 /// Case-insensitive label comparison, byte-by-byte.
 fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     const min_len = @min(a.len, b.len);
@@ -762,7 +789,8 @@ pub fn nsec3HashInRange(
 // ── NSEC3 Owner Hash + Budgeted Hashing ──────────────────────────────
 
 /// Maximum hash computations per NSEC3 validation (CVE-2023-50868 mitigation).
-pub const max_nsec3_hash_budget: u16 = 8;
+/// Worst case: 32 hashes * 150 max iterations = 4800 SHA-1 ops.
+pub const max_nsec3_hash_budget: u16 = 32;
 
 /// Extract the raw hash from an NSEC3 owner name by base32hex-decoding its first label.
 /// Returns null if the label length is wrong or contains invalid characters.
@@ -776,16 +804,26 @@ pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     return result;
 }
 
-/// Compute NSEC3 hash with budget tracking. Returns null if budget exhausted.
+pub const BudgetedHashError = error{ BudgetExhausted, HashFailed };
+
+/// Compute NSEC3 hash with budget tracking. Callers map BudgetExhausted to
+/// .insecure (CVE-2023-50868 mitigation) and HashFailed to .bogus.
 pub fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
     budget: *u16,
-) ?[Sha1.digest_length]u8 {
-    if (budget.* == 0) return null;
+) BudgetedHashError![Sha1.digest_length]u8 {
+    if (budget.* == 0) return error.BudgetExhausted;
     budget.* -= 1;
-    return nsec3Hash(name, salt, iterations) catch return null;
+    return nsec3Hash(name, salt, iterations) catch return error.HashFailed;
+}
+
+fn budgetedHashStatus(e: BudgetedHashError) SecurityStatus {
+    return switch (e) {
+        error.BudgetExhausted => .insecure,
+        error.HashFailed => .bogus,
+    };
 }
 
 // ── Mixed NSEC/NSEC3 Detection ───────────────────────────────────────
@@ -815,47 +853,57 @@ pub fn validateNegativeProof(
     // Reject mixed NSEC/NSEC3
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
-    // Try NSEC proofs first
-    var name_denied = false;
+    // Try NSEC proofs first. Track the NSEC that covered qname so we can derive
+    // the closest encloser and only test wildcard denial at the correct name.
+    // Invariant: `any_nsec` remains false when the proof is pure NSEC3, which
+    // lets control fall through to the NSEC3 path below.
+    var covering_nsec: ?dns.ResourceRecord = null;
+    var any_nsec = false;
     for (authorities) |rr| {
-        if (rr.rtype == .nsec) {
-            if (is_nxdomain) {
-                if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) {
-                    name_denied = true;
-                }
-            } else {
-                // NODATA: NSEC owner matches qname, type not in bitmap
-                if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype)) {
-                    return .secure;
-                }
+        if (rr.rtype != .nsec) continue;
+        any_nsec = true;
+        if (is_nxdomain) {
+            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) {
+                covering_nsec = rr;
+            }
+        } else {
+            // NODATA: NSEC owner matches qname, type not in bitmap
+            if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype)) {
+                return .secure;
             }
         }
     }
 
-    // RFC 4035 §5.4: NXDOMAIN requires both name denial AND wildcard denial
-    if (is_nxdomain and name_denied) {
-        var wildcard_denied = false;
-        // Walk ancestors of qname to construct *.ancestor and check wildcard denial
-        var label_offset: usize = 1; // start at parent
-        while (label_offset < qname.labels.len) : (label_offset += 1) {
-            var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
-            const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-            const wildcard = dns.makeWildcardName(&wc_labels_buf, ancestor) orelse continue;
+    // RFC 4035 §5.4: NXDOMAIN requires both name denial AND wildcard denial at
+    // the closest encloser. The CE is the longest label-suffix of qname that is
+    // also a suffix of the covering NSEC's owner or next_domain_name.
+    if (is_nxdomain and any_nsec) {
+        const covering = covering_nsec orelse return .unchecked;
+        const ce_depth = @max(
+            commonSuffixLabels(qname, covering.name),
+            commonSuffixLabels(qname, covering.rdata.nsec.next_domain_name),
+        );
+        // CE must be a proper ancestor of qname (strictly fewer labels).
+        if (ce_depth >= qname.labels.len) return .bogus;
+        var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+        const wildcard = dns.makeWildcardName(
+            &wc_labels_buf,
+            dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] },
+        ) orelse return .unchecked;
 
-            for (authorities) |rr| {
-                if (rr.rtype != .nsec) continue;
-                // Wildcard is covered by NSEC range (doesn't exist)
-                if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) {
-                    wildcard_denied = true;
-                    break;
-                }
-                // Wildcard matches NSEC owner but qtype absent (NODATA at wildcard)
-                if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, wildcard, qtype)) {
-                    wildcard_denied = true;
-                    break;
-                }
+        var wildcard_denied = false;
+        for (authorities) |rr| {
+            if (rr.rtype != .nsec) continue;
+            // Wildcard is covered by NSEC range (doesn't exist)
+            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) {
+                wildcard_denied = true;
+                break;
             }
-            if (wildcard_denied) break;
+            // Wildcard matches NSEC owner but qtype absent (NODATA at wildcard)
+            if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, wildcard, qtype)) {
+                wildcard_denied = true;
+                break;
+            }
         }
         if (wildcard_denied) return .secure;
         return .unchecked;
@@ -879,6 +927,7 @@ fn validateNsec3NegativeProof(
     for (authorities) |rr| {
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
+            if (nsec3.hash_algorithm != .sha1) return .bogus;
             if (nsec3.iterations > max_nsec3_iterations) return .bogus;
             salt = nsec3.salt;
             iterations = nsec3.iterations;
@@ -892,7 +941,8 @@ fn validateNsec3NegativeProof(
 
     if (!is_nxdomain) {
         // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
-        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) orelse return .bogus;
+        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) catch |e|
+            return budgetedHashStatus(e);
         for (authorities) |rr| {
             if (rr.rtype != .nsec3) continue;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
@@ -917,7 +967,8 @@ fn validateNsec3NegativeProof(
     while (label_offset < qname.labels.len) : (label_offset += 1) {
         // Build ancestor name from qname.labels[label_offset..]
         const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) orelse return .bogus;
+        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) catch |e|
+            return budgetedHashStatus(e);
 
         for (authorities) |rr| {
             if (rr.rtype != .nsec3) continue;
@@ -936,13 +987,15 @@ fn validateNsec3NegativeProof(
 
     // Next closer name: CE + one label toward qname = qname.labels[ce_offset - 1..]
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) orelse return .bogus;
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) catch |e|
+        return budgetedHashStatus(e);
 
     // Wildcard at closest encloser: *.CE
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
-    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) orelse return .bogus;
+    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) catch |e|
+        return budgetedHashStatus(e);
 
     // Verify: some NSEC3 covers the next-closer hash
     var nc_covered = false;
@@ -1002,9 +1055,10 @@ pub fn validateAnswerRrset(
 }
 
 /// RFC 6840 §5.11: supported RRSIG algorithms.
+/// RFC 8624: RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7) are NOT RECOMMENDED; treat as unsupported.
 fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
-        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
+        .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
         else => false,
     };
 }
@@ -1842,6 +1896,49 @@ test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
     try testing.expectEqual(SecurityStatus.unchecked, status);
 }
 
+fn nsecRr(owner: dns.Name, next: dns.Name) dns.ResourceRecord {
+    return .{
+        .name = owner,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = &.{} } },
+    };
+}
+
+test "validateNegativeProof NSEC NXDOMAIN deep CE (not zone apex)" {
+    // qname = missing.sub.example.com; CE is sub.example.com, NOT example.com.
+    // Covering NSEC endpoints share sub.example.com with qname; wildcard denial
+    // must be at *.sub.example.com, not *.example.com.
+    const aaa_sub = dns.Name{ .labels = &.{ "aaa", "sub", "example", "com" } };
+    const zzz_sub = dns.Name{ .labels = &.{ "zzz", "sub", "example", "com" } };
+    const sub = dns.Name{ .labels = &.{ "sub", "example", "com" } };
+    const missing = dns.Name{ .labels = &.{ "missing", "sub", "example", "com" } };
+
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(aaa_sub, zzz_sub), // covers qname: aaa < missing < zzz
+        nsecRr(sub, aaa_sub), // covers *.sub.example.com: sub < *.sub < aaa.sub
+    };
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true));
+}
+
+test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" {
+    // Same qname but the only wildcard denial present is for *.example.com,
+    // not *.sub.example.com. RFC 4035 §5.4 requires denial at the CE; this
+    // proof is incomplete and must NOT validate as secure.
+    const aaa_sub = dns.Name{ .labels = &.{ "aaa", "sub", "example", "com" } };
+    const zzz_sub = dns.Name{ .labels = &.{ "zzz", "sub", "example", "com" } };
+    const example_com = dns.Name{ .labels = &.{ "example", "com" } };
+    const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
+    const missing = dns.Name{ .labels = &.{ "missing", "sub", "example", "com" } };
+
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(aaa_sub, zzz_sub),
+        nsecRr(example_com, aaa), // covers *.example.com only (wrong level)
+    };
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true));
+}
+
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
     // A single NSEC that covers both the qname AND the wildcard
     const example_com = dns.Name{
@@ -1907,7 +2004,7 @@ fn makeNsec3Rr(
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
+            .hash_algorithm = .sha1,
             .flags = 0,
             .iterations = 0,
             .salt = salt,
@@ -2127,16 +2224,17 @@ test "classifyDelegation NSEC3 non-match" {
 }
 
 test "NSEC3 hash budget exhaustion" {
-    // Deep qname: a.b.c.d.e.f.g.h.i.j.example.com — needs 10+ hashes to find CE,
-    // but budget is 8, so should return insecure
-    const qname = dns.Name{
-        .labels = &.{
-            @as([]const u8, "a"), @as([]const u8, "b"),       @as([]const u8, "c"),
-            @as([]const u8, "d"), @as([]const u8, "e"),       @as([]const u8, "f"),
-            @as([]const u8, "g"), @as([]const u8, "h"),       @as([]const u8, "i"),
-            @as([]const u8, "j"), @as([]const u8, "example"), @as([]const u8, "com"),
-        },
+    // Deep qname: build enough labels to exceed max_nsec3_hash_budget. With budget=32
+    // and 1 hash per ancestor lookup, a qname deeper than 32 labels exhausts the budget
+    // before finding a CE, and should be treated as .insecure (DoS mitigation).
+    const deep_labels: []const []const u8 = &.{
+        "l00", "l01",     "l02", "l03", "l04", "l05", "l06", "l07",
+        "l08", "l09",     "l10", "l11", "l12", "l13", "l14", "l15",
+        "l16", "l17",     "l18", "l19", "l20", "l21", "l22", "l23",
+        "l24", "l25",     "l26", "l27", "l28", "l29", "l30", "l31",
+        "l32", "example", "com",
     };
+    const qname = dns.Name{ .labels = deep_labels };
     const salt: []const u8 = &.{};
 
     // One unrelated NSEC3 — will never match any ancestor, so budget gets exhausted
@@ -2146,7 +2244,7 @@ test "NSEC3 hash budget exhaustion" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
 }
 
 test "NSEC3 high-iteration returns bogus" {
@@ -2166,7 +2264,7 @@ test "NSEC3 high-iteration returns bogus" {
         .rclass = .in,
         .ttl = 300,
         .rdata = .{ .nsec3 = .{
-            .hash_algorithm = 1,
+            .hash_algorithm = .sha1,
             .flags = 0,
             .iterations = 200,
             .salt = salt,

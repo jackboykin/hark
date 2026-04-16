@@ -556,6 +556,11 @@ const WorkerState = struct {
                             .accept => |acc| {
                                 if (acc.err == null and acc.fd >= 0) {
                                     if (!self.queue.pushTcpClient(acc.fd)) {
+                                        // Drop silently (no SERVFAIL): we haven't read the
+                                        // query yet so we don't have an ID, and reading it
+                                        // would consume the pool capacity we're protecting.
+                                        // Client sees TCP reset and should retry (typically
+                                        // over UDP).
                                         log.warn("resolution queue full, dropping TCP client", .{});
                                         sys.close(acc.fd);
                                     }
@@ -808,6 +813,7 @@ const WorkerState = struct {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
                         self.processTcpClient(item.sock_fd, udp, tcp, tls);
                     } else {
+                        // Drop silently for the same reason as the queue-full path above.
                         log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
                         sys.close(item.sock_fd);
                     }

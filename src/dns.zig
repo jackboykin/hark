@@ -92,6 +92,7 @@ pub const Error = error{
     EndOfData,
     LabelTooLong,
     NameTooLong,
+    TooManyLabels,
     CompressionPointerLoop,
     FormatError,
     InvalidLabelType,
@@ -257,6 +258,12 @@ pub const DigestType = enum(u8) {
     _,
 };
 
+/// RFC 5155 §8.1: the only NSEC3 hash algorithm defined is SHA-1.
+pub const Nsec3HashAlgorithm = enum(u8) {
+    sha1 = 1,
+    _,
+};
+
 pub const RrsigData = struct {
     type_covered: RType,
     algorithm: DnssecAlgorithm,
@@ -297,7 +304,7 @@ pub const NsecData = struct {
 };
 
 pub const Nsec3Data = struct {
-    hash_algorithm: u8,
+    hash_algorithm: Nsec3HashAlgorithm,
     flags: u8,
     iterations: u16,
     salt: []const u8,
@@ -306,7 +313,7 @@ pub const Nsec3Data = struct {
 };
 
 pub const Nsec3ParamData = struct {
-    hash_algorithm: u8,
+    hash_algorithm: Nsec3HashAlgorithm,
     flags: u8,
     iterations: u16,
     salt: []const u8,
@@ -622,6 +629,7 @@ pub const Parser = struct {
                 // Normal label
                 const label_len: usize = len_byte;
                 if (label_len > max_label_len) return error.LabelTooLong;
+                if (labels.items.len >= max_label_count) return error.TooManyLabels;
                 cursor += 1;
                 if (cursor + label_len > self.msg.len) return error.EndOfData;
                 const label_data = self.msg[cursor..][0..label_len];
@@ -795,7 +803,7 @@ pub const Parser = struct {
             },
             .nsec3 => {
                 if (rdlength < 6) return error.InvalidRDataLength;
-                const hash_algorithm = try self.readU8();
+                const hash_algorithm: Nsec3HashAlgorithm = @enumFromInt(try self.readU8());
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
@@ -818,7 +826,7 @@ pub const Parser = struct {
             },
             .nsec3param => {
                 if (rdlength < 5) return error.InvalidRDataLength;
-                const hash_algorithm = try self.readU8();
+                const hash_algorithm: Nsec3HashAlgorithm = @enumFromInt(try self.readU8());
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
@@ -1086,7 +1094,7 @@ pub const Serializer = struct {
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
-                try self.writeU8(nsec3.hash_algorithm);
+                try self.writeU8(@intFromEnum(nsec3.hash_algorithm));
                 try self.writeU8(nsec3.flags);
                 try self.writeU16(nsec3.iterations);
                 try self.writeU8(try castOrRDataErr(u8, nsec3.salt.len));
@@ -1096,7 +1104,7 @@ pub const Serializer = struct {
                 try self.writeSlice(nsec3.type_bit_maps);
             },
             .nsec3param => |nsec3p| {
-                try self.writeU8(nsec3p.hash_algorithm);
+                try self.writeU8(@intFromEnum(nsec3p.hash_algorithm));
                 try self.writeU8(nsec3p.flags);
                 try self.writeU16(nsec3p.iterations);
                 try self.writeU8(try castOrRDataErr(u8, nsec3p.salt.len));
@@ -1314,7 +1322,7 @@ fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
         },
         .nsec3 => |nsec3| {
             try writer.print("{d} {d} {d} ", .{
-                nsec3.hash_algorithm,
+                @intFromEnum(nsec3.hash_algorithm),
                 nsec3.flags,
                 nsec3.iterations,
             });
@@ -1331,7 +1339,7 @@ fn printResourceRecord(rr: ResourceRecord, writer: anytype) !void {
         },
         .nsec3param => |nsec3p| {
             try writer.print("{d} {d} {d} ", .{
-                nsec3p.hash_algorithm,
+                @intFromEnum(nsec3p.hash_algorithm),
                 nsec3p.flags,
                 nsec3p.iterations,
             });
@@ -2096,7 +2104,7 @@ fn appendRr(list: *ArrayList(ResourceRecord), allocator: Allocator, rr: Resource
     };
 }
 
-fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
+pub fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
     for (rrs) |rr| {
         freeName(allocator, rr.name);
         freeRData(allocator, rr.rdata);
@@ -2502,7 +2510,7 @@ test "NSEC3 record parse/serialize roundtrip" {
     defer freeMessage(testing.allocator, msg);
 
     const nsec3 = msg.answers[0].rdata.nsec3;
-    try testing.expectEqual(@as(u8, 1), nsec3.hash_algorithm);
+    try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
     try testing.expectEqual(@as(u8, 0), nsec3.flags);
     try testing.expectEqual(@as(u16, 10), nsec3.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3.salt);
@@ -2554,7 +2562,7 @@ test "NSEC3PARAM record parse/serialize roundtrip" {
     defer freeMessage(testing.allocator, msg);
 
     const nsec3p = msg.answers[0].rdata.nsec3param;
-    try testing.expectEqual(@as(u8, 1), nsec3p.hash_algorithm);
+    try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3p.hash_algorithm);
     try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
 

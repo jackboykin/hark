@@ -2595,7 +2595,7 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
             .rclass = .in,
             .ttl = 3600,
             .rdata = .{ .nsec3 = .{
-                .hash_algorithm = 1,
+                .hash_algorithm = .sha1,
                 .flags = 0,
                 .iterations = 0,
                 .salt = &.{},
