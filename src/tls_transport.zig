@@ -39,22 +39,25 @@ pub const TlsTransport = struct {
         return .{ .allocator = allocator, .config = config, .ca_bundle = ca_bundle, .io = io };
     }
 
+    /// Try a query on a pooled connection for `key`. Returns null if no pool,
+    /// no pooled conn available, or the pooled conn failed (and was released).
+    fn tryPooledQuery(self: *TlsTransport, key: AddressKey, wire_query: []const u8, response_buf: []u8) ?[]const u8 {
+        const pool = self.pool orelse return null;
+        const conn = pool.acquire(key) orelse return null;
+        if (queryOnConnection(conn, wire_query, response_buf)) |data| {
+            pool.release(key, conn, true);
+            return data;
+        } else |_| {
+            pool.release(key, conn, false);
+            return null;
+        }
+    }
+
     pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
         const tls_server = toPort(server, self.config.port);
         const key = AddressKey.fromAddress(tls_server);
 
-        // ── Try pooled connection first ──
-        if (self.pool) |pool| {
-            if (pool.acquire(key)) |conn| {
-                if (queryOnConnection(conn, wire_query, response_buf)) |data| {
-                    pool.release(key, conn, true);
-                    return data;
-                } else |_| {
-                    // Pooled connection failed — close it, fall through to new connection
-                    pool.release(key, conn, false);
-                }
-            }
-        }
+        if (self.tryPooledQuery(key, wire_query, response_buf)) |data| return data;
 
         // ── Establish new connection ──
         const conn = try self.connectAndHandshake(tls_server);
@@ -125,17 +128,7 @@ pub const TlsTransport = struct {
         const tls_server = toPort(server, self.config.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
-        // ── Try pooled connection first ──
-        if (self.pool) |pool| {
-            if (pool.acquire(addr_key)) |conn| {
-                if (queryOnConnection(conn, wire_query, response_buf)) |data| {
-                    pool.release(addr_key, conn, true);
-                    return data;
-                } else |_| {
-                    pool.release(addr_key, conn, false);
-                }
-            }
-        }
+        if (self.tryPooledQuery(addr_key, wire_query, response_buf)) |data| return data;
 
         // ── New connection ──
         const sock = try connectTcpBlocking(tls_server, timeout_ms);

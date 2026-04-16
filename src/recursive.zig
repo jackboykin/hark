@@ -3,9 +3,8 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
-const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
-const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
+const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
@@ -75,8 +74,8 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
 pub const RecursiveResolver = struct {
-    transport: AnyUdpTransport,
-    tcp_transport: ?AnyTcpTransport = null,
+    transport: *BlockingUdpTransport,
+    tcp_transport: ?*BlockingTcpTransport = null,
     io: std.Io = undefined,
     cache: ?*RRsetCache = null,
     qname_minimisation: bool = true,
@@ -114,7 +113,7 @@ pub const RecursiveResolver = struct {
     /// Create a thread-local resolver clone with fresh transports. Shared
     /// caches and config are inherited; transport and per-query mutable
     /// state are reset so the clone is safe for independent resolution.
-    fn cloneForThread(self: *RecursiveResolver, udp: AnyUdpTransport, tcp: AnyTcpTransport) RecursiveResolver {
+    fn cloneForThread(self: *RecursiveResolver, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport) RecursiveResolver {
         var resolver = self.*;
         resolver.transport = udp;
         resolver.tcp_transport = tcp;
@@ -135,7 +134,7 @@ pub const RecursiveResolver = struct {
     const failover_timeout_cap: u32 = 2000;
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.getTimeoutMs();
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.config.timeout_ms;
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
@@ -747,7 +746,11 @@ pub const RecursiveResolver = struct {
         if (dns.hasTcBit(response_data)) {
             if (self.tcp_transport) |tcp| {
                 var tcp_buf: [65535]u8 = undefined;
-                if (tcp.queryPooled(wire_query, server, &tcp_buf, self.tcp_pool)) |tcp_data| {
+                const tcp_result = if (self.tcp_pool) |p|
+                    tcp.queryPooled(wire_query, server, &tcp_buf, p)
+                else
+                    tcp.query(wire_query, server, &tcp_buf);
+                if (tcp_result) |tcp_data| {
                     const response = try tryParseMessage(allocator, tcp_data) orelse return null;
                     if (!response.header.qr) return null;
                     return response;
@@ -779,8 +782,6 @@ pub const RecursiveResolver = struct {
         server_order: []const usize,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
-        const bt = self.transport.blocking;
-
         var s0_idx: ?usize = null;
         var s1_idx: ?usize = null;
         for (server_order) |idx| {
@@ -806,7 +807,7 @@ pub const RecursiveResolver = struct {
             break :blk @min(300, @max(50, rtt));
         } else self.stagger_ms;
 
-        const overall_timeout = self.transport.getTimeoutMs();
+        const overall_timeout = self.transport.config.timeout_ms;
 
         const qid0 = rand.queryId(self.io);
         const qid1 = rand.queryId(self.io);
@@ -826,7 +827,7 @@ pub const RecursiveResolver = struct {
 
         const query_start = monotonic.nowUs();
 
-        const stag_result = bt.queryStaggered(
+        const stag_result = self.transport.queryStaggered(
             .{ w0, w1 },
             .{ qid0, qid1 },
             .{ servers[idx0], servers[idx1] },
@@ -1607,7 +1608,7 @@ pub const RecursiveResolver = struct {
         fn run(ctx: *NsThreadCtx) void {
             var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{}, ctx.parent.io);
             var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
-            var resolver = ctx.parent.cloneForThread(.{ .blocking = &udp_t }, .{ .blocking = &tcp_t });
+            var resolver = ctx.parent.cloneForThread(&udp_t, &tcp_t);
 
             // Per-query memory cap (same as main query path)
             var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
@@ -2441,7 +2442,7 @@ test "recursive resolve example.com A from root hints" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2476,7 +2477,7 @@ test "recursive resolve nonexistent domain returns name_error" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2500,7 +2501,7 @@ test "recursive resolve domain with glueless NS" {
     // Shorter timeouts: glueless path issues many sub-queries
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2535,7 +2536,7 @@ test "recursive resolve with CNAME chain" {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

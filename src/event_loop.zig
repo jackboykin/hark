@@ -18,40 +18,14 @@ pub const Completion = struct {
 };
 
 pub const Result = union(enum) {
-    send: SendResult,
     recv: RecvResult,
-    timeout: TimeoutResult,
-    connect: ConnectResult,
-    tcp_send: TcpSendResult,
-    tcp_recv: TcpRecvResult,
     accept: AcceptResult,
     read: ReadResult,
-};
-
-pub const SendResult = struct {
-    bytes_sent: i32,
 };
 
 pub const RecvResult = struct {
     data: []const u8,
     addr: na.Address,
-    err: ?anyerror,
-};
-
-pub const TimeoutResult = struct {
-    expired: bool, // false if cancelled
-};
-
-pub const ConnectResult = struct {
-    err: ?anyerror,
-};
-
-pub const TcpSendResult = struct {
-    bytes_sent: i32,
-};
-
-pub const TcpRecvResult = struct {
-    data: []const u8,
     err: ?anyerror,
 };
 
@@ -69,38 +43,30 @@ pub const ReadResult = struct {
 
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { send, recv, timeout, cancel, connect, tcp_send, tcp_recv, accept, read };
+const OpKind = enum { recv, cancel, accept, read };
 
 const Slot = struct {
     kind: OpKind,
     context: *anyopaque,
     active: bool,
 
-    // Storage for send/recv (must have pointer stability until CQE)
+    // Storage for recv (must have pointer stability until CQE)
     iov: [1]posix.iovec,
-    iov_const: [1]posix.iovec_const,
     addr: na.PosixAddress,
     addr_len: posix.socklen_t,
     msghdr: posix.msghdr,
-    msghdr_const: posix.msghdr_const,
     recv_buf: [recv_buf_size]u8,
-
-    // Timeout spec
-    timeout_spec: linux.kernel_timespec,
 
     fn init() Slot {
         return .{
-            .kind = .timeout,
+            .kind = .recv,
             .context = undefined,
             .active = false,
             .iov = undefined,
-            .iov_const = undefined,
             .addr = undefined,
             .addr_len = 0,
             .msghdr = undefined,
-            .msghdr_const = undefined,
             .recv_buf = undefined,
-            .timeout_spec = undefined,
         };
     }
 };
@@ -158,45 +124,6 @@ pub const EventLoop = struct {
         return id;
     }
 
-    pub fn setTimeout(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.timeout, context);
-        errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-        slot.timeout_spec = .{
-            .sec = @intCast(ms / 1000),
-            .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000),
-        };
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_timeout(&slot.timeout_spec, 0, 0);
-        sqe.user_data = id;
-        return id;
-    }
-
-    pub fn sendTo(self: *EventLoop, fd: posix.fd_t, data: []const u8, dest: na.Address, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.send, context);
-        errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-
-        slot.iov_const[0] = .{ .base = data.ptr, .len = data.len };
-        slot.addr_len = na.toSockaddr(&dest, &slot.addr);
-
-        slot.msghdr_const = .{
-            .name = @ptrCast(&slot.addr),
-            .namelen = slot.addr_len,
-            .iov = &slot.iov_const,
-            .iovlen = 1,
-            .control = null,
-            .controllen = 0,
-            .flags = 0,
-        };
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_sendmsg(fd, &slot.msghdr_const, 0);
-        sqe.user_data = id;
-        return id;
-    }
-
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.recv, context);
         errdefer self.freeSlot(id);
@@ -218,36 +145,6 @@ pub const EventLoop = struct {
 
         var sqe = try self.ring.get_sqe();
         sqe.prep_recvmsg(fd, &slot.msghdr, 0);
-        sqe.user_data = id;
-        return id;
-    }
-
-    pub fn connect(self: *EventLoop, fd: posix.fd_t, dest: na.Address, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.connect, context);
-        errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-        slot.addr_len = na.toSockaddr(&dest, &slot.addr);
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_connect(fd, &slot.addr.any, slot.addr_len);
-        sqe.user_data = id;
-        return id;
-    }
-
-    pub fn tcpSend(self: *EventLoop, fd: posix.fd_t, data: []const u8, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.tcp_send, context);
-        errdefer self.freeSlot(id);
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_send(fd, data, 0);
-        sqe.user_data = id;
-        return id;
-    }
-
-    pub fn tcpRecv(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.tcp_recv, context);
-        errdefer self.freeSlot(id);
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_recv(fd, &self.slots[id].recv_buf, 0);
         sqe.user_data = id;
         return id;
     }
@@ -330,9 +227,6 @@ pub const EventLoop = struct {
             completion.context = slot.context;
 
             switch (slot.kind) {
-                .send => {
-                    completion.result = .{ .send = .{ .bytes_sent = cqe.res } };
-                },
                 .recv => {
                     if (cqe.res > 0) {
                         const len: usize = @intCast(cqe.res);
@@ -351,46 +245,6 @@ pub const EventLoop = struct {
                         completion.result = .{ .recv = .{
                             .data = &.{},
                             .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = error.RecvFailed,
-                        } };
-                    }
-                },
-                .timeout => {
-                    const cancelled = isCancelled(cqe);
-                    completion.result = .{ .timeout = .{ .expired = !cancelled } };
-                },
-                .connect => {
-                    if (cqe.res == 0) {
-                        completion.result = .{ .connect = .{ .err = null } };
-                    } else if (isCancelled(cqe)) {
-                        completion.result = .{ .connect = .{ .err = error.Cancelled } };
-                    } else {
-                        completion.result = .{ .connect = .{ .err = error.ConnectFailed } };
-                    }
-                },
-                .tcp_send => {
-                    completion.result = .{ .tcp_send = .{ .bytes_sent = cqe.res } };
-                },
-                .tcp_recv => {
-                    if (cqe.res > 0) {
-                        const len: usize = @intCast(cqe.res);
-                        completion.result = .{ .tcp_recv = .{
-                            .data = slot.recv_buf[0..len],
-                            .err = null,
-                        } };
-                    } else if (cqe.res == 0) {
-                        completion.result = .{ .tcp_recv = .{
-                            .data = &.{},
-                            .err = error.ConnectionClosed,
-                        } };
-                    } else if (isCancelled(cqe)) {
-                        completion.result = .{ .tcp_recv = .{
-                            .data = &.{},
-                            .err = error.Cancelled,
-                        } };
-                    } else {
-                        completion.result = .{ .tcp_recv = .{
-                            .data = &.{},
                             .err = error.RecvFailed,
                         } };
                     }
@@ -470,75 +324,6 @@ test "EventLoop create/destroy" {
     defer loop.destroy();
 
     try testing.expectEqual(@as(u16, max_operations), loop.free_count);
-}
-
-test "EventLoop setTimeout fires" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    var ctx: u8 = 42;
-    _ = try loop.setTimeout(10, @ptrCast(&ctx));
-
-    var completions: [max_operations]Completion = undefined;
-    const results = try loop.tick(&completions);
-    try testing.expectEqual(@as(usize, 1), results.len);
-    try testing.expect(results[0].result.timeout.expired);
-    try testing.expectEqual(@as(u8, 42), @as(*u8, @ptrCast(@alignCast(results[0].context))).*);
-}
-
-test "EventLoop sendTo/recvFrom loopback" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    // Create two UDP sockets
-    const sock_a = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(sock_a);
-    const sock_b = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(sock_b);
-
-    // Bind sock_b to localhost ephemeral port
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(sock_b, &bind_pa.any, bind_len);
-
-    // Get the actual port assigned
-    const dest_addr = try na.getSockName(sock_b);
-
-    const payload = "hello io_uring";
-    var send_ctx: u8 = 1;
-    var recv_ctx: u8 = 2;
-
-    // Queue both operations
-    _ = try loop.recvFrom(sock_b, @ptrCast(&recv_ctx));
-    _ = try loop.sendTo(sock_a, payload, dest_addr, @ptrCast(&send_ctx));
-
-    var completions: [max_operations]Completion = undefined;
-    var got_send = false;
-    var got_recv = false;
-
-    // May take two ticks
-    for (0..2) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .send => {
-                    got_send = true;
-                    try testing.expect(c.result.send.bytes_sent > 0);
-                },
-                .recv => {
-                    got_recv = true;
-                    try testing.expectEqualStrings(payload, c.result.recv.data);
-                    try testing.expectEqual(@as(?anyerror, null), c.result.recv.err);
-                },
-                else => {},
-            }
-        }
-        if (got_send and got_recv) break;
-    }
-
-    try testing.expect(got_send);
-    try testing.expect(got_recv);
 }
 
 test "EventLoop recvFrom with external sender (server pattern)" {
@@ -662,125 +447,4 @@ test "EventLoop cancel pending recvFrom" {
     }
 
     try testing.expect(got_cancelled);
-}
-
-test "EventLoop TCP connect/send/recv loopback" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    // Create a TCP listener
-    const listener = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(listener);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(listener, &bind_pa.any, bind_len);
-    try sys.listen(listener, 1);
-
-    const server_addr = try na.getSockName(listener);
-
-    // Server thread: accept, read, echo back, close
-    const ServerThread = struct {
-        fn run(sock: posix.fd_t) void {
-            var polls = [1]std.posix.pollfd{.{
-                .fd = sock,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const poll_result = std.posix.poll(&polls, 2000) catch return;
-            if (poll_result == 0) return;
-
-            var client_pa: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
-            var client_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-            const client = sys.accept(sock, @ptrCast(&client_pa), &client_len, 0) catch return;
-            defer sys.close(client);
-
-            var buf: [4096]u8 = undefined;
-            // Poll for data on the accepted connection
-            var cpoll = [1]std.posix.pollfd{.{
-                .fd = client,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const cpoll_result = std.posix.poll(&cpoll, 2000) catch return;
-            if (cpoll_result == 0) return;
-
-            const n = sys.read(client, &buf) catch return;
-            if (n == 0) return;
-            _ = sys.write(client, buf[0..n]) catch return;
-        }
-    };
-
-    const thread = try std.Thread.spawn(.{}, ServerThread.run, .{listener});
-
-    // Client: connect, send, recv
-    const client = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(client);
-
-    var connect_ctx: u8 = 1;
-    var send_ctx: u8 = 2;
-    var recv_ctx: u8 = 3;
-
-    _ = try loop.connect(client, server_addr, @ptrCast(&connect_ctx));
-
-    var completions: [max_operations]Completion = undefined;
-
-    // Wait for connect
-    var connected = false;
-    for (0..5) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .connect => |r| {
-                    try testing.expectEqual(@as(?anyerror, null), r.err);
-                    connected = true;
-                },
-                else => {},
-            }
-        }
-        if (connected) break;
-    }
-    try testing.expect(connected);
-
-    // Send data
-    const payload = "hello TCP io_uring";
-    _ = try loop.tcpSend(client, payload, @ptrCast(&send_ctx));
-
-    var sent = false;
-    for (0..5) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .tcp_send => |r| {
-                    try testing.expect(r.bytes_sent > 0);
-                    sent = true;
-                },
-                else => {},
-            }
-        }
-        if (sent) break;
-    }
-    try testing.expect(sent);
-
-    // Recv echo
-    _ = try loop.tcpRecv(client, @ptrCast(&recv_ctx));
-
-    var got_data = false;
-    for (0..5) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .tcp_recv => |r| {
-                    try testing.expectEqual(@as(?anyerror, null), r.err);
-                    try testing.expectEqualStrings(payload, r.data);
-                    got_data = true;
-                },
-                else => {},
-            }
-        }
-        if (got_data) break;
-    }
-    try testing.expect(got_data);
-
-    thread.join();
 }

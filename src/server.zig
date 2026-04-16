@@ -26,8 +26,6 @@ const InFlightTable = dedup_mod.InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const ServerConfig = @import("config.zig").ServerConfig;
-const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
-const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
@@ -633,8 +631,8 @@ const WorkerState = struct {
     fn processTcpClient(
         self: *WorkerState,
         client_fd: posix.fd_t,
-        udp: AnyUdpTransport,
-        tcp: AnyTcpTransport,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) void {
         defer sys.close(client_fd);
@@ -718,8 +716,8 @@ const WorkerState = struct {
         qtype: dns.RType,
         cd: bool,
         bypass_cache: bool,
-        udp: AnyUdpTransport,
-        tcp: AnyTcpTransport,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) !recursive.RecursiveResolver.ResolveResult {
         switch (self.config.mode) {
@@ -774,7 +772,7 @@ const WorkerState = struct {
         }
     }
 
-    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: AnyUdpTransport, tcp: AnyTcpTransport, tls: ?*TlsTransport) void {
+    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport, tls: ?*TlsTransport) void {
         var cap = self.queryCap();
         var prefetch_arena = std.heap.ArenaAllocator.init(cap.allocator());
         defer prefetch_arena.deinit();
@@ -794,8 +792,8 @@ const WorkerState = struct {
             break :blk t;
         } else null;
 
-        const udp: AnyUdpTransport = .{ .blocking = &udp_t };
-        const tcp: AnyTcpTransport = .{ .blocking = &tcp_t };
+        const udp = &udp_t;
+        const tcp = &tcp_t;
         const tls: ?*TlsTransport = if (tls_t) |*t| t else null;
 
         while (self.queue.pop()) |item| {
@@ -827,8 +825,8 @@ const WorkerState = struct {
         sock: posix.fd_t,
         data: []const u8,
         client_addr: na.Address,
-        udp: AnyUdpTransport,
-        tcp: AnyTcpTransport,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) void {
         var cap = self.queryCap();
@@ -888,8 +886,8 @@ const WorkerState = struct {
         name: []const u8,
         qtype: dns.RType,
         cd: bool,
-        udp: AnyUdpTransport,
-        tcp: AnyTcpTransport,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) !recursive.RecursiveResolver.ResolveResult {
         const cd_flag: u8 = @intFromBool(cd);
