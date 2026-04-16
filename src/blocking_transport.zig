@@ -174,7 +174,7 @@ pub const BlockingUdpTransport = struct {
     }
 
     fn openSocket(self: *BlockingUdpTransport, dest: na.Address) !posix.fd_t {
-        return openUdpSocket(dest, false, self.io);
+        return openUdpSocket(dest, self.io);
     }
 };
 

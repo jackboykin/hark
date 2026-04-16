@@ -7,9 +7,6 @@ const Certificate = std.crypto.Certificate;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
-const EventLoop = @import("event_loop.zig").EventLoop;
-const Completion = @import("event_loop.zig").Completion;
-const max_operations = @import("event_loop.zig").max_operations;
 const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
 const PooledConnection = pool_mod.PooledConnection;
@@ -31,19 +28,15 @@ pub const TlsConfig = struct {
     port: u16 = 853,
 };
 
-const Tag = enum { connect, timeout };
-const Ctx = struct { tag: Tag };
-
 pub const TlsTransport = struct {
-    loop: ?*EventLoop,
     allocator: Allocator,
     config: TlsConfig,
     ca_bundle: Certificate.Bundle,
     io: Io,
     pool: ?*ConnectionPool = null,
 
-    pub fn init(loop: ?*EventLoop, allocator: Allocator, config: TlsConfig, ca_bundle: Certificate.Bundle, io: Io) TlsTransport {
-        return .{ .loop = loop, .allocator = allocator, .config = config, .ca_bundle = ca_bundle, .io = io };
+    pub fn init(allocator: Allocator, config: TlsConfig, ca_bundle: Certificate.Bundle, io: Io) TlsTransport {
+        return .{ .allocator = allocator, .config = config, .ca_bundle = ca_bundle, .io = io };
     }
 
     pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
@@ -81,62 +74,12 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// TCP connect via io_uring, then switch to blocking mode with socket timeouts.
-    /// Requires a non-null EventLoop; pool threads must use connectTcpBlocking.
-    fn connectTcp(self: *TlsTransport, tls_server: na.Address, connect_timeout_ms: u32, rw_timeout_ms: u32) !posix.fd_t {
-        const loop = self.loop orelse unreachable; // pool threads must use connectTcpBlocking
-        const af: u32 = na.afU32(tls_server);
-        const sock = try sys.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer sys.close(sock);
-
-        var connect_ctx = Ctx{ .tag = .connect };
-        var timeout_ctx = Ctx{ .tag = .timeout };
-
-        const connect_op = try loop.connect(sock, tls_server, @ptrCast(&connect_ctx));
-        const timeout_op = try loop.setTimeout(connect_timeout_ms, @ptrCast(&timeout_ctx));
-
-        connect_loop: while (true) {
-            var completions: [max_operations]Completion = undefined;
-            const results = try loop.tick(&completions);
-            for (results) |c| {
-                const ctx: *Ctx = @ptrCast(@alignCast(c.context));
-                switch (ctx.tag) {
-                    .connect => {
-                        if (c.result.connect.err != null) {
-                            loop.cancel(timeout_op) catch {};
-                            loop.flush();
-                            return error.ConnectFailed;
-                        }
-                        loop.cancel(timeout_op) catch {};
-                        loop.flush();
-                        break :connect_loop;
-                    },
-                    .timeout => {
-                        if (c.result.timeout.expired) {
-                            loop.cancel(connect_op) catch {};
-                            loop.flush();
-                            return error.Timeout;
-                        }
-                    },
-                }
-            }
-        }
-
-        // Switch to blocking mode with socket timeouts
-        const current_flags = try sys.fcntl(sock, posix.F.GETFL, 0);
-        const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-        _ = try sys.fcntl(sock, posix.F.SETFL, current_flags & ~nonblock_bit);
-
-        sys.setSocketTimeouts(sock, rw_timeout_ms);
-
-        return sock;
-    }
-
-    /// Establish a TCP connection via io_uring, perform TLS handshake,
+    /// Establish a blocking TCP connection, perform TLS handshake,
     /// and return a heap-allocated PooledConnection.
     fn connectAndHandshake(self: *TlsTransport, tls_server: na.Address) !*PooledConnection {
-        const sock = try self.connectTcp(tls_server, self.config.connect_timeout_ms, self.config.response_timeout_ms);
+        const sock = try connectTcpBlocking(tls_server, self.config.connect_timeout_ms);
         errdefer sys.close(sock);
+        sys.setSocketTimeouts(sock, self.config.response_timeout_ms);
 
         const conn = try self.allocator.create(PooledConnection);
         errdefer self.allocator.destroy(conn);
@@ -178,7 +121,6 @@ pub const TlsTransport = struct {
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
     /// no SNI, 4-second connect timeout, immediate fallback on any failure.
     /// Tries pooled connection first, pools new connections on success.
-    /// Auto-detects io_uring vs blocking connect based on whether self.loop is set.
     pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
         const tls_server = toPort(server, self.config.port);
         const addr_key = AddressKey.fromAddress(tls_server);
@@ -195,12 +137,10 @@ pub const TlsTransport = struct {
             }
         }
 
-        // ── New connection: blocking if no EventLoop, io_uring otherwise ──
-        const conn = if (self.loop == null) blk: {
-            const sock = try connectTcpBlocking(tls_server, timeout_ms);
-            errdefer sys.close(sock);
-            break :blk try self.initOpportunisticConnection(sock);
-        } else try self.connectAndHandshakeOpportunistic(tls_server, timeout_ms);
+        // ── New connection ──
+        const sock = try connectTcpBlocking(tls_server, timeout_ms);
+        errdefer sys.close(sock);
+        const conn = try self.initOpportunisticConnection(sock);
 
         const data = queryOnConnection(conn, wire_query, response_buf) catch |err| {
             conn.destroyBroken(self.allocator);
@@ -214,14 +154,6 @@ pub const TlsTransport = struct {
         }
 
         return data;
-    }
-
-    /// Establish an opportunistic TLS connection (ALPN "dot", no cert, no SNI)
-    /// and return a heap-allocated PooledConnection.
-    fn connectAndHandshakeOpportunistic(self: *TlsTransport, tls_server: na.Address, timeout_ms: u32) !*PooledConnection {
-        const sock = try self.connectTcp(tls_server, timeout_ms, timeout_ms);
-        errdefer sys.close(sock);
-        return self.initOpportunisticConnection(sock);
     }
 
     /// Allocate a PooledConnection from a connected socket and perform an
@@ -359,18 +291,12 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
-
     // Load system CA bundle
     var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
 
-    var tls_t = TlsTransport.init(loop, testing.allocator, .{
+    var tls_t = TlsTransport.init(testing.allocator, .{
         .server_name = "one.one.one.one",
     }, ca_bundle, io);
 
@@ -383,7 +309,7 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     var response_buf: [65535]u8 = undefined;
 
     const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.Timeout, error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
+        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
         else => return err,
     };
 
@@ -401,17 +327,11 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
-
     var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
 
-    var tls_t = TlsTransport.init(loop, testing.allocator, .{
+    var tls_t = TlsTransport.init(testing.allocator, .{
         .server_name = "dns.google",
     }, ca_bundle, io);
 
@@ -424,7 +344,7 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     var response_buf: [65535]u8 = undefined;
 
     const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.Timeout, error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
+        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
         else => return err,
     };
 
@@ -441,12 +361,6 @@ test "TlsTransport connection pooling reuses connection" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
-
     var ca_bundle: Certificate.Bundle = .empty;
     ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
     defer ca_bundle.deinit(testing.allocator);
@@ -454,7 +368,7 @@ test "TlsTransport connection pooling reuses connection" {
     var pool = ConnectionPool.init(testing.allocator, io);
     defer pool.deinit();
 
-    var tls_t = TlsTransport.init(loop, testing.allocator, .{
+    var tls_t = TlsTransport.init(testing.allocator, .{
         .server_name = "one.one.one.one",
     }, ca_bundle, io);
     tls_t.pool = &pool;
@@ -469,7 +383,7 @@ test "TlsTransport connection pooling reuses connection" {
 
     // First query — establishes connection, stores in pool
     _ = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.Timeout, error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
+        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
         else => return err,
     };
 
@@ -478,7 +392,7 @@ test "TlsTransport connection pooling reuses connection" {
 
     // Second query — should reuse pooled connection
     const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.Timeout, error.ConnectFailed, error.TlsHandshakeFailed, error.TlsSendFailed, error.TlsRecvFailed => return error.SkipZigTest,
+        error.ConnectFailed, error.TlsHandshakeFailed, error.TlsSendFailed, error.TlsRecvFailed => return error.SkipZigTest,
         else => return err,
     };
 

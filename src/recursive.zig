@@ -3,8 +3,8 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
-const UdpTransport = @import("transport.zig").UdpTransport;
 const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
+const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const encrypted_ns = @import("encrypted_ns.zig");
@@ -779,10 +779,7 @@ pub const RecursiveResolver = struct {
         server_order: []const usize,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
-        const bt = switch (self.transport) {
-            .blocking => |t| t,
-            else => return null,
-        };
+        const bt = self.transport.blocking;
 
         var s0_idx: ?usize = null;
         var s1_idx: ?usize = null;
@@ -886,8 +883,8 @@ pub const RecursiveResolver = struct {
 
         var last_server_failure: ?dns.Message = null;
 
-        // ── Staggered NS racing (blocking transport only) ──
-        if (self.transport == .blocking and server_order.len >= 2 and self.stagger_ms > 0) {
+        // ── Staggered NS racing ──
+        if (server_order.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, server_order, parent_zone)) |stag| {
                 self.fireOteProbe(stag.server);
                 return .{ .message = stag.message, .responding_server = stag.server };
@@ -1449,11 +1446,9 @@ pub const RecursiveResolver = struct {
             else => 1,
         };
 
-        // Parallel path: race 2 NS names concurrently when on blocking transport
-        // with at least 2 NS names and fetch_limit > 1.
-        if (ns_fetch_limit > 1 and ns_names.len >= 2 and self.gpa != null and
-            self.transport == .blocking)
-        {
+        // Parallel path: race 2 NS names concurrently. The helper thread
+        // creates its own BlockingUdpTransport via cloneForThread.
+        if (ns_fetch_limit > 1 and ns_names.len >= 2 and self.gpa != null) {
             return self.resolveNsAddressesParallel(allocator, ns_names, depth, ns_fetch_limit);
         }
 
@@ -2434,9 +2429,7 @@ test "qname_minimisation=false sends full name immediately" {
     try testing.expectEqual(target_label_count, minimise_label_count);
 }
 
-// ── Integration tests (require Linux + io_uring + network) ─────────────
-
-const EventLoop = @import("event_loop.zig").EventLoop;
+// ── Integration tests (require Linux + network) ────────────────────────
 
 fn skipIfNotLinux() !void {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
@@ -2446,16 +2439,9 @@ test "recursive resolve example.com A from root hints" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
+    var transport = BlockingUdpTransport.init(.{}, io);
 
-    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
-    defer transport.deinit();
-
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2488,16 +2474,9 @@ test "recursive resolve nonexistent domain returns name_error" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
+    var transport = BlockingUdpTransport.init(.{}, io);
 
-    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
-    defer transport.deinit();
-
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2518,17 +2497,10 @@ test "recursive resolve domain with glueless NS" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
-
     // Shorter timeouts: glueless path issues many sub-queries
-    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }, io) catch return error.SkipZigTest;
-    defer transport.deinit();
+    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2561,16 +2533,9 @@ test "recursive resolve with CNAME chain" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
+    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var transport = UdpTransport.init(loop, .{ .timeout_ms = 2000, .retransmit_ms = 500 }, io) catch return error.SkipZigTest;
-    defer transport.deinit();
-
-    var resolver = RecursiveResolver{ .transport = .{ .uring = &transport }, .io = io };
+    var resolver = RecursiveResolver{ .transport = .{ .blocking = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

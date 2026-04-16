@@ -2,9 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hark = @import("hark");
 const dns = hark.dns;
-const EventLoop = hark.event_loop.EventLoop;
-const UdpTransport = hark.transport.UdpTransport;
-const TcpTransport = hark.tcp_transport.TcpTransport;
+const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
+const BlockingTcpTransport = hark.blocking_transport.BlockingTcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
 const ConnectionPool = hark.connection_pool.ConnectionPool(hark.connection_pool.PooledConnection);
 const EncryptedNsCache = hark.encrypted_ns.EncryptedNsCache;
@@ -223,20 +222,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     }
 
-    // EventLoop and transport use GPA (long-lived)
-    const loop = EventLoop.create(gpa_alloc) catch |err| {
-        log.err("failed to initialize io_uring: {}", .{err});
-        std.process.exit(1);
-    };
-    defer loop.destroy();
-
-    var t = UdpTransport.init(loop, .{}, io) catch |err| {
-        log.err("failed to create UDP socket: {}", .{err});
-        std.process.exit(1);
-    };
-    defer t.deinit();
-
-    var tcp_t = TcpTransport.init(loop, .{});
+    var t = BlockingUdpTransport.init(.{}, io);
+    var tcp_t = BlockingTcpTransport.init(.{});
 
     if (dot_strict and dot_host == null) {
         log.err("--dot-strict requires --dot-host for hostname verification", .{});
@@ -256,7 +243,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer if (ca_bundle_loaded) ca_bundle.deinit(gpa_alloc);
 
     // TLS transport (only when --dot is set)
-    var tls_t = TlsTransport.init(loop, gpa_alloc, .{
+    var tls_t = TlsTransport.init(gpa_alloc, .{
         .server_name = dot_host,
         .strict = dot_strict,
     }, ca_bundle, io);
@@ -275,7 +262,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver.initWithTcp(.{ .uring = &t }, .{ .uring = &tcp_t });
+        var resolver = ForwardingResolver.initWithTcp(.{ .blocking = &t }, .{ .blocking = &tcp_t });
         resolver.io = io;
         if (dot_mode) {
             resolver.tls_transport = &tls_t;
@@ -299,8 +286,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{
-            .transport = .{ .uring = &t },
-            .tcp_transport = .{ .uring = &tcp_t },
+            .transport = .{ .blocking = &t },
+            .tcp_transport = .{ .blocking = &tcp_t },
             .cache = &cache,
             .qname_minimisation = !no_qmin,
             .dnssec_enabled = dnssec_enabled,

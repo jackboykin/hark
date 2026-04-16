@@ -10,8 +10,6 @@ const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const OperationId = @import("event_loop.zig").OperationId;
-const UdpTransport = @import("transport.zig").UdpTransport;
-const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 const recursive = @import("recursive.zig");
 const RecursiveResolver = recursive.RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
@@ -94,6 +92,10 @@ const WorkQueue = struct {
         self.head = (self.head + 1) % work_queue_capacity;
         self.count -= 1;
         return item;
+    }
+
+    fn pushTcpClient(self: *WorkQueue, client_fd: posix.fd_t) bool {
+        return self.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), client_fd, .tcp);
     }
 
     fn signalShutdown(self: *WorkQueue) void {
@@ -325,26 +327,6 @@ pub const Server = struct {
         };
         defer server_loop.destroy();
 
-        // Separate EventLoop for outbound resolution queries.
-        // The resolver's tick()/flush() must not interfere with the
-        // server's pending accept/signalfd operations.
-        const transport_loop = EventLoop.create(self.allocator) catch |err| {
-            log.err("worker failed to create transport event loop: {s}", .{@errorName(err)});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            return;
-        };
-        defer transport_loop.destroy();
-
-        // Per-thread outbound transport (uses its own loop)
-        var udp_transport = UdpTransport.init(transport_loop, .{}, self.io) catch |err| {
-            log.err("worker failed to create UDP transport: {s}", .{@errorName(err)});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            return;
-        };
-        defer udp_transport.deinit();
-
-        var tcp_transport = TcpTransport.init(transport_loop, .{});
-
         // Per-thread server sockets — one UDP + one TCP per listen address
         var udp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
         var tcp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
@@ -386,7 +368,7 @@ pub const Server = struct {
         }
 
         // Per-worker TLS transport (shares encrypted_ns_cache + pool across workers)
-        var tls_transport = TlsTransport.init(transport_loop, self.allocator, .{}, self.ca_bundle, self.io);
+        var tls_transport = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
         if (self.enc_pool) |*pool| tls_transport.pool = pool;
 
         var queue = WorkQueue{ .io = self.io };
@@ -401,8 +383,6 @@ pub const Server = struct {
             .allocator = self.allocator,
             .io = self.io,
             .loop = server_loop,
-            .udp_transport = &udp_transport,
-            .tcp_transport = &tcp_transport,
             .tls_transport = if (self.config.opportunistic) &tls_transport else null,
             .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
             .cache = &self.cache,
@@ -415,6 +395,7 @@ pub const Server = struct {
             .queue = &queue,
             .ca_bundle = self.ca_bundle,
             .tcp_pool = &do53_tcp_pool,
+            .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
         };
 
         const pool_size = self.config.resolution_threads;
@@ -459,8 +440,6 @@ const WorkerState = struct {
     allocator: mem.Allocator,
     io: Io,
     loop: *EventLoop,
-    udp_transport: *UdpTransport,
-    tcp_transport: *TcpTransport,
     tls_transport: ?*TlsTransport,
     encrypted_ns_cache: ?*EncryptedNsCache,
     cache: *RRsetCache,
@@ -473,6 +452,18 @@ const WorkerState = struct {
     queue: *WorkQueue,
     ca_bundle: Certificate.Bundle,
     tcp_pool: ?*TcpConnectionPool = null,
+    active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    max_tcp_clients: u32 = 0,
+
+    /// Try to claim a TCP client slot. Returns true on success (caller
+    /// must fetchSub when done). CAS loop prevents overcount.
+    fn claimTcpSlot(self: *WorkerState) bool {
+        while (true) {
+            const current = self.active_tcp_clients.load(.monotonic);
+            if (current >= self.max_tcp_clients) return false;
+            if (self.active_tcp_clients.cmpxchgStrong(current, current + 1, .monotonic, .monotonic) == null) return true;
+        }
+    }
 
     /// Create a per-query memory cap. When the limit is hit, arena returns
     /// OutOfMemory and existing error handling sends SERVFAIL.
@@ -564,7 +555,10 @@ const WorkerState = struct {
                         switch (c.result) {
                             .accept => |acc| {
                                 if (acc.err == null and acc.fd >= 0) {
-                                    self.handleTcpClient(acc.fd);
+                                    if (!self.queue.pushTcpClient(acc.fd)) {
+                                        log.warn("resolution queue full, dropping TCP client", .{});
+                                        sys.close(acc.fd);
+                                    }
                                 }
                             },
                             else => {},
@@ -631,12 +625,16 @@ const WorkerState = struct {
         }
     }
 
-    fn handleTcpClient(self: *WorkerState, client_fd: posix.fd_t) void {
+    fn processTcpClient(
+        self: *WorkerState,
+        client_fd: posix.fd_t,
+        udp: AnyUdpTransport,
+        tcp: AnyTcpTransport,
+        tls: ?*TlsTransport,
+    ) void {
         defer sys.close(client_fd);
 
         // Switch accepted fd to blocking mode with idle timeout.
-        // This avoids calling tick() on the server_loop, which would steal
-        // completions for accept/recvFrom/signalfd and cause a deadlock.
         const flags = sys.fcntl(client_fd, posix.F.GETFL, 0) catch return;
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
@@ -683,7 +681,7 @@ const WorkerState = struct {
             const name_str = name_buf[0..name_len];
 
             const start_ns = monotonic.nowNs();
-            const result = self.resolveWithDedup(alloc, name_str, question.qtype, query.header.cd) catch |err| {
+            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, udp, tcp, tls) catch |err| {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
@@ -700,16 +698,12 @@ const WorkerState = struct {
             tcpWriteMessage(client_fd, wire) orelse return;
 
             if (result.prefetch_name) |prefetch_name| {
-                self.doPrefetch(prefetch_name, result.prefetch_qtype);
+                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls);
             }
             if (result.prefetch_dnskey_zone) |zone| {
-                self.doPrefetch(zone, .dnskey);
+                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls);
             }
         }
-    }
-
-    fn resolveWithDedup(self: *WorkerState, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, cd: bool) !recursive.RecursiveResolver.ResolveResult {
-        return self.resolveWithDedupUsing(alloc, name, qtype, cd, .{ .uring = self.udp_transport }, .{ .uring = self.tcp_transport }, self.tls_transport);
     }
 
     fn resolveQueryWith(
@@ -775,10 +769,6 @@ const WorkerState = struct {
         }
     }
 
-    fn doPrefetch(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType) void {
-        self.doPrefetchWith(prefetch_name, prefetch_qtype, .{ .uring = self.udp_transport }, .{ .uring = self.tcp_transport }, self.tls_transport);
-    }
-
     fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: AnyUdpTransport, tcp: AnyTcpTransport, tls: ?*TlsTransport) void {
         var cap = self.queryCap();
         var prefetch_arena = std.heap.ArenaAllocator.init(cap.allocator());
@@ -791,16 +781,17 @@ const WorkerState = struct {
         var udp_t = BlockingUdpTransport.init(.{}, self.io);
         var tcp_t = BlockingTcpTransport.init(.{});
 
-        // Pool threads use queryOpportunisticBlocking (blocking TCP connect),
-        // so no EventLoop is needed. Passing null ensures connectTcp panics
-        // if accidentally called from a pool thread.
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
-            var t = TlsTransport.init(null, self.allocator, .{}, self.ca_bundle, self.io);
+            var t = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
             if (self.tls_transport) |main_tls| {
                 t.pool = main_tls.pool;
             }
             break :blk t;
         } else null;
+
+        const udp: AnyUdpTransport = .{ .blocking = &udp_t };
+        const tcp: AnyTcpTransport = .{ .blocking = &tcp_t };
+        const tls: ?*TlsTransport = if (tls_t) |*t| t else null;
 
         while (self.queue.pop()) |item| {
             switch (item.protocol) {
@@ -808,11 +799,19 @@ const WorkerState = struct {
                     item.sock_fd,
                     item.query_buf[0..item.query_len],
                     item.client_addr,
-                    &udp_t,
-                    &tcp_t,
-                    if (tls_t) |*t| t else null,
+                    udp,
+                    tcp,
+                    tls,
                 ),
-                .tcp => {}, // TCP clients still handled on io_uring worker thread (handleTcpClient)
+                .tcp => {
+                    if (self.claimTcpSlot()) {
+                        defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
+                        self.processTcpClient(item.sock_fd, udp, tcp, tls);
+                    } else {
+                        log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
+                        sys.close(item.sock_fd);
+                    }
+                },
             }
         }
     }
@@ -822,9 +821,9 @@ const WorkerState = struct {
         sock: posix.fd_t,
         data: []const u8,
         client_addr: na.Address,
-        udp_t: *BlockingUdpTransport,
-        tcp_t: *BlockingTcpTransport,
-        tls_t: ?*TlsTransport,
+        udp: AnyUdpTransport,
+        tcp: AnyTcpTransport,
+        tls: ?*TlsTransport,
     ) void {
         var cap = self.queryCap();
         var arena = std.heap.ArenaAllocator.init(cap.allocator());
@@ -852,7 +851,7 @@ const WorkerState = struct {
         const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = monotonic.nowNs();
-        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t) catch |err| {
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, udp, tcp, tls) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
@@ -870,10 +869,10 @@ const WorkerState = struct {
         }
 
         if (result.prefetch_name) |prefetch_name| {
-            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t);
+            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls);
         }
         if (result.prefetch_dnskey_zone) |zone| {
-            self.doPrefetchWith(zone, .dnskey, .{ .blocking = udp_t }, .{ .blocking = tcp_t }, tls_t);
+            self.doPrefetchWith(zone, .dnskey, udp, tcp, tls);
         }
     }
 
@@ -1107,8 +1106,7 @@ fn tcpWriteMessage(fd: posix.fd_t, data: []const u8) ?void {
 }
 
 fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: na.Address) void {
-    // Use direct sendto instead of io_uring to avoid consuming server CQEs
-    // (accept, signalfd) that might arrive during the send.
+    // Direct sendto — the server loop's EventLoop is only for accept/recv/signal.
     var storage: na.PosixAddress = undefined;
     const sa_len = na.toSockaddr(&dest, &storage);
     _ = sys.sendto(sock, data, 0, &storage.any, sa_len) catch return;

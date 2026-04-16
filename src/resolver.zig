@@ -3,13 +3,11 @@ const mem = std.mem;
 const testing = std.testing;
 const posix = std.posix;
 const dns = @import("dns.zig");
-const EventLoop = @import("event_loop.zig").EventLoop;
-const UdpTransport = @import("transport.zig").UdpTransport;
 const AnyUdpTransport = @import("transport.zig").AnyUdpTransport;
+const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const AnyTcpTransport = @import("tcp_transport.zig").AnyTcpTransport;
 const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const Config = @import("transport.zig").Config;
 const na = @import("net_address.zig");
 
 pub const ForwardingResolver = struct {
@@ -88,16 +86,9 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     const io = testing.io;
 
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
-    defer loop.destroy();
+    var transport = BlockingUdpTransport.init(.{}, io);
 
-    var transport = UdpTransport.init(loop, .{}, io) catch return error.SkipZigTest;
-    defer transport.deinit();
-
-    var resolver = ForwardingResolver{ .transport = .{ .uring = &transport }, .io = io };
+    var resolver = ForwardingResolver{ .transport = .{ .blocking = &transport }, .io = io };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
