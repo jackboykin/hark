@@ -255,7 +255,7 @@ pub const BlockingTcpTransport = struct {
 
         var bytes_sent: usize = 0;
         while (bytes_sent < total_send) {
-            try updateTimeout(sock, deadline_ns);
+            try sys.updateTimeout(sock, posix.SO.SNDTIMEO, deadline_ns);
             const n = sys.write(sock, send_buf[bytes_sent..total_send]) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
@@ -266,7 +266,7 @@ pub const BlockingTcpTransport = struct {
         var len_filled: usize = 0;
 
         while (len_filled < 2) {
-            try updateTimeout(sock, deadline_ns);
+            try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
             const n = sys.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             len_filled += n;
@@ -277,25 +277,13 @@ pub const BlockingTcpTransport = struct {
 
         var body_filled: usize = 0;
         while (body_filled < body_len) {
-            try updateTimeout(sock, deadline_ns);
+            try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
             const n = sys.read(sock, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             body_filled += n;
         }
 
         return response_buf[0..body_len];
-    }
-
-    /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
-    fn updateTimeout(sock: posix.fd_t, deadline_ns: i128) !void {
-        const remaining_ns = deadline_ns - monotonic.nowNs();
-        if (remaining_ns <= 0) return error.Timeout;
-        const remaining_ms: u32 = @intCast(@min(
-            @divFloor(remaining_ns, 1_000_000),
-            std.math.maxInt(u32),
-        ));
-        if (remaining_ms == 0) return error.Timeout;
-        sys.setSocketTimeouts(sock, remaining_ms);
     }
 };
 

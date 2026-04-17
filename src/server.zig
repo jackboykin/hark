@@ -37,6 +37,7 @@ const monotonic = @import("monotonic.zig");
 const log = std.log.scoped(.server);
 
 const tcp_idle_timeout_ms: u32 = 5_000;
+const tcp_idle_timeout_ns: i128 = @as(i128, tcp_idle_timeout_ms) * 1_000_000;
 const max_tcp_queries_per_conn: u32 = 128;
 
 const work_queue_capacity = 256;
@@ -642,18 +643,17 @@ const WorkerState = struct {
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
 
-        sys.setSocketTimeouts(client_fd, tcp_idle_timeout_ms);
-
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
             tcp_queries += 1;
+            const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             var len_buf: [2]u8 = undefined;
-            tcpReadExactBlocking(client_fd, &len_buf) orelse return;
+            tcpReadExactBlocking(client_fd, &len_buf, read_deadline_ns) orelse return;
             const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
             var query_buf: [65535]u8 = undefined;
-            tcpReadExactBlocking(client_fd, query_buf[0..msg_len]) orelse return;
+            tcpReadExactBlocking(client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
 
             var cap = self.queryCap();
             var arena = std.heap.ArenaAllocator.init(cap.allocator());
@@ -666,7 +666,7 @@ const WorkerState = struct {
                 if (data.len >= 2) {
                     const id = mem.readInt(u16, data[0..2], .big);
                     const w = serializeErrorResponse(&response_wire, id, .format_error, false, &.{}) orelse return;
-                    tcpWriteMessage(client_fd, w) orelse return;
+                    tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
                 return;
@@ -674,7 +674,7 @@ const WorkerState = struct {
 
             if (validateQuery(query)) |rcode| {
                 const w = serializeErrorResponse(&response_wire, query.header.id, rcode, query.header.rd, query.questions) orelse return;
-                tcpWriteMessage(client_fd, w) orelse return;
+                tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
 
@@ -689,7 +689,8 @@ const WorkerState = struct {
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, query.header.rd, query.questions) orelse return;
-                tcpWriteMessage(client_fd, w) orelse return;
+                const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
+                tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
                 continue;
             };
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -698,7 +699,8 @@ const WorkerState = struct {
             log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
 
             const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, 65535), result.message, alloc) orelse return;
-            tcpWriteMessage(client_fd, wire) orelse return;
+            const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
+            tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
             if (result.prefetch_name) |prefetch_name| {
                 self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls);
@@ -1078,18 +1080,20 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
 
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 
-fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8) ?void {
+fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
     var total: usize = 0;
     while (total < buf.len) {
+        sys.updateTimeout(fd, posix.SO.RCVTIMEO, deadline_ns) catch return null;
         const n = sys.read(fd, buf[total..]) catch return null;
         if (n == 0) return null; // connection closed
         total += n;
     }
 }
 
-fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8) ?void {
+fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     var total: usize = 0;
     while (total < data.len) {
+        sys.updateTimeout(fd, posix.SO.SNDTIMEO, deadline_ns) catch return null;
         const n = sys.write(fd, data[total..]) catch return null;
         total += n;
     }
@@ -1102,11 +1106,11 @@ fn validateQuery(query: dns.Message) ?dns.RCode {
     return null;
 }
 
-fn tcpWriteMessage(fd: posix.fd_t, data: []const u8) ?void {
+fn tcpWriteMessage(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     var len_prefix: [2]u8 = undefined;
     mem.writeInt(u16, &len_prefix, @intCast(data.len), .big);
-    tcpWriteAllBlocking(fd, &len_prefix) orelse return null;
-    tcpWriteAllBlocking(fd, data) orelse return null;
+    tcpWriteAllBlocking(fd, &len_prefix, deadline_ns) orelse return null;
+    tcpWriteAllBlocking(fd, data, deadline_ns) orelse return null;
 }
 
 fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: na.Address) void {

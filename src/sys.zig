@@ -10,6 +10,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const monotonic = @import("monotonic.zig");
 
 pub fn socket(af: u32, sock_type: u32, protocol: u32) !posix.fd_t {
     const rc = linux.socket(af, sock_type, protocol);
@@ -216,6 +217,19 @@ pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
         .usec = @intCast(@as(u64, ms % 1000) * 1000),
     };
     posix.setsockopt(sock, posix.SOL.SOCKET, opt, std.mem.asBytes(&timeout)) catch {};
+}
+
+/// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
+/// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
+pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {
+    const remaining_ns = deadline_ns - monotonic.nowNs();
+    if (remaining_ns <= 0) return error.Timeout;
+    const remaining_ms: u32 = @intCast(@min(
+        @divFloor(remaining_ns, 1_000_000),
+        std.math.maxInt(u32),
+    ));
+    if (remaining_ms == 0) return error.Timeout;
+    setSocketTimeout(sock, opt, remaining_ms);
 }
 
 pub fn pipe() ![2]posix.fd_t {
