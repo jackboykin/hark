@@ -76,7 +76,7 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory
 pub const RecursiveResolver = struct {
     transport: *BlockingUdpTransport,
     tcp_transport: ?*BlockingTcpTransport = null,
-    io: std.Io = undefined,
+    io: std.Io,
     cache: ?*RRsetCache = null,
     qname_minimisation: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)

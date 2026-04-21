@@ -152,12 +152,12 @@ pub const Server = struct {
         const cache = if (cfg.workers > 1)
             RRsetCache.initThreadSafeWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts, io)
         else
-            RRsetCache.initWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts);
+            RRsetCache.initWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts, io);
 
         const rtt_cache = if (cfg.workers > 1)
             RttCache.initThreadSafe(allocator, io)
         else
-            RttCache.init(allocator);
+            RttCache.init(allocator, io);
 
         const ns_selector = if (cfg.workers > 1)
             NsSelector.initThreadSafe(allocator, io)
@@ -188,13 +188,13 @@ pub const Server = struct {
                 break :blk if (cfg.workers > 1)
                     NsecCache.initThreadSafe(nsec_alloc, NsecCache.default_max_bytes, io)
                 else
-                    NsecCache.init(nsec_alloc, NsecCache.default_max_bytes);
+                    NsecCache.init(nsec_alloc, NsecCache.default_max_bytes, io);
             } else null,
             .key_cache = if (cfg.dnssec) blk: {
                 break :blk if (cfg.workers > 1)
                     RRsetCache.initThreadSafe(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries, io)
                 else
-                    RRsetCache.init(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries);
+                    RRsetCache.init(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries, io);
             } else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),

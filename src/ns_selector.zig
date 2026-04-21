@@ -74,7 +74,7 @@ const ArmState = struct {
 pub const NsSelector = struct {
     arms: std.AutoHashMap(ArmKey, ArmState),
     mutex: ?std.Io.Mutex,
-    io: std.Io = undefined,
+    io: std.Io,
     gamma: f32,
 
     pub fn init(allocator: Allocator, io: std.Io) NsSelector {

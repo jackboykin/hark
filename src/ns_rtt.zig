@@ -40,13 +40,14 @@ const RttState = struct {
 pub const RttCache = struct {
     entries: std.AutoHashMap(AddressKey, RttState),
     mutex: ?std.Io.Mutex,
-    io: std.Io = undefined,
+    io: std.Io,
     now_fn: *const fn () i64,
 
-    pub fn init(allocator: Allocator) RttCache {
+    pub fn init(allocator: Allocator, io: std.Io) RttCache {
         return .{
             .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
             .mutex = null,
+            .io = io,
             .now_fn = &@import("monotonic.zig").nowMs,
         };
     }
@@ -158,7 +159,7 @@ fn testAddr(last_octet: u8) AddressKey {
 }
 
 test "getTimeout returns initial for unknown server" {
-    var cache = RttCache.init(testing.allocator);
+    var cache = RttCache.init(testing.allocator, testing.io);
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
@@ -166,7 +167,7 @@ test "getTimeout returns initial for unknown server" {
 }
 
 test "recordSuccess updates EWMA" {
-    var cache = RttCache.init(testing.allocator);
+    var cache = RttCache.init(testing.allocator, testing.io);
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
@@ -185,7 +186,7 @@ test "recordSuccess updates EWMA" {
 }
 
 test "recordTimeout increments consecutive count and marks dead" {
-    var cache = RttCache.init(testing.allocator);
+    var cache = RttCache.init(testing.allocator, testing.io);
     defer cache.deinit();
     cache.now_fn = &testNowMs;
     test_now_ms = 1000;

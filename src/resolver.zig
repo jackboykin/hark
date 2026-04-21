@@ -85,7 +85,7 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = ForwardingResolver{ .transport = &transport, .io = io };
+    var resolver = ForwardingResolver.init(&transport, io);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -254,7 +254,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     else
         std.heap.smp_allocator;
     hark.cache.randomizeHashSeed(io);
-    var cache = RRsetCache.init(cache_alloc, 16 * 1024 * 1024, 10_000);
+    var cache = RRsetCache.init(cache_alloc, 16 * 1024 * 1024, 10_000, io);
     defer cache.deinit();
 
     // DNS message data uses arena
@@ -281,7 +281,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
         if (opportunistic) tls_t.pool = &enc_pool;
 
-        var rtt_cache = RttCache.init(gpa_alloc);
+        var rtt_cache = RttCache.init(gpa_alloc, io);
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{

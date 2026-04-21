@@ -297,7 +297,7 @@ pub const RRsetCache = struct {
     max_entries: u32,
     now_fn: *const fn () i64,
     rwlock: ?std.Io.RwLock = null,
-    io: std.Io = undefined,
+    io: std.Io,
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     prefetch: bool = false,
@@ -322,11 +322,11 @@ pub const RRsetCache = struct {
         skip_key_types: bool = false,
     };
 
-    pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32) RRsetCache {
-        return initWithOptions(backing, max_bytes, max_entries, .{});
+    pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32, io: std.Io) RRsetCache {
+        return initWithOptions(backing, max_bytes, max_entries, .{}, io);
     }
 
-    pub fn initWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions) RRsetCache {
+    pub fn initWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions, io: std.Io) RRsetCache {
         // Allocate SIEVE visited flags from backing allocator (not counted against cache budget).
         const visited: ?[]std.atomic.Value(u8) = if (backing.alloc(std.atomic.Value(u8), max_entries)) |v| blk: {
             for (v) |*slot| slot.* = std.atomic.Value(u8).init(0);
@@ -336,6 +336,7 @@ pub const RRsetCache = struct {
             .counting = CountingAllocator.init(backing, max_bytes),
             .map = .empty,
             .max_entries = max_entries,
+            .io = io,
             .now_fn = &defaultNowSeconds,
             .prefetch = opts.prefetch,
             .serve_stale_ttl = opts.serve_stale_ttl,
@@ -350,9 +351,8 @@ pub const RRsetCache = struct {
     }
 
     pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions, io: std.Io) RRsetCache {
-        var c = initWithOptions(backing, max_bytes, max_entries, opts);
+        var c = initWithOptions(backing, max_bytes, max_entries, opts, io);
         c.rwlock = std.Io.RwLock.init;
-        c.io = io;
         return c;
     }
 
@@ -936,7 +936,7 @@ fn testNowSeconds() i64 {
 }
 
 fn makeTestCache(alloc: Allocator) RRsetCache {
-    var cache = RRsetCache.init(alloc, 1024 * 1024, 100);
+    var cache = RRsetCache.init(alloc, 1024 * 1024, 100, testing.io);
     cache.now_fn = &testNowSeconds;
     return cache;
 }
@@ -1279,7 +1279,7 @@ test "cache eviction when full" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(alloc, 1024 * 1024, 2); // max 2 entries
+    var cache = RRsetCache.init(alloc, 1024 * 1024, 2, testing.io); // max 2 entries
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1376,7 +1376,7 @@ test "cache prefetch flag at 10 percent TTL" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .prefetch = true });
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .prefetch = true }, testing.io);
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1454,7 +1454,7 @@ test "cache serve stale within window" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 }, testing.io);
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1490,7 +1490,7 @@ test "cache serve stale beyond window returns null" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 }, testing.io);
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1516,7 +1516,7 @@ test "cache min TTL floor" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .min_ttl = 300 });
+    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .min_ttl = 300 }, testing.io);
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
