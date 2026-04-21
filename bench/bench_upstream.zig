@@ -74,7 +74,7 @@ fn setup(allocator: std.mem.Allocator) !Setup {
     // Build one wire query; reuse across iterations (query ID patched each call).
     const msg = try dns.buildQuery(allocator, 0, "bench.test", .a);
     defer dns.freeMessage(allocator, msg);
-    var tmp: [512]u8 = undefined;
+    var tmp: [dns.max_udp_payload]u8 = undefined;
     const w = try dns.serializeMessage(&tmp, msg);
     const wire = try allocator.dupe(u8, w);
 
@@ -95,7 +95,7 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
     defer transport.deinit();
-    var response_buf: [hark.dns.edns_udp_payload]u8 = undefined;
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
 
     for (0..warmup) |i| {
         std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
@@ -121,7 +121,7 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator);
     defer s.deinit();
-    var response_buf: [hark.dns.edns_udp_payload]u8 = undefined;
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
 
     for (0..warmup) |i| {
         var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);

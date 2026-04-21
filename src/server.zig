@@ -630,7 +630,7 @@ const WorkerState = struct {
     }
 
     fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
-        var wire_buf: [512]u8 = undefined;
+        var wire_buf: [dns.max_udp_payload]u8 = undefined;
         if (serializeErrorResponse(&wire_buf, id, rcode, rd, questions)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
@@ -683,11 +683,11 @@ const WorkerState = struct {
             const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
-            var query_buf: [65535]u8 = undefined;
+            var query_buf: [dns.max_message_len]u8 = undefined;
             tcpReadExactBlocking(client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
 
             const alloc = query_pta.reset();
-            var response_wire: [65535]u8 = undefined;
+            var response_wire: [dns.max_message_len]u8 = undefined;
             const data = query_buf[0..msg_len];
 
             const query = dns.parseMessage(alloc, data) catch {
@@ -908,7 +908,7 @@ const WorkerState = struct {
         var rcode_buf2: [24]u8 = undefined;
         log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
 
-        var wire_buf: [65535]u8 = undefined;
+        var wire_buf: [dns.max_message_len]u8 = undefined;
         if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
@@ -1299,7 +1299,7 @@ test "buildResponseWire sets correct header fields" {
         .questions = &.{},
     };
 
-    var buf: [512]u8 = undefined;
+    var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x1234,
         .rd = true,
@@ -1378,7 +1378,7 @@ test "serializeErrorResponse produces valid DNS message" {
     const name = try dns.parseDottedName(a, "example.com");
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
-    var buf: [512]u8 = undefined;
+    var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = serializeErrorResponse(&buf, 0xABCD, .refused, true, questions).?;
 
     const parsed = try dns.parseMessage(a, wire);
@@ -1391,7 +1391,7 @@ test "serializeErrorResponse produces valid DNS message" {
 }
 
 test "serializeErrorResponse with no question (parse failure)" {
-    var buf: [512]u8 = undefined;
+    var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = serializeErrorResponse(&buf, 0x1234, .format_error, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

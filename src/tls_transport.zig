@@ -299,7 +299,7 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     const server = na.initIp4(.{ 1, 1, 1, 1 }, 53); // port overridden to 853
-    var response_buf: [65535]u8 = undefined;
+    var response_buf: [dns.max_message_len]u8 = undefined;
 
     const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
         error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
@@ -334,7 +334,7 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     const server = na.initIp4(.{ 8, 8, 8, 8 }, 53);
-    var response_buf: [65535]u8 = undefined;
+    var response_buf: [dns.max_message_len]u8 = undefined;
 
     const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
         error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
@@ -372,7 +372,7 @@ test "TlsTransport connection pooling reuses connection" {
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     const server = na.initIp4(.{ 1, 1, 1, 1 }, 53);
-    var response_buf: [65535]u8 = undefined;
+    var response_buf: [dns.max_message_len]u8 = undefined;
 
     // First query — establishes connection, stores in pool
     _ = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {

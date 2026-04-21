@@ -1514,7 +1514,7 @@ test "name parsing - self pointer rejection" {
 
 test "full query packet parse" {
     // A DNS query for "example.com" type A class IN
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     // Header: id=0x0001, RD=1, qdcount=1
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x0100, .big); // RD=1
@@ -1546,7 +1546,7 @@ test "full query packet parse" {
 
 test "response with A records" {
     // Build a response with 1 question + 1 A answer
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     // Header: id=0x1234, QR=1, RD=1, RA=1, qdcount=1, ancount=1
     mem.writeInt(u16, pkt[0..2], 0x1234, .big);
     mem.writeInt(u16, pkt[2..4], 0x8180, .big);
@@ -1594,7 +1594,7 @@ test "response with A records" {
 }
 
 test "SOA record parsing" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     // Header: ancount=1
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1
@@ -1652,7 +1652,7 @@ test "SOA record parsing" {
 }
 
 test "MX record parsing" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x8000, .big);
     mem.writeInt(u16, pkt[4..6], 0, .big);
@@ -1689,7 +1689,7 @@ test "MX record parsing" {
 }
 
 test "TXT record parsing" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x8000, .big);
     mem.writeInt(u16, pkt[4..6], 0, .big);
@@ -1734,7 +1734,7 @@ test "TXT record parsing" {
 
 test "roundtrip: parse -> serialize -> parse -> compare" {
     // Build a query packet
-    var original_pkt: [512]u8 = undefined;
+    var original_pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, original_pkt[0..2], 0xABCD, .big);
     mem.writeInt(u16, original_pkt[2..4], 0x0100, .big); // RD=1
     mem.writeInt(u16, original_pkt[4..6], 1, .big);
@@ -1775,7 +1775,7 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
     const msg1 = try parseMessage(arena.allocator(), original_pkt[0..pos]);
 
     // Serialize
-    var ser_buf: [512]u8 = undefined;
+    var ser_buf: [max_udp_payload]u8 = undefined;
     const serialized = try serializeMessage(&ser_buf, msg1);
 
     // Parse again
@@ -1859,7 +1859,7 @@ test "hasTcBit detects truncation on mid-record truncated response" {
 }
 
 test "edge case: max-length label" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, pkt[0..2], 1, .big);
     mem.writeInt(u16, pkt[2..4], 0, .big);
     mem.writeInt(u16, pkt[4..6], 1, .big);
@@ -1883,7 +1883,7 @@ test "edge case: max-length label" {
 }
 
 test "edge case: oversized label" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, pkt[0..2], 1, .big);
     mem.writeInt(u16, pkt[2..4], 0, .big);
     mem.writeInt(u16, pkt[4..6], 1, .big);
@@ -1975,7 +1975,7 @@ test "EDNS0: serialized OPT has correct wire format" {
 
     const msg = try buildQueryWithOptions(alloc, 0xABCD, "x.com", .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
 
-    var buf: [512]u8 = undefined;
+    var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
     // ar_count in header should be 1 (the OPT record)
@@ -2256,7 +2256,7 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     try testing.expectEqual(msg.header.id, msg2.header.id);
@@ -2273,7 +2273,7 @@ test "buildQueryWithOptions rd=false roundtrip" {
     try testing.expect(!msg.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     try testing.expect(!msg2.header.rd);
@@ -2283,7 +2283,7 @@ test "buildQueryWithOptions rd=false roundtrip" {
 
 // ── Test helpers ────────────────────────────────────────────────────
 
-fn testHeader(pkt: *[512]u8, opts: struct {
+fn testHeader(pkt: *[max_udp_payload]u8, opts: struct {
     id: u16 = 0x0001,
     flags: u16 = 0x8000,
     qd: u16 = 0,
@@ -2307,7 +2307,7 @@ fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Messa
 // ── DNSSEC record type tests ────────────────────────────────────────
 
 test "DNSKEY record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2347,7 +2347,7 @@ test "DNSKEY record parse/serialize roundtrip" {
     try testing.expect(dnskey.isSecureEntryPoint());
     try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const dk2 = msg2.answers[0].rdata.dnskey;
@@ -2358,7 +2358,7 @@ test "DNSKEY record parse/serialize roundtrip" {
 }
 
 test "DS record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2394,7 +2394,7 @@ test "DS record parse/serialize roundtrip" {
     try testing.expectEqual(DigestType.sha256, ds.digest_type);
     try testing.expectEqualSlices(u8, &digest, ds.digest);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const ds2 = msg2.answers[0].rdata.ds;
@@ -2403,7 +2403,7 @@ test "DS record parse/serialize roundtrip" {
 }
 
 test "RRSIG record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2456,7 +2456,7 @@ test "RRSIG record parse/serialize roundtrip" {
     try testing.expectEqualStrings("example", rrsig.signer_name.labels[0]);
     try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const rrsig2 = msg2.answers[0].rdata.rrsig;
@@ -2467,7 +2467,7 @@ test "RRSIG record parse/serialize roundtrip" {
 }
 
 test "NSEC record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2517,7 +2517,7 @@ test "NSEC record parse/serialize roundtrip" {
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .aaaa));
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .txt));
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const nsec2 = msg2.answers[0].rdata.nsec;
@@ -2526,7 +2526,7 @@ test "NSEC record parse/serialize roundtrip" {
 }
 
 test "NSEC3 record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2578,7 +2578,7 @@ test "NSEC3 record parse/serialize roundtrip" {
     try testing.expect(typeBitmapContains(nsec3.type_bit_maps, .a));
     try testing.expect(!typeBitmapContains(nsec3.type_bit_maps, .aaaa));
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const n3_2 = msg2.answers[0].rdata.nsec3;
@@ -2590,7 +2590,7 @@ test "NSEC3 record parse/serialize roundtrip" {
 }
 
 test "NSEC3PARAM record parse/serialize roundtrip" {
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2627,7 +2627,7 @@ test "NSEC3PARAM record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
 
-    var rt_buf: [512]u8 = undefined;
+    var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const np2 = msg2.answers[0].rdata.nsec3param;
@@ -2694,7 +2694,7 @@ test "safeTagName handles known and unknown enum values" {
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     // Craft a packet where the RRSIG signer name extends past the declared rdlength.
     // Before the fix this would cause an unsigned integer underflow (panic/UB).
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;
@@ -2741,7 +2741,7 @@ test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
 
 test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" {
     // Craft a packet where the NSEC next domain name extends past the declared rdlength.
-    var pkt: [512]u8 = undefined;
+    var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
     var pos: usize = 12;

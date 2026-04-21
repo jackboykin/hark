@@ -388,7 +388,7 @@ test "BlockingUdpTransport loopback query" {
     // Build a DNS query
     const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a);
     defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [512]u8 = undefined;
+    var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
@@ -421,7 +421,7 @@ test "BlockingUdpTransport timeout" {
 
     const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a);
     defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [512]u8 = undefined;
+    var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
@@ -450,7 +450,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
 
     const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa);
     defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [512]u8 = undefined;
+    var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
     const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
@@ -471,13 +471,13 @@ fn echoServerThread(sock: posix.fd_t) void {
     const poll_result = posix.poll(&polls, 2000) catch return;
     if (poll_result == 0) return;
 
-    var recv_buf: [512]u8 = undefined;
+    var recv_buf: [dns.max_udp_payload]u8 = undefined;
     var client_addr: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
     var client_addr_len: posix.socklen_t = @sizeOf(na.PosixAddress);
     const n = sys.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
     if (n < 2) return;
 
-    var resp: [512]u8 = undefined;
+    var resp: [dns.max_udp_payload]u8 = undefined;
     @memcpy(resp[0..n], recv_buf[0..n]);
     resp[2] |= 0x80;
     _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
