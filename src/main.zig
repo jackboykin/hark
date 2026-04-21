@@ -262,8 +262,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver.initWithTcp(&t, &tcp_t);
-        resolver.io = io;
+        var resolver = ForwardingResolver.initWithTcp(&t, &tcp_t, io);
         if (dot_mode) {
             resolver.tls_transport = &tls_t;
         }

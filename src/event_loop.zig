@@ -43,7 +43,7 @@ pub const ReadResult = struct {
 
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { recv, cancel, accept, read };
+const OpKind = enum { recv, accept, read };
 
 const Slot = struct {
     kind: OpKind,
@@ -298,7 +298,6 @@ pub const EventLoop = struct {
                         } };
                     }
                 },
-                .cancel => {},
             }
 
             self.freeSlot(id);

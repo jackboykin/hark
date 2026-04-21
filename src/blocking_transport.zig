@@ -43,7 +43,7 @@ pub const BlockingUdpTransport = struct {
         const retransmit_ms = @max(50, timeout_ms / 3);
 
         // Set initial recv timeout to retransmit interval
-        setRecvTimeout(sock, retransmit_ms);
+        sys.setSocketTimeout(sock, posix.SO.RCVTIMEO, retransmit_ms);
 
         // Send initial query
         _ = sys.send(sock, wire_query, 0) catch return error.Timeout;
@@ -70,7 +70,7 @@ pub const BlockingUdpTransport = struct {
                         retransmit_ms,
                     )));
                     if (remain_ms == 0) return error.Timeout;
-                    setRecvTimeout(sock, remain_ms);
+                    sys.setSocketTimeout(sock, posix.SO.RCVTIMEO, remain_ms);
                     continue;
                 },
                 else => return error.Timeout,
@@ -286,12 +286,6 @@ pub const BlockingTcpTransport = struct {
         return response_buf[0..body_len];
     }
 };
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-fn setRecvTimeout(sock: posix.fd_t, ms: u32) void {
-    sys.setSocketTimeout(sock, posix.SO.RCVTIMEO, ms);
-}
 
 // ── Tests ────────────────────────────────────────────────────────────────
 

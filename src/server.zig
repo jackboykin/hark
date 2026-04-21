@@ -755,8 +755,7 @@ const WorkerState = struct {
                 return result;
             },
             .forward => {
-                var resolver = ForwardingResolver.initWithTcp(udp, tcp);
-                resolver.io = self.io;
+                var resolver = ForwardingResolver.initWithTcp(udp, tcp, self.io);
                 const upstreams = if (self.config.upstreams.len > 0)
                     self.config.upstreams
                 else
