@@ -36,7 +36,7 @@ pub const edns_udp_payload: u16 = 1232;
 /// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
 /// message can be at most 65535 bytes. Also the ceiling for any DNS
 /// response buffer we might parse.
-pub const max_message_len: u32 = 65535;
+pub const max_message_len: u16 = 65535;
 
 // ── Enums ──────────────────────────────────────────────────────────────
 
@@ -881,12 +881,13 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
 /// alias `bytes` — the wire buffer. Caller must keep `bytes` alive for
 /// the lifetime of the returned Message.
 ///
-/// `allocator` must be an arena (or otherwise free-resilient): the
-/// errdefers call `freeName`/`freeRData`, which attempt `allocator.free`
-/// on byte slices that aren't allocator-owned. Arenas no-op their `free`,
-/// which is the only invariant that makes this sound. Production uses a
-/// per-query arena; tests should wrap `testing.allocator` in an
-/// `ArenaAllocator`.
+/// `allocator` must be an arena on success: the returned Message's
+/// aliased slices point into `bytes`, so `freeMessage` is only sound
+/// when `allocator.free` is a no-op. On error, per-item cleanup is
+/// skipped for the same reason — only ArrayList backing buffers are
+/// deinit'd, which is safe under any allocator. Production uses a
+/// per-query arena; tests wrap `testing.allocator` in an `ArenaAllocator`
+/// for successful-parse paths.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     if (bytes.len < header_len) return error.EndOfData;
 
@@ -902,46 +903,32 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
 
     var questions: ArrayList(Question) = .empty;
     questions.ensureTotalCapacity(allocator, @min(hdr.qd_count, max_questions)) catch return error.OutOfMemory;
-    errdefer {
-        for (questions.items) |q| freeName(allocator, q.name);
-        questions.deinit(allocator);
-    }
+    errdefer questions.deinit(allocator);
     for (0..hdr.qd_count) |_| {
         const q = try parser.parseQuestion(allocator);
-        questions.append(allocator, q) catch {
-            freeName(allocator, q.name);
-            return error.OutOfMemory;
-        };
+        questions.append(allocator, q) catch return error.OutOfMemory;
     }
 
     var answers: ArrayList(ResourceRecord) = .empty;
     answers.ensureTotalCapacity(allocator, @min(hdr.an_count, max_rrs)) catch return error.OutOfMemory;
-    errdefer {
-        freeResourceRecordContents(allocator, answers.items);
-        answers.deinit(allocator);
-    }
+    errdefer answers.deinit(allocator);
     for (0..hdr.an_count) |_| {
-        try appendRr(&answers, allocator, try parser.parseResourceRecord(allocator));
+        const rr = try parser.parseResourceRecord(allocator);
+        answers.append(allocator, rr) catch return error.OutOfMemory;
     }
 
     var authorities: ArrayList(ResourceRecord) = .empty;
     authorities.ensureTotalCapacity(allocator, @min(hdr.ns_count, max_rrs)) catch return error.OutOfMemory;
-    errdefer {
-        freeResourceRecordContents(allocator, authorities.items);
-        authorities.deinit(allocator);
-    }
+    errdefer authorities.deinit(allocator);
     for (0..hdr.ns_count) |_| {
-        try appendRr(&authorities, allocator, try parser.parseResourceRecord(allocator));
+        const rr = try parser.parseResourceRecord(allocator);
+        authorities.append(allocator, rr) catch return error.OutOfMemory;
     }
 
     var additionals: ArrayList(ResourceRecord) = .empty;
     additionals.ensureTotalCapacity(allocator, @min(hdr.ar_count, max_rrs)) catch return error.OutOfMemory;
-    errdefer {
-        freeResourceRecordContents(allocator, additionals.items);
-        additionals.deinit(allocator);
-    }
+    errdefer additionals.deinit(allocator);
     var opt: ?OptRecord = null;
-    errdefer if (opt) |o| freeOpt(allocator, o);
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
         if (rr.rtype == .opt and opt == null) {
@@ -954,7 +941,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
                 .options = try parseEdnsOptions(allocator, rr.rdata.unknown),
             };
         } else {
-            try appendRr(&additionals, allocator, rr);
+            additionals.append(allocator, rr) catch return error.OutOfMemory;
         }
     }
 
@@ -2142,14 +2129,6 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
 pub fn freeOpt(allocator: Allocator, opt: OptRecord) void {
     for (opt.options) |o| allocator.free(o.data);
     if (opt.options.len > 0) allocator.free(opt.options);
-}
-
-fn appendRr(list: *ArrayList(ResourceRecord), allocator: Allocator, rr: ResourceRecord) Error!void {
-    list.append(allocator, rr) catch {
-        freeName(allocator, rr.name);
-        freeRData(allocator, rr.rdata);
-        return error.OutOfMemory;
-    };
 }
 
 pub fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
