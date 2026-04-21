@@ -188,6 +188,7 @@ pub const Server = struct {
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
                 .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
+                .max_bytes = NsecCache.default_max_bytes,
                 .io = io,
                 .thread_safe = cfg.workers > 1,
             }) else null,

@@ -48,7 +48,7 @@ pub const ForwardingResolver = struct {
             var response_buf: [65535]u8 = undefined;
             const response_data = try tls_t.query(wire_query, upstream, &response_buf);
             const msg = try dns.parseMessage(allocator, response_data);
-            try validateResponse(msg, expected_name, qtype);
+            try dns.validateResponse(msg, expected_name, qtype);
             return msg;
         }
 
@@ -61,7 +61,7 @@ pub const ForwardingResolver = struct {
                 var tcp_buf: [65535]u8 = undefined;
                 if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
-                    try validateResponse(msg, expected_name, qtype);
+                    try dns.validateResponse(msg, expected_name, qtype);
                     return msg;
                 } else |_| {
                     // TCP failed — fall through to parse truncated response as last resort
@@ -70,20 +70,10 @@ pub const ForwardingResolver = struct {
         }
 
         const msg = try dns.parseMessage(allocator, response_data);
-        try validateResponse(msg, expected_name, qtype);
+        try dns.validateResponse(msg, expected_name, qtype);
         return msg;
     }
 };
-
-/// RFC 9619 / Unbound model: error responses (FORMERR, SERVFAIL, REFUSED)
-/// may omit the question section. Reject NOERROR/NXDOMAIN with missing
-/// questions (suspicious — nothing legitimate to poison into cache).
-fn validateResponse(msg: dns.Message, expected_name: dns.Name, qtype: dns.RType) error{FormatError}!void {
-    if (!msg.header.qr) return error.FormatError;
-    if (!dns.validateQuestionMatch(msg, expected_name, qtype)) {
-        if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
-    }
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 

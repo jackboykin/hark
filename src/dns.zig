@@ -2045,6 +2045,16 @@ pub fn validateQuestionMatch(response: Message, expected_name: Name, expected_ty
     return q.qtype == expected_type and q.qclass == .in and q.name.eql(expected_name);
 }
 
+/// RFC 9619 / Unbound model: error responses (FORMERR, SERVFAIL, REFUSED)
+/// may omit the question section. Reject NOERROR/NXDOMAIN with missing
+/// questions (suspicious — nothing legitimate to poison into cache).
+pub fn validateResponse(msg: Message, expected_name: Name, qtype: RType) error{FormatError}!void {
+    if (!msg.header.qr) return error.FormatError;
+    if (!validateQuestionMatch(msg, expected_name, qtype)) {
+        if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
+    }
+}
+
 pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);

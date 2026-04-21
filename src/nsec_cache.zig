@@ -236,7 +236,7 @@ pub const NsecCache = struct {
 
     pub const Config = struct {
         backing: Allocator,
-        max_bytes: usize = default_max_bytes,
+        max_bytes: usize,
         io: std.Io,
         thread_safe: bool = false,
     };
