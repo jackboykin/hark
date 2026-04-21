@@ -726,7 +726,7 @@ const WorkerState = struct {
             var rcode_buf: [24]u8 = undefined;
             log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
 
-            const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, 65535), result.message, alloc) orelse return;
+            const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, dns.max_message_len), result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
@@ -1308,7 +1308,7 @@ test "buildResponseWire sets correct header fields" {
         .client_edns = false,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = 512,
+        .max_payload = dns.max_udp_payload,
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
@@ -1353,7 +1353,7 @@ test "buildResponseWire with EDNS0" {
         .questions = &.{},
     };
 
-    var buf: [1232]u8 = undefined;
+    var buf: [dns.edns_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x5678,
         .rd = true,
@@ -1362,7 +1362,7 @@ test "buildResponseWire with EDNS0" {
         .client_edns = true,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = 1232,
+        .max_payload = dns.edns_udp_payload,
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
