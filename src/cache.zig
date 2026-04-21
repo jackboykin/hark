@@ -314,7 +314,12 @@ pub const RRsetCache = struct {
     prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    pub const CacheOptions = struct {
+    pub const Config = struct {
+        backing: Allocator,
+        max_bytes: usize,
+        max_entries: u32,
+        io: std.Io,
+        thread_safe: bool = false,
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
         min_ttl: u32 = 0,
@@ -322,38 +327,25 @@ pub const RRsetCache = struct {
         skip_key_types: bool = false,
     };
 
-    pub fn init(backing: Allocator, max_bytes: usize, max_entries: u32, io: std.Io) RRsetCache {
-        return initWithOptions(backing, max_bytes, max_entries, .{}, io);
-    }
-
-    pub fn initWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions, io: std.Io) RRsetCache {
+    pub fn init(cfg: Config) RRsetCache {
         // Allocate SIEVE visited flags from backing allocator (not counted against cache budget).
-        const visited: ?[]std.atomic.Value(u8) = if (backing.alloc(std.atomic.Value(u8), max_entries)) |v| blk: {
+        const visited: ?[]std.atomic.Value(u8) = if (cfg.backing.alloc(std.atomic.Value(u8), cfg.max_entries)) |v| blk: {
             for (v) |*slot| slot.* = std.atomic.Value(u8).init(0);
             break :blk v;
         } else |_| null;
         return .{
-            .counting = CountingAllocator.init(backing, max_bytes),
+            .counting = CountingAllocator.init(cfg.backing, cfg.max_bytes),
             .map = .empty,
-            .max_entries = max_entries,
-            .io = io,
+            .max_entries = cfg.max_entries,
+            .io = cfg.io,
+            .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
             .now_fn = &defaultNowSeconds,
-            .prefetch = opts.prefetch,
-            .serve_stale_ttl = opts.serve_stale_ttl,
-            .min_ttl = opts.min_ttl,
-            .skip_key_types = opts.skip_key_types,
+            .prefetch = cfg.prefetch,
+            .serve_stale_ttl = cfg.serve_stale_ttl,
+            .min_ttl = cfg.min_ttl,
+            .skip_key_types = cfg.skip_key_types,
             .visited = visited,
         };
-    }
-
-    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, max_entries: u32, io: std.Io) RRsetCache {
-        return initThreadSafeWithOptions(backing, max_bytes, max_entries, .{}, io);
-    }
-
-    pub fn initThreadSafeWithOptions(backing: Allocator, max_bytes: usize, max_entries: u32, opts: CacheOptions, io: std.Io) RRsetCache {
-        var c = initWithOptions(backing, max_bytes, max_entries, opts, io);
-        c.rwlock = std.Io.RwLock.init;
-        return c;
     }
 
     pub const Stats = struct {
@@ -936,7 +928,7 @@ fn testNowSeconds() i64 {
 }
 
 fn makeTestCache(alloc: Allocator) RRsetCache {
-    var cache = RRsetCache.init(alloc, 1024 * 1024, 100, testing.io);
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     return cache;
 }
@@ -1279,7 +1271,7 @@ test "cache eviction when full" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(alloc, 1024 * 1024, 2, testing.io); // max 2 entries
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 2, .io = testing.io }); // max 2 entries
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1376,7 +1368,7 @@ test "cache prefetch flag at 10 percent TTL" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .prefetch = true }, testing.io);
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1454,7 +1446,7 @@ test "cache serve stale within window" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 }, testing.io);
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1490,7 +1482,7 @@ test "cache serve stale beyond window returns null" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .serve_stale_ttl = 3600 }, testing.io);
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -1516,7 +1508,7 @@ test "cache min TTL floor" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.initWithOptions(alloc, 1024 * 1024, 100, .{ .min_ttl = 300 }, testing.io);
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .min_ttl = 300 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 

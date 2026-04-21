@@ -254,7 +254,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     else
         std.heap.smp_allocator;
     hark.cache.randomizeHashSeed(io);
-    var cache = RRsetCache.init(cache_alloc, 16 * 1024 * 1024, 10_000, io);
+    var cache = RRsetCache.init(.{ .backing = cache_alloc, .max_bytes = 16 * 1024 * 1024, .max_entries = 10_000, .io = io });
     defer cache.deinit();
 
     // DNS message data uses arena

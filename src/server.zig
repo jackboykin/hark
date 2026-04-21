@@ -139,20 +139,21 @@ pub const Server = struct {
         cache_mod.randomizeHashSeed(io);
         dedup_mod.randomizeHashSeed(io);
 
-        const cache_opts = RRsetCache.CacheOptions{
-            .prefetch = cfg.prefetch,
-            .serve_stale_ttl = cfg.serve_stale_ttl,
-            .min_ttl = cfg.min_ttl,
-            .skip_key_types = cfg.dnssec,
-        };
         const cache_alloc = if (builtin.single_threaded)
             allocator
         else
             std.heap.smp_allocator;
-        const cache = if (cfg.workers > 1)
-            RRsetCache.initThreadSafeWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts, io)
-        else
-            RRsetCache.initWithOptions(cache_alloc, cfg.cache_size, cfg.cache_entries, cache_opts, io);
+        const cache = RRsetCache.init(.{
+            .backing = cache_alloc,
+            .max_bytes = cfg.cache_size,
+            .max_entries = cfg.cache_entries,
+            .io = io,
+            .thread_safe = cfg.workers > 1,
+            .prefetch = cfg.prefetch,
+            .serve_stale_ttl = cfg.serve_stale_ttl,
+            .min_ttl = cfg.min_ttl,
+            .skip_key_types = cfg.dnssec,
+        });
 
         const rtt_cache = if (cfg.workers > 1)
             RttCache.initThreadSafe(allocator, io)
@@ -190,12 +191,13 @@ pub const Server = struct {
                 else
                     NsecCache.init(nsec_alloc, NsecCache.default_max_bytes, io);
             } else null,
-            .key_cache = if (cfg.dnssec) blk: {
-                break :blk if (cfg.workers > 1)
-                    RRsetCache.initThreadSafe(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries, io)
-                else
-                    RRsetCache.init(cache_alloc, cfg.key_cache_size, cfg.key_cache_entries, io);
-            } else null,
+            .key_cache = if (cfg.dnssec) RRsetCache.init(.{
+                .backing = cache_alloc,
+                .max_bytes = cfg.key_cache_size,
+                .max_entries = cfg.key_cache_entries,
+                .io = io,
+                .thread_safe = cfg.workers > 1,
+            }) else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
         };
