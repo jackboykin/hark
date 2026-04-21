@@ -7,6 +7,39 @@ const RRsetCache = hark.cache.RRsetCache;
 
 pub const host_labels_spec = [_][]const u8{ "host{d}", "example", "com" };
 
+/// Header for a one-record authoritative answer.
+pub const single_answer_header: dns.Header = .{
+    .id = 0,
+    .qr = true,
+    .opcode = .query,
+    .aa = true,
+    .tc = false,
+    .rd = false,
+    .ra = false,
+    .z = 0,
+    .ad = false,
+    .cd = false,
+    .rcode = .no_error,
+    .qd_count = 0,
+    .an_count = 1,
+    .ns_count = 0,
+    .ar_count = 0,
+};
+
+/// Wrap a single resource record into a minimal authoritative message.
+pub fn singleAnswerMessage(alloc: std.mem.Allocator, rr: dns.ResourceRecord) !dns.Message {
+    const recs = try alloc.alloc(dns.ResourceRecord, 1);
+    recs[0] = rr;
+    return .{ .header = single_answer_header, .questions = &.{}, .answers = recs };
+}
+
+/// Duplicate a slice of string literals into an owned labels slice.
+pub fn dupeLabels(alloc: std.mem.Allocator, parts: []const []const u8) ![][]const u8 {
+    const labels = try alloc.alloc([]const u8, parts.len);
+    for (parts, 0..) |p, i| labels[i] = try alloc.dupe(u8, p);
+    return labels;
+}
+
 /// Build a minimal authoritative A-record response message with a two- or
 /// three-label name. Used by cache/dedup/sieve benches to populate a cache
 /// with synthetic entries.
@@ -24,36 +57,13 @@ pub fn makeAResponse(
         labels[i] = try alloc.dupe(u8, lit);
     }
 
-    const recs = try alloc.alloc(dns.ResourceRecord, 1);
-    recs[0] = .{
+    return singleAnswerMessage(alloc, .{
         .name = dns.Name{ .labels = labels },
         .rtype = .a,
         .rclass = .in,
         .ttl = 3600,
         .rdata = .{ .a = rdata_a },
-    };
-
-    return .{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = recs,
-    };
+    });
 }
 
 /// Populate `cache` with `n` synthetic A records (hostN.example.com → 10.0.N.N)

@@ -1675,7 +1675,7 @@ pub const RecursiveResolver = struct {
 
     /// Walk the domain name from TLD to find the closest cached delegation.
     /// E.g., for "www.example.com", check NS records for "com" then "example.com".
-    fn findClosestCachedDelegation(
+    pub fn findClosestCachedDelegation(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         target_name: []const u8,
@@ -1694,8 +1694,16 @@ pub const RecursiveResolver = struct {
         }
         if (part_count == 0) return null;
 
-        // Walk from TLD toward full name, looking for cached NS + addresses
+        // Walk from TLD toward full name, looking for cached NS + addresses.
+        // Intermediate NS/glue clones live in a scratch arena that is reset
+        // each iteration, so losing levels do not accumulate in the caller's
+        // arena. A miss after a prior hit terminates the walk: referral
+        // caching is populated top-down, so no deeper level can exist.
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
+
         var best: ?DelegationResult = null;
+        var had_ns_hit = false;
 
         var i: usize = part_count;
         while (i > 0) {
@@ -1714,55 +1722,60 @@ pub const RecursiveResolver = struct {
             }
             const zone_str = zone_buf[0..pos];
 
-            // Look up cached NS records for this zone
-            if (cache.lookup(allocator, zone_str, .ns, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        // Extract NS names from cached records
-                        var ns_names: [max_servers_per_level]dns.Name = undefined;
-                        var ns_count: usize = 0;
-                        for (h.records) |ns_rr| {
-                            if (ns_rr.rtype == .ns and ns_count < max_servers_per_level) {
-                                ns_names[ns_count] = ns_rr.rdata.ns;
-                                ns_count += 1;
-                            }
-                        }
+            _ = scratch_arena.reset(.retain_capacity);
+            const scratch = scratch_arena.allocator();
 
-                        if (try self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count])) |res| {
-                            // DNSSEC: only use this delegation if DS status is known.
-                            // If DS is a cache miss, another thread may not have cached
-                            // the insecure delegation yet. Try a targeted DS re-probe
-                            // using the parent delegation's servers (like Unbound's key
-                            // cache refresh) before falling back to referral re-walk.
-                            if (self.dnssec_enabled) {
-                                const ds_cache = self.keyCache() orelse break;
-                                if (ds_cache.lookup(allocator, zone_str, .ds, .in) == null) {
-                                    const reprobed = if (best) |parent_deleg|
-                                        self.reproveDelegationSecurity(
-                                            allocator,
-                                            zone_str,
-                                            parent_deleg.addrs[0..parent_deleg.count],
-                                        )
-                                    else
-                                        false;
-                                    if (!reprobed) break;
-                                    // DS status re-established — re-check before using
-                                    if (ds_cache.lookup(allocator, zone_str, .ds, .in) == null) break;
-                                }
-                            }
+            const ns_lookup = cache.lookup(scratch, zone_str, .ns, .in) orelse {
+                if (had_ns_hit) break;
+                continue;
+            };
+            const hit = switch (ns_lookup) {
+                .hit => |h| h,
+                .negative => continue,
+            };
+            had_ns_hit = true;
 
-                            const zone_name = try dns.parseDottedName(allocator, zone_str);
-                            best = .{
-                                .addrs = res.addrs,
-                                .count = res.count,
-                                .zone = zone_name,
-                            };
-                            // Keep going to find a more specific zone
-                        }
-                    },
-                    .negative => {},
+            var ns_names: [max_servers_per_level]dns.Name = undefined;
+            var ns_count: usize = 0;
+            for (hit.records) |ns_rr| {
+                if (ns_rr.rtype == .ns and ns_count < max_servers_per_level) {
+                    ns_names[ns_count] = ns_rr.rdata.ns;
+                    ns_count += 1;
                 }
             }
+
+            const res = (try self.lookupCachedNsAddresses(scratch, ns_names[0..ns_count])) orelse continue;
+
+            // DNSSEC: only use this delegation if DS status is known.
+            // If DS is a cache miss, another thread may not have cached
+            // the insecure delegation yet. Try a targeted DS re-probe
+            // using the parent delegation's servers (like Unbound's key
+            // cache refresh) before falling back to referral re-walk.
+            if (self.dnssec_enabled) {
+                const ds_cache = self.keyCache() orelse break;
+                if (!ds_cache.lookupExists(zone_str, .ds, .in)) {
+                    const reprobed = if (best) |parent_deleg|
+                        self.reproveDelegationSecurity(
+                            allocator,
+                            zone_str,
+                            parent_deleg.addrs[0..parent_deleg.count],
+                        )
+                    else
+                        false;
+                    if (!reprobed) break;
+                    // DS status re-established — re-check before using
+                    if (!ds_cache.lookupExists(zone_str, .ds, .in)) break;
+                }
+            }
+
+            // Zone name must live on the caller's arena: `best` outlives
+            // the scratch reset. Addresses are plain `na.Address` values.
+            const zone_name = try dns.parseDottedName(allocator, zone_str);
+            best = .{
+                .addrs = res.addrs,
+                .count = res.count,
+                .zone = zone_name,
+            };
         }
 
         return best;

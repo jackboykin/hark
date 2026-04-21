@@ -20,6 +20,7 @@ const sieve = @import("bench_sieve.zig");
 const cache_hit = @import("bench_cache_hit.zig");
 const dedup = @import("bench_dedup.zig");
 const upstream = @import("bench_upstream.zig");
+const delegation = @import("bench_delegation.zig");
 
 const benchmarks = [_]Benchmark{
     .{ .name = "self_test", .run = self_test.run },
@@ -32,6 +33,7 @@ const benchmarks = [_]Benchmark{
     .{ .name = "dedup_f01", .run = dedup.runF01 },
     .{ .name = "upstream_perquery", .run = upstream.runPerQuery },
     .{ .name = "upstream_persistent", .run = upstream.runPersistent },
+    .{ .name = "delegation", .run = delegation.run },
 };
 
 fn percentile(sorted: []const i64, p: f64) i64 {
