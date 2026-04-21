@@ -39,7 +39,7 @@ const RttState = struct {
 
 pub const RttCache = struct {
     entries: std.AutoHashMap(AddressKey, RttState),
-    mutex: ?std.Io.Mutex,
+    rwlock: ?std.Io.RwLock,
     io: std.Io,
     now_fn: *const fn () i64,
 
@@ -52,7 +52,7 @@ pub const RttCache = struct {
     pub fn init(cfg: Config) RttCache {
         return .{
             .entries = std.AutoHashMap(AddressKey, RttState).init(cfg.allocator),
-            .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
+            .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
             .io = cfg.io,
             .now_fn = &@import("monotonic.zig").nowMs,
         };
@@ -64,8 +64,8 @@ pub const RttCache = struct {
 
     /// Return the recommended timeout in ms for this server.
     pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
 
         const state = self.entries.get(key) orelse return initial_timeout_ms;
         return computeTimeout(state);
@@ -73,8 +73,8 @@ pub const RttCache = struct {
 
     /// Record a successful response with measured RTT (microseconds).
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
 
         const gop = self.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -97,8 +97,8 @@ pub const RttCache = struct {
 
     /// Record a timeout for this server (exponential backoff + dead marking).
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
+        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlock(self.io);
 
         const gop = self.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -120,8 +120,8 @@ pub const RttCache = struct {
 
     /// Check whether the server is currently marked dead.
     pub fn isDead(self: *RttCache, key: AddressKey) bool {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
 
         const state = self.entries.get(key) orelse return false;
         return state.dead_until_ms > self.now_fn();

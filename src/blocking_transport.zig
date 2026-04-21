@@ -305,7 +305,14 @@ pub const BlockingTcpTransport = struct {
 
     /// Send a length-prefixed DNS query and receive the response on an
     /// already-connected TCP socket, enforcing an absolute deadline.
+    ///
+    /// SO_SNDTIMEO/SO_RCVTIMEO are set once to the remaining deadline as a
+    /// per-syscall upper bound; the userspace deadline check before each
+    /// read/write enforces the total bound (slow-trickle mitigation).
     fn sendAndReceiveTcp(sock: posix.fd_t, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+        try sys.updateTimeout(sock, posix.SO.SNDTIMEO, deadline_ns);
+        try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
+
         // ── Send length-prefixed query ──
         var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
         if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
@@ -316,7 +323,7 @@ pub const BlockingTcpTransport = struct {
 
         var bytes_sent: usize = 0;
         while (bytes_sent < total_send) {
-            try sys.updateTimeout(sock, posix.SO.SNDTIMEO, deadline_ns);
+            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
             const n = sys.write(sock, send_buf[bytes_sent..total_send]) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
@@ -327,7 +334,7 @@ pub const BlockingTcpTransport = struct {
         var len_filled: usize = 0;
 
         while (len_filled < 2) {
-            try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
+            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
             const n = sys.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             len_filled += n;
@@ -338,7 +345,7 @@ pub const BlockingTcpTransport = struct {
 
         var body_filled: usize = 0;
         while (body_filled < body_len) {
-            try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
+            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
             const n = sys.read(sock, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             body_filled += n;

@@ -822,7 +822,7 @@ pub const RecursiveResolver = struct {
             return if (err == error.OutOfMemory) error.OutOfMemory else null;
         var wire1: [dns.edns_udp_payload]u8 = undefined;
         @memcpy(wire1[0..w0.len], w0);
-        mem.writeInt(u16, wire1[0..2], qid1, .big);
+        dns.patchQueryId(wire1[0..w0.len], qid1);
         const w1 = wire1[0..w0.len];
 
         const query_start = monotonic.nowUs();
@@ -892,6 +892,13 @@ pub const RecursiveResolver = struct {
             }
         }
 
+        const query_msg = try dns.buildQueryWithOptions(allocator, 0, query_name, query_type, .{
+            .rd = false,
+            .edns = .{ .do_bit = self.dnssec_aware },
+        });
+        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+        const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
+
         for (server_order, 0..) |server_idx, server_i| {
             const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
@@ -905,17 +912,9 @@ pub const RecursiveResolver = struct {
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
+            // RFC 5452: fresh id per attempt.
             const query_id = rand.queryId(self.io);
-
-            // Build iterative query (rd=false, EDNS0)
-            const query_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
-                .rd = false,
-                .edns = .{ .do_bit = self.dnssec_aware },
-            });
-
-            // Serialize
-            var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-            const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
+            dns.patchQueryId(wire_buf[0..wire_query.len], query_id);
 
             // ── RFC 9539: Opportunistic encrypted query ──
             if (self.tls_transport) |tls_t| {

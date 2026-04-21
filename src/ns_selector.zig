@@ -133,7 +133,15 @@ pub const NsSelector = struct {
             const state = self.arms.get(arm_key) orelse ArmState{};
 
             order_buf[live_count] = i;
-            samples[live_count] = betaSample(self.io, state.alpha, state.beta);
+            // Beta(1,1) is uniform: skip Marsaglia-Tsang Gamma machinery when
+            // the arm is at the uninformed prior (no observations, or floored
+            // back to it by discount). Dominant case on cold resolutions.
+            // Float == is bit-exact here because discountZone floors both
+            // fields back to the prior via @max with the same constants.
+            samples[live_count] = if (state.alpha == alpha_prior and state.beta == beta_prior)
+                rand.uniformFloat(self.io)
+            else
+                betaSample(self.io, state.alpha, state.beta);
             live_count += 1;
         }
 

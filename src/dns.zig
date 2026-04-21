@@ -1115,6 +1115,14 @@ pub const Serializer = struct {
     }
 };
 
+/// Overwrite the 2-byte query id in a serialized DNS message. Used by
+/// failover/staggered paths that build and serialize once, then rotate
+/// per-attempt query-id entropy (RFC 5452 §9.1).
+pub fn patchQueryId(wire: []u8, id: u16) void {
+    std.debug.assert(wire.len >= 2);
+    std.mem.writeInt(u16, wire[0..2], id, .big);
+}
+
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ser = Serializer.init(buf);
 
