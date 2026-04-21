@@ -36,4 +36,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "hark", .module = mod },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Run microbenchmarks (optional filter: zig build bench -- <name_substring>)");
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_run.step);
+    if (b.args) |args| bench_run.addArgs(args);
 }
