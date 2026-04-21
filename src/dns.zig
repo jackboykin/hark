@@ -33,6 +33,10 @@ pub const max_name_len = 253;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
 pub const edns_udp_payload: u16 = 1232;
+/// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
+/// message can be at most 65535 bytes. Also the ceiling for any DNS
+/// response buffer we might parse.
+pub const max_message_len: u32 = 65535;
 
 // ── Enums ──────────────────────────────────────────────────────────────
 
@@ -589,12 +593,10 @@ pub const Parser = struct {
         return slice;
     }
 
-    fn dupSlice(self: *Parser, allocator: Allocator, len: usize) Error![]const u8 {
-        if (len == 0) return &.{};
-        const data = try self.readSlice(len);
-        return allocator.dupe(u8, data) catch return error.OutOfMemory;
-    }
-
+    /// Parse a wire-format Name. Labels alias the wire buffer directly —
+    /// the returned `Name.labels` outer slice is `allocator`-owned, but
+    /// each `labels[i]` byte slice points into `self.msg`. Caller must
+    /// keep the wire buffer alive for the lifetime of the parsed Name.
     pub fn parseName(self: *Parser, allocator: Allocator) Error!Name {
         var labels: ArrayList([]const u8) = .empty;
         var total_len: usize = 0;
@@ -633,8 +635,7 @@ pub const Parser = struct {
                 cursor += 1;
                 if (cursor + label_len > self.msg.len) return error.EndOfData;
                 const label_data = self.msg[cursor..][0..label_len];
-                const duped = allocator.dupe(u8, label_data) catch return error.OutOfMemory;
-                labels.append(allocator, duped) catch return error.OutOfMemory;
+                labels.append(allocator, label_data) catch return error.OutOfMemory;
                 cursor += label_len;
                 total_len += label_len + 1; // +1 for the dot separator
                 if (total_len > max_name_len + 1) return error.NameTooLong;
@@ -727,8 +728,7 @@ pub const Parser = struct {
                     const str_len: usize = try self.readU8();
                     if (self.pos + str_len > rdata_end) return error.FormatError;
                     const str_data = try self.readSlice(str_len);
-                    const duped = allocator.dupe(u8, str_data) catch return error.OutOfMemory;
-                    strings.append(allocator, duped) catch return error.OutOfMemory;
+                    strings.append(allocator, str_data) catch return error.OutOfMemory;
                 }
                 return .{ .txt = .{
                     .strings = strings.toOwnedSlice(allocator) catch return error.OutOfMemory,
@@ -748,8 +748,7 @@ pub const Parser = struct {
                 const name_len = self.pos - name_start;
                 if (18 + name_len > rdlength) return error.InvalidRDataLength;
                 const sig_len = rdlength - 18 - name_len;
-                const sig_data = try self.readSlice(sig_len);
-                const signature = allocator.dupe(u8, sig_data) catch return error.OutOfMemory;
+                const signature = try self.readSlice(sig_len);
                 return .{ .rrsig = .{
                     .type_covered = type_covered,
                     .algorithm = algorithm,
@@ -767,8 +766,7 @@ pub const Parser = struct {
                 const flags = try self.readU16();
                 const protocol = try self.readU8();
                 const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
-                const key_data = try self.readSlice(rdlength - 4);
-                const public_key = allocator.dupe(u8, key_data) catch return error.OutOfMemory;
+                const public_key = try self.readSlice(rdlength - 4);
                 return .{ .dnskey = .{
                     .flags = flags,
                     .protocol = protocol,
@@ -781,8 +779,7 @@ pub const Parser = struct {
                 const key_tag = try self.readU16();
                 const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
                 const digest_type: DigestType = @enumFromInt(try self.readU8());
-                const digest_data = try self.readSlice(rdlength - 4);
-                const digest = allocator.dupe(u8, digest_data) catch return error.OutOfMemory;
+                const digest = try self.readSlice(rdlength - 4);
                 return .{ .ds = .{
                     .key_tag = key_tag,
                     .algorithm = algorithm,
@@ -798,7 +795,7 @@ pub const Parser = struct {
                 if (name_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec = .{
                     .next_domain_name = next_domain_name,
-                    .type_bit_maps = try self.dupSlice(allocator, rdlength - name_len),
+                    .type_bit_maps = try self.readSlice(rdlength - name_len),
                 } };
             },
             .nsec3 => {
@@ -809,11 +806,11 @@ pub const Parser = struct {
                 const salt_len: usize = try self.readU8();
                 // Validate salt + hash_len byte fit within rdlength
                 if (5 + salt_len + 1 > rdlength) return error.InvalidRDataLength;
-                const salt = try self.dupSlice(allocator, salt_len);
+                const salt = try self.readSlice(salt_len);
                 const hash_len: usize = try self.readU8();
                 const consumed = 6 + salt_len + hash_len;
                 if (consumed > rdlength) return error.InvalidRDataLength;
-                const next_hashed_owner = try self.dupSlice(allocator, hash_len);
+                const next_hashed_owner = try self.readSlice(hash_len);
                 const bitmap_len = rdlength - consumed;
                 return .{ .nsec3 = .{
                     .hash_algorithm = hash_algorithm,
@@ -821,7 +818,7 @@ pub const Parser = struct {
                     .iterations = iterations,
                     .salt = salt,
                     .next_hashed_owner = next_hashed_owner,
-                    .type_bit_maps = try self.dupSlice(allocator, bitmap_len),
+                    .type_bit_maps = try self.readSlice(bitmap_len),
                 } };
             },
             .nsec3param => {
@@ -835,13 +832,12 @@ pub const Parser = struct {
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
                     .iterations = iterations,
-                    .salt = try self.dupSlice(allocator, salt_len),
+                    .salt = try self.readSlice(salt_len),
                 } };
             },
             .opt, _ => {
                 const data = try self.readSlice(rdlength);
-                const duped = allocator.dupe(u8, data) catch return error.OutOfMemory;
-                return .{ .unknown = duped };
+                return .{ .unknown = data };
             },
         }
     }
@@ -867,7 +863,7 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
         const length = mem.readInt(u16, rdata[pos + 2 ..][0..2], .big);
         pos += 4;
         if (pos + length > rdata.len) return error.FormatError;
-        const data = allocator.dupe(u8, rdata[pos..][0..length]) catch return error.OutOfMemory;
+        const data = rdata[pos..][0..length];
         options.append(allocator, .{ .code = code, .data = data }) catch return error.OutOfMemory;
         pos += length;
     }
@@ -877,6 +873,20 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
 
 // ── Top-level parse ────────────────────────────────────────────────────
 
+/// Parse a DNS wire message.
+///
+/// Lifetime contract: parsed `Name.labels[i]` byte slices and rdata byte
+/// slices (RRSIG signature, DNSKEY public_key, DS digest, NSEC bitmap,
+/// NSEC3 salt/hash/bitmap, NSEC3PARAM salt, unknown, EDNS option data)
+/// alias `bytes` — the wire buffer. Caller must keep `bytes` alive for
+/// the lifetime of the returned Message.
+///
+/// `allocator` must be an arena (or otherwise free-resilient): the
+/// errdefers call `freeName`/`freeRData`, which attempt `allocator.free`
+/// on byte slices that aren't allocator-owned. Arenas no-op their `free`,
+/// which is the only invariant that makes this sound. Production uses a
+/// per-query arena; tests should wrap `testing.allocator` in an
+/// `ArenaAllocator`.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     if (bytes.len < header_len) return error.EndOfData;
 
@@ -935,9 +945,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
         if (rr.rtype == .opt and opt == null) {
-            // OPT pseudo-record: extract fields, free the parsed RR shell
-            defer freeName(allocator, rr.name);
-            defer freeRData(allocator, rr.rdata);
+            // OPT pseudo-record: extract fields and discard the shell.
             opt = .{
                 .udp_payload_size = @intFromEnum(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
@@ -1460,10 +1468,10 @@ test "header parse known bytes" {
 test "name parsing - uncompressed" {
     // "example.com" = \x07example\x03com\x00
     const data = "\x07example\x03com\x00";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var parser = Parser{ .msg = data, .pos = 0 };
-    const name = try parser.parseName(testing.allocator);
-    defer testing.allocator.free(name.labels);
-    defer for (name.labels) |l| testing.allocator.free(l);
+    const name = try parser.parseName(arena.allocator());
 
     try testing.expectEqual(@as(usize, 2), name.labels.len);
     try testing.expectEqualStrings("example", name.labels[0]);
@@ -1477,10 +1485,10 @@ test "name parsing - compressed" {
     // Offset 13: \x03foo\xC0\x00       (pointer to offset 0 = "example.com")
     // So "foo.example.com"
     const data = "\x07example\x03com\x00\x03foo\xC0\x00";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     var parser = Parser{ .msg = data, .pos = 13 };
-    const name = try parser.parseName(testing.allocator);
-    defer testing.allocator.free(name.labels);
-    defer for (name.labels) |l| testing.allocator.free(l);
+    const name = try parser.parseName(arena.allocator());
 
     try testing.expectEqual(@as(usize, 3), name.labels.len);
     try testing.expectEqualStrings("foo", name.labels[0]);
@@ -1523,17 +1531,9 @@ test "full query packet parse" {
     mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
     pos += 2;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer {
-        for (msg.questions) |q| {
-            for (q.name.labels) |l| testing.allocator.free(l);
-            testing.allocator.free(q.name.labels);
-        }
-        testing.allocator.free(msg.questions);
-        testing.allocator.free(msg.answers);
-        testing.allocator.free(msg.authorities);
-        testing.allocator.free(msg.additionals);
-    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
     try testing.expect(msg.header.rd);
@@ -1582,8 +1582,9 @@ test "response with A records" {
     pkt[pos + 3] = 34;
     pos += 4;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const rr = msg.answers[0];
@@ -1635,8 +1636,9 @@ test "SOA record parsing" {
     mem.writeInt(u32, pkt[pos..][0..4], 86400, .big); // minimum
     pos += 4;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const soa = msg.answers[0].rdata.soa;
@@ -1677,8 +1679,9 @@ test "MX record parsing" {
     @memcpy(pkt[pos..][0..exchange.len], exchange);
     pos += exchange.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const mx = msg.answers[0].rdata.mx;
     try testing.expectEqual(@as(u16, 10), mx.preference);
@@ -1719,8 +1722,9 @@ test "TXT record parsing" {
     @memcpy(pkt[pos..][0..txt2.len], txt2);
     pos += txt2.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const txt = msg.answers[0].rdata.txt;
     try testing.expectEqual(@as(usize, 2), txt.strings.len);
@@ -1766,16 +1770,16 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
     pos += 4;
 
     // Parse
-    const msg1 = try parseMessage(testing.allocator, original_pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg1);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg1 = try parseMessage(arena.allocator(), original_pkt[0..pos]);
 
     // Serialize
     var ser_buf: [512]u8 = undefined;
     const serialized = try serializeMessage(&ser_buf, msg1);
 
     // Parse again
-    const msg2 = try parseMessage(testing.allocator, serialized);
-    defer freeMessage(testing.allocator, msg2);
+    const msg2 = try parseMessage(arena.allocator(), serialized);
 
     // Compare
     try testing.expectEqual(msg1.header.id, msg2.header.id);
@@ -1870,8 +1874,9 @@ test "edge case: max-length label" {
     mem.writeInt(u16, pkt[77..79], 1, .big); // A
     mem.writeInt(u16, pkt[79..81], 1, .big); // IN
 
-    const msg = try parseMessage(testing.allocator, pkt[0..81]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..81]);
 
     try testing.expectEqual(@as(usize, 1), msg.questions.len);
     try testing.expectEqual(@as(usize, 63), msg.questions[0].name.labels[0].len);
@@ -1902,9 +1907,9 @@ test "fuzz: random bytes must not panic" {
             const len = smith.slice(&buf);
             const input = buf[0..len];
             // parseMessage should either return a valid result or an error, never panic
-            if (parseMessage(testing.allocator, input)) |msg| {
-                freeMessage(testing.allocator, msg);
-            } else |_| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            if (parseMessage(arena.allocator(), input)) |_| {} else |_| {
                 // Any error is fine — just must not panic
             }
         }
@@ -2159,6 +2164,12 @@ fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
     allocator.free(rrs);
 }
 
+/// Free a Message and all owned contents. For Messages returned from
+/// `parseMessage`, `allocator` must be the arena the Message was parsed
+/// into — Name labels and all rdata byte slices (TXT strings included)
+/// alias the wire buffer, so `allocator.free` on them is only sound when
+/// it is a no-op. For manually-built or `cloneRData`'d Messages (e.g.
+/// cache-owned records), any allocator that owns the contents works.
 pub fn freeMessage(allocator: Allocator, msg: Message) void {
     for (msg.questions) |q| freeName(allocator, q.name);
     allocator.free(msg.questions);
@@ -2233,8 +2244,9 @@ test "isSubdomainOf case insensitive" {
 }
 
 test "buildQuery roundtrip" {
-    const msg = try buildQuery(testing.allocator, 0x1234, "example.com", .a);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try buildQuery(arena.allocator(), 0x1234, "example.com", .a);
 
     try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
     try testing.expect(!msg.header.qr);
@@ -2244,8 +2256,8 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     try testing.expectEqual(msg.header.id, msg2.header.id);
     try testing.expectEqual(msg.header.rd, msg2.header.rd);
@@ -2254,14 +2266,15 @@ test "buildQuery roundtrip" {
 }
 
 test "buildQueryWithOptions rd=false roundtrip" {
-    const msg = try buildQueryWithOptions(testing.allocator, 0x5678, "example.com", .a, .{ .rd = false });
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try buildQueryWithOptions(arena.allocator(), 0x5678, "example.com", .a, .{ .rd = false });
 
     try testing.expect(!msg.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     try testing.expect(!msg2.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg2.header.id);
@@ -2286,9 +2299,8 @@ fn testHeader(pkt: *[512]u8, opts: struct {
     mem.writeInt(u16, pkt[10..12], opts.ar, .big);
 }
 
-fn testRoundtrip(allocator: Allocator, msg: Message) Error!Message {
-    var ser_buf: [512]u8 = undefined;
-    const wire = try serializeMessage(&ser_buf, msg);
+fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Message {
+    const wire = try serializeMessage(wire_buf, msg);
     return parseMessage(allocator, wire);
 }
 
@@ -2322,8 +2334,9 @@ test "DNSKEY record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..key_data.len], &key_data);
     pos += key_data.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const dnskey = msg.answers[0].rdata.dnskey;
@@ -2334,8 +2347,8 @@ test "DNSKEY record parse/serialize roundtrip" {
     try testing.expect(dnskey.isSecureEntryPoint());
     try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const dk2 = msg2.answers[0].rdata.dnskey;
     try testing.expectEqual(dnskey.flags, dk2.flags);
@@ -2371,8 +2384,9 @@ test "DS record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..digest.len], &digest);
     pos += digest.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const ds = msg.answers[0].rdata.ds;
     try testing.expectEqual(@as(u16, 20326), ds.key_tag);
@@ -2380,8 +2394,8 @@ test "DS record parse/serialize roundtrip" {
     try testing.expectEqual(DigestType.sha256, ds.digest_type);
     try testing.expectEqualSlices(u8, &digest, ds.digest);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const ds2 = msg2.answers[0].rdata.ds;
     try testing.expectEqual(ds.key_tag, ds2.key_tag);
@@ -2427,8 +2441,9 @@ test "RRSIG record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..fake_sig.len], &fake_sig);
     pos += fake_sig.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const rrsig = msg.answers[0].rdata.rrsig;
     try testing.expectEqual(RType.a, rrsig.type_covered);
@@ -2441,8 +2456,8 @@ test "RRSIG record parse/serialize roundtrip" {
     try testing.expectEqualStrings("example", rrsig.signer_name.labels[0]);
     try testing.expectEqualSlices(u8, &fake_sig, rrsig.signature);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const rrsig2 = msg2.answers[0].rdata.rrsig;
     try testing.expectEqual(rrsig.type_covered, rrsig2.type_covered);
@@ -2486,8 +2501,9 @@ test "NSEC record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
     pos += bitmap.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const nsec = msg.answers[0].rdata.nsec;
     try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
@@ -2501,8 +2517,8 @@ test "NSEC record parse/serialize roundtrip" {
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .aaaa));
     try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .txt));
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const nsec2 = msg2.answers[0].rdata.nsec;
     try testing.expect(nsec.next_domain_name.eql(nsec2.next_domain_name));
@@ -2549,8 +2565,9 @@ test "NSEC3 record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
     pos += bitmap.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const nsec3 = msg.answers[0].rdata.nsec3;
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
@@ -2561,8 +2578,8 @@ test "NSEC3 record parse/serialize roundtrip" {
     try testing.expect(typeBitmapContains(nsec3.type_bit_maps, .a));
     try testing.expect(!typeBitmapContains(nsec3.type_bit_maps, .aaaa));
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const n3_2 = msg2.answers[0].rdata.nsec3;
     try testing.expectEqual(nsec3.hash_algorithm, n3_2.hash_algorithm);
@@ -2601,16 +2618,17 @@ test "NSEC3PARAM record parse/serialize roundtrip" {
     @memcpy(pkt[pos..][0..salt.len], &salt);
     pos += salt.len;
 
-    const msg = try parseMessage(testing.allocator, pkt[0..pos]);
-    defer freeMessage(testing.allocator, msg);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     const nsec3p = msg.answers[0].rdata.nsec3param;
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3p.hash_algorithm);
     try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
 
-    const msg2 = try testRoundtrip(testing.allocator, msg);
-    defer freeMessage(testing.allocator, msg2);
+    var rt_buf: [512]u8 = undefined;
+    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     const np2 = msg2.answers[0].rdata.nsec3param;
     try testing.expectEqual(nsec3p.hash_algorithm, np2.hash_algorithm);

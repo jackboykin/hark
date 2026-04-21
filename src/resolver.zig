@@ -45,21 +45,22 @@ pub const ForwardingResolver = struct {
 
         // DoT path: send directly over TLS (already TCP-based, no TC-bit fallback needed)
         if (self.tls_transport) |tls_t| {
-            var response_buf: [65535]u8 = undefined;
-            const response_data = try tls_t.query(wire_query, upstream, &response_buf);
+            const response_buf = try allocator.alloc(u8, dns.max_message_len);
+            const response_data = try tls_t.query(wire_query, upstream, response_buf);
             const msg = try dns.parseMessage(allocator, response_data);
             try dns.validateResponse(msg, expected_name, qtype);
             return msg;
         }
 
-        // Do53 path: UDP with TCP fallback on truncation
-        const response_data = try self.transport.query(wire_query, query_id, upstream);
+        // Do53 path: UDP with TCP fallback on truncation.
+        const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
+        const response_data = try self.transport.query(wire_query, query_id, upstream, response_buf);
 
         // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
         if (dns.hasTcBit(response_data)) {
             if (self.tcp_transport) |tcp| {
-                var tcp_buf: [65535]u8 = undefined;
-                if (tcp.query(wire_query, upstream, &tcp_buf)) |tcp_data| {
+                const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
+                if (tcp.query(wire_query, upstream, tcp_buf)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
                     try dns.validateResponse(msg, expected_name, qtype);
                     return msg;

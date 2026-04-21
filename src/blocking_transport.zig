@@ -28,7 +28,6 @@ pub const Config = struct {
 pub const BlockingUdpTransport = struct {
     config: Config,
     io: std.Io,
-    response_buf: [4096]u8 = undefined,
     sock_v4: ?posix.fd_t = null,
     sock_v6: ?posix.fd_t = null,
     v4_queries: u32 = 0,
@@ -86,11 +85,16 @@ pub const BlockingUdpTransport = struct {
         sock.last_rcvtimeo_ms.* = ms;
     }
 
-    pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address) ![]const u8 {
-        return self.queryWithTimeout(wire_query, query_id, upstream, self.config.timeout_ms);
+    pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, response_buf: []u8) ![]const u8 {
+        return self.queryWithTimeout(wire_query, query_id, upstream, self.config.timeout_ms, response_buf);
     }
 
-    pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32) ![]const u8 {
+    /// `response_buf` must outlive every slice the caller holds from the
+    /// Message they parse out of the returned bytes — parsed Name labels
+    /// and rdata byte slices alias this buffer. Pass a per-query arena-
+    /// allocated buffer so wire-buffer lifetime matches parsed-Message
+    /// lifetime.
+    pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32, response_buf: []u8) ![]const u8 {
         const sock = try self.persistentSocket(upstream);
 
         // Retransmit interval: 1/3 of overall timeout, at least 50ms
@@ -111,7 +115,7 @@ pub const BlockingUdpTransport = struct {
 
             var src_sa: na.PosixAddress = undefined;
             var src_sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-            const n = sys.recvfrom(sock.fd, &self.response_buf, 0, @ptrCast(&src_sa), &src_sa_len) catch |err| switch (err) {
+            const n = sys.recvfrom(sock.fd, response_buf, 0, @ptrCast(&src_sa), &src_sa_len) catch |err| switch (err) {
                 error.WouldBlock => {
                     // Timeout on recv — retransmit or fail.
                     if (retransmits_left == 0) return error.Timeout;
@@ -140,9 +144,9 @@ pub const BlockingUdpTransport = struct {
             const src_addr = na.fromSockaddr(&src_sa);
             if (!src_addr.eql(&upstream)) continue;
 
-            const resp_id = mem.readInt(u16, self.response_buf[0..2], .big);
+            const resp_id = mem.readInt(u16, response_buf[0..2], .big);
             if (resp_id == query_id) {
-                return self.response_buf[0..n];
+                return response_buf[0..n];
             }
             // Wrong ID — keep waiting.
         }
@@ -157,6 +161,8 @@ pub const BlockingUdpTransport = struct {
     /// Each leg uses a connected UDP socket with unique source port (RFC 5452 §9.1).
     /// Only races queries to different server IPs — birthday attack surface is not amplified
     /// because each leg targets a different destination.
+    /// `response_buf` must outlive every slice the caller holds from the
+    /// returned response (see queryWithTimeout).
     pub fn queryStaggered(
         self: *BlockingUdpTransport,
         wire_queries: [2][]const u8,
@@ -164,6 +170,7 @@ pub const BlockingUdpTransport = struct {
         servers: [2]na.Address,
         stagger_ms: u32,
         overall_timeout_ms: u32,
+        response_buf: []u8,
     ) !StaggeredResult {
         // Open and connect socket for server[0]
         const sock0 = try self.openSocket(servers[0]);
@@ -180,8 +187,8 @@ pub const BlockingUdpTransport = struct {
             const n = posix.poll(&polls, wait_ms) catch 0;
             if (n > 0) {
                 if (polls[0].revents & posix.POLL.IN != 0) {
-                    if (self.tryRecv(sock0, query_ids[0])) |len| {
-                        return .{ .response_data = self.response_buf[0..len], .responding_idx = 0 };
+                    if (tryRecv(sock0, query_ids[0], response_buf)) |len| {
+                        return .{ .response_data = response_buf[0..len], .responding_idx = 0 };
                     }
                 }
             }
@@ -212,13 +219,13 @@ pub const BlockingUdpTransport = struct {
 
             // Check both — prefer whichever has data
             if (polls[0].revents & posix.POLL.IN != 0) {
-                if (self.tryRecv(sock0, query_ids[0])) |len| {
-                    return .{ .response_data = self.response_buf[0..len], .responding_idx = 0 };
+                if (tryRecv(sock0, query_ids[0], response_buf)) |len| {
+                    return .{ .response_data = response_buf[0..len], .responding_idx = 0 };
                 }
             }
             if (polls[1].revents & posix.POLL.IN != 0) {
-                if (self.tryRecv(sock1, query_ids[1])) |len| {
-                    return .{ .response_data = self.response_buf[0..len], .responding_idx = 1 };
+                if (tryRecv(sock1, query_ids[1], response_buf)) |len| {
+                    return .{ .response_data = response_buf[0..len], .responding_idx = 1 };
                 }
             }
             // POLLERR/POLLHUP — keep polling until timeout
@@ -226,10 +233,10 @@ pub const BlockingUdpTransport = struct {
     }
 
     /// Try to receive a valid DNS response. Returns byte count or null.
-    fn tryRecv(self: *BlockingUdpTransport, sock: posix.fd_t, expected_id: u16) ?usize {
-        const n = sys.recv(sock, &self.response_buf, posix.MSG.DONTWAIT) catch return null;
+    fn tryRecv(sock: posix.fd_t, expected_id: u16, response_buf: []u8) ?usize {
+        const n = sys.recv(sock, response_buf, posix.MSG.DONTWAIT) catch return null;
         if (n < 2) return null;
-        const resp_id = mem.readInt(u16, self.response_buf[0..2], .big);
+        const resp_id = mem.readInt(u16, response_buf[0..2], .big);
         if (resp_id != expected_id) return null;
         return n;
     }
@@ -386,7 +393,8 @@ test "BlockingUdpTransport loopback query" {
 
     const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
 
-    const response = try transport.query(wire_query, 0x1234, server_addr);
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
+    const response = try transport.query(wire_query, 0x1234, server_addr, &response_buf);
     thread.join();
 
     try testing.expect(response.len >= 12);
@@ -416,7 +424,8 @@ test "BlockingUdpTransport timeout" {
     var wire_buf: [512]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const result = transport.query(wire_query, 0x5678, server_addr);
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
+    const result = transport.query(wire_query, 0x5678, server_addr, &response_buf);
     try testing.expectError(error.Timeout, result);
 }
 
@@ -446,7 +455,8 @@ test "BlockingUdpTransport IPv6 loopback query" {
 
     const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
 
-    const response = try transport.query(wire_query, 0xABCD, server_addr);
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
+    const response = try transport.query(wire_query, 0xABCD, server_addr, &response_buf);
     thread.join();
 
     try testing.expect(response.len >= 12);

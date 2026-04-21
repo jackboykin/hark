@@ -728,11 +728,18 @@ pub const RecursiveResolver = struct {
         const addr_key = AddressKey.fromAddress(server);
         const query_start = monotonic.nowUs();
 
+        // Fresh per-hop response_buf in the caller arena: parsed Name/rdata
+        // slices alias this buffer, and state such as parent_zone,
+        // seen_zones, and cname_chain keeps referring to earlier-hop parse
+        // output across loop iterations — each hop needs its own buffer so
+        // those slices survive until the arena resets.
+        const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
         const response_data = self.transport.queryWithTimeout(
             wire_query,
             query_id,
             server,
             timeout,
+            response_buf,
         ) catch {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
             return null;
@@ -745,11 +752,11 @@ pub const RecursiveResolver = struct {
         // TC bit: retry over TCP (RFC 2181 — ignore truncated data)
         if (dns.hasTcBit(response_data)) {
             if (self.tcp_transport) |tcp| {
-                var tcp_buf: [65535]u8 = undefined;
+                const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
                 const tcp_result = if (self.tcp_pool) |p|
-                    tcp.queryPooled(wire_query, server, &tcp_buf, p)
+                    tcp.queryPooled(wire_query, server, tcp_buf, p)
                 else
-                    tcp.query(wire_query, server, &tcp_buf);
+                    tcp.query(wire_query, server, tcp_buf);
                 if (tcp_result) |tcp_data| {
                     const response = try tryParseMessage(allocator, tcp_data) orelse return null;
                     if (!response.header.qr) return null;
@@ -827,12 +834,14 @@ pub const RecursiveResolver = struct {
 
         const query_start = monotonic.nowUs();
 
+        const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
         const stag_result = self.transport.queryStaggered(
             .{ w0, w1 },
             .{ qid0, qid1 },
             .{ servers[idx0], servers[idx1] },
             stagger,
             overall_timeout,
+            response_buf,
         ) catch return null;
 
         const elapsed_us = monotonic.nowUs() - query_start;
@@ -930,8 +939,8 @@ pub const RecursiveResolver = struct {
                             var padded_buf: [dns.edns_udp_payload]u8 = undefined;
                             const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-                            var tls_response_buf: [65535]u8 = undefined;
-                            if (tls_t.queryOpportunistic(padded_query, server, &tls_response_buf, 4000)) |tls_data| {
+                            const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
+                            if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, 4000)) |tls_data| {
                                 if (try tryParseMessage(allocator, tls_data)) |tls_response| {
                                     if (tls_response.header.qr and
                                         tls_response.header.rcode != .format_error and

@@ -95,10 +95,11 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
     defer transport.deinit();
+    var response_buf: [hark.dns.edns_udp_payload]u8 = undefined;
 
     for (0..warmup) |i| {
         std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
-        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr, &response_buf);
         std.mem.doNotOptimizeAway(resp.ptr);
     }
 
@@ -107,7 +108,7 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         const qid: u16 = @intCast(i & 0xffff);
         std.mem.writeInt(u16, s.wire[0..2], qid, .big);
         const t0 = monotonic.nowNs();
-        const resp = try transport.query(s.wire, qid, s.server_addr);
+        const resp = try transport.query(s.wire, qid, s.server_addr, &response_buf);
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
         std.mem.doNotOptimizeAway(resp.ptr);
@@ -120,12 +121,13 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator);
     defer s.deinit();
+    var response_buf: [hark.dns.edns_udp_payload]u8 = undefined;
 
     for (0..warmup) |i| {
         var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
         defer transport.deinit();
         std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
-        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr, &response_buf);
         std.mem.doNotOptimizeAway(resp.ptr);
     }
 
@@ -135,7 +137,7 @@ pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         std.mem.writeInt(u16, s.wire[0..2], qid, .big);
         const t0 = monotonic.nowNs();
         var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
-        const resp = try transport.query(s.wire, qid, s.server_addr);
+        const resp = try transport.query(s.wire, qid, s.server_addr, &response_buf);
         transport.deinit();
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
