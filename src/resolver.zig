@@ -11,16 +11,24 @@ const na = @import("net_address.zig");
 
 pub const ForwardingResolver = struct {
     transport: *BlockingUdpTransport,
-    tcp_transport: ?*BlockingTcpTransport = null,
-    tls_transport: ?*TlsTransport = null,
+    tcp_transport: ?*BlockingTcpTransport,
+    tls_transport: ?*TlsTransport,
     io: std.Io,
 
-    pub fn init(transport: *BlockingUdpTransport, io: std.Io) ForwardingResolver {
-        return .{ .transport = transport, .tcp_transport = null, .tls_transport = null, .io = io };
-    }
+    pub const Config = struct {
+        transport: *BlockingUdpTransport,
+        tcp_transport: ?*BlockingTcpTransport = null,
+        tls_transport: ?*TlsTransport = null,
+        io: std.Io,
+    };
 
-    pub fn initWithTcp(transport: *BlockingUdpTransport, tcp: *BlockingTcpTransport, io: std.Io) ForwardingResolver {
-        return .{ .transport = transport, .tcp_transport = tcp, .tls_transport = null, .io = io };
+    pub fn init(cfg: Config) ForwardingResolver {
+        return .{
+            .transport = cfg.transport,
+            .tcp_transport = cfg.tcp_transport,
+            .tls_transport = cfg.tls_transport,
+            .io = cfg.io,
+        };
     }
 
     pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: na.Address) !dns.Message {
@@ -85,7 +93,7 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = ForwardingResolver.init(&transport, io);
+    var resolver = ForwardingResolver.init(.{ .transport = &transport, .io = io });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
