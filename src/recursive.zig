@@ -1604,6 +1604,7 @@ pub const RecursiveResolver = struct {
 
         fn run(ctx: *NsThreadCtx) void {
             var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{}, ctx.parent.io);
+            defer udp_t.deinit();
             var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
             var resolver = ctx.parent.cloneForThread(&udp_t, &tcp_t);
 

@@ -223,6 +223,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     }
 
     var t = BlockingUdpTransport.init(.{}, io);
+    defer t.deinit();
     var tcp_t = BlockingTcpTransport.init(.{});
 
     if (dot_strict and dot_host == null) {

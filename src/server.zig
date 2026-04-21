@@ -42,6 +42,37 @@ const max_tcp_queries_per_conn: u32 = 128;
 
 const work_queue_capacity = 256;
 
+// ── Per-thread query arena (F-03) ─────────────────────────────────────
+//
+// Owned by a pool thread, reused across queries via reset(.retain_capacity).
+// Layering: caller → CountingAllocator → ArenaAllocator → gpa.
+// The CountingAllocator sits in front of the arena so each query's own
+// allocations are bounded by query_memory_limit regardless of retained
+// arena capacity (retention can't bypass the cap).
+
+const PerThreadArena = struct {
+    arena: std.heap.ArenaAllocator,
+    cap: CountingAllocator,
+
+    fn init(self: *PerThreadArena, gpa: mem.Allocator, max_bytes: usize) void {
+        self.arena = std.heap.ArenaAllocator.init(gpa);
+        self.cap = CountingAllocator.init(
+            self.arena.allocator(),
+            if (max_bytes > 0) max_bytes else std.math.maxInt(usize),
+        );
+    }
+
+    fn reset(self: *PerThreadArena) mem.Allocator {
+        self.cap.current_bytes.store(0, .monotonic);
+        _ = self.arena.reset(.retain_capacity);
+        return self.cap.allocator();
+    }
+
+    fn deinit(self: *PerThreadArena) void {
+        self.arena.deinit();
+    }
+};
+
 // ── Work Queue for resolution thread pool ─────────────────────────────
 
 const WorkItem = struct {
@@ -467,13 +498,6 @@ const WorkerState = struct {
         }
     }
 
-    /// Create a per-query memory cap. When the limit is hit, arena returns
-    /// OutOfMemory and existing error handling sends SERVFAIL.
-    fn queryCap(self: *WorkerState) CountingAllocator {
-        const limit = self.config.query_memory_limit;
-        return CountingAllocator.init(self.allocator, if (limit > 0) limit else std.math.maxInt(usize));
-    }
-
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
         const n = udp_socks.len;
 
@@ -638,6 +662,8 @@ const WorkerState = struct {
         udp: *BlockingUdpTransport,
         tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
+        query_pta: *PerThreadArena,
+        prefetch_pta: *PerThreadArena,
     ) void {
         defer sys.close(client_fd);
 
@@ -658,10 +684,7 @@ const WorkerState = struct {
             var query_buf: [65535]u8 = undefined;
             tcpReadExactBlocking(client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
 
-            var cap = self.queryCap();
-            var arena = std.heap.ArenaAllocator.init(cap.allocator());
-            defer arena.deinit();
-            const alloc = arena.allocator();
+            const alloc = query_pta.reset();
             var response_wire: [65535]u8 = undefined;
             const data = query_buf[0..msg_len];
 
@@ -706,10 +729,10 @@ const WorkerState = struct {
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
             if (result.prefetch_name) |prefetch_name| {
-                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls);
+                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
             }
             if (result.prefetch_dnskey_zone) |zone| {
-                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls);
+                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
             }
         }
     }
@@ -780,16 +803,15 @@ const WorkerState = struct {
         }
     }
 
-    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport, tls: ?*TlsTransport) void {
-        var cap = self.queryCap();
-        var prefetch_arena = std.heap.ArenaAllocator.init(cap.allocator());
-        defer prefetch_arena.deinit();
-        _ = self.resolveQueryWith(prefetch_arena.allocator(), prefetch_name, prefetch_qtype, false, true, udp, tcp, tls) catch {};
+    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport, tls: ?*TlsTransport, prefetch_pta: *PerThreadArena) void {
+        const alloc = prefetch_pta.reset();
+        _ = self.resolveQueryWith(alloc, prefetch_name, prefetch_qtype, false, true, udp, tcp, tls) catch {};
     }
 
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) void {
         var udp_t = BlockingUdpTransport.init(.{}, self.io);
+        defer udp_t.deinit();
         var tcp_t = BlockingTcpTransport.init(.{});
 
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
@@ -804,6 +826,14 @@ const WorkerState = struct {
         const tcp = &tcp_t;
         const tls: ?*TlsTransport = if (tls_t) |*t| t else null;
 
+        var query_pta: PerThreadArena = undefined;
+        query_pta.init(self.allocator, self.config.query_memory_limit);
+        defer query_pta.deinit();
+
+        var prefetch_pta: PerThreadArena = undefined;
+        prefetch_pta.init(self.allocator, self.config.query_memory_limit);
+        defer prefetch_pta.deinit();
+
         while (self.queue.pop()) |item| {
             switch (item.protocol) {
                 .udp => self.processUdpQuery(
@@ -813,11 +843,13 @@ const WorkerState = struct {
                     udp,
                     tcp,
                     tls,
+                    &query_pta,
+                    &prefetch_pta,
                 ),
                 .tcp => {
                     if (self.claimTcpSlot()) {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
-                        self.processTcpClient(item.sock_fd, udp, tcp, tls);
+                        self.processTcpClient(item.sock_fd, udp, tcp, tls, &query_pta, &prefetch_pta);
                     } else {
                         // Drop silently for the same reason as the queue-full path above.
                         log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
@@ -836,11 +868,10 @@ const WorkerState = struct {
         udp: *BlockingUdpTransport,
         tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
+        query_pta: *PerThreadArena,
+        prefetch_pta: *PerThreadArena,
     ) void {
-        var cap = self.queryCap();
-        var arena = std.heap.ArenaAllocator.init(cap.allocator());
-        defer arena.deinit();
-        const alloc = arena.allocator();
+        const alloc = query_pta.reset();
 
         const query_msg = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
@@ -881,10 +912,10 @@ const WorkerState = struct {
         }
 
         if (result.prefetch_name) |prefetch_name| {
-            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls);
+            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
         }
         if (result.prefetch_dnskey_zone) |zone| {
-            self.doPrefetchWith(zone, .dnskey, udp, tcp, tls);
+            self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
         }
     }
 
@@ -898,6 +929,16 @@ const WorkerState = struct {
         tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) !recursive.RecursiveResolver.ResolveResult {
+        // Fast path (F-01): dedup only prevents duplicate upstream queries.
+        // On a fresh cache hit no upstream I/O happens, so the InFlightTable
+        // mutex pair is pure overhead. A shared-lock existence probe skips
+        // it. On miss we fall through to the normal dedup + resolve path.
+        if (self.cache) |c| {
+            if (c.lookupExists(name, qtype, .in)) {
+                return self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
+            }
+        }
+
         const cd_flag: u8 = @intFromBool(cd);
         var is_leader = true;
         if (self.dedup) |dedup| {

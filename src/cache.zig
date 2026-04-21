@@ -229,22 +229,25 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 }
 
 /// Clone cached records into caller-owned ResourceRecords with a given TTL.
+/// F-05: uses `cloneNameFlat` (single allocation per name) and aliases the
+/// shared owner name across all records in the RRset — by definition
+/// members of an RRset share owner name, qtype, and qclass.
+/// The caller's allocator MUST be an arena (or otherwise free-resilient):
+/// the flat name layout cannot be passed to `dns.freeName`, and the alias
+/// means each owner name is present in multiple `ResourceRecord.name`
+/// fields. Today every caller is an arena-allocated per-query arena.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     const records = try alloc.alloc(dns.ResourceRecord, cached.len);
-    errdefer alloc.free(records);
-    var done: usize = 0;
-    errdefer dns.freeResourceRecordContents(alloc, records[0..done]);
+    if (cached.len == 0) return records;
+    const shared_name = try dns.cloneNameFlat(alloc, cached[0].name);
     for (cached, 0..) |cr, i| {
-        const cloned_name = try cloneName(alloc, cr.name);
-        errdefer dns.freeName(alloc, cloned_name);
         records[i] = .{
-            .name = cloned_name,
+            .name = shared_name,
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
             .rdata = try cloneRData(alloc, cr.rdata),
         };
-        done = i + 1;
     }
     return records;
 }
@@ -390,6 +393,30 @@ pub const RRsetCache = struct {
     }
 
     // ── Lookup ────────────────────────────────────────────────────────
+
+    /// Cheap existence probe: returns true iff a fresh (non-expired)
+    /// positive or negative entry is present for (name, rtype, rclass).
+    /// No clone, no prefetch accounting — just a short-lived shared lock
+    /// + hash probe + timestamp check. Used as a fast path to skip the
+    /// dedup table on cache hits.
+    pub fn lookupExists(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+    ) bool {
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        const idx = self.map.getIndex(probe) orelse return false;
+        const now = self.now_fn();
+        return switch (self.map.values()[idx]) {
+            .positive => |p| now < p.expires_at,
+            .negative => |n| now < n.expires_at,
+        };
+    }
 
     /// Look up a cached RRset. Returns null if not found or expired.
     /// On hit, returns records allocated with caller_alloc (the per-query arena),
@@ -871,11 +898,17 @@ pub const RRsetCache = struct {
     }
 
     /// SIEVE eviction: scan from hand, give visited entries a second chance,
-    /// evict the first unvisited entry. Amortized O(1).
+    /// evict the first unvisited entry. Scan is capped to bound write-lock
+    /// hold time under a full, fully-popular cache — if no unvisited entry
+    /// is found within the budget, evict at hand. SIEVE is an approximation
+    /// policy; trading optimal eviction for bounded latency is sound.
+    const sieve_scan_cap: u32 = 64;
+
     fn sieveEvict(self: *RRsetCache, count: u32) void {
         const alloc = self.counting.allocator();
+        const limit = @min(count, sieve_scan_cap);
         var probes: u32 = 0;
-        while (probes < count) : (probes += 1) {
+        while (probes < limit) : (probes += 1) {
             if (self.hand >= count) self.hand = 0;
             const i = self.hand;
             if (self.isVisited(i)) {
@@ -887,7 +920,7 @@ pub const RRsetCache = struct {
                 return;
             }
         }
-        // All visited (flags now cleared) — evict at hand
+        // Budget exhausted (or all visited) — evict at hand.
         if (self.hand >= count) self.hand = 0;
         self.removeAtIndex(alloc, self.hand);
         _ = self.evictions.fetchAdd(1, .monotonic);

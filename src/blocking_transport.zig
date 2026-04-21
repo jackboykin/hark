@@ -17,15 +17,59 @@ pub const Config = struct {
 };
 
 /// UDP transport using blocking sockets for thread-pool resolution.
-/// Each query creates a connected UDP socket for kernel-level source
-/// address filtering (RFC 5452) and uses SO_RCVTIMEO for timeouts.
+///
+/// F-02: the simple `queryWithTimeout` path uses per-thread persistent
+/// unconnected sockets (one per address family) bound to a random
+/// ephemeral port. Each hop does `sendto` + `recvfrom` + source-address
+/// check, eliminating the `socket/bind/connect/close` syscall quartet
+/// per query. Source-port randomness (RFC 5452 §9.1) is preserved by
+/// rebinding every `rebind_after_queries` queries.
+///
+/// `queryStaggered` still opens two short-lived connected sockets per
+/// call — racing two responses on one shared socket is doable but needs
+/// more care, and the staggered path fires only when `stagger_ms > 0`
+/// and 2+ NS are available.
 pub const BlockingUdpTransport = struct {
     config: Config,
     io: std.Io,
     response_buf: [4096]u8 = undefined,
+    sock_v4: ?posix.fd_t = null,
+    sock_v6: ?posix.fd_t = null,
+    v4_queries: u32 = 0,
+    v6_queries: u32 = 0,
+
+    /// Rotate the persistent socket every N queries for defense-in-depth:
+    /// rebinding picks a fresh random source port, re-randomizing the
+    /// RFC 5452 entropy. 4096 is small enough that an attacker guessing
+    /// source-port+query-id has a narrow window per binding.
+    const rebind_after_queries: u32 = 4096;
 
     pub fn init(config: Config, io: std.Io) BlockingUdpTransport {
         return .{ .config = config, .io = io };
+    }
+
+    pub fn deinit(self: *BlockingUdpTransport) void {
+        if (self.sock_v4) |fd| sys.close(fd);
+        if (self.sock_v6) |fd| sys.close(fd);
+        self.sock_v4 = null;
+        self.sock_v6 = null;
+    }
+
+    fn persistentSocket(self: *BlockingUdpTransport, dest: na.Address) !posix.fd_t {
+        const sock_ref, const counter_ref = switch (dest) {
+            .ip4 => .{ &self.sock_v4, &self.v4_queries },
+            .ip6 => .{ &self.sock_v6, &self.v6_queries },
+        };
+        if (sock_ref.* != null and counter_ref.* >= rebind_after_queries) {
+            sys.close(sock_ref.*.?);
+            sock_ref.* = null;
+            counter_ref.* = 0;
+        }
+        if (sock_ref.* == null) {
+            sock_ref.* = try openUdpSocket(dest, self.io);
+        }
+        counter_ref.* += 1;
+        return sock_ref.*.?;
     }
 
     pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address) ![]const u8 {
@@ -33,20 +77,16 @@ pub const BlockingUdpTransport = struct {
     }
 
     pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32) ![]const u8 {
-        const sock = try self.openSocket(upstream);
-        defer sys.close(sock);
-
-        // Connect to server — kernel rejects spoofed source addresses (RFC 5452).
-        try na.connectTo(sock, &upstream);
+        const sock = try self.persistentSocket(upstream);
 
         // Retransmit interval: 1/3 of overall timeout, at least 50ms
         const retransmit_ms = @max(50, timeout_ms / 3);
-
-        // Set initial recv timeout to retransmit interval
         sys.setSocketTimeout(sock, posix.SO.RCVTIMEO, retransmit_ms);
 
-        // Send initial query
-        _ = sys.send(sock, wire_query, 0) catch return error.Timeout;
+        var upstream_sa: na.PosixAddress = undefined;
+        const upstream_sa_len = na.toSockaddr(&upstream, &upstream_sa);
+
+        _ = sys.sendto(sock, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch return error.Timeout;
 
         const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
         var retransmits_left: u32 = self.config.retransmit_count;
@@ -55,16 +95,15 @@ pub const BlockingUdpTransport = struct {
             const remaining_ns = deadline_ns - monotonic.nowNs();
             if (remaining_ns <= 0) return error.Timeout;
 
-            const n = sys.recv(sock, &self.response_buf, 0) catch |err| switch (err) {
+            var src_sa: na.PosixAddress = undefined;
+            var src_sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            const n = sys.recvfrom(sock, &self.response_buf, 0, @ptrCast(&src_sa), &src_sa_len) catch |err| switch (err) {
                 error.WouldBlock => {
-                    // Timeout on recv — retransmit or fail
+                    // Timeout on recv — retransmit or fail.
                     if (retransmits_left == 0) return error.Timeout;
                     retransmits_left -= 1;
+                    _ = sys.sendto(sock, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch return error.Timeout;
 
-                    // Retransmit
-                    _ = sys.send(sock, wire_query, 0) catch return error.Timeout;
-
-                    // Adjust timeout to min(retransmit_ms, remaining)
                     const remain_ms = @as(u32, @intCast(@min(
                         @divFloor(remaining_ns, 1_000_000),
                         retransmit_ms,
@@ -78,12 +117,18 @@ pub const BlockingUdpTransport = struct {
 
             if (n < 2) continue;
 
-            // Validate query ID (source address validated by kernel via connected socket)
+            // Userspace source check: the persistent socket is unconnected so
+            // it can receive responses addressed to any peer. Drop anything
+            // that isn't from the upstream we asked. Late responses from
+            // prior queries to different servers would be dropped here.
+            const src_addr = na.fromSockaddr(&src_sa);
+            if (!na.ipEqual(src_addr, upstream)) continue;
+
             const resp_id = mem.readInt(u16, self.response_buf[0..2], .big);
             if (resp_id == query_id) {
                 return self.response_buf[0..n];
             }
-            // Wrong ID — keep waiting
+            // Wrong ID — keep waiting.
         }
     }
 
