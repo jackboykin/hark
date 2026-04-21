@@ -1,14 +1,10 @@
-//! F-02: persistent per-thread UDP socket
+//! Persistent per-thread UDP socket. Launches a minimal loopback echo server
+//! that flips QR bit on any query, and measures `BlockingUdpTransport.query`
+//! wall time across iterations. The syscall-count reduction shows up under
+//! `strace -c`.
 //!
-//! Launches a minimal loopback echo server (returns an NXDOMAIN-like
-//! response for any query ID). Measures `BlockingUdpTransport.query`
-//! wall time across iterations; the syscall-count reduction shows up
-//! under `strace -c` (see bench-harness-plan.md §5).
-//!
-//! A single short-lived transport sees the same socket reused each
-//! iteration — so the measured wall time already includes the F-02
-//! benefit. Comparing against a "per-query socket" variant that forces
-//! a fresh socket per call shows the delta directly.
+//! Two variants: one reuses a single transport (persistent socket), the
+//! other constructs a fresh transport per call (fresh socket).
 
 const std = @import("std");
 const posix = std.posix;
@@ -92,7 +88,7 @@ fn setup(allocator: std.mem.Allocator) !Setup {
     };
 }
 
-/// F-02 enabled: single persistent socket across all queries.
+/// Single persistent socket reused across all queries.
 pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator);
     defer s.deinit();
@@ -102,7 +98,8 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     for (0..warmup) |i| {
         std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
-        _ = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        std.mem.doNotOptimizeAway(resp.ptr);
     }
 
     const samples = try allocator.alloc(i64, bench_iters);
@@ -110,15 +107,16 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         const qid: u16 = @intCast(i & 0xffff);
         std.mem.writeInt(u16, s.wire[0..2], qid, .big);
         const t0 = monotonic.nowNs();
-        _ = try transport.query(s.wire, qid, s.server_addr);
+        const resp = try transport.query(s.wire, qid, s.server_addr);
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
+        std.mem.doNotOptimizeAway(resp.ptr);
     }
 
-    return .{ .samples_ns = samples, .label = "persistent socket (F-02)" };
+    return .{ .samples_ns = samples, .label = "persistent socket" };
 }
 
-/// Pre-F-02 behaviour: fresh transport (and thus fresh socket) per query.
+/// Fresh transport (and thus fresh socket) per query.
 pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator);
     defer s.deinit();
@@ -127,7 +125,8 @@ pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
         defer transport.deinit();
         std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
-        _ = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr);
+        std.mem.doNotOptimizeAway(resp.ptr);
     }
 
     const samples = try allocator.alloc(i64, bench_iters);
@@ -136,11 +135,12 @@ pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         std.mem.writeInt(u16, s.wire[0..2], qid, .big);
         const t0 = monotonic.nowNs();
         var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
-        _ = try transport.query(s.wire, qid, s.server_addr);
+        const resp = try transport.query(s.wire, qid, s.server_addr);
         transport.deinit();
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
+        std.mem.doNotOptimizeAway(resp.ptr);
     }
 
-    return .{ .samples_ns = samples, .label = "fresh transport per query (pre-F-02)" };
+    return .{ .samples_ns = samples, .label = "fresh transport per query" };
 }

@@ -1,7 +1,6 @@
-//! F-03: thread-local arena reuse across queries
-//!
-//! Variant A (current): fresh ArenaAllocator.init / deinit per iteration.
-//! Variant B (proposed): one arena, reset(.retain_capacity) per iteration.
+//! Thread-local arena reuse across queries. Two variants:
+//!   fresh_arena:  ArenaAllocator.init / deinit per iteration
+//!   reset_arena:  one arena, reset(.retain_capacity) per iteration
 //!
 //! Each iteration does a representative burst of small allocations mimicking
 //! what a cache-hit query arena sees: a labels slice + a few dupes + a

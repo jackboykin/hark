@@ -42,13 +42,15 @@ const max_tcp_queries_per_conn: u32 = 128;
 
 const work_queue_capacity = 256;
 
-// ── Per-thread query arena (F-03) ─────────────────────────────────────
+// Per-thread query arena, owned by a pool thread and reused across queries
+// via reset(.retain_capacity). Layering: caller → CountingAllocator → arena.
+// The CountingAllocator sits in front so each query's allocations are bounded
+// by query_memory_limit regardless of retained arena capacity (retention
+// cannot bypass the cap).
 //
-// Owned by a pool thread, reused across queries via reset(.retain_capacity).
-// Layering: caller → CountingAllocator → ArenaAllocator → gpa.
-// The CountingAllocator sits in front of the arena so each query's own
-// allocations are bounded by query_memory_limit regardless of retained
-// arena capacity (retention can't bypass the cap).
+// `init` takes *PerThreadArena (unlike most struct inits in this file) because
+// cap.backing stores &self.arena — the struct is self-referential and cannot
+// be returned by value without risking a dangling pointer if NRVO doesn't fire.
 
 const PerThreadArena = struct {
     arena: std.heap.ArenaAllocator,
@@ -326,8 +328,8 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions, {d} prefetch-eligible, {d} stale", .{
-            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions ({d} cap-exhausted), {d} prefetch-eligible, {d} stale", .{
+            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
@@ -929,14 +931,12 @@ const WorkerState = struct {
         tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
     ) !recursive.RecursiveResolver.ResolveResult {
-        // Fast path (F-01): dedup only prevents duplicate upstream queries.
-        // On a fresh cache hit no upstream I/O happens, so the InFlightTable
-        // mutex pair is pure overhead. A shared-lock existence probe skips
-        // it. On miss we fall through to the normal dedup + resolve path.
-        if (self.cache) |c| {
-            if (c.lookupExists(name, qtype, .in)) {
-                return self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
-            }
+        // Dedup only prevents duplicate upstream queries. On a cache hit no
+        // upstream I/O happens, so the InFlightTable mutex pair is pure
+        // overhead; a shared-lock existence probe skips it. On miss we fall
+        // through to the normal dedup + resolve path.
+        if (self.cache.lookupExists(name, qtype, .in)) {
+            return self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
         }
 
         const cd_flag: u8 = @intFromBool(cd);

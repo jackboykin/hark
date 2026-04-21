@@ -229,13 +229,10 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 }
 
 /// Clone cached records into caller-owned ResourceRecords with a given TTL.
-/// F-05: uses `cloneNameFlat` (single allocation per name) and aliases the
-/// shared owner name across all records in the RRset — by definition
-/// members of an RRset share owner name, qtype, and qclass.
 /// The caller's allocator MUST be an arena (or otherwise free-resilient):
-/// the flat name layout cannot be passed to `dns.freeName`, and the alias
-/// means each owner name is present in multiple `ResourceRecord.name`
-/// fields. Today every caller is an arena-allocated per-query arena.
+/// the records alias one shared flat-allocated owner name (members of an
+/// RRset share owner, qtype, qclass), and the flat layout cannot be passed
+/// to `dns.freeName`. Today every caller uses a per-query arena.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     const records = try alloc.alloc(dns.ResourceRecord, cached.len);
     if (cached.len == 0) return records;
@@ -313,6 +310,10 @@ pub const RRsetCache = struct {
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     negative_stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Evictions that exhausted the SIEVE scan budget (every probed entry
+    /// was visited). Fallback to eviction-at-hand degrades eviction quality;
+    /// a non-zero rate here means the cache is persistently hot-heavy.
+    cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -359,6 +360,8 @@ pub const RRsetCache = struct {
         stores: u64,
         negative_stores: u64,
         evictions: u64,
+        /// Subset of `evictions` where the SIEVE scan cap was exhausted.
+        cap_exhausted_evictions: u64,
         prefetch_eligible: u64,
         stale_hits: u64,
     };
@@ -375,6 +378,7 @@ pub const RRsetCache = struct {
             .stores = self.stores.load(.monotonic),
             .negative_stores = self.negative_stores.load(.monotonic),
             .evictions = self.evictions.load(.monotonic),
+            .cap_exhausted_evictions = self.cap_exhausted_evictions.load(.monotonic),
             .prefetch_eligible = self.prefetch_eligible.load(.monotonic),
             .stale_hits = self.stale_hits.load(.monotonic),
         };
@@ -398,7 +402,9 @@ pub const RRsetCache = struct {
     /// positive or negative entry is present for (name, rtype, rclass).
     /// No clone, no prefetch accounting — just a short-lived shared lock
     /// + hash probe + timestamp check. Used as a fast path to skip the
-    /// dedup table on cache hits.
+    /// dedup table on cache hits. Marks the entry visited on hit so
+    /// SIEVE eviction sees the fast-path access (otherwise hot entries
+    /// that always take this path could be evicted as cold).
     pub fn lookupExists(
         self: *RRsetCache,
         name: []const u8,
@@ -412,10 +418,12 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const idx = self.map.getIndex(probe) orelse return false;
         const now = self.now_fn();
-        return switch (self.map.values()[idx]) {
+        const fresh = switch (self.map.values()[idx]) {
             .positive => |p| now < p.expires_at,
             .negative => |n| now < n.expires_at,
         };
+        if (fresh) self.markVisited(idx);
+        return fresh;
     }
 
     /// Look up a cached RRset. Returns null if not found or expired.
@@ -924,6 +932,7 @@ pub const RRsetCache = struct {
         if (self.hand >= count) self.hand = 0;
         self.removeAtIndex(alloc, self.hand);
         _ = self.evictions.fetchAdd(1, .monotonic);
+        _ = self.cap_exhausted_evictions.fetchAdd(1, .monotonic);
     }
 
     fn freeKey(alloc: Allocator, key: CacheKey) void {

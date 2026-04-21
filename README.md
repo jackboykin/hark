@@ -26,6 +26,8 @@ Requires Zig 0.16 and a Linux kernel with io_uring support.
 ```
 zig build
 zig build test
+zig build bench              # microbenchmarks; ReleaseFast
+zig build bench -- cache_hit # filter to matching names
 ```
 
 ## Usage
@@ -81,40 +83,6 @@ queries = true
 ```
 
 All fields are optional — defaults are localhost:53, recursive mode, DNSSEC off, workers = CPU count, 4 resolution threads per worker.
-
-## Architecture
-
-```
-              ┌───────────────────────────┐
- clients ───► │  Server (io_uring accept) │
-              └─────────────┬─────────────┘
-                            │ work queue
-              ┌─────────────▼─────────────┐
-              │   Resolution Pool         │
-              │   (blocking sockets)      │
-              │                           │
-              │   Deduplication           │
-              │   Cache lookup (RwLock)   │
-              │   QNAME minimization      │
-              │   Staggered NS racing     │
-              │   Recursive resolution    │
-              │   DNSSEC validation       │
-              │   Prefetch                │
-              │                           │
-              └─────────────┬─────────────┘
-                            │
-              ┌─────────────▼─────────────┐
-              │   Transport               │
-              │   UDP (connected sockets) │
-              │   TCP fallback            │
-              │   DoT / RFC 9539          │
-              │   TLS connection pool     │
-              └─────────────┬─────────────┘
-                            │
-              ┌─────────────▼─────────────┐
-              │   Wire Format (dns.zig)   │
-              └───────────────────────────┘
-```
 
 ## Design
 

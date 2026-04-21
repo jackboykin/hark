@@ -1,8 +1,6 @@
-//! F-04: bounded SIEVE eviction scan
-//!
-//! Worst case: cache full with all entries visited. sieveEvict scans all N
-//! entries clearing flags before evicting at hand. We measure the wall time
-//! of one storeResponse call in that state.
+//! Bounded SIEVE eviction scan, worst case: cache full with every entry
+//! visited, so sieveEvict hits the scan cap before evicting at hand. We
+//! measure the wall time of one storeResponse call in that state.
 //!
 //! Setup between samples: lookup every currently-in-cache key to re-mark
 //! visited (sieveEvict clears flags during its scan).
@@ -13,48 +11,12 @@ const dns = hark.dns;
 const monotonic = hark.monotonic;
 const RRsetCache = hark.cache.RRsetCache;
 const BenchResult = @import("main.zig").BenchResult;
+const bench_common = @import("bench_common.zig");
 
 const cache_size: u32 = 512;
 const bench_iters: usize = 2000;
 const warmup: usize = 100;
-
-fn makeAResponse(alloc: std.mem.Allocator, idx: u32) !dns.Message {
-    const label_num = try std.fmt.allocPrint(alloc, "k{d}", .{idx});
-    const labels = try alloc.alloc([]const u8, 2);
-    labels[0] = label_num;
-    labels[1] = try alloc.dupe(u8, "test");
-
-    const recs = try alloc.alloc(dns.ResourceRecord, 1);
-    recs[0] = .{
-        .name = dns.Name{ .labels = labels },
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .a = .{ 1, 2, 3, @intCast(idx & 0xff) } },
-    };
-
-    return .{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = recs,
-    };
-}
+const labels_spec = [_][]const u8{ "k{d}", "test" };
 
 fn markAllVisited(cache: *RRsetCache, mark_arena: *std.heap.ArenaAllocator) void {
     _ = mark_arena.reset(.retain_capacity);
@@ -83,7 +45,10 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     const messages = try allocator.alloc(dns.Message, total_msgs);
     defer allocator.free(messages);
-    for (0..total_msgs) |i| messages[i] = try makeAResponse(msg_alloc, @intCast(i));
+    for (0..total_msgs) |i| {
+        const idx: u32 = @intCast(i);
+        messages[i] = try bench_common.makeAResponse(msg_alloc, idx, &labels_spec, .{ 1, 2, 3, @intCast(idx & 0xff) });
+    }
 
     const root_zone = dns.Name{ .labels = &.{} };
 
