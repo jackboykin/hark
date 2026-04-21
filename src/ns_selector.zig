@@ -77,20 +77,17 @@ pub const NsSelector = struct {
     io: std.Io,
     gamma: f32,
 
-    pub fn init(allocator: Allocator, io: std.Io) NsSelector {
-        return .{
-            .arms = std.AutoHashMap(ArmKey, ArmState).init(allocator),
-            .mutex = null,
-            .io = io,
-            .gamma = default_gamma,
-        };
-    }
+    pub const Config = struct {
+        allocator: Allocator,
+        io: std.Io,
+        thread_safe: bool = false,
+    };
 
-    pub fn initThreadSafe(allocator: Allocator, io: std.Io) NsSelector {
+    pub fn init(cfg: Config) NsSelector {
         return .{
-            .arms = std.AutoHashMap(ArmKey, ArmState).init(allocator),
-            .mutex = std.Io.Mutex.init,
-            .io = io,
+            .arms = std.AutoHashMap(ArmKey, ArmState).init(cfg.allocator),
+            .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
+            .io = cfg.io,
             .gamma = default_gamma,
         };
     }
@@ -349,7 +346,7 @@ test "beta sample in range" {
 }
 
 test "selectServers basic ordering" {
-    var sel = NsSelector.init(testing.allocator, testing.io);
+    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "example", "com" } };
@@ -376,7 +373,7 @@ test "selectServers basic ordering" {
 }
 
 test "discount causes re-exploration" {
-    var sel = NsSelector.init(testing.allocator, testing.io);
+    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
     sel.gamma = 0.9; // Aggressive discount for test
 
@@ -405,7 +402,7 @@ test "discount causes re-exploration" {
 }
 
 test "recordOutcome updates state" {
-    var sel = NsSelector.init(testing.allocator, testing.io);
+    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "example", "com" } };
@@ -419,7 +416,7 @@ test "recordOutcome updates state" {
 }
 
 test "confidence returns null for unknown" {
-    var sel = NsSelector.init(testing.allocator, testing.io);
+    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
     const zone = dns.Name{ .labels = &.{ "unknown", "com" } };
@@ -428,7 +425,7 @@ test "confidence returns null for unknown" {
 }
 
 test "per-zone isolation" {
-    var sel = NsSelector.init(testing.allocator, testing.io);
+    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
     const zone_a = dns.Name{ .labels = &.{ "a", "com" } };

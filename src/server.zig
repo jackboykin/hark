@@ -155,15 +155,17 @@ pub const Server = struct {
             .skip_key_types = cfg.dnssec,
         });
 
-        const rtt_cache = if (cfg.workers > 1)
-            RttCache.initThreadSafe(allocator, io)
-        else
-            RttCache.init(allocator, io);
+        const rtt_cache = RttCache.init(.{
+            .allocator = allocator,
+            .io = io,
+            .thread_safe = cfg.workers > 1,
+        });
 
-        const ns_selector = if (cfg.workers > 1)
-            NsSelector.initThreadSafe(allocator, io)
-        else
-            NsSelector.init(allocator, io);
+        const ns_selector = NsSelector.init(.{
+            .allocator = allocator,
+            .io = io,
+            .thread_safe = cfg.workers > 1,
+        });
 
         var ca_bundle: Certificate.Bundle = .empty;
         if (cfg.opportunistic) {
@@ -184,13 +186,11 @@ pub const Server = struct {
             .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
-            .nsec_cache = if (cfg.dnssec) blk: {
-                const nsec_alloc = if (builtin.single_threaded) allocator else std.heap.smp_allocator;
-                break :blk if (cfg.workers > 1)
-                    NsecCache.initThreadSafe(nsec_alloc, NsecCache.default_max_bytes, io)
-                else
-                    NsecCache.init(nsec_alloc, NsecCache.default_max_bytes, io);
-            } else null,
+            .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
+                .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
+                .io = io,
+                .thread_safe = cfg.workers > 1,
+            }) else null,
             .key_cache = if (cfg.dnssec) RRsetCache.init(.{
                 .backing = cache_alloc,
                 .max_bytes = cfg.key_cache_size,

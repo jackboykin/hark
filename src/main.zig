@@ -281,7 +281,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
         if (opportunistic) tls_t.pool = &enc_pool;
 
-        var rtt_cache = RttCache.init(gpa_alloc, io);
+        var rtt_cache = RttCache.init(.{ .allocator = gpa_alloc, .io = io });
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{

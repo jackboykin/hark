@@ -234,22 +234,23 @@ pub const NsecCache = struct {
     const max_zones: usize = 256;
     const max_store_batch: usize = 8;
 
-    pub fn init(backing: Allocator, max_bytes: usize, io: std.Io) NsecCache {
+    pub const Config = struct {
+        backing: Allocator,
+        max_bytes: usize = default_max_bytes,
+        io: std.Io,
+        thread_safe: bool = false,
+    };
+
+    pub fn init(cfg: Config) NsecCache {
         return .{
             .zones = .empty,
-            .rwlock = null,
-            .io = io,
-            .counting = CountingAllocator.init(backing, max_bytes),
+            .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
+            .io = cfg.io,
+            .counting = CountingAllocator.init(cfg.backing, cfg.max_bytes),
             .now_fn = &@import("monotonic.zig").nowSec,
             .hits = std.atomic.Value(u64).init(0),
             .misses = std.atomic.Value(u64).init(0),
         };
-    }
-
-    pub fn initThreadSafe(backing: Allocator, max_bytes: usize, io: std.Io) NsecCache {
-        var nc = init(backing, max_bytes, io);
-        nc.rwlock = std.Io.RwLock.init;
-        return nc;
     }
 
     pub fn deinit(self: *NsecCache) void {
@@ -541,7 +542,7 @@ fn freeSoa(alloc: Allocator, soa: dns.ResourceRecord) void {
 }
 
 fn testCache(alloc: Allocator) NsecCache {
-    var nc = NsecCache.init(alloc, 64 * 1024, testing.io);
+    var nc = NsecCache.init(.{ .backing = alloc, .max_bytes = 64 * 1024, .io = testing.io });
     nc.now_fn = &testNowSeconds;
     return nc;
 }

@@ -301,7 +301,6 @@ pub const RRsetCache = struct {
     serve_stale_ttl: u32 = 0,
     min_ttl: u32 = 0,
     prefetch: bool = false,
-    /// When true, storeRRsetsImpl skips .dnskey and .ds records (routed to key cache).
     skip_key_types: bool = false,
     /// SIEVE eviction state: per-entry visited flag and circular scan pointer.
     visited: ?[]std.atomic.Value(u8) = null,

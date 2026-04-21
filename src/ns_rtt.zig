@@ -43,20 +43,17 @@ pub const RttCache = struct {
     io: std.Io,
     now_fn: *const fn () i64,
 
-    pub fn init(allocator: Allocator, io: std.Io) RttCache {
-        return .{
-            .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
-            .mutex = null,
-            .io = io,
-            .now_fn = &@import("monotonic.zig").nowMs,
-        };
-    }
+    pub const Config = struct {
+        allocator: Allocator,
+        io: std.Io,
+        thread_safe: bool = false,
+    };
 
-    pub fn initThreadSafe(allocator: Allocator, io: std.Io) RttCache {
+    pub fn init(cfg: Config) RttCache {
         return .{
-            .entries = std.AutoHashMap(AddressKey, RttState).init(allocator),
-            .mutex = std.Io.Mutex.init,
-            .io = io,
+            .entries = std.AutoHashMap(AddressKey, RttState).init(cfg.allocator),
+            .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
+            .io = cfg.io,
             .now_fn = &@import("monotonic.zig").nowMs,
         };
     }
@@ -159,7 +156,7 @@ fn testAddr(last_octet: u8) AddressKey {
 }
 
 test "getTimeout returns initial for unknown server" {
-    var cache = RttCache.init(testing.allocator, testing.io);
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
@@ -167,7 +164,7 @@ test "getTimeout returns initial for unknown server" {
 }
 
 test "recordSuccess updates EWMA" {
-    var cache = RttCache.init(testing.allocator, testing.io);
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
@@ -186,7 +183,7 @@ test "recordSuccess updates EWMA" {
 }
 
 test "recordTimeout increments consecutive count and marks dead" {
-    var cache = RttCache.init(testing.allocator, testing.io);
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer cache.deinit();
     cache.now_fn = &testNowMs;
     test_now_ms = 1000;
