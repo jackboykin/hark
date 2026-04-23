@@ -399,8 +399,13 @@ pub const EventLoop = struct {
                             .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = err,
                         } };
-                        // Any parse failure means the SQE is effectively
-                        // dead for this caller; force re-arming.
+                        // io_uring clears F_MORE on error CQEs (see
+                        // io_req_set_res in kernel/io_uring), so
+                        // free_after is already true on the ENOBUFS /
+                        // CANCELED paths. We force it here for the
+                        // defensive in-process parse-failure paths too:
+                        // a malformed header would otherwise leave the
+                        // slot active with no way to recover it.
                         free_after = true;
                     }
                 },
