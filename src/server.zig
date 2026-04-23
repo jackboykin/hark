@@ -166,6 +166,8 @@ pub const Server = struct {
     key_cache: ?RRsetCache,
     shutdown: std.atomic.Value(bool),
     worker_errors: std.atomic.Value(u32),
+    udp_queue_drops: std.atomic.Value(u64),
+    tcp_queue_drops: std.atomic.Value(u64),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         // Randomize hash seeds for cache and dedup tables (hash collision attack defense).
@@ -234,6 +236,8 @@ pub const Server = struct {
             }) else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
+            .udp_queue_drops = std.atomic.Value(u64).init(0),
+            .tcp_queue_drops = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -347,6 +351,11 @@ pub const Server = struct {
                 ns.zones, ns.memory_bytes, ns.hits, ns.misses, ns_pct,
             });
         }
+        const udp_drops = self.udp_queue_drops.load(.monotonic);
+        const tcp_drops = self.tcp_queue_drops.load(.monotonic);
+        if (udp_drops > 0 or tcp_drops > 0) {
+            log.info("work queue drops: {d} UDP, {d} TCP", .{ udp_drops, tcp_drops });
+        }
     }
 
     fn workerThread(self: *Server, listen_addrs: []const na.Address) void {
@@ -428,6 +437,8 @@ pub const Server = struct {
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .shutdown = &self.shutdown,
             .queue = &queue,
+            .udp_queue_drops = &self.udp_queue_drops,
+            .tcp_queue_drops = &self.tcp_queue_drops,
             .ca_bundle = self.ca_bundle,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
@@ -485,6 +496,8 @@ const WorkerState = struct {
     nsec_cache: ?*NsecCache,
     shutdown: *std.atomic.Value(bool),
     queue: *WorkQueue,
+    udp_queue_drops: *std.atomic.Value(u64),
+    tcp_queue_drops: *std.atomic.Value(u64),
     ca_bundle: Certificate.Bundle,
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -589,6 +602,7 @@ const WorkerState = struct {
                                         // would consume the pool capacity we're protecting.
                                         // Client sees TCP reset and should retry (typically
                                         // over UDP).
+                                        _ = self.tcp_queue_drops.fetchAdd(1, .monotonic);
                                         log.warn("resolution queue full, dropping TCP client", .{});
                                         sys.close(acc.fd);
                                     }
@@ -653,6 +667,7 @@ const WorkerState = struct {
             return;
         }
         if (!self.queue.push(data, client_addr, sock, .udp)) {
+            _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
             log.warn("resolution queue full, dropping query", .{});
             sendErrorUdp(sock, id, .server_failure, rd, &.{}, client_addr);
         }
