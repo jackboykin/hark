@@ -242,10 +242,22 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 const evicted = gop.value_ptr.appendEvictingOldest(conn);
                 evicted.destroyBroken(self.allocator);
                 // total_conns unchanged: evicted one, added one.
+                self.assertCountInvariant();
                 return;
             }
             gop.value_ptr.append(conn);
             self.total_conns += 1;
+            self.assertCountInvariant();
+        }
+
+        /// Debug-only: `total_conns` must match the sum of slot lengths.
+        /// Guards against desync in the per-key vs. global bookkeeping.
+        fn assertCountInvariant(self: *Self) void {
+            if (!std.debug.runtime_safety) return;
+            var sum: usize = 0;
+            var iter = self.entries.iterator();
+            while (iter.next()) |entry| sum += entry.value_ptr.len;
+            std.debug.assert(sum == self.total_conns);
         }
 
         /// Remove connections that have been idle longer than max_idle_sec.
@@ -275,6 +287,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 }
             }
             for (empty_keys_buf[0..empty_count]) |k| _ = self.entries.remove(k);
+            self.assertCountInvariant();
         }
 
         /// Evict the globally oldest (lowest last_used) connection. Caller

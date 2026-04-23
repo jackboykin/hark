@@ -527,7 +527,7 @@ const WorkerState = struct {
         // Prefer multishot recvmsg — one SQE per socket stays armed and
         // produces CQEs for every inbound packet. Fall back to one-shot
         // if the kernel / buffer-ring setup rejected it.
-        const use_multishot_udp = self.loop.udp_buf_ring != null;
+        const use_multishot_udp = self.loop.supportsMultishotRecv();
         for (udp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
@@ -597,7 +597,7 @@ const WorkerState = struct {
                         if (!self.shutdown.load(.acquire)) {
                             const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
                             const still_armed = is_multishot and udp_ops[idx] != null and
-                                self.loop.slots[udp_ops[idx].?].active;
+                                self.loop.isActive(udp_ops[idx].?);
                             if (still_armed) continue;
                             udp_ops[idx] = (if (use_multishot_udp)
                                 self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx))

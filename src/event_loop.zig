@@ -15,8 +15,8 @@ const multishot_group_id: u16 = 0;
 const multishot_buf_count: u16 = 256;
 const multishot_name_reserve: u32 = 28; // sockaddr_in6 max
 const multishot_payload_max: u32 = 4096;
-/// io_uring_recvmsg_out(16) + reserved name + payload.
-const multishot_buf_size: u32 = 16 + multishot_name_reserve + multishot_payload_max;
+/// io_uring_recvmsg_out header + reserved name + payload.
+const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + multishot_payload_max;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -236,6 +236,16 @@ pub const EventLoop = struct {
     /// kernel can reuse it for a subsequent packet.
     pub fn releaseBuf(self: *EventLoop, buf_id: u16) void {
         if (self.udp_buf_ring) |*ring| ring.release(buf_id);
+    }
+
+    pub fn supportsMultishotRecv(self: *const EventLoop) bool {
+        return self.udp_buf_ring != null;
+    }
+
+    /// True iff the op's slot is still held by the kernel — used to
+    /// decide whether a multishot op is still armed after a CQE.
+    pub fn isActive(self: *const EventLoop, id: OperationId) bool {
+        return self.slots[id].active;
     }
 
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
@@ -468,6 +478,11 @@ pub const EventLoop = struct {
             };
         }
         const buf_id = try cqe.buffer_id();
+        // Past this point the kernel has claimed a buffer; any parse
+        // failure must return it to the ring, or malformed-packet
+        // bursts will starve the ring to ENOBUFS.
+        errdefer ring.release(buf_id);
+
         const used_len: usize = @intCast(cqe.res);
         const buf = ring.bufferAt(buf_id)[0..used_len];
 
@@ -653,7 +668,7 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
         }
         // After the first CQE, the SQE should still be armed (F_MORE);
         // slot stays active with no re-registration.
-        if (received > 0 and loop.slots[op_id].active) still_armed_seen = true;
+        if (received > 0 and loop.isActive(op_id)) still_armed_seen = true;
         if (received == payloads.len) break;
     }
 
