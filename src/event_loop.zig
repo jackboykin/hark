@@ -242,10 +242,14 @@ pub const EventLoop = struct {
         return self.udp_buf_ring != null;
     }
 
-    /// True iff the op's slot is still held by the kernel — used to
-    /// decide whether a multishot op is still armed after a CQE.
-    pub fn isActive(self: *const EventLoop, id: OperationId) bool {
-        return self.slots[id].active;
+    /// True iff `op_id` refers to a multishot op whose slot the kernel
+    /// still holds (IORING_CQE_F_MORE was set on the most recent CQE).
+    /// Callers use this after processing a CQE to decide whether to
+    /// re-arm the op.
+    pub fn stillArmed(self: *const EventLoop, op_id: ?OperationId) bool {
+        const id = op_id orelse return false;
+        const slot = &self.slots[id];
+        return slot.active and slot.kind == .recv_multi;
     }
 
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
@@ -668,7 +672,7 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
         }
         // After the first CQE, the SQE should still be armed (F_MORE);
         // slot stays active with no re-registration.
-        if (received > 0 and loop.isActive(op_id)) still_armed_seen = true;
+        if (received > 0 and loop.stillArmed(op_id)) still_armed_seen = true;
         if (received == payloads.len) break;
     }
 

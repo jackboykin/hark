@@ -580,10 +580,8 @@ const WorkerState = struct {
                         break;
                     },
                     .udp_recv => {
-                        var is_multishot = false;
                         switch (c.result) {
                             .recv => |recv| {
-                                is_multishot = recv.buf_id != null;
                                 if (recv.err == null and recv.data.len > 0) {
                                     self.handleUdpQuery(ctx.fd, recv.data, recv.addr);
                                 }
@@ -591,23 +589,19 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        // Multishot stays armed across CQEs. Only re-arm
-                        // when the kernel terminated the op (surfaced here
-                        // as the same freed-slot path one-shot recv uses).
-                        if (!self.shutdown.load(.acquire)) {
-                            const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
-                            const still_armed = is_multishot and udp_ops[idx] != null and
-                                self.loop.isActive(udp_ops[idx].?);
-                            if (still_armed) continue;
-                            udp_ops[idx] = (if (use_multishot_udp)
-                                self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx))
-                            else
-                                self.loop.recvFrom(ctx.fd, @ptrCast(ctx))) catch |err| {
-                                log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
-                                udp_ops[idx] = null;
-                                continue;
-                            };
-                        }
+                        if (self.shutdown.load(.acquire)) continue;
+                        const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
+                        // Multishot stays armed across CQEs; re-arm only
+                        // when the kernel terminated it.
+                        if (self.loop.stillArmed(udp_ops[idx])) continue;
+                        udp_ops[idx] = (if (use_multishot_udp)
+                            self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx))
+                        else
+                            self.loop.recvFrom(ctx.fd, @ptrCast(ctx))) catch |err| {
+                            log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
+                            udp_ops[idx] = null;
+                            continue;
+                        };
                     },
                     .tcp_accept => {
                         switch (c.result) {
