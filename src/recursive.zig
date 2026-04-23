@@ -200,7 +200,7 @@ pub const RecursiveResolver = struct {
                 }
             }
 
-            const target_name = try dns.parseDottedName(allocator, current_name);
+            var target_name = try dns.parseDottedName(allocator, current_name);
 
             // NSEC CACHE: synthesize negative responses from cached NSEC proofs (RFC 8198).
             // Skip if CD bit set (Appendix A) or cache bypassed.
@@ -459,6 +459,24 @@ pub const RecursiveResolver = struct {
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
+
+                                // Same-zone CNAME: keep current auth servers, delegation,
+                                // and security_state. The DNSSEC chain of trust is
+                                // unchanged within a zone, so re-walking from root would
+                                // only redo cache lookups. Skip back to the inner
+                                // referral loop with the new target.
+                                if (parent_zone.labels.len > 0 and
+                                    cname_rr.rdata.cname.isSubdomainOf(parent_zone))
+                                {
+                                    current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
+                                    target_name = try dns.parseDottedName(allocator, current_name);
+                                    minimise_label_count = if (self.qname_minimisation)
+                                        parent_zone.labels.len + 1
+                                    else
+                                        target_name.labels.len;
+                                    continue;
+                                }
+
                                 current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
                                 // Re-resolve CNAME target from root with fresh security state.
                                 // Preserve .insecure: an unauthenticated CNAME could redirect
