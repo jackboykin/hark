@@ -57,10 +57,16 @@ const EntryState = struct {
 
 pub const AcquireResult = enum { leader, follower };
 
+/// Followers sleep on `conditions[shard]` where shard = key-hash % this.
+/// A leader's broadcast wakes only the 1/N of followers whose keys hash
+/// to the same shard, vs. waking the whole table. Power of two so the
+/// modulo compiles to a mask.
+const shard_count = 64;
+
 pub const InFlightTable = struct {
     map: std.HashMapUnmanaged(DedupKey, EntryState, DedupKeyContext, 80),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
-    condition: std.Io.Condition = std.Io.Condition.init,
+    conditions: [shard_count]std.Io.Condition = @splat(std.Io.Condition.init),
     io: std.Io,
     allocator: mem.Allocator,
 
@@ -74,6 +80,10 @@ pub const InFlightTable = struct {
 
     pub fn deinit(self: *InFlightTable) void {
         self.map.deinit(self.allocator);
+    }
+
+    fn shardOf(key: DedupKey) usize {
+        return @intCast(DedupKeyContext.hash(.{}, key) % shard_count);
     }
 
     /// Try to become the leader for this (name, qtype) pair.
@@ -93,15 +103,17 @@ pub const InFlightTable = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.map.getPtr(key)) |_| {
-            // Another worker is resolving this — wait for completion.
-            // The condition is shared across all entries, so any key's
-            // releaseLeader broadcast wakes us to recheck the deadline.
+            // Another worker is resolving this — wait on this key's shard.
+            // A releaseLeader for any key in the same shard will wake us to
+            // recheck; releases for keys in other shards will not broadcast
+            // here at all.
             const monotonic = @import("monotonic.zig");
             const deadline = monotonic.nowNs() +| @as(i128, timeout_ns);
+            const shard = shardOf(key);
             while (self.map.get(key)) |entry| {
                 if (entry.completed) break;
                 if (monotonic.nowNs() >= deadline) break;
-                self.condition.waitUncancelable(self.io, &self.mutex);
+                self.conditions[shard].waitUncancelable(self.io, &self.mutex);
             }
             return .follower;
         }
@@ -122,7 +134,7 @@ pub const InFlightTable = struct {
         if (self.map.getPtr(key)) |entry| {
             entry.completed = true;
         }
-        self.condition.broadcast(self.io);
+        self.conditions[shardOf(key)].broadcast(self.io);
         // Remove entry so followers see null and break out, and future requests start fresh.
         _ = self.map.remove(key);
     }
