@@ -8,6 +8,16 @@ const sys = @import("sys.zig");
 pub const max_operations = 64;
 const recv_buf_size = 4096;
 
+/// Buffer group for multishot UDP recvmsg. 256 buffers × (header + name +
+/// payload) ≈ 1 MiB per worker. Sized to absorb short bursts without
+/// ENOBUFS while the tick loop drains and releases buffers.
+const multishot_group_id: u16 = 0;
+const multishot_buf_count: u16 = 256;
+const multishot_name_reserve: u32 = 28; // sockaddr_in6 max
+const multishot_payload_max: u32 = 4096;
+/// io_uring_recvmsg_out(16) + reserved name + payload.
+const multishot_buf_size: u32 = 16 + multishot_name_reserve + multishot_payload_max;
+
 // ── Public types ────────────────────────────────────────────────────────
 
 pub const OperationId = u16;
@@ -27,6 +37,10 @@ pub const RecvResult = struct {
     data: []const u8,
     addr: na.Address,
     err: ?anyerror,
+    /// Non-null for multishot recv completions. Caller MUST call
+    /// `releaseBuf(buf_id)` after processing `data`, or the buffer ring
+    /// will starve and further recvs will fail with ENOBUFS.
+    buf_id: ?u16 = null,
 };
 
 pub const AcceptResult = struct {
@@ -43,7 +57,7 @@ pub const ReadResult = struct {
 
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { recv, accept, read };
+const OpKind = enum { recv, recv_multi, accept, read };
 
 const Slot = struct {
     kind: OpKind,
@@ -73,12 +87,66 @@ const Slot = struct {
 
 // ── EventLoop ───────────────────────────────────────────────────────────
 
+/// Non-incremental buffer ring for multishot recvmsg. Each CQE consumes
+/// one buffer fully; we reset and re-add it to the ring in `releaseBuf`.
+/// (Zig std's BufferGroup hardcodes `.inc = true`, which is wrong for
+/// per-packet consumption — the kernel would pack multiple messages
+/// into the same buffer.)
+const UdpBufRing = struct {
+    br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
+    buffers: []u8,
+    buffer_size: u32,
+    buffers_count: u16,
+    group_id: u16,
+
+    fn init(ring_fd: linux.fd_t, allocator: std.mem.Allocator) !UdpBufRing {
+        const buffers = try allocator.alloc(u8, multishot_buf_size * multishot_buf_count);
+        errdefer allocator.free(buffers);
+        const br = try linux.IoUring.setup_buf_ring(ring_fd, multishot_buf_count, multishot_group_id, .{ .inc = false });
+        linux.IoUring.buf_ring_init(br);
+        const mask = linux.IoUring.buf_ring_mask(multishot_buf_count);
+        var i: u16 = 0;
+        while (i < multishot_buf_count) : (i += 1) {
+            const pos: usize = @as(usize, multishot_buf_size) * i;
+            const buf = buffers[pos .. pos + multishot_buf_size];
+            linux.IoUring.buf_ring_add(br, buf, i, mask, i);
+        }
+        linux.IoUring.buf_ring_advance(br, multishot_buf_count);
+        return .{
+            .br = br,
+            .buffers = buffers,
+            .buffer_size = multishot_buf_size,
+            .buffers_count = multishot_buf_count,
+            .group_id = multishot_group_id,
+        };
+    }
+
+    fn deinit(self: *UdpBufRing, ring_fd: linux.fd_t, allocator: std.mem.Allocator) void {
+        linux.IoUring.free_buf_ring(ring_fd, self.br, self.buffers_count, self.group_id);
+        allocator.free(self.buffers);
+    }
+
+    fn bufferAt(self: *const UdpBufRing, buffer_id: u16) []u8 {
+        const pos: usize = @as(usize, self.buffer_size) * buffer_id;
+        return self.buffers[pos .. pos + self.buffer_size];
+    }
+
+    fn release(self: *UdpBufRing, buffer_id: u16) void {
+        const mask = linux.IoUring.buf_ring_mask(self.buffers_count);
+        linux.IoUring.buf_ring_add(self.br, self.bufferAt(buffer_id), buffer_id, mask, 0);
+        linux.IoUring.buf_ring_advance(self.br, 1);
+    }
+};
+
 pub const EventLoop = struct {
     allocator: std.mem.Allocator,
     ring: linux.IoUring,
     slots: [max_operations]Slot,
     free_list: [max_operations]OperationId,
     free_count: u16,
+    /// Buffer ring backing multishot recvmsg. null if kernel/allocator
+    /// rejected setup — callers must fall back to one-shot `recvFrom`.
+    udp_buf_ring: ?UdpBufRing,
 
     pub fn create(allocator: std.mem.Allocator) !*EventLoop {
         const self = try allocator.create(EventLoop);
@@ -94,11 +162,13 @@ pub const EventLoop = struct {
             self.slots[i] = Slot.init();
             self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
         }
+        self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch null;
         return self;
     }
 
     pub fn destroy(self: *EventLoop) void {
         const allocator = self.allocator;
+        if (self.udp_buf_ring) |*bg| bg.deinit(self.ring.fd, allocator);
         self.ring.deinit();
         allocator.destroy(self);
     }
@@ -122,6 +192,50 @@ pub const EventLoop = struct {
         slot.context = context;
         slot.active = true;
         return id;
+    }
+
+    /// Arm a multishot recvmsg on `fd`. One SQE produces CQEs for every
+    /// inbound packet until the kernel stops the op (e.g. ENOBUFS).
+    /// Callers receive a `RecvResult` with `buf_id` set and MUST call
+    /// `releaseBuf` after processing the payload.
+    ///
+    /// Returns `error.MultishotNotAvailable` if the kernel rejected the
+    /// buffer-ring setup; callers should fall back to `recvFrom`.
+    pub fn recvFromMulti(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
+        const ring = self.udp_buf_ring orelse return error.MultishotNotAvailable;
+        const id = try self.initOp(.recv_multi, context);
+        errdefer self.freeSlot(id);
+        const slot = &self.slots[id];
+
+        // msghdr configures the kernel's output layout. iov is ignored
+        // (buffer selected from the ring). namelen/controllen tell the
+        // kernel how many bytes to reserve for sender address / control
+        // msgs; we reserve multishot_name_reserve (sockaddr_in6) and 0
+        // control since DNS doesn't need CMSG.
+        slot.addr_len = multishot_name_reserve;
+        slot.msghdr = .{
+            .name = null,
+            .namelen = slot.addr_len,
+            .iov = undefined,
+            .iovlen = 0,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+
+        var sqe = try self.ring.get_sqe();
+        sqe.prep_recvmsg(fd, &slot.msghdr, 0);
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+        sqe.buf_index = ring.group_id;
+        sqe.user_data = id;
+        return id;
+    }
+
+    /// Release a multishot recv buffer back to the buffer ring so the
+    /// kernel can reuse it for a subsequent packet.
+    pub fn releaseBuf(self: *EventLoop, buf_id: u16) void {
+        if (self.udp_buf_ring) |*ring| ring.release(buf_id);
     }
 
     pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
@@ -226,6 +340,10 @@ pub const EventLoop = struct {
             const completion = &buf[out];
             completion.context = slot.context;
 
+            // Multishot ops keep the slot alive as long as F_MORE is set;
+            // the kernel will produce more CQEs for the same user_data.
+            var free_after = true;
+
             switch (slot.kind) {
                 .recv => {
                     if (cqe.res > 0) {
@@ -247,6 +365,29 @@ pub const EventLoop = struct {
                             .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = error.RecvFailed,
                         } };
+                    }
+                },
+                .recv_multi => {
+                    // When F_MORE is clear, the kernel has terminated the
+                    // multishot (e.g. on ENOBUFS); the slot must be freed
+                    // so the caller can re-arm it.
+                    free_after = cqe.flags & linux.IORING_CQE_F_MORE == 0;
+                    if (parseMultishotRecv(self, cqe)) |parsed| {
+                        completion.result = .{ .recv = .{
+                            .data = parsed.payload,
+                            .addr = parsed.addr,
+                            .err = null,
+                            .buf_id = parsed.buf_id,
+                        } };
+                    } else |err| {
+                        completion.result = .{ .recv = .{
+                            .data = &.{},
+                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
+                            .err = err,
+                        } };
+                        // Any parse failure means the SQE is effectively
+                        // dead for this caller; force re-arming.
+                        free_after = true;
                     }
                 },
                 .accept => {
@@ -300,11 +441,52 @@ pub const EventLoop = struct {
                 },
             }
 
-            self.freeSlot(id);
+            if (free_after) self.freeSlot(id);
             out += 1;
         }
 
         return buf[0..out];
+    }
+
+    const MultishotParsed = struct {
+        addr: na.Address,
+        payload: []const u8,
+        buf_id: u16,
+    };
+
+    /// Parse a multishot recvmsg CQE: extract the selected buffer,
+    /// destructure the `io_uring_recvmsg_out` header, and return the
+    /// sender address + payload slice (both aliased into the buffer).
+    fn parseMultishotRecv(self: *EventLoop, cqe: linux.io_uring_cqe) !MultishotParsed {
+        const ring = &(self.udp_buf_ring orelse return error.MultishotNotAvailable);
+        if (cqe.res < 0) {
+            const errno: linux.E = @enumFromInt(@as(u31, @intCast(-cqe.res)));
+            return switch (errno) {
+                .NOBUFS => error.NoBuffers,
+                .CANCELED => error.Cancelled,
+                else => error.RecvFailed,
+            };
+        }
+        const buf_id = try cqe.buffer_id();
+        const used_len: usize = @intCast(cqe.res);
+        const buf = ring.bufferAt(buf_id)[0..used_len];
+
+        // Kernel writes: [io_uring_recvmsg_out][name (reserved)][control][payload]
+        if (buf.len < @sizeOf(linux.io_uring_recvmsg_out)) return error.RecvFailed;
+        const out: *const linux.io_uring_recvmsg_out = @ptrCast(@alignCast(buf.ptr));
+        const name_off = @sizeOf(linux.io_uring_recvmsg_out);
+        const payload_off = name_off + multishot_name_reserve;
+        if (out.namelen == 0 or out.namelen > multishot_name_reserve) return error.RecvFailed;
+        if (payload_off + out.payloadlen > buf.len) return error.RecvFailed;
+
+        // Reinterpret the name bytes as a sockaddr — same storage as
+        // `na.PosixAddress`, populated by the kernel.
+        const addr_ptr: *const na.PosixAddress = @ptrCast(@alignCast(buf.ptr + name_off));
+        return .{
+            .addr = na.fromSockaddr(addr_ptr),
+            .payload = buf[payload_off..][0..out.payloadlen],
+            .buf_id = buf_id,
+        };
     }
 };
 
@@ -412,6 +594,77 @@ test "EventLoop recvFrom with external sender (server pattern)" {
 
     thread.join();
     try testing.expect(got_recv);
+}
+
+test "EventLoop recvFromMulti receives multiple packets on one SQE" {
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    if (loop.udp_buf_ring == null) return error.SkipZigTest;
+
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(sock, &bind_pa.any, bind_len);
+    const server_addr = try na.getSockName(sock);
+
+    var ctx: u8 = 1;
+    const op_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+
+    // Send 3 packets from a separate thread — one multishot SQE should
+    // produce 3 CQEs without re-arming.
+    const payloads = [_][]const u8{ "first", "second", "third" };
+    const SenderThread = struct {
+        fn run(addr: na.Address, msgs: []const []const u8) void {
+            const s = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+            defer sys.close(s);
+            var pa: na.PosixAddress = undefined;
+            const sa_len = na.toSockaddr(&addr, &pa);
+            for (msgs) |m| _ = sys.sendto(s, m, 0, &pa.any, sa_len) catch return;
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, &payloads });
+
+    var completions: [max_operations]Completion = undefined;
+    var seen = [_]bool{false} ** payloads.len;
+    var received: usize = 0;
+    var still_armed_seen = false;
+
+    for (0..10) |_| {
+        const results = try loop.tick(&completions);
+        for (results) |c| {
+            switch (c.result) {
+                .recv => |r| {
+                    if (r.err == null and r.buf_id != null) {
+                        for (payloads, 0..) |p, pi| {
+                            if (std.mem.eql(u8, p, r.data) and !seen[pi]) {
+                                seen[pi] = true;
+                                received += 1;
+                                break;
+                            }
+                        }
+                        loop.releaseBuf(r.buf_id.?);
+                    }
+                },
+                else => {},
+            }
+        }
+        // After the first CQE, the SQE should still be armed (F_MORE);
+        // slot stays active with no re-registration.
+        if (received > 0 and loop.slots[op_id].active) still_armed_seen = true;
+        if (received == payloads.len) break;
+    }
+
+    thread.join();
+    try testing.expectEqual(payloads.len, received);
+    try testing.expect(still_armed_seen);
+
+    // Tear down the multishot SQE before destroy so the kernel doesn't
+    // keep it armed against a torn-down buffer ring.
+    try loop.cancel(op_id);
+    loop.flush();
 }
 
 test "EventLoop cancel pending recvFrom" {

@@ -524,11 +524,17 @@ const WorkerState = struct {
         var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
         var tcp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
 
-        // Register recvFrom for each UDP socket
+        // Prefer multishot recvmsg — one SQE per socket stays armed and
+        // produces CQEs for every inbound packet. Fall back to one-shot
+        // if the kernel / buffer-ring setup rejected it.
+        const use_multishot_udp = self.loop.udp_buf_ring != null;
         for (udp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
-            udp_ops[i] = self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i])) catch |err| blk: {
+            udp_ops[i] = (if (use_multishot_udp)
+                self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i]))
+            else
+                self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i]))) catch |err| blk: {
                 log.err("failed to register UDP recvFrom: {s}", .{@errorName(err)});
                 break :blk null;
             };
@@ -574,18 +580,29 @@ const WorkerState = struct {
                         break;
                     },
                     .udp_recv => {
+                        var is_multishot = false;
                         switch (c.result) {
                             .recv => |recv| {
+                                is_multishot = recv.buf_id != null;
                                 if (recv.err == null and recv.data.len > 0) {
                                     self.handleUdpQuery(ctx.fd, recv.data, recv.addr);
                                 }
+                                if (recv.buf_id) |bid| self.loop.releaseBuf(bid);
                             },
                             else => {},
                         }
+                        // Multishot stays armed across CQEs. Only re-arm
+                        // when the kernel terminated the op (surfaced here
+                        // as the same freed-slot path one-shot recv uses).
                         if (!self.shutdown.load(.acquire)) {
-                            // Find which index this ctx belongs to and re-register
                             const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
-                            udp_ops[idx] = self.loop.recvFrom(ctx.fd, @ptrCast(ctx)) catch |err| {
+                            const still_armed = is_multishot and udp_ops[idx] != null and
+                                self.loop.slots[udp_ops[idx].?].active;
+                            if (still_armed) continue;
+                            udp_ops[idx] = (if (use_multishot_udp)
+                                self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx))
+                            else
+                                self.loop.recvFrom(ctx.fd, @ptrCast(ctx))) catch |err| {
                                 log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
                                 udp_ops[idx] = null;
                                 continue;
