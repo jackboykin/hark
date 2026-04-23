@@ -102,13 +102,57 @@ pub const PooledConnection = struct {
 // ── ConnectionPool (comptime generic) ───────────────────────────────
 
 const max_entries_default: usize = 32;
+const per_key_cap: usize = 4;
 
 pub fn ConnectionPool(comptime Conn: type) type {
     return struct {
         const Self = @This();
 
+        /// Per-key LIFO of idle connections. `append` at the end, `pop`
+        /// from the end — reusing the most-recently-used conn keeps the
+        /// TCP/TLS session warmest. When full, `appendEvictingOldest`
+        /// drops index 0 (insertion-oldest for this key).
+        const Slots = struct {
+            items: [per_key_cap]*Conn = undefined,
+            len: u8 = 0,
+
+            fn isEmpty(self: *const Slots) bool {
+                return self.len == 0;
+            }
+
+            fn isFull(self: *const Slots) bool {
+                return self.len == per_key_cap;
+            }
+
+            fn append(self: *Slots, conn: *Conn) void {
+                self.items[self.len] = conn;
+                self.len += 1;
+            }
+
+            fn pop(self: *Slots) *Conn {
+                self.len -= 1;
+                return self.items[self.len];
+            }
+
+            fn appendEvictingOldest(self: *Slots, conn: *Conn) *Conn {
+                const evicted = self.items[0];
+                for (1..self.len) |i| self.items[i - 1] = self.items[i];
+                self.items[self.len - 1] = conn;
+                return evicted;
+            }
+
+            fn removeAt(self: *Slots, idx: u8) *Conn {
+                const evicted = self.items[idx];
+                var i: u8 = idx + 1;
+                while (i < self.len) : (i += 1) self.items[i - 1] = self.items[i];
+                self.len -= 1;
+                return evicted;
+            }
+        };
+
         allocator: Allocator,
-        entries: std.AutoHashMap(AddressKey, *Conn),
+        entries: std.AutoHashMap(AddressKey, Slots),
+        total_conns: usize = 0,
         mutex: Io.Mutex = Io.Mutex.init,
         io: Io,
         max_idle_sec: i64 = 30,
@@ -118,7 +162,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
         pub fn init(allocator: Allocator, io: Io) Self {
             return .{
                 .allocator = allocator,
-                .entries = std.AutoHashMap(AddressKey, *Conn).init(allocator),
+                .entries = std.AutoHashMap(AddressKey, Slots).init(allocator),
                 .io = io,
             };
         }
@@ -128,32 +172,39 @@ pub fn ConnectionPool(comptime Conn: type) type {
             defer self.mutex.unlock(self.io);
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
-                entry.value_ptr.*.destroyBroken(self.allocator);
+                const slots = entry.value_ptr;
+                for (slots.items[0..slots.len]) |conn| conn.destroyBroken(self.allocator);
             }
             self.entries.deinit();
+            self.total_conns = 0;
         }
 
         /// Retrieve a cached connection for the given key. Returns null if
-        /// no connection exists or the cached entry has expired.
+        /// no idle connection exists or all cached entries for the key
+        /// have expired.
         pub fn acquire(self: *Self, key: AddressKey) ?*Conn {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             // Opportunistic idle sweep only when pool is above half capacity
-            if (self.entries.count() >= self.max_entries / 2) self.evictIdleLocked();
+            if (self.total_conns >= self.max_entries / 2) self.evictIdleLocked();
 
-            const kv = self.entries.fetchRemove(key) orelse return null;
-            const conn = kv.value;
-
+            const slots = self.entries.getPtr(key) orelse return null;
             const now = self.now_fn();
-            const is_stale = now - conn.last_used > self.max_idle_sec;
-            const is_expired = if (comptime @hasDecl(Conn, "isExpired")) conn.isExpired() else false;
-            if (is_stale or is_expired) {
-                conn.destroyBroken(self.allocator);
-                return null;
+            while (!slots.isEmpty()) {
+                const conn = slots.pop();
+                self.total_conns -= 1;
+                const is_stale = now - conn.last_used > self.max_idle_sec;
+                const is_expired = if (comptime @hasDecl(Conn, "isExpired")) conn.isExpired() else false;
+                if (is_stale or is_expired) {
+                    conn.destroyBroken(self.allocator);
+                    continue;
+                }
+                if (slots.isEmpty()) _ = self.entries.remove(key);
+                return conn;
             }
-
-            return conn;
+            _ = self.entries.remove(key);
+            return null;
         }
 
         /// Return a connection to the pool (alive=true) or discard it (alive=false).
@@ -166,72 +217,90 @@ pub fn ConnectionPool(comptime Conn: type) type {
             defer self.mutex.unlock(self.io);
             conn.last_used = self.now_fn();
             if (comptime @hasDecl(Conn, "recordUse")) conn.recordUse();
-            self.putReplaceLocked(key, conn);
+            self.insertLocked(key, conn);
         }
 
         /// Store a newly established connection in the pool.
         pub fn store(self: *Self, key: AddressKey, conn: *Conn) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.entries.count() >= self.max_entries) {
-                self.evictOldestLocked();
-            }
             conn.last_used = self.now_fn();
             if (comptime @hasDecl(Conn, "initCounters")) conn.initCounters();
-            self.putReplaceLocked(key, conn);
+            self.insertLocked(key, conn);
         }
 
-        /// Insert conn, destroying any previous connection for the same key.
-        /// Caller must hold mutex.
-        fn putReplaceLocked(self: *Self, key: AddressKey, conn: *Conn) void {
-            const result = self.entries.fetchPut(key, conn) catch {
+        fn insertLocked(self: *Self, key: AddressKey, conn: *Conn) void {
+            if (self.total_conns >= self.max_entries) self.evictGlobalOldestLocked();
+
+            const gop = self.entries.getOrPut(key) catch {
                 conn.destroyBroken(self.allocator);
                 return;
             };
-            if (result) |old| {
-                old.value.destroyBroken(self.allocator);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+
+            if (gop.value_ptr.isFull()) {
+                const evicted = gop.value_ptr.appendEvictingOldest(conn);
+                evicted.destroyBroken(self.allocator);
+                // total_conns unchanged: evicted one, added one.
+                return;
             }
+            gop.value_ptr.append(conn);
+            self.total_conns += 1;
         }
 
-        /// Remove all connections that have been idle longer than max_idle_sec.
+        /// Remove connections that have been idle longer than max_idle_sec.
         /// Caller must hold mutex.
         fn evictIdleLocked(self: *Self) void {
             const now = self.now_fn();
-            var to_remove: [max_entries_default]AddressKey = undefined;
-            var remove_count: usize = 0;
+            var empty_keys_buf: [max_entries_default]AddressKey = undefined;
+            var empty_count: usize = 0;
 
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
-                if (now - entry.value_ptr.*.last_used > self.max_idle_sec) {
-                    to_remove[remove_count] = entry.key_ptr.*;
-                    remove_count += 1;
-                    if (remove_count >= max_entries_default) break;
+                const slots = entry.value_ptr;
+                var write: u8 = 0;
+                for (slots.items[0..slots.len]) |conn| {
+                    if (now - conn.last_used > self.max_idle_sec) {
+                        conn.destroyBroken(self.allocator);
+                        self.total_conns -= 1;
+                    } else {
+                        slots.items[write] = conn;
+                        write += 1;
+                    }
+                }
+                slots.len = write;
+                if (slots.isEmpty() and empty_count < empty_keys_buf.len) {
+                    empty_keys_buf[empty_count] = entry.key_ptr.*;
+                    empty_count += 1;
                 }
             }
-
-            for (to_remove[0..remove_count]) |k| {
-                if (self.entries.fetchRemove(k)) |kv| {
-                    kv.value.destroyBroken(self.allocator);
-                }
-            }
+            for (empty_keys_buf[0..empty_count]) |k| _ = self.entries.remove(k);
         }
 
-        fn evictOldestLocked(self: *Self) void {
+        /// Evict the globally oldest (lowest last_used) connection. Caller
+        /// must hold mutex.
+        fn evictGlobalOldestLocked(self: *Self) void {
             var oldest_key: ?AddressKey = null;
+            var oldest_idx: u8 = 0;
             var oldest_time: i64 = std.math.maxInt(i64);
 
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
-                if (entry.value_ptr.*.last_used < oldest_time) {
-                    oldest_time = entry.value_ptr.*.last_used;
-                    oldest_key = entry.key_ptr.*;
+                const slots = entry.value_ptr;
+                for (slots.items[0..slots.len], 0..) |conn, idx| {
+                    if (conn.last_used < oldest_time) {
+                        oldest_time = conn.last_used;
+                        oldest_key = entry.key_ptr.*;
+                        oldest_idx = @intCast(idx);
+                    }
                 }
             }
-
             if (oldest_key) |k| {
-                if (self.entries.fetchRemove(k)) |kv| {
-                    kv.value.destroyBroken(self.allocator);
-                }
+                const slots = self.entries.getPtr(k) orelse return;
+                const conn = slots.removeAt(oldest_idx);
+                conn.destroyBroken(self.allocator);
+                self.total_conns -= 1;
+                if (slots.isEmpty()) _ = self.entries.remove(k);
             }
         }
 
@@ -423,6 +492,85 @@ fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
         .query_count = 0,
     };
     return conn;
+}
+
+test "ConnectionPool multi-entry per key (LIFO)" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TlsPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    defer pool.deinit();
+
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
+
+    const c1 = try createTestConnection(testing.allocator);
+    pool.store(key, c1);
+    fake_time = 1001;
+    const c2 = try createTestConnection(testing.allocator);
+    pool.store(key, c2);
+    fake_time = 1002;
+    const c3 = try createTestConnection(testing.allocator);
+    pool.store(key, c3);
+
+    try testing.expectEqual(@as(usize, 3), pool.total_conns);
+    try testing.expectEqual(@as(usize, 1), pool.entries.count());
+
+    // LIFO: acquire returns the most recently stored
+    const a1 = pool.acquire(key).?;
+    try testing.expectEqual(c3, a1);
+    const a2 = pool.acquire(key).?;
+    try testing.expectEqual(c2, a2);
+    const a3 = pool.acquire(key).?;
+    try testing.expectEqual(c1, a3);
+    try testing.expectEqual(@as(usize, 0), pool.total_conns);
+    try testing.expect(pool.acquire(key) == null);
+
+    pool.release(key, a1, true);
+    pool.release(key, a2, true);
+    pool.release(key, a3, true);
+    try testing.expectEqual(@as(usize, 3), pool.total_conns);
+}
+
+test "ConnectionPool per-key cap evicts oldest within key" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TlsPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    defer pool.deinit();
+
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
+
+    // Fill to per-key cap (4)
+    for (0..per_key_cap) |_| {
+        const c = try createTestConnection(testing.allocator);
+        pool.store(key, c);
+        fake_time += 1;
+    }
+    try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
+
+    // One more — triggers appendEvictingOldest, total_conns unchanged
+    const c_new = try createTestConnection(testing.allocator);
+    pool.store(key, c_new);
+    try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
+
+    // LIFO: c_new is on top
+    const got = pool.acquire(key).?;
+    try testing.expectEqual(c_new, got);
+    pool.release(key, got, true);
 }
 
 test "TcpConnectionPool max queries eviction" {
