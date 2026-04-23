@@ -268,9 +268,8 @@ pub const RecursiveResolver = struct {
                 // Build probe name from target's trailing labels, or use the full name.
                 const query_name: []const u8 = if (is_final) current_name else blk: {
                     const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
-                    const child_buf = child_view.format();
-                    const child_len = mem.indexOfScalar(u8, &child_buf, 0) orelse child_buf.len;
-                    break :blk try allocator.dupe(u8, child_buf[0..child_len]);
+                    var child_buf: [dns.max_name_len + 1]u8 = undefined;
+                    break :blk try allocator.dupe(u8, child_view.formatInto(&child_buf));
                 };
                 const query_type: dns.RType = if (is_final) qtype else .a;
 
@@ -622,8 +621,8 @@ pub const RecursiveResolver = struct {
             if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
         }
         // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
-        const zs = nameToSlice(zone_cut);
-        if (!self.reproveDelegationSecurity(allocator, zs.buf[0..zs.len], parent_servers))
+        var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+        if (!self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers))
             return .secure;
         return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
     }
@@ -644,8 +643,8 @@ pub const RecursiveResolver = struct {
         const ce = dns.Name{ .labels = target_name.labels[target_name.labels.len - ce_label_count ..] };
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         const wc_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return null;
-        const wc_s = nameToSlice(wc_name);
-        const wc_dotted = wc_s.buf[0..wc_s.len];
+        var wc_buf: [dns.max_name_len + 1]u8 = undefined;
+        const wc_dotted = wc_name.formatInto(&wc_buf);
 
         const c = self.cache orelse return null;
         const wc_result = c.lookup(allocator, wc_dotted, qtype, .in) orelse return null;
@@ -817,7 +816,7 @@ pub const RecursiveResolver = struct {
             if (s0_idx == null) {
                 s0_idx = idx;
             } else if (s1_idx == null) {
-                if (!addressMatchesUpstream(servers[idx], servers[s0_idx.?])) {
+                if (!na.ipEqual(servers[idx], servers[s0_idx.?])) {
                     s1_idx = idx;
                     break;
                 }
@@ -1032,8 +1031,6 @@ pub const RecursiveResolver = struct {
             tls_t.probeInBackground(server, oc);
         }
     }
-
-    const addressMatchesUpstream = @import("transport.zig").addressMatchesUpstream;
 
     // ── DNSSEC Answer Validation ───────────────────────────────────────
 
@@ -1479,8 +1476,32 @@ pub const RecursiveResolver = struct {
         return self.resolveNsAddressesSerial(allocator, ns_names, depth, ns_fetch_limit);
     }
 
+    const address_rtypes = [_]dns.RType{ .a, .aaaa };
+
+    /// Append A+AAAA addresses from `records` to `addrs`, skipping non-routable.
+    /// Returns true if at least one address was appended.
+    fn appendAddressesFromRecords(
+        records: []const dns.ResourceRecord,
+        addrs: *[max_servers_per_level]na.Address,
+        count: *usize,
+    ) bool {
+        var added = false;
+        for (records) |rr| {
+            if (count.* >= max_servers_per_level) break;
+            const addr: na.Address = switch (rr.rtype) {
+                .a => na.initIp4(rr.rdata.a, 53),
+                .aaaa => na.initIp6(rr.rdata.aaaa, 53, 0, 0),
+                else => continue,
+            };
+            if (na.isNonRoutableNs(addr)) continue;
+            addrs[count.*] = addr;
+            count.* += 1;
+            added = true;
+        }
+        return added;
+    }
+
     /// Resolve A + AAAA for a single NS name, appending addresses to addrs[count..].
-    /// Returns the number of addresses added, or error.OutOfMemory.
     fn resolveNsName(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1494,31 +1515,12 @@ pub const RecursiveResolver = struct {
             return false;
         };
         var found = false;
-        if (self.resolveImpl(allocator, ns_dotted, .a, depth + 1)) |r| {
-            for (r.message.answers) |rr| {
-                if (rr.rtype == .a and count.* < max_servers_per_level) {
-                    const addr = na.initIp4(rr.rdata.a, 53);
-                    if (na.isNonRoutableNs(addr)) continue;
-                    addrs[count.*] = addr;
-                    count.* += 1;
-                    found = true;
-                }
+        for (address_rtypes) |qtype| {
+            if (self.resolveImpl(allocator, ns_dotted, qtype, depth + 1)) |r| {
+                if (appendAddressesFromRecords(r.message.answers, addrs, count)) found = true;
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
             }
-        } else |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-        }
-        if (self.resolveImpl(allocator, ns_dotted, .aaaa, depth + 1)) |r| {
-            for (r.message.answers) |rr| {
-                if (rr.rtype == .aaaa and count.* < max_servers_per_level) {
-                    const addr = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
-                    if (na.isNonRoutableNs(addr)) continue;
-                    addrs[count.*] = addr;
-                    count.* += 1;
-                    found = true;
-                }
-            }
-        } else |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
         }
         return found;
     }
@@ -1664,34 +1666,12 @@ pub const RecursiveResolver = struct {
 
         for (ns_names) |ns_name| {
             const ns_dotted = try nameToDotted(allocator, ns_name);
-            if (cache.lookup(allocator, ns_dotted, .a, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        for (h.records) |rr| {
-                            if (rr.rtype == .a and count < max_servers_per_level) {
-                                const addr = na.initIp4(rr.rdata.a, 53);
-                                if (na.isNonRoutableNs(addr)) continue;
-                                addrs[count] = addr;
-                                count += 1;
-                            }
-                        }
-                    },
-                    .negative => {},
-                }
-            }
-            if (cache.lookup(allocator, ns_dotted, .aaaa, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        for (h.records) |rr| {
-                            if (rr.rtype == .aaaa and count < max_servers_per_level) {
-                                const addr = na.initIp6(rr.rdata.aaaa, 53, 0, 0);
-                                if (na.isNonRoutableNs(addr)) continue;
-                                addrs[count] = addr;
-                                count += 1;
-                            }
-                        }
-                    },
-                    .negative => {},
+            for (address_rtypes) |qtype| {
+                if (cache.lookup(allocator, ns_dotted, qtype, .in)) |result| {
+                    switch (result) {
+                        .hit => |h| _ = appendAddressesFromRecords(h.records, &addrs, &count),
+                        .negative => {},
+                    }
                 }
             }
         }
@@ -1813,8 +1793,8 @@ pub const RecursiveResolver = struct {
 
 fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zone: dns.Name) bool {
     const c = cache orelse return false;
-    const zs = nameToSlice(zone);
-    const ds_result = c.lookup(allocator, zs.buf[0..zs.len], .ds, .in) orelse return false;
+    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    const ds_result = c.lookup(allocator, zone.formatInto(&zone_buf), .ds, .in) orelse return false;
     return switch (ds_result) {
         .negative => true,
         .hit => false,
@@ -1839,8 +1819,8 @@ fn cacheInsecureDelegation(
         if (rr.ttl > 0 and rr.ttl < neg_ttl) neg_ttl = rr.ttl;
     }
 
-    const zs = nameToSlice(zone_cut);
-    c.storeNegativeBare(zs.buf[0..zs.len], .ds, .in, .no_error, neg_ttl, .insecure);
+    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    c.storeNegativeBare(zone_cut.formatInto(&zone_buf), .ds, .in, .no_error, neg_ttl, .insecure);
 }
 
 /// Validate DNSKEY answers against cached DS records (RFC 4035 §5.2).
@@ -1908,13 +1888,6 @@ fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const d
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Return the formatted name as a slice into a stack buffer (no allocation).
-fn nameToSlice(name: dns.Name) struct { buf: [dns.max_name_len + 1]u8, len: usize } {
-    const buf = name.format();
-    const len = mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
-    return .{ .buf = buf, .len = len };
-}
-
 /// Strip authority/additional sections from a message for targeted cache stores.
 fn answersOnly(msg: dns.Message) dns.Message {
     var m = msg;
@@ -1934,8 +1907,8 @@ fn epochNowU32() u32 {
 }
 
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
-    const s = nameToSlice(name);
-    return allocator.dupe(u8, s.buf[0..s.len]);
+    var buf: [dns.max_name_len + 1]u8 = undefined;
+    return allocator.dupe(u8, name.formatInto(&buf));
 }
 
 fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord {
@@ -2105,18 +2078,15 @@ fn makeName(alloc: mem.Allocator, comptime labels: []const []const u8) !dns.Name
     return dns.Name{ .labels = l };
 }
 
-fn makeNsRr(alloc: mem.Allocator, zone: dns.Name, ns_name: dns.Name) !dns.ResourceRecord {
-    _ = alloc;
+fn makeNsRr(zone: dns.Name, ns_name: dns.Name) dns.ResourceRecord {
     return .{ .name = zone, .rtype = .ns, .rclass = .in, .ttl = 172800, .rdata = .{ .ns = ns_name } };
 }
 
-fn makeGlueA(alloc: mem.Allocator, name: dns.Name, addr: [4]u8) !dns.ResourceRecord {
-    _ = alloc;
+fn makeGlueA(name: dns.Name, addr: [4]u8) dns.ResourceRecord {
     return .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 172800, .rdata = .{ .a = addr } };
 }
 
-fn makeGlueAaaa(alloc: mem.Allocator, name: dns.Name, addr: [16]u8) !dns.ResourceRecord {
-    _ = alloc;
+fn makeGlueAaaa(name: dns.Name, addr: [16]u8) dns.ResourceRecord {
     return .{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 172800, .rdata = .{ .aaaa = addr } };
 }
 
@@ -2140,7 +2110,7 @@ test "extractReferral with NS and glue A records" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 192, 0, 2, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
@@ -2169,7 +2139,7 @@ test "extractReferral with NS but no glue returns no_glue" {
     const alloc = testing.allocator;
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2190,7 +2160,7 @@ test "extractReferral case-insensitive glue matching" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "NS1", "EXAMPLE", "COM" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 198, 51, 100, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 198, 51, 100, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2204,7 +2174,7 @@ test "extractReferral rejects private IP glue (DNS rebinding defense)" {
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     // Glue pointing to loopback — must be rejected
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 127, 0, 0, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2218,7 +2188,7 @@ test "extractReferral rejects out-of-zone glue" {
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "evil", "org" });
     // Glue for ns1.evil.org — out of bailiwick for parent zone "com"
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 6, 6, 6, 6 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 6, 6, 6, 6 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{"com"} }) orelse return error.TestUnexpectedResult;
@@ -2231,7 +2201,7 @@ test "extractReferral no_glue carries multiple NS names" {
     const ns2 = try makeName(alloc, &.{ "ns2", "other", "net" });
     const zone1 = try makeName(alloc, &.{ "example", "com" });
     const zone2 = try makeName(alloc, &.{ "example", "com" });
-    const response = try makeResponse(alloc, &.{ try makeNsRr(alloc, zone1, ns1), try makeNsRr(alloc, zone2, ns2) }, &.{});
+    const response = try makeResponse(alloc, &.{ makeNsRr(zone1, ns1), makeNsRr(zone2, ns2) }, &.{});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2249,7 +2219,7 @@ test "extractReferral accepts in-zone glue" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{"com"});
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 192, 0, 2, 53 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 53 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2263,7 +2233,7 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const ipv6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueAaaa(alloc, glue_name, ipv6)});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueAaaa(glue_name, ipv6)});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
@@ -2286,7 +2256,7 @@ test "extractReferral rejects same-zone NS as non-referral" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{try makeNsRr(alloc, zone_name, ns_name)}, &.{try makeGlueA(alloc, glue_name, .{ 192, 0, 2, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "api", "example", "com" } };

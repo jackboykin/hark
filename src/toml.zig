@@ -16,10 +16,6 @@ pub const Value = union(enum) {
 pub const Table = struct {
     map: std.StringHashMapUnmanaged(Value),
 
-    pub fn get(self: Table, key: []const u8) ?Value {
-        return self.map.get(key);
-    }
-
     pub fn getString(self: Table, key: []const u8) ?[]const u8 {
         const val = self.map.get(key) orelse return null;
         return switch (val) {
@@ -109,11 +105,9 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
     errdefer freeTable(allocator, &root);
 
     var current_section: ?[]const u8 = null;
-    var line_num: usize = 0;
     var lines = mem.splitScalar(u8, input, '\n');
 
     while (lines.next()) |raw_line| {
-        line_num += 1;
         const line = stripComment(mem.trim(u8, raw_line, &std.ascii.whitespace));
 
         if (line.len == 0) continue;

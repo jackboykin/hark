@@ -45,10 +45,6 @@ const ZoneNsecList = struct {
         return .{ .entries = entries, .len = 0, .soa = null };
     }
 
-    fn capacity(self: *const ZoneNsecList) usize {
-        return self.entries.len;
-    }
-
     fn deinit(self: *ZoneNsecList, alloc: Allocator) void {
         for (self.entries[0..self.len]) |*e| freeEntry(alloc, e);
         alloc.free(self.entries);
@@ -65,10 +61,10 @@ const ZoneNsecList = struct {
             return;
         }
 
-        if (self.len >= self.capacity()) {
+        if (self.len >= self.entries.len) {
             // Try expiring stale entries first; fall back to evicting oldest
             self.evictExpired(alloc, now);
-            if (self.len >= self.capacity()) {
+            if (self.len >= self.entries.len) {
                 _ = self.evictOldest(alloc);
             }
             // Re-find after compaction shifted entries
@@ -288,10 +284,8 @@ pub const NsecCache = struct {
         }
 
         // Format + lowercase zone key before lock (DNS is case-insensitive)
-        const zone_formatted = zone.format();
-        const zone_len = mem.indexOfScalar(u8, &zone_formatted, 0) orelse zone_formatted.len;
         var zone_lower_buf: [dns.max_name_len + 1]u8 = undefined;
-        const zone_lower = dns.lowerNameIntoBuf(zone_lower_buf[0..zone_len], zone_formatted[0..zone_len]);
+        const zone_lower = zone.formatLower(&zone_lower_buf);
 
         const now = self.now_fn();
         const alloc = self.counting.allocator();

@@ -77,21 +77,24 @@ pub const TlsTransport = struct {
         return data;
     }
 
+    /// Allocate a PooledConnection wired to `sock`. Caller must free via
+    /// `destroyBroken` / `closeAndDestroy` on any subsequent error.
+    fn newPooledConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
+        const conn = try self.allocator.create(PooledConnection);
+        const file = File{ .handle = sock, .flags = .{ .nonblocking = false } };
+        conn.sock = sock;
+        conn.last_used = 0;
+        conn.net_reader = File.Reader.initStreaming(file, self.io, &conn.net_read_buf);
+        conn.net_writer = File.Writer.initStreaming(file, self.io, &conn.net_write_buf);
+        return conn;
+    }
+
     /// Establish a blocking TCP connection, perform TLS handshake,
     /// and return a heap-allocated PooledConnection.
     fn connectAndHandshake(self: *TlsTransport, tls_server: na.Address) !*PooledConnection {
         const sock = try connectTcpBlocking(tls_server, self.config.connect_timeout_ms);
         errdefer sys.close(sock);
         sys.setSocketTimeouts(sock, self.config.response_timeout_ms);
-
-        const conn = try self.allocator.create(PooledConnection);
-        errdefer self.allocator.destroy(conn);
-
-        const file = File{ .handle = sock, .flags = .{ .nonblocking = false } };
-        conn.sock = sock;
-        conn.last_used = 0;
-        conn.net_reader = File.Reader.initStreaming(file, self.io, &conn.net_read_buf);
-        conn.net_writer = File.Writer.initStreaming(file, self.io, &conn.net_write_buf);
 
         // RFC 7858 strict mode: hostname verification is mandatory.
         if (self.config.strict and self.config.server_name == null) {
@@ -102,17 +105,14 @@ pub const TlsTransport = struct {
             return error.ServerNameRequired;
         }
 
+        const conn = try self.newPooledConnection(sock);
+        errdefer self.allocator.destroy(conn);
+
+        // After the guards above: either skip_verification is true, or
+        // server_name is non-null. The `.?` unwraps are infallible.
         conn.tls_client = VendoredTlsClient.init(&conn.net_reader.interface, &conn.net_writer.interface, .{
-            .host = if (self.config.skip_verification)
-                .no_verification
-            else if (self.config.server_name) |sn|
-                .{ .explicit = sn }
-            else
-                .no_verification,
-            .ca = if (self.config.skip_verification or self.config.server_name == null)
-                .no_verification
-            else
-                .{ .bundle = self.ca_bundle },
+            .host = if (self.config.skip_verification) .no_verification else .{ .explicit = self.config.server_name.? },
+            .ca = if (self.config.skip_verification) .no_verification else .{ .bundle = self.ca_bundle },
             .alpn = "dot", // RFC 9539 §4.4: DoT queries MUST use ALPN "dot"
             .read_buffer = &conn.tls_read_buf,
             .write_buffer = &conn.tls_write_buf,
@@ -152,14 +152,8 @@ pub const TlsTransport = struct {
     /// Allocate a PooledConnection from a connected socket and perform an
     /// opportunistic TLS handshake (ALPN "dot", no cert, no SNI).
     fn initOpportunisticConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
-        const conn = try self.allocator.create(PooledConnection);
+        const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
-
-        const file = File{ .handle = sock, .flags = .{ .nonblocking = false } };
-        conn.sock = sock;
-        conn.last_used = 0;
-        conn.net_reader = File.Reader.initStreaming(file, self.io, &conn.net_read_buf);
-        conn.net_writer = File.Writer.initStreaming(file, self.io, &conn.net_write_buf);
 
         // RFC 9539 §4.6.3.3: SHOULD NOT send SNI
         // RFC 9539 §4.6.3.4: MUST accept any certificate

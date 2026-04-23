@@ -51,10 +51,6 @@ const DedupKeyContext = struct {
 
 // ── In-flight table ────────────────────────────────────────────────────
 
-const EntryState = struct {
-    completed: bool = false,
-};
-
 pub const AcquireResult = enum { leader, follower };
 
 /// Followers sleep on `conditions[shard]` where shard = key-hash % this.
@@ -64,7 +60,7 @@ pub const AcquireResult = enum { leader, follower };
 const shard_count = 64;
 
 pub const InFlightTable = struct {
-    map: std.HashMapUnmanaged(DedupKey, EntryState, DedupKeyContext, 80),
+    map: std.HashMapUnmanaged(DedupKey, bool, DedupKeyContext, 80),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     conditions: [shard_count]std.Io.Condition = @splat(std.Io.Condition.init),
     io: std.Io,
@@ -110,8 +106,8 @@ pub const InFlightTable = struct {
             const monotonic = @import("monotonic.zig");
             const deadline = monotonic.nowNs() +| @as(i128, timeout_ns);
             const shard = shardOf(key);
-            while (self.map.get(key)) |entry| {
-                if (entry.completed) break;
+            while (self.map.get(key)) |completed| {
+                if (completed) break;
                 if (monotonic.nowNs() >= deadline) break;
                 self.conditions[shard].waitUncancelable(self.io, &self.mutex);
             }
@@ -119,7 +115,7 @@ pub const InFlightTable = struct {
         }
 
         // First request for this key — become leader.
-        self.map.put(self.allocator, key, .{}) catch return .leader;
+        self.map.put(self.allocator, key, false) catch return .leader;
         return .leader;
     }
 
@@ -131,8 +127,8 @@ pub const InFlightTable = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.map.getPtr(key)) |entry| {
-            entry.completed = true;
+        if (self.map.getPtr(key)) |completed| {
+            completed.* = true;
         }
         self.conditions[shardOf(key)].broadcast(self.io);
         // Remove entry so followers see null and break out, and future requests start fresh.

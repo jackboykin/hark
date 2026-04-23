@@ -180,22 +180,6 @@ pub fn dup(fd: posix.fd_t) !posix.fd_t {
     };
 }
 
-pub fn accept(fd: posix.fd_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t, flags: u32) !posix.fd_t {
-    const rc = linux.accept4(fd, addr, len, flags);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .AGAIN => error.WouldBlock,
-        .BADF, .NOTSOCK => unreachable,
-        .CONNABORTED => error.ConnectionAborted,
-        .INTR => error.Interrupted,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOMEM, .NOBUFS => error.SystemResources,
-        .PERM => error.PermissionDenied,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
 pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
     const rc = linux.fcntl(fd, cmd, arg);
     return switch (linux.errno(rc)) {

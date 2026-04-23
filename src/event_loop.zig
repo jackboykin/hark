@@ -50,7 +50,6 @@ pub const AcceptResult = struct {
 };
 
 pub const ReadResult = struct {
-    bytes_read: usize,
     data: []const u8,
     err: ?anyerror,
 };
@@ -434,25 +433,21 @@ pub const EventLoop = struct {
                     if (cqe.res > 0) {
                         const len: usize = @intCast(cqe.res);
                         completion.result = .{ .read = .{
-                            .bytes_read = len,
                             .data = slot.recv_buf[0..len],
                             .err = null,
                         } };
                     } else if (cqe.res == 0) {
                         completion.result = .{ .read = .{
-                            .bytes_read = 0,
                             .data = &.{},
                             .err = error.EndOfFile,
                         } };
                     } else if (isCancelled(cqe)) {
                         completion.result = .{ .read = .{
-                            .bytes_read = 0,
                             .data = &.{},
                             .err = error.Cancelled,
                         } };
                     } else {
                         completion.result = .{ .read = .{
-                            .bytes_read = 0,
                             .data = &.{},
                             .err = error.ReadFailed,
                         } };

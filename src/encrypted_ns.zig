@@ -36,7 +36,6 @@ pub const ServerStatus = enum {
 const NsEntry = struct {
     status: ServerStatus = .unknown,
     last_probe: i64 = 0,
-    failure_count: u8 = 0,
 };
 
 // ── Encrypted NS Cache ────────────────────────────────────────────────
@@ -98,7 +97,6 @@ pub const EncryptedNsCache = struct {
         self.entries.put(key, .{
             .status = .probing,
             .last_probe = now,
-            .failure_count = 0,
         }) catch return false;
 
         return true;
@@ -111,20 +109,16 @@ pub const EncryptedNsCache = struct {
         self.entries.put(key, .{
             .status = .capable,
             .last_probe = self.now_fn(),
-            .failure_count = 0,
         }) catch {};
     }
 
-    /// Mark a server as failed (probe failed). Increments failure_count.
+    /// Mark a server as failed (probe failed).
     pub fn markFailed(self: *EncryptedNsCache, key: AddressKey) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const existing = self.entries.get(key);
-        const count = if (existing) |e| e.failure_count else 0;
         self.entries.put(key, .{
             .status = .failed,
             .last_probe = self.now_fn(),
-            .failure_count = if (count < 255) count + 1 else 255,
         }) catch {};
     }
 

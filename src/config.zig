@@ -42,7 +42,6 @@ pub const ConfigError = error{
     InvalidListenAddress,
     InvalidUpstreamAddress,
     InvalidMode,
-    InvalidPort,
     InvalidValue,
     InvalidWorkerCount,
     InvalidQueryMemoryLimit,
@@ -85,6 +84,12 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
 
 // ── Parser ─────────────────────────────────────────────────────────────
 
+fn nonNegativeClamped(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
+    const v = table.getInteger(key) orelse return null;
+    if (v < 0) return error.InvalidValue;
+    return @intCast(@min(v, std.math.maxInt(T)));
+}
+
 pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
     var parsed = try toml.parse(allocator, contents);
     defer parsed.deinit();
@@ -126,45 +131,22 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
-        if (resolver.getInteger("query-memory-limit")) |q| {
-            if (q < 0) return error.InvalidValue;
-            const val: usize = @intCast(@min(q, std.math.maxInt(usize)));
+        if (try nonNegativeClamped(usize, resolver, "query-memory-limit")) |val| {
             if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
             cfg.query_memory_limit = val;
         }
-        if (resolver.getInteger("stagger-ms")) |s| {
-            if (s < 0) return error.InvalidValue;
-            cfg.stagger_ms = @intCast(@min(s, 1000));
-        }
+        if (try nonNegativeClamped(u32, resolver, "stagger-ms")) |v| cfg.stagger_ms = @min(v, 1000);
     }
 
     // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
-        if (cache.getInteger("size")) |s| {
-            if (s < 0) return error.InvalidValue;
-            cfg.cache_size = @intCast(@min(s, std.math.maxInt(usize)));
-        }
-        if (cache.getInteger("entries")) |e| {
-            if (e < 0) return error.InvalidValue;
-            cfg.cache_entries = @intCast(@min(e, std.math.maxInt(u32)));
-        }
-        if (cache.getInteger("key-cache-size")) |s| {
-            if (s < 0) return error.InvalidValue;
-            cfg.key_cache_size = @intCast(@min(s, std.math.maxInt(usize)));
-        }
-        if (cache.getInteger("key-cache-entries")) |e| {
-            if (e < 0) return error.InvalidValue;
-            cfg.key_cache_entries = @intCast(@min(e, std.math.maxInt(u32)));
-        }
+        if (try nonNegativeClamped(usize, cache, "size")) |v| cfg.cache_size = v;
+        if (try nonNegativeClamped(u32, cache, "entries")) |v| cfg.cache_entries = v;
+        if (try nonNegativeClamped(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
+        if (try nonNegativeClamped(u32, cache, "key-cache-entries")) |v| cfg.key_cache_entries = v;
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
-        if (cache.getInteger("serve-stale-ttl")) |s| {
-            if (s < 0) return error.InvalidValue;
-            cfg.serve_stale_ttl = @intCast(@min(s, std.math.maxInt(u32)));
-        }
-        if (cache.getInteger("min-ttl")) |m| {
-            if (m < 0) return error.InvalidValue;
-            cfg.min_ttl = @intCast(@min(m, std.math.maxInt(u32)));
-        }
+        if (try nonNegativeClamped(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
+        if (try nonNegativeClamped(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
     }
 
     // [logging] section

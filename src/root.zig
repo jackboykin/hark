@@ -1,6 +1,5 @@
 pub const dns = @import("dns.zig");
 pub const event_loop = @import("event_loop.zig");
-pub const transport = @import("transport.zig");
 pub const resolver = @import("resolver.zig");
 pub const recursive = @import("recursive.zig");
 pub const cache = @import("cache.zig");
@@ -26,7 +25,6 @@ pub const net_address = @import("net_address.zig");
 test {
     _ = dns;
     _ = event_loop;
-    _ = transport;
     _ = resolver;
     _ = recursive;
     _ = cache;

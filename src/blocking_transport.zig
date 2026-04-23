@@ -3,7 +3,7 @@ const posix = std.posix;
 const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
-const openUdpSocket = @import("transport.zig").openUdpSocket;
+const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
 const AddressKey = @import("connection_pool.zig").AddressKey;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
@@ -15,6 +15,27 @@ pub const Config = struct {
     timeout_ms: u32 = 5000,
     retransmit_count: u32 = 2,
 };
+
+/// Create a UDP socket bound to a random ephemeral port (RFC 5452).
+fn openUdpSocket(dest: na.Address, io: std.Io) !posix.fd_t {
+    const af: u32 = na.afU32(dest);
+    const sock = try sys.socket(af, posix.SOCK.DGRAM, 0);
+    errdefer sys.close(sock);
+
+    for (0..64) |_| {
+        const port = rand.ephemeralPort(io);
+        const addr = if (af == posix.AF.INET6)
+            na.initIp6(.{0} ** 16, port, 0, 0)
+        else
+            na.initIp4(.{ 0, 0, 0, 0 }, port);
+        na.bindTo(sock, &addr) catch |err| switch (err) {
+            error.AddressInUse => continue,
+            else => return err,
+        };
+        return sock;
+    }
+    return error.AddressInUse;
+}
 
 /// UDP transport using blocking sockets for thread-pool resolution.
 ///
@@ -173,7 +194,7 @@ pub const BlockingUdpTransport = struct {
         response_buf: []u8,
     ) !StaggeredResult {
         // Open and connect socket for server[0]
-        const sock0 = try self.openSocket(servers[0]);
+        const sock0 = try openUdpSocket(servers[0], self.io);
         defer sys.close(sock0);
         na.connectTo(sock0, &servers[0]) catch return error.Timeout;
         _ = sys.send(sock0, wire_queries[0], 0) catch return error.Timeout;
@@ -198,7 +219,7 @@ pub const BlockingUdpTransport = struct {
         const remaining_ns = deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return error.Timeout;
 
-        const sock1 = try self.openSocket(servers[1]);
+        const sock1 = try openUdpSocket(servers[1], self.io);
         defer sys.close(sock1);
         na.connectTo(sock1, &servers[1]) catch return error.Timeout;
         _ = sys.send(sock1, wire_queries[1], 0) catch return error.Timeout;
@@ -239,10 +260,6 @@ pub const BlockingUdpTransport = struct {
         const resp_id = mem.readInt(u16, response_buf[0..2], .big);
         if (resp_id != expected_id) return null;
         return n;
-    }
-
-    fn openSocket(self: *BlockingUdpTransport, dest: na.Address) !posix.fd_t {
-        return openUdpSocket(dest, self.io);
     }
 };
 

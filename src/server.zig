@@ -36,8 +36,7 @@ const monotonic = @import("monotonic.zig");
 
 const log = std.log.scoped(.server);
 
-const tcp_idle_timeout_ms: u32 = 5_000;
-const tcp_idle_timeout_ns: i128 = @as(i128, tcp_idle_timeout_ms) * 1_000_000;
+const tcp_idle_timeout_ns: i128 = 5_000 * std.time.ns_per_ms;
 const max_tcp_queries_per_conn: u32 = 128;
 
 const work_queue_capacity = 256;
@@ -124,10 +123,6 @@ const WorkQueue = struct {
         self.head = (self.head + 1) % work_queue_capacity;
         self.count -= 1;
         return item;
-    }
-
-    fn pushTcpClient(self: *WorkQueue, client_fd: posix.fd_t) bool {
-        return self.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), client_fd, .tcp);
     }
 
     fn signalShutdown(self: *WorkQueue) void {
@@ -306,7 +301,7 @@ pub const Server = struct {
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*t, i| {
-                t.* = std.Thread.spawn(.{}, workerThread, .{ self, listen_addrs }) catch |err| {
+                t.* = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), true }) catch |err| {
                     log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
                     // Signal shutdown to already-spawned threads
                     self.shutdown.store(true, .release);
@@ -358,10 +353,6 @@ pub const Server = struct {
         }
     }
 
-    fn workerThread(self: *Server, listen_addrs: []const na.Address) void {
-        self.runWorker(listen_addrs, -1, true);
-    }
-
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) void {
         // Per-thread EventLoop for server accept/recv
         const server_loop = EventLoop.create(self.allocator) catch |err| {
@@ -398,13 +389,9 @@ pub const Server = struct {
         }
 
         // Check at least one address succeeded
-        var any_ok = false;
-        for (0..listen_addrs.len) |i| {
-            if (udp_socks[i] >= 0) {
-                any_ok = true;
-                break;
-            }
-        }
+        const any_ok = for (udp_socks[0..listen_addrs.len]) |s| {
+            if (s >= 0) break true;
+        } else false;
         if (!any_ok) {
             log.err("worker failed to bind any listen address", .{});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
@@ -607,7 +594,7 @@ const WorkerState = struct {
                         switch (c.result) {
                             .accept => |acc| {
                                 if (acc.err == null and acc.fd >= 0) {
-                                    if (!self.queue.pushTcpClient(acc.fd)) {
+                                    if (!self.queue.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), acc.fd, .tcp)) {
                                         // Drop silently (no SERVFAIL): we haven't read the
                                         // query yet so we don't have an ID, and reading it
                                         // would consume the pool capacity we're protecting.
@@ -733,9 +720,8 @@ const WorkerState = struct {
             }
 
             const question = query.questions[0];
-            const name_buf = question.name.format();
-            const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
-            const name_str = name_buf[0..name_len];
+            var name_buf: [dns.max_name_len + 1]u8 = undefined;
+            const name_str = question.name.formatInto(&name_buf);
 
             const start_ns = monotonic.nowNs();
             const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, udp, tcp, tls) catch |err| {
@@ -756,12 +742,7 @@ const WorkerState = struct {
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
-            if (result.prefetch_name) |prefetch_name| {
-                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
-            }
-            if (result.prefetch_dnskey_zone) |zone| {
-                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
-            }
+            self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
         }
     }
 
@@ -809,11 +790,11 @@ const WorkerState = struct {
                 return result;
             },
             .forward => {
-                var resolver = ForwardingResolver.init(.{
+                var resolver = ForwardingResolver{
                     .transport = udp,
                     .tcp_transport = tcp,
                     .io = self.io,
-                });
+                };
                 const upstreams = if (self.config.upstreams.len > 0)
                     self.config.upstreams
                 else
@@ -915,9 +896,8 @@ const WorkerState = struct {
         }
 
         const question = query_msg.questions[0];
-        const name_buf = question.name.format();
-        const name_len = mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
-        const name_str = name_buf[0..name_len];
+        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        const name_str = question.name.formatInto(&name_buf);
 
         const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
@@ -939,6 +919,17 @@ const WorkerState = struct {
             sendUdpResponse(sock, wire, client_addr);
         }
 
+        self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
+    }
+
+    fn dispatchPrefetches(
+        self: *WorkerState,
+        result: recursive.RecursiveResolver.ResolveResult,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
+        tls: ?*TlsTransport,
+        prefetch_pta: *PerThreadArena,
+    ) void {
         if (result.prefetch_name) |prefetch_name| {
             self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
         }
@@ -1212,13 +1203,6 @@ fn isNonLoopback(a: na.Address) bool {
     }
 }
 
-fn setV6Only(sock: posix.fd_t, af: u32) !void {
-    if (af == posix.AF.INET6) {
-        const v6only: c_int = 1;
-        try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(v6only));
-    }
-}
-
 // ── Socket creation ────────────────────────────────────────────────────
 
 fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: bool) !posix.fd_t {
@@ -1226,7 +1210,10 @@ fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: 
     const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK, 0);
     errdefer sys.close(sock);
 
-    try setV6Only(sock, af);
+    if (af == posix.AF.INET6) {
+        const v6only: c_int = 1;
+        try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(v6only));
+    }
     const optval: c_int = 1;
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(optval));
     if (reuseport) {

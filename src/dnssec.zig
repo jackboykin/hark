@@ -365,6 +365,22 @@ pub fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) Ve
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
 
+/// Write the RRSIG header (everything except the signature) in canonical
+/// wire form. Used by both RRSIG verification (buildSignedData) and RRSIG
+/// canonical serialization (writeCanonicalRData).
+fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!usize {
+    if (buf.len < 18) return error.BufferTooSmall;
+    mem.writeInt(u16, buf[0..2], @intFromEnum(rrsig.type_covered), .big);
+    buf[2] = @intFromEnum(rrsig.algorithm);
+    buf[3] = rrsig.labels;
+    mem.writeInt(u32, buf[4..8], rrsig.original_ttl, .big);
+    mem.writeInt(u32, buf[8..12], rrsig.sig_expiration, .big);
+    mem.writeInt(u32, buf[12..16], rrsig.sig_inception, .big);
+    mem.writeInt(u16, buf[16..18], rrsig.key_tag, .big);
+    const name_len = writeCanonicalNameWire(buf[18..], rrsig.signer_name) catch return error.BufferTooSmall;
+    return 18 + name_len;
+}
+
 /// Build the signed data for RRSIG verification.
 /// Returns a slice of the buffer containing: RRSIG_RDATA(sans signature) || sorted_canonical_RRset
 pub fn buildSignedData(
@@ -372,26 +388,8 @@ pub fn buildSignedData(
     rrsig: dns.RrsigData,
     rrset: []const dns.ResourceRecord,
 ) error{BufferTooSmall}![]const u8 {
-    var pos: usize = 0;
-
     // 1. RRSIG RDATA fields (sans signature)
-    if (pos + 18 > buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[pos..][0..2], @intFromEnum(rrsig.type_covered), .big);
-    pos += 2;
-    buf[pos] = @intFromEnum(rrsig.algorithm);
-    pos += 1;
-    buf[pos] = rrsig.labels;
-    pos += 1;
-    mem.writeInt(u32, buf[pos..][0..4], rrsig.original_ttl, .big);
-    pos += 4;
-    mem.writeInt(u32, buf[pos..][0..4], rrsig.sig_expiration, .big);
-    pos += 4;
-    mem.writeInt(u32, buf[pos..][0..4], rrsig.sig_inception, .big);
-    pos += 4;
-    mem.writeInt(u16, buf[pos..][0..2], rrsig.key_tag, .big);
-    pos += 2;
-    const name_len = writeCanonicalNameWire(buf[pos..], rrsig.signer_name) catch return error.BufferTooSmall;
-    pos += name_len;
+    const pos: usize = try writeRrsigHeaderWire(buf, rrsig);
 
     // 2. Build canonical RRset entries, sorted by RDATA (RFC 4034 §6.3)
     // Each entry: canonical_owner_wire || type(2) || class(2) || original_ttl(4) || rdlength(2) || canonical_rdata
@@ -500,23 +498,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
             return pos;
         },
         .rrsig => |rrsig| {
-            var pos: usize = 0;
-            if (pos + 18 > buf.len) return error.BufferTooSmall;
-            mem.writeInt(u16, buf[pos..][0..2], @intFromEnum(rrsig.type_covered), .big);
-            pos += 2;
-            buf[pos] = @intFromEnum(rrsig.algorithm);
-            pos += 1;
-            buf[pos] = rrsig.labels;
-            pos += 1;
-            mem.writeInt(u32, buf[pos..][0..4], rrsig.original_ttl, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], rrsig.sig_expiration, .big);
-            pos += 4;
-            mem.writeInt(u32, buf[pos..][0..4], rrsig.sig_inception, .big);
-            pos += 4;
-            mem.writeInt(u16, buf[pos..][0..2], rrsig.key_tag, .big);
-            pos += 2;
-            pos += writeCanonicalNameWire(buf[pos..], rrsig.signer_name) catch return error.BufferTooSmall;
+            var pos: usize = try writeRrsigHeaderWire(buf, rrsig);
             if (pos + rrsig.signature.len > buf.len) return error.BufferTooSmall;
             @memcpy(buf[pos..][0..rrsig.signature.len], rrsig.signature);
             pos += rrsig.signature.len;

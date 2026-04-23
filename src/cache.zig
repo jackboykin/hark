@@ -179,44 +179,30 @@ pub fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
         .nsec => |nsec_data| blk: {
             const next_name = try cloneName(alloc, nsec_data.next_domain_name);
             errdefer dns.freeName(alloc, next_name);
-            const bitmaps = if (nsec_data.type_bit_maps.len > 0)
-                try alloc.dupe(u8, nsec_data.type_bit_maps)
-            else
-                @as([]const u8, &.{});
             break :blk .{ .nsec = .{
                 .next_domain_name = next_name,
-                .type_bit_maps = bitmaps,
+                .type_bit_maps = try dns.dupeOrEmpty(alloc, nsec_data.type_bit_maps),
             } };
         },
         .nsec3 => |nsec3| blk: {
-            const salt = if (nsec3.salt.len > 0)
-                try alloc.dupe(u8, nsec3.salt)
-            else
-                @as([]const u8, &.{});
-            errdefer if (salt.len > 0) alloc.free(salt);
-            const next_hash = try alloc.dupe(u8, nsec3.next_hashed_owner);
-            errdefer alloc.free(next_hash);
-            const bitmaps = if (nsec3.type_bit_maps.len > 0)
-                try alloc.dupe(u8, nsec3.type_bit_maps)
-            else
-                @as([]const u8, &.{});
+            const salt = try dns.dupeOrEmpty(alloc, nsec3.salt);
+            errdefer dns.freeIfOwned(alloc, salt);
+            const next_hash = try dns.dupeOrEmpty(alloc, nsec3.next_hashed_owner);
+            errdefer dns.freeIfOwned(alloc, next_hash);
             break :blk .{ .nsec3 = .{
                 .hash_algorithm = nsec3.hash_algorithm,
                 .flags = nsec3.flags,
                 .iterations = nsec3.iterations,
                 .salt = salt,
                 .next_hashed_owner = next_hash,
-                .type_bit_maps = bitmaps,
+                .type_bit_maps = try dns.dupeOrEmpty(alloc, nsec3.type_bit_maps),
             } };
         },
         .nsec3param => |nsec3p| .{ .nsec3param = .{
             .hash_algorithm = nsec3p.hash_algorithm,
             .flags = nsec3p.flags,
             .iterations = nsec3p.iterations,
-            .salt = if (nsec3p.salt.len > 0)
-                try alloc.dupe(u8, nsec3p.salt)
-            else
-                @as([]const u8, &.{}),
+            .salt = try dns.dupeOrEmpty(alloc, nsec3p.salt),
         } },
         .unknown => |data| .{ .unknown = try alloc.dupe(u8, data) },
     };
@@ -279,14 +265,6 @@ fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
 fn toLowerNameAlloc(alloc: Allocator, name: []const u8) ![]const u8 {
     const buf = try alloc.alloc(u8, name.len);
     return lowerInto(buf, name);
-}
-
-/// Convert a dns.Name to a lowercased dotted string, allocated.
-fn nameToLowerDotted(alloc: Allocator, name: dns.Name) ![]const u8 {
-    const fmt = name.format();
-    const len = mem.indexOfScalar(u8, &fmt, 0) orelse fmt.len;
-    const result = try alloc.alloc(u8, len);
-    return lowerInto(result, fmt[0..len]);
 }
 
 // ── RRsetCache ────────────────────────────────────────────────────────
@@ -539,11 +517,11 @@ pub const RRsetCache = struct {
         if (response.header.rcode != .no_error) return;
         if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
         defer if (self.rwlock) |*rw| rw.unlock(self.io);
-        self.storeRRsetsImpl(response.answers, authority_zone, true, status);
+        self.storeRRsetsImpl(response.answers, authority_zone, status);
         // Skip authority/additional from positive responses (CVE-2025-11411).
         if (response.answers.len == 0) {
-            self.storeRRsetsImpl(response.authorities, authority_zone, true, .unchecked);
-            self.storeRRsetsImpl(response.additionals, authority_zone, true, .unchecked);
+            self.storeRRsetsImpl(response.authorities, authority_zone, .unchecked);
+            self.storeRRsetsImpl(response.additionals, authority_zone, .unchecked);
         }
     }
 
@@ -694,7 +672,7 @@ pub const RRsetCache = struct {
         };
     }
 
-    fn storeRRsetsImpl(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, check_bailiwick: bool, status: SecurityStatus) void {
+    fn storeRRsetsImpl(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, status: SecurityStatus) void {
         if (records.len == 0) return;
         const alloc = self.counting.allocator();
 
@@ -706,9 +684,7 @@ pub const RRsetCache = struct {
         for (records) |rr| {
             // Skip records we shouldn't cache
             if (rr.ttl == 0) continue;
-            if (check_bailiwick and authority_zone.labels.len > 0) {
-                if (!rr.name.isSubdomainOf(authority_zone)) continue;
-            }
+            if (authority_zone.labels.len > 0 and !rr.name.isSubdomainOf(authority_zone)) continue;
 
             // Skip SOA in authority — these are for negative caching, handled separately
             if (rr.rtype == .soa) continue;
@@ -720,10 +696,8 @@ pub const RRsetCache = struct {
             if (self.skip_key_types and (rr.rtype == .dnskey or rr.rtype == .ds)) continue;
 
             // Check if we already processed this (name, type) group
-            const name_fmt = rr.name.format();
-            const name_len = mem.indexOfScalar(u8, &name_fmt, 0) orelse name_fmt.len;
             var lower_buf: [dns.max_name_len + 1]u8 = undefined;
-            const lower_name = lowerNameBuf(&lower_buf, name_fmt[0..name_len]) orelse continue;
+            const lower_name = rr.name.formatLower(&lower_buf);
             var nh = std.hash.Wyhash.init(0);
             nh.update(lower_name);
             const name_hash = nh.final();

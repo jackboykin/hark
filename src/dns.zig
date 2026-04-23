@@ -84,9 +84,6 @@ pub const RType = enum(u16) {
 
 pub const RClass = enum(u16) {
     in = 1,
-    cs = 2,
-    ch = 3,
-    hs = 4,
     _,
 };
 
@@ -195,6 +192,30 @@ pub const Name = struct {
         return buf;
     }
 
+    /// Format `self` into `buf` as a dotted string. Returns the written slice so
+    /// callers don't need to re-scan for the null terminator.
+    pub fn formatInto(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
+        var pos: usize = 0;
+        for (self.labels) |label| {
+            if (pos > 0) {
+                buf[pos] = '.';
+                pos += 1;
+            }
+            for (label) |byte| {
+                buf[pos] = if (byte >= 0x21 and byte <= 0x7e) byte else '?';
+                pos += 1;
+            }
+        }
+        return buf[0..pos];
+    }
+
+    /// Like `formatInto` but lowercased (DNS is case-insensitive).
+    pub fn formatLower(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
+        const dotted = self.formatInto(buf);
+        for (buf[0..dotted.len]) |*b| b.* = std.ascii.toLower(b.*);
+        return buf[0..dotted.len];
+    }
+
     pub fn eql(a: Name, b: Name) bool {
         if (a.labels.len != b.labels.len) return false;
         for (a.labels, b.labels) |la, lb| {
@@ -288,10 +309,6 @@ pub const DnskeyData = struct {
 
     pub fn isZoneKey(self: DnskeyData) bool {
         return (self.flags & 0x100) != 0; // bit 7 (ZONE flag)
-    }
-
-    pub fn isSecureEntryPoint(self: DnskeyData) bool {
-        return (self.flags & 0x0001) != 0; // bit 15 (SEP flag)
     }
 };
 
@@ -1169,10 +1186,9 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
             try ser.writeU16(12); // EDNS0 Padding option code (RFC 7830)
             try ser.writeU16(padding_len);
             // Write zero-filled padding
-            var i: u16 = 0;
-            while (i < padding_len) : (i += 1) {
-                try ser.writeU8(0);
-            }
+            try ser.ensureSpace(padding_len);
+            @memset(ser.buf[ser.pos..][0..padding_len], 0);
+            ser.pos += padding_len;
         }
     }
 
@@ -2085,6 +2101,19 @@ pub fn freeName(allocator: Allocator, name: Name) void {
     allocator.free(name.labels);
 }
 
+/// Free a slice that may be empty (parsed data can alias the wire buffer with
+/// zero-length slices that were never heap-allocated).
+pub fn freeIfOwned(allocator: Allocator, slice: []const u8) void {
+    if (slice.len > 0) allocator.free(slice);
+}
+
+/// Duplicate a slice, returning an unallocated empty slice for empty inputs.
+/// Mirrors `freeIfOwned` so clone/free symmetry is preserved.
+pub fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
+    if (slice.len == 0) return &.{};
+    return allocator.dupe(u8, slice);
+}
+
 pub fn freeRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa => {},
@@ -2102,26 +2131,20 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
         },
         .rrsig => |rrsig| {
             freeName(allocator, rrsig.signer_name);
-            if (rrsig.signature.len > 0) allocator.free(rrsig.signature);
+            freeIfOwned(allocator, rrsig.signature);
         },
-        .dnskey => |dnskey| {
-            if (dnskey.public_key.len > 0) allocator.free(dnskey.public_key);
-        },
-        .ds => |ds_data| {
-            if (ds_data.digest.len > 0) allocator.free(ds_data.digest);
-        },
+        .dnskey => |dnskey| freeIfOwned(allocator, dnskey.public_key),
+        .ds => |ds_data| freeIfOwned(allocator, ds_data.digest),
         .nsec => |nsec_data| {
             freeName(allocator, nsec_data.next_domain_name);
-            if (nsec_data.type_bit_maps.len > 0) allocator.free(nsec_data.type_bit_maps);
+            freeIfOwned(allocator, nsec_data.type_bit_maps);
         },
         .nsec3 => |nsec3| {
-            if (nsec3.salt.len > 0) allocator.free(nsec3.salt);
-            if (nsec3.next_hashed_owner.len > 0) allocator.free(nsec3.next_hashed_owner);
-            if (nsec3.type_bit_maps.len > 0) allocator.free(nsec3.type_bit_maps);
+            freeIfOwned(allocator, nsec3.salt);
+            freeIfOwned(allocator, nsec3.next_hashed_owner);
+            freeIfOwned(allocator, nsec3.type_bit_maps);
         },
-        .nsec3param => |nsec3p| {
-            if (nsec3p.salt.len > 0) allocator.free(nsec3p.salt);
-        },
+        .nsec3param => |nsec3p| freeIfOwned(allocator, nsec3p.salt),
         .unknown => |data| allocator.free(data),
     }
 }
@@ -2323,7 +2346,6 @@ test "DNSKEY record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u8, 3), dnskey.protocol);
     try testing.expectEqual(DnssecAlgorithm.rsasha256, dnskey.algorithm);
     try testing.expect(dnskey.isZoneKey());
-    try testing.expect(dnskey.isSecureEntryPoint());
     try testing.expectEqualSlices(u8, &key_data, dnskey.public_key);
 
     var rt_buf: [max_udp_payload]u8 = undefined;

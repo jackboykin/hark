@@ -263,12 +263,12 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver.init(.{
+        var resolver = ForwardingResolver{
             .transport = &t,
             .tcp_transport = &tcp_t,
             .tls_transport = if (dot_mode) &tls_t else null,
             .io = io,
-        });
+        };
         break :blk resolver.resolve(arena.allocator(), name, qtype, upstream_addr) catch |err| {
             log.err("query failed: {s}", .{@errorName(err)});
             std.process.exit(1);
