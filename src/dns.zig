@@ -469,6 +469,12 @@ pub const ResourceRecord = struct {
     rclass: RClass,
     ttl: u32,
     rdata: RData,
+    /// Pre-serialized wire bytes for the full RR (name + type + class + ttl +
+    /// rdlength + rdata). When set, the serializer memcpys these verbatim and
+    /// overwrites the 4 TTL bytes at `wire_ttl_offset` with `.ttl`. Populated
+    /// by the cache to skip per-field re-serialization on hit.
+    wire: ?[]const u8 = null,
+    wire_ttl_offset: u16 = 0,
 };
 
 // ── Message ────────────────────────────────────────────────────────────
@@ -1036,6 +1042,17 @@ pub const Serializer = struct {
     }
 
     pub fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
+        if (rr.wire) |blob| {
+            const start = self.pos;
+            try self.writeSlice(blob);
+            // Patch TTL: the stored blob carries a placeholder; response TTL is rr.ttl.
+            mem.writeInt(u32, self.buf[start + rr.wire_ttl_offset ..][0..4], rr.ttl, .big);
+            return;
+        }
+        try self.writeRecordFields(rr);
+    }
+
+    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name);
         try self.writeU16(@intFromEnum(rr.rtype));
         try self.writeU16(@intFromEnum(rr.rclass));
@@ -1133,6 +1150,34 @@ pub const Serializer = struct {
 pub fn patchQueryId(wire: []u8, id: u16) void {
     std.debug.assert(wire.len >= 2);
     std.mem.writeInt(u16, wire[0..2], id, .big);
+}
+
+pub const BuiltRR = struct {
+    bytes: []const u8,
+    /// Byte offset of the TTL's first byte within `bytes`.
+    ttl_offset: u16,
+};
+
+/// Serialize a single RR into `buf` using the field-by-field path (never the
+/// wire fast-path, even if `rr.wire` is set — this function builds blobs for
+/// the cache to store). Returns the bytes written and the TTL offset for
+/// later patching.
+pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
+    var ser = Serializer.init(buf);
+    try ser.writeName(rr.name);
+    try ser.writeU16(@intFromEnum(rr.rtype));
+    try ser.writeU16(@intFromEnum(rr.rclass));
+    const ttl_offset: u16 = try castOrRDataErr(u16, ser.pos);
+    try ser.writeU32(rr.ttl);
+
+    const rdlength_pos = ser.pos;
+    try ser.writeU16(0);
+    const rdata_start = ser.pos;
+    try ser.writeRData(rr.rdata);
+    const rdata_len = ser.pos - rdata_start;
+    mem.writeInt(u16, ser.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
+
+    return .{ .bytes = ser.buf[0..ser.pos], .ttl_offset = ttl_offset };
 }
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
@@ -1792,6 +1837,40 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
     try testing.expect(msg1.questions[0].name.eql(msg2.questions[0].name));
     try testing.expect(msg1.answers[0].name.eql(msg2.answers[0].name));
     try testing.expectEqualSlices(u8, &msg1.answers[0].rdata.a, &msg2.answers[0].rdata.a);
+}
+
+test "writeResourceRecord fast-path matches field path with TTL patch" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const name = try parseDottedName(a, "example.com");
+    const base = ResourceRecord{ .name = name, .rtype = .a, .rclass = .in, .ttl = 500, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+
+    // Pre-build the wire blob (stored in cache with placeholder TTL 500).
+    var stage: [128]u8 = undefined;
+    const built = try buildResourceRecordWire(&stage, base);
+
+    // Slow path with remaining TTL = 100.
+    var slow: [128]u8 = undefined;
+    var ser_slow = Serializer.init(&slow);
+    try ser_slow.writeResourceRecord(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 100, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
+
+    // Fast path: same RR but wire blob carries TTL=500, rr.ttl=100 triggers a patch.
+    var fast: [128]u8 = undefined;
+    var ser_fast = Serializer.init(&fast);
+    try ser_fast.writeResourceRecord(.{
+        .name = name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 100,
+        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
+        .wire = built.bytes,
+        .wire_ttl_offset = built.ttl_offset,
+    });
+
+    try testing.expectEqualSlices(u8, slow[0..ser_slow.pos], fast[0..ser_fast.pos]);
 }
 
 test "edge case: empty message (too short)" {

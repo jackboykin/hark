@@ -66,7 +66,17 @@ const CachedRecord = struct {
     rtype: dns.RType,
     rclass: dns.RClass,
     rdata: dns.RData,
+    /// Pre-serialized RR wire bytes (excludes compression). The TTL slot at
+    /// `wire_ttl_offset` is a placeholder — lookups patch it to the
+    /// remaining TTL on emit. Lets the response serializer memcpy instead
+    /// of walking per-field.
+    wire: []const u8,
+    wire_ttl_offset: u16,
 };
+
+/// Stack buffer size for staging a single RR's wire bytes at store time.
+/// Covers typical DNSKEY/RRSIG (<2KB). Oversized RRs are skipped for caching.
+const rr_wire_stage_len: usize = 4096;
 
 const CachedRRset = struct {
     records: []CachedRecord,
@@ -219,18 +229,32 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 /// the records alias one shared flat-allocated owner name (members of an
 /// RRset share owner, qtype, qclass), and the flat layout cannot be passed
 /// to `dns.freeName`. Today every caller uses a per-query arena.
+///
+/// Also duplicates each record's pre-serialized wire blob into a single
+/// contiguous arena buffer so the response serializer can memcpy+TTL-patch
+/// instead of re-walking each field.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     const records = try alloc.alloc(dns.ResourceRecord, cached.len);
     if (cached.len == 0) return records;
     const shared_name = try dns.cloneNameFlat(alloc, cached[0].name);
+
+    var total_wire: usize = 0;
+    for (cached) |cr| total_wire += cr.wire.len;
+    const wire_buf = try alloc.alloc(u8, total_wire);
+
+    var offset: usize = 0;
     for (cached, 0..) |cr, i| {
+        @memcpy(wire_buf[offset..][0..cr.wire.len], cr.wire);
         records[i] = .{
             .name = shared_name,
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
             .rdata = try cloneRData(alloc, cr.rdata),
+            .wire = wire_buf[offset..][0..cr.wire.len],
+            .wire_ttl_offset = cr.wire_ttl_offset,
         };
+        offset += cr.wire.len;
     }
     return records;
 }
@@ -243,12 +267,19 @@ fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.Res
         dns.freeName(alloc, cloned_name);
         return null;
     };
+    const cloned_wire = alloc.dupe(u8, s.wire) catch {
+        dns.freeName(alloc, cloned_name);
+        dns.freeRData(alloc, cloned_rdata);
+        return null;
+    };
     return dns.ResourceRecord{
         .name = cloned_name,
         .rtype = s.rtype,
         .rclass = s.rclass,
         .ttl = ttl,
         .rdata = cloned_rdata,
+        .wire = cloned_wire,
+        .wire_ttl_offset = s.wire_ttl_offset,
     };
 }
 
@@ -587,11 +618,26 @@ pub const RRsetCache = struct {
             alloc.free(key_name);
             return;
         };
+        var soa_wire_stage: [rr_wire_stage_len]u8 = undefined;
+        const soa_built = dns.buildResourceRecordWire(&soa_wire_stage, soa) catch {
+            dns.freeName(alloc, cached_soa_name);
+            dns.freeRData(alloc, cached_soa_rdata);
+            alloc.free(key_name);
+            return;
+        };
+        const cached_soa_wire = alloc.dupe(u8, soa_built.bytes) catch {
+            dns.freeName(alloc, cached_soa_name);
+            dns.freeRData(alloc, cached_soa_rdata);
+            alloc.free(key_name);
+            return;
+        };
         const cached_soa = CachedRecord{
             .name = cached_soa_name,
             .rtype = soa.rtype,
             .rclass = soa.rclass,
             .rdata = cached_soa_rdata,
+            .wire = cached_soa_wire,
+            .wire_ttl_offset = soa_built.ttl_offset,
         };
 
         self.evictIfNeeded();
@@ -608,6 +654,7 @@ pub const RRsetCache = struct {
         } }) catch {
             dns.freeName(alloc, cached_soa.name);
             dns.freeRData(alloc, cached_soa.rdata);
+            alloc.free(cached_soa.wire);
             alloc.free(key_name);
             return;
         };
@@ -754,8 +801,15 @@ pub const RRsetCache = struct {
             };
             var idx: usize = 0;
             for (match_buf[0..collect_count]) |other| {
-                const cloned_name = cloneName(alloc, other.name) catch break;
+                var wire_stage: [rr_wire_stage_len]u8 = undefined;
+                const built = dns.buildResourceRecordWire(&wire_stage, other) catch break;
+                const wire_owned = alloc.dupe(u8, built.bytes) catch break;
+                const cloned_name = cloneName(alloc, other.name) catch {
+                    alloc.free(wire_owned);
+                    break;
+                };
                 const cloned_rdata = cloneRData(alloc, other.rdata) catch {
+                    alloc.free(wire_owned);
                     dns.freeName(alloc, cloned_name);
                     break;
                 };
@@ -764,6 +818,8 @@ pub const RRsetCache = struct {
                     .rtype = other.rtype,
                     .rclass = other.rclass,
                     .rdata = cloned_rdata,
+                    .wire = wire_owned,
+                    .wire_ttl_offset = built.ttl_offset,
                 };
                 idx += 1;
             }
@@ -773,6 +829,7 @@ pub const RRsetCache = struct {
                 for (cached_records[0..idx]) |cr| {
                     dns.freeName(alloc, cr.name);
                     dns.freeRData(alloc, cr.rdata);
+                    alloc.free(cr.wire);
                 }
                 alloc.free(cached_records);
                 alloc.free(key_name);
@@ -793,6 +850,7 @@ pub const RRsetCache = struct {
                 for (cached_records) |cr| {
                     dns.freeName(alloc, cr.name);
                     dns.freeRData(alloc, cr.rdata);
+                    alloc.free(cr.wire);
                 }
                 alloc.free(cached_records);
                 alloc.free(key_name);
@@ -919,6 +977,7 @@ pub const RRsetCache = struct {
                 for (rrset.records) |cr| {
                     dns.freeName(alloc, cr.name);
                     dns.freeRData(alloc, cr.rdata);
+                    alloc.free(cr.wire);
                 }
                 alloc.free(rrset.records);
             },
@@ -926,6 +985,7 @@ pub const RRsetCache = struct {
                 if (neg.soa) |soa| {
                     dns.freeName(alloc, soa.name);
                     dns.freeRData(alloc, soa.rdata);
+                    alloc.free(soa.wire);
                 }
             },
         }
