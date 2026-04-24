@@ -696,6 +696,24 @@ pub const RRsetCache = struct {
         _ = self.negative_stores.fetchAdd(1, .monotonic);
     }
 
+    /// True if a non-expired positive entry exists for (name, rtype, rclass)
+    /// with a non-`.unchecked` security status (i.e., `.secure` or `.insecure`
+    /// — the entries RFC 9520 §3.4 considers trustworthy).
+    /// Takes the shared lock; safe to call without holding any other lock.
+    pub fn hasValidatedPositive(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+    ) bool {
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
+        const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        return self.hasProtectedPositive(key);
+    }
+
     // ── Internal ──────────────────────────────────────────────────────
 
     /// True if `key` has a non-expired validated positive entry (RFC 9520 §3.4).

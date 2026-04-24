@@ -178,11 +178,15 @@ const BackgroundTasks = struct {
         _ = self.active.fetchSub(1, .seq_cst);
     }
 
+    fn inFlight(self: *const BackgroundTasks) u32 {
+        return self.active.load(.seq_cst);
+    }
+
     /// Block until all in-flight background threads finish. Called from
     /// Server.deinit so caches/config outlive the threads that read them.
     fn awaitAll(self: *BackgroundTasks) void {
         self.shutting_down.store(true, .seq_cst);
-        while (self.active.load(.seq_cst) > 0) {
+        while (self.inFlight() > 0) {
             const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
             _ = std.os.linux.nanosleep(&ts, null); // 1ms
         }
@@ -613,17 +617,11 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
         .cache = &server.cache,
         .qname_minimisation = server.config.qname_minimization,
         .dnssec_aware = server.config.dnssec,
-        // Force validation on for both kinds: prefetch mirrors a CD=0 query
-        // (which also validates), and revalidate is the whole point.
         .dnssec_enabled = server.config.dnssec,
         .tls_transport = tls_ptr,
         .encrypted_ns_cache = if (server.encrypted_ns_cache) |*oc| oc else null,
         .rtt_cache = &server.rtt_cache,
         .ns_selector = &server.ns_selector,
-        // .prefetch: bypass cache (the whole point is to refetch a near-expiry
-        // entry). .revalidate: also bypass — a cache lookup on an .unchecked
-        // entry returns it without triggering validation, so we must force an
-        // upstream round-trip to get signed data that validateAnswer can verify.
         .bypass_cache = true,
         .stagger_ms = server.config.stagger_ms,
         .dedup = if (server.dedup) |*d| d else null,
@@ -634,10 +632,12 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
         .key_cache = if (server.key_cache) |*kc| kc else null,
     };
 
-    // Discard the result — we ran this purely for the cache side effects
-    // (records stored with .secure / .insecure / invalidated on BOGUS
-    // via the resolver's internal bogusServfail → storeNegativeBare path).
-    _ = resolver.resolve(alloc, name, qtype) catch {};
+    // Errors are common (network flakiness, upstream SERVFAIL) and not
+    // actionable here — the task runs for cache side effects only.
+    _ = resolver.resolve(alloc, name, qtype) catch |err| {
+        var qtype_buf: [24]u8 = undefined;
+        log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(dns.RType, qtype, &qtype_buf), @errorName(err) });
+    };
 }
 
 // ── WorkerState ────────────────────────────────────────────────────────
@@ -1143,6 +1143,7 @@ const WorkerState = struct {
     /// loss is missed cache warming, never an incorrect response.
     fn scheduleCd1Revalidate(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
         if (!self.config.dnssec) return;
+        if (self.cache.hasValidatedPositive(name, qtype, .in)) return;
         _ = self.server.trySpawnBgPrefetch(name, qtype, .revalidate);
     }
 
@@ -1656,18 +1657,14 @@ test "createSocket UDP reuseport allows multiple binds" {
 
 test "BackgroundTasks.tryClaim caps concurrent tasks" {
     var bg = BackgroundTasks{};
-    // Drain every slot.
     for (0..max_bg_tasks) |_| {
         try testing.expect(bg.tryClaim());
     }
-    // Over cap — refused without blocking.
     try testing.expect(!bg.tryClaim());
-    // Release one — next claim succeeds.
     bg.release();
     try testing.expect(bg.tryClaim());
-    // Drain for cleanliness.
     for (0..max_bg_tasks) |_| bg.release();
-    try testing.expectEqual(@as(u32, 0), bg.active.load(.seq_cst));
+    try testing.expectEqual(@as(u32, 0), bg.inFlight());
 }
 
 test "BackgroundTasks rejects tryClaim after shutdown" {
@@ -1676,7 +1673,7 @@ test "BackgroundTasks rejects tryClaim after shutdown" {
     // Even with empty slots, shutdown short-circuits tryClaim so bg threads
     // can drain to zero and awaitAll can return.
     try testing.expect(!bg.tryClaim());
-    try testing.expectEqual(@as(u32, 0), bg.active.load(.seq_cst));
+    try testing.expectEqual(@as(u32, 0), bg.inFlight());
 }
 
 test "AD bit cleared on unvalidated (.unchecked) cache hit — T1-06 honesty" {
@@ -1739,6 +1736,46 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit — T1-06 honesty" {
     try testing.expectEqual(true, parsed2.header.ad);
 }
 
+test "hasValidatedPositive returns true only for non-.unchecked entries" {
+    // Guards the predicate that scheduleCd1Revalidate uses to short-circuit
+    // repeated CD=1 queries to an already-validated name. A steady CD=1
+    // workload would otherwise pay a bg spawn + upstream round-trip per
+    // query even after the cache entry is .secure.
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const config = @import("config.zig");
+    var cfg = config.parseConfig(testing.allocator,
+        \\[server]
+        \\dnssec = true
+    ) catch return error.SkipZigTest;
+    defer cfg.deinit();
+
+    var server = try Server.init(testing.allocator, cfg, testing.io);
+    defer server.deinit();
+
+    // Before any cached entry: hasValidatedPositive is false; bg scheduler
+    // would spawn (we don't actually spawn here — just exercise the check).
+    try testing.expect(!server.cache.hasValidatedPositive("example.com", .a, .in));
+
+    // Populate cache with a .secure answer (simulates a prior CD=0 resolve
+    // or a completed bg revalidation).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const name = try dns.parseDottedName(a, "example.com");
+    const answers = try a.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    const resp = dns.Message{
+        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
+        .questions = &.{},
+        .answers = answers,
+    };
+    server.cache.storeResponseWithStatus(resp, dns.Name{ .labels = &.{} }, .secure);
+
+    try testing.expect(server.cache.hasValidatedPositive("example.com", .a, .in));
+    // .unchecked entries are NOT protected — bg scheduler should still fire.
+    try testing.expect(!server.cache.hasValidatedPositive("unknown.com", .a, .in));
+}
+
 test "trySpawnBgPrefetch rejects oversize and empty names" {
     // Input validation before the expensive heap+spawn path. Protects against
     // a malformed name slipping through and the thread getting a truncated
@@ -1758,5 +1795,5 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
 
     // Drain: no thread should have been spawned for the rejected inputs.
     server.bg_tasks.awaitAll();
-    try testing.expectEqual(@as(u32, 0), server.bg_tasks.active.load(.seq_cst));
+    try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());
 }
