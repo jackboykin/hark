@@ -1618,3 +1618,80 @@ test "cache stats tracking" {
     try testing.expectEqual(@as(u64, 1), cache.getStats().hits); // unchanged
     try testing.expectEqual(@as(u64, 2), cache.getStats().misses);
 }
+
+test "BOGUS invalidates .unchecked positive to SERVFAIL (T1-06 bg validation)" {
+    // When background CD=1 revalidation discovers BOGUS, recursive.zig's
+    // bogusServfail calls storeNegativeBare(SERVFAIL, ttl=1, .unchecked).
+    // An .unchecked positive entry must be overwritten by that negative
+    // entry so subsequent CD=0 queries hit SERVFAIL (RFC 4035 §5.5).
+    // A .secure positive is protected (RFC 9520 §3.4) and must survive.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "example", "com" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+
+    // Step 1: a CD=1 query populates the cache as .unchecked (the CD=1
+    // resolver skips inline validation per server.zig's dnssec_enabled gate).
+    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, .unchecked);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const r = cache.lookup(a, "example.com", .a, .in).?;
+        try testing.expectEqual(SecurityStatus.unchecked, r.hit.security_status);
+    }
+
+    // Step 2: bg validation finishes .bogus → bogusServfail path.
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
+
+    // Step 3: next CD=0 lookup must see the SERVFAIL negative, not the
+    // stale .unchecked positive (which would have returned answer bytes
+    // for bogus data).
+    {
+        const r = cache.lookup(a, "example.com", .a, .in).?;
+        switch (r) {
+            .hit => return error.TestExpectedNegative,
+            .negative => |n| try testing.expectEqual(dns.RCode.server_failure, n.rcode),
+        }
+    }
+}
+
+test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
+    // A previously .secure entry must not be dropped by a subsequent
+    // SERVFAIL store — hasProtectedPositive guards against downgrade by
+    // a stale/injected negative. This is the counterpart invariant to
+    // the preceding test: the bg-validation invalidation path only wins
+    // against .unchecked, never against already-validated data.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "example", "com" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+
+    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, .secure);
+
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const r = cache.lookup(arena.allocator(), "example.com", .a, .in).?;
+    switch (r) {
+        .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
+        .negative => return error.TestExpectedHitAfterProtection,
+    }
+}

@@ -119,6 +119,19 @@ pub const InFlightTable = struct {
         return .leader;
     }
 
+    /// Non-blocking: become the leader or bail. Unlike `acquireOrWait`, followers
+    /// are not enqueued — `false` means "someone else is handling this, skip."
+    /// Used by background tasks that have nothing to return to a follower
+    /// (prefetch, async validation).
+    pub fn tryAcquireLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) bool {
+        const key = DedupKey.init(name, qtype, flags) orelse return false;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.map.get(key)) |_| return false;
+        self.map.put(self.allocator, key, false) catch return false;
+        return true;
+    }
+
     /// Called by the leader when resolution is complete. Wakes all waiting followers
     /// and removes the entry so subsequent requests start fresh.
     pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) void {
@@ -242,4 +255,42 @@ test "different flags are independent" {
 
     table.releaseLeader("example.com", .a, 0);
     table.releaseLeader("example.com", .a, 1);
+}
+
+test "CD bit partitions dedup groups (regression: audit C-01)" {
+    // CD=0 and CD=1 must map to distinct dedup keys so they do not
+    // coalesce. RFC 6840 §5.9: CD=1 clients want data regardless of
+    // validation state, CD=0 clients want validation. Fusing them means
+    // one population gets the wrong semantics.
+    var table = InFlightTable.init(testing.allocator, testing.io);
+    defer table.deinit();
+
+    const cd0: u8 = 0;
+    const cd1: u8 = 1;
+
+    const leader_cd0 = table.acquireOrWait("example.com", .a, cd0);
+    try testing.expectEqual(.leader, leader_cd0);
+
+    // CD=1 for the same (name, qtype) must become its own leader, not wait.
+    const leader_cd1 = table.acquireOrWait("example.com", .a, cd1);
+    try testing.expectEqual(.leader, leader_cd1);
+
+    table.releaseLeader("example.com", .a, cd0);
+    table.releaseLeader("example.com", .a, cd1);
+    try testing.expectEqual(@as(u32, 0), table.map.count());
+}
+
+test "tryAcquireLeader coalesces without enqueueing followers" {
+    var table = InFlightTable.init(testing.allocator, testing.io);
+    defer table.deinit();
+
+    try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
+    // Second attempt returns false immediately (no wait), does not add an entry.
+    try testing.expect(!table.tryAcquireLeader("example.com", .dnskey, 0));
+    table.releaseLeader("example.com", .dnskey, 0);
+    try testing.expectEqual(@as(u32, 0), table.map.count());
+
+    // Freed — next claim succeeds again.
+    try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
+    table.releaseLeader("example.com", .dnskey, 0);
 }

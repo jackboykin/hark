@@ -144,6 +144,51 @@ const Ctx = struct {
 
 const max_listen_addrs = 8;
 
+// ── Background task bookkeeping ────────────────────────────────────────
+
+/// Cap concurrent background tasks (prefetch + CD=1 validation). Mirrors
+/// the pattern in encrypted_ns.EncryptedNsCache / tls_transport.probeInBackground:
+/// spawn detached threads with a CAS-loop cap, poll to drain on shutdown.
+/// DNSSEC cold-cache bursts previously deadlocked on over-fanout (audit
+/// T1-08), so the cap is conservative.
+const max_bg_tasks: u32 = 16;
+
+/// Dedup flag value for background CD=1 revalidation tasks. Distinct
+/// from CD=0 (flag=0) and CD=1-client (flag=1) so a client-facing query
+/// and a background revalidation of the same (name, qtype) don't coalesce.
+const bg_revalidate_flag: u8 = 2;
+
+const BackgroundTasks = struct {
+    active: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Reserve a slot for a new background thread. Returns false when the
+    /// cap is hit or we're shutting down — caller must fall back (run inline
+    /// or drop), never block here.
+    fn tryClaim(self: *BackgroundTasks) bool {
+        if (self.shutting_down.load(.seq_cst)) return false;
+        while (true) {
+            const cur = self.active.load(.seq_cst);
+            if (cur >= max_bg_tasks) return false;
+            if (self.active.cmpxchgStrong(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
+        }
+    }
+
+    fn release(self: *BackgroundTasks) void {
+        _ = self.active.fetchSub(1, .seq_cst);
+    }
+
+    /// Block until all in-flight background threads finish. Called from
+    /// Server.deinit so caches/config outlive the threads that read them.
+    fn awaitAll(self: *BackgroundTasks) void {
+        self.shutting_down.store(true, .seq_cst);
+        while (self.active.load(.seq_cst) > 0) {
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null); // 1ms
+        }
+    }
+};
+
 // ── Server ─────────────────────────────────────────────────────────────
 
 pub const Server = struct {
@@ -163,6 +208,7 @@ pub const Server = struct {
     worker_errors: std.atomic.Value(u32),
     udp_queue_drops: std.atomic.Value(u64),
     tcp_queue_drops: std.atomic.Value(u64),
+    bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         // Randomize hash seeds for cache and dedup tables (hash collision attack defense).
@@ -237,6 +283,9 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        // Drain detached prefetch/revalidate threads before freeing the
+        // caches/dedup/CA bundle they read.
+        self.bg_tasks.awaitAll();
         if (self.encrypted_ns_cache) |*oc| {
             oc.awaitProbes();
             oc.deinit();
@@ -410,6 +459,7 @@ pub const Server = struct {
 
         // Worker state
         var ws = WorkerState{
+            .server = self,
             .config = &self.config,
             .allocator = self.allocator,
             .io = self.io,
@@ -463,12 +513,138 @@ pub const Server = struct {
         // before the stack-allocated TlsTransport is destroyed.
         if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
     }
+
+    /// Attempt to hand off a prefetch or CD=1 revalidation to a detached
+    /// background thread. Returns true if spawned; false means the caller
+    /// should fall back (run inline or drop — caller's choice). The bg
+    /// thread owns the heap-allocated context and releases the bg_tasks
+    /// slot on exit.
+    fn trySpawnBgPrefetch(self: *Server, name: []const u8, qtype: dns.RType, kind: BgKind) bool {
+        if (name.len == 0 or name.len > dns.max_name_len + 1) return false;
+        if (!self.bg_tasks.tryClaim()) return false;
+
+        const ctx = self.allocator.create(BgPrefetchCtx) catch {
+            self.bg_tasks.release();
+            return false;
+        };
+        ctx.* = .{ .server = self, .qtype = qtype, .kind = kind, .name_len = @intCast(name.len) };
+        @memcpy(ctx.name_buf[0..name.len], name);
+
+        const thread = std.Thread.spawn(.{ .stack_size = 1 << 20 }, bgPrefetchThread, .{ctx}) catch {
+            self.allocator.destroy(ctx);
+            self.bg_tasks.release();
+            return false;
+        };
+        thread.detach();
+        return true;
+    }
 };
+
+const BgKind = enum {
+    /// Cache-refresh prefetch (near-expiry answer RRset or DNSKEY). Always
+    /// runs with `bypass_cache=true` and dnssec_enabled mirrors config —
+    /// semantically equivalent to a fresh CD=0 query.
+    prefetch,
+    /// CD=1 revalidation (audit T1-06). Re-resolve with dnssec_enabled=true
+    /// to upgrade the .unchecked cache entry to .secure (or invalidate on
+    /// BOGUS). Runs with `bypass_cache=true` so validation actually fires
+    /// — cache-hit on .unchecked records returns them without re-verifying,
+    /// so we pay the upstream round-trip to get signed data for validation.
+    revalidate,
+};
+
+const BgPrefetchCtx = struct {
+    server: *Server,
+    name_buf: [dns.max_name_len + 1]u8 = undefined,
+    name_len: u8 = 0,
+    qtype: dns.RType,
+    kind: BgKind,
+};
+
+fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
+    const server = ctx.server;
+    defer server.allocator.destroy(ctx);
+    defer server.bg_tasks.release();
+
+    const name = ctx.name_buf[0..ctx.name_len];
+    const qtype = ctx.qtype;
+
+    // Coalesce concurrent bg tasks for the same (name, qtype, kind). Without
+    // this, a burst of client queries that each detect near-expiry would
+    // fan out into N upstream refresh queries for the same name.
+    const dedup_flag: u8 = switch (ctx.kind) {
+        // .prefetch uses flag=0 (same bucket as CD=0 client queries) —
+        // if a real CD=0 resolve is already in flight for this name our
+        // bg task skips, avoiding a duplicate upstream fetch.
+        .prefetch => 0,
+        // .revalidate uses a distinct flag so it can coexist with an
+        // unrelated in-flight CD=0 or CD=1 client query for the same name.
+        .revalidate => bg_revalidate_flag,
+    };
+    const dedup_opt: ?*InFlightTable = if (server.dedup) |*d| d else null;
+    if (dedup_opt) |dedup| {
+        if (!dedup.tryAcquireLeader(name, qtype, dedup_flag)) return;
+    }
+    defer if (dedup_opt) |dedup| dedup.releaseLeader(name, qtype, dedup_flag);
+
+    // Fresh per-thread transports (mirrors the resolveNsAddressesFanout
+    // pattern). BG threads never reuse per-worker TCP pools — a rare
+    // refresh doesn't need amortized pooling.
+    var udp_t = BlockingUdpTransport.init(.{}, server.io);
+    defer udp_t.deinit();
+    var tcp_t = BlockingTcpTransport.init(.{});
+
+    var tls_t: ?TlsTransport = if (server.config.opportunistic) blk: {
+        var t = TlsTransport.init(server.allocator, .{}, server.ca_bundle, server.io);
+        if (server.enc_pool) |*pool| t.pool = pool;
+        break :blk t;
+    } else null;
+    const tls_ptr: ?*TlsTransport = if (tls_t) |*t| t else null;
+
+    var cap = CountingAllocator.init(server.allocator, server.config.query_memory_limit);
+    var arena = std.heap.ArenaAllocator.init(cap.allocator());
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var resolver = RecursiveResolver{
+        .transport = &udp_t,
+        .tcp_transport = &tcp_t,
+        .io = server.io,
+        .cache = &server.cache,
+        .qname_minimisation = server.config.qname_minimization,
+        .dnssec_aware = server.config.dnssec,
+        // Force validation on for both kinds: prefetch mirrors a CD=0 query
+        // (which also validates), and revalidate is the whole point.
+        .dnssec_enabled = server.config.dnssec,
+        .tls_transport = tls_ptr,
+        .encrypted_ns_cache = if (server.encrypted_ns_cache) |*oc| oc else null,
+        .rtt_cache = &server.rtt_cache,
+        .ns_selector = &server.ns_selector,
+        // .prefetch: bypass cache (the whole point is to refetch a near-expiry
+        // entry). .revalidate: also bypass — a cache lookup on an .unchecked
+        // entry returns it without triggering validation, so we must force an
+        // upstream round-trip to get signed data that validateAnswer can verify.
+        .bypass_cache = true,
+        .stagger_ms = server.config.stagger_ms,
+        .dedup = if (server.dedup) |*d| d else null,
+        .tcp_pool = null,
+        .gpa = server.allocator,
+        .query_memory_limit = server.config.query_memory_limit,
+        .nsec_cache = if (server.nsec_cache) |*nc| nc else null,
+        .key_cache = if (server.key_cache) |*kc| kc else null,
+    };
+
+    // Discard the result — we ran this purely for the cache side effects
+    // (records stored with .secure / .insecure / invalidated on BOGUS
+    // via the resolver's internal bogusServfail → storeNegativeBare path).
+    _ = resolver.resolve(alloc, name, qtype) catch {};
+}
 
 // ── WorkerState ────────────────────────────────────────────────────────
 // Per-thread state that handles the actual serve loop.
 
 const WorkerState = struct {
+    server: *Server,
     config: *const ServerConfig,
     allocator: mem.Allocator,
     io: Io,
@@ -743,6 +919,9 @@ const WorkerState = struct {
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
             self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
+            if (query.header.cd) {
+                self.scheduleCd1Revalidate(name_str, question.qtype);
+            }
         }
     }
 
@@ -920,6 +1099,15 @@ const WorkerState = struct {
         }
 
         self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
+
+        // T1-06: when a CD=1 client's fresh answer landed in the cache as
+        // .unchecked (the CD=1 resolver skips validation per RFC 6840 §5.9),
+        // schedule background validation so subsequent CD=0 lookups can
+        // hit .secure instead of re-resolving. Safe to call on cache hits
+        // too — bg thread dedups on (name, qtype, bg_revalidate_flag).
+        if (query_msg.header.cd) {
+            self.scheduleCd1Revalidate(name_str, question.qtype);
+        }
     }
 
     fn dispatchPrefetches(
@@ -930,12 +1118,32 @@ const WorkerState = struct {
         tls: ?*TlsTransport,
         prefetch_pta: *PerThreadArena,
     ) void {
+        // Try to hand each prefetch off to a background thread so the worker
+        // can pick up the next inbound query without waiting on DNSKEY / DS
+        // network I/O (audit T1-07). If the background cap is hit or the
+        // thread-spawn fails, fall back to running inline on the worker —
+        // matches the prior behavior, never drops the refresh.
         if (result.prefetch_name) |prefetch_name| {
-            self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
+            if (!self.server.trySpawnBgPrefetch(prefetch_name, result.prefetch_qtype, .prefetch)) {
+                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
+            }
         }
         if (result.prefetch_dnskey_zone) |zone| {
-            self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
+            if (!self.server.trySpawnBgPrefetch(zone, .dnskey, .prefetch)) {
+                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
+            }
         }
+    }
+
+    /// Schedule background DNSSEC validation for a cache entry populated by
+    /// a CD=1 query. The original response shipped to the client with AD=0
+    /// and the RRset is cached as .unchecked; background validation
+    /// promotes it to .secure (benefiting subsequent CD=0 lookups) or
+    /// invalidates on BOGUS. Silently drops on cap/spawn failure — the only
+    /// loss is missed cache warming, never an incorrect response.
+    fn scheduleCd1Revalidate(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
+        if (!self.config.dnssec) return;
+        _ = self.server.trySpawnBgPrefetch(name, qtype, .revalidate);
     }
 
     fn resolveWithDedupUsing(
@@ -1444,4 +1652,111 @@ test "createSocket UDP reuseport allows multiple binds" {
     const addr2 = na.initIp4(.{ 127, 0, 0, 1 }, port);
     const sock2 = createSocket(addr2, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
     defer sys.close(sock2);
+}
+
+test "BackgroundTasks.tryClaim caps concurrent tasks" {
+    var bg = BackgroundTasks{};
+    // Drain every slot.
+    for (0..max_bg_tasks) |_| {
+        try testing.expect(bg.tryClaim());
+    }
+    // Over cap — refused without blocking.
+    try testing.expect(!bg.tryClaim());
+    // Release one — next claim succeeds.
+    bg.release();
+    try testing.expect(bg.tryClaim());
+    // Drain for cleanliness.
+    for (0..max_bg_tasks) |_| bg.release();
+    try testing.expectEqual(@as(u32, 0), bg.active.load(.seq_cst));
+}
+
+test "BackgroundTasks rejects tryClaim after shutdown" {
+    var bg = BackgroundTasks{};
+    bg.shutting_down.store(true, .seq_cst);
+    // Even with empty slots, shutdown short-circuits tryClaim so bg threads
+    // can drain to zero and awaitAll can return.
+    try testing.expect(!bg.tryClaim());
+    try testing.expectEqual(@as(u32, 0), bg.active.load(.seq_cst));
+}
+
+test "AD bit cleared on unvalidated (.unchecked) cache hit — T1-06 honesty" {
+    // RFC 6840 §5.9 / RFC 4035 §3.2.2: AD MUST NOT be set unless the
+    // resolver verified. A cache entry stored as .unchecked (e.g. by the
+    // CD=1 early-serve path before background validation upgrades it)
+    // must not produce AD=1 responses to CD=0 clients.
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const questions = try a.alloc(dns.Question, 1);
+    questions[0] = .{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in };
+
+    // Simulate a cached-and-returned message where the resolver did NOT
+    // set ad=true (because security_status was .unchecked at lookup time —
+    // recursive.zig:182 computes `ad = h.security_status == .secure`).
+    const response_unchecked = dns.Message{
+        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .questions = &.{},
+    };
+
+    var buf: [dns.edns_udp_payload]u8 = undefined;
+    const wire = buildResponseWire(&buf, .{
+        .query_id = 1,
+        .rd = true,
+        .cd = false, // CD=0 client — asking us to validate
+        .questions = questions,
+        .client_edns = true,
+        .client_do = true, // DO=1 → client_wants_ad via fromQuery; exercise the AD-strip path
+        .client_wants_ad = true,
+        .max_payload = dns.edns_udp_payload,
+    }, response_unchecked, a).?;
+
+    const parsed = try dns.parseMessage(a, wire);
+    try testing.expectEqual(false, parsed.header.ad);
+
+    // Same message with validation-proven security_status=.secure would have
+    // response.header.ad == true upstream of buildResponseWire; confirm the
+    // path then emits AD=1.
+    const response_secure = dns.Message{
+        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = true, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .questions = &.{},
+    };
+    var buf2: [dns.edns_udp_payload]u8 = undefined;
+    const wire2 = buildResponseWire(&buf2, .{
+        .query_id = 2,
+        .rd = true,
+        .cd = false,
+        .questions = questions,
+        .client_edns = true,
+        .client_do = true,
+        .client_wants_ad = true,
+        .max_payload = dns.edns_udp_payload,
+    }, response_secure, a).?;
+    const parsed2 = try dns.parseMessage(a, wire2);
+    try testing.expectEqual(true, parsed2.header.ad);
+}
+
+test "trySpawnBgPrefetch rejects oversize and empty names" {
+    // Input validation before the expensive heap+spawn path. Protects against
+    // a malformed name slipping through and the thread getting a truncated
+    // or empty buffer.
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const config = @import("config.zig");
+    var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
+    defer cfg.deinit();
+
+    var server = try Server.init(testing.allocator, cfg, testing.io);
+    defer server.deinit();
+
+    try testing.expect(!server.trySpawnBgPrefetch("", .a, .prefetch));
+    var too_long: [dns.max_name_len + 2]u8 = undefined;
+    @memset(&too_long, 'a');
+    try testing.expect(!server.trySpawnBgPrefetch(&too_long, .a, .prefetch));
+
+    // Drain: no thread should have been spawned for the rejected inputs.
+    server.bg_tasks.awaitAll();
+    try testing.expectEqual(@as(u32, 0), server.bg_tasks.active.load(.seq_cst));
 }
