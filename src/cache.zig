@@ -1637,7 +1637,7 @@ test "cache stats tracking" {
     try testing.expectEqual(@as(u64, 2), cache.getStats().misses);
 }
 
-test "BOGUS invalidates .unchecked positive to SERVFAIL (T1-06 bg validation)" {
+test "BOGUS invalidates .unchecked positive to SERVFAIL" {
     // When background CD=1 revalidation discovers BOGUS, recursive.zig's
     // bogusServfail calls storeNegativeBare(SERVFAIL, ttl=1, .unchecked).
     // An .unchecked positive entry must be overwritten by that negative

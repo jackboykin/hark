@@ -257,7 +257,7 @@ test "different flags are independent" {
     table.releaseLeader("example.com", .a, 1);
 }
 
-test "CD bit partitions dedup groups (regression: audit C-01)" {
+test "CD bit partitions dedup groups" {
     // CD=0 and CD=1 must map to distinct dedup keys so they do not
     // coalesce. RFC 6840 §5.9: CD=1 clients want data regardless of
     // validation state, CD=0 clients want validation. Fusing them means

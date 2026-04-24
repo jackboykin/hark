@@ -149,8 +149,8 @@ const max_listen_addrs = 8;
 /// Cap concurrent background tasks (prefetch + CD=1 validation). Mirrors
 /// the pattern in encrypted_ns.EncryptedNsCache / tls_transport.probeInBackground:
 /// spawn detached threads with a CAS-loop cap, poll to drain on shutdown.
-/// DNSSEC cold-cache bursts previously deadlocked on over-fanout (audit
-/// T1-08), so the cap is conservative.
+/// Conservative cap — DNSSEC cold-cache bursts can otherwise deadlock on
+/// over-fanout.
 const max_bg_tasks: u32 = 16;
 
 /// Dedup flag value for background CD=1 revalidation tasks. Distinct
@@ -166,26 +166,26 @@ const BackgroundTasks = struct {
     /// cap is hit or we're shutting down — caller must fall back (run inline
     /// or drop), never block here.
     fn tryClaim(self: *BackgroundTasks) bool {
-        if (self.shutting_down.load(.seq_cst)) return false;
+        if (self.shutting_down.load(.acquire)) return false;
         while (true) {
-            const cur = self.active.load(.seq_cst);
+            const cur = self.active.load(.monotonic);
             if (cur >= max_bg_tasks) return false;
-            if (self.active.cmpxchgStrong(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
+            if (self.active.cmpxchgStrong(cur, cur + 1, .monotonic, .monotonic) == null) return true;
         }
     }
 
     fn release(self: *BackgroundTasks) void {
-        _ = self.active.fetchSub(1, .seq_cst);
+        _ = self.active.fetchSub(1, .release);
     }
 
     fn inFlight(self: *const BackgroundTasks) u32 {
-        return self.active.load(.seq_cst);
+        return self.active.load(.acquire);
     }
 
     /// Block until all in-flight background threads finish. Called from
     /// Server.deinit so caches/config outlive the threads that read them.
     fn awaitAll(self: *BackgroundTasks) void {
-        self.shutting_down.store(true, .seq_cst);
+        self.shutting_down.store(true, .release);
         while (self.inFlight() > 0) {
             const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
             _ = std.os.linux.nanosleep(&ts, null); // 1ms
@@ -549,7 +549,7 @@ const BgKind = enum {
     /// runs with `bypass_cache=true` and dnssec_enabled mirrors config —
     /// semantically equivalent to a fresh CD=0 query.
     prefetch,
-    /// CD=1 revalidation (audit T1-06). Re-resolve with dnssec_enabled=true
+    /// CD=1 revalidation. Re-resolve with dnssec_enabled=true
     /// to upgrade the .unchecked cache entry to .secure (or invalidate on
     /// BOGUS). Runs with `bypass_cache=true` so validation actually fires
     /// — cache-hit on .unchecked records returns them without re-verifying,
@@ -573,16 +573,10 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     const name = ctx.name_buf[0..ctx.name_len];
     const qtype = ctx.qtype;
 
-    // Coalesce concurrent bg tasks for the same (name, qtype, kind). Without
-    // this, a burst of client queries that each detect near-expiry would
-    // fan out into N upstream refresh queries for the same name.
+    // Coalesce bursts of near-expiry client queries that would otherwise
+    // fan out into N upstream refreshes for the same (name, qtype, kind).
     const dedup_flag: u8 = switch (ctx.kind) {
-        // .prefetch uses flag=0 (same bucket as CD=0 client queries) —
-        // if a real CD=0 resolve is already in flight for this name our
-        // bg task skips, avoiding a duplicate upstream fetch.
         .prefetch => 0,
-        // .revalidate uses a distinct flag so it can coexist with an
-        // unrelated in-flight CD=0 or CD=1 client query for the same name.
         .revalidate => bg_revalidate_flag,
     };
     const dedup_opt: ?*InFlightTable = if (server.dedup) |*d| d else null;
@@ -1100,11 +1094,6 @@ const WorkerState = struct {
 
         self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
 
-        // T1-06: when a CD=1 client's fresh answer landed in the cache as
-        // .unchecked (the CD=1 resolver skips validation per RFC 6840 §5.9),
-        // schedule background validation so subsequent CD=0 lookups can
-        // hit .secure instead of re-resolving. Safe to call on cache hits
-        // too — bg thread dedups on (name, qtype, bg_revalidate_flag).
         if (query_msg.header.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
         }
@@ -1118,11 +1107,9 @@ const WorkerState = struct {
         tls: ?*TlsTransport,
         prefetch_pta: *PerThreadArena,
     ) void {
-        // Try to hand each prefetch off to a background thread so the worker
-        // can pick up the next inbound query without waiting on DNSKEY / DS
-        // network I/O (audit T1-07). If the background cap is hit or the
-        // thread-spawn fails, fall back to running inline on the worker —
-        // matches the prior behavior, never drops the refresh.
+        // Hand prefetches to bg threads so the worker can take the next
+        // inbound query; on cap/spawn failure, fall back to inline on the
+        // worker — a refresh is never dropped.
         if (result.prefetch_name) |prefetch_name| {
             if (!self.server.trySpawnBgPrefetch(prefetch_name, result.prefetch_qtype, .prefetch)) {
                 self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
@@ -1669,14 +1656,14 @@ test "BackgroundTasks.tryClaim caps concurrent tasks" {
 
 test "BackgroundTasks rejects tryClaim after shutdown" {
     var bg = BackgroundTasks{};
-    bg.shutting_down.store(true, .seq_cst);
+    bg.shutting_down.store(true, .release);
     // Even with empty slots, shutdown short-circuits tryClaim so bg threads
     // can drain to zero and awaitAll can return.
     try testing.expect(!bg.tryClaim());
     try testing.expectEqual(@as(u32, 0), bg.inFlight());
 }
 
-test "AD bit cleared on unvalidated (.unchecked) cache hit — T1-06 honesty" {
+test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // RFC 6840 §5.9 / RFC 4035 §3.2.2: AD MUST NOT be set unless the
     // resolver verified. A cache entry stored as .unchecked (e.g. by the
     // CD=1 early-serve path before background validation upgrades it)

@@ -1540,13 +1540,12 @@ pub const RecursiveResolver = struct {
     fn resolveNsNameOne(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
-        ns_name: dns.Name,
+        ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!void {
-        const ns_dotted = try nameToDotted(allocator, ns_name);
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
             _ = appendAddressesFromRecords(r.message.answers, addrs, count);
         } else |err| {
@@ -1563,9 +1562,10 @@ pub const RecursiveResolver = struct {
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!bool {
+        const ns_dotted = try nameToDotted(allocator, ns_name);
         const before = count.*;
         for (address_rtypes) |qtype| {
-            try self.resolveNsNameOne(allocator, ns_name, qtype, depth, addrs, count);
+            try self.resolveNsNameOne(allocator, ns_dotted, qtype, depth, addrs, count);
         }
         return count.* > before;
     }
@@ -1610,6 +1610,14 @@ pub const RecursiveResolver = struct {
         const task_n = names_n * rtypes_n;
         std.debug.assert(task_n <= max_ns_parallel_tasks);
 
+        // Precompute dotted names once per NS name; the two rtype tasks for
+        // each name share the string. Safe to share across helpers because
+        // the caller-arena outlives the join.
+        var dotted_names: [max_ns_fetch_limit][]const u8 = undefined;
+        for (0..names_n) |ni| {
+            dotted_names[ni] = try nameToDotted(allocator, ns_names[ni]);
+        }
+
         var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
         var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
 
@@ -1621,7 +1629,7 @@ pub const RecursiveResolver = struct {
             const ri = i % rtypes_n;
             task_ctxs[i] = .{
                 .parent = self,
-                .ns_name = ns_names[ni],
+                .ns_dotted = dotted_names[ni],
                 .rtype = address_rtypes[ri],
                 .depth = depth,
             };
@@ -1640,7 +1648,7 @@ pub const RecursiveResolver = struct {
         var count: usize = 0;
 
         // Task 0 = (NS[0], A) on caller thread.
-        try self.resolveNsNameOne(allocator, ns_names[0], address_rtypes[0], depth, &addrs, &count);
+        try self.resolveNsNameOne(allocator, dotted_names[0], address_rtypes[0], depth, &addrs, &count);
 
         // Thread-spawn fallbacks: run the task on the caller so we don't drop
         // it. Reserved for fork/resource-limit conditions.
@@ -1648,7 +1656,7 @@ pub const RecursiveResolver = struct {
             if (threads[i] != null) continue;
             const ni = i / rtypes_n;
             const ri = i % rtypes_n;
-            try self.resolveNsNameOne(allocator, ns_names[ni], address_rtypes[ri], depth, &addrs, &count);
+            try self.resolveNsNameOne(allocator, dotted_names[ni], address_rtypes[ri], depth, &addrs, &count);
         }
 
         // Join helpers and merge their addresses. Null each slot after the
@@ -1670,14 +1678,14 @@ pub const RecursiveResolver = struct {
         return .{ .addrs = addrs, .count = count };
     }
 
-    /// Context for a helper thread resolving one (ns_name, rtype) pair.
-    /// `ns_name`'s labels reference the caller-arena buffer; safe because
+    /// Context for a helper thread resolving one (ns_dotted, rtype) pair.
+    /// `ns_dotted` references the caller arena; safe because
     /// `resolveNsAddressesFanout` joins all helpers before returning. The
     /// parent pointer is read once at start to clone shared state (caches,
     /// selectors) into a thread-local resolver; config is stable after init.
     const NsTaskCtx = struct {
         parent: *RecursiveResolver,
-        ns_name: dns.Name,
+        ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
         addrs: [max_servers_per_level]na.Address = undefined,
@@ -1696,7 +1704,7 @@ pub const RecursiveResolver = struct {
 
             resolver.resolveNsNameOne(
                 arena.allocator(),
-                ctx.ns_name,
+                ctx.ns_dotted,
                 ctx.rtype,
                 ctx.depth,
                 &ctx.addrs,

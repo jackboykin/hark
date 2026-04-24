@@ -178,9 +178,8 @@ pub const BlockingUdpTransport = struct {
         responding_idx: u8,
     };
 
-    /// Maximum parallel legs for `queryStaggered`. Bounds the stack-allocated
-    /// pollfd + socket arrays. Must be >= any caller's effective cap; the
-    /// resolver currently sizes itself smaller for headroom.
+    /// Bounds stack-allocated pollfd + socket arrays in `queryStaggered`.
+    /// Must be >= any caller's effective cap.
     pub const max_staggered_legs = 4;
 
     /// Race up to `max_staggered_legs` nameservers with staggered launches; take
