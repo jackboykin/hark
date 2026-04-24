@@ -469,10 +469,8 @@ pub const ResourceRecord = struct {
     rclass: RClass,
     ttl: u32,
     rdata: RData,
-    /// Pre-serialized wire bytes for the full RR (name + type + class + ttl +
-    /// rdlength + rdata). When set, the serializer memcpys these verbatim and
-    /// overwrites the 4 TTL bytes at `wire_ttl_offset` with `.ttl`. Populated
-    /// by the cache to skip per-field re-serialization on hit.
+    /// When set, serializer memcpys these bytes and patches the 4 TTL bytes
+    /// at `wire_ttl_offset` from `.ttl` — the blob's own TTL is a placeholder.
     wire: ?[]const u8 = null,
     wire_ttl_offset: u16 = 0,
 };
@@ -1045,28 +1043,29 @@ pub const Serializer = struct {
         if (rr.wire) |blob| {
             const start = self.pos;
             try self.writeSlice(blob);
-            // Patch TTL: the stored blob carries a placeholder; response TTL is rr.ttl.
             mem.writeInt(u32, self.buf[start + rr.wire_ttl_offset ..][0..4], rr.ttl, .big);
             return;
         }
-        try self.writeRecordFields(rr);
+        _ = try self.writeRecordFields(rr);
     }
 
-    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!void {
+    /// Serialize an RR via the field-by-field path (ignoring `rr.wire`).
+    /// Returns the byte offset of the TTL field, used by store-time callers
+    /// that want to patch TTL later.
+    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!u16 {
         try self.writeName(rr.name);
         try self.writeU16(@intFromEnum(rr.rtype));
         try self.writeU16(@intFromEnum(rr.rclass));
+        const ttl_offset: u16 = try castOrRDataErr(u16, self.pos);
         try self.writeU32(rr.ttl);
 
-        // Serialize rdata to a temporary position to measure length
         const rdlength_pos = self.pos;
         try self.writeU16(0); // placeholder
         const rdata_start = self.pos;
         try self.writeRData(rr.rdata);
         const rdata_len = self.pos - rdata_start;
-
-        // Patch rdlength
         mem.writeInt(u16, self.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
+        return ttl_offset;
     }
 
     pub fn writeRData(self: *Serializer, rdata: RData) Error!void {
@@ -1154,29 +1153,12 @@ pub fn patchQueryId(wire: []u8, id: u16) void {
 
 pub const BuiltRR = struct {
     bytes: []const u8,
-    /// Byte offset of the TTL's first byte within `bytes`.
     ttl_offset: u16,
 };
 
-/// Serialize a single RR into `buf` using the field-by-field path (never the
-/// wire fast-path, even if `rr.wire` is set — this function builds blobs for
-/// the cache to store). Returns the bytes written and the TTL offset for
-/// later patching.
 pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
     var ser = Serializer.init(buf);
-    try ser.writeName(rr.name);
-    try ser.writeU16(@intFromEnum(rr.rtype));
-    try ser.writeU16(@intFromEnum(rr.rclass));
-    const ttl_offset: u16 = try castOrRDataErr(u16, ser.pos);
-    try ser.writeU32(rr.ttl);
-
-    const rdlength_pos = ser.pos;
-    try ser.writeU16(0);
-    const rdata_start = ser.pos;
-    try ser.writeRData(rr.rdata);
-    const rdata_len = ser.pos - rdata_start;
-    mem.writeInt(u16, ser.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
-
+    const ttl_offset = try ser.writeRecordFields(rr);
     return .{ .bytes = ser.buf[0..ser.pos], .ttl_offset = ttl_offset };
 }
 

@@ -66,16 +66,18 @@ const CachedRecord = struct {
     rtype: dns.RType,
     rclass: dns.RClass,
     rdata: dns.RData,
-    /// Pre-serialized RR wire bytes (excludes compression). The TTL slot at
-    /// `wire_ttl_offset` is a placeholder — lookups patch it to the
-    /// remaining TTL on emit. Lets the response serializer memcpy instead
-    /// of walking per-field.
     wire: []const u8,
     wire_ttl_offset: u16,
 };
 
-/// Stack buffer size for staging a single RR's wire bytes at store time.
-/// Covers typical DNSKEY/RRSIG (<2KB). Oversized RRs are skipped for caching.
+fn freeCachedRecord(alloc: Allocator, cr: CachedRecord) void {
+    dns.freeName(alloc, cr.name);
+    dns.freeRData(alloc, cr.rdata);
+    alloc.free(cr.wire);
+}
+
+/// Stack staging buffer for serializing one RR at store time. Covers typical
+/// DNSKEY/RRSIG (<2KB) with headroom; oversized RRs fail to cache.
 const rr_wire_stage_len: usize = 4096;
 
 const CachedRRset = struct {
@@ -229,10 +231,6 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 /// the records alias one shared flat-allocated owner name (members of an
 /// RRset share owner, qtype, qclass), and the flat layout cannot be passed
 /// to `dns.freeName`. Today every caller uses a per-query arena.
-///
-/// Also duplicates each record's pre-serialized wire blob into a single
-/// contiguous arena buffer so the response serializer can memcpy+TTL-patch
-/// instead of re-walking each field.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     const records = try alloc.alloc(dns.ResourceRecord, cached.len);
     if (cached.len == 0) return records;
@@ -652,9 +650,7 @@ pub const RRsetCache = struct {
             .soa = cached_soa,
             .security_status = security_status,
         } }) catch {
-            dns.freeName(alloc, cached_soa.name);
-            dns.freeRData(alloc, cached_soa.rdata);
-            alloc.free(cached_soa.wire);
+            freeCachedRecord(alloc, cached_soa);
             alloc.free(key_name);
             return;
         };
@@ -826,11 +822,7 @@ pub const RRsetCache = struct {
 
             if (idx == 0 or idx < collect_count) {
                 // Partial clone failure — don't cache an incomplete RRset.
-                for (cached_records[0..idx]) |cr| {
-                    dns.freeName(alloc, cr.name);
-                    dns.freeRData(alloc, cr.rdata);
-                    alloc.free(cr.wire);
-                }
+                for (cached_records[0..idx]) |cr| freeCachedRecord(alloc, cr);
                 alloc.free(cached_records);
                 alloc.free(key_name);
                 continue;
@@ -847,11 +839,7 @@ pub const RRsetCache = struct {
                 .stored_at = now,
                 .security_status = status,
             } }) catch {
-                for (cached_records) |cr| {
-                    dns.freeName(alloc, cr.name);
-                    dns.freeRData(alloc, cr.rdata);
-                    alloc.free(cr.wire);
-                }
+                for (cached_records) |cr| freeCachedRecord(alloc, cr);
                 alloc.free(cached_records);
                 alloc.free(key_name);
                 continue;
@@ -974,19 +962,11 @@ pub const RRsetCache = struct {
     fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
         switch (entry) {
             .positive => |rrset| {
-                for (rrset.records) |cr| {
-                    dns.freeName(alloc, cr.name);
-                    dns.freeRData(alloc, cr.rdata);
-                    alloc.free(cr.wire);
-                }
+                for (rrset.records) |cr| freeCachedRecord(alloc, cr);
                 alloc.free(rrset.records);
             },
             .negative => |neg| {
-                if (neg.soa) |soa| {
-                    dns.freeName(alloc, soa.name);
-                    dns.freeRData(alloc, soa.rdata);
-                    alloc.free(soa.wire);
-                }
+                if (neg.soa) |soa| freeCachedRecord(alloc, soa);
             },
         }
     }
