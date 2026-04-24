@@ -766,26 +766,35 @@ pub const RecursiveResolver = struct {
         // Record liveness — truncated responses still prove server is alive
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
 
-        // TC bit: retry over TCP (RFC 2181 — ignore truncated data)
+        // RFC 2181 §9: TC-set UDP response must be retried over TCP.
         if (dns.hasTcBit(response_data)) {
-            if (self.tcp_transport) |tcp| {
-                const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-                const tcp_result = if (self.tcp_pool) |p|
-                    tcp.queryPooled(wire_query, server, tcp_buf, p)
-                else
-                    tcp.query(wire_query, server, tcp_buf);
-                if (tcp_result) |tcp_data| {
-                    const response = try tryParseMessage(allocator, tcp_data) orelse return null;
-                    if (!response.header.qr) return null;
-                    return response;
-                } else |err| {
-                    log.warn("TCP fallback failed: {s}", .{@errorName(err)});
-                }
-            }
-            return null;
+            return self.tcpFallback(allocator, wire_query, server);
         }
 
         const response = try tryParseMessage(allocator, response_data) orelse return null;
+        if (!response.header.qr) return null;
+        return response;
+    }
+
+    /// Issue the query over TCP (pooled if available). Returns null if TCP
+    /// isn't configured, the request fails, or the response is malformed.
+    /// Caller is responsible for question-match validation when needed.
+    fn tcpFallback(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        wire_query: []const u8,
+        server: na.Address,
+    ) error{OutOfMemory}!?dns.Message {
+        const tcp = self.tcp_transport orelse return null;
+        const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
+        const tcp_data = (if (self.tcp_pool) |p|
+            tcp.queryPooled(wire_query, server, tcp_buf, p)
+        else
+            tcp.query(wire_query, server, tcp_buf)) catch |err| {
+            log.warn("TCP fallback failed: {s}", .{@errorName(err)});
+            return null;
+        };
+        const response = try tryParseMessage(allocator, tcp_data) orelse return null;
         if (!response.header.qr) return null;
         return response;
     }
@@ -888,27 +897,13 @@ pub const RecursiveResolver = struct {
         // RFC 2181 §9: TC-set response cannot be used. Retry the winning
         // server over TCP immediately; falling through to the sequential loop
         // would re-query servers that already lost the race (wasted UDP RTTs).
-        if (dns.hasTcBit(stag_result.response_data)) {
-            if (self.tcp_transport) |tcp| {
-                const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-                const tcp_result = if (self.tcp_pool) |p|
-                    tcp.queryPooled(wires[winner], responding_addr, tcp_buf, p)
-                else
-                    tcp.query(wires[winner], responding_addr, tcp_buf);
-                if (tcp_result) |tcp_data| {
-                    const resp = try tryParseMessage(allocator, tcp_data) orelse return null;
-                    dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
-                    return .{ .message = resp, .server = responding_addr };
-                } else |err| {
-                    log.warn("TCP fallback (staggered TC) failed: {s}", .{@errorName(err)});
-                }
-            }
-            return null;
-        }
+        const resp = if (dns.hasTcBit(stag_result.response_data))
+            try self.tcpFallback(allocator, wires[winner], responding_addr) orelse return null
+        else
+            try tryParseMessage(allocator, stag_result.response_data) orelse return null;
 
-        const resp = try tryParseMessage(allocator, stag_result.response_data) orelse return null;
-        // RFC 5452 §9.1 / RFC 9619: reject responses whose question doesn't
-        // echo the query. Sequential path does the same at queryAuthoritativeServers.
+        // RFC 5452 §9.1 / RFC 9619: reject responses whose question doesn't echo
+        // the query. (The sequential path enforces this via queryAuthoritativeServers.)
         dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
 
         return .{ .message = resp, .server = responding_addr };
@@ -1540,7 +1535,26 @@ pub const RecursiveResolver = struct {
         return added;
     }
 
-    /// Resolve A + AAAA for a single NS name, appending addresses to addrs[count..].
+    /// Resolve one (ns_name, rtype) pair and append any resulting addresses
+    /// to `addrs[count..]`. Non-OOM resolution failures are swallowed.
+    fn resolveNsNameOne(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        ns_name: dns.Name,
+        rtype: dns.RType,
+        depth: usize,
+        addrs: *[max_servers_per_level]na.Address,
+        count: *usize,
+    ) error{OutOfMemory}!void {
+        const ns_dotted = try nameToDotted(allocator, ns_name);
+        if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
+            _ = appendAddressesFromRecords(r.message.answers, addrs, count);
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+        }
+    }
+
+    /// Resolve A + AAAA for a single NS name serially.
     fn resolveNsName(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1549,19 +1563,11 @@ pub const RecursiveResolver = struct {
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!bool {
-        const ns_dotted = nameToDotted(allocator, ns_name) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return false;
-        };
-        var found = false;
+        const before = count.*;
         for (address_rtypes) |qtype| {
-            if (self.resolveImpl(allocator, ns_dotted, qtype, depth + 1)) |r| {
-                if (appendAddressesFromRecords(r.message.answers, addrs, count)) found = true;
-            } else |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-            }
+            try self.resolveNsNameOne(allocator, ns_name, qtype, depth, addrs, count);
         }
-        return found;
+        return count.* > before;
     }
 
     fn resolveNsAddressesSerial(
@@ -1634,12 +1640,7 @@ pub const RecursiveResolver = struct {
         var count: usize = 0;
 
         // Task 0 = (NS[0], A) on caller thread.
-        const ns0_dotted = try nameToDotted(allocator, ns_names[0]);
-        if (self.resolveImpl(allocator, ns0_dotted, address_rtypes[0], depth + 1)) |r| {
-            _ = appendAddressesFromRecords(r.message.answers, &addrs, &count);
-        } else |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-        }
+        try self.resolveNsNameOne(allocator, ns_names[0], address_rtypes[0], depth, &addrs, &count);
 
         // Thread-spawn fallbacks: run the task on the caller so we don't drop
         // it. Reserved for fork/resource-limit conditions.
@@ -1647,15 +1648,11 @@ pub const RecursiveResolver = struct {
             if (threads[i] != null) continue;
             const ni = i / rtypes_n;
             const ri = i % rtypes_n;
-            const nsd = try nameToDotted(allocator, ns_names[ni]);
-            if (self.resolveImpl(allocator, nsd, address_rtypes[ri], depth + 1)) |r| {
-                _ = appendAddressesFromRecords(r.message.answers, &addrs, &count);
-            } else |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-            }
+            try self.resolveNsNameOne(allocator, ns_names[ni], address_rtypes[ri], depth, &addrs, &count);
         }
 
-        // Join helpers and merge their addresses.
+        // Join helpers and merge their addresses. Null each slot after the
+        // join so the deferred cleanup loop at the top doesn't double-join.
         for (1..task_n) |i| {
             const t = threads[i] orelse continue;
             t.join();
@@ -1696,17 +1693,17 @@ pub const RecursiveResolver = struct {
             var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
             var arena = std.heap.ArenaAllocator.init(cap.allocator());
             defer arena.deinit();
-            const a = arena.allocator();
 
-            const ns_dotted = nameToDotted(a, ctx.ns_name) catch {
+            resolver.resolveNsNameOne(
+                arena.allocator(),
+                ctx.ns_name,
+                ctx.rtype,
+                ctx.depth,
+                &ctx.addrs,
+                &ctx.count,
+            ) catch {
                 ctx.oom = true;
-                return;
             };
-            if (resolver.resolveImpl(a, ns_dotted, ctx.rtype, ctx.depth + 1)) |r| {
-                _ = appendAddressesFromRecords(r.message.answers, &ctx.addrs, &ctx.count);
-            } else |err| {
-                if (err == error.OutOfMemory) ctx.oom = true;
-            }
         }
     };
 
