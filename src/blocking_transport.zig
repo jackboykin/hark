@@ -178,78 +178,102 @@ pub const BlockingUdpTransport = struct {
         responding_idx: u8,
     };
 
-    /// Send a query to two nameservers with staggered timing, take first valid response.
-    /// Each leg uses a connected UDP socket with unique source port (RFC 5452 §9.1).
-    /// Only races queries to different server IPs — birthday attack surface is not amplified
-    /// because each leg targets a different destination.
-    /// `response_buf` must outlive every slice the caller holds from the
-    /// returned response (see queryWithTimeout).
+    /// Maximum parallel legs for `queryStaggered`. Bounds the stack-allocated
+    /// pollfd + socket arrays. Keep in sync with the resolver's cap (itself
+    /// bounded by ns_fetch_limit).
+    pub const max_staggered_legs = 4;
+
+    /// Race up to `max_staggered_legs` nameservers with staggered launches; take
+    /// the first valid response. Each leg uses a connected UDP socket with a
+    /// unique random source port (RFC 5452 §9.1). Callers must supply distinct
+    /// destination IPs per leg — racing the same IP would not amplify birthday
+    /// entropy beyond a single query.
+    ///
+    /// `wire_queries`, `query_ids`, and `servers` must be the same length
+    /// (2..`max_staggered_legs`), one entry per leg. Leg 0 launches immediately;
+    /// leg `i` launches at `query_start + i*stagger_ms` if no earlier leg has
+    /// responded by then. `response_buf` must outlive every slice the caller
+    /// holds from the returned response (see queryWithTimeout).
     pub fn queryStaggered(
         self: *BlockingUdpTransport,
-        wire_queries: [2][]const u8,
-        query_ids: [2]u16,
-        servers: [2]na.Address,
+        wire_queries: []const []const u8,
+        query_ids: []const u16,
+        servers: []const na.Address,
         stagger_ms: u32,
         overall_timeout_ms: u32,
         response_buf: []u8,
     ) !StaggeredResult {
-        // Open and connect socket for server[0]
-        const sock0 = try openUdpSocket(servers[0], self.io);
-        defer sys.close(sock0);
-        na.connectTo(sock0, &servers[0]) catch return error.Timeout;
-        _ = sys.send(sock0, wire_queries[0], 0) catch return error.Timeout;
+        const leg_n = servers.len;
+        std.debug.assert(leg_n >= 2 and leg_n <= max_staggered_legs);
+        std.debug.assert(leg_n == wire_queries.len and leg_n == query_ids.len);
+
+        var socks: [max_staggered_legs]posix.fd_t = undefined;
+        var sock_count: usize = 0;
+        defer for (socks[0..sock_count]) |fd| sys.close(fd);
 
         const deadline_ns = monotonic.nowNs() + @as(i128, overall_timeout_ms) * 1_000_000;
+        const stagger_ns: i128 = @as(i128, stagger_ms) * 1_000_000;
 
-        // Phase 1: wait stagger_ms for server[0]
-        {
-            const wait_ms: i32 = @intCast(@min(stagger_ms, overall_timeout_ms));
-            var polls = [1]posix.pollfd{.{ .fd = sock0, .events = posix.POLL.IN, .revents = 0 }};
-            const n = posix.poll(&polls, wait_ms) catch 0;
-            if (n > 0) {
-                if (polls[0].revents & posix.POLL.IN != 0) {
-                    if (tryRecv(sock0, query_ids[0], response_buf)) |len| {
-                        return .{ .response_data = response_buf[0..len], .responding_idx = 0 };
+        // Launch leg 0 synchronously so the caller sees connect/send errors
+        // immediately rather than spinning in the poll loop.
+        const s0 = try openUdpSocket(servers[0], self.io);
+        socks[0] = s0;
+        sock_count = 1;
+        na.connectTo(s0, &servers[0]) catch return error.Timeout;
+        _ = sys.send(s0, wire_queries[0], 0) catch return error.Timeout;
+        var next_launch_ns: i128 = monotonic.nowNs() + stagger_ns;
+
+        while (true) {
+            const now_ns = monotonic.nowNs();
+            if (now_ns >= deadline_ns) return error.Timeout;
+
+            // Fire any legs whose stagger interval has elapsed.
+            while (sock_count < leg_n and now_ns >= next_launch_ns) {
+                const idx = sock_count;
+                const fd = openUdpSocket(servers[idx], self.io) catch {
+                    // Out of ephemeral ports / fd budget: stop trying to fan
+                    // out, keep polling the legs already in flight.
+                    next_launch_ns = deadline_ns;
+                    break;
+                };
+                socks[idx] = fd;
+                sock_count += 1;
+                na.connectTo(fd, &servers[idx]) catch {
+                    next_launch_ns = deadline_ns;
+                    break;
+                };
+                _ = sys.send(fd, wire_queries[idx], 0) catch {
+                    next_launch_ns = deadline_ns;
+                    break;
+                };
+                next_launch_ns = monotonic.nowNs() + stagger_ns;
+            }
+
+            // Poll until the deadline or the next scheduled launch, whichever
+            // comes first.
+            const wait_until_ns = if (sock_count < leg_n)
+                @min(deadline_ns, next_launch_ns)
+            else
+                deadline_ns;
+            const wait_ns = wait_until_ns - monotonic.nowNs();
+            if (wait_ns <= 0) continue;
+            const wait_ms: i32 = @intCast(@min(@divFloor(wait_ns, 1_000_000), std.math.maxInt(i32)));
+
+            var polls: [max_staggered_legs]posix.pollfd = undefined;
+            for (0..sock_count) |i| {
+                polls[i] = .{ .fd = socks[i], .events = posix.POLL.IN, .revents = 0 };
+            }
+            const n = posix.poll(polls[0..sock_count], wait_ms) catch 0;
+            if (n == 0) continue; // next launch fires, or overall deadline expires
+
+            for (0..sock_count) |i| {
+                if (polls[i].revents & posix.POLL.IN != 0) {
+                    if (tryRecv(socks[i], query_ids[i], response_buf)) |len| {
+                        return .{ .response_data = response_buf[0..len], .responding_idx = @intCast(i) };
                     }
                 }
             }
-        }
-
-        // Phase 2: server[0] didn't respond in stagger window — also query server[1]
-        const remaining_ns = deadline_ns - monotonic.nowNs();
-        if (remaining_ns <= 0) return error.Timeout;
-
-        const sock1 = try openUdpSocket(servers[1], self.io);
-        defer sys.close(sock1);
-        na.connectTo(sock1, &servers[1]) catch return error.Timeout;
-        _ = sys.send(sock1, wire_queries[1], 0) catch return error.Timeout;
-
-        // Phase 3: poll both sockets for remaining time
-        while (true) {
-            const remain_ns = deadline_ns - monotonic.nowNs();
-            if (remain_ns <= 0) return error.Timeout;
-            const remain_ms: i32 = @intCast(@min(@divFloor(remain_ns, 1_000_000), std.math.maxInt(i32)));
-            if (remain_ms <= 0) return error.Timeout;
-
-            var polls = [2]posix.pollfd{
-                .{ .fd = sock0, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = sock1, .events = posix.POLL.IN, .revents = 0 },
-            };
-            const n = posix.poll(&polls, remain_ms) catch return error.Timeout;
-            if (n == 0) return error.Timeout;
-
-            // Check both — prefer whichever has data
-            if (polls[0].revents & posix.POLL.IN != 0) {
-                if (tryRecv(sock0, query_ids[0], response_buf)) |len| {
-                    return .{ .response_data = response_buf[0..len], .responding_idx = 0 };
-                }
-            }
-            if (polls[1].revents & posix.POLL.IN != 0) {
-                if (tryRecv(sock1, query_ids[1], response_buf)) |len| {
-                    return .{ .response_data = response_buf[0..len], .responding_idx = 1 };
-                }
-            }
-            // POLLERR/POLLHUP — keep polling until timeout
+            // All readable sockets had unparseable/wrong-id packets; keep polling.
         }
     }
 

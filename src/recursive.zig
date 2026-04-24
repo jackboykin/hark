@@ -797,6 +797,14 @@ pub const RecursiveResolver = struct {
         server: na.Address,
     };
 
+    /// Cap on simultaneous staggered legs. Matches typical ns_fetch_limit at
+    /// depth 0; must not exceed `BlockingUdpTransport.max_staggered_legs`.
+    const max_staggered_legs: usize = 3;
+
+    comptime {
+        std.debug.assert(max_staggered_legs <= BlockingUdpTransport.max_staggered_legs);
+    }
+
     fn tryStaggeredQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -806,64 +814,70 @@ pub const RecursiveResolver = struct {
         server_order: []const usize,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
-        var s0_idx: ?usize = null;
-        var s1_idx: ?usize = null;
-        for (server_order) |idx| {
+        // Collect up to max_staggered_legs distinct-IP non-dead servers in
+        // preferred order. Racing duplicate IPs wouldn't add birthday entropy
+        // (RFC 5452) or latency diversity, so dedupe by IP.
+        var leg_idxs: [max_staggered_legs]usize = undefined;
+        var leg_count: usize = 0;
+        outer: for (server_order) |idx| {
             const addr_key = AddressKey.fromAddress(servers[idx]);
-            if (self.rtt_cache) |rc| {
-                if (rc.isDead(addr_key)) continue;
+            if (self.rtt_cache) |rc| if (rc.isDead(addr_key)) continue;
+            for (leg_idxs[0..leg_count]) |prev| {
+                if (na.ipEqual(servers[idx], servers[prev])) continue :outer;
             }
-            if (s0_idx == null) {
-                s0_idx = idx;
-            } else if (s1_idx == null) {
-                if (!na.ipEqual(servers[idx], servers[s0_idx.?])) {
-                    s1_idx = idx;
-                    break;
-                }
-            }
+            leg_idxs[leg_count] = idx;
+            leg_count += 1;
+            if (leg_count >= max_staggered_legs) break;
         }
-
-        const idx0 = s0_idx orelse return null;
-        const idx1 = s1_idx orelse return null;
+        if (leg_count < 2) return null;
 
         const stagger = if (self.rtt_cache) |rc| blk: {
-            const rtt = rc.getTimeout(AddressKey.fromAddress(servers[idx0]));
+            const rtt = rc.getTimeout(AddressKey.fromAddress(servers[leg_idxs[0]]));
             break :blk @min(300, @max(50, rtt));
         } else self.stagger_ms;
 
         const overall_timeout = self.transport.config.timeout_ms;
 
-        const qid0 = rand.queryId(self.io);
-        const qid1 = rand.queryId(self.io);
+        // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
+        // per leg because each socket's send holds the wire bytes past the
+        // individual call.
+        var wires_storage: [max_staggered_legs][dns.edns_udp_payload]u8 = undefined;
+        var wires: [max_staggered_legs][]const u8 = undefined;
+        var qids: [max_staggered_legs]u16 = undefined;
+        var leg_addrs: [max_staggered_legs]na.Address = undefined;
 
-        // Build and serialize once, copy + patch ID for the second leg
-        const msg0 = dns.buildQueryWithOptions(allocator, qid0, query_name, query_type, .{
+        qids[0] = rand.queryId(self.io);
+        const msg0 = dns.buildQueryWithOptions(allocator, qids[0], query_name, query_type, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
         }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
-        var wire0: [dns.edns_udp_payload]u8 = undefined;
-        const w0 = dns.serializeMessage(&wire0, msg0) catch |err|
+        const w0 = dns.serializeMessage(&wires_storage[0], msg0) catch |err|
             return if (err == error.OutOfMemory) error.OutOfMemory else null;
-        var wire1: [dns.edns_udp_payload]u8 = undefined;
-        @memcpy(wire1[0..w0.len], w0);
-        dns.patchQueryId(wire1[0..w0.len], qid1);
-        const w1 = wire1[0..w0.len];
+        wires[0] = w0;
+        leg_addrs[0] = servers[leg_idxs[0]];
+
+        for (1..leg_count) |i| {
+            qids[i] = rand.queryId(self.io);
+            @memcpy(wires_storage[i][0..w0.len], w0);
+            dns.patchQueryId(wires_storage[i][0..w0.len], qids[i]);
+            wires[i] = wires_storage[i][0..w0.len];
+            leg_addrs[i] = servers[leg_idxs[i]];
+        }
 
         const query_start = monotonic.nowUs();
-
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
         const stag_result = self.transport.queryStaggered(
-            .{ w0, w1 },
-            .{ qid0, qid1 },
-            .{ servers[idx0], servers[idx1] },
+            wires[0..leg_count],
+            qids[0..leg_count],
+            leg_addrs[0..leg_count],
             stagger,
             overall_timeout,
             response_buf,
         ) catch return null;
 
         const elapsed_us = monotonic.nowUs() - query_start;
-        const responding_idx = if (stag_result.responding_idx == 0) idx0 else idx1;
-        const responding_addr = servers[responding_idx];
+        const winner = stag_result.responding_idx;
+        const responding_addr = leg_addrs[winner];
         const addr_key = AddressKey.fromAddress(responding_addr);
 
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
@@ -871,11 +885,31 @@ pub const RecursiveResolver = struct {
             ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
         }
 
-        // TC bit: fall through to sequential path which handles TCP retry
-        if (dns.hasTcBit(stag_result.response_data)) return null;
+        // RFC 2181 §9: TC-set response cannot be used. Retry the winning
+        // server over TCP immediately; falling through to the sequential loop
+        // would re-query servers that already lost the race (wasted UDP RTTs).
+        if (dns.hasTcBit(stag_result.response_data)) {
+            if (self.tcp_transport) |tcp| {
+                const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
+                const tcp_result = if (self.tcp_pool) |p|
+                    tcp.queryPooled(wires[winner], responding_addr, tcp_buf, p)
+                else
+                    tcp.query(wires[winner], responding_addr, tcp_buf);
+                if (tcp_result) |tcp_data| {
+                    const resp = try tryParseMessage(allocator, tcp_data) orelse return null;
+                    dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
+                    return .{ .message = resp, .server = responding_addr };
+                } else |err| {
+                    log.warn("TCP fallback (staggered TC) failed: {s}", .{@errorName(err)});
+                }
+            }
+            return null;
+        }
 
         const resp = try tryParseMessage(allocator, stag_result.response_data) orelse return null;
-        if (!resp.header.qr) return null;
+        // RFC 5452 §9.1 / RFC 9619: reject responses whose question doesn't
+        // echo the query. Sequential path does the same at queryAuthoritativeServers.
+        dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
 
         return .{ .message = resp, .server = responding_addr };
     }
@@ -1467,16 +1501,21 @@ pub const RecursiveResolver = struct {
             else => 1,
         };
 
-        // Parallel path: race 2 NS names concurrently. The helper thread
-        // creates its own BlockingUdpTransport via cloneForThread.
-        if (ns_fetch_limit > 1 and ns_names.len >= 2 and self.gpa != null) {
-            return self.resolveNsAddressesParallel(allocator, ns_names, depth, ns_fetch_limit);
+        // Parallel path: one helper thread per (ns_name × rtype) task beyond
+        // the caller's. Bounded by ns_fetch_limit so the worst-case fanout is
+        // `ns_fetch_limit * 2 - 1` helpers (5 at depth 0).
+        if (self.gpa != null and ns_names.len >= 1) {
+            return self.resolveNsAddressesFanout(allocator, ns_names, depth, ns_fetch_limit);
         }
 
         return self.resolveNsAddressesSerial(allocator, ns_names, depth, ns_fetch_limit);
     }
 
     const address_rtypes = [_]dns.RType{ .a, .aaaa };
+    /// Largest ns_fetch_limit used by resolveNsAddresses (depth 0). Bounds the
+    /// stack-allocated task-context array in resolveNsAddressesFanout.
+    const max_ns_fetch_limit: usize = 3;
+    const max_ns_parallel_tasks: usize = max_ns_fetch_limit * address_rtypes.len;
 
     /// Append A+AAAA addresses from `records` to `addrs`, skipping non-routable.
     /// Returns true if at least one address was appended.
@@ -1547,104 +1586,127 @@ pub const RecursiveResolver = struct {
         return .{ .addrs = addrs, .count = count };
     }
 
-    /// Resolve NS[0] on the caller thread and NS[1] on a helper thread
-    /// concurrently. Falls back to serial for remaining NS names if needed.
-    fn resolveNsAddressesParallel(
+    /// Fan out NS-address resolution across one thread per (ns_name × rtype)
+    /// task. Task 0 (NS[0], A) runs on the caller thread; tasks 1..N run on
+    /// helper threads so A and AAAA for each NS name execute in parallel. If
+    /// a spawn fails, the task falls back to the caller thread after the
+    /// helpers join — correctness is preserved, latency reverts to serial.
+    fn resolveNsAddressesFanout(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         ns_names: []const dns.Name,
         depth: usize,
         ns_fetch_limit: usize,
     ) !?NsAddrResult {
+        const rtypes_n = address_rtypes.len;
+        const names_n = @min(ns_names.len, ns_fetch_limit);
+        if (names_n == 0) return null;
+        const task_n = names_n * rtypes_n;
+        std.debug.assert(task_n <= max_ns_parallel_tasks);
+
+        var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
+        var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
+
+        // Spawn helpers for tasks [1..task_n]. Task 0 runs on the caller.
+        // `threads[i] == null` after this loop means spawn failed — the task
+        // is handled synchronously in the fallback loop below.
+        for (1..task_n) |i| {
+            const ni = i / rtypes_n;
+            const ri = i % rtypes_n;
+            task_ctxs[i] = .{
+                .parent = self,
+                .ns_name = ns_names[ni],
+                .rtype = address_rtypes[ri],
+                .depth = depth,
+            };
+            threads[i] = std.Thread.spawn(.{ .stack_size = 1 << 20 }, NsTaskCtx.run, .{&task_ctxs[i]}) catch null;
+        }
+        // Guarantee helper join before task_ctxs go out of scope, including
+        // error-return paths below.
+        defer for (&threads) |*slot| {
+            if (slot.*) |t| {
+                t.join();
+                slot.* = null;
+            }
+        };
+
         var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
-        var resolved_ns_count: usize = 0;
 
-        // Spawn helper thread for NS[1]
-        var helper_ctx = NsThreadCtx{ .parent = self, .ns_name = ns_names[1], .depth = depth };
-        const helper = std.Thread.spawn(
-            .{ .stack_size = 1 << 20 },
-            NsThreadCtx.run,
-            .{&helper_ctx},
-        ) catch null;
-        // Ensure helper is always joined before helper_ctx goes out of scope
-        defer if (helper) |h| h.join();
-
-        // Resolve NS[0] on caller thread
-        if (try self.resolveNsName(allocator, ns_names[0], depth, &addrs, &count)) {
-            resolved_ns_count += 1;
+        // Task 0 = (NS[0], A) on caller thread.
+        const ns0_dotted = try nameToDotted(allocator, ns_names[0]);
+        if (self.resolveImpl(allocator, ns0_dotted, address_rtypes[0], depth + 1)) |r| {
+            _ = appendAddressesFromRecords(r.message.answers, &addrs, &count);
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
         }
 
-        // Merge helper results (defer above ensures join happened)
-        if (helper != null) {
-            if (helper_ctx.oom) return error.OutOfMemory;
-            const hcount = helper_ctx.count;
-            if (hcount > 0) {
-                const space = max_servers_per_level - count;
-                const to_copy = @min(hcount, space);
-                @memcpy(addrs[count..][0..to_copy], helper_ctx.addrs[0..to_copy]);
-                count += to_copy;
-                resolved_ns_count += 1;
-            }
-        } else {
-            // Thread spawn failed — resolve NS[1] serially on caller
-            if (resolved_ns_count < ns_fetch_limit) {
-                const r = try self.resolveNsAddressesSerial(allocator, ns_names[1..], depth, ns_fetch_limit - resolved_ns_count);
-                if (r) |result| {
-                    const space = max_servers_per_level - count;
-                    const to_copy = @min(result.count, space);
-                    @memcpy(addrs[count..][0..to_copy], result.addrs[0..to_copy]);
-                    count += to_copy;
-                }
-                if (count == 0) return null;
-                return .{ .addrs = addrs, .count = count };
+        // Thread-spawn fallbacks: run the task on the caller so we don't drop
+        // it. Reserved for fork/resource-limit conditions.
+        for (1..task_n) |i| {
+            if (threads[i] != null) continue;
+            const ni = i / rtypes_n;
+            const ri = i % rtypes_n;
+            const nsd = try nameToDotted(allocator, ns_names[ni]);
+            if (self.resolveImpl(allocator, nsd, address_rtypes[ri], depth + 1)) |r| {
+                _ = appendAddressesFromRecords(r.message.answers, &addrs, &count);
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
             }
         }
 
-        // Resolve remaining NS names serially if needed (ns_fetch_limit >= 3)
-        if (resolved_ns_count < ns_fetch_limit and ns_names.len > 2) {
-            for (ns_names[2..]) |ns_name| {
-                if (try self.resolveNsName(allocator, ns_name, depth, &addrs, &count)) {
-                    resolved_ns_count += 1;
-                    if (resolved_ns_count >= ns_fetch_limit) break;
-                }
-            }
+        // Join helpers and merge their addresses.
+        for (1..task_n) |i| {
+            const t = threads[i] orelse continue;
+            t.join();
+            threads[i] = null;
+            if (task_ctxs[i].oom) return error.OutOfMemory;
+            const hc = task_ctxs[i].count;
+            if (hc == 0) continue;
+            const space = max_servers_per_level - count;
+            const to_copy = @min(hc, space);
+            @memcpy(addrs[count..][0..to_copy], task_ctxs[i].addrs[0..to_copy]);
+            count += to_copy;
         }
 
         if (count == 0) return null;
         return .{ .addrs = addrs, .count = count };
     }
 
-    /// Context for a helper thread resolving one NS name's A + AAAA records.
-    /// The ns_name is a shallow copy whose label pointers reference the caller's
-    /// arena; safe because the caller joins the helper before returning.
-    /// The parent pointer is read once at thread start to clone shared state
-    /// and config into a thread-local resolver; the pointer fields and config
-    /// on the parent are stable (set at init, never modified during resolution).
-    const NsThreadCtx = struct {
+    /// Context for a helper thread resolving one (ns_name, rtype) pair.
+    /// `ns_name`'s labels reference the caller-arena buffer; safe because
+    /// `resolveNsAddressesFanout` joins all helpers before returning. The
+    /// parent pointer is read once at start to clone shared state (caches,
+    /// selectors) into a thread-local resolver; config is stable after init.
+    const NsTaskCtx = struct {
         parent: *RecursiveResolver,
         ns_name: dns.Name,
+        rtype: dns.RType,
         depth: usize,
-        // Output
         addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
         oom: bool = false,
 
-        fn run(ctx: *NsThreadCtx) void {
-            var udp_t = @import("blocking_transport.zig").BlockingUdpTransport.init(.{}, ctx.parent.io);
+        fn run(ctx: *NsTaskCtx) void {
+            var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
             defer udp_t.deinit();
-            var tcp_t = @import("blocking_transport.zig").BlockingTcpTransport.init(.{});
+            var tcp_t = BlockingTcpTransport.init(.{});
             var resolver = ctx.parent.cloneForThread(&udp_t, &tcp_t);
 
-            // Per-query memory cap (same as main query path)
             var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
             var arena = std.heap.ArenaAllocator.init(cap.allocator());
             defer arena.deinit();
+            const a = arena.allocator();
 
-            _ = resolver.resolveNsName(arena.allocator(), ctx.ns_name, ctx.depth, &ctx.addrs, &ctx.count) catch {
+            const ns_dotted = nameToDotted(a, ctx.ns_name) catch {
                 ctx.oom = true;
                 return;
             };
+            if (resolver.resolveImpl(a, ns_dotted, ctx.rtype, ctx.depth + 1)) |r| {
+                _ = appendAddressesFromRecords(r.message.answers, &ctx.addrs, &ctx.count);
+            } else |err| {
+                if (err == error.OutOfMemory) ctx.oom = true;
+            }
         }
     };
 
