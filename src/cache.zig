@@ -80,6 +80,24 @@ fn freeCachedRecord(alloc: Allocator, cr: CachedRecord) void {
 /// DNSKEY/RRSIG (<2KB) with headroom; oversized RRs fail to cache.
 const rr_wire_stage_len: usize = 4096;
 
+fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
+    var wire_stage: [rr_wire_stage_len]u8 = undefined;
+    const built = try dns.buildResourceRecordWire(&wire_stage, rr);
+    const wire_owned = try alloc.dupe(u8, built.bytes);
+    errdefer alloc.free(wire_owned);
+    const cloned_name = try cloneName(alloc, rr.name);
+    errdefer dns.freeName(alloc, cloned_name);
+    const cloned_rdata = try cloneRData(alloc, rr.rdata);
+    return .{
+        .name = cloned_name,
+        .rtype = rr.rtype,
+        .rclass = rr.rclass,
+        .rdata = cloned_rdata,
+        .wire = wire_owned,
+        .wire_ttl_offset = built.ttl_offset,
+    };
+}
+
 const CachedRRset = struct {
     records: []CachedRecord,
     expires_at: i64,
@@ -607,35 +625,9 @@ pub const RRsetCache = struct {
         }
         self.removeAndFree(key);
 
-        const cached_soa_name = cloneName(alloc, soa.name) catch {
+        const cached_soa = buildCachedRecord(alloc, soa) catch {
             alloc.free(key_name);
             return;
-        };
-        const cached_soa_rdata = cloneRData(alloc, soa.rdata) catch {
-            dns.freeName(alloc, cached_soa_name);
-            alloc.free(key_name);
-            return;
-        };
-        var soa_wire_stage: [rr_wire_stage_len]u8 = undefined;
-        const soa_built = dns.buildResourceRecordWire(&soa_wire_stage, soa) catch {
-            dns.freeName(alloc, cached_soa_name);
-            dns.freeRData(alloc, cached_soa_rdata);
-            alloc.free(key_name);
-            return;
-        };
-        const cached_soa_wire = alloc.dupe(u8, soa_built.bytes) catch {
-            dns.freeName(alloc, cached_soa_name);
-            dns.freeRData(alloc, cached_soa_rdata);
-            alloc.free(key_name);
-            return;
-        };
-        const cached_soa = CachedRecord{
-            .name = cached_soa_name,
-            .rtype = soa.rtype,
-            .rclass = soa.rclass,
-            .rdata = cached_soa_rdata,
-            .wire = cached_soa_wire,
-            .wire_ttl_offset = soa_built.ttl_offset,
         };
 
         self.evictIfNeeded();
@@ -797,26 +789,7 @@ pub const RRsetCache = struct {
             };
             var idx: usize = 0;
             for (match_buf[0..collect_count]) |other| {
-                var wire_stage: [rr_wire_stage_len]u8 = undefined;
-                const built = dns.buildResourceRecordWire(&wire_stage, other) catch break;
-                const wire_owned = alloc.dupe(u8, built.bytes) catch break;
-                const cloned_name = cloneName(alloc, other.name) catch {
-                    alloc.free(wire_owned);
-                    break;
-                };
-                const cloned_rdata = cloneRData(alloc, other.rdata) catch {
-                    alloc.free(wire_owned);
-                    dns.freeName(alloc, cloned_name);
-                    break;
-                };
-                cached_records[idx] = .{
-                    .name = cloned_name,
-                    .rtype = other.rtype,
-                    .rclass = other.rclass,
-                    .rdata = cloned_rdata,
-                    .wire = wire_owned,
-                    .wire_ttl_offset = built.ttl_offset,
-                };
+                cached_records[idx] = buildCachedRecord(alloc, other) catch break;
                 idx += 1;
             }
 
