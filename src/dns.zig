@@ -1049,9 +1049,7 @@ pub const Serializer = struct {
         _ = try self.writeRecordFields(rr);
     }
 
-    /// Serialize an RR via the field-by-field path (ignoring `rr.wire`).
-    /// Returns the byte offset of the TTL field, used by store-time callers
-    /// that want to patch TTL later.
+    /// Ignores `rr.wire`. Returns the TTL byte offset for later patching.
     fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!u16 {
         try self.writeName(rr.name);
         try self.writeU16(@intFromEnum(rr.rtype));
