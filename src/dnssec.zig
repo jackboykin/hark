@@ -528,6 +528,12 @@ fn serialAfter(s1: u32, s2: u32) bool {
     return s1 != s2 and (s1 -% s2) < 0x80000000;
 }
 
+/// Seconds of clock-skew tolerance applied to RRSIG inception/expiration.
+/// Matches BIND's `sig-validity-skew` and Unbound's `val-sig-skew-min`
+/// defaults — a server with a slightly off wall clock would otherwise
+/// reject valid signatures intermittently.
+pub const clock_skew_tolerance: u32 = 300;
+
 /// Verify an RRSIG signature against a DNSKEY and RRset.
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
@@ -541,9 +547,14 @@ pub fn verifyRrsig(
         if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
     }
 
-    // RFC 4035 §5.3.1: check signature validity period
-    if (serialAfter(rrsig.sig_inception, now_u32)) return error.SignatureExpired;
-    if (serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
+    // RFC 4035 §5.3.1: check signature validity period, with clock-skew
+    // tolerance both ways. Wall clock ahead by up to N seconds is fine
+    // (don't reject not-yet-valid by N); behind by N is fine (don't reject
+    // expired by N).
+    const skew_ahead = now_u32 +% clock_skew_tolerance;
+    const skew_behind = now_u32 -% clock_skew_tolerance;
+    if (serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
+    if (serialAfter(skew_behind, rrsig.sig_expiration)) return error.SignatureExpired;
 
     // Build the signed data
     var signed_data_buf: [65536]u8 = undefined;
@@ -2319,8 +2330,8 @@ test "verifyRrsig rejects expired signature" {
     };
     const rrset = [_]dns.ResourceRecord{};
 
-    // now is after expiration
-    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1700000001));
+    // now is past expiration by more than the clock-skew tolerance
+    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1700000000 + clock_skew_tolerance + 1));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
@@ -2349,8 +2360,44 @@ test "verifyRrsig rejects not-yet-valid signature" {
     };
     const rrset = [_]dns.ResourceRecord{};
 
-    // now is before inception
-    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1698999999));
+    // now is before inception by more than the clock-skew tolerance
+    try testing.expectError(error.SignatureExpired, verifyRrsig(rrsig, dnskey, &rrset, 1699000000 - clock_skew_tolerance - 1));
+}
+
+test "verifyRrsig tolerates clock skew within window" {
+    // RRSIGs within ±clock_skew_tolerance of the validity window must not
+    // fail with SignatureExpired. With an empty key/signature, ECDSA verify
+    // returns InvalidSignature — which is fine; we only assert that the
+    // failure isn't time-related.
+    const signer_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 12345,
+        .signer_name = signer_name,
+        .signature = &.{},
+    };
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const rrset = [_]dns.ResourceRecord{};
+
+    inline for (.{
+        1700000000 + clock_skew_tolerance, // just past expiration, within tolerance
+        1699000000 - clock_skew_tolerance, // just before inception, within tolerance
+    }) |now| {
+        const result = verifyRrsig(rrsig, dnskey, &rrset, now);
+        if (result) |_| {} else |err| {
+            try testing.expect(err != error.SignatureExpired);
+        }
+    }
 }
 
 // ── H3: RSA key validation tests ────────────────────────────────────
