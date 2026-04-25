@@ -26,6 +26,10 @@ const dead_duration_ms: i64 = 1_000;
 /// Maximum backoff doublings (Knot: cap at 256x initial).
 const max_backoff_shifts: u8 = 8;
 
+/// Cap on tracked nameserver entries; bounds memory under random-server
+/// load. Dropped entries revert to `initial_timeout_ms` next observation.
+pub const default_max_entries: u32 = 4_096;
+
 // ── RttState ─────────────────────────────────────────────────────────
 
 const RttState = struct {
@@ -42,11 +46,13 @@ pub const RttCache = struct {
     rwlock: ?std.Io.RwLock,
     io: std.Io,
     now_fn: *const fn () i64,
+    max_entries: u32,
 
     pub const Config = struct {
         allocator: Allocator,
         io: std.Io,
         thread_safe: bool = false,
+        max_entries: u32 = default_max_entries,
     };
 
     pub fn init(cfg: Config) RttCache {
@@ -55,6 +61,7 @@ pub const RttCache = struct {
             .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
             .io = cfg.io,
             .now_fn = &@import("monotonic.zig").nowMs,
+            .max_entries = cfg.max_entries,
         };
     }
 
@@ -93,6 +100,7 @@ pub const RttCache = struct {
             gop.value_ptr.consecutive_timeouts = 0;
             gop.value_ptr.dead_until_ms = 0;
         }
+        if (self.entries.count() > self.max_entries) self.entries.clearRetainingCapacity();
     }
 
     /// Record a timeout for this server (exponential backoff + dead marking).
@@ -116,6 +124,7 @@ pub const RttCache = struct {
                 gop.value_ptr.dead_until_ms = self.now_fn() + dead_duration_ms;
             }
         }
+        if (self.entries.count() > self.max_entries) self.entries.clearRetainingCapacity();
     }
 
     /// Check whether the server is currently marked dead.
@@ -180,6 +189,30 @@ test "recordSuccess updates EWMA" {
     const t2 = cache.getTimeout(key);
     try testing.expect(t2 > 0);
     try testing.expect(t2 <= max_timeout_ms);
+}
+
+test "entries map is bounded under random-server load" {
+    // Without a cap, recording many distinct nameservers would grow
+    // `entries` indefinitely.
+    var cache = RttCache.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .max_entries = 32,
+    });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+
+    var i: u32 = 0;
+    while (i < 512) : (i += 1) {
+        const key = AddressKey.fromAddress(na.initIp4(.{
+            @intCast((i >> 16) & 0xff),
+            @intCast((i >> 8) & 0xff),
+            @intCast(i & 0xff),
+            1,
+        }, 53));
+        if (i & 1 == 0) cache.recordSuccess(key, 50_000) else cache.recordTimeout(key);
+        try testing.expect(cache.entries.count() <= cache.max_entries + 1);
+    }
 }
 
 test "recordTimeout increments consecutive count and marks dead" {

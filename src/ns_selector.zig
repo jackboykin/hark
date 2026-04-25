@@ -21,6 +21,10 @@ const beta_prior: f32 = 1.0;
 /// Max NS per zone (13 IPv4 + 13 IPv6).
 pub const max_order = 26;
 
+/// Cap on tracked (zone, server) arms; bounds memory under random-zone
+/// load. Lost arms reset to the Beta(1,1) prior on next observation.
+pub const default_max_arms: u32 = 16_384;
+
 // ── Outcome ──────────────────────────────────────────────────────────
 
 pub const Outcome = enum {
@@ -76,11 +80,13 @@ pub const NsSelector = struct {
     mutex: ?std.Io.Mutex,
     io: std.Io,
     gamma: f32,
+    max_arms: u32,
 
     pub const Config = struct {
         allocator: Allocator,
         io: std.Io,
         thread_safe: bool = false,
+        max_arms: u32 = default_max_arms,
     };
 
     pub fn init(cfg: Config) NsSelector {
@@ -89,6 +95,7 @@ pub const NsSelector = struct {
             .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
             .io = cfg.io,
             .gamma = default_gamma,
+            .max_arms = cfg.max_arms,
         };
     }
 
@@ -182,6 +189,11 @@ pub const NsSelector = struct {
         if (!gop.found_existing) gop.value_ptr.* = ArmState{};
         gop.value_ptr.alpha += r;
         gop.value_ptr.beta += (1.0 - r);
+
+        // Bound memory: clear once we cross the cap. Cheaper and simpler
+        // than batch eviction; the count check is O(1) and clearing
+        // retains bucket capacity so subsequent inserts don't realloc.
+        if (self.arms.count() > self.max_arms) self.arms.clearRetainingCapacity();
     }
 
     /// Return the confidence score (Beta mean) for a server in a zone.
@@ -430,6 +442,29 @@ test "confidence returns null for unknown" {
     const zone = dns.Name{ .labels = &.{ "unknown", "com" } };
     const server = na.initIp4(.{ 10, 0, 0, 99 }, 53);
     try testing.expectEqual(@as(?f32, null), sel.confidence(zone, server));
+}
+
+test "arms map is bounded under random-zone load" {
+    // Without a cap, recording outcomes against many distinct (zone, server)
+    // pairs would grow `arms` indefinitely.
+    var sel = NsSelector.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .max_arms = 64, // small cap to exercise eviction quickly
+    });
+    defer sel.deinit();
+
+    var label_buf: [16]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 1024) : (i += 1) {
+        const label = std.fmt.bufPrint(&label_buf, "z{d}", .{i}) catch unreachable;
+        const zone = dns.Name{ .labels = &.{ label, "test" } };
+        const server = na.initIp4(.{ 10, 0, 0, @intCast(i & 0xff) }, 53);
+        sel.recordOutcome(zone, server, .success, 10_000);
+        // Cap permits brief overshoot up to one eviction batch but should
+        // never grow unboundedly.
+        try testing.expect(sel.arms.count() <= sel.max_arms + 1);
+    }
 }
 
 test "per-zone isolation" {
