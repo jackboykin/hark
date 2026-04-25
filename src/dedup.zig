@@ -59,12 +59,8 @@ pub const AcquireResult = enum { leader, follower };
 /// modulo compiles to a mask.
 const shard_count = 64;
 
-/// Hard cap on simultaneous in-flight entries. Without it, a flood of
-/// unique queries (e.g., random-subdomain water-torture) would grow the
-/// map without bound. Reaching the cap degrades gracefully: new requests
-/// become their own leaders (skipping coalescing) instead of failing.
-/// 8192 × ~270 B per entry ≈ 2 MiB, well above any realistic concurrent
-/// legit fan-out for one resolver.
+/// Hard cap to bound the table under random-subdomain water-torture floods.
+/// 8192 × ~270 B per entry ≈ 2 MiB.
 pub const max_entries: u32 = 8192;
 
 pub const InFlightTable = struct {
@@ -122,11 +118,7 @@ pub const InFlightTable = struct {
             return .follower;
         }
 
-        // Cap reached — degrade to "everyone is a leader" so the table
-        // can't grow without bound under unique-query flood.
         if (self.map.count() >= max_entries) return .leader;
-
-        // First request for this key — become leader.
         self.map.put(self.allocator, key, false) catch return .leader;
         return .leader;
     }

@@ -1380,9 +1380,6 @@ fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?voi
 
 const ValidationFailure = struct {
     rcode: dns.RCode,
-    /// Upper 8 bits of the 12-bit extended RCODE per RFC 6891 §6.1.3.
-    /// Non-zero means the response MUST carry an OPT pseudo-record
-    /// echoing this byte in its TTL.
     extended_rcode: u8 = 0,
 };
 
