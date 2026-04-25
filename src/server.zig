@@ -811,13 +811,9 @@ const WorkerState = struct {
         self.loop.flush();
     }
 
-    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
-        sendErrorUdpExt(sock, id, rcode, 0, rd, questions, client_addr);
-    }
-
-    fn sendErrorUdpExt(sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
+    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
-        if (serializeErrorResponseExt(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
+        if (serializeErrorResponse(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -834,18 +830,18 @@ const WorkerState = struct {
         // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
         const opcode: u4 = @truncate(data[2] >> 3);
         if (opcode != 0) { // Only QUERY (0) supported
-            sendErrorUdp(sock, id, .not_implemented, rd, &.{}, client_addr);
+            sendErrorUdp(sock, id, .not_implemented, 0, rd, &.{}, client_addr);
             return;
         }
         const qdcount = mem.readInt(u16, data[4..6], .big);
         if (qdcount != 1) {
-            sendErrorUdp(sock, id, .format_error, rd, &.{}, client_addr);
+            sendErrorUdp(sock, id, .format_error, 0, rd, &.{}, client_addr);
             return;
         }
         if (!self.queue.push(data, client_addr, sock, .udp)) {
             _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
             log.warn("resolution queue full, dropping query", .{});
-            sendErrorUdp(sock, id, .server_failure, rd, &.{}, client_addr);
+            sendErrorUdp(sock, id, .server_failure, 0, rd, &.{}, client_addr);
         }
     }
 
@@ -884,7 +880,7 @@ const WorkerState = struct {
             const query = dns.parseMessage(alloc, data) catch {
                 if (data.len >= 2) {
                     const id = mem.readInt(u16, data[0..2], .big);
-                    const w = serializeErrorResponse(&response_wire, id, .format_error, false, &.{}) orelse return;
+                    const w = serializeErrorResponse(&response_wire, id, .format_error, 0, false, &.{}) orelse return;
                     tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
@@ -892,7 +888,7 @@ const WorkerState = struct {
             };
 
             if (validateQuery(query)) |fail| {
-                const w = serializeErrorResponseExt(&response_wire, query.header.id, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
                 tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
@@ -906,7 +902,7 @@ const WorkerState = struct {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
-                const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, 0, query.header.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
                 tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
                 continue;
@@ -1066,13 +1062,13 @@ const WorkerState = struct {
         const query_msg = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                sendErrorUdp(sock, id, .format_error, false, &.{}, client_addr);
+                sendErrorUdp(sock, id, .format_error, 0, false, &.{}, client_addr);
             }
             return;
         };
 
         if (validateQuery(query_msg)) |fail| {
-            sendErrorUdpExt(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
+            sendErrorUdp(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1087,7 +1083,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
-            sendErrorUdp(sock, query_msg.header.id, .server_failure, query_msg.header.rd, query_msg.questions, client_addr);
+            sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1322,11 +1318,7 @@ fn buildResponseWire(
     return null;
 }
 
-fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question) ?[]const u8 {
-    return serializeErrorResponseExt(wire_buf, query_id, rcode, 0, rd, questions);
-}
-
-fn serializeErrorResponseExt(
+fn serializeErrorResponse(
     wire_buf: []u8,
     query_id: u16,
     rcode: dns.RCode,
@@ -1357,7 +1349,6 @@ fn serializeErrorResponseExt(
             .qd_count = @intCast(questions.len),
             .an_count = 0,
             .ns_count = 0,
-            // serializeMessage bumps ar_count by 1 when opt is non-null.
             .ar_count = 0,
         },
         .questions = questions,
@@ -1631,7 +1622,7 @@ test "serializeErrorResponse produces valid DNS message" {
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, true, questions).?;
+    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, 0, true, questions).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
@@ -1644,7 +1635,7 @@ test "serializeErrorResponse produces valid DNS message" {
 
 test "serializeErrorResponse with no question (parse failure)" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .format_error, false, &.{}).?;
+    const wire = serializeErrorResponse(&buf, 0x1234, .format_error, 0, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1683,9 +1674,9 @@ test "validateQuery returns BADVERS for unsupported EDNS version" {
     try testing.expectEqual(@as(u8, 1), fail.extended_rcode);
 }
 
-test "serializeErrorResponseExt emits BADVERS OPT" {
+test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponseExt(&buf, 0x1234, .no_error, 1, false, &.{}).?;
+    const wire = serializeErrorResponse(&buf, 0x1234, .no_error, 1, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
