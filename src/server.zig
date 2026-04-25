@@ -812,8 +812,12 @@ const WorkerState = struct {
     }
 
     fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
+        sendErrorUdpExt(sock, id, rcode, 0, rd, questions, client_addr);
+    }
+
+    fn sendErrorUdpExt(sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
-        if (serializeErrorResponse(&wire_buf, id, rcode, rd, questions)) |wire| {
+        if (serializeErrorResponseExt(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
             sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -887,8 +891,8 @@ const WorkerState = struct {
                 return;
             };
 
-            if (validateQuery(query)) |rcode| {
-                const w = serializeErrorResponse(&response_wire, query.header.id, rcode, query.header.rd, query.questions) orelse return;
+            if (validateQuery(query)) |fail| {
+                const w = serializeErrorResponseExt(&response_wire, query.header.id, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
                 tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
@@ -1067,8 +1071,8 @@ const WorkerState = struct {
             return;
         };
 
-        if (validateQuery(query_msg)) |rcode| {
-            sendErrorUdp(sock, query_msg.header.id, rcode, query_msg.header.rd, query_msg.questions, client_addr);
+        if (validateQuery(query_msg)) |fail| {
+            sendErrorUdpExt(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1319,6 +1323,24 @@ fn buildResponseWire(
 }
 
 fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: bool, questions: []const dns.Question) ?[]const u8 {
+    return serializeErrorResponseExt(wire_buf, query_id, rcode, 0, rd, questions);
+}
+
+fn serializeErrorResponseExt(
+    wire_buf: []u8,
+    query_id: u16,
+    rcode: dns.RCode,
+    extended_rcode: u8,
+    rd: bool,
+    questions: []const dns.Question,
+) ?[]const u8 {
+    const opt: ?dns.OptRecord = if (extended_rcode != 0) .{
+        .udp_payload_size = dns.edns_udp_payload,
+        .extended_rcode = extended_rcode,
+        .version = 0,
+        .do_bit = false,
+        .options = &.{},
+    } else null;
     const msg = dns.Message{
         .header = .{
             .id = query_id,
@@ -1335,9 +1357,11 @@ fn serializeErrorResponse(wire_buf: []u8, query_id: u16, rcode: dns.RCode, rd: b
             .qd_count = @intCast(questions.len),
             .an_count = 0,
             .ns_count = 0,
+            // serializeMessage bumps ar_count by 1 when opt is non-null.
             .ar_count = 0,
         },
         .questions = questions,
+        .opt = opt,
     };
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
@@ -1363,14 +1387,25 @@ fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?voi
     }
 }
 
-fn validateQuery(query: dns.Message) ?dns.RCode {
+const ValidationFailure = struct {
+    rcode: dns.RCode,
+    /// Upper 8 bits of the 12-bit extended RCODE per RFC 6891 §6.1.3.
+    /// Non-zero means the response MUST carry an OPT pseudo-record
+    /// echoing this byte in its TTL.
+    extended_rcode: u8 = 0,
+};
+
+fn validateQuery(query: dns.Message) ?ValidationFailure {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful
     // (UDP path drops silently before parse).
-    if (query.header.qr) return .format_error;
-    if (query.header.opcode != .query) return .not_implemented;
-    if (query.questions.len != 1) return .format_error;
-    if (query.questions[0].qclass != .in) return .refused;
+    if (query.header.qr) return .{ .rcode = .format_error };
+    if (query.header.opcode != .query) return .{ .rcode = .not_implemented };
+    if (query.questions.len != 1) return .{ .rcode = .format_error };
+    if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
+    // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
+    // version. Header RCODE bits = 0; OPT extended_rcode field = 1.
+    if (query.opt) |opt| if (opt.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
     return null;
 }
 
@@ -1627,7 +1662,67 @@ test "validateQuery rejects QR=1 (response posing as query)" {
     var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
     spoofed.header.qr = true;
 
-    try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?);
+    try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
+}
+
+test "validateQuery returns BADVERS for unsupported EDNS version" {
+    // RFC 6891 §6.1.3: header RCODE = 0, OPT extended_rcode = 1.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    query.opt = .{
+        .udp_payload_size = 4096,
+        .extended_rcode = 0,
+        .version = 1, // unsupported
+        .do_bit = false,
+        .options = &.{},
+    };
+
+    const fail = validateQuery(query).?;
+    try testing.expectEqual(dns.RCode.no_error, fail.rcode);
+    try testing.expectEqual(@as(u8, 1), fail.extended_rcode);
+}
+
+test "serializeErrorResponseExt emits BADVERS OPT" {
+    var buf: [dns.max_udp_payload]u8 = undefined;
+    const wire = serializeErrorResponseExt(&buf, 0x1234, .no_error, 1, false, &.{}).?;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try dns.parseMessage(arena.allocator(), wire);
+    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
+    try testing.expectEqual(dns.RCode.no_error, parsed.header.rcode);
+    try testing.expect(parsed.opt != null);
+    try testing.expectEqual(@as(u8, 1), parsed.opt.?.extended_rcode);
+}
+
+test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Build a query, then manually append a second OPT to additionals.
+    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    query.opt = .{
+        .udp_payload_size = 4096,
+        .extended_rcode = 0,
+        .version = 0,
+        .do_bit = false,
+        .options = &.{},
+    };
+    // Inject a second OPT as a raw additional. dns.serializeMessage emits the
+    // first via msg.opt; we hand-craft an extra OPT at the end of the wire.
+    var buf: [dns.max_udp_payload]u8 = undefined;
+    const base = try dns.serializeMessage(&buf, query);
+    // Bump ar_count by 1 in the header (offset 10, big-endian u16).
+    const ar_count_before = std.mem.readInt(u16, buf[10..12], .big);
+    std.mem.writeInt(u16, buf[10..12], ar_count_before + 1, .big);
+    // Append a minimal OPT: root name (0), type=41, class=4096, ttl=0, rdlen=0.
+    const extra: [11]u8 = .{ 0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0 };
+    const extended_len = base.len + extra.len;
+    @memcpy(buf[base.len..extended_len], &extra);
+
+    try testing.expectError(error.MultipleOptRecords, dns.parseMessage(arena.allocator(), buf[0..extended_len]));
 }
 
 test "createSocket UDP binds to ephemeral port" {

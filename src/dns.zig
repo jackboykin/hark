@@ -98,6 +98,7 @@ pub const Error = error{
     FormatError,
     InvalidLabelType,
     InvalidRDataLength,
+    MultipleOptRecords,
     OutOfMemory,
 };
 
@@ -955,8 +956,9 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     var opt: ?OptRecord = null;
     for (0..hdr.ar_count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
-        if (rr.rtype == .opt and opt == null) {
-            // OPT pseudo-record: extract fields and discard the shell.
+        if (rr.rtype == .opt) {
+            // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
+            if (opt != null) return error.MultipleOptRecords;
             opt = .{
                 .udp_payload_size = @intFromEnum(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
