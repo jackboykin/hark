@@ -59,6 +59,14 @@ pub const AcquireResult = enum { leader, follower };
 /// modulo compiles to a mask.
 const shard_count = 64;
 
+/// Hard cap on simultaneous in-flight entries. Without it, a flood of
+/// unique queries (e.g., random-subdomain water-torture) would grow the
+/// map without bound. Reaching the cap degrades gracefully: new requests
+/// become their own leaders (skipping coalescing) instead of failing.
+/// 8192 × ~270 B per entry ≈ 2 MiB, well above any realistic concurrent
+/// legit fan-out for one resolver.
+pub const max_entries: u32 = 8192;
+
 pub const InFlightTable = struct {
     map: std.HashMapUnmanaged(DedupKey, bool, DedupKeyContext, 80),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
@@ -114,6 +122,10 @@ pub const InFlightTable = struct {
             return .follower;
         }
 
+        // Cap reached — degrade to "everyone is a leader" so the table
+        // can't grow without bound under unique-query flood.
+        if (self.map.count() >= max_entries) return .leader;
+
         // First request for this key — become leader.
         self.map.put(self.allocator, key, false) catch return .leader;
         return .leader;
@@ -128,6 +140,7 @@ pub const InFlightTable = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.map.get(key)) |_| return false;
+        if (self.map.count() >= max_entries) return false;
         self.map.put(self.allocator, key, false) catch return false;
         return true;
     }
@@ -278,6 +291,34 @@ test "CD bit partitions dedup groups" {
     table.releaseLeader("example.com", .a, cd0);
     table.releaseLeader("example.com", .a, cd1);
     try testing.expectEqual(@as(u32, 0), table.map.count());
+}
+
+test "table caps entries at max_entries" {
+    var table = InFlightTable.init(testing.allocator, testing.io);
+    defer table.deinit();
+
+    // Fill the table to its cap with unique names.
+    var name_buf: [32]u8 = undefined;
+    for (0..max_entries) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
+        try testing.expectEqual(.leader, table.acquireOrWait(name, .a, 0));
+    }
+    try testing.expectEqual(@as(u32, max_entries), table.map.count());
+
+    // One more unique query: still gets .leader, but isn't inserted.
+    try testing.expectEqual(.leader, table.acquireOrWait("overflow.example.com", .a, 0));
+    try testing.expectEqual(@as(u32, max_entries), table.map.count());
+
+    // tryAcquireLeader also refuses past the cap.
+    try testing.expect(!table.tryAcquireLeader("overflow2.example.com", .a, 0));
+    try testing.expectEqual(@as(u32, max_entries), table.map.count());
+
+    // Clean up — release everything we leadered so the test allocator
+    // doesn't see leaks.
+    for (0..max_entries) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
+        table.releaseLeader(name, .a, 0);
+    }
 }
 
 test "tryAcquireLeader coalesces without enqueueing followers" {
