@@ -138,6 +138,13 @@ pub const RecursiveResolver = struct {
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
+    /// Snapshot timestamp for a server-skip loop. 0 when no rtt_cache —
+    /// `RttCache.isDead` returns false for any key against now=0, which
+    /// is the right "always live" fallback.
+    fn rttNowMs(self: *const RecursiveResolver) i64 {
+        return if (self.rtt_cache) |rc| rc.nowMs() else 0;
+    }
+
     pub const ResolveResult = struct {
         message: dns.Message,
         prefetch_name: ?[]const u8 = null,
@@ -828,9 +835,10 @@ pub const RecursiveResolver = struct {
         // (RFC 5452) or latency diversity, so dedupe by IP.
         var leg_idxs: [max_staggered_legs]usize = undefined;
         var leg_count: usize = 0;
+        const now_ms = self.rttNowMs();
         outer: for (server_order) |idx| {
             const addr_key = AddressKey.fromAddress(servers[idx]);
-            if (self.rtt_cache) |rc| if (rc.isDead(addr_key)) continue;
+            if (self.rtt_cache) |rc| if (rc.isDead(addr_key, now_ms)) continue;
             for (leg_idxs[0..leg_count]) |prev| {
                 if (na.ipEqual(servers[idx], servers[prev])) continue :outer;
             }
@@ -954,6 +962,7 @@ pub const RecursiveResolver = struct {
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
         const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
+        const now_ms = self.rttNowMs();
         for (server_order, 0..) |server_idx, server_i| {
             const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
@@ -962,7 +971,7 @@ pub const RecursiveResolver = struct {
 
             // Skip dead servers unless last (fallback when all are dead)
             if (self.rtt_cache) |rc| {
-                if (rc.isDead(addr_key) and !is_last_server) continue;
+                if (rc.isDead(addr_key, now_ms) and !is_last_server) continue;
             }
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
@@ -1230,11 +1239,12 @@ pub const RecursiveResolver = struct {
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
         const try_count = @min(servers.len, max_servers);
+        const now_ms = self.rttNowMs();
         for (servers[0..try_count], 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
             if (self.rtt_cache) |rc| {
-                if (rc.isDead(addr_key) and i + 1 < try_count) continue;
+                if (rc.isDead(addr_key, now_ms) and i + 1 < try_count) continue;
             }
 
             // Fresh TXID per server to prevent cross-server ID prediction.

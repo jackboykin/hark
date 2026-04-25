@@ -103,6 +103,10 @@ pub const NsSelector = struct {
         self.arms.deinit();
     }
 
+    pub fn count(self: *const NsSelector) usize {
+        return self.arms.count();
+    }
+
     /// Select servers using Thompson Sampling. Returns ordered indices
     /// into `servers`: best Thompson draw first, dead servers last.
     /// RttCache is still consulted for dead-server status.
@@ -124,12 +128,13 @@ pub const NsSelector = struct {
         var live_count: usize = 0;
         var dead_count: usize = 0;
         var samples: [max_order]f32 = undefined;
+        const now_ms = if (rtt_cache) |rc| rc.nowMs() else 0;
 
         for (servers, 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
             // Check dead status via RttCache (hard failure override).
-            const is_dead = if (rtt_cache) |rc| rc.isDead(addr_key) else false;
+            const is_dead = if (rtt_cache) |rc| rc.isDead(addr_key, now_ms) else false;
             if (is_dead) {
                 order_buf[max_order - 1 - dead_count] = i;
                 dead_count += 1;
@@ -463,7 +468,7 @@ test "arms map is bounded under random-zone load" {
         sel.recordOutcome(zone, server, .success, 10_000);
         // Cap permits brief overshoot up to one eviction batch but should
         // never grow unboundedly.
-        try testing.expect(sel.arms.count() <= sel.max_arms + 1);
+        try testing.expect(sel.count() <= sel.max_arms + 1);
     }
 }
 

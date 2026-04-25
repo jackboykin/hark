@@ -128,12 +128,20 @@ pub const RttCache = struct {
     }
 
     /// Check whether the server is currently marked dead.
-    pub fn isDead(self: *RttCache, key: AddressKey) bool {
+    pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
 
         const state = self.entries.get(key) orelse return false;
-        return state.dead_until_ms > self.now_fn();
+        return state.dead_until_ms > now_ms;
+    }
+
+    pub fn nowMs(self: *const RttCache) i64 {
+        return self.now_fn();
+    }
+
+    pub fn count(self: *const RttCache) usize {
+        return self.entries.count();
     }
 };
 
@@ -211,7 +219,7 @@ test "entries map is bounded under random-server load" {
             1,
         }, 53));
         if (i & 1 == 0) cache.recordSuccess(key, 50_000) else cache.recordTimeout(key);
-        try testing.expect(cache.entries.count() <= cache.max_entries + 1);
+        try testing.expect(cache.count() <= cache.max_entries + 1);
     }
 }
 
@@ -225,16 +233,16 @@ test "recordTimeout increments consecutive count and marks dead" {
 
     // Prime with a success
     cache.recordSuccess(key, 100_000);
-    try testing.expect(!cache.isDead(key));
+    try testing.expect(!cache.isDead(key, cache.nowMs()));
 
     // Timeout 4 times → should be dead
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     cache.recordTimeout(key);
-    try testing.expect(cache.isDead(key));
+    try testing.expect(cache.isDead(key, cache.nowMs()));
 
     // After dead_duration_ms, should recover
     test_now_ms = 1000 + dead_duration_ms + 1;
-    try testing.expect(!cache.isDead(key));
+    try testing.expect(!cache.isDead(key, cache.nowMs()));
 }
