@@ -820,6 +820,10 @@ const WorkerState = struct {
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
         if (data.len < 12) return;
+        // RFC 1035 §4.1.1: drop QR=1 silently. Treating a spoofed response
+        // as a query would let an attacker reflect upstream resolutions
+        // off this server.
+        if (data[2] & 0x80 != 0) return;
         const id = mem.readInt(u16, data[0..2], .big);
         const rd = data[2] & 0x01 != 0; // RFC 1035 §4.1.1: echo RD in response
         // Pre-validate from raw header bytes to avoid wasting pool threads
@@ -1360,6 +1364,10 @@ fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?voi
 }
 
 fn validateQuery(query: dns.Message) ?dns.RCode {
+    // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
+    // resolve it. Returning format_error keeps the TCP connection useful
+    // (UDP path drops silently before parse).
+    if (query.header.qr) return .format_error;
     if (query.header.opcode != .query) return .not_implemented;
     if (query.questions.len != 1) return .format_error;
     if (query.questions[0].qclass != .in) return .refused;
@@ -1610,6 +1618,16 @@ test "serializeErrorResponse with no question (parse failure)" {
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
     try testing.expectEqual(dns.RCode.format_error, parsed.header.rcode);
     try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
+}
+
+test "validateQuery rejects QR=1 (response posing as query)" {
+    // RFC 1035 §4.1.1: resolving a QR=1 packet would make hark a reflection vector.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    spoofed.header.qr = true;
+
+    try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?);
 }
 
 test "createSocket UDP binds to ephemeral port" {

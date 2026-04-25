@@ -524,11 +524,14 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
+/// RFC 8467 §4.1 recommended block-size for DoT query padding.
+pub const dot_padding_target: u16 = 468;
+
 pub const EdnsConfig = struct {
     udp_payload_size: u16 = edns_udp_payload,
     do_bit: bool = false,
     /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) to reach
-    /// this total message size. RFC 8467 §4.1 recommends 468 for DoT.
+    /// this total message size. See `dot_padding_target` for DoT.
     padding_target: u16 = 0,
 };
 
@@ -1191,8 +1194,11 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
         // EDNS0 padding (RFC 7830, option code 12): pad total message to padding_target
         var padding_len: u16 = 0;
         if (opt.padding_target > 0) {
-            // OPT fixed overhead: 1(name) + 2(type) + 2(class) + 4(ttl) + 2(rdlength) = 11
-            const msg_size_before_padding = ser.pos + 11 + rdlength + 4; // +4 for padding option header
+            // ser.pos already includes name(1) + type(2) + class(2) + ttl(4) = 9
+            // bytes of OPT. Only the rdlength (2) and the padding option header
+            // (4) remain unwritten, so the predicted final size is ser.pos + 6
+            // + rdlength + padding_len.
+            const msg_size_before_padding = ser.pos + 2 + rdlength + 4;
             if (opt.padding_target > msg_size_before_padding) {
                 padding_len = @intCast(opt.padding_target - msg_size_before_padding);
             }
@@ -2059,6 +2065,26 @@ test "EDNS0: serialized OPT has correct wire format" {
     try testing.expectEqual(@as(u32, 0x00008000), ttl);
     // RDLENGTH = 0
     try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
+}
+
+test "EDNS0: padding_target produces wire of exactly that size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const msg = try buildQueryWithOptions(alloc, 0xBEEF, "example.com", .a, .{
+        .rd = true,
+        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_target = dot_padding_target },
+    });
+
+    var buf: [max_udp_payload]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+
+    try testing.expectEqual(@as(usize, dot_padding_target), wire.len);
+
+    // And it should still parse cleanly with the OPT carrying a padding option.
+    const parsed = try parseMessage(alloc, wire);
+    try testing.expect(parsed.opt != null);
 }
 
 test "EDNS0: buildQuery without edns has no opt" {

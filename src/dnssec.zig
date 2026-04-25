@@ -1036,11 +1036,12 @@ pub fn validateAnswerRrset(
     return .secure;
 }
 
-/// RFC 6840 §5.11: supported RRSIG algorithms.
-/// RFC 8624: RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7) are NOT RECOMMENDED; treat as unsupported.
+/// RFC 8624 §3.1: MUST validate RSASHA1/RSASHA1-NSEC3 even though they
+/// are NOT RECOMMENDED for signing — signing-not-recommended is not
+/// validation-unsupported.
 fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
-        .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
+        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
         else => false,
     };
 }
@@ -1168,6 +1169,24 @@ test "keyTag computation" {
     // ac += (1802 >> 16) & 0xFFFF = 0
     // tag = 1802 & 0xFFFF = 1802
     try testing.expectEqual(@as(u16, 1802), tag);
+}
+
+test "isSupportedAlgorithm covers RFC 8624 MUST-validate set" {
+    // RFC 8624 §3.1: validators MUST validate algorithms 5 (RSASHA1),
+    // 7 (RSASHA1-NSEC3-SHA1), 8 (RSASHA256), 10 (RSASHA512), 13 and 14
+    // (ECDSA), 15 (Ed25519). Marking any of these unsupported silently
+    // downgrades signed zones to insecure and lets forged answers through.
+    try testing.expect(isSupportedAlgorithm(.rsasha1));
+    try testing.expect(isSupportedAlgorithm(.rsasha1_nsec3));
+    try testing.expect(isSupportedAlgorithm(.rsasha256));
+    try testing.expect(isSupportedAlgorithm(.rsasha512));
+    try testing.expect(isSupportedAlgorithm(.ecdsap256sha256));
+    try testing.expect(isSupportedAlgorithm(.ecdsap384sha384));
+    try testing.expect(isSupportedAlgorithm(.ed25519));
+    // Algorithms RFC 8624 declares MUST NOT use for either signing or
+    // validation should still register as unsupported.
+    try testing.expect(!isSupportedAlgorithm(.rsamd5));
+    try testing.expect(!isSupportedAlgorithm(.dsasha1));
 }
 
 test "isValidZoneKey (RFC 4034 §2.1.1–2)" {

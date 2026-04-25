@@ -980,7 +980,7 @@ pub const RecursiveResolver = struct {
                             // Known-good server → try encrypted (pool or new connection)
                             const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
                                 .rd = false,
-                                .edns = .{ .do_bit = self.dnssec_aware, .padding_target = 468 },
+                                .edns = .{ .do_bit = self.dnssec_aware, .padding_target = dns.dot_padding_target },
                             });
                             var padded_buf: [dns.edns_udp_payload]u8 = undefined;
                             const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
