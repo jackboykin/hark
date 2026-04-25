@@ -246,28 +246,39 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 
 /// Clone cached records into caller-owned ResourceRecords with a given TTL.
 /// The caller's allocator MUST be an arena (or otherwise free-resilient):
-/// the records alias one shared flat-allocated owner name (members of an
-/// RRset share owner, qtype, qclass), and the flat layout cannot be passed
-/// to `dns.freeName`. Today every caller uses a per-query arena.
+/// records share an inline wire-bytes region packed alongside the records
+/// array, and an out-of-line shared owner name from `cloneNameFlat` —
+/// neither can be freed individually. Today every caller uses a per-query
+/// arena.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
-    const records = try alloc.alloc(dns.ResourceRecord, cached.len);
-    if (cached.len == 0) return records;
-    const shared_name = try dns.cloneNameFlat(alloc, cached[0].name);
+    if (cached.len == 0) return try alloc.alloc(dns.ResourceRecord, 0);
 
+    const RR = dns.ResourceRecord;
+    const records_bytes = @sizeOf(RR) * cached.len;
     var total_wire: usize = 0;
     for (cached) |cr| total_wire += cr.wire.len;
-    const wire_buf = try alloc.alloc(u8, total_wire);
+
+    const buf = try alloc.alignedAlloc(
+        u8,
+        comptime std.mem.Alignment.fromByteUnits(@alignOf(RR)),
+        records_bytes + total_wire,
+    );
+    const records_ptr: [*]RR = @ptrCast(buf.ptr);
+    const records: []RR = records_ptr[0..cached.len];
+    const wire_area = buf[records_bytes..];
+
+    const shared_name = try dns.cloneNameFlat(alloc, cached[0].name);
 
     var offset: usize = 0;
     for (cached, 0..) |cr, i| {
-        @memcpy(wire_buf[offset..][0..cr.wire.len], cr.wire);
+        @memcpy(wire_area[offset..][0..cr.wire.len], cr.wire);
         records[i] = .{
             .name = shared_name,
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
             .rdata = try cloneRData(alloc, cr.rdata),
-            .wire = wire_buf[offset..][0..cr.wire.len],
+            .wire = wire_area[offset..][0..cr.wire.len],
             .wire_ttl_offset = cr.wire_ttl_offset,
         };
         offset += cr.wire.len;
