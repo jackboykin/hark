@@ -42,6 +42,7 @@ writer: Writer,
 /// Populated when `error.TlsAlert` is returned.
 alert: ?tls.Alert = null,
 read_err: ?ReadError = null,
+write_err: ?WriteError = null,
 tls_version: tls.ProtocolVersion,
 read_seq: u64,
 write_seq: u64,
@@ -66,6 +67,10 @@ pub const ReadError = error{
     TlsRecordOverflow,
     TlsUnexpectedMessage,
     TlsIllegalParameter,
+    TlsSequenceOverflow,
+};
+
+pub const WriteError = error{
     TlsSequenceOverflow,
 };
 
@@ -999,20 +1004,20 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
     done: {
         {
             const buf = w.buffered();
-            const prepared = prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
+            const prepared = try prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
             total_clear += prepared.cleartext_len;
             ciphertext_end += prepared.ciphertext_end;
             if (prepared.cleartext_len < buf.len) break :done;
         }
         for (data[0 .. data.len - 1]) |buf| {
-            const prepared = prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
+            const prepared = try prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
             total_clear += prepared.cleartext_len;
             ciphertext_end += prepared.ciphertext_end;
             if (prepared.cleartext_len < buf.len) break :done;
         }
         const buf = data[data.len - 1];
         for (0..splat) |_| {
-            const prepared = prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
+            const prepared = try prepareCiphertextRecord(c, ciphertext_buf[ciphertext_end..], buf, .application_data);
             total_clear += prepared.cleartext_len;
             ciphertext_end += prepared.ciphertext_end;
             if (prepared.cleartext_len < buf.len) break :done;
@@ -1026,7 +1031,7 @@ fn flush(w: *Writer) Writer.Error!void {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
     const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
+    const prepared = try prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
 }
@@ -1038,7 +1043,7 @@ pub fn end(c: *Client) Writer.Error!void {
     try flush(&c.writer);
     const output = c.output;
     const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
+    const prepared = try prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
     output.advance(prepared.ciphertext_end);
 }
 
@@ -1047,7 +1052,7 @@ fn prepareCiphertextRecord(
     ciphertext_buf: []u8,
     bytes: []const u8,
     inner_content_type: tls.ContentType,
-) struct {
+) Writer.Error!struct {
     ciphertext_end: usize,
     cleartext_len: usize,
 } {
@@ -1095,7 +1100,7 @@ fn prepareCiphertextRecord(
                         break :nonce @as(V, pv.client_iv) ^ operand;
                     };
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_key);
-                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch std.math.maxInt(u64);
+                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch return failWrite(c, error.TlsSequenceOverflow);
                 }
             },
             .tls_1_2 => {
@@ -1137,7 +1142,7 @@ fn prepareCiphertextRecord(
                     const auth_tag = ciphertext_buf[ciphertext_end..][0..P.mac_length];
                     ciphertext_end += P.mac_length;
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_write_key);
-                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch std.math.maxInt(u64);
+                    c.write_seq = std.math.add(u64, c.write_seq, 1) catch return failWrite(c, error.TlsSequenceOverflow);
                 }
             },
             else => unreachable,
@@ -1362,6 +1367,11 @@ fn rebase(r: *Reader, capacity: usize) void {
 fn failRead(c: *Client, err: ReadError) error{ReadFailed} {
     c.read_err = err;
     return error.ReadFailed;
+}
+
+fn failWrite(c: *Client, err: WriteError) Writer.Error {
+    c.write_err = err;
+    return error.WriteFailed;
 }
 
 fn logSecrets(w: *Writer, context: anytype, secrets: anytype) void {
