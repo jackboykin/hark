@@ -84,6 +84,8 @@ pub const TlsTransport = struct {
         const file = File{ .handle = sock, .flags = .{ .nonblocking = false } };
         conn.sock = sock;
         conn.last_used = 0;
+        conn.query_count = 0;
+        conn.max_queries = 200;
         conn.net_reader = File.Reader.initStreaming(file, self.io, &conn.net_read_buf);
         conn.net_writer = File.Writer.initStreaming(file, self.io, &conn.net_write_buf);
         return conn;

@@ -77,6 +77,10 @@ pub const PooledConnection = struct {
     net_writer: File.Writer,
     tls_client: VendoredTlsClient,
     last_used: i64,
+    /// Per-RFC 7766 §6.2.1: bound queries on a single TLS session. Matches the
+    /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
+    query_count: u16 = 0,
+    max_queries: u16 = 200,
 
     // Inline buffers — stable addresses since struct is heap-allocated.
     net_read_buf: [VendoredTlsClient.min_buffer_len]u8,
@@ -96,6 +100,18 @@ pub const PooledConnection = struct {
     pub fn destroyBroken(self: *PooledConnection, allocator: Allocator) void {
         sys.close(self.sock);
         allocator.destroy(self);
+    }
+
+    pub fn isExpired(self: *const PooledConnection) bool {
+        return self.query_count >= self.max_queries;
+    }
+
+    pub fn recordUse(self: *PooledConnection) void {
+        self.query_count +|= 1;
+    }
+
+    pub fn initCounters(self: *PooledConnection) void {
+        self.query_count = 1;
     }
 };
 
@@ -584,6 +600,36 @@ test "ConnectionPool per-key cap evicts oldest within key" {
     const got = pool.acquire(key).?;
     try testing.expectEqual(c_new, got);
     pool.release(key, got, true);
+}
+
+test "TlsPool max queries eviction (RFC 7766 §6.2.1)" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TlsPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    defer pool.deinit();
+
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
+    const conn = try createTestConnection(testing.allocator);
+    conn.max_queries = 3;
+    pool.store(key, conn); // initCounters → query_count = 1
+
+    const a1 = pool.acquire(key).?;
+    pool.release(key, a1, true); // recordUse → query_count = 2
+    const a2 = pool.acquire(key).?;
+    pool.release(key, a2, true); // recordUse → query_count = 3
+
+    // Cap reached: acquire detects isExpired and discards.
+    const result = pool.acquire(key);
+    try testing.expect(result == null);
+    try testing.expect(pool.entries.count() == 0);
 }
 
 test "TcpConnectionPool max queries eviction" {
