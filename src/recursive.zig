@@ -110,6 +110,11 @@ pub const RecursiveResolver = struct {
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
+    /// Per-resolution KeyTrap (CVE-2023-50387) budget. Reset at every `resolve()`
+    /// entry so it bounds work for one user-facing query (incl. all CNAME hops,
+    /// referrals, DNSKEY/DS validations, and authority NSEC checks).
+    validation_budget: dnssec.ValidationBudget = .{},
+
     /// Create a thread-local resolver clone with fresh transports. Shared
     /// caches and config are inherited; transport and per-query mutable
     /// state are reset so the clone is safe for independent resolution.
@@ -120,6 +125,7 @@ pub const RecursiveResolver = struct {
         resolver.gpa = null;
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
+        resolver.validation_budget = .{};
         return resolver;
     }
 
@@ -154,6 +160,7 @@ pub const RecursiveResolver = struct {
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
+        self.validation_budget = .{};
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
         return result;
@@ -1189,7 +1196,7 @@ pub const RecursiveResolver = struct {
             if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
-                        validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed) catch return null;
+                        validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null;
                     },
                     .negative => {}, // Insecure delegation — no DS validation needed
                 }
@@ -1203,13 +1210,13 @@ pub const RecursiveResolver = struct {
                     if (!self.fetchDsFromParent(allocator, zone_name)) return null;
                     const ds_result = c.lookup(allocator, zone_name, .ds, .in) orelse return null;
                     switch (ds_result) {
-                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed) catch return null,
+                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null,
                         .negative => return null, // Re-probe established insecure — caller's security_state is stale
                     }
                 } else {
                     // Root zone: validate against hardcoded trust anchor
                     const now_u32 = epochNowU32();
-                    dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32) catch return null;
+                    dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32, &self.validation_budget) catch return null;
                 }
             }
         }
@@ -1428,7 +1435,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (try self.fetchDnskey(allocator, signer_dotted, servers)) orelse return .bogus;
 
         // Validate the answer RRsets
-        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32)) {
+        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32, &self.validation_budget)) {
             .secure => {
                 response.header.ad = true;
                 return .valid;
@@ -1467,7 +1474,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
         const now_u32 = epochNowU32();
-        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32);
+        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, &self.validation_budget);
     }
 
     /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.
@@ -1906,6 +1913,7 @@ fn validateDnskeyAgainstDs(
     dnskey_answers: []const dns.ResourceRecord,
     ds_records_rr: []const dns.ResourceRecord,
     zone_parsed: dns.Name,
+    budget: ?*dnssec.ValidationBudget,
 ) !void {
     var ds_records: [16]dns.DsData = undefined;
     var ds_count: usize = 0;
@@ -1923,6 +1931,7 @@ fn validateDnskeyAgainstDs(
             ds_records[0..ds_count],
             zone_parsed,
             now_u32,
+            budget,
         );
     }
 }

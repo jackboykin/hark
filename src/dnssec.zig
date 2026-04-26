@@ -20,6 +20,30 @@ pub const VerifyError = error{
     InvalidRData,
     BufferTooSmall,
     SignatureExpired,
+    /// CVE-2023-50387 (KeyTrap) defense: per-resolution signature-verify budget
+    /// exhausted. Callers map this to .bogus; the response SERVFAILs.
+    ValidationBudgetExhausted,
+};
+
+// ── KeyTrap (CVE-2023-50387) Defense ─────────────────────────────────
+
+/// Caps RRSIG verifications per query to bound DS×DNSKEY×RRSIG amplification
+/// (CVE-2023-50387, KeyTrap). 64 ≈ 2× the worst legitimate case (~25 verifies
+/// for cold-cache lookups under KSK rollover with multi-algorithm signing).
+/// Raise if legitimately complex zones SERVFAIL; lower under tight CPU budgets.
+pub const max_sig_verify_per_resolution: u16 = 64;
+
+/// Per-resolution counter for RRSIG verification attempts. One instance is
+/// shared across all `verifyRrsig` calls for a single user query (DNSKEY
+/// validation, answer validation, authority NSEC validation). Owned by the
+/// resolver; reset at the top of each `resolve()`.
+pub const ValidationBudget = struct {
+    sig_verify_remaining: u16 = max_sig_verify_per_resolution,
+
+    pub fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
+        if (self.sig_verify_remaining == 0) return error.ValidationBudgetExhausted;
+        self.sig_verify_remaining -= 1;
+    }
 };
 
 // ── Security Status ──────────────────────────────────────────────────
@@ -115,6 +139,7 @@ pub fn validateDnskeyRrset(
     ds_records: []const dns.DsData,
     zone_name: dns.Name,
     now_u32: u32,
+    budget: ?*ValidationBudget,
 ) VerifyError!void {
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
@@ -156,8 +181,8 @@ pub fn validateDnskeyRrset(
 
                 if (rrsig.key_tag == ksk_tag) {
                     // Direct KSK verification
-                    verifyRrsig(rrsig, ksk, filtered, now_u32) catch continue;
-                    return;
+                    if (try tryVerifyRrsig(rrsig, ksk, filtered, now_u32, budget)) return;
+                    continue;
                 }
 
                 // Fallback: signing key must be DS-authenticated (C2 fix)
@@ -174,8 +199,7 @@ pub fn validateDnskeyRrset(
                         break;
                     }
                     if (!ds_auth) continue;
-                    verifyRrsig(rrsig, dk, filtered, now_u32) catch continue;
-                    return;
+                    if (try tryVerifyRrsig(rrsig, dk, filtered, now_u32, budget)) return;
                 }
             }
         }
@@ -209,9 +233,7 @@ pub fn classifyDelegation(
 
     if (has_ds) return .secure;
 
-    // No DS — check for NSEC/NSEC3 proof of DS absence
-    var had_nsec3_high_iterations = false;
-
+    // No DS — check for NSEC/NSEC3 proof of DS absence.
     // All NSEC3 records in a response share the same salt/iterations (RFC 9276),
     // so the child zone hash can be computed once and reused across all records.
     var cached_hash: ?[Sha1.digest_length]u8 = null;
@@ -232,10 +254,10 @@ pub fn classifyDelegation(
             // Permissive: skip unsupported hash algos to let a sibling NSEC3
             // still prove the zone insecure. Validation path is strict below.
             if (nsec3.hash_algorithm != .sha1) continue;
-            if (nsec3.iterations > max_nsec3_iterations) {
-                had_nsec3_high_iterations = true;
-                continue;
-            }
+            // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Per
+            // RFC 5155 §7.3, all NSEC3 in a zone share the same iterations,
+            // so one high-iteration record taints the whole proof.
+            if (nsec3.iterations > max_nsec3_iterations) return .insecure;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
 
             // Reuse cached hash if salt/iterations match, otherwise recompute.
@@ -267,7 +289,6 @@ pub fn classifyDelegation(
     }
 
     // No DS and no valid proof of absence — fail closed to SERVFAIL.
-    // Covers both high-iteration NSEC3 (RFC 9276 §4) and missing proof.
     return .secure;
 }
 
@@ -531,15 +552,40 @@ fn serialAfter(s1: u32, s2: u32) bool {
 /// 5 minutes — covers typical NTP drift; stricter than Unbound (1h floor).
 pub const clock_skew_tolerance: u32 = 300;
 
+/// Verify an RRSIG, returning true on success, false on non-budget failure.
+/// Propagates ValidationBudgetExhausted so callers can bail out of loops.
+fn tryVerifyRrsig(
+    rrsig: dns.RrsigData,
+    dnskey: dns.DnskeyData,
+    rrset: []const dns.ResourceRecord,
+    now_u32: u32,
+    budget: ?*ValidationBudget,
+) error{ValidationBudgetExhausted}!bool {
+    verifyRrsig(rrsig, dnskey, rrset, now_u32, budget) catch |e| switch (e) {
+        error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
+        else => return false,
+    };
+    return true;
+}
+
 /// Verify an RRSIG signature against a DNSKEY and RRset.
 pub fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
+    budget: ?*ValidationBudget,
 ) VerifyError!void {
-    // RFC 4034 §3.1.3: labels MUST NOT exceed the owner's non-root label count.
+    // KeyTrap (CVE-2023-50387) mitigation: charge before any work so attempts
+    // count even when the cheap pre-checks below would reject.
+    if (budget) |b| try b.consumeVerify();
+
+    // RFC 4034 §3.1.3: signer name MUST be a (non-strict) ancestor of every
+    // RRset owner, and `labels` MUST NOT exceed the owner's non-root label
+    // count. Owner-vs-signer is also checked at the resolver layer (bailiwick
+    // scrubbing); enforcing here defends future callers from missing it.
     for (rrset) |rr| {
+        if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.labels.len) return error.InvalidSignature;
         if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
     }
@@ -915,7 +961,9 @@ fn validateNsec3NegativeProof(
         if (rr.rtype == .nsec3) {
             const nsec3 = rr.rdata.nsec3;
             if (nsec3.hash_algorithm != .sha1) return .bogus;
-            if (nsec3.iterations > max_nsec3_iterations) return .bogus;
+            // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Mirrors
+            // classifyDelegation — both paths share one policy.
+            if (nsec3.iterations > max_nsec3_iterations) return .insecure;
             salt = nsec3.salt;
             iterations = nsec3.iterations;
             found_nsec3 = true;
@@ -1023,16 +1071,17 @@ pub fn validateAnswerRrset(
     qtype: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
+    budget: ?*ValidationBudget,
 ) SecurityStatus {
     // Validate the main answer type
-    if (validateRrsetForType(answers, qtype, dnskey_records, now_u32) == .bogus) return .bogus;
+    if (validateRrsetForType(answers, qtype, dnskey_records, now_u32, budget) == .bogus) return .bogus;
 
     // If answers contain CNAME records, validate the CNAME RRset too.
     // After bailiwick scrubbing, all answer records are from the same zone.
     if (qtype != .cname) {
         for (answers) |rr| {
             if (rr.rtype == .cname) {
-                if (validateRrsetForType(answers, .cname, dnskey_records, now_u32) == .bogus) return .bogus;
+                if (validateRrsetForType(answers, .cname, dnskey_records, now_u32, budget) == .bogus) return .bogus;
                 break;
             }
         }
@@ -1058,6 +1107,7 @@ fn validateRrsetForType(
     covered_type: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
+    budget: ?*ValidationBudget,
 ) SecurityStatus {
     var had_unsupported_algo = false;
     for (answers) |sig_rr| {
@@ -1088,8 +1138,7 @@ fn validateRrsetForType(
             if (!isValidZoneKey(dk)) continue;
             if (keyTag(dk) != rrsig.key_tag) continue;
             if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
-            verifyRrsig(rrsig, dk, filtered[0..count], now_u32) catch continue;
-            return .secure;
+            if (tryVerifyRrsig(rrsig, dk, filtered[0..count], now_u32, budget) catch return .bogus) return .secure;
         }
     }
     // RFC 6840 §5.11: all-unsupported algorithms → insecure, not bogus.
@@ -1104,6 +1153,7 @@ pub fn verifyAuthorityNsecSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
+    budget: ?*ValidationBudget,
 ) SecurityStatus {
     // Verify that every NSEC/NSEC3 record has a valid RRSIG.
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
@@ -1142,9 +1192,10 @@ pub fn verifyAuthorityNsecSigs(
                 if (!isValidZoneKey(dk)) continue;
                 if (keyTag(dk) != rrsig.key_tag) continue;
                 if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
-                verifyRrsig(rrsig, dk, rrset[0..rrset_count], now_u32) catch continue;
-                sig_verified = true;
-                break;
+                if (tryVerifyRrsig(rrsig, dk, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
+                    sig_verified = true;
+                    break;
+                }
             }
             if (sig_verified) break;
         }
@@ -1295,7 +1346,7 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
 
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000),
+        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, null),
     );
 }
 
@@ -2253,8 +2304,10 @@ test "NSEC3 hash budget exhaustion" {
     try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
 }
 
-test "NSEC3 high-iteration returns bogus" {
-    // Iterations > 150 → .bogus (RFC 9276 §4: fail closed, don't downgrade to insecure)
+test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
+    // Iterations > 150 → .insecure: validator opts out of expensive proof rather
+    // than burning CPU. classifyDelegation and validateNegativeProof both apply
+    // this policy uniformly.
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "www"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -2279,9 +2332,13 @@ test "NSEC3 high-iteration returns bogus" {
         } },
     }};
 
-    // Both NXDOMAIN and NODATA should return .bogus
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true));
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, false));
+    // Both NXDOMAIN and NODATA negative-proof paths return .insecure
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false));
+
+    // classifyDelegation matches: high-iteration NSEC3 → insecure delegation
+    const child_zone = dns.Name{ .labels = zone_labels };
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────
@@ -2322,12 +2379,12 @@ const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
 
 test "verifyRrsig rejects expired signature" {
     // now is past expiration by more than the clock-skew tolerance
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + clock_skew_tolerance + 1));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + clock_skew_tolerance + 1, null));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
     // now is before inception by more than the clock-skew tolerance
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - clock_skew_tolerance - 1));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - clock_skew_tolerance - 1, null));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
@@ -2336,8 +2393,89 @@ test "verifyRrsig tolerates clock skew within window" {
         1699000000 - clock_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
-        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now));
+        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, null));
     }
+}
+
+test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.1.3)" {
+    // Cross-zone signer ("example.org" trying to sign "example.com" record):
+    // the crypto layer rejects independently of the bailiwick check upstream.
+    const cross_signer = dns.Name{ .labels = &.{ "example", "org" } };
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 12345,
+        .signer_name = cross_signer,
+        .signature = &.{},
+    };
+    const rrset = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+    };
+    try testing.expectError(
+        error.InvalidSignature,
+        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, null),
+    );
+}
+
+test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
+    var budget: ValidationBudget = .{ .sig_verify_remaining = 2 };
+    // Each call charges one unit, even when later checks would reject (empty
+    // key here trips InvalidKey). Two attempts deplete the budget.
+    inline for (0..2) |_| {
+        try testing.expectError(error.InvalidKey, verifyRrsig(
+            test_window_rrsig,
+            test_window_dnskey,
+            test_window_empty_rrset,
+            1699500000,
+            &budget,
+        ));
+    }
+    try testing.expectEqual(@as(u16, 0), budget.sig_verify_remaining);
+    try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
+        test_window_rrsig,
+        test_window_dnskey,
+        test_window_empty_rrset,
+        1699500000,
+        &budget,
+    ));
+}
+
+test "validateRrsetForType propagates budget exhaustion as bogus" {
+    // Pathological setup: one RRSIG covering A, with a DNSKEY whose key_tag
+    // matches. The budget is pre-exhausted, so the very first verifyRrsig
+    // attempt trips ValidationBudgetExhausted, which the caller maps to bogus.
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const tag = keyTag(dnskey);
+    const rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = tag,
+        .signer_name = test_owner,
+        .signature = &.{},
+    };
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = rrsig } },
+    };
+    const dnskeys = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
+    };
+    var budget: ValidationBudget = .{ .sig_verify_remaining = 0 };
+    const status = validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget);
+    try testing.expectEqual(SecurityStatus.bogus, status);
 }
 
 // ── H3: RSA key validation tests ────────────────────────────────────
