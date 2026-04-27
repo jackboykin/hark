@@ -203,6 +203,21 @@ pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
     posix.setsockopt(sock, posix.SOL.SOCKET, opt, std.mem.asBytes(&timeout)) catch {};
 }
 
+/// Disable Nagle's algorithm. Kernel persists this across the fd lifetime.
+/// With Nagle on + delayed-ACK on the peer, length-prefix + body writes (or
+/// back-to-back queries on a pooled connection) can stall up to 40 ms.
+pub fn setNoDelay(sock: posix.fd_t) void {
+    const one: c_int = 1;
+    posix.setsockopt(sock, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+}
+
+/// Suppress the next delayed-ACK on this socket. Kernel auto-clears the flag
+/// after the next ACK fires, so re-arm after every recv on a pooled fd.
+pub fn setQuickAck(sock: posix.fd_t) void {
+    const one: c_int = 1;
+    posix.setsockopt(sock, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&one)) catch {};
+}
+
 /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
 /// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
 pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {
@@ -214,6 +229,42 @@ pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeou
     ));
     if (remaining_ms == 0) return error.Timeout;
     setSocketTimeout(sock, opt, remaining_ms);
+}
+
+test "setNoDelay and setQuickAck flip the kernel TCP options" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const sock = try socket(linux.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(sock);
+
+    var val: c_int = -1;
+    var len: posix.socklen_t = @sizeOf(c_int);
+
+    // NODELAY default is 0 (Nagle on); confirm the helper flips it to 1.
+    {
+        const rc = linux.getsockopt(sock, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&val), &len);
+        try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
+        try std.testing.expectEqual(@as(c_int, 0), val);
+    }
+    setNoDelay(sock);
+    {
+        val = -1;
+        len = @sizeOf(c_int);
+        const rc = linux.getsockopt(sock, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&val), &len);
+        try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
+        try std.testing.expectEqual(@as(c_int, 1), val);
+    }
+
+    // QUICKACK is one-shot: the kernel auto-clears after the next ACK fires,
+    // so this just verifies the setsockopt succeeds and the kernel reports 1.
+    setQuickAck(sock);
+    {
+        val = -1;
+        len = @sizeOf(c_int);
+        const rc = linux.getsockopt(sock, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&val), &len);
+        try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
+        try std.testing.expectEqual(@as(c_int, 1), val);
+    }
 }
 
 pub fn pipe() ![2]posix.fd_t {

@@ -157,12 +157,19 @@ pub const RecursiveResolver = struct {
         prefetch_qtype: dns.RType = .a,
         /// DNSKEY zone needing async refresh (TTL < 10%). Server handles after responding.
         prefetch_dnskey_zone: ?[]const u8 = null,
+        /// Happy-Eyeballs (RFC 8305) cousin qtype — A↔AAAA pairing.
+        cousin_prefetch_qtype: ?dns.RType = null,
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         self.validation_budget = .{};
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
+        result.cousin_prefetch_qtype = switch (qtype) {
+            .a => .aaaa,
+            .aaaa => .a,
+            else => null,
+        };
         return result;
     }
 
@@ -855,10 +862,10 @@ pub const RecursiveResolver = struct {
         }
         if (leg_count < 2) return null;
 
-        const stagger = if (self.rtt_cache) |rc| blk: {
-            const rtt = rc.getTimeout(AddressKey.fromAddress(servers[leg_idxs[0]]));
-            break :blk @min(300, @max(50, rtt));
-        } else self.stagger_ms;
+        const stagger = if (self.rtt_cache) |rc|
+            rc.getHedgeStagger(AddressKey.fromAddress(servers[leg_idxs[0]]))
+        else
+            self.stagger_ms;
 
         const overall_timeout = self.transport.config.timeout_ms;
 
@@ -1552,8 +1559,12 @@ pub const RecursiveResolver = struct {
         return added;
     }
 
+    const ns_addr_dedup_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
     /// Resolve one (ns_name, rtype) pair and append any resulting addresses
     /// to `addrs[count..]`. Non-OOM resolution failures are swallowed.
+    /// Wrapped in dedup so concurrent recursions hitting the same NS collapse;
+    /// bounded timeout prevents follower-deadlock under cross-NS dependencies.
     fn resolveNsNameOne(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1563,6 +1574,12 @@ pub const RecursiveResolver = struct {
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!void {
+        const leader = if (self.dedup) |dedup|
+            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, 0, ns_addr_dedup_timeout_ns) == .leader
+        else
+            false;
+        defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, 0);
+
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
             _ = appendAddressesFromRecords(r.message.answers, addrs, count);
         } else |err| {

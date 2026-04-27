@@ -112,10 +112,14 @@ pub const TlsTransport = struct {
 
         // After the guards above: either skip_verification is true, or
         // server_name is non-null. The `.?` unwraps are infallible.
+        // Send ALPN "dot" per RFC 9539 §4.4 but don't require echo: Cloudflare
+        // and Google's DoT endpoints accept the protocol without echoing it
+        // back, in violation of RFC 7301 §3.2.
         conn.tls_client = VendoredTlsClient.init(&conn.net_reader.interface, &conn.net_writer.interface, .{
             .host = if (self.config.skip_verification) .no_verification else .{ .explicit = self.config.server_name.? },
             .ca = if (self.config.skip_verification) .no_verification else .{ .bundle = self.ca_bundle },
-            .alpn = "dot", // RFC 9539 §4.4: DoT queries MUST use ALPN "dot"
+            .alpn = "dot",
+            .alpn_required = false,
             .read_buffer = &conn.tls_read_buf,
             .write_buffer = &conn.tls_write_buf,
         }, self.io) catch return error.TlsHandshakeFailed;
@@ -177,6 +181,7 @@ pub const TlsTransport = struct {
         const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
         errdefer sys.close(sock);
         sys.setSocketTimeouts(sock, timeout_ms);
+        sys.setNoDelay(sock);
         na.connectTo(sock, &tls_server) catch return error.ConnectFailed;
         return sock;
     }
@@ -267,6 +272,7 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     // Read response body
     conn.tls_client.reader.readSliceAll(response_buf[0..resp_len]) catch return error.TlsRecvFailed;
 
+    sys.setQuickAck(conn.sock);
     return response_buf[0..resp_len];
 }
 

@@ -860,6 +860,7 @@ const WorkerState = struct {
         const flags = sys.fcntl(client_fd, posix.F.GETFL, 0) catch return;
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
+        sys.setNoDelay(client_fd);
 
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
@@ -872,6 +873,7 @@ const WorkerState = struct {
 
             var query_buf: [dns.max_message_len]u8 = undefined;
             tcpReadExactBlocking(client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
+            sys.setQuickAck(client_fd);
 
             const alloc = query_pta.reset();
             var response_wire: [dns.max_message_len]u8 = undefined;
@@ -916,7 +918,7 @@ const WorkerState = struct {
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
-            self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
+            self.dispatchPrefetches(result, name_str, udp, tcp, tls, prefetch_pta);
             if (query.header.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
@@ -1096,7 +1098,7 @@ const WorkerState = struct {
             sendUdpResponse(sock, wire, client_addr);
         }
 
-        self.dispatchPrefetches(result, udp, tcp, tls, prefetch_pta);
+        self.dispatchPrefetches(result, name_str, udp, tcp, tls, prefetch_pta);
 
         if (query_msg.header.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
@@ -1106,23 +1108,34 @@ const WorkerState = struct {
     fn dispatchPrefetches(
         self: *WorkerState,
         result: recursive.RecursiveResolver.ResolveResult,
+        query_name: []const u8,
         udp: *BlockingUdpTransport,
         tcp: *BlockingTcpTransport,
         tls: ?*TlsTransport,
         prefetch_pta: *PerThreadArena,
     ) void {
-        // Hand prefetches to bg threads so the worker can take the next
-        // inbound query; on cap/spawn failure, fall back to inline on the
-        // worker — a refresh is never dropped.
-        if (result.prefetch_name) |prefetch_name| {
-            if (!self.server.trySpawnBgPrefetch(prefetch_name, result.prefetch_qtype, .prefetch)) {
-                self.doPrefetchWith(prefetch_name, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
-            }
-        }
-        if (result.prefetch_dnskey_zone) |zone| {
-            if (!self.server.trySpawnBgPrefetch(zone, .dnskey, .prefetch)) {
-                self.doPrefetchWith(zone, .dnskey, udp, tcp, tls, prefetch_pta);
-            }
+        // TTL-refresh: bg thread, with inline fallback so a refresh is never dropped.
+        if (result.prefetch_name) |n| self.spawnOrInline(n, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
+        if (result.prefetch_dnskey_zone) |z| self.spawnOrInline(z, .dnskey, udp, tcp, tls, prefetch_pta);
+
+        // RFC 8305 cousin co-prefetch: fire-and-forget, gated on a cache miss.
+        const cousin_qtype = result.cousin_prefetch_qtype orelse return;
+        if (!self.config.prefetch_cousin) return;
+        if (self.cache.lookupExists(query_name, cousin_qtype, .in)) return;
+        _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .prefetch);
+    }
+
+    fn spawnOrInline(
+        self: *WorkerState,
+        name: []const u8,
+        qtype: dns.RType,
+        udp: *BlockingUdpTransport,
+        tcp: *BlockingTcpTransport,
+        tls: ?*TlsTransport,
+        prefetch_pta: *PerThreadArena,
+    ) void {
+        if (!self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) {
+            self.doPrefetchWith(name, qtype, udp, tcp, tls, prefetch_pta);
         }
     }
 

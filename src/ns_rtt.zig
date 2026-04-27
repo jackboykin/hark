@@ -30,6 +30,17 @@ const max_backoff_shifts: u8 = 8;
 /// load. Dropped entries revert to `initial_timeout_ms` next observation.
 pub const default_max_entries: u32 = 4_096;
 
+/// Hedge stagger = `hedge_multiplier × min_rtt`. 3× lands roughly at p95 for
+/// well-behaved RTT distributions (Dean–Barroso "Tail at Scale", CACM 2013).
+const hedge_multiplier: u32 = 3;
+
+/// Re-anchor min_rtt after this long without a new minimum — lets the floor
+/// track upward on route changes that move the path's true floor.
+const hedge_decay_ms: i64 = 30_000;
+
+const hedge_cold_default_ms: u32 = initial_timeout_ms / 4;
+const max_hedge_stagger_ms: u32 = 300;
+
 // ── RttState ─────────────────────────────────────────────────────────
 
 const RttState = struct {
@@ -37,6 +48,8 @@ const RttState = struct {
     rttvar_us: i64, // RTT variance
     consecutive_timeouts: u8,
     dead_until_ms: i64, // Timestamp when dead period ends
+    min_rtt_us: i64, // Windowed minimum RTT (re-anchored after hedge_decay_ms)
+    min_rtt_stamp_ms: i64, // Timestamp of last min_rtt update
 };
 
 // ── RttCache ─────────────────────────────────────────────────────────
@@ -80,6 +93,7 @@ pub const RttCache = struct {
 
     /// Record a successful response with measured RTT (microseconds).
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
+        const now_ms = self.now_fn();
         if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
         defer if (self.rwlock) |*rw| rw.unlock(self.io);
 
@@ -91,6 +105,8 @@ pub const RttCache = struct {
                 .rttvar_us = @divTrunc(rtt_us, 2),
                 .consecutive_timeouts = 0,
                 .dead_until_ms = 0,
+                .min_rtt_us = rtt_us,
+                .min_rtt_stamp_ms = now_ms,
             };
         } else {
             // RFC 6298 EWMA update
@@ -99,8 +115,33 @@ pub const RttCache = struct {
             gop.value_ptr.srtt_us = 7 * @divTrunc(gop.value_ptr.srtt_us, 8) + @divTrunc(rtt_us, 8);
             gop.value_ptr.consecutive_timeouts = 0;
             gop.value_ptr.dead_until_ms = 0;
+
+            // Min-RTT tracking: re-anchor if stale, else take the running min.
+            // Re-anchoring lets the floor track upward on route changes.
+            if (now_ms - gop.value_ptr.min_rtt_stamp_ms > hedge_decay_ms) {
+                gop.value_ptr.min_rtt_us = rtt_us;
+                gop.value_ptr.min_rtt_stamp_ms = now_ms;
+            } else if (rtt_us < gop.value_ptr.min_rtt_us) {
+                gop.value_ptr.min_rtt_us = rtt_us;
+                gop.value_ptr.min_rtt_stamp_ms = now_ms;
+            }
         }
         if (self.entries.count() > self.max_entries) self.entries.clearRetainingCapacity();
+    }
+
+    /// Hedge stagger for the leading-leg server, in ms. Callers must filter
+    /// dead servers (via `isDead`) before calling — this returns a stagger
+    /// even for entries with stale samples.
+    pub fn getHedgeStagger(self: *RttCache, key: AddressKey) u32 {
+        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+
+        const state = self.entries.get(key) orelse return hedge_cold_default_ms;
+        if (state.min_rtt_us <= 0) return hedge_cold_default_ms;
+
+        const stagger_us = @as(i64, hedge_multiplier) * state.min_rtt_us;
+        const stagger_ms: u32 = @intCast(@max(1, @divTrunc(stagger_us, 1000)));
+        return @max(min_timeout_ms, @min(stagger_ms, max_hedge_stagger_ms));
     }
 
     /// Record a timeout for this server (exponential backoff + dead marking).
@@ -115,6 +156,8 @@ pub const RttCache = struct {
                 .rttvar_us = @as(i64, initial_timeout_ms) * 500,
                 .consecutive_timeouts = 1,
                 .dead_until_ms = 0,
+                .min_rtt_us = 0, // Unset — getHedgeStagger returns cold default.
+                .min_rtt_stamp_ms = 0,
             };
         } else {
             if (gop.value_ptr.consecutive_timeouts < 255) {
@@ -221,6 +264,98 @@ test "entries map is bounded under random-server load" {
         if (i & 1 == 0) cache.recordSuccess(key, 50_000) else cache.recordTimeout(key);
         try testing.expect(cache.count() <= cache.max_entries + 1);
     }
+}
+
+test "getHedgeStagger returns cold default for unknown server" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+
+    try testing.expectEqual(hedge_cold_default_ms, cache.getHedgeStagger(testAddr(1)));
+}
+
+test "getHedgeStagger uses 3x min_rtt clamped to [50, 300]" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+    test_now_ms = 1000;
+
+    const key = testAddr(1);
+
+    // 80ms, 60ms, 90ms — minimum is 60ms → stagger = 180ms
+    cache.recordSuccess(key, 80_000);
+    cache.recordSuccess(key, 60_000);
+    cache.recordSuccess(key, 90_000);
+    try testing.expectEqual(@as(u32, 180), cache.getHedgeStagger(key));
+
+    // Floor: 5ms → 3*5=15 → clamped to 50ms
+    const key_low = testAddr(2);
+    cache.recordSuccess(key_low, 5_000);
+    try testing.expectEqual(@as(u32, 50), cache.getHedgeStagger(key_low));
+
+    // Ceiling: 200ms → 3*200=600 → clamped to 300ms
+    const key_high = testAddr(3);
+    cache.recordSuccess(key_high, 200_000);
+    try testing.expectEqual(@as(u32, 300), cache.getHedgeStagger(key_high));
+}
+
+test "min_rtt re-anchors after hedge_decay_ms" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+    test_now_ms = 1000;
+
+    const key = testAddr(1);
+
+    // Anchor at 20ms.
+    cache.recordSuccess(key, 20_000);
+    try testing.expectEqual(@as(u32, 60), cache.getHedgeStagger(key));
+
+    // Within decay window, 100ms doesn't move the floor.
+    test_now_ms = 1000 + hedge_decay_ms - 1;
+    cache.recordSuccess(key, 100_000);
+    try testing.expectEqual(@as(u32, 60), cache.getHedgeStagger(key));
+
+    // Past decay window, 100ms re-anchors → 3*100=300 (at the ceiling).
+    test_now_ms = 1000 + hedge_decay_ms + 1;
+    cache.recordSuccess(key, 100_000);
+    try testing.expectEqual(@as(u32, 300), cache.getHedgeStagger(key));
+}
+
+test "hedge stagger survives transient timeouts that inflate RTO" {
+    // The win: hedge fires at p95 even when one timeout has doubled the RTO.
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+    test_now_ms = 1000;
+
+    const key = testAddr(1);
+    cache.recordSuccess(key, 20_000);
+    const rto_clean = cache.getTimeout(key);
+    const hedge = cache.getHedgeStagger(key);
+
+    cache.recordTimeout(key);
+
+    try testing.expect(cache.getTimeout(key) > rto_clean); // RTO backs off
+    try testing.expectEqual(hedge, cache.getHedgeStagger(key)); // hedge unchanged
+}
+
+test "recordTimeout does not disturb min_rtt" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+    test_now_ms = 1000;
+
+    const key = testAddr(1);
+    cache.recordSuccess(key, 50_000);
+    const before = cache.getHedgeStagger(key);
+
+    cache.recordTimeout(key);
+    cache.recordTimeout(key);
+    cache.recordTimeout(key);
+    cache.recordTimeout(key);
+
+    try testing.expectEqual(before, cache.getHedgeStagger(key));
 }
 
 test "recordTimeout increments consecutive count and marks dead" {

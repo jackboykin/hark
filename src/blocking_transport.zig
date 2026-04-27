@@ -346,6 +346,7 @@ pub const BlockingTcpTransport = struct {
         const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
         errdefer sys.close(sock);
         sys.setSocketTimeout(sock, posix.SO.SNDTIMEO, self.config.connect_timeout_ms);
+        sys.setNoDelay(sock);
         na.connectTo(sock, &server) catch return error.ConnectFailed;
         return sock;
     }
@@ -398,6 +399,7 @@ pub const BlockingTcpTransport = struct {
             body_filled += n;
         }
 
+        sys.setQuickAck(sock);
         return response_buf[0..body_len];
     }
 };
