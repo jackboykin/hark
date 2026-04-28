@@ -459,10 +459,6 @@ pub const Server = struct {
             return;
         }
 
-        // Per-worker TLS transport (shares encrypted_ns_cache + pool across workers)
-        var tls_transport = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
-        if (self.enc_pool) |*pool| tls_transport.pool = pool;
-
         var queue = WorkQueue{ .io = self.io };
 
         // Per-worker Do53 TCP connection pool (RFC 7766)
@@ -476,7 +472,7 @@ pub const Server = struct {
             .allocator = self.allocator,
             .io = self.io,
             .loop = server_loop,
-            .tls_transport = if (self.config.opportunistic) &tls_transport else null,
+            .enc_pool = if (self.enc_pool) |*pool| pool else null,
             .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
             .cache = &self.cache,
             .key_cache = if (self.key_cache) |*kc| kc else null,
@@ -522,8 +518,8 @@ pub const Server = struct {
         queue.signalShutdown();
         for (pool_threads[0..spawned]) |pt| pt.join();
 
-        // Ensure background probe threads that captured &tls_transport complete
-        // before the stack-allocated TlsTransport is destroyed.
+        // Drain detached DoT probe threads before the per-pool-thread
+        // TlsTransport instances they captured go out of scope.
         if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
     }
 
@@ -653,7 +649,7 @@ const WorkerState = struct {
     allocator: mem.Allocator,
     io: Io,
     loop: *EventLoop,
-    tls_transport: ?*TlsTransport,
+    enc_pool: ?*ConnectionPool,
     encrypted_ns_cache: ?*EncryptedNsCache,
     cache: *RRsetCache,
     key_cache: ?*RRsetCache,
@@ -825,8 +821,22 @@ const WorkerState = struct {
     fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
         if (serializeErrorResponse(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
-            sendUdpResponse(self, sock, wire, client_addr);
+            self.sendUdpResponse(sock, wire, client_addr);
         }
+    }
+
+    fn sendUdpResponse(self: *WorkerState, sock: posix.fd_t, data: []const u8, dest: na.Address) void {
+        // MSG_DONTWAIT keeps the pool thread off a saturated kernel send buffer:
+        // dropping the response on WouldBlock/SystemResources is correct DNS
+        // behavior (the client retransmits), and beats stalling the worker.
+        var storage: na.PosixAddress = undefined;
+        const sa_len = na.toSockaddr(&dest, &storage);
+        _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch |err| switch (err) {
+            error.WouldBlock, error.SystemResources => {
+                _ = self.udp_send_drops.fetchAdd(1, .monotonic);
+            },
+            else => {},
+        };
     }
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
@@ -1008,9 +1018,7 @@ const WorkerState = struct {
 
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
             var t = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
-            if (self.tls_transport) |main_tls| {
-                t.pool = main_tls.pool;
-            }
+            t.pool = self.enc_pool;
             break :blk t;
         } else null;
 
@@ -1096,7 +1104,7 @@ const WorkerState = struct {
 
         var wire_buf: [dns.max_message_len]u8 = undefined;
         if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
-            sendUdpResponse(self, sock, wire, client_addr);
+            self.sendUdpResponse(sock, wire, client_addr);
         }
 
         self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
@@ -1410,21 +1418,6 @@ fn tcpWriteMessage(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     mem.writeInt(u16, &len_prefix, @intCast(data.len), .big);
     tcpWriteAllBlocking(fd, &len_prefix, deadline_ns) orelse return null;
     tcpWriteAllBlocking(fd, data, deadline_ns) orelse return null;
-}
-
-fn sendUdpResponse(ws: *WorkerState, sock: posix.fd_t, data: []const u8, dest: na.Address) void {
-    // Direct sendto — the server loop's EventLoop is only for accept/recv/signal.
-    // MSG_DONTWAIT keeps the pool thread off a saturated kernel send buffer:
-    // dropping the response on WouldBlock/SystemResources is correct DNS
-    // behavior (the client retransmits), and beats stalling the worker.
-    var storage: na.PosixAddress = undefined;
-    const sa_len = na.toSockaddr(&dest, &storage);
-    _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch |err| switch (err) {
-        error.WouldBlock, error.SystemResources => {
-            _ = ws.udp_send_drops.fetchAdd(1, .monotonic);
-        },
-        else => {},
-    };
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

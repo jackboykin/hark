@@ -221,6 +221,20 @@ pub fn setQuickAck(sock: posix.fd_t) void {
 /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
 /// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
 pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {
+    const remaining_ms = try remainingMsFromDeadline(deadline_ns);
+    setSocketTimeout(sock, opt, remaining_ms);
+}
+
+/// Like `updateTimeout` but skips the setsockopt when `cached_ms` already
+/// matches the new value. `cached_ms == 0` is treated as "unset, force set."
+pub fn updateTimeoutCached(sock: posix.fd_t, opt: u32, deadline_ns: i128, cached_ms: *u32) error{Timeout}!void {
+    const remaining_ms = try remainingMsFromDeadline(deadline_ns);
+    if (cached_ms.* == remaining_ms) return;
+    setSocketTimeout(sock, opt, remaining_ms);
+    cached_ms.* = remaining_ms;
+}
+
+fn remainingMsFromDeadline(deadline_ns: i128) error{Timeout}!u32 {
     const remaining_ns = deadline_ns - monotonic.nowNs();
     if (remaining_ns <= 0) return error.Timeout;
     const remaining_ms: u32 = @intCast(@min(
@@ -228,7 +242,7 @@ pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeou
         std.math.maxInt(u32),
     ));
     if (remaining_ms == 0) return error.Timeout;
-    setSocketTimeout(sock, opt, remaining_ms);
+    return remaining_ms;
 }
 
 test "setNoDelay and setQuickAck flip the kernel TCP options" {

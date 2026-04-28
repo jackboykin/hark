@@ -129,6 +129,14 @@ pub const RecursiveResolver = struct {
         return resolver;
     }
 
+    fn udp(self: *const RecursiveResolver) *BlockingUdpTransport {
+        return self.transports.do53.asBlocking().udp;
+    }
+
+    fn tcp(self: *const RecursiveResolver) ?*BlockingTcpTransport {
+        return self.transports.do53.asBlocking().tcp;
+    }
+
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
     fn keyCache(self: *RecursiveResolver) ?*RRsetCache {
         if (self.key_cache) |kc| return kc;
@@ -140,7 +148,7 @@ pub const RecursiveResolver = struct {
     const failover_timeout_cap: u32 = 2000;
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.do53.asBlocking().udp.config.timeout_ms;
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.udp().config.timeout_ms;
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
@@ -772,7 +780,7 @@ pub const RecursiveResolver = struct {
         // output across loop iterations — each hop needs its own buffer so
         // those slices survive until the arena resets.
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const response_data = self.transports.do53.asBlocking().udp.queryWithTimeout(
+        const response_data = self.udp().queryWithTimeout(
             wire_query,
             query_id,
             server,
@@ -806,12 +814,12 @@ pub const RecursiveResolver = struct {
         wire_query: []const u8,
         server: na.Address,
     ) error{OutOfMemory}!?dns.Message {
-        const tcp = self.transports.do53.asBlocking().tcp orelse return null;
+        const tcp_t = self.tcp() orelse return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
         const tcp_data = (if (self.tcp_pool) |p|
-            tcp.queryPooled(wire_query, server, tcp_buf, p)
+            tcp_t.queryPooled(wire_query, server, tcp_buf, p)
         else
-            tcp.query(wire_query, server, tcp_buf)) catch |err| {
+            tcp_t.query(wire_query, server, tcp_buf)) catch |err| {
             log.warn("TCP fallback failed: {s}", .{@errorName(err)});
             return null;
         };
@@ -867,7 +875,7 @@ pub const RecursiveResolver = struct {
         else
             self.stagger_ms;
 
-        const overall_timeout = self.transports.do53.asBlocking().udp.config.timeout_ms;
+        const overall_timeout = self.udp().config.timeout_ms;
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
         // per leg because each socket's send holds the wire bytes past the
@@ -897,7 +905,7 @@ pub const RecursiveResolver = struct {
 
         const query_start = monotonic.nowUs();
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const stag_result = self.transports.do53.asBlocking().udp.queryStaggered(
+        const stag_result = self.udp().queryStaggered(
             wires[0..leg_count],
             qids[0..leg_count],
             leg_addrs[0..leg_count],

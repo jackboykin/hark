@@ -81,6 +81,10 @@ pub const PooledConnection = struct {
     /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
     query_count: u16 = 0,
     max_queries: u16 = 200,
+    /// Cached SO_*TIMEO values to skip redundant setsockopts on pooled queries
+    /// where the deadline-derived ms is unchanged. 0 means "unset, force next."
+    last_sndtimeo_ms: u32 = 0,
+    last_rcvtimeo_ms: u32 = 0,
 
     // Inline buffers — stable addresses since struct is heap-allocated.
     net_read_buf: [VendoredTlsClient.min_buffer_len]u8,
