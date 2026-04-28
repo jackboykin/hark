@@ -16,6 +16,7 @@ const encrypted_ns_mod = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns_mod.EncryptedNsCache;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
+const monotonic = @import("monotonic.zig");
 const log = std.log.scoped(.tls_transport);
 
 pub const TlsConfig = struct {
@@ -41,10 +42,10 @@ pub const TlsTransport = struct {
 
     /// Try a query on a pooled connection for `key`. Returns null if no pool,
     /// no pooled conn available, or the pooled conn failed (and was released).
-    fn tryPooledQuery(self: *TlsTransport, key: AddressKey, wire_query: []const u8, response_buf: []u8) ?[]const u8 {
+    fn tryPooledQuery(self: *TlsTransport, key: AddressKey, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ?[]const u8 {
         const pool = self.pool orelse return null;
         const conn = pool.acquire(key) orelse return null;
-        if (queryOnConnection(conn, wire_query, response_buf)) |data| {
+        if (queryOnConnection(conn, wire_query, response_buf, deadline_ns)) |data| {
             pool.release(key, conn, true);
             return data;
         } else |_| {
@@ -56,13 +57,14 @@ pub const TlsTransport = struct {
     pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
         const tls_server = toPort(server, self.config.port);
         const key = AddressKey.fromAddress(tls_server);
+        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * std.time.ns_per_ms;
 
-        if (self.tryPooledQuery(key, wire_query, response_buf)) |data| return data;
+        if (self.tryPooledQuery(key, wire_query, response_buf, deadline_ns)) |data| return data;
 
         // ── Establish new connection ──
         const conn = try self.connectAndHandshake(tls_server);
 
-        const data = queryOnConnection(conn, wire_query, response_buf) catch |err| {
+        const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
             conn.destroyBroken(self.allocator);
             return err;
         };
@@ -128,20 +130,24 @@ pub const TlsTransport = struct {
     }
 
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
-    /// no SNI, 4-second connect timeout, immediate fallback on any failure.
-    /// Tries pooled connection first, pools new connections on success.
-    pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
+    /// no SNI, immediate fallback on any failure. Tries pooled connection
+    /// first, pools new connections on success. `deadline_ns` is an absolute
+    /// monotonic deadline that bounds both connect and query.
+    pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, deadline_ns: i128) ![]const u8 {
         const tls_server = toPort(server, self.config.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
-        if (self.tryPooledQuery(addr_key, wire_query, response_buf)) |data| return data;
+        if (self.tryPooledQuery(addr_key, wire_query, response_buf, deadline_ns)) |data| return data;
 
         // ── New connection ──
-        const sock = try connectTcpBlocking(tls_server, timeout_ms);
+        const remaining_ns = deadline_ns - monotonic.nowNs();
+        if (remaining_ns <= 0) return error.Timeout;
+        const connect_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
+        const sock = try connectTcpBlocking(tls_server, connect_ms);
         errdefer sys.close(sock);
         const conn = try self.initOpportunisticConnection(sock);
 
-        const data = queryOnConnection(conn, wire_query, response_buf) catch |err| {
+        const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
             conn.destroyBroken(self.allocator);
             return err;
         };
@@ -250,19 +256,30 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 
 /// Send a length-prefixed DNS query over an established TLS connection
 /// and read the length-prefixed response.
-fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8) ![]const u8 {
+///
+/// `deadline_ns` tightens the kernel SO_SNDTIMEO/SO_RCVTIMEO once before each
+/// direction. SO timeouts are per-syscall, so a slow-trickle peer that drips
+/// data in tiny chunks could in principle exceed the deadline; the bound
+/// achieved here is "no indefinite stall." Acceptable because upstream TLS
+/// peers are chosen authoritative/recursive servers — not arbitrary peers.
+/// True per-payload bounding would require restructuring TLS-layer I/O to
+/// expose hooks for per-syscall deadline checks (vendored tls_client uses
+/// buffered Io.Writer/Reader, not raw syscalls).
+fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
     if (wire_query.len > dns.max_udp_payload) return error.QueryTooLarge;
     const msg_len: u16 = @intCast(wire_query.len);
     var len_prefix: [2]u8 = undefined;
     mem.writeInt(u16, &len_prefix, msg_len, .big);
 
     // Send length-prefixed query
+    try sys.updateTimeout(conn.sock, posix.SO.SNDTIMEO, deadline_ns);
     conn.tls_client.writer.writeAll(&len_prefix) catch return error.TlsSendFailed;
     conn.tls_client.writer.writeAll(wire_query) catch return error.TlsSendFailed;
     conn.tls_client.writer.flush() catch return error.TlsSendFailed;
     conn.net_writer.interface.flush() catch return error.TlsSendFailed;
 
     // Read 2-byte length prefix
+    try sys.updateTimeout(conn.sock, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
     conn.tls_client.reader.readSliceAll(&resp_len_buf) catch return error.TlsRecvFailed;
     const resp_len = mem.readInt(u16, &resp_len_buf, .big);

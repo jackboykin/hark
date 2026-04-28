@@ -1009,7 +1009,8 @@ pub const RecursiveResolver = struct {
                             const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
                             const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
-                            if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, 4000)) |tls_data| {
+                            const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
+                            if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
                                 if (try tryParseMessage(allocator, tls_data)) |tls_response| {
                                     if (tls_response.header.qr and
                                         tls_response.header.rcode != .format_error and
@@ -1137,7 +1138,7 @@ pub const RecursiveResolver = struct {
 
         // Dedup: coalesce concurrent DNSKEY fetches for the same zone.
         if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, dnskey_dedup_timeout_ns)) {
+            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, monotonic.nowNs() + dnskey_dedup_timeout_ns)) {
                 .leader => {
                     // We're the leader — do the actual fetch, then release.
                     defer dedup.releaseLeader(zone_name, .dnskey, 0);
@@ -1157,7 +1158,7 @@ pub const RecursiveResolver = struct {
                     // Cache still empty — leader failed. Re-acquire dedup so only
                     // one follower retries (prevents thundering herd). Shorter
                     // timeout: leader's partial work warmed intermediate caches.
-                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, dnskey_dedup_timeout_ns / 2)) {
+                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, monotonic.nowNs() + dnskey_dedup_timeout_ns / 2)) {
                         .leader => {
                             defer dedup.releaseLeader(zone_name, .dnskey, 0);
                             return self.fetchAndValidateDnskey(allocator, zone_name, servers);
@@ -1346,7 +1347,7 @@ pub const RecursiveResolver = struct {
 
         // Dedup: coalesce concurrent DS fetches for the same zone.
         if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, ds_dedup_timeout_ns)) {
+            switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, monotonic.nowNs() + ds_dedup_timeout_ns)) {
                 .leader => {
                     defer dedup.releaseLeader(zone_name, .ds, 0);
                     return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
@@ -1357,7 +1358,7 @@ pub const RecursiveResolver = struct {
                         if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
                     }
                     // Cache still empty — leader failed. One follower retries.
-                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, ds_dedup_timeout_ns / 2)) {
+                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, monotonic.nowNs() + ds_dedup_timeout_ns / 2)) {
                         .leader => {
                             defer dedup.releaseLeader(zone_name, .ds, 0);
                             return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
@@ -1575,7 +1576,7 @@ pub const RecursiveResolver = struct {
         count: *usize,
     ) error{OutOfMemory}!void {
         const leader = if (self.dedup) |dedup|
-            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, 0, ns_addr_dedup_timeout_ns) == .leader
+            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, 0, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
         else
             false;
         defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, 0);

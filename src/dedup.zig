@@ -23,6 +23,7 @@ const DedupKey = struct {
 };
 
 const rand = @import("rand.zig");
+const monotonic = @import("monotonic.zig");
 
 /// Hash seed randomized at startup to prevent hash collision attacks.
 /// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
@@ -89,14 +90,19 @@ pub const InFlightTable = struct {
     /// Try to become the leader for this (name, qtype) pair.
     /// Returns `.leader` if this is the first request — caller must call `releaseLeader` when done.
     /// Returns `.follower` if another worker is already resolving — blocks until the leader finishes.
+    ///
+    /// The default 2s budget bounds how long a follower waits on the leader.
+    /// It's shorter than typical recursive-resolver client timeouts (5-10s);
+    /// a sub-second client API would need explicit deadline propagation here.
     pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) AcquireResult {
-        return self.acquireOrWaitWithTimeout(name, qtype, flags, 2 * std.time.ns_per_s);
+        return self.acquireOrWaitWithTimeout(name, qtype, flags, monotonic.nowNs() + 2 * std.time.ns_per_s);
     }
 
-    /// Like `acquireOrWait` but with a caller-specified timeout.
-    /// DNSKEY fetches use a longer timeout (6s) because cold-cache DNSSEC
-    /// chains (root → TLD → SLD → DNSKEY) can take 3-5s.
-    pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, timeout_ns: u64) AcquireResult {
+    /// Like `acquireOrWait` but takes an absolute monotonic deadline. Callers
+    /// pass `monotonic.nowNs() + relative_ns` so the wait honors the real
+    /// remaining budget. DNSKEY fetches use a longer (6s) deadline because
+    /// cold-cache DNSSEC chains (root → TLD → SLD → DNSKEY) can take 3-5s.
+    pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns: i128) AcquireResult {
         const key = DedupKey.init(name, qtype, flags) orelse return .leader;
 
         self.mutex.lockUncancelable(self.io);
@@ -107,12 +113,10 @@ pub const InFlightTable = struct {
             // A releaseLeader for any key in the same shard will wake us to
             // recheck; releases for keys in other shards will not broadcast
             // here at all.
-            const monotonic = @import("monotonic.zig");
-            const deadline = monotonic.nowNs() +| @as(i128, timeout_ns);
             const shard = shardOf(key);
             while (self.map.get(key)) |completed| {
                 if (completed) break;
-                if (monotonic.nowNs() >= deadline) break;
+                if (monotonic.nowNs() >= deadline_ns) break;
                 self.conditions[shard].waitUncancelable(self.io, &self.mutex);
             }
             return .follower;
@@ -243,8 +247,8 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
     defer table.deinit();
 
     _ = table.acquireOrWait("example.com", .a, 0);
-    // Same-thread follower: timedWait times out immediately since no one will signal.
-    const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, 1);
+    // Same-thread follower with already-expired deadline: returns immediately.
+    const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, monotonic.nowNs());
     try testing.expectEqual(.follower, r);
     table.releaseLeader("example.com", .a, 0);
 }
