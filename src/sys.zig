@@ -91,7 +91,7 @@ pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.s
             .INTR => continue,
             .MSGSIZE => error.MessageTooBig,
             .PIPE => error.BrokenPipe,
-            .NOMEM => error.SystemResources,
+            .NOBUFS, .NOMEM => error.SystemResources,
             else => |e| posix.unexpectedErrno(e),
         };
     }

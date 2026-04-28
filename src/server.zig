@@ -214,6 +214,7 @@ pub const Server = struct {
     worker_errors: std.atomic.Value(u32),
     udp_queue_drops: std.atomic.Value(u64),
     tcp_queue_drops: std.atomic.Value(u64),
+    udp_send_drops: std.atomic.Value(u64),
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
@@ -285,6 +286,7 @@ pub const Server = struct {
             .worker_errors = std.atomic.Value(u32).init(0),
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
+            .udp_send_drops = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -406,6 +408,10 @@ pub const Server = struct {
         if (udp_drops > 0 or tcp_drops > 0) {
             log.info("work queue drops: {d} UDP, {d} TCP", .{ udp_drops, tcp_drops });
         }
+        const udp_send_drops = self.udp_send_drops.load(.monotonic);
+        if (udp_send_drops > 0) {
+            log.info("UDP send-buffer drops: {d}", .{udp_send_drops});
+        }
     }
 
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) void {
@@ -482,6 +488,7 @@ pub const Server = struct {
             .queue = &queue,
             .udp_queue_drops = &self.udp_queue_drops,
             .tcp_queue_drops = &self.tcp_queue_drops,
+            .udp_send_drops = &self.udp_send_drops,
             .ca_bundle = self.ca_bundle,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
@@ -658,6 +665,7 @@ const WorkerState = struct {
     queue: *WorkQueue,
     udp_queue_drops: *std.atomic.Value(u64),
     tcp_queue_drops: *std.atomic.Value(u64),
+    udp_send_drops: *std.atomic.Value(u64),
     ca_bundle: Certificate.Bundle,
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -814,10 +822,10 @@ const WorkerState = struct {
         self.loop.flush();
     }
 
-    fn sendErrorUdp(sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
+    fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
         if (serializeErrorResponse(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
-            sendUdpResponse(sock, wire, client_addr);
+            sendUdpResponse(self, sock, wire, client_addr);
         }
     }
 
@@ -833,18 +841,18 @@ const WorkerState = struct {
         // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
         const opcode: u4 = @truncate(data[2] >> 3);
         if (opcode != 0) { // Only QUERY (0) supported
-            sendErrorUdp(sock, id, .not_implemented, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, .not_implemented, 0, rd, &.{}, client_addr);
             return;
         }
         const qdcount = mem.readInt(u16, data[4..6], .big);
         if (qdcount != 1) {
-            sendErrorUdp(sock, id, .format_error, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, .format_error, 0, rd, &.{}, client_addr);
             return;
         }
         if (!self.queue.push(data, client_addr, sock, .udp)) {
             _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
             log.warn("resolution queue full, dropping query", .{});
-            sendErrorUdp(sock, id, .server_failure, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, .server_failure, 0, rd, &.{}, client_addr);
         }
     }
 
@@ -1057,13 +1065,13 @@ const WorkerState = struct {
         const query_msg = dns.parseMessage(alloc, data) catch {
             if (data.len >= 2) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                sendErrorUdp(sock, id, .format_error, 0, false, &.{}, client_addr);
+                self.sendErrorUdp(sock, id, .format_error, 0, false, &.{}, client_addr);
             }
             return;
         };
 
         if (validateQuery(query_msg)) |fail| {
-            sendErrorUdp(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1078,7 +1086,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
-            sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1088,7 +1096,7 @@ const WorkerState = struct {
 
         var wire_buf: [dns.max_message_len]u8 = undefined;
         if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
-            sendUdpResponse(sock, wire, client_addr);
+            sendUdpResponse(self, sock, wire, client_addr);
         }
 
         self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
@@ -1404,11 +1412,19 @@ fn tcpWriteMessage(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     tcpWriteAllBlocking(fd, data, deadline_ns) orelse return null;
 }
 
-fn sendUdpResponse(sock: posix.fd_t, data: []const u8, dest: na.Address) void {
+fn sendUdpResponse(ws: *WorkerState, sock: posix.fd_t, data: []const u8, dest: na.Address) void {
     // Direct sendto — the server loop's EventLoop is only for accept/recv/signal.
+    // MSG_DONTWAIT keeps the pool thread off a saturated kernel send buffer:
+    // dropping the response on WouldBlock/SystemResources is correct DNS
+    // behavior (the client retransmits), and beats stalling the worker.
     var storage: na.PosixAddress = undefined;
     const sa_len = na.toSockaddr(&dest, &storage);
-    _ = sys.sendto(sock, data, 0, &storage.any, sa_len) catch return;
+    _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch |err| switch (err) {
+        error.WouldBlock, error.SystemResources => {
+            _ = ws.udp_send_drops.fetchAdd(1, .monotonic);
+        },
+        else => {},
+    };
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
