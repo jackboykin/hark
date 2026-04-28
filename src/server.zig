@@ -29,6 +29,8 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
+const transport_mod = @import("transport.zig");
+const Transports = transport_mod.Transports;
 const Certificate = std.crypto.Certificate;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
@@ -605,14 +607,15 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     const alloc = arena.allocator();
 
     var resolver = RecursiveResolver{
-        .transport = &udp_t,
-        .tcp_transport = &tcp_t,
+        .transports = .{
+            .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+            .tls = tls_ptr,
+        },
         .io = server.io,
         .cache = &server.cache,
         .qname_minimisation = server.config.qname_minimization,
         .dnssec_aware = server.config.dnssec,
         .dnssec_enabled = server.config.dnssec,
-        .tls_transport = tls_ptr,
         .encrypted_ns_cache = if (server.encrypted_ns_cache) |*oc| oc else null,
         .rtt_cache = &server.rtt_cache,
         .ns_selector = &server.ns_selector,
@@ -848,9 +851,7 @@ const WorkerState = struct {
     fn processTcpClient(
         self: *WorkerState,
         client_fd: posix.fd_t,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
         query_pta: *PerThreadArena,
         prefetch_pta: *PerThreadArena,
     ) void {
@@ -900,7 +901,7 @@ const WorkerState = struct {
             const name_str = question.name.formatInto(&name_buf);
 
             const start_ns = monotonic.nowNs();
-            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, udp, tcp, tls) catch |err| {
+            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, transports) catch |err| {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
@@ -918,7 +919,7 @@ const WorkerState = struct {
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
-            self.dispatchPrefetches(result, name_str, udp, tcp, tls, prefetch_pta);
+            self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
             if (query.header.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
@@ -932,15 +933,12 @@ const WorkerState = struct {
         qtype: dns.RType,
         cd: bool,
         bypass_cache: bool,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
         switch (self.config.mode) {
             .recursive => {
                 var resolver = RecursiveResolver{
-                    .transport = udp,
-                    .tcp_transport = tcp,
+                    .transports = transports,
                     .io = self.io,
                     .cache = self.cache,
                     .qname_minimisation = self.config.qname_minimization,
@@ -948,7 +946,6 @@ const WorkerState = struct {
                     .dnssec_aware = self.config.dnssec,
                     // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
                     .dnssec_enabled = self.config.dnssec and !cd,
-                    .tls_transport = tls,
                     .encrypted_ns_cache = self.encrypted_ns_cache,
                     .rtt_cache = self.rtt_cache,
                     .ns_selector = self.ns_selector,
@@ -970,8 +967,7 @@ const WorkerState = struct {
             },
             .forward => {
                 var resolver = ForwardingResolver{
-                    .transport = udp,
-                    .tcp_transport = tcp,
+                    .transports = transports,
                     .io = self.io,
                 };
                 const upstreams = if (self.config.upstreams.len > 0)
@@ -991,9 +987,9 @@ const WorkerState = struct {
         }
     }
 
-    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport, tls: ?*TlsTransport, prefetch_pta: *PerThreadArena) void {
+    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, transports: Transports, prefetch_pta: *PerThreadArena) void {
         const alloc = prefetch_pta.reset();
-        _ = self.resolveQueryWith(alloc, prefetch_name, prefetch_qtype, false, true, udp, tcp, tls) catch {};
+        _ = self.resolveQueryWith(alloc, prefetch_name, prefetch_qtype, false, true, transports) catch {};
     }
 
     /// Resolution thread pool entry point.
@@ -1010,9 +1006,10 @@ const WorkerState = struct {
             break :blk t;
         } else null;
 
-        const udp = &udp_t;
-        const tcp = &tcp_t;
-        const tls: ?*TlsTransport = if (tls_t) |*t| t else null;
+        const transports: Transports = .{
+            .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+            .tls = if (tls_t) |*t| t else null,
+        };
 
         var query_pta: PerThreadArena = undefined;
         query_pta.init(self.allocator, self.config.query_memory_limit);
@@ -1028,16 +1025,14 @@ const WorkerState = struct {
                     item.sock_fd,
                     item.query_buf[0..item.query_len],
                     item.client_addr,
-                    udp,
-                    tcp,
-                    tls,
+                    transports,
                     &query_pta,
                     &prefetch_pta,
                 ),
                 .tcp => {
                     if (self.claimTcpSlot()) {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
-                        self.processTcpClient(item.sock_fd, udp, tcp, tls, &query_pta, &prefetch_pta);
+                        self.processTcpClient(item.sock_fd, transports, &query_pta, &prefetch_pta);
                     } else {
                         // Drop silently for the same reason as the queue-full path above.
                         log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
@@ -1053,9 +1048,7 @@ const WorkerState = struct {
         sock: posix.fd_t,
         data: []const u8,
         client_addr: na.Address,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
         query_pta: *PerThreadArena,
         prefetch_pta: *PerThreadArena,
     ) void {
@@ -1081,7 +1074,7 @@ const WorkerState = struct {
         const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
 
         const start_ns = monotonic.nowNs();
-        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, udp, tcp, tls) catch |err| {
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, transports) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
@@ -1098,7 +1091,7 @@ const WorkerState = struct {
             sendUdpResponse(sock, wire, client_addr);
         }
 
-        self.dispatchPrefetches(result, name_str, udp, tcp, tls, prefetch_pta);
+        self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
 
         if (query_msg.header.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
@@ -1109,14 +1102,12 @@ const WorkerState = struct {
         self: *WorkerState,
         result: recursive.RecursiveResolver.ResolveResult,
         query_name: []const u8,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
         prefetch_pta: *PerThreadArena,
     ) void {
         // TTL-refresh: bg thread, with inline fallback so a refresh is never dropped.
-        if (result.prefetch_name) |n| self.spawnOrInline(n, result.prefetch_qtype, udp, tcp, tls, prefetch_pta);
-        if (result.prefetch_dnskey_zone) |z| self.spawnOrInline(z, .dnskey, udp, tcp, tls, prefetch_pta);
+        if (result.prefetch_name) |n| self.spawnOrInline(n, result.prefetch_qtype, transports, prefetch_pta);
+        if (result.prefetch_dnskey_zone) |z| self.spawnOrInline(z, .dnskey, transports, prefetch_pta);
 
         // RFC 8305 cousin co-prefetch: fire-and-forget, gated on a cache miss.
         const cousin_qtype = result.cousin_prefetch_qtype orelse return;
@@ -1129,13 +1120,11 @@ const WorkerState = struct {
         self: *WorkerState,
         name: []const u8,
         qtype: dns.RType,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
         prefetch_pta: *PerThreadArena,
     ) void {
         if (!self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) {
-            self.doPrefetchWith(name, qtype, udp, tcp, tls, prefetch_pta);
+            self.doPrefetchWith(name, qtype, transports, prefetch_pta);
         }
     }
 
@@ -1157,16 +1146,14 @@ const WorkerState = struct {
         name: []const u8,
         qtype: dns.RType,
         cd: bool,
-        udp: *BlockingUdpTransport,
-        tcp: *BlockingTcpTransport,
-        tls: ?*TlsTransport,
+        transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
         // Dedup only prevents duplicate upstream queries. On a cache hit no
         // upstream I/O happens, so the InFlightTable mutex pair is pure
         // overhead; a shared-lock existence probe skips it. On miss we fall
         // through to the normal dedup + resolve path.
         if (self.cache.lookupExists(name, qtype, .in)) {
-            return self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
+            return self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         }
 
         const cd_flag: u8 = @intFromBool(cd);
@@ -1182,7 +1169,7 @@ const WorkerState = struct {
         errdefer if (is_leader) {
             if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
         };
-        const result = try self.resolveQueryWith(alloc, name, qtype, cd, false, udp, tcp, tls);
+        const result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         if (is_leader) {
             if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
         }

@@ -8,11 +8,11 @@ const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransp
 const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const na = @import("net_address.zig");
+const transport_mod = @import("transport.zig");
+const Transports = transport_mod.Transports;
 
 pub const ForwardingResolver = struct {
-    transport: *BlockingUdpTransport,
-    tcp_transport: ?*BlockingTcpTransport = null,
-    tls_transport: ?*TlsTransport = null,
+    transports: Transports,
     io: std.Io,
 
     pub fn resolve(self: *ForwardingResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, upstream: na.Address) !dns.Message {
@@ -28,7 +28,7 @@ pub const ForwardingResolver = struct {
         const expected_name = query_msg.questions[0].name;
 
         // DoT path: send directly over TLS (already TCP-based, no TC-bit fallback needed)
-        if (self.tls_transport) |tls_t| {
+        if (self.transports.tls) |tls_t| {
             const response_buf = try allocator.alloc(u8, dns.max_message_len);
             const response_data = try tls_t.query(wire_query, upstream, response_buf);
             const msg = try dns.parseMessage(allocator, response_data);
@@ -36,13 +36,15 @@ pub const ForwardingResolver = struct {
             return msg;
         }
 
+        const blocking = self.transports.do53.asBlocking();
+
         // Do53 path: UDP with TCP fallback on truncation.
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const response_data = try self.transport.query(wire_query, query_id, upstream, response_buf);
+        const response_data = try blocking.udp.query(wire_query, query_id, upstream, response_buf);
 
         // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
         if (dns.hasTcBit(response_data)) {
-            if (self.tcp_transport) |tcp| {
+            if (blocking.tcp) |tcp| {
                 const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
                 if (tcp.query(wire_query, upstream, tcp_buf)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
@@ -68,7 +70,10 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = ForwardingResolver{ .transport = &transport, .io = io };
+    var resolver = ForwardingResolver{
+        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .io = io,
+    };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -6,6 +6,9 @@ const dnssec = @import("dnssec.zig");
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
+const transport_mod = @import("transport.zig");
+const Transport = transport_mod.Transport;
+const Transports = transport_mod.Transports;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("connection_pool.zig").AddressKey;
@@ -74,8 +77,7 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
 pub const RecursiveResolver = struct {
-    transport: *BlockingUdpTransport,
-    tcp_transport: ?*BlockingTcpTransport = null,
+    transports: Transports,
     io: std.Io,
     cache: ?*RRsetCache = null,
     qname_minimisation: bool = true,
@@ -84,7 +86,6 @@ pub const RecursiveResolver = struct {
     /// Whether to request DNSSEC data (DO bit) — always true if server is DNSSEC-capable.
     /// RFC 4035 §3.2.1: MUST set DO regardless of CD bit or per-query validation.
     dnssec_aware: bool = false,
-    tls_transport: ?*TlsTransport = null,
     encrypted_ns_cache: ?*EncryptedNsCache = null,
     rtt_cache: ?*RttCache = null,
     ns_selector: ?*NsSelector = null,
@@ -118,10 +119,9 @@ pub const RecursiveResolver = struct {
     /// Create a thread-local resolver clone with fresh transports. Shared
     /// caches and config are inherited; transport and per-query mutable
     /// state are reset so the clone is safe for independent resolution.
-    fn cloneForThread(self: *RecursiveResolver, udp: *BlockingUdpTransport, tcp: *BlockingTcpTransport) RecursiveResolver {
+    fn cloneForThread(self: *RecursiveResolver, transports: Transports) RecursiveResolver {
         var resolver = self.*;
-        resolver.transport = udp;
-        resolver.tcp_transport = tcp;
+        resolver.transports = transports;
         resolver.gpa = null;
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
@@ -140,7 +140,7 @@ pub const RecursiveResolver = struct {
     const failover_timeout_cap: u32 = 2000;
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transport.config.timeout_ms;
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.do53.asBlocking().udp.config.timeout_ms;
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
@@ -772,7 +772,7 @@ pub const RecursiveResolver = struct {
         // output across loop iterations — each hop needs its own buffer so
         // those slices survive until the arena resets.
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const response_data = self.transport.queryWithTimeout(
+        const response_data = self.transports.do53.asBlocking().udp.queryWithTimeout(
             wire_query,
             query_id,
             server,
@@ -806,7 +806,7 @@ pub const RecursiveResolver = struct {
         wire_query: []const u8,
         server: na.Address,
     ) error{OutOfMemory}!?dns.Message {
-        const tcp = self.tcp_transport orelse return null;
+        const tcp = self.transports.do53.asBlocking().tcp orelse return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
         const tcp_data = (if (self.tcp_pool) |p|
             tcp.queryPooled(wire_query, server, tcp_buf, p)
@@ -867,7 +867,7 @@ pub const RecursiveResolver = struct {
         else
             self.stagger_ms;
 
-        const overall_timeout = self.transport.config.timeout_ms;
+        const overall_timeout = self.transports.do53.asBlocking().udp.config.timeout_ms;
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
         // per leg because each socket's send holds the wire bytes past the
@@ -897,7 +897,7 @@ pub const RecursiveResolver = struct {
 
         const query_start = monotonic.nowUs();
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const stag_result = self.transport.queryStaggered(
+        const stag_result = self.transports.do53.asBlocking().udp.queryStaggered(
             wires[0..leg_count],
             qids[0..leg_count],
             leg_addrs[0..leg_count],
@@ -995,7 +995,7 @@ pub const RecursiveResolver = struct {
             dns.patchQueryId(wire_buf[0..wire_query.len], query_id);
 
             // ── RFC 9539: Opportunistic encrypted query ──
-            if (self.tls_transport) |tls_t| {
+            if (self.transports.tls) |tls_t| {
                 if (self.encrypted_ns_cache) |oc| {
                     const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
                     switch (oc.getStatus(tls_key)) {
@@ -1077,7 +1077,7 @@ pub const RecursiveResolver = struct {
 
     fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
         const oc = self.encrypted_ns_cache orelse return;
-        const tls_t = self.tls_transport orelse return;
+        const tls_t = self.transports.tls orelse return;
         const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
         if (oc.claimProbe(tls_key)) {
             tls_t.probeInBackground(server, oc);
@@ -1730,7 +1730,10 @@ pub const RecursiveResolver = struct {
             var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
             defer udp_t.deinit();
             var tcp_t = BlockingTcpTransport.init(.{});
-            var resolver = ctx.parent.cloneForThread(&udp_t, &tcp_t);
+            var resolver = ctx.parent.cloneForThread(.{
+                .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+                .tls = ctx.parent.transports.tls,
+            });
 
             var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
             var arena = std.heap.ArenaAllocator.init(cap.allocator());
@@ -2552,7 +2555,10 @@ test "recursive resolve example.com A from root hints" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
+    var resolver = RecursiveResolver{
+        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .io = io,
+    };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2587,7 +2593,10 @@ test "recursive resolve nonexistent domain returns name_error" {
 
     var transport = BlockingUdpTransport.init(.{}, io);
 
-    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
+    var resolver = RecursiveResolver{
+        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .io = io,
+    };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2611,7 +2620,10 @@ test "recursive resolve domain with glueless NS" {
     // Shorter timeouts: glueless path issues many sub-queries
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
+    var resolver = RecursiveResolver{
+        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .io = io,
+    };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2646,7 +2658,10 @@ test "recursive resolve with CNAME chain" {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    var resolver = RecursiveResolver{ .transport = &transport, .io = io };
+    var resolver = RecursiveResolver{
+        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .io = io,
+    };
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

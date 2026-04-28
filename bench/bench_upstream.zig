@@ -14,7 +14,6 @@ const monotonic = hark.monotonic;
 const sys = hark.sys;
 const na = hark.net_address;
 const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
-const openUdpSocket = hark.transport.openUdpSocket;
 const BenchResult = @import("main.zig").BenchResult;
 
 const bench_iters: usize = 5_000;

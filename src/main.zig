@@ -264,9 +264,10 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     const response = if (forward_mode) blk: {
         var resolver = ForwardingResolver{
-            .transport = &t,
-            .tcp_transport = &tcp_t,
-            .tls_transport = if (dot_mode) &tls_t else null,
+            .transports = .{
+                .do53 = .{ .blocking = .{ .udp = &t, .tcp = &tcp_t } },
+                .tls = if (dot_mode) &tls_t else null,
+            },
             .io = io,
         };
         break :blk resolver.resolve(arena.allocator(), name, qtype, upstream_addr) catch |err| {
@@ -288,14 +289,15 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{
-            .transport = &t,
-            .tcp_transport = &tcp_t,
+            .transports = .{
+                .do53 = .{ .blocking = .{ .udp = &t, .tcp = &tcp_t } },
+                .tls = if (opportunistic) &tls_t else null,
+            },
             .cache = &cache,
             .qname_minimisation = !no_qmin,
             .dnssec_enabled = dnssec_enabled,
             .dnssec_aware = dnssec_enabled,
             .rtt_cache = &rtt_cache,
-            .tls_transport = if (opportunistic) &tls_t else null,
             .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
             .io = io,
         };
