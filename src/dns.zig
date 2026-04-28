@@ -2393,39 +2393,66 @@ fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Messa
     return parseMessage(allocator, wire);
 }
 
+const TestRdata = struct {
+    buf: [256]u8 = undefined,
+    pos: usize = 0,
+
+    fn putU8(self: *TestRdata, v: u8) void {
+        self.buf[self.pos] = v;
+        self.pos += 1;
+    }
+    fn putU16(self: *TestRdata, v: u16) void {
+        mem.writeInt(u16, self.buf[self.pos..][0..2], v, .big);
+        self.pos += 2;
+    }
+    fn putU32(self: *TestRdata, v: u32) void {
+        mem.writeInt(u32, self.buf[self.pos..][0..4], v, .big);
+        self.pos += 4;
+    }
+    fn putBytes(self: *TestRdata, v: []const u8) void {
+        @memcpy(self.buf[self.pos..][0..v.len], v);
+        self.pos += v.len;
+    }
+    fn slice(self: *const TestRdata) []const u8 {
+        return self.buf[0..self.pos];
+    }
+};
+
+fn testBuildAnswer(pkt: *[max_udp_payload]u8, rrname: []const u8, rtype_int: u16, ttl: u32, rdata: []const u8) usize {
+    testHeader(pkt, .{});
+    var pos: usize = 12;
+    @memcpy(pkt[pos..][0..rrname.len], rrname);
+    pos += rrname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], rtype_int, .big);
+    pos += 2;
+    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // class IN
+    pos += 2;
+    mem.writeInt(u32, pkt[pos..][0..4], ttl, .big);
+    pos += 4;
+    mem.writeInt(u16, pkt[pos..][0..2], @intCast(rdata.len), .big);
+    pos += 2;
+    @memcpy(pkt[pos..][0..rdata.len], rdata);
+    pos += rdata.len;
+    return pos;
+}
+
 // ── DNSSEC record type tests ────────────────────────────────────────
 
 test "DNSKEY record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    // Name: "." (root)
-    pkt[pos] = 0;
-    pos += 1;
-    mem.writeInt(u16, pkt[pos..][0..2], 48, .big); // DNSKEY
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 172800, .big); // TTL
-    pos += 4;
     // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
     const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
-    const rdlen: u16 = 4 + key_data.len;
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 257, .big); // flags
-    pos += 2;
-    pkt[pos] = 3; // protocol
-    pos += 1;
-    pkt[pos] = 8; // algorithm
-    pos += 1;
-    @memcpy(pkt[pos..][0..key_data.len], &key_data);
-    pos += key_data.len;
+    var rd = TestRdata{};
+    rd.putU16(257);
+    rd.putU8(3);
+    rd.putU8(8);
+    rd.putBytes(&key_data);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x00", 48, 172800, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const dnskey = msg.answers[0].rdata.dnskey;
@@ -2446,35 +2473,20 @@ test "DNSKEY record parse/serialize roundtrip" {
 }
 
 test "DS record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 43, .big); // DS
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 86400, .big);
-    pos += 4;
     // RDATA: key_tag=20326, alg=8, digest_type=2 (SHA-256), digest=32 bytes
     const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(4 + digest.len), .big);
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 20326, .big); // key_tag
-    pos += 2;
-    pkt[pos] = 8; // algorithm
-    pos += 1;
-    pkt[pos] = 2; // digest_type (SHA-256)
-    pos += 1;
-    @memcpy(pkt[pos..][0..digest.len], &digest);
-    pos += digest.len;
+    var rd = TestRdata{};
+    rd.putU16(20326);
+    rd.putU8(8);
+    rd.putU8(2);
+    rd.putBytes(&digest);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 43, 86400, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     const ds = msg.answers[0].rdata.ds;
     try testing.expectEqual(@as(u16, 20326), ds.key_tag);
@@ -2491,47 +2503,25 @@ test "DS record parse/serialize roundtrip" {
 }
 
 test "RRSIG record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 46, .big); // RRSIG
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big);
-    pos += 4;
-
     const signer_wire = "\x07example\x03com\x00"; // example.com
     const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
-    const rdlen: u16 = 18 + @as(u16, signer_wire.len) + fake_sig.len;
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // type_covered = A
-    pos += 2;
-    pkt[pos] = 13; // algorithm = ECDSAP256SHA256
-    pos += 1;
-    pkt[pos] = 2; // labels
-    pos += 1;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // original_ttl
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 1700000000, .big); // sig_expiration
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 1699000000, .big); // sig_inception
-    pos += 4;
-    mem.writeInt(u16, pkt[pos..][0..2], 12345, .big); // key_tag
-    pos += 2;
-    @memcpy(pkt[pos..][0..signer_wire.len], signer_wire);
-    pos += signer_wire.len;
-    @memcpy(pkt[pos..][0..fake_sig.len], &fake_sig);
-    pos += fake_sig.len;
+    var rd = TestRdata{};
+    rd.putU16(1); // type_covered = A
+    rd.putU8(13); // algorithm = ECDSAP256SHA256
+    rd.putU8(2); // labels
+    rd.putU32(300); // original_ttl
+    rd.putU32(1700000000); // sig_expiration
+    rd.putU32(1699000000); // sig_inception
+    rd.putU16(12345); // key_tag
+    rd.putBytes(signer_wire);
+    rd.putBytes(&fake_sig);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 46, 300, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     const rrsig = msg.answers[0].rdata.rrsig;
     try testing.expectEqual(RType.a, rrsig.type_covered);
@@ -2555,20 +2545,6 @@ test "RRSIG record parse/serialize roundtrip" {
 }
 
 test "NSEC record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 47, .big); // NSEC
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big);
-    pos += 4;
-
     const next_name = "\x04host\x07example\x03com\x00";
     // Type bitmap: window 0, length 7 bytes
     // A(1): byte 0, bit 1 => 0x40
@@ -2581,17 +2557,16 @@ test "NSEC record parse/serialize roundtrip" {
     // => byte 5 = 0x03
     // DNSKEY(48): byte 6, bit 0 => 0x80
     const bitmap = [_]u8{ 0x00, 0x07, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const rdlen: u16 = @intCast(next_name.len + bitmap.len);
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    @memcpy(pkt[pos..][0..next_name.len], next_name);
-    pos += next_name.len;
-    @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
-    pos += bitmap.len;
+    var rd = TestRdata{};
+    rd.putBytes(next_name);
+    rd.putBytes(&bitmap);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 47, 3600, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     const nsec = msg.answers[0].rdata.nsec;
     try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
@@ -2614,48 +2589,25 @@ test "NSEC record parse/serialize roundtrip" {
 }
 
 test "NSEC3 record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    // Owner: some base32 hash label under example.com (simplified for test)
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 50, .big); // NSEC3
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big);
-    pos += 4;
-
     const salt = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
     const bitmap = [_]u8{ 0x00, 0x01, 0x40 }; // window 0, len 1, A bit set
-    // hash_alg(1) + flags(1) + iterations(2) + salt_len(1) + salt(4) + hash_len(1) + hash(20) + bitmap(3)
-    const rdlen: u16 = 1 + 1 + 2 + 1 + salt.len + 1 + next_hash.len + bitmap.len;
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    pkt[pos] = 1; // hash_algorithm (SHA-1)
-    pos += 1;
-    pkt[pos] = 0; // flags
-    pos += 1;
-    mem.writeInt(u16, pkt[pos..][0..2], 10, .big); // iterations
-    pos += 2;
-    pkt[pos] = @intCast(salt.len); // salt_len
-    pos += 1;
-    @memcpy(pkt[pos..][0..salt.len], &salt);
-    pos += salt.len;
-    pkt[pos] = @intCast(next_hash.len); // hash_len
-    pos += 1;
-    @memcpy(pkt[pos..][0..next_hash.len], &next_hash);
-    pos += next_hash.len;
-    @memcpy(pkt[pos..][0..bitmap.len], &bitmap);
-    pos += bitmap.len;
+    var rd = TestRdata{};
+    rd.putU8(1); // hash_algorithm (SHA-1)
+    rd.putU8(0); // flags
+    rd.putU16(10); // iterations
+    rd.putU8(@intCast(salt.len));
+    rd.putBytes(&salt);
+    rd.putU8(@intCast(next_hash.len));
+    rd.putBytes(&next_hash);
+    rd.putBytes(&bitmap);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 50, 3600, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     const nsec3 = msg.answers[0].rdata.nsec3;
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
@@ -2678,37 +2630,20 @@ test "NSEC3 record parse/serialize roundtrip" {
 }
 
 test "NSEC3PARAM record parse/serialize roundtrip" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 51, .big); // NSEC3PARAM
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 0, .big); // TTL=0 per RFC 5155
-    pos += 4;
-
     const salt = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(5 + salt.len), .big);
-    pos += 2;
-    pkt[pos] = 1; // hash_algorithm
-    pos += 1;
-    pkt[pos] = 0; // flags
-    pos += 1;
-    mem.writeInt(u16, pkt[pos..][0..2], 0, .big); // iterations
-    pos += 2;
-    pkt[pos] = @intCast(salt.len);
-    pos += 1;
-    @memcpy(pkt[pos..][0..salt.len], &salt);
-    pos += salt.len;
+    var rd = TestRdata{};
+    rd.putU8(1); // hash_algorithm
+    rd.putU8(0); // flags
+    rd.putU16(0); // iterations
+    rd.putU8(@intCast(salt.len));
+    rd.putBytes(&salt);
+
+    var pkt: [max_udp_payload]u8 = undefined;
+    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 51, 0, rd.slice());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
 
     const nsec3p = msg.answers[0].rdata.nsec3param;
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3p.hash_algorithm);
