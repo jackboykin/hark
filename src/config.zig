@@ -213,33 +213,23 @@ pub fn parseAddress(s: []const u8, default_port: u16) ?Address {
         return net_addr.initIp6(ip6.bytes, port, 0, 0);
     }
 
-    // Check for IPv4 with port: 1.2.3.4:53
-    // Count colons — IPv6 has multiple, IPv4:port has exactly one
-    var colon_count: usize = 0;
-    var last_colon: usize = 0;
-    for (s, 0..) |c, i| {
-        if (c == ':') {
-            colon_count += 1;
-            last_colon = i;
+    // First vs last colon distinguish the three remaining shapes:
+    //   no colons     → bare IPv4
+    //   one colon     → IPv4:port (first == last)
+    //   many colons   → bare IPv6 (first != last)
+    const first = mem.indexOfScalar(u8, s, ':');
+    const last = mem.lastIndexOfScalar(u8, s, ':');
+
+    if (first) |f| {
+        if (f == last.?) {
+            const port = std.fmt.parseInt(u16, s[f + 1 ..], 10) catch return null;
+            const ip4 = parseIpv4(s[0..f]) orelse return null;
+            return net_addr.initIp4(ip4, port);
         }
-    }
-
-    if (colon_count == 1) {
-        // IPv4 with port
-        const ip_str = s[0..last_colon];
-        const port_str = s[last_colon + 1 ..];
-        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
-        const ip4 = parseIpv4(ip_str) orelse return null;
-        return net_addr.initIp4(ip4, port);
-    }
-
-    if (colon_count > 1) {
-        // Bare IPv6 without brackets
         const ip6 = net_addr.Ip6.parse(s, default_port) catch return null;
         return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
     }
 
-    // Plain IPv4 (no port)
     const ip4 = parseIpv4(s) orelse return null;
     return net_addr.initIp4(ip4, default_port);
 }
