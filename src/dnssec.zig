@@ -1882,73 +1882,31 @@ test "validateNegativeProof NSEC NODATA" {
 }
 
 test "validateNegativeProof NSEC NXDOMAIN" {
-    const alpha = dns.Name{
-        .labels = &.{ @as([]const u8, "alpha"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const gamma = dns.Name{
-        .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const example_com = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
+    const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
+    const example_com = dns.Name{ .labels = &.{ "example", "com" } };
 
-    // Two NSECs: one covering qname, one covering *.example.com
+    // Two NSECs: one covering qname, one covering *.example.com.
     // *.example.com sorts before alpha.example.com, so we need an NSEC
     // that covers the wildcard range.
     const authorities = [_]dns.ResourceRecord{
-        .{
-            .name = alpha,
-            .rtype = .nsec,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec = .{
-                .next_domain_name = gamma,
-                .type_bit_maps = &.{},
-            } },
-        },
-        // NSEC covering *.example.com: example.com -> alpha.example.com
-        .{
-            .name = example_com,
-            .rtype = .nsec,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .nsec = .{
-                .next_domain_name = alpha,
-                .type_bit_maps = &.{},
-            } },
-        },
+        nsecRr(alpha, gamma),
+        nsecRr(example_com, alpha), // covers *.example.com: example.com -> alpha.example.com
     };
 
-    const beta = dns.Name{
-        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     const status = validateNegativeProof(&authorities, beta, .a, true);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
 test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
-    const alpha = dns.Name{
-        .labels = &.{ @as([]const u8, "alpha"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const gamma = dns.Name{
-        .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
+    const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
 
     // Only one NSEC covering qname, no wildcard denial
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = alpha,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec = .{
-            .next_domain_name = gamma,
-            .type_bit_maps = &.{},
-        } },
-    }};
+    const authorities = [_]dns.ResourceRecord{nsecRr(alpha, gamma)};
 
-    const beta = dns.Name{
-        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     const status = validateNegativeProof(&authorities, beta, .a, true);
     try testing.expectEqual(SecurityStatus.unchecked, status);
 }
@@ -1997,30 +1955,15 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
 }
 
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
-    // A single NSEC that covers both the qname AND the wildcard
-    const example_com = dns.Name{
-        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
-    };
-    const zeta = dns.Name{
-        .labels = &.{ @as([]const u8, "zeta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    // A single NSEC that covers both the qname AND the wildcard.
+    // example.com -> zeta.example.com covers both *.example.com and
+    // beta.example.com (both sort between example.com and zeta).
+    const example_com = dns.Name{ .labels = &.{ "example", "com" } };
+    const zeta = dns.Name{ .labels = &.{ "zeta", "example", "com" } };
 
-    // NSEC: example.com -> zeta.example.com covers both
-    // *.example.com and beta.example.com (both sort between example.com and zeta)
-    const authorities = [_]dns.ResourceRecord{.{
-        .name = example_com,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .nsec = .{
-            .next_domain_name = zeta,
-            .type_bit_maps = &.{},
-        } },
-    }};
+    const authorities = [_]dns.ResourceRecord{nsecRr(example_com, zeta)};
 
-    const beta = dns.Name{
-        .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
-    };
+    const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     const status = validateNegativeProof(&authorities, beta, .a, true);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
@@ -2516,31 +2459,23 @@ test "verifyRsa accepts 2048-bit (256-byte) modulus key parsing" {
     try testing.expect(result == error.InvalidSignature or result == error.InvalidKey);
 }
 
-test "verifyRsa rejects even exponent" {
-    var key_data: [1 + 3 + 256]u8 = undefined;
-    key_data[0] = 3;
-    key_data[1] = 0x01;
-    key_data[2] = 0x00;
-    key_data[3] = 0x02; // even exponent
-    @memset(key_data[4..], 0xAA);
+fn expectVerifyRsaInvalidKey(exp: []const u8) !void {
+    var key_data: [1 + 16 + 256]u8 = undefined;
+    key_data[0] = @intCast(exp.len);
+    @memcpy(key_data[1 .. 1 + exp.len], exp);
+    @memset(key_data[1 + exp.len ..], 0xAA);
     const sig = [_]u8{0} ** 256;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", key_data[0 .. 1 + exp.len + 256], Sha256));
+}
+
+test "verifyRsa rejects even exponent" {
+    try expectVerifyRsaInvalidKey(&.{ 0x01, 0x00, 0x02 }); // 65538, even
 }
 
 test "verifyRsa rejects exponent 0" {
-    var key_data: [1 + 1 + 256]u8 = undefined;
-    key_data[0] = 1; // exponent length = 1
-    key_data[1] = 0; // exponent = 0
-    @memset(key_data[2..], 0xAA);
-    const sig = [_]u8{0} ** 256;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+    try expectVerifyRsaInvalidKey(&.{0});
 }
 
 test "verifyRsa rejects exponent 1" {
-    var key_data: [1 + 1 + 256]u8 = undefined;
-    key_data[0] = 1; // exponent length = 1
-    key_data[1] = 1; // exponent = 1
-    @memset(key_data[2..], 0xAA);
-    const sig = [_]u8{0} ** 256;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", &key_data, Sha256));
+    try expectVerifyRsaInvalidKey(&.{1});
 }
