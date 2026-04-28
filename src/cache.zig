@@ -118,6 +118,13 @@ const NegativeEntry = struct {
 const CacheEntry = union(enum) {
     positive: CachedRRset,
     negative: NegativeEntry,
+
+    fn expiresAt(self: CacheEntry) i64 {
+        return switch (self) {
+            .positive => |p| p.expires_at,
+            .negative => |n| n.expires_at,
+        };
+    }
 };
 
 // ── Lookup result ─────────────────────────────────────────────────────
@@ -454,10 +461,7 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const idx = self.map.getIndex(probe) orelse return false;
         const now = self.now_fn();
-        const fresh = switch (self.map.values()[idx]) {
-            .positive => |p| now < p.expires_at,
-            .negative => |n| now < n.expires_at,
-        };
+        const fresh = now < self.map.values()[idx].expiresAt();
         if (fresh) self.markVisited(idx);
         return fresh;
     }
@@ -799,10 +803,7 @@ pub const RRsetCache = struct {
             // Check if we already have a valid entry — don't overwrite
             if (self.map.get(key)) |existing| {
                 const now = self.now_fn();
-                const expired = switch (existing) {
-                    .positive => |p| now >= p.expires_at,
-                    .negative => |n| now >= n.expires_at,
-                };
+                const expired = now >= existing.expiresAt();
                 if (!expired) {
                     alloc.free(key_name);
                     continue;
@@ -914,10 +915,7 @@ pub const RRsetCache = struct {
             const i = self.hand;
             self.hand += 1;
             self.clearVisited(i);
-            const expired = switch (self.map.values()[i]) {
-                .positive => |p| now >= p.expires_at,
-                .negative => |n| now >= n.expires_at,
-            };
+            const expired = now >= self.map.values()[i].expiresAt();
             if (expired) {
                 self.removeAtIndex(alloc, i);
                 _ = self.evictions.fetchAdd(1, .monotonic);
@@ -1020,6 +1018,50 @@ fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
     };
 }
 
+fn storeTestA(cache: *RRsetCache, alloc: Allocator, comptime labels: []const []const u8, ttl: u32, ip: [4]u8) !void {
+    const name = try makeTestName(alloc, labels);
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = ttl, .rdata = .{ .a = ip } };
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+}
+
+fn buildTestSoaAuthority(
+    alloc: Allocator,
+    comptime soa_labels: []const []const u8,
+    comptime mname_labels: []const []const u8,
+    comptime rname_labels: []const []const u8,
+    ttl: u32,
+    minimum: u32,
+) ![]dns.ResourceRecord {
+    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
+    authorities[0] = .{
+        .name = try makeTestName(alloc, soa_labels),
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = ttl,
+        .rdata = .{ .soa = .{
+            .mname = try makeTestName(alloc, mname_labels),
+            .rname = try makeTestName(alloc, rname_labels),
+            .serial = 2024010101,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = minimum,
+        } },
+    };
+    return authorities;
+}
+
+fn freeTestAuthorities(alloc: Allocator, authorities: []dns.ResourceRecord) void {
+    for (authorities) |rr| {
+        dns.freeName(alloc, rr.name);
+        dns.freeRData(alloc, rr.rdata);
+    }
+    alloc.free(authorities);
+}
+
 test "cache store and lookup positive" {
     const alloc = testing.allocator;
     test_time = 1000;
@@ -1027,15 +1069,7 @@ test "cache store and lookup positive" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 93, 184, 216, 34 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    const root_zone = dns.Name{ .labels = &.{} };
-    cache.storeResponse(response, root_zone);
+    try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 93, 184, 216, 34 });
 
     // Lookup should hit
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1060,14 +1094,7 @@ test "cache lookup expired entry returns null" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "example", "com" }, 60, .{ 1, 2, 3, 4 });
 
     // Advance time past TTL
     test_time = 1061;
@@ -1085,14 +1112,7 @@ test "cache TTL adjustment" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 });
 
     // Advance 100 seconds
     test_time = 1100;
@@ -1114,14 +1134,7 @@ test "cache case insensitive lookup" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "EXAMPLE", "COM" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "EXAMPLE", "COM" }, 300, .{ 1, 2, 3, 4 });
 
     // Lookup with lowercase
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1137,35 +1150,9 @@ test "cache negative NXDOMAIN" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const soa_name = try makeTestName(alloc, &.{ "example", "com" });
-    const mname = try makeTestName(alloc, &.{ "ns1", "example", "com" });
-    const rname = try makeTestName(alloc, &.{ "admin", "example", "com" });
-
-    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
-    authorities[0] = .{
-        .name = soa_name,
-        .rtype = .soa,
-        .rclass = .in,
-        .ttl = 900,
-        .rdata = .{
-            .soa = .{
-                .mname = mname,
-                .rname = rname,
-                .serial = 2024010101,
-                .refresh = 3600,
-                .retry = 900,
-                .expire = 604800,
-                .minimum = 600, // min(900, 600) = 600
-            },
-        },
-    };
-    defer {
-        for (authorities) |rr| {
-            dns.freeName(alloc, rr.name);
-            dns.freeRData(alloc, rr.rdata);
-        }
-        alloc.free(authorities);
-    }
+    // min(900, 600) = 600
+    const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
 
     cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
@@ -1191,33 +1178,8 @@ test "storeNegative rejects cross-zone SOA" {
     defer cache.deinit();
 
     // SOA for "other.net" — not a parent of "www.example.com"
-    const soa_name = try makeTestName(alloc, &.{ "other", "net" });
-    const mname = try makeTestName(alloc, &.{ "ns1", "other", "net" });
-    const rname = try makeTestName(alloc, &.{ "admin", "other", "net" });
-
-    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
-    authorities[0] = .{
-        .name = soa_name,
-        .rtype = .soa,
-        .rclass = .in,
-        .ttl = 900,
-        .rdata = .{ .soa = .{
-            .mname = mname,
-            .rname = rname,
-            .serial = 2024010101,
-            .refresh = 3600,
-            .retry = 900,
-            .expire = 604800,
-            .minimum = 600,
-        } },
-    };
-    defer {
-        for (authorities) |rr| {
-            dns.freeName(alloc, rr.name);
-            dns.freeRData(alloc, rr.rdata);
-        }
-        alloc.free(authorities);
-    }
+    const authorities = try buildTestSoaAuthority(alloc, &.{ "other", "net" }, &.{ "ns1", "other", "net" }, &.{ "admin", "other", "net" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
 
     cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
@@ -1235,33 +1197,8 @@ test "storeNegative accepts parent-zone SOA" {
     defer cache.deinit();
 
     // SOA for "com" — valid parent of "www.example.com"
-    const soa_name = try makeTestName(alloc, &.{"com"});
-    const mname = try makeTestName(alloc, &.{ "ns1", "com" });
-    const rname = try makeTestName(alloc, &.{ "admin", "com" });
-
-    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
-    authorities[0] = .{
-        .name = soa_name,
-        .rtype = .soa,
-        .rclass = .in,
-        .ttl = 900,
-        .rdata = .{ .soa = .{
-            .mname = mname,
-            .rname = rname,
-            .serial = 2024010101,
-            .refresh = 3600,
-            .retry = 900,
-            .expire = 604800,
-            .minimum = 600,
-        } },
-    };
-    defer {
-        for (authorities) |rr| {
-            dns.freeName(alloc, rr.name);
-            dns.freeRData(alloc, rr.rdata);
-        }
-        alloc.free(authorities);
-    }
+    const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
 
     cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
 
@@ -1286,35 +1223,11 @@ test "storeNegative rejects SOA above zone cut" {
 
     // SOA for "com" is a valid parent of "www.example.com", but the zone cut
     // is "example.com" — a rogue child server should not inject parent SOA.
-    const soa_name = try makeTestName(alloc, &.{"com"});
-    const mname = try makeTestName(alloc, &.{ "ns1", "com" });
-    const rname = try makeTestName(alloc, &.{ "admin", "com" });
     const zone_cut = try makeTestName(alloc, &.{ "example", "com" });
     defer dns.freeName(alloc, zone_cut);
 
-    const authorities = try alloc.alloc(dns.ResourceRecord, 1);
-    authorities[0] = .{
-        .name = soa_name,
-        .rtype = .soa,
-        .rclass = .in,
-        .ttl = 900,
-        .rdata = .{ .soa = .{
-            .mname = mname,
-            .rname = rname,
-            .serial = 2024010101,
-            .refresh = 3600,
-            .retry = 900,
-            .expire = 604800,
-            .minimum = 600,
-        } },
-    };
-    defer {
-        for (authorities) |rr| {
-            dns.freeName(alloc, rr.name);
-            dns.freeRData(alloc, rr.rdata);
-        }
-        alloc.free(authorities);
-    }
+    const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
 
     cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut, .unchecked);
 
@@ -1390,14 +1303,7 @@ test "cache skip zero TTL records" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "zero", "ttl" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 0, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "zero", "ttl" }, 0, .{ 1, 2, 3, 4 });
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1429,13 +1335,7 @@ test "cache prefetch flag at 10 percent TTL" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 });
 
     // At 50% TTL — no prefetch
     test_time = 1150;
@@ -1477,13 +1377,7 @@ test "cache prefetch disabled by default" {
     var cache = makeTestCache(alloc); // default: prefetch=false
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 });
 
     // At 5% TTL — still no prefetch (disabled)
     test_time = 1285;
@@ -1507,13 +1401,7 @@ test "cache serve stale within window" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "stale", "test" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "stale", "test" }, 60, .{ 1, 2, 3, 4 });
 
     // Expired but within stale window
     test_time = 1100; // 40s past expiry
@@ -1543,13 +1431,7 @@ test "cache serve stale beyond window returns null" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "stale2", "test" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "stale2", "test" }, 60, .{ 1, 2, 3, 4 });
 
     // Beyond stale window (60s TTL + 3600s stale = 3660s)
     test_time = 1000 + 60 + 3601;
@@ -1569,13 +1451,7 @@ test "cache min TTL floor" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "cdn", "test" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "cdn", "test" }, 60, .{ 1, 2, 3, 4 });
 
     // Should be cached with TTL=300, not 60
     {
@@ -1625,14 +1501,7 @@ test "cache stats tracking" {
     try testing.expectEqual(@as(u64, 1), cache.getStats().misses);
 
     // Store a record
-    const name = try makeTestName(alloc, &.{ "stats", "test" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    try storeTestA(&cache, alloc, &.{ "stats", "test" }, 300, .{ 1, 2, 3, 4 });
     try testing.expectEqual(@as(u64, 1), cache.getStats().stores);
     try testing.expectEqual(@as(u32, 1), cache.getStats().entries);
 
