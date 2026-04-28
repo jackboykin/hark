@@ -272,14 +272,14 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     mem.writeInt(u16, &len_prefix, msg_len, .big);
 
     // Send length-prefixed query
-    try sys.updateTimeoutCached(conn.sock, posix.SO.SNDTIMEO, deadline_ns, &conn.last_sndtimeo_ms);
+    try sys.updateTimeout(conn.sock, posix.SO.SNDTIMEO, deadline_ns);
     conn.tls_client.writer.writeAll(&len_prefix) catch return error.TlsSendFailed;
     conn.tls_client.writer.writeAll(wire_query) catch return error.TlsSendFailed;
     conn.tls_client.writer.flush() catch return error.TlsSendFailed;
     conn.net_writer.interface.flush() catch return error.TlsSendFailed;
 
     // Read 2-byte length prefix
-    try sys.updateTimeoutCached(conn.sock, posix.SO.RCVTIMEO, deadline_ns, &conn.last_rcvtimeo_ms);
+    try sys.updateTimeout(conn.sock, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
     conn.tls_client.reader.readSliceAll(&resp_len_buf) catch return error.TlsRecvFailed;
     const resp_len = mem.readInt(u16, &resp_len_buf, .big);

@@ -826,16 +826,15 @@ const WorkerState = struct {
     }
 
     fn sendUdpResponse(self: *WorkerState, sock: posix.fd_t, data: []const u8, dest: na.Address) void {
-        // MSG_DONTWAIT keeps the pool thread off a saturated kernel send buffer:
-        // dropping the response on WouldBlock/SystemResources is correct DNS
-        // behavior (the client retransmits), and beats stalling the worker.
+        // MSG_DONTWAIT keeps the pool thread off a saturated kernel send buffer.
+        // Dropping the response is correct DNS behavior — the client retransmits.
+        // All sendto failures (WouldBlock, SystemResources, MessageTooBig, peer
+        // resets, etc.) are counted under one drop signal: any send failure is
+        // operationally a "response not delivered" event the operator wants to see.
         var storage: na.PosixAddress = undefined;
         const sa_len = na.toSockaddr(&dest, &storage);
-        _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch |err| switch (err) {
-            error.WouldBlock, error.SystemResources => {
-                _ = self.udp_send_drops.fetchAdd(1, .monotonic);
-            },
-            else => {},
+        _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch {
+            _ = self.udp_send_drops.fetchAdd(1, .monotonic);
         };
     }
 
