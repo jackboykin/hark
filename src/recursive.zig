@@ -651,7 +651,7 @@ pub const RecursiveResolver = struct {
         }
         // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
         var zone_buf: [dns.max_name_len + 1]u8 = undefined;
-        if (!self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers))
+        if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
             return .secure;
         return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
     }
@@ -1216,24 +1216,25 @@ pub const RecursiveResolver = struct {
                     },
                     .negative => {}, // Insecure delegation — no DS validation needed
                 }
-            } else {
-                // DS not in cache (evicted or cold start). For non-root zones,
-                // re-fetch DS from the parent zone's NS before giving up
-                // (RFC 4035 §5.2). All major resolvers (Unbound, BIND, PowerDNS)
-                // re-fetch rather than returning bogus for transient cache misses.
-                // Root zone (empty name) is exempt — it's the trust anchor.
-                if (zone_name.len > 0) {
-                    if (!self.fetchDsFromParent(allocator, zone_name)) return null;
-                    const ds_result = c.lookup(allocator, zone_name, .ds, .in) orelse return null;
-                    switch (ds_result) {
+            } else if (zone_name.len > 0) {
+                // DS not in cache. Re-fetch from parent and validate against the
+                // freshly fetched records — RFC 1035 §3.2.1 permits using TTL=0
+                // RRs "for the transaction in progress" even though they will
+                // not be retained in the cache. The negative-DS cache (with
+                // NSEC TTL, not the suppressed DS TTL) still distinguishes
+                // insecure delegations from outright failures.
+                if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
+                    validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, &self.validation_budget) catch return null;
+                } else if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
+                    switch (result) {
+                        .negative => {}, // insecure delegation proven during fetch
                         .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null,
-                        .negative => return null, // Re-probe established insecure — caller's security_state is stale
                     }
-                } else {
-                    // Root zone: validate against hardcoded trust anchor
-                    const now_u32 = epochNowU32();
-                    dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32, &self.validation_budget) catch return null;
-                }
+                } else return null;
+            } else {
+                // Root zone: validate against hardcoded trust anchor
+                const now_u32 = epochNowU32();
+                dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32, &self.validation_budget) catch return null;
             }
         }
 
@@ -1303,9 +1304,10 @@ pub const RecursiveResolver = struct {
     /// Re-fetch DS for a zone by finding the parent zone's NS in cache
     /// and querying them. Falls back to resolving NS addresses from the
     /// network when cached addresses have expired (simultaneous DS+DNSKEY
-    /// TTL expiry). Returns true if DS is now in cache.
-    fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) bool {
-        if (self.resolving_ds) return false; // re-entrancy guard
+    /// TTL expiry). Returns the DS records on signed delegation, null on
+    /// insecure (negative cached) or failure.
+    fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) ?[]const dns.ResourceRecord {
+        if (self.resolving_ds) return null; // re-entrancy guard
 
         // Derive parent zone: strip first label (e.g. "example.com" → "com")
         // TLDs have no dot — parent is root, query root hints (RFC 4035 §3.1.4.1).
@@ -1315,10 +1317,10 @@ pub const RecursiveResolver = struct {
             return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
         const parent_zone = zone_name[pos + 1 ..];
 
-        const cache = self.cache orelse return false;
-        const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return false) {
+        const cache = self.cache orelse return null;
+        const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return null) {
             .hit => |h| h,
-            .negative => return false,
+            .negative => return null,
         };
         var ns_names: [max_servers_per_level]dns.Name = undefined;
         var ns_count: usize = 0;
@@ -1333,24 +1335,32 @@ pub const RecursiveResolver = struct {
         const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch null) orelse blk: {
             self.resolving_ds = true;
             defer self.resolving_ds = false;
-            break :blk (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return false;
+            break :blk (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return null;
         };
         return self.reproveDelegationSecurity(allocator, zone_name, addrs.addrs[0..addrs.count]);
     }
 
-    /// Refresh expired DS status by querying parent servers directly.
-    /// Uses dedup to coalesce concurrent fetches. Returns true if DS is now in cache.
+    /// Refresh expired DS status by querying parent servers directly. Uses
+    /// dedup to coalesce concurrent fetches. Returns the fresh DS records
+    /// (slice lives on `allocator`, the per-query arena) when the zone is
+    /// signed; null when the delegation is proven insecure (negative DS
+    /// cached) or when the fetch failed. The records themselves are not
+    /// cached if their TTL is 0 (RFC 1035 §3.2.1) — callers therefore use
+    /// the returned slice in-flight rather than relying on a cache lookup.
     fn reproveDelegationSecurity(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
         parent_servers: []const na.Address,
-    ) bool {
+    ) ?[]const dns.ResourceRecord {
         const kc = self.keyCache();
 
         // Fast path: DS already in cache (another thread may have fetched it).
         if (kc) |c| {
-            if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+            if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
+                .hit => |h| h.records,
+                .negative => null,
+            };
         }
 
         // Dedup: coalesce concurrent DS fetches for the same zone.
@@ -1363,9 +1373,13 @@ pub const RecursiveResolver = struct {
                 .follower => {
                     // Leader finished — re-check cache.
                     if (kc) |c| {
-                        if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+                        if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
+                            .hit => |h| h.records,
+                            .negative => null,
+                        };
                     }
-                    // Cache still empty — leader failed. One follower retries.
+                    // Cache still empty — leader failed (or TTL=0 DS that the
+                    // cache silently drops). One follower retries.
                     switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, monotonic.nowNs() + ds_dedup_timeout_ns / 2)) {
                         .leader => {
                             defer dedup.releaseLeader(zone_name, .ds, 0);
@@ -1373,9 +1387,12 @@ pub const RecursiveResolver = struct {
                         },
                         .follower => {
                             if (kc) |c| {
-                                if (c.lookup(allocator, zone_name, .ds, .in) != null) return true;
+                                if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
+                                    .hit => |h| h.records,
+                                    .negative => null,
+                                };
                             }
-                            return false;
+                            return null;
                         },
                     }
                 },
@@ -1390,35 +1407,40 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         zone_name: []const u8,
         parent_servers: []const na.Address,
-    ) bool {
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return false) orelse return false;
-        const zone = dns.parseDottedName(allocator, zone_name) catch return false;
+    ) ?[]const dns.ResourceRecord {
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return null) orelse return null;
+        const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
         // Cache DS response: main cache for NS/glue (skip_key_types skips DS),
-        // key cache for DS only (avoid polluting with NS/glue).
+        // key cache for DS only (avoid polluting with NS/glue). Stores no-op
+        // when the response carries TTL=0 — the returned slice keeps the
+        // records alive for the in-flight transaction (RFC 1035 §3.2.1).
         if (self.cache) |c| c.storeResponse(response, zone);
         // DS stored as .unchecked — validated indirectly via DNSKEY RRSIG.
         if (self.key_cache) |kc| kc.storeResponseWithStatus(answersOnly(response), zone, .unchecked);
 
-        // Positive DS — zone is signed.
-        // Check both answers (direct DS query) and authorities (referral-style response).
+        // Positive DS — zone is signed. Return the section that holds the DS
+        // records; validateDnskeyAgainstDs filters by rtype, so RRSIGs and
+        // glue ride along harmlessly.
         for (response.answers) |rr| {
-            if (rr.rtype == .ds) return true;
+            if (rr.rtype == .ds) return response.answers;
         }
         for (response.authorities) |rr| {
-            if (rr.rtype == .ds) return true;
+            if (rr.rtype == .ds) return response.authorities;
         }
 
-        // No DS — verify NSEC/NSEC3 proof and cache insecure delegation
+        // No DS — verify NSEC/NSEC3 proof and cache insecure delegation. The
+        // negative-DS entry uses NSEC TTLs (not the DS's TTL=0), so callers
+        // that fall back to the cache after a null return can still
+        // distinguish insecure from outright failure.
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone);
             if (status == .insecure) {
                 cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
-                return true;
             }
         }
-        return false;
+        return null;
     }
 
     /// Validate answer RRsets for a response from a secure zone.
@@ -1874,17 +1896,18 @@ pub const RecursiveResolver = struct {
             if (self.dnssec_enabled) {
                 const ds_cache = self.keyCache() orelse break;
                 if (!ds_cache.lookupExists(zone_str, .ds, .in)) {
-                    const reprobed = if (best) |parent_deleg|
+                    const records = if (best) |parent_deleg|
                         self.reproveDelegationSecurity(
                             allocator,
                             zone_str,
                             parent_deleg.addrs[0..parent_deleg.count],
                         )
                     else
-                        false;
-                    if (!reprobed) break;
-                    // DS status re-established — re-check before using
-                    if (!ds_cache.lookupExists(zone_str, .ds, .in)) break;
+                        null;
+                    // Records non-null = signed (may not be cached if TTL=0,
+                    // but DS status is known). Null + cache hit (negative)
+                    // = insecure. Null + cache miss = unknown, give up.
+                    if (records == null and !ds_cache.lookupExists(zone_str, .ds, .in)) break;
                 }
             }
 
