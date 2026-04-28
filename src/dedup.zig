@@ -317,6 +317,47 @@ test "table caps entries at max_entries" {
     }
 }
 
+test "leader fail wakes follower; retry becomes new leader" {
+    // Locks the recursive.zig retry pattern: when the original leader's
+    // fetch fails (releaseLeader with no cache population), waiting
+    // followers wake with .follower; their second acquireOrWait must
+    // promote them to .leader so exactly one retries the upstream fetch.
+    // Regression target: a future helper that swallows the post-wake
+    // re-acquire would leave followers stuck waiting on a cache entry
+    // that will never appear.
+    var table = InFlightTable.init(testing.allocator, testing.io);
+    defer table.deinit();
+
+    try testing.expectEqual(.leader, table.acquireOrWait("example.com", .dnskey, 0));
+
+    var first_result = std.atomic.Value(u8).init(0);
+    var second_result = std.atomic.Value(u8).init(0);
+
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(tbl: *InFlightTable, first: *std.atomic.Value(u8), second: *std.atomic.Value(u8)) void {
+            const r1 = tbl.acquireOrWait("example.com", .dnskey, 0);
+            first.store(@intFromEnum(r1), .release);
+            // Simulate "leader failed; cache still empty" — retry.
+            const r2 = tbl.acquireOrWait("example.com", .dnskey, 0);
+            second.store(@intFromEnum(r2), .release);
+            if (r2 == .leader) tbl.releaseLeader("example.com", .dnskey, 0);
+        }
+    }.run, .{ &table, &first_result, &second_result });
+
+    // Give the follower time to block.
+    {
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    // Main "fails" — release without populating any cache.
+    table.releaseLeader("example.com", .dnskey, 0);
+    t.join();
+
+    try testing.expectEqual(@intFromEnum(AcquireResult.follower), first_result.load(.acquire));
+    try testing.expectEqual(@intFromEnum(AcquireResult.leader), second_result.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), table.map.count());
+}
+
 test "tryAcquireLeader coalesces without enqueueing followers" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
