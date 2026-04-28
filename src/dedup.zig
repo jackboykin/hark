@@ -212,28 +212,35 @@ test "follower waits for leader" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
-    const leader_result = table.acquireOrWait("example.com", .a, 0);
-    try testing.expectEqual(.leader, leader_result);
+    try testing.expectEqual(.leader, table.acquireOrWait("example.com", .a, 0));
 
+    var started = std.atomic.Value(bool).init(false);
     var follower_done = std.atomic.Value(bool).init(false);
     var follower_result = std.atomic.Value(u8).init(0);
 
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(tbl: *InFlightTable, done: *std.atomic.Value(bool), result: *std.atomic.Value(u8)) void {
+        fn run(tbl: *InFlightTable, started_flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool), result: *std.atomic.Value(u8)) void {
+            started_flag.store(true, .release);
             const r = tbl.acquireOrWait("example.com", .a, 0);
             result.store(@intFromEnum(r), .release);
             done.store(true, .release);
         }
-    }.run, .{ &table, &follower_done, &follower_result });
+    }.run, .{ &table, &started, &follower_done, &follower_result });
 
-    // Give follower time to block
+    // Wait until the follower has at least begun executing — a slow CI
+    // runner that hadn't even scheduled the thread would false-pass the
+    // "not done" check below otherwise (silent miss, not flake).
+    while (!started.load(.acquire)) std.Thread.yield() catch {};
+
+    // Tiny sleep to let the follower reach the condvar wait. The window
+    // between started.store() and the wait itself is a handful of
+    // instructions — microseconds even on slow runners.
     {
-        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 5_000_000 };
         _ = std.os.linux.nanosleep(&ts, null);
     }
     try testing.expectEqual(false, follower_done.load(.acquire));
 
-    // Release — follower should wake
     table.releaseLeader("example.com", .a, 0);
     t.join();
 

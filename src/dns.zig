@@ -2398,22 +2398,22 @@ const TestRdata = struct {
     pos: usize = 0,
 
     fn putU8(self: *TestRdata, v: u8) void {
-        std.debug.assert(self.pos + 1 <= self.buf.len);
+        if (self.pos + 1 > self.buf.len) @panic("TestRdata overflow");
         self.buf[self.pos] = v;
         self.pos += 1;
     }
     fn putU16(self: *TestRdata, v: u16) void {
-        std.debug.assert(self.pos + 2 <= self.buf.len);
+        if (self.pos + 2 > self.buf.len) @panic("TestRdata overflow");
         mem.writeInt(u16, self.buf[self.pos..][0..2], v, .big);
         self.pos += 2;
     }
     fn putU32(self: *TestRdata, v: u32) void {
-        std.debug.assert(self.pos + 4 <= self.buf.len);
+        if (self.pos + 4 > self.buf.len) @panic("TestRdata overflow");
         mem.writeInt(u32, self.buf[self.pos..][0..4], v, .big);
         self.pos += 4;
     }
     fn putBytes(self: *TestRdata, v: []const u8) void {
-        std.debug.assert(self.pos + v.len <= self.buf.len);
+        if (self.pos + v.len > self.buf.len) @panic("TestRdata overflow");
         @memcpy(self.buf[self.pos..][0..v.len], v);
         self.pos += v.len;
     }
