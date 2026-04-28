@@ -493,74 +493,63 @@ pub const RRsetCache = struct {
 
         switch (entry) {
             .positive => |rrset| {
-                const is_expired = now >= rrset.expires_at;
-                if (is_expired) {
-                    if (self.serve_stale_ttl == 0 or (now - rrset.expires_at) >= self.serve_stale_ttl) {
-                        // Deferred eviction: under shared read lock we cannot mutate the map.
-                        // Expired entries linger until the next write path calls evictIfNeeded().
-                        // Compliant with RFC 8767.
-                        _ = self.misses.fetchAdd(1, .monotonic);
-                        return null;
-                    }
-                    // Stale but within window — serve with synthetic TTL (RFC 8767).
-                    // Clear security status: RRSIGs may have expired since caching,
-                    // so the resolver cannot vouch for authenticity (RFC 4035 §3.2.3).
-                    const records = cloneRRset(caller_alloc, rrset.records, 30) catch return null;
-                    _ = self.hits.fetchAdd(1, .monotonic);
-                    _ = self.stale_hits.fetchAdd(1, .monotonic);
-                    _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                    return .{ .hit = .{ .records = records, .remaining_ttl = 30, .needs_prefetch = true, .security_status = .unchecked } };
-                }
-
-                const elapsed: u32 = @intCast(@min(@max(now - rrset.stored_at, 0), rrset.original_ttl));
-                const remaining = rrset.original_ttl - elapsed;
-                const needs_prefetch = self.prefetch and (remaining * 10 <= rrset.original_ttl);
-                const records = cloneRRset(caller_alloc, rrset.records, remaining) catch return null;
-
-                _ = self.hits.fetchAdd(1, .monotonic);
-                if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                return .{ .hit = .{ .records = records, .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .security_status = rrset.security_status } };
+                const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
+                const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
+                return .{ .hit = .{
+                    .records = records,
+                    .remaining_ttl = hit.remaining_ttl,
+                    .needs_prefetch = hit.needs_prefetch,
+                    .security_status = if (hit.force_unchecked) .unchecked else rrset.security_status,
+                } };
             },
             .negative => |neg| {
-                const is_expired = now >= neg.expires_at;
-                if (is_expired) {
-                    // Never serve-stale for SERVFAIL entries — their short TTL
-                    // (e.g. 1s for DNSSEC bogus) is intentional and serve-stale
-                    // would extend failure duration beyond design intent.
-                    if (self.serve_stale_ttl == 0 or neg.rcode == .server_failure or (now - neg.expires_at) >= self.serve_stale_ttl) {
-                        // Deferred eviction: expired entry stays until next write.
-                        _ = self.misses.fetchAdd(1, .monotonic);
-                        return null;
-                    }
-                    const soa = cloneCachedRecord(caller_alloc, neg.soa, 30);
-                    _ = self.hits.fetchAdd(1, .monotonic);
-                    _ = self.stale_hits.fetchAdd(1, .monotonic);
-                    _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
-                    return .{ .negative = .{
-                        .rcode = neg.rcode,
-                        .remaining_ttl = 30,
-                        .soa = soa,
-                        .needs_prefetch = true,
-                        .security_status = .unchecked,
-                    } };
-                }
-
-                const elapsed: u32 = @intCast(@min(@max(now - neg.stored_at, 0), neg.original_ttl));
-                const remaining = neg.original_ttl - elapsed;
-                const needs_prefetch = self.prefetch and (remaining * 10 <= neg.original_ttl);
-                const soa = cloneCachedRecord(caller_alloc, neg.soa, remaining);
-
-                _ = self.hits.fetchAdd(1, .monotonic);
-                if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+                // SERVFAIL never serves stale: short TTL (e.g. 1s for DNSSEC bogus)
+                // is intentional; extending it would prolong failure beyond design.
+                const disable_stale = neg.rcode == .server_failure;
+                const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
+                const soa = cloneCachedRecord(caller_alloc, neg.soa, hit.remaining_ttl);
                 return .{ .negative = .{
                     .rcode = neg.rcode,
-                    .remaining_ttl = remaining,
+                    .remaining_ttl = hit.remaining_ttl,
                     .soa = soa,
-                    .needs_prefetch = needs_prefetch,
-                    .security_status = neg.security_status,
+                    .needs_prefetch = hit.needs_prefetch,
+                    .security_status = if (hit.force_unchecked) .unchecked else neg.security_status,
                 } };
             },
         }
+    }
+
+    /// Evaluate freshness for a cache entry, bumping hit/miss/stale counters.
+    /// Returns null on full miss (expired beyond stale window, or stale disabled).
+    /// On stale hit, returns force_unchecked=true: RRSIGs may have expired since
+    /// caching, so the resolver cannot vouch for authenticity (RFC 4035 §3.2.3,
+    /// RFC 8767). On fresh hit, force_unchecked=false.
+    fn evalFreshness(
+        self: *RRsetCache,
+        expires_at: i64,
+        stored_at: i64,
+        original_ttl: u32,
+        now: i64,
+        disable_stale: bool,
+    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, force_unchecked: bool } {
+        if (now < expires_at) {
+            const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
+            const remaining = original_ttl - elapsed;
+            const needs_prefetch = self.prefetch and (remaining * 10 <= original_ttl);
+            _ = self.hits.fetchAdd(1, .monotonic);
+            if (needs_prefetch) _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+            return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false };
+        }
+        if (disable_stale or self.serve_stale_ttl == 0 or (now - expires_at) >= self.serve_stale_ttl) {
+            // Deferred eviction: under shared read lock we cannot mutate the map;
+            // expired entries linger until the next write path calls evictIfNeeded.
+            _ = self.misses.fetchAdd(1, .monotonic);
+            return null;
+        }
+        _ = self.hits.fetchAdd(1, .monotonic);
+        _ = self.stale_hits.fetchAdd(1, .monotonic);
+        _ = self.prefetch_eligible.fetchAdd(1, .monotonic);
+        return .{ .remaining_ttl = 30, .needs_prefetch = true, .force_unchecked = true };
     }
 
     // ── Store ─────────────────────────────────────────────────────────
@@ -1441,6 +1430,27 @@ test "cache serve stale beyond window returns null" {
         const result = cache.lookup(arena.allocator(), "stale2.test", .a, .in);
         try testing.expect(result == null);
     }
+}
+
+test "SERVFAIL never serves stale" {
+    // RFC 8767 + design intent: a SERVFAIL with intentionally-short TTL
+    // (e.g. 1s for DNSSEC bogus per recursive.zig's bogusServfail) must
+    // not be extended into the serve-stale window. Doing so would prolong
+    // upstream failure long after the zone is fixed.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    cache.storeNegativeBare("bogus.test", .a, .in, .server_failure, 1, .unchecked);
+
+    // 5s past expiry, well within the 3600s stale window — must still miss.
+    test_time = 1000 + 1 + 5;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), "bogus.test", .a, .in) == null);
 }
 
 test "cache min TTL floor" {
