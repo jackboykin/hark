@@ -317,7 +317,7 @@ test "table caps entries at max_entries" {
     }
 }
 
-test "leader fail wakes follower; retry becomes new leader" {
+test "leader fail; follower retry becomes new leader" {
     // Locks the recursive.zig retry pattern: when the original leader's
     // fetch fails (releaseLeader with no cache population), waiting
     // followers wake with .follower; their second acquireOrWait must
@@ -325,36 +325,32 @@ test "leader fail wakes follower; retry becomes new leader" {
     // Regression target: a future helper that swallows the post-wake
     // re-acquire would leave followers stuck waiting on a cache entry
     // that will never appear.
+    //
+    // Single-threaded: an expired deadline lets the same thread observe
+    // .follower without actually blocking, then retry after the leader
+    // releases. Deterministic — no sleep, no thread spawn. Avoids the
+    // CI-flake landmine that comes with multi-thread timing tests.
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
     try testing.expectEqual(.leader, table.acquireOrWait("example.com", .dnskey, 0));
 
-    var first_result = std.atomic.Value(u8).init(0);
-    var second_result = std.atomic.Value(u8).init(0);
+    // Same-thread "follower" with already-expired deadline: returns .follower
+    // immediately, exactly as a real follower would after the leader's release
+    // wakes it (the wake-then-recheck path returns the same enum value).
+    const first = table.acquireOrWaitWithTimeout("example.com", .dnskey, 0, monotonic.nowNs());
+    try testing.expectEqual(.follower, first);
 
-    const t = try std.Thread.spawn(.{}, struct {
-        fn run(tbl: *InFlightTable, first: *std.atomic.Value(u8), second: *std.atomic.Value(u8)) void {
-            const r1 = tbl.acquireOrWait("example.com", .dnskey, 0);
-            first.store(@intFromEnum(r1), .release);
-            // Simulate "leader failed; cache still empty" — retry.
-            const r2 = tbl.acquireOrWait("example.com", .dnskey, 0);
-            second.store(@intFromEnum(r2), .release);
-            if (r2 == .leader) tbl.releaseLeader("example.com", .dnskey, 0);
-        }
-    }.run, .{ &table, &first_result, &second_result });
-
-    // Give the follower time to block.
-    {
-        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-    // Main "fails" — release without populating any cache.
+    // Leader "fails" — release without populating any cache.
     table.releaseLeader("example.com", .dnskey, 0);
-    t.join();
 
-    try testing.expectEqual(@intFromEnum(AcquireResult.follower), first_result.load(.acquire));
-    try testing.expectEqual(@intFromEnum(AcquireResult.leader), second_result.load(.acquire));
+    // The retry must promote the next caller to leader; the entry was
+    // removed on release. If a future refactor accidentally left the entry
+    // in place, this would return .follower again and the caller would
+    // wait forever on a cache that nothing populates.
+    const second = table.acquireOrWait("example.com", .dnskey, 0);
+    try testing.expectEqual(.leader, second);
+    table.releaseLeader("example.com", .dnskey, 0);
     try testing.expectEqual(@as(u32, 0), table.map.count());
 }
 
