@@ -1159,6 +1159,7 @@ pub fn verifyAuthorityNsecSigs(
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
     // so no dedup is needed.
     var any_nsec = false;
+    var any_unsupported = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3) continue;
         any_nsec = true;
@@ -1199,11 +1200,21 @@ pub fn verifyAuthorityNsecSigs(
             }
             if (sig_verified) break;
         }
-        // RFC 6840 §5.11: all-unsupported algorithms → insecure, not bogus.
-        if (!sig_verified) return if (had_unsupported_algo) .insecure else .bogus;
+        if (!sig_verified) {
+            // An unsigned NSEC owner is bogus (RFC 4035 §5.3): every owner
+            // must have a valid signature. Accumulate the all-unsupported-algo
+            // case across all owners — short-circuiting on the first one
+            // would let an attacker mix one fake unsupported-algo RRSIG with
+            // unsigned NSECs and downgrade the result to .insecure.
+            if (!had_unsupported_algo) return .bogus;
+            any_unsupported = true;
+        }
     }
 
-    return if (any_nsec) .secure else .unchecked;
+    if (!any_nsec) return .unchecked;
+    // RFC 6840 §5.11: every owner ended up with only unsupported algorithms.
+    if (any_unsupported) return .insecure;
+    return .secure;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2419,6 +2430,84 @@ test "validateRrsetForType propagates budget exhaustion as bogus" {
     var budget: ValidationBudget = .{ .sig_verify_remaining = 0 };
     const status = validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget);
     try testing.expectEqual(SecurityStatus.bogus, status);
+}
+
+// ── verifyAuthorityNsecSigs: validation-bypass guards ────────────────
+//
+// These tests lock the "every NSEC/NSEC3 owner must verify" invariant
+// (RFC 4035 §5.3, RFC 6840 §5.4/§5.11). A regression where the function
+// accepts unsigned or unrelated NSEC records would let an attacker forge
+// an NXDOMAIN response with insecure denial-of-existence — a DNSSEC
+// validation bypass on the order of CVE-2023-50387.
+
+fn nsecRrsigRr(owner: dns.Name, signer: dns.Name, algorithm: dns.DnssecAlgorithm) dns.ResourceRecord {
+    return .{
+        .name = owner,
+        .rtype = .rrsig,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .rrsig = .{
+            .type_covered = .nsec,
+            .algorithm = algorithm,
+            .labels = @intCast(owner.labels.len),
+            .original_ttl = 300,
+            .sig_expiration = 1700000000,
+            .sig_inception = 1699000000,
+            .key_tag = 12345,
+            .signer_name = signer,
+            .signature = &.{},
+        } },
+    };
+}
+
+test "verifyAuthorityNsecSigs: NSEC without RRSIG returns bogus" {
+    const owner = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
+    // No DNSKEYs needed; iteration fails the find-RRSIG step.
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+    );
+}
+
+test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
+    // Even if the FIRST NSEC carries an unsupported-algo RRSIG (which
+    // would yield .insecure on its own), a SECOND NSEC with no RRSIG at
+    // all must still drive the result to .bogus. The "every owner must
+    // verify" invariant is non-negotiable.
+    const owner1 = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
+    const next1 = dns.Name{ .labels = &.{ "beta", "example", "com" } };
+    const owner2 = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
+    const next2 = dns.Name{ .labels = &.{ "delta", "example", "com" } };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(owner1, next1),
+        nsecRrsigRr(owner1, signer, .dsasha1), // unsupported algo, won't verify
+        nsecRr(owner2, next2),
+        // no RRSIG for owner2 — bogus
+    };
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+    );
+}
+
+test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns insecure" {
+    // RFC 6840 §5.11: when every candidate signature uses an unsupported
+    // algorithm, the result is .insecure (not .bogus). Validators must
+    // not treat unsupported-algo zones as authentication failures.
+    const owner = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(owner, next),
+        nsecRrsigRr(owner, signer, .dsasha1), // unsupported — triggers had_unsupported_algo
+    };
+    try testing.expectEqual(
+        SecurityStatus.insecure,
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+    );
 }
 
 // ── H3: RSA key validation tests ────────────────────────────────────
