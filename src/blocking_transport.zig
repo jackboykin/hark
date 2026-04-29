@@ -16,6 +16,20 @@ pub const Config = struct {
     retransmit_count: u32 = 2,
 };
 
+/// Map a UDP-send syscall error to a transport-level error. WouldBlock from
+/// SO_SNDTIMEO means the kernel send buffer stayed jammed past the deadline;
+/// kernel-async ICMP unreachable surfaces here too. MessageTooBig means our
+/// serialized query exceeded path MTU — should not happen under normal EDNS
+/// limits, so a distinct variant lets it stand out in logs.
+fn mapUdpSendErr(err: anyerror) error{ Timeout, PeerUnreachable, MessageTooBig, SendFailed } {
+    return switch (err) {
+        error.WouldBlock => error.Timeout,
+        error.ConnectionRefused => error.PeerUnreachable,
+        error.MessageTooBig => error.MessageTooBig,
+        else => error.SendFailed,
+    };
+}
+
 /// Create a UDP socket bound to a random ephemeral port (RFC 5452).
 fn openUdpSocket(dest: na.Address, io: std.Io) !posix.fd_t {
     const af: u32 = na.afU32(dest);
@@ -125,7 +139,7 @@ pub const BlockingUdpTransport = struct {
         var upstream_sa: na.PosixAddress = undefined;
         const upstream_sa_len = na.toSockaddr(&upstream, &upstream_sa);
 
-        _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch return error.Timeout;
+        _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch |err| return mapUdpSendErr(err);
 
         const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
         var retransmits_left: u32 = self.config.retransmit_count;
@@ -141,7 +155,7 @@ pub const BlockingUdpTransport = struct {
                     // Timeout on recv — retransmit or fail.
                     if (retransmits_left == 0) return error.Timeout;
                     retransmits_left -= 1;
-                    _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch return error.Timeout;
+                    _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch |e| return mapUdpSendErr(e);
 
                     const remain_ms = @as(u32, @intCast(@min(
                         @divFloor(remaining_ns, 1_000_000),
@@ -151,7 +165,8 @@ pub const BlockingUdpTransport = struct {
                     setRcvTimeoIfChanged(sock, remain_ms);
                     continue;
                 },
-                else => return error.Timeout,
+                error.ConnectionRefused => return error.PeerUnreachable,
+                else => return error.RecvFailed,
             };
 
             if (n < 2) continue;
@@ -218,8 +233,8 @@ pub const BlockingUdpTransport = struct {
         const s0 = try openUdpSocket(servers[0], self.io);
         socks[0] = s0;
         sock_count = 1;
-        na.connectTo(s0, &servers[0]) catch return error.Timeout;
-        _ = sys.send(s0, wire_queries[0], 0) catch return error.Timeout;
+        na.connectTo(s0, &servers[0]) catch return error.SendFailed;
+        _ = sys.send(s0, wire_queries[0], 0) catch |err| return mapUdpSendErr(err);
         var next_launch_ns: i128 = monotonic.nowNs() + stagger_ns;
 
         while (true) {

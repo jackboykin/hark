@@ -66,11 +66,17 @@ const max_cname_chain = 8;
 const max_minimise_count = 10;
 
 /// Parse a DNS message, propagating OOM and converting other parse
-/// errors to null so callers can skip malformed responses.
-fn tryParseMessage(allocator: mem.Allocator, data: []const u8) error{OutOfMemory}!?dns.Message {
+/// errors to null so callers can skip malformed responses. Logs the
+/// server address and error name at debug level — warn would be a DoS
+/// amplifier for an attacker controlling an authoritative server.
+fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Address) error{OutOfMemory}!?dns.Message {
     return dns.parseMessage(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        else => {
+            var addr_buf: [64]u8 = undefined;
+            log.debug("dropping malformed reply from {s}: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
+            return null;
+        },
     };
 }
 
@@ -608,10 +614,7 @@ pub const RecursiveResolver = struct {
             .referral => |ref| .{ .addrs = ref.addrs, .count = ref.count },
             .no_glue => |ng| blk: {
                 if (try self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count])) |res| break :blk res;
-                const resolved = self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    return error.NoGlueRecords;
-                };
+                const resolved = try self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth);
                 break :blk resolved orelse return error.NoGlueRecords;
             },
         };
@@ -786,8 +789,12 @@ pub const RecursiveResolver = struct {
             server,
             timeout,
             response_buf,
-        ) catch {
+        ) catch |err| {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+            if (err != error.Timeout) {
+                var addr_buf: [64]u8 = undefined;
+                log.debug("UDP query to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
+            }
             return null;
         };
         const elapsed_us = monotonic.nowUs() - query_start;
@@ -800,7 +807,7 @@ pub const RecursiveResolver = struct {
             return self.tcpFallback(allocator, wire_query, server);
         }
 
-        const response = try tryParseMessage(allocator, response_data) orelse return null;
+        const response = try tryParseMessage(allocator, response_data, server) orelse return null;
         if (!response.header.qr) return null;
         return response;
     }
@@ -820,10 +827,11 @@ pub const RecursiveResolver = struct {
             tcp_t.queryPooled(wire_query, server, tcp_buf, p)
         else
             tcp_t.query(wire_query, server, tcp_buf)) catch |err| {
-            log.warn("TCP fallback failed: {s}", .{@errorName(err)});
+            var addr_buf: [64]u8 = undefined;
+            log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
         };
-        const response = try tryParseMessage(allocator, tcp_data) orelse return null;
+        const response = try tryParseMessage(allocator, tcp_data, server) orelse return null;
         if (!response.header.qr) return null;
         return response;
     }
@@ -930,7 +938,7 @@ pub const RecursiveResolver = struct {
         const resp = if (dns.hasTcBit(stag_result.response_data))
             try self.tcpFallback(allocator, wires[winner], responding_addr) orelse return null
         else
-            try tryParseMessage(allocator, stag_result.response_data) orelse return null;
+            try tryParseMessage(allocator, stag_result.response_data, responding_addr) orelse return null;
 
         // RFC 5452 §9.1 / RFC 9619: reject responses whose question doesn't echo
         // the query. (The sequential path enforces this via queryAuthoritativeServers.)
@@ -1019,7 +1027,7 @@ pub const RecursiveResolver = struct {
                             const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
                             const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
                             if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
-                                if (try tryParseMessage(allocator, tls_data)) |tls_response| {
+                                if (try tryParseMessage(allocator, tls_data, server)) |tls_response| {
                                     if (tls_response.header.qr and
                                         tls_response.header.rcode != .format_error and
                                         dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
