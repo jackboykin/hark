@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     var args_list = std.ArrayList([:0]const u8).empty;
     defer args_list.deinit(allocator);
     while (args_iter.next()) |arg| {
-        args_list.append(allocator, arg) catch break;
+        try args_list.append(allocator, arg);
     }
     const args = args_list.items;
 
@@ -350,19 +350,15 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     }
 
-    // Load config: explicit path → ./hark.toml → /etc/hark/hark.toml → defaults
+    // Load config: explicit path → ./hark.toml → /etc/hark/hark.toml → defaults.
+    // Only fall through on FileNotFound; surface any other error (parse, I/O).
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(gpa_alloc, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
         }
     else
-        hark.config.parseConfigFile(gpa_alloc, "hark.toml") catch
-            hark.config.parseConfigFile(gpa_alloc, "/etc/hark/hark.toml") catch
-            hark.config.parseConfig(gpa_alloc, "") catch |err| {
-            log.err("creating default config: {s}", .{@errorName(err)});
-            std.process.exit(1);
-        };
+        loadDefaultConfig(gpa_alloc) catch std.process.exit(1);
     defer cfg.deinit();
 
     // Enable verbose logging from CLI flag or config
@@ -380,5 +376,23 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     server.run() catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
+    };
+}
+
+fn loadDefaultConfig(gpa_alloc: std.mem.Allocator) !hark.config.ServerConfig {
+    for ([_][]const u8{ "hark.toml", "/etc/hark/hark.toml" }) |path| {
+        if (hark.config.parseConfigFile(gpa_alloc, path)) |cfg| {
+            return cfg;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
+                return err;
+            },
+        }
+    }
+    return hark.config.parseConfig(gpa_alloc, "") catch |err| {
+        log.err("creating default config: {s}", .{@errorName(err)});
+        return err;
     };
 }

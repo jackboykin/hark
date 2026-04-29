@@ -144,7 +144,6 @@ pub const TlsTransport = struct {
         if (remaining_ns <= 0) return error.Timeout;
         const connect_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
         const sock = try connectTcpBlocking(tls_server, connect_ms);
-        errdefer sys.close(sock);
         const conn = try self.initOpportunisticConnection(sock);
 
         const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
@@ -163,7 +162,9 @@ pub const TlsTransport = struct {
 
     /// Allocate a PooledConnection from a connected socket and perform an
     /// opportunistic TLS handshake (ALPN "dot", no cert, no SNI).
+    /// Takes ownership of `sock`: closes it on any failure path.
     fn initOpportunisticConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
+        errdefer sys.close(sock);
         const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
 
@@ -230,7 +231,6 @@ pub const TlsTransport = struct {
         // ── TLS handshake ──
         const conn = self.initOpportunisticConnection(sock) catch {
             enc_ns_cache.markFailed(addr_key);
-            sys.close(sock);
             return;
         };
 

@@ -226,7 +226,7 @@ pub const Server = struct {
             allocator
         else
             std.heap.smp_allocator;
-        const cache = RRsetCache.init(.{
+        var cache = RRsetCache.init(.{
             .backing = cache_alloc,
             .max_bytes = cfg.cache_size,
             .max_entries = cfg.cache_entries,
@@ -237,18 +237,21 @@ pub const Server = struct {
             .min_ttl = cfg.min_ttl,
             .skip_key_types = cfg.dnssec,
         });
+        errdefer cache.deinit();
 
-        const rtt_cache = RttCache.init(.{
+        var rtt_cache = RttCache.init(.{
             .allocator = allocator,
             .io = io,
             .thread_safe = cfg.workers > 1,
         });
+        errdefer rtt_cache.deinit();
 
-        const ns_selector = NsSelector.init(.{
+        var ns_selector = NsSelector.init(.{
             .allocator = allocator,
             .io = io,
             .thread_safe = cfg.workers > 1,
         });
+        errdefer ns_selector.deinit();
 
         var ca_bundle: Certificate.Bundle = .empty;
         if (cfg.opportunistic) {
