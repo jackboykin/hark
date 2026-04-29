@@ -122,6 +122,13 @@ pub const InFlightTable = struct {
             return .follower;
         }
 
+        // At cap: graceful degradation. Return `.leader` without inserting so
+        // every overflow caller runs uncoordinated. Eviction would be worse
+        // under water-torture floods: at cap by definition we're under attack
+        // load, mostly unique keys, no dedup benefit from eviction — but each
+        // eviction wakes a real query's followers who retry, doubling upstream
+        // amplification per arrival. Concurrent identical-key callers at cap
+        // both becoming uncoordinated leaders is the lesser evil here.
         if (self.map.count() >= max_entries) return .leader;
         self.map.put(self.allocator, key, false) catch return .leader;
         return .leader;
@@ -308,7 +315,11 @@ test "table caps entries at max_entries" {
     }
     try testing.expectEqual(@as(u32, max_entries), table.map.count());
 
-    // One more unique query: still gets .leader, but isn't inserted.
+    // One more unique query: still gets .leader, but isn't inserted — graceful
+    // degradation under cap pressure. Concurrent same-key callers also become
+    // uncoordinated leaders rather than dedup; this is the lesser evil vs.
+    // evicting a real in-flight entry whose followers would retry and double
+    // upstream load.
     try testing.expectEqual(.leader, table.acquireOrWait("overflow.example.com", .a, 0));
     try testing.expectEqual(@as(u32, max_entries), table.map.count());
 

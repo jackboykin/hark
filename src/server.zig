@@ -172,7 +172,21 @@ const BackgroundTasks = struct {
         while (true) {
             const cur = self.active.load(.monotonic);
             if (cur >= max_bg_tasks) return false;
-            if (self.active.cmpxchgStrong(cur, cur + 1, .monotonic, .monotonic) == null) return true;
+            // .acq_rel on success: the release publishes our bump so awaitAll's
+            // acquire-load sees it; the acquire pairs with the post-bump
+            // shutdown re-check below.
+            if (self.active.cmpxchgStrong(cur, cur + 1, .acq_rel, .monotonic) == null) {
+                // Re-check shutdown after the bump landed. Between our pre-check
+                // and CAS, awaitAll may have set shutting_down and observed
+                // inFlight==0 (because our bump hadn't published yet) and
+                // exited. If shutdown is now set, roll back so we don't spawn
+                // into torn-down server state.
+                if (self.shutting_down.load(.acquire)) {
+                    _ = self.active.fetchSub(1, .release);
+                    return false;
+                }
+                return true;
+            }
         }
     }
 
@@ -186,6 +200,12 @@ const BackgroundTasks = struct {
 
     /// Block until all in-flight background threads finish. Called from
     /// Server.deinit so caches/config outlive the threads that read them.
+    ///
+    /// The poll-sleep is load-bearing for `tryClaim`'s rollback contract: a
+    /// CAS bump can land after `shutting_down` is set, so the poll must
+    /// observe the transient bump and wait for the subsequent rollback
+    /// decrement that the post-CAS re-check performs. A single-shot wait
+    /// (e.g. condvar) would re-open the race.
     fn awaitAll(self: *BackgroundTasks) void {
         self.shutting_down.store(true, .release);
         while (self.inFlight() > 0) {
