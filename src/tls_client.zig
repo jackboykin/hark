@@ -1286,6 +1286,8 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .handshake => {
             var ct_i: usize = 0;
             while (true) {
+                // Need 4 bytes for the handshake header (type + 3-byte length).
+                if (cleartext.len - ct_i < 4) return failRead(c, error.TlsBadLength);
                 const handshake_type: tls.HandshakeType = @enumFromInt(cleartext[ct_i]);
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
@@ -1316,6 +1318,8 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         }
                         c.read_seq = 0;
 
+                        // RFC 8446 §4.6.3: KeyUpdate carries exactly one byte (the request flag).
+                        if (handshake.len < 1) return failRead(c, error.TlsBadLength);
                         switch (@as(tls.KeyUpdateRequest, @enumFromInt(handshake[0]))) {
                             .update_requested => {
                                 switch (c.application_cipher) {

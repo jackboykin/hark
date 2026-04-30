@@ -314,8 +314,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        // Drain detached prefetch/revalidate threads before freeing the
-        // caches/dedup/CA bundle they read.
+        // awaitProbes MUST precede ca_bundle.deinit: each probe holds a
+        // by-value TlsTransport whose ca_bundle slices alias this owner.
         self.bg_tasks.awaitAll();
         if (self.encrypted_ns_cache) |*oc| {
             oc.awaitProbes();

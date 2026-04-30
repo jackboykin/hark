@@ -208,7 +208,12 @@ pub const TlsTransport = struct {
             }
             if (enc_ns_cache.active_probes.cmpxchgStrong(current, current + 1, .seq_cst, .seq_cst) == null) break;
         }
-        const thread = std.Thread.spawn(.{}, probeThread, .{ self, tls_server, addr_key, enc_ns_cache }) catch {
+        // Pass TlsTransport by value: the probe thread is detached and
+        // outlives the spawning thread (pool / bg-prefetch) whose stack
+        // frame holds the original `*TlsTransport`. Copying snaps the
+        // small handle (allocator / config / ca_bundle / io / pool ptr)
+        // into the new thread's args before the spawning stack vanishes.
+        const thread = std.Thread.spawn(.{}, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
             enc_ns_cache.markFailed(addr_key);
             _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
             return;
@@ -216,12 +221,14 @@ pub const TlsTransport = struct {
         thread.detach();
     }
 
-    fn probeThread(self: *TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
+    fn probeThread(tls: TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
         defer _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
         if (enc_ns_cache.shutting_down.load(.seq_cst)) {
             enc_ns_cache.revertProbing(addr_key);
             return;
         }
+
+        var self = tls; // value copy owned by this thread
 
         const sock = connectTcpBlocking(tls_server, 4000) catch {
             enc_ns_cache.markFailed(addr_key);
