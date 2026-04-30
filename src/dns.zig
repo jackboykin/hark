@@ -79,6 +79,7 @@ pub const RType = enum(u16) {
     dnskey = 48,
     nsec3 = 50,
     nsec3param = 51,
+    any = 255,
     _,
 };
 
@@ -860,7 +861,7 @@ pub const Parser = struct {
                     .salt = try self.readSlice(salt_len),
                 } };
             },
-            .opt, _ => {
+            .opt, .any, _ => {
                 const data = try self.readSlice(rdlength);
                 return .{ .unknown = data };
             },

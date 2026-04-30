@@ -1073,21 +1073,26 @@ pub fn validateAnswerRrset(
     now_u32: u32,
     budget: ?*ValidationBudget,
 ) SecurityStatus {
-    // Validate the main answer type
-    if (validateRrsetForType(answers, qtype, dnskey_records, now_u32, budget) == .bogus) return .bogus;
+    // Validate the main answer type. Propagate .insecure (all-unsupported-algo
+    // RRSIGs) instead of silently upgrading to .secure — otherwise the resolver
+    // would stamp AD on data it never cryptographically verified.
+    const main = validateRrsetForType(answers, qtype, dnskey_records, now_u32, budget);
+    if (main == .bogus) return .bogus;
 
     // If answers contain CNAME records, validate the CNAME RRset too.
     // After bailiwick scrubbing, all answer records are from the same zone.
     if (qtype != .cname) {
         for (answers) |rr| {
             if (rr.rtype == .cname) {
-                if (validateRrsetForType(answers, .cname, dnskey_records, now_u32, budget) == .bogus) return .bogus;
+                const cname_status = validateRrsetForType(answers, .cname, dnskey_records, now_u32, budget);
+                if (cname_status == .bogus) return .bogus;
+                if (cname_status == .insecure) return .insecure;
                 break;
             }
         }
     }
 
-    return .secure;
+    return main;
 }
 
 /// RFC 8624 §3.1: MUST validate RSASHA1/RSASHA1-NSEC3 even though they
@@ -1110,6 +1115,7 @@ fn validateRrsetForType(
     budget: ?*ValidationBudget,
 ) SecurityStatus {
     var had_unsupported_algo = false;
+    var attempted_supported = false;
     for (answers) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
         const rrsig = sig_rr.rdata.rrsig;
@@ -1119,6 +1125,10 @@ fn validateRrsetForType(
             had_unsupported_algo = true;
             continue;
         }
+
+        // Set BEFORE the owner filter — owner-mismatch is itself a forgery
+        // signal, not an excuse to launder to .insecure.
+        attempted_supported = true;
 
         // Filter RRset by this RRSIG's owner (same owner + type)
         var filtered: [64]dns.ResourceRecord = undefined;
@@ -1141,7 +1151,10 @@ fn validateRrsetForType(
             if (tryVerifyRrsig(rrsig, dk, filtered[0..count], now_u32, budget) catch return .bogus) return .secure;
         }
     }
-    // RFC 6840 §5.11: all-unsupported algorithms → insecure, not bogus.
+    // RFC 6840 §5.11: all-unsupported → .insecure. But a supported-algo
+    // attempt that failed must yield .bogus, not .insecure, or attackers
+    // launder failures via injected unsupported-algo RRSIGs.
+    if (attempted_supported) return .bogus;
     return if (had_unsupported_algo) .insecure else .bogus;
 }
 
@@ -1177,6 +1190,7 @@ pub fn verifyAuthorityNsecSigs(
         // Find a matching RRSIG and verify it
         var sig_verified = false;
         var had_unsupported_algo = false;
+        var attempted_supported = false;
         for (authorities) |sig_rr| {
             if (sig_rr.rtype != .rrsig) continue;
             const rrsig = sig_rr.rdata.rrsig;
@@ -1186,6 +1200,8 @@ pub fn verifyAuthorityNsecSigs(
                 had_unsupported_algo = true;
                 continue;
             }
+
+            attempted_supported = true;
 
             for (dnskey_records) |dk_rr| {
                 if (dk_rr.rtype != .dnskey) continue;
@@ -1201,11 +1217,10 @@ pub fn verifyAuthorityNsecSigs(
             if (sig_verified) break;
         }
         if (!sig_verified) {
-            // An unsigned NSEC owner is bogus (RFC 4035 §5.3): every owner
-            // must have a valid signature. Accumulate the all-unsupported-algo
-            // case across all owners — short-circuiting on the first one
-            // would let an attacker mix one fake unsupported-algo RRSIG with
-            // unsigned NSECs and downgrade the result to .insecure.
+            // RFC 4035 §5.3: every NSEC owner must verify. .insecure only
+            // when every supported-algo path was unavailable; otherwise
+            // bogus. See validateRrsetForType for the laundering rationale.
+            if (attempted_supported) return .bogus;
             if (!had_unsupported_algo) return .bogus;
             any_unsupported = true;
         }
@@ -2507,6 +2522,176 @@ test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns insecure" {
     try testing.expectEqual(
         SecurityStatus.insecure,
         verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+    );
+}
+
+test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bogus" {
+    // Laundering guard: an attacker who attaches one fake unsupported-algo
+    // RRSIG alongside a real supported-algo RRSIG that fails verification
+    // must NOT be able to downgrade the result from .bogus to .insecure.
+    const owner = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const tag = keyTag(dnskey);
+    const supported_rrsig = dns.ResourceRecord{
+        .name = owner,
+        .rtype = .rrsig,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{
+            .rrsig = .{
+                .type_covered = .nsec,
+                .algorithm = .ecdsap256sha256,
+                .labels = @intCast(owner.labels.len),
+                .original_ttl = 300,
+                .sig_expiration = 1700000000,
+                .sig_inception = 1699000000,
+                .key_tag = tag,
+                .signer_name = signer,
+                .signature = &.{}, // empty — verify fails (not budget; returns false)
+            },
+        },
+    };
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(owner, next),
+        nsecRrsigRr(owner, signer, .dsasha1), // unsupported — pre-fix would have triggered .insecure
+        supported_rrsig, // supported but verify fails
+    };
+    const dnskeys = [_]dns.ResourceRecord{
+        .{ .name = signer, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
+    };
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, null),
+    );
+}
+
+test "validateRrsetForType: owner-mismatch supported + matched unsupported returns bogus" {
+    // Owner-mismatch laundering: attacker sends a supported-algo RRSIG
+    // whose owner doesn't match any answer record (count == 0 path) plus
+    // an unsupported-algo RRSIG that does match. Without setting the
+    // attempted-supported flag before the owner filter, the result laundered
+    // to .insecure. Real signed zones never include RRSIGs whose owner
+    // doesn't match any RR they cover, so the mismatch itself is a
+    // forgery signal.
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const tag = keyTag(dnskey);
+    const other_owner = dns.Name{ .labels = &.{ "other", "com" } };
+    const supported_mismatched = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = @intCast(other_owner.labels.len),
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = tag,
+        .signer_name = other_owner,
+        .signature = &.{},
+    };
+    const unsupported_matched = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .dsasha1,
+        .labels = @intCast(test_owner.labels.len),
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 0,
+        .signer_name = test_owner,
+        .signature = &.{},
+    };
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = unsupported_matched } },
+        // The supported-algo RRSIG has owner = "other.com" — won't match the answer
+        .{ .name = other_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = supported_mismatched } },
+    };
+    const dnskeys = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
+    };
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, null),
+    );
+}
+
+test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus" {
+    // Same laundering guard as above, on the answer-validation path.
+    const dnskey = dns.DnskeyData{
+        .flags = 256,
+        .protocol = 3,
+        .algorithm = .ecdsap256sha256,
+        .public_key = &.{},
+    };
+    const tag = keyTag(dnskey);
+    const supported_rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = @intCast(test_owner.labels.len),
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = tag,
+        .signer_name = test_owner,
+        .signature = &.{}, // empty — verify fails
+    };
+    const unsupported_rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .dsasha1,
+        .labels = @intCast(test_owner.labels.len),
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 0,
+        .signer_name = test_owner,
+        .signature = &.{},
+    };
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = unsupported_rrsig } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = supported_rrsig } },
+    };
+    const dnskeys = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
+    };
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, null),
+    );
+}
+
+test "validateAnswerRrset: insecure sub-result propagates (not laundered to secure)" {
+    // RRSIG present but algorithm unsupported → validateRrsetForType returns
+    // .insecure. The wrapper must propagate .insecure, not silently return
+    // .secure — otherwise the caller stamps AD on never-verified data.
+    const unsupported_rrsig = dns.RrsigData{
+        .type_covered = .a,
+        .algorithm = .dsasha1, // unsupported
+        .labels = @intCast(test_owner.labels.len),
+        .original_ttl = 300,
+        .sig_expiration = 1700000000,
+        .sig_inception = 1699000000,
+        .key_tag = 0,
+        .signer_name = test_owner,
+        .signature = &.{},
+    };
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = unsupported_rrsig } },
+    };
+    try testing.expectEqual(
+        SecurityStatus.insecure,
+        validateAnswerRrset(&answers, .a, &.{}, 1699500000, null),
     );
 }
 

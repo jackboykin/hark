@@ -539,14 +539,15 @@ pub const RecursiveResolver = struct {
                             .skip => {},
                         }
                     }
-                    if (self.cache) |c| {
+                    // Don't cache ANY responses: RFC 8482 makes them server-
+                    // policy, so unauthenticated constituents would become a
+                    // poisoning channel for later per-type lookups.
+                    if (self.cache) |c| if (qtype != .any) {
                         c.storeResponseWithStatus(response, parent_zone, answer_status);
-                        // Store wildcard RRsets for aggressive NSEC synthesis (RFC 8198 §5.3).
-                        // Detect wildcard expansion: RRSIG labels < owner name labels.
                         if (answer_status == .secure and self.nsec_cache != null) {
                             self.storeWildcardRRsets(response.answers, qtype);
                         }
-                    }
+                    };
 
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -706,9 +707,20 @@ pub const RecursiveResolver = struct {
         answers: []const dns.ResourceRecord,
         qtype: dns.RType,
     ) void {
-        // Find RRSIG for qtype to detect wildcard expansion
-        const rrsig = dnssec.findRrsig(answers, qtype) orelse return;
-        const rrsig_labels = rrsig.labels;
+        // Pick the RRSIG covering qtype with the highest `labels` count
+        // (narrowest wildcard). A smaller-labels forgery alongside the
+        // real RRSIG would otherwise widen the cached wildcard owner —
+        // e.g. forge labels=1 against real labels=2 to install *.com.
+        // Larger-labels forgeries only narrow scope (DoS on aggressive
+        // NSEC at this zone, no poisoning).
+        var rrsig: ?dns.RrsigData = null;
+        for (answers) |rr| {
+            if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != qtype) continue;
+            if (rrsig == null or rr.rdata.rrsig.labels > rrsig.?.labels) {
+                rrsig = rr.rdata.rrsig;
+            }
+        }
+        const sig = rrsig orelse return;
 
         // Single pass: detect wildcard expansion from the first expanded answer record,
         // then collect all qtype records + covering RRSIGs with wildcard owner name.
@@ -718,9 +730,8 @@ pub const RecursiveResolver = struct {
         var wc_count: usize = 0;
         for (answers) |ans_rr| {
             if (wc_count >= wc_records.len) break;
-            // Detect wildcard from first answer record where RRSIG labels < owner labels
-            if (wildcard_owner == null and ans_rr.rtype == qtype and ans_rr.name.labels.len > rrsig_labels) {
-                const ce = dns.Name{ .labels = ans_rr.name.labels[ans_rr.name.labels.len - rrsig_labels ..] };
+            if (wildcard_owner == null and ans_rr.rtype == qtype and ans_rr.name.labels.len > sig.labels) {
+                const ce = dns.Name{ .labels = ans_rr.name.labels[ans_rr.name.labels.len - sig.labels ..] };
                 wildcard_owner = dns.makeWildcardName(&wc_labels_buf, ce);
             }
             const wco = wildcard_owner orelse continue;
@@ -734,9 +745,7 @@ pub const RecursiveResolver = struct {
         }
         if (wc_count == 0) return;
 
-        // Store in main cache under wildcard name with .secure status
-        // The zone for bailiwick is the signer zone (closest encloser parent)
-        const signer_zone = rrsig.signer_name;
+        const signer_zone = sig.signer_name;
         if (self.cache) |c| {
             c.storeResponseWithStatus(.{
                 .header = .{
@@ -1463,6 +1472,10 @@ pub const RecursiveResolver = struct {
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
 
+        // RFC 8482: ANY responses are server-policy and have no single
+        // type_covered RRSIG; treat as unauthenticated rather than bogus.
+        if (qtype == .any) return .skip;
+
         const now_u32 = epochNowU32();
 
         // Find RRSIG in answers to get the signer zone
@@ -2185,10 +2198,13 @@ fn validateNegativeResponse(
     is_nxdomain: bool,
 ) NegativeValidation {
     if (security_state != .secure) return .proceed;
+    // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative
+    // response must carry a complete proof; an incomplete one (.unchecked)
+    // fails closed. .insecure (RFC 6840 §5.11) still proceeds without AD.
     return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain)) {
         .secure => .proceed,
-        .bogus => .bogus,
-        .unchecked, .insecure => .skip_cache,
+        .insecure => .skip_cache,
+        .bogus, .unchecked => .bogus,
     };
 }
 
@@ -2794,9 +2810,33 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
     try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false));
 }
 
-test "validateNegativeResponse returns skip_cache when no proof found in secure zone" {
+test "validateNegativeResponse returns bogus when no proof found in secure zone" {
     const name = dns.Name{ .labels = &.{ "nonexistent", "example", "com" } };
-    // Empty authorities — no NSEC/NSEC3 records to prove anything
-    try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, true));
-    try testing.expectEqual(NegativeValidation.skip_cache, validateNegativeResponse(.secure, &.{}, name, .a, false));
+    // Empty authorities in a known-secure zone is a downgrade attempt:
+    // RFC 4035 §3.2.1 requires NSEC/NSEC3 with every negative response for
+    // signed zones. Fail closed rather than serving the unauthenticated
+    // NXDOMAIN/NODATA.
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true));
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false));
+}
+
+test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
+    // NSEC covers qname but the wildcard-denial NSEC is missing — RFC 4035
+    // §5.4 requires both. validateNegativeProof returns .unchecked; the
+    // recursive wrapper must escalate that to .bogus inside a secure zone,
+    // not serve the response unauthenticated.
+    const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
+    const ccc = dns.Name{ .labels = &.{ "ccc", "example", "com" } };
+    const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{
+        .{ .name = aaa, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{
+            .next_domain_name = ccc,
+            .type_bit_maps = &.{},
+        } } },
+        // No NSEC for *.example.com — proof is incomplete.
+    };
+    try testing.expectEqual(
+        NegativeValidation.bogus,
+        validateNegativeResponse(.secure, &authorities, beta, .a, true),
+    );
 }
