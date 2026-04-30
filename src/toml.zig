@@ -283,6 +283,9 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
 
     // Find closing bracket
     const close = mem.lastIndexOfScalar(u8, raw, ']') orelse return error.InvalidSyntax;
+    // Reject trailing garbage so a typo like `key = ["x"] junk` surfaces as
+    // an error instead of silently dropping the trailing characters.
+    for (raw[close + 1 ..]) |c| if (!std.ascii.isWhitespace(c)) return error.InvalidSyntax;
     const inner = mem.trim(u8, raw[1..close], &std.ascii.whitespace);
 
     if (inner.len == 0) {
