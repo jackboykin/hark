@@ -1025,12 +1025,26 @@ fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
 }
 
 fn storeTestA(cache: *RRsetCache, alloc: Allocator, comptime labels: []const []const u8, ttl: u32, ip: [4]u8) !void {
+    return storeTestAWithStatus(cache, alloc, labels, ttl, ip, .unchecked);
+}
+
+fn storeTestAWithStatus(cache: *RRsetCache, alloc: Allocator, comptime labels: []const []const u8, ttl: u32, ip: [4]u8, status: SecurityStatus) !void {
     const name = try makeTestName(alloc, labels);
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = ttl, .rdata = .{ .a = ip } };
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} });
+    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, status);
+}
+
+fn expectCachedHitStatus(alloc: Allocator, cache: *RRsetCache, name: []const u8, expected: SecurityStatus) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const r = cache.lookup(arena.allocator(), name, .a, .in) orelse return error.TestExpectedHit;
+    switch (r) {
+        .hit => |h| try testing.expectEqual(expected, h.security_status),
+        .negative => return error.TestExpectedHit,
+    }
 }
 
 fn buildTestSoaAuthority(
@@ -1591,100 +1605,43 @@ test "BOGUS invalidates .unchecked positive to SERVFAIL" {
 }
 
 test ".unchecked positive is upgraded to .secure on revalidation store" {
-    // CD=1 revalidation pathway: original CD=1 query stores .unchecked, the
-    // background revalidator re-resolves with dnssec_enabled and stores .secure
-    // for the same key. The store must replace the .unchecked entry — anything
-    // else makes scheduleCd1Revalidate a silent no-op and CD=0 clients never
-    // see AD set on this key.
+    // CD=1 then bg-revalidator: the .secure store must replace the
+    // .unchecked entry, else scheduleCd1Revalidate is a silent no-op.
     const alloc = testing.allocator;
     test_time = 1000;
-
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name1 = try makeTestName(alloc, &.{ "example", "com" });
-    const answers1 = try alloc.alloc(dns.ResourceRecord, 1);
-    answers1[0] = .{ .name = name1, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const r1 = makeTestResponse(answers1);
-    defer dns.freeMessage(alloc, r1);
-    cache.storeResponseWithStatus(r1, dns.Name{ .labels = &.{} }, .unchecked);
-
-    const name2 = try makeTestName(alloc, &.{ "example", "com" });
-    const answers2 = try alloc.alloc(dns.ResourceRecord, 1);
-    answers2[0] = .{ .name = name2, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const r2 = makeTestResponse(answers2);
-    defer dns.freeMessage(alloc, r2);
-    cache.storeResponseWithStatus(r2, dns.Name{ .labels = &.{} }, .secure);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const r = cache.lookup(arena.allocator(), "example.com", .a, .in).?;
-    switch (r) {
-        .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
-        .negative => return error.TestExpectedHit,
-    }
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .unchecked);
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
+    try expectCachedHitStatus(alloc, &cache, "example.com", .secure);
 }
 
 test "fresh .secure positive replaces fresh .secure negative on same key" {
-    // Negative-blocks-positive guard: a cached fresh negative for (name, rtype)
-    // must not block a subsequent positive store at equal-or-higher security
-    // status. Without this, a cached NXDOMAIN locks out real data for the
-    // negative's full SOA-derived TTL.
+    // A cached negative for (name, rtype) must not block a subsequent
+    // positive store at equal trust rank — otherwise a cached NXDOMAIN
+    // locks out real data for the full SOA-derived TTL.
     const alloc = testing.allocator;
     test_time = 1000;
-
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
     cache.storeNegativeBare("example.com", .a, .in, .name_error, 600, .secure);
-
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, .secure);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const r = cache.lookup(arena.allocator(), "example.com", .a, .in).?;
-    switch (r) {
-        .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
-        .negative => return error.TestExpectedHitAfterPositiveOverride,
-    }
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
+    try expectCachedHitStatus(alloc, &cache, "example.com", .secure);
 }
 
 test ".unchecked store does not downgrade fresh .secure positive" {
-    // Symmetric anti-downgrade guard: an .unchecked store from a CD=1 query
-    // must not replace an already-validated .secure entry. Otherwise a
-    // CD=1 client could silently flip AD-set cached entries to AD-cleared.
+    // Anti-downgrade: an .unchecked store from a CD=1 query must not
+    // replace an already-validated .secure entry.
     const alloc = testing.allocator;
     test_time = 1000;
-
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name1 = try makeTestName(alloc, &.{ "example", "com" });
-    const answers1 = try alloc.alloc(dns.ResourceRecord, 1);
-    answers1[0] = .{ .name = name1, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const r1 = makeTestResponse(answers1);
-    defer dns.freeMessage(alloc, r1);
-    cache.storeResponseWithStatus(r1, dns.Name{ .labels = &.{} }, .secure);
-
-    const name2 = try makeTestName(alloc, &.{ "example", "com" });
-    const answers2 = try alloc.alloc(dns.ResourceRecord, 1);
-    answers2[0] = .{ .name = name2, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 9, 9, 9, 9 } } };
-    const r2 = makeTestResponse(answers2);
-    defer dns.freeMessage(alloc, r2);
-    cache.storeResponseWithStatus(r2, dns.Name{ .labels = &.{} }, .unchecked);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const r = cache.lookup(arena.allocator(), "example.com", .a, .in).?;
-    switch (r) {
-        .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
-        .negative => return error.TestExpectedHit,
-    }
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 9, 9, 9, 9 }, .unchecked);
+    try expectCachedHitStatus(alloc, &cache, "example.com", .secure);
 }
 
 test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
