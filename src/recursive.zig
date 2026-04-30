@@ -2204,7 +2204,19 @@ fn validateNegativeResponse(
     return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain)) {
         .secure => .proceed,
         .insecure => .skip_cache,
-        .bogus, .unchecked => .bogus,
+        .bogus => .bogus,
+        .unchecked => {
+            // Diagnostic for the fail-closed path: a real-world broken auth
+            // (or a middlebox stripping NSEC) shows up here as SERVFAIL
+            // where other resolvers may serve unauthenticated.
+            var name_buf: [dns.max_name_len + 1]u8 = undefined;
+            var qtype_buf: [24]u8 = undefined;
+            log.warn(
+                "incomplete NSEC/NSEC3 proof for {s} {s} (nx={}); SERVFAIL per RFC 4035 §5.4",
+                .{ qname.formatInto(&name_buf), dns.safeTagName(dns.RType, qtype, &qtype_buf), is_nxdomain },
+            );
+            return .bogus;
+        },
     };
 }
 
