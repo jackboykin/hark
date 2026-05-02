@@ -277,6 +277,50 @@ test "entries map is bounded under random-server load" {
     try testing.expectEqual(@as(usize, cache.max_entries), cache.count());
 }
 
+test "concurrent inserts under cap pressure stay bounded" {
+    // Pins the lock invariant for evictOne: if the cap-check or eviction
+    // were ever moved outside the rwlock, two threads racing inside
+    // evictOne could invalidate each other's iterator and corrupt the map.
+    var cache = RttCache.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .thread_safe = true,
+        .max_entries = 64,
+    });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+
+    const Worker = struct {
+        const inserts = 512;
+        cache: *RttCache,
+        thread_id: u8,
+
+        fn run(self: *@This()) void {
+            var i: u32 = 0;
+            while (i < inserts) : (i += 1) {
+                const k = AddressKey.fromAddress(na.initIp4(.{
+                    self.thread_id,
+                    @intCast((i >> 8) & 0xff),
+                    @intCast(i & 0xff),
+                    1,
+                }, 53));
+                if (i & 1 == 0) self.cache.recordSuccess(k, 50_000) else self.cache.recordTimeout(k);
+            }
+        }
+    };
+
+    const num_threads = 4;
+    var workers: [num_threads]Worker = undefined;
+    var threads: [num_threads]std.Thread = undefined;
+    for (0..num_threads) |i| {
+        workers[i] = .{ .cache = &cache, .thread_id = @intCast(i + 1) };
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
+    }
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(@as(usize, cache.max_entries), cache.count());
+}
+
 test "getHedgeStagger returns cold default for unknown server" {
     var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer cache.deinit();
