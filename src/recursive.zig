@@ -117,9 +117,8 @@ pub const RecursiveResolver = struct {
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
-    /// Per-resolution KeyTrap (CVE-2023-50387) budget. Reset at every `resolve()`
-    /// entry so it bounds work for one user-facing query (incl. all CNAME hops,
-    /// referrals, DNSKEY/DS validations, and authority NSEC checks).
+    /// Per-resolution DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes). Reset
+    /// at every `resolve()` entry so it bounds work for one user-facing query.
     validation_budget: dnssec.ValidationBudget = .{},
 
     /// Create a thread-local resolver clone with fresh transports. Shared
@@ -647,7 +646,7 @@ pub const RecursiveResolver = struct {
         if (authorities.len > 0) {
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
             if (auth_status == .secure) {
-                const status = dnssec.classifyDelegation(authorities, zone_cut);
+                const status = dnssec.classifyDelegation(authorities, zone_cut, &self.validation_budget);
                 cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities);
                 return status;
             }
@@ -1452,7 +1451,7 @@ pub const RecursiveResolver = struct {
         // distinguish insecure from outright failure.
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(response.authorities, zone);
+            const status = dnssec.classifyDelegation(response.authorities, zone, &self.validation_budget);
             if (status == .insecure) {
                 cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
             }
@@ -1553,7 +1552,7 @@ pub const RecursiveResolver = struct {
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 
-        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain);
+        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, &self.validation_budget);
     }
 
     fn resolveNsAddresses(
@@ -2202,12 +2201,13 @@ fn validateNegativeResponse(
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    budget: *dnssec.ValidationBudget,
 ) NegativeValidation {
     if (security_state != .secure) return .proceed;
     // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative
     // response must carry a complete proof; an incomplete one (.unchecked)
     // fails closed. .insecure (RFC 6840 §5.11) still proceeds without AD.
-    return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain)) {
+    return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, budget)) {
         .secure => .proceed,
         .insecure => .skip_cache,
         .bogus => .bogus,
@@ -2768,9 +2768,10 @@ test "recursive resolve with CNAME chain" {
 
 test "validateNegativeResponse returns proceed when security_state is not secure" {
     const name = dns.Name{ .labels = &.{ "example", "com" } };
+    var b: dnssec.ValidationBudget = .{};
     // unchecked/insecure → proceed regardless of authorities
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true));
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true, &b));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false, &b));
 }
 
 test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
@@ -2805,7 +2806,8 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
             } },
         },
     };
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true));
+    var b: dnssec.ValidationBudget = .{};
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true, &b));
 }
 
 test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
@@ -2826,7 +2828,8 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
             },
         },
     };
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false));
+    var b: dnssec.ValidationBudget = .{};
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false, &b));
 }
 
 test "validateNegativeResponse returns bogus when no proof found in secure zone" {
@@ -2836,8 +2839,9 @@ test "validateNegativeResponse returns bogus when no proof found in secure zone"
     // RFC 4035 §3.2.1 requires NSEC/NSEC3 with every negative response for
     // signed zones. Fail closed rather than serving the unauthenticated
     // NXDOMAIN/NODATA.
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true));
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false));
+    var b: dnssec.ValidationBudget = .{};
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true, &b));
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false, &b));
 }
 
 test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
@@ -2856,8 +2860,9 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
         } } },
         // No NSEC for *.example.com — proof is incomplete.
     };
+    var b: dnssec.ValidationBudget = .{};
     try testing.expectEqual(
         NegativeValidation.bogus,
-        validateNegativeResponse(.secure, &authorities, beta, .a, true),
+        validateNegativeResponse(.secure, &authorities, beta, .a, true, &b),
     );
 }

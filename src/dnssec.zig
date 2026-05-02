@@ -25,7 +25,7 @@ pub const VerifyError = error{
     ValidationBudgetExhausted,
 };
 
-// ── KeyTrap (CVE-2023-50387) Defense ─────────────────────────────────
+// ── Per-Resolution CPU Budgets ───────────────────────────────────────
 
 /// Caps RRSIG verifications per query to bound DS×DNSKEY×RRSIG amplification
 /// (CVE-2023-50387, KeyTrap). 64 ≈ 2× the worst legitimate case (~25 verifies
@@ -33,16 +33,28 @@ pub const VerifyError = error{
 /// Raise if legitimately complex zones SERVFAIL; lower under tight CPU budgets.
 pub const max_sig_verify_per_resolution: u16 = 64;
 
-/// Per-resolution counter for RRSIG verification attempts. One instance is
-/// shared across all `verifyRrsig` calls for a single user query (DNSKEY
-/// validation, answer validation, authority NSEC validation). Owned by the
-/// resolver; reset at the top of each `resolve()`.
+/// Caps NSEC3 hash invocations per query (CVE-2023-50868 + salt-cache-defeat
+/// in `classifyDelegation`). 96 covers the worst legitimate case (~78 hashes
+/// across max-CNAME-chain × max-referrals with deep IDN qnames) with modest
+/// headroom; exhaustion fails open to `.insecure` (skip_cache, no SERVFAIL).
+/// Each invocation is bounded to `max_nsec3_iterations` SHA-1 ops, so worst-
+/// case spend is 96 × 150 ≈ 14.4k SHA-1 compressions per resolution.
+/// Raise to 128 if telemetry shows legitimate zones tripping the cap.
+pub const max_nsec3_hashes_per_resolution: u16 = 96;
+
+/// Per-resolution CPU counters; reset at the top of each `resolve()`.
 pub const ValidationBudget = struct {
     sig_verify_remaining: u16 = max_sig_verify_per_resolution,
+    nsec3_hash_remaining: u16 = max_nsec3_hashes_per_resolution,
 
     pub fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.sig_verify_remaining == 0) return error.ValidationBudgetExhausted;
         self.sig_verify_remaining -= 1;
+    }
+
+    pub fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
+        if (self.nsec3_hash_remaining == 0) return error.ValidationBudgetExhausted;
+        self.nsec3_hash_remaining -= 1;
     }
 };
 
@@ -221,6 +233,7 @@ fn isInsecureDelegationProof(type_bit_maps: []const u8) bool {
 pub fn classifyDelegation(
     authorities: []const dns.ResourceRecord,
     child_zone: dns.Name,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     // Look for DS records for the child zone
     var has_ds = false;
@@ -260,14 +273,18 @@ pub fn classifyDelegation(
             if (nsec3.iterations > max_nsec3_iterations) return .insecure;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
 
-            // Reuse cached hash if salt/iterations match, otherwise recompute.
+            // Reuse cached hash if salt/iterations match; cache misses charge
+            // the per-resolution budget (the salt-cache-defeat surface).
             const child_hash = blk: {
                 if (cached_hash) |h| {
                     if (cached_iterations == nsec3.iterations and
                         mem.eql(u8, cached_salt, nsec3.salt))
                         break :blk h;
                 }
-                const new_hash = nsec3Hash(child_zone, nsec3.salt, nsec3.iterations) catch continue;
+                const new_hash = budgetedNsec3Hash(child_zone, nsec3.salt, nsec3.iterations, budget) catch |e| switch (e) {
+                    error.ValidationBudgetExhausted => return .insecure,
+                    error.HashFailed => continue,
+                };
                 cached_hash = new_hash;
                 cached_salt = nsec3.salt;
                 cached_iterations = nsec3.iterations;
@@ -821,10 +838,6 @@ pub fn nsec3HashInRange(
 
 // ── NSEC3 Owner Hash + Budgeted Hashing ──────────────────────────────
 
-/// Maximum hash computations per NSEC3 validation (CVE-2023-50868 mitigation).
-/// Worst case: 32 hashes * 150 max iterations = 4800 SHA-1 ops.
-pub const max_nsec3_hash_budget: u16 = 32;
-
 /// Extract the raw hash from an NSEC3 owner name by base32hex-decoding its first label.
 /// Returns null if the label length is wrong or contains invalid characters.
 pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
@@ -837,24 +850,24 @@ pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     return result;
 }
 
-pub const BudgetedHashError = error{ BudgetExhausted, HashFailed };
+pub const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
 
-/// Compute NSEC3 hash with budget tracking. Callers map BudgetExhausted to
-/// .insecure (CVE-2023-50868 mitigation) and HashFailed to .bogus.
+/// Compute NSEC3 hash with per-resolution budget tracking. Callers map
+/// ValidationBudgetExhausted to .insecure (CVE-2023-50868 + salt-cache-defeat
+/// in `classifyDelegation`) and HashFailed to .bogus.
 pub fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
-    budget: *u16,
+    budget: *ValidationBudget,
 ) BudgetedHashError![Sha1.digest_length]u8 {
-    if (budget.* == 0) return error.BudgetExhausted;
-    budget.* -= 1;
+    try budget.consumeNsec3Hash();
     return nsec3Hash(name, salt, iterations) catch return error.HashFailed;
 }
 
 fn budgetedHashStatus(e: BudgetedHashError) SecurityStatus {
     return switch (e) {
-        error.BudgetExhausted => .insecure,
+        error.ValidationBudgetExhausted => .insecure,
         error.HashFailed => .bogus,
     };
 }
@@ -882,6 +895,7 @@ pub fn validateNegativeProof(
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     // Reject mixed NSEC/NSEC3
     if (hasMixedNsecNsec3(authorities)) return .bogus;
@@ -943,7 +957,7 @@ pub fn validateNegativeProof(
     }
 
     // Try NSEC3 proofs
-    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain);
+    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, budget);
 }
 
 /// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5).
@@ -952,6 +966,7 @@ fn validateNsec3NegativeProof(
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     // Extract NSEC3 parameters from first NSEC3 record
     var salt: []const u8 = &.{};
@@ -972,11 +987,9 @@ fn validateNsec3NegativeProof(
     }
     if (!found_nsec3) return .unchecked;
 
-    var budget: u16 = max_nsec3_hash_budget;
-
     if (!is_nxdomain) {
         // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
-        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, &budget) catch |e|
+        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch |e|
             return budgetedHashStatus(e);
         for (authorities) |rr| {
             if (rr.rtype != .nsec3) continue;
@@ -1002,7 +1015,7 @@ fn validateNsec3NegativeProof(
     while (label_offset < qname.labels.len) : (label_offset += 1) {
         // Build ancestor name from qname.labels[label_offset..]
         const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, &budget) catch |e|
+        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, budget) catch |e|
             return budgetedHashStatus(e);
 
         for (authorities) |rr| {
@@ -1022,14 +1035,14 @@ fn validateNsec3NegativeProof(
 
     // Next closer name: CE + one label toward qname = qname.labels[ce_offset - 1..]
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, &budget) catch |e|
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch |e|
         return budgetedHashStatus(e);
 
     // Wildcard at closest encloser: *.CE
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
-    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, &budget) catch |e|
+    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch |e|
         return budgetedHashStatus(e);
 
     // Verify: some NSEC3 covers the next-closer hash
@@ -1579,7 +1592,8 @@ test "classifyDelegation with DS present" {
         } },
     }};
 
-    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
 }
 
 test "classifyDelegation with NSEC proving no DS" {
@@ -1610,7 +1624,8 @@ test "classifyDelegation with NSEC proving no DS" {
         },
     }};
 
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone, &b));
 }
 
 test "classifyDelegation with no DS and no proof" {
@@ -1638,7 +1653,8 @@ test "classifyDelegation with no DS and no proof" {
     }};
 
     // No DS and no NSEC/NSEC3 proof — indeterminate, fails closed to .secure
-    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
 }
 
 test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
@@ -1662,7 +1678,8 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
             .ttl = 86400,
             .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = type_bit_maps } },
         }};
-        try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
+        var b: ValidationBudget = .{};
+        try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
     }
 }
 
@@ -1903,7 +1920,8 @@ test "validateNegativeProof NSEC NODATA" {
     }};
 
     // NODATA for AAAA should be proven secure
-    const status = validateNegativeProof(&authorities, name, .aaaa, false);
+    var b: ValidationBudget = .{};
+    const status = validateNegativeProof(&authorities, name, .aaaa, false, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -1921,7 +1939,8 @@ test "validateNegativeProof NSEC NXDOMAIN" {
     };
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
-    const status = validateNegativeProof(&authorities, beta, .a, true);
+    var b: ValidationBudget = .{};
+    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -1933,7 +1952,8 @@ test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
     const authorities = [_]dns.ResourceRecord{nsecRr(alpha, gamma)};
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
-    const status = validateNegativeProof(&authorities, beta, .a, true);
+    var b: ValidationBudget = .{};
+    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
     try testing.expectEqual(SecurityStatus.unchecked, status);
 }
 
@@ -1960,7 +1980,8 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE (not zone apex)" {
         nsecRr(aaa_sub, zzz_sub), // covers qname: aaa < missing < zzz
         nsecRr(sub, aaa_sub), // covers *.sub.example.com: sub < *.sub < aaa.sub
     };
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" {
@@ -1977,7 +1998,8 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
         nsecRr(aaa_sub, zzz_sub),
         nsecRr(example_com, aaa), // covers *.example.com only (wrong level)
     };
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
@@ -1990,7 +2012,8 @@ test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
     const authorities = [_]dns.ResourceRecord{nsecRr(example_com, zeta)};
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
-    const status = validateNegativeProof(&authorities, beta, .a, true);
+    var b: ValidationBudget = .{};
+    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -2130,7 +2153,8 @@ test "NSEC3 NODATA - secure" {
     // Bitmap: A(bit1=0x40) + NS(bit2=0x20) = 0x60
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x60 })};
 
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
 }
 
 test "NSEC3 NODATA - CNAME in bitmap" {
@@ -2146,7 +2170,8 @@ test "NSEC3 NODATA - CNAME in bitmap" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x04 })};
 
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
 }
 
 test "NSEC3 NXDOMAIN - closest encloser proof" {
@@ -2182,7 +2207,8 @@ test "NSEC3 NXDOMAIN - closest encloser proof" {
         wc_rr,
     };
 
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "NSEC3 NXDOMAIN - missing wildcard cover" {
@@ -2209,7 +2235,8 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
         nc_rr,
     };
 
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "classifyDelegation NSEC3 match" {
@@ -2226,7 +2253,8 @@ test "classifyDelegation NSEC3 match" {
     // NS only (no DS)
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x20 })};
 
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone, &b));
 }
 
 test "classifyDelegation NSEC3 non-match" {
@@ -2246,13 +2274,13 @@ test "classifyDelegation NSEC3 non-match" {
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0} ** 20), &[_]u8{ 0x00, 0x01, 0x20 })};
 
     // NSEC3 doesn't cover the child zone — indeterminate, fails closed to .secure
-    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
 }
 
 test "NSEC3 hash budget exhaustion" {
-    // Deep qname: build enough labels to exceed max_nsec3_hash_budget. With budget=32
-    // and 1 hash per ancestor lookup, a qname deeper than 32 labels exhausts the budget
-    // before finding a CE, and should be treated as .insecure (DoS mitigation).
+    // CVE-2023-50868: a deep ancestor walk under a tight budget exhausts before
+    // the CE is found; the proof fails open to .insecure rather than burning CPU.
     const deep_labels: []const []const u8 = &.{
         "l00", "l01",     "l02", "l03", "l04", "l05", "l06", "l07",
         "l08", "l09",     "l10", "l11", "l12", "l13", "l14", "l15",
@@ -2270,7 +2298,8 @@ test "NSEC3 hash budget exhaustion" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
+    var b: ValidationBudget = .{ .nsec3_hash_remaining = 32 };
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
@@ -2302,12 +2331,74 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
     }};
 
     // Both NXDOMAIN and NODATA negative-proof paths return .insecure
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true));
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false));
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false, &b));
 
     // classifyDelegation matches: high-iteration NSEC3 → insecure delegation
     const child_zone = dns.Name{ .labels = zone_labels };
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone));
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone, &b));
+}
+
+test "classifyDelegation salt-cache defeat exhausts NSEC3 budget" {
+    // Adversarial: stuff the authority section with NSEC3 records that all use
+    // unique salts. Each record forces a fresh nsec3Hash because the single-slot
+    // salt cache misses on every transition. Without the per-resolution budget
+    // this is unmetered CPU; with the budget the resolution returns .insecure
+    // once the cap is hit.
+    const N: usize = 32;
+    const child_zone = dns.Name{ .labels = &.{ "victim", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{ "example", "com" };
+
+    var bufs: [N]Nsec3OwnerBufs = undefined;
+    var unique_salts: [N][1]u8 = undefined;
+    var rrs: [N]dns.ResourceRecord = undefined;
+    const next_owner = [_]u8{0xFF} ** 20;
+
+    for (0..N) |i| {
+        bufs[i] = .{};
+        unique_salts[i] = .{@as(u8, @intCast(i))};
+        const owner = makeNsec3OwnerName([_]u8{@as(u8, @intCast(i ^ 0xA5))} ** 20, zone_labels, &bufs[i].enc, &bufs[i].labels);
+        rrs[i] = .{
+            .name = owner,
+            .rtype = .nsec3,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .nsec3 = .{
+                .hash_algorithm = .sha1,
+                .flags = 0,
+                .iterations = max_nsec3_iterations,
+                .salt = &unique_salts[i],
+                .next_hashed_owner = &next_owner,
+                .type_bit_maps = &.{},
+            } },
+        };
+    }
+
+    var b: ValidationBudget = .{ .nsec3_hash_remaining = 8 };
+    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&rrs, child_zone, &b));
+    try testing.expectEqual(@as(u16, 0), b.nsec3_hash_remaining);
+}
+
+test "NSEC3 budget accumulates across negative-proof calls" {
+    // Per-resolution semantics: a single ValidationBudget is shared across the
+    // whole resolve(), so two validateNegativeProof invocations on the same
+    // budget must accumulate. Use the NODATA path (one hash per call); a budget
+    // of 1 admits the first call but exhausts the second.
+    const qname = dns.Name{ .labels = &.{ "example", "com" } };
+    const salt: []const u8 = &.{};
+
+    var bufs: Nsec3OwnerBufs = .{};
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
+
+    var b: ValidationBudget = .{ .nsec3_hash_remaining = 1 };
+    const first = validateNegativeProof(&authorities, qname, .a, false, &b);
+    try testing.expectEqual(SecurityStatus.unchecked, first);
+    try testing.expectEqual(@as(u16, 0), b.nsec3_hash_remaining);
+    const second = validateNegativeProof(&authorities, qname, .a, false, &b);
+    try testing.expectEqual(SecurityStatus.insecure, second);
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────
