@@ -195,10 +195,18 @@ pub const NsSelector = struct {
         gop.value_ptr.alpha += r;
         gop.value_ptr.beta += (1.0 - r);
 
-        // Bound memory: clear once we cross the cap. Cheaper and simpler
-        // than batch eviction; the count check is O(1) and clearing
-        // retains bucket capacity so subsequent inserts don't realloc.
-        if (self.arms.count() > self.max_arms) self.arms.clearRetainingCapacity();
+        if (self.arms.count() > self.max_arms) self.evictOne(arm_key);
+    }
+
+    /// Evict one non-`protected` arm; a flood across many zones must not
+    /// erase healthy root/TLD posteriors all at once.
+    fn evictOne(self: *NsSelector, protected: ArmKey) void {
+        var it = self.arms.iterator();
+        while (it.next()) |kv| {
+            if (std.meta.eql(kv.key_ptr.*, protected)) continue;
+            self.arms.removeByPtr(kv.key_ptr);
+            return;
+        }
     }
 
     /// Return the confidence score (Beta mean) for a server in a zone.
@@ -450,12 +458,11 @@ test "confidence returns null for unknown" {
 }
 
 test "arms map is bounded under random-zone load" {
-    // Without a cap, recording outcomes against many distinct (zone, server)
-    // pairs would grow `arms` indefinitely.
+    // Saturates AT the cap (single-entry eviction); does not oscillate to 0.
     var sel = NsSelector.init(.{
         .allocator = testing.allocator,
         .io = testing.io,
-        .max_arms = 64, // small cap to exercise eviction quickly
+        .max_arms = 64,
     });
     defer sel.deinit();
 
@@ -466,10 +473,9 @@ test "arms map is bounded under random-zone load" {
         const zone = dns.Name{ .labels = &.{ label, "test" } };
         const server = na.initIp4(.{ 10, 0, 0, @intCast(i & 0xff) }, 53);
         sel.recordOutcome(zone, server, .success, 10_000);
-        // Cap permits brief overshoot up to one eviction batch but should
-        // never grow unboundedly.
-        try testing.expect(sel.count() <= sel.max_arms + 1);
+        try testing.expect(sel.count() <= sel.max_arms);
     }
+    try testing.expectEqual(@as(usize, sel.max_arms), sel.count());
 }
 
 test "per-zone isolation" {

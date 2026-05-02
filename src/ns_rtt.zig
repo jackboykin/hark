@@ -126,7 +126,7 @@ pub const RttCache = struct {
                 gop.value_ptr.min_rtt_stamp_ms = now_ms;
             }
         }
-        if (self.entries.count() > self.max_entries) self.entries.clearRetainingCapacity();
+        if (self.entries.count() > self.max_entries) self.evictOne(key);
     }
 
     /// Hedge stagger for the leading-leg server, in ms. Callers must filter
@@ -167,7 +167,18 @@ pub const RttCache = struct {
                 gop.value_ptr.dead_until_ms = self.now_fn() + dead_duration_ms;
             }
         }
-        if (self.entries.count() > self.max_entries) self.entries.clearRetainingCapacity();
+        if (self.entries.count() > self.max_entries) self.evictOne(key);
+    }
+
+    /// Evict one non-`protected` entry; a flood across many servers must not
+    /// erase healthy root/TLD scoring all at once.
+    fn evictOne(self: *RttCache, protected: AddressKey) void {
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (std.meta.eql(kv.key_ptr.*, protected)) continue;
+            self.entries.removeByPtr(kv.key_ptr);
+            return;
+        }
     }
 
     /// Check whether the server is currently marked dead.
@@ -243,8 +254,7 @@ test "recordSuccess updates EWMA" {
 }
 
 test "entries map is bounded under random-server load" {
-    // Without a cap, recording many distinct nameservers would grow
-    // `entries` indefinitely.
+    // Saturates AT the cap (single-entry eviction); does not oscillate to 0.
     var cache = RttCache.init(.{
         .allocator = testing.allocator,
         .io = testing.io,
@@ -262,8 +272,9 @@ test "entries map is bounded under random-server load" {
             1,
         }, 53));
         if (i & 1 == 0) cache.recordSuccess(key, 50_000) else cache.recordTimeout(key);
-        try testing.expect(cache.count() <= cache.max_entries + 1);
+        try testing.expect(cache.count() <= cache.max_entries);
     }
+    try testing.expectEqual(@as(usize, cache.max_entries), cache.count());
 }
 
 test "getHedgeStagger returns cold default for unknown server" {

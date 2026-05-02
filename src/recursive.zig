@@ -1704,6 +1704,11 @@ pub const RecursiveResolver = struct {
             dotted_names[ni] = try nameToDotted(allocator, ns_names[ni]);
         }
 
+        // One shared CountingAllocator caps the helpers' combined memory at
+        // query_memory_limit. Without sharing, each helper had its own cap and
+        // a single user query could allocate task_n × limit.
+        var helpers_cap = CountingAllocator.init(self.gpa.?, self.query_memory_limit);
+
         var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
         var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
 
@@ -1718,6 +1723,7 @@ pub const RecursiveResolver = struct {
                 .ns_dotted = dotted_names[ni],
                 .rtype = address_rtypes[ri],
                 .depth = depth,
+                .shared_cap = &helpers_cap,
             };
             threads[i] = std.Thread.spawn(.{ .stack_size = 1 << 20 }, NsTaskCtx.run, .{&task_ctxs[i]}) catch null;
         }
@@ -1774,6 +1780,7 @@ pub const RecursiveResolver = struct {
         ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
+        shared_cap: *CountingAllocator,
         addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
         oom: bool = false,
@@ -1787,8 +1794,7 @@ pub const RecursiveResolver = struct {
                 .tls = ctx.parent.transports.tls,
             });
 
-            var cap = CountingAllocator.init(ctx.parent.gpa.?, ctx.parent.query_memory_limit);
-            var arena = std.heap.ArenaAllocator.init(cap.allocator());
+            var arena = std.heap.ArenaAllocator.init(ctx.shared_cap.allocator());
             defer arena.deinit();
 
             resolver.resolveNsNameOne(
