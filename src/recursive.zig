@@ -2774,6 +2774,7 @@ test "validateNegativeResponse returns proceed when security_state is not secure
 }
 
 test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
+    testing.log_level = .err; // silence the fail-closed diagnostic warn
     const name = dns.Name{ .labels = &.{ "example", "com" } };
     // Build authorities with both NSEC and NSEC3 records
     const authorities = [_]dns.ResourceRecord{
@@ -2829,6 +2830,7 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
 }
 
 test "validateNegativeResponse returns bogus when no proof found in secure zone" {
+    testing.log_level = .err; // silence the fail-closed diagnostic warn
     const name = dns.Name{ .labels = &.{ "nonexistent", "example", "com" } };
     // Empty authorities in a known-secure zone is a downgrade attempt:
     // RFC 4035 §3.2.1 requires NSEC/NSEC3 with every negative response for
@@ -2839,6 +2841,7 @@ test "validateNegativeResponse returns bogus when no proof found in secure zone"
 }
 
 test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
+    testing.log_level = .err; // silence the fail-closed diagnostic warn
     // NSEC covers qname but the wildcard-denial NSEC is missing — RFC 4035
     // §5.4 requires both. validateNegativeProof returns .unchecked; the
     // recursive wrapper must escalate that to .bogus inside a secure zone,
