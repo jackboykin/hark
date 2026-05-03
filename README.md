@@ -1,7 +1,7 @@
 # hark
 
 A validating, recursive, caching DNS resolver built from scratch in Zig.
-Runs on Linux with io_uring. Zero external dependencies.
+Runs on Linux with io_uring.
 
 ## Features
 
@@ -87,5 +87,11 @@ All fields are optional — defaults are localhost:53, recursive mode, DNSSEC of
 ## Design
 
 - **Linux-first** — io_uring for client I/O, blocking sockets for upstream queries. Portability is not a goal.
-- **Zero dependencies** — stdlib only. No vendored C, no package manager.
+- **Vendor-minimal** — stdlib first; one vendored Zig library for DoT (see [Credits](#credits)). No package manager, no fetched deps, no vendored C.
 - **Tested** — fuzzed parsers, integration tests against live DNS, leak detection via `std.testing.allocator`.
+
+## Credits
+
+DoT uses [ianic/tls.zig](https://github.com/ianic/tls.zig) (MIT, Igor Anić),
+vendored under `src/vendor/tls-ianic/`. See that directory's `PATCHES.md`
+for the pinned commit, local patch, and refresh procedure.
