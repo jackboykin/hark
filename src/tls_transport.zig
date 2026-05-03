@@ -71,7 +71,6 @@ pub const TlsTransport = struct {
             return err;
         };
 
-        // Store in pool or close
         if (self.pool) |pool| {
             pool.store(key, conn);
         } else {
@@ -114,30 +113,35 @@ pub const TlsTransport = struct {
         const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
 
-        try self.handshake(conn, server_name, self.ca_bundle, false);
+        try self.handshake(conn, server_name, self.ca_bundle);
         return conn;
     }
 
-    /// Run the TLS handshake on `conn`. ALPN advertises "dot" per RFC 9539 §4.4
-    /// without requiring the peer to echo it: Cloudflare and Google accept the
-    /// protocol without echoing in violation of RFC 7301 §3.2. If the peer
-    /// echoes any other protocol the handshake is rejected — sending a
+    /// Run the TLS handshake on `conn`. `host=""` selects opportunistic mode:
+    /// no SNI (vendored ianic patch elides the extension), no cert verification.
+    /// Otherwise authenticated mode: SNI sent, full chain + hostname verify.
+    /// ALPN advertises "dot" per RFC 9539 §4.4. The peer omitting the echo is
+    /// tolerated (Cloudflare / Google do this in violation of RFC 7301 §3.2);
+    /// a non-"dot" echo is rejected as a handshake failure — sending a
     /// length-prefixed DNS frame to e.g. an h2 endpoint would corrupt state.
-    fn handshake(self: *TlsTransport, conn: *PooledConnection, host: []const u8, root_ca: Certificate.Bundle, skip_verify: bool) !void {
+    fn handshake(self: *TlsTransport, conn: *PooledConnection, host: []const u8, root_ca: Certificate.Bundle) !void {
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
         conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
             .rng = rng_impl.interface(),
             .now = Io.Timestamp.now(self.io, .real),
             .host = host,
             .root_ca = root_ca,
-            .insecure_skip_verify = skip_verify,
+            .insecure_skip_verify = host.len == 0,
             .alpn_protocols = &.{alpn_dot},
         }) catch |err| {
             log.debug("TLS handshake failed against {s}: {s}", .{ host, @errorName(err) });
             return error.TlsHandshakeFailed;
         };
         if (conn.tls.alpn_protocol) |proto| {
-            if (!std.mem.eql(u8, proto, alpn_dot)) return error.TlsAlpnMismatch;
+            if (!std.mem.eql(u8, proto, alpn_dot)) {
+                log.warn("TLS ALPN mismatch against {s}: peer echoed {s}", .{ host, proto });
+                return error.TlsHandshakeFailed;
+            }
         }
     }
 
@@ -180,10 +184,9 @@ pub const TlsTransport = struct {
         const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
 
-        // RFC 9539: §4.6.3.3 no SNI (host="" → vendored ianic elides the
-        // extension, see src/vendor/tls-ianic/PATCHES.md), §4.6.3.4 accept any
-        // cert, §4.4 advertise ALPN "dot".
-        try self.handshake(conn, "", .empty, true);
+        // RFC 9539 §4.6.3.3/4: no SNI, accept any cert. host="" selects
+        // opportunistic mode in handshake().
+        try self.handshake(conn, "", .empty);
         return conn;
     }
 
@@ -217,6 +220,9 @@ pub const TlsTransport = struct {
         // frame holds the original `*TlsTransport`. Copying snaps the
         // small handle (allocator / config / ca_bundle / io / pool ptr)
         // into the new thread's args before the spawning stack vanishes.
+        // The Certificate.Bundle copy aliases byte slices owned by the
+        // caller; they must outlive every detached probe. Hark's main
+        // bundle is process-lifetime, so this holds.
         const thread = std.Thread.spawn(.{}, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
             enc_ns_cache.markFailed(addr_key);
             _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
@@ -277,23 +283,15 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// expose hooks for per-syscall deadline checks (the TLS layer buffers
 /// records, not raw syscalls).
 fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
-    // Sized to hark's own EDNS query buffer (`dns.edns_udp_payload` = 1232).
-    // DoT permits up to 65 KiB but hark never builds queries that large; if
-    // a future query path needs more, raise this constant deliberately.
-    if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
-    const msg_len: u16 = @intCast(wire_query.len);
-
-    // Stage length prefix + query into one buffer so the TLS layer emits a
-    // single record + one syscall per query. Two writeAll calls would flush
-    // twice (ianic flushes per record).
+    // Stage into a single buffer so the TLS layer emits one record + one
+    // syscall per query — two writeAll calls would flush twice (ianic
+    // flushes per record).
     var staging: [2 + dns.edns_udp_payload]u8 = undefined;
-    mem.writeInt(u16, staging[0..2], msg_len, .big);
-    @memcpy(staging[2..][0..wire_query.len], wire_query);
+    const framed = try dns.stageLengthPrefixed(&staging, wire_query);
 
     try sys.updateTimeout(conn.sock, posix.SO.SNDTIMEO, deadline_ns);
-    conn.tls.writeAll(staging[0 .. 2 + wire_query.len]) catch return error.TlsSendFailed;
+    conn.tls.writeAll(framed) catch return error.TlsSendFailed;
 
-    // Read 2-byte length prefix
     try sys.updateTimeout(conn.sock, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
     const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch return error.TlsRecvFailed;
@@ -302,7 +300,6 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
 
     if (resp_len == 0 or resp_len > response_buf.len) return error.InvalidLength;
 
-    // Read response body
     const n_body = conn.tls.readAtLeast(response_buf[0..resp_len], resp_len) catch return error.TlsRecvFailed;
     if (n_body < resp_len) return error.TlsRecvFailed;
 
@@ -365,7 +362,6 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
         else => return err,
     };
 
-    // Parse and verify
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const response = try dns.parseMessage(arena.allocator(), response_data);
@@ -568,8 +564,10 @@ test "TlsTransport strict mode without server_name fails fast" {
 // Real Cloudflare DoT, but advertise an SNI/verify name no public cert
 // could legitimately bear (.invalid is RFC 2606 reserved). Cloudflare's
 // chain validates fine; the hostname check inside cert verification must
-// reject it. Run twice (default and strict) so a future regression that
-// only fires hostname binding in one of the two modes is caught.
+// reject it. Strict mode currently shares the cert-verify path, so the
+// strict variant is a documentation-of-intent assertion: it pins that
+// strict mode is at least as strict as default mode, ready to catch a
+// future divergence.
 fn runHostnameMismatchTest(strict: bool) !void {
     try skipIfNotLinux();
     const io = testing.io;

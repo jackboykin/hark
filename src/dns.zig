@@ -38,6 +38,17 @@ pub const edns_udp_payload: u16 = 1232;
 /// response buffer we might parse.
 pub const max_message_len: u16 = 65535;
 
+/// Stage `wire_query` into `buf` as a 2-byte big-endian length prefix
+/// followed by the query bytes. Returns the populated slice. Used by
+/// DNS-over-TCP and DNS-over-TLS callers; both bound queries to
+/// `edns_udp_payload`.
+pub fn stageLengthPrefixed(buf: *[2 + edns_udp_payload]u8, wire_query: []const u8) ![]const u8 {
+    if (wire_query.len > edns_udp_payload) return error.QueryTooLarge;
+    std.mem.writeInt(u16, buf[0..2], @intCast(wire_query.len), .big);
+    @memcpy(buf[2..][0..wire_query.len], wire_query);
+    return buf[0 .. 2 + wire_query.len];
+}
+
 // ── Enums ──────────────────────────────────────────────────────────────
 
 pub const OpCode = enum(u4) {

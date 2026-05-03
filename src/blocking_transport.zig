@@ -378,16 +378,12 @@ pub const BlockingTcpTransport = struct {
 
         // ── Send length-prefixed query ──
         var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
-        if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
-        const msg_len: u16 = @intCast(wire_query.len);
-        mem.writeInt(u16, send_buf[0..2], msg_len, .big);
-        @memcpy(send_buf[2..][0..wire_query.len], wire_query);
-        const total_send = 2 + wire_query.len;
+        const framed = try dns.stageLengthPrefixed(&send_buf, wire_query);
 
         var bytes_sent: usize = 0;
-        while (bytes_sent < total_send) {
+        while (bytes_sent < framed.len) {
             if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
-            const n = sys.write(sock, send_buf[bytes_sent..total_send]) catch return error.SendFailed;
+            const n = sys.write(sock, framed[bytes_sent..]) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
         }
