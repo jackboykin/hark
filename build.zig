@@ -4,9 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const tls_mod = b.addModule("tls", .{
+        .root_source_file = b.path("src/vendor/tls-ianic/root.zig"),
+        .target = target,
+    });
+
     const mod = b.addModule("hark", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "tls", .module = tls_mod },
+        },
     });
 
     const exe = b.addExecutable(.{

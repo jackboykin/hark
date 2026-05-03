@@ -7,7 +7,7 @@ const File = Io.File;
 const testing = std.testing;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const VendoredTlsClient = @import("tls_client.zig");
+const tls = @import("tls");
 
 // ── AddressKey ───────────────────────────────────────────────────────
 
@@ -75,7 +75,7 @@ pub const PooledConnection = struct {
     sock: posix.fd_t,
     net_reader: File.Reader,
     net_writer: File.Writer,
-    tls_client: VendoredTlsClient,
+    tls: tls.Connection,
     last_used: i64,
     /// Per-RFC 7766 §6.2.1: bound queries on a single TLS session. Matches the
     /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
@@ -83,15 +83,12 @@ pub const PooledConnection = struct {
     max_queries: u16 = 200,
 
     // Inline buffers — stable addresses since struct is heap-allocated.
-    net_read_buf: [VendoredTlsClient.min_buffer_len]u8,
-    net_write_buf: [VendoredTlsClient.min_buffer_len]u8,
-    tls_read_buf: [VendoredTlsClient.min_buffer_len]u8,
-    tls_write_buf: [VendoredTlsClient.min_buffer_len]u8,
+    net_read_buf: [tls.input_buffer_len]u8,
+    net_write_buf: [tls.output_buffer_len]u8,
 
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
-        self.tls_client.end() catch {};
-        self.tls_client.output.flush() catch {};
+        self.tls.close() catch {};
         sys.close(self.sock);
         allocator.destroy(self);
     }
@@ -499,12 +496,10 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
         .sock = sock,
         .net_reader = undefined,
         .net_writer = undefined,
-        .tls_client = undefined,
+        .tls = undefined,
         .last_used = 0,
         .net_read_buf = undefined,
         .net_write_buf = undefined,
-        .tls_read_buf = undefined,
-        .tls_write_buf = undefined,
     };
     return conn;
 }
