@@ -36,3 +36,34 @@ Note: `testdata/` is included even though it only feeds upstream's own test
 blocks. Zig 0.16 eagerly resolves top-level `@import` declarations regardless
 of whether they're referenced, so dropping the directory breaks compilation.
 At ~60 KB it isn't worth patching out.
+
+## Refresh checklist (security properties hark relies on)
+
+When pulling a newer upstream, confirm each item still holds before merging.
+"Confirm" usually means a one-line grep or running the named test.
+
+- **Hostname verification fires when `host.len > 0` and `insecure_skip_verify
+  = false`.** Currently at `handshake_common.zig:342-343`. Without this, a
+  cert from any trusted CA would be accepted regardless of the SNI name.
+  Test: `TlsTransport authenticated mode rejects hostname mismatch`.
+- **SNI extension is elided when `host.len == 0`.** This is our patch above.
+  Test: `ianic SNI patch: host="" elides server_name extension`.
+- **ALPN echo can be inspected post-handshake via `Connection.alpn_protocol`.**
+  hark rejects non-`"dot"` echoes; if upstream changes the field name or
+  semantics, the ALPN-mismatch guard at `tls_transport.zig` silently no-ops.
+- **`Connection.close()` writes a `close_notify` alert and flushes.** Pool
+  cleanup in `connection_pool.zig` calls this; if upstream makes `close` a
+  no-op or removes the flush, we leak un-acked plaintext on tear-down.
+- **`Connection.writeAll` writes one TLS record per call.** `queryOnConnection`
+  stages length+query into one buffer expecting a single record + syscall;
+  if upstream introduces internal chunking the perf assumption breaks but
+  correctness holds.
+- **Client cert auth is not required.** hark passes `auth = null`; if upstream
+  ever makes that mandatory, all DoT handshakes break.
+- **Cipher-suite / named-group defaults still include TLS 1.3 AEAD suites
+  (AES-128/256-GCM, ChaCha20-Poly1305) and X25519 / secp256r1.** hark relies
+  on ianic's defaults; downgrade by upstream would silently weaken security.
+
+`zig build test` covers the regression-testable items (1, 2). The rest are
+contract checks — read the relevant lines or run a real DoT query against
+1.1.1.1 with `--dot --dot-host one.one.one.one` to confirm end-to-end.

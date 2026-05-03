@@ -486,6 +486,11 @@ test "ConnectionPool max entries eviction" {
 
 /// Create a minimal PooledConnection for unit testing pool mechanics.
 /// Uses a dup'd /dev/null fd so close() is safe.
+///
+/// Note: `tls` is `undefined`. Pool tests reach the connection only via
+/// `destroyBroken` (which doesn't touch `.tls`), never `closeAndDestroy`
+/// (which calls `tls.close()`). If the pool's release path ever switches
+/// to `closeAndDestroy`, this helper must populate a real `tls.Connection`.
 fn createTestConnection(allocator: Allocator) !*PooledConnection {
     const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
     const sock = try sys.dup(dev_null);

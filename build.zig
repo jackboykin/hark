@@ -7,11 +7,13 @@ pub fn build(b: *std.Build) void {
     const tls_mod = b.addModule("tls", .{
         .root_source_file = b.path("src/vendor/tls-ianic/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const mod = b.addModule("hark", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "tls", .module = tls_mod },
         },

@@ -26,7 +26,6 @@ pub const TlsConfig = struct {
     connect_timeout_ms: u32 = 5000,
     response_timeout_ms: u32 = 10000,
     server_name: ?[]const u8 = null,
-    skip_verification: bool = false,
     /// RFC 7858 strict mode: require hostname verification (server_name must be set).
     strict: bool = false,
     port: u16 = 853,
@@ -99,13 +98,14 @@ pub const TlsTransport = struct {
     /// Establish a blocking TCP connection, perform TLS handshake,
     /// and return a heap-allocated PooledConnection.
     fn connectAndHandshake(self: *TlsTransport, tls_server: na.Address) !*PooledConnection {
-        // Config validation before any side effects.
+        // Config validation before any side effects. server_name must be a
+        // non-empty hostname: ianic skips hostname verification when host="",
+        // so a blank name would silently accept any cert from a trusted CA.
         if (self.config.strict and self.config.server_name == null) {
             return error.StrictModeRequiresHostname;
         }
-        if (!self.config.skip_verification and self.config.server_name == null) {
-            return error.ServerNameRequired;
-        }
+        const server_name = self.config.server_name orelse return error.ServerNameRequired;
+        if (server_name.len == 0) return error.ServerNameRequired;
 
         const sock = try connectTcpBlocking(tls_server, self.config.connect_timeout_ms);
         errdefer sys.close(sock);
@@ -114,14 +114,15 @@ pub const TlsTransport = struct {
         const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
 
-        const host: []const u8 = if (self.config.skip_verification) "" else self.config.server_name.?;
-        try self.handshake(conn, host, self.ca_bundle, self.config.skip_verification);
+        try self.handshake(conn, server_name, self.ca_bundle, false);
         return conn;
     }
 
     /// Run the TLS handshake on `conn`. ALPN advertises "dot" per RFC 9539 §4.4
     /// without requiring the peer to echo it: Cloudflare and Google accept the
-    /// protocol without echoing in violation of RFC 7301 §3.2.
+    /// protocol without echoing in violation of RFC 7301 §3.2. If the peer
+    /// echoes any other protocol the handshake is rejected — sending a
+    /// length-prefixed DNS frame to e.g. an h2 endpoint would corrupt state.
     fn handshake(self: *TlsTransport, conn: *PooledConnection, host: []const u8, root_ca: Certificate.Bundle, skip_verify: bool) !void {
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
         conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
@@ -131,7 +132,13 @@ pub const TlsTransport = struct {
             .root_ca = root_ca,
             .insecure_skip_verify = skip_verify,
             .alpn_protocols = &.{alpn_dot},
-        }) catch return error.TlsHandshakeFailed;
+        }) catch |err| {
+            log.debug("TLS handshake failed against {s}: {s}", .{ host, @errorName(err) });
+            return error.TlsHandshakeFailed;
+        };
+        if (conn.tls.alpn_protocol) |proto| {
+            if (!std.mem.eql(u8, proto, alpn_dot)) return error.TlsAlpnMismatch;
+        }
     }
 
     /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
@@ -270,13 +277,16 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// expose hooks for per-syscall deadline checks (the TLS layer buffers
 /// records, not raw syscalls).
 fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
-    if (wire_query.len > dns.max_udp_payload) return error.QueryTooLarge;
+    // Sized to hark's own EDNS query buffer (`dns.edns_udp_payload` = 1232).
+    // DoT permits up to 65 KiB but hark never builds queries that large; if
+    // a future query path needs more, raise this constant deliberately.
+    if (wire_query.len > dns.edns_udp_payload) return error.QueryTooLarge;
     const msg_len: u16 = @intCast(wire_query.len);
 
     // Stage length prefix + query into one buffer so the TLS layer emits a
     // single record + one syscall per query. Two writeAll calls would flush
     // twice (ianic flushes per record).
-    var staging: [2 + dns.max_udp_payload]u8 = undefined;
+    var staging: [2 + dns.edns_udp_payload]u8 = undefined;
     mem.writeInt(u16, staging[0..2], msg_len, .big);
     @memcpy(staging[2..][0..wire_query.len], wire_query);
 
@@ -521,6 +531,22 @@ test "ianic SNI sanity: host=\"example.com\" includes server_name" {
     try testing.expect(clientHelloHasSni(buf[0..n]));
 }
 
+test "TlsTransport rejects empty server_name" {
+    const io = testing.io;
+    var ca_bundle: Certificate.Bundle = .empty;
+    defer ca_bundle.deinit(testing.allocator);
+
+    var tls_t = TlsTransport.init(testing.allocator, .{
+        .server_name = "",
+    }, ca_bundle, io);
+
+    var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+    var response_buf: [dns.max_message_len]u8 = undefined;
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 853);
+
+    try testing.expectError(error.ServerNameRequired, tls_t.query(&wire_buf, server, &response_buf));
+}
+
 test "TlsTransport strict mode without server_name fails fast" {
     const io = testing.io;
     var ca_bundle: Certificate.Bundle = .empty;
@@ -539,19 +565,21 @@ test "TlsTransport strict mode without server_name fails fast" {
     try testing.expectError(error.StrictModeRequiresHostname, tls_t.query(&wire_buf, server, &response_buf));
 }
 
-test "TlsTransport authenticated mode rejects hostname mismatch" {
+// Real Cloudflare DoT, but advertise an SNI/verify name no public cert
+// could legitimately bear (.invalid is RFC 2606 reserved). Cloudflare's
+// chain validates fine; the hostname check inside cert verification must
+// reject it. Run twice (default and strict) so a future regression that
+// only fires hostname binding in one of the two modes is caught.
+fn runHostnameMismatchTest(strict: bool) !void {
     try skipIfNotLinux();
     const io = testing.io;
 
     var ca_bundle = try loadSystemCaBundleOrSkip(io);
     defer ca_bundle.deinit(testing.allocator);
 
-    // Real Cloudflare DoT, but advertise an SNI/verify name no public cert
-    // could legitimately bear (.invalid is RFC 2606 reserved). Cloudflare's
-    // chain validates fine; the hostname check inside cert verification must
-    // reject it.
     var tls_t = TlsTransport.init(testing.allocator, .{
         .server_name = "definitely-not-cloudflare.invalid",
+        .strict = strict,
     }, ca_bundle, io);
 
     const msg = try dns.buildQuery(testing.allocator, 0xDEAD, "example.com", .a);
@@ -572,6 +600,14 @@ test "TlsTransport authenticated mode rejects hostname mismatch" {
     }
 }
 
+test "TlsTransport authenticated mode rejects hostname mismatch" {
+    try runHostnameMismatchTest(false);
+}
+
+test "TlsTransport strict mode rejects hostname mismatch" {
+    try runHostnameMismatchTest(true);
+}
+
 test "probeInBackground reverts .probing when max_probes hit" {
     const io = testing.io;
     var enc_ns_cache = EncryptedNsCache.init(testing.allocator, io);
@@ -589,9 +625,7 @@ test "probeInBackground reverts .probing when max_probes hit" {
     enc_ns_cache.active_probes.store(encrypted_ns_mod.max_probes, .seq_cst);
 
     // probeInBackground should hit the max_probes guard and revert.
-    // Safe to use undefined: returns before spawning a thread or accessing other fields.
-    var tls_t: TlsTransport = undefined;
-    tls_t.config = .{};
+    var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
     tls_t.probeInBackground(server, &enc_ns_cache);
 
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
@@ -612,9 +646,7 @@ test "probeThread reverts .probing on shutdown" {
     // Signal shutdown before spawning
     enc_ns_cache.shutting_down.store(true, .seq_cst);
 
-    // Safe to use undefined: shutdown flag forces early return before accessing other fields.
-    var tls_t: TlsTransport = undefined;
-    tls_t.config = .{};
+    var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
     tls_t.probeInBackground(server, &enc_ns_cache);
 
     // Wait for the detached thread to finish
