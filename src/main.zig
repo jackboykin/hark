@@ -180,7 +180,9 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--forward")) {
+        if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
+            log_verbose.store(true, .release);
+        } else if (std.mem.eql(u8, args[i], "--forward")) {
             forward_mode = true;
         } else if (std.mem.eql(u8, args[i], "--dot")) {
             dot_mode = true;
