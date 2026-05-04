@@ -2758,3 +2758,17 @@ test "verifyRsa rejects exponent 0" {
 test "verifyRsa rejects exponent 1" {
     try expectVerifyRsaInvalidKey(&.{1});
 }
+
+test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
+    // Known-answer test against an authoritative-server NSEC3 proof, captured
+    // from a1-32.akam.net for `jsc.nasa.gov DS`. Catches regressions in
+    // iteration count, hash chaining, or canonical name wire encoding that
+    // a roundtrip test would miss.
+    const child_zone = dns.Name{ .labels = &.{ "jsc", "nasa", "gov" } };
+    const salt = [_]u8{ 0xA3, 0xB6, 0xC3, 0xF4, 0x96, 0x50, 0x04, 0xE9 };
+    const computed = try nsec3Hash(child_zone, &salt, 10);
+
+    var expected: [Sha1.digest_length]u8 = undefined;
+    _ = try dns.base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
+    try testing.expectEqualSlices(u8, &expected, &computed);
+}

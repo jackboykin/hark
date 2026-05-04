@@ -423,17 +423,23 @@ pub const RecursiveResolver = struct {
 
                 // ── Final query response handling ──
 
-                // DNSSEC: when the server is authoritative for both parent and
-                // child zones, it answers directly without a referral, so
-                // classifyDelegation never ran.  Establish delegation security
-                // before validation/NXDOMAIN/NODATA (RFC 4035 §5.2).
+                // DNSSEC: when the server is authoritative for both parent
+                // and a child zone (possibly several labels deeper), it
+                // answers directly without a referral, so classifyDelegation
+                // never ran. Probe the next label below parent_zone — the
+                // shallowest possible cut, whose parent is the signed zone we
+                // already trust, so its DS NODATA proof can be validated
+                // (RFC 4035 §5.2). A deeper hidden cut is still covered: it
+                // lives inside the .insecure island this probe establishes.
                 if (self.dnssec_enabled and security_state == .secure and
                     target_name.labels.len > parent_zone.labels.len and
                     response.header.aa and !hasSignedRecords(response))
                 {
+                    const cut_labels = target_name.labels[target_name.labels.len - parent_zone.labels.len - 1 ..];
+                    const candidate_cut = dns.Name{ .labels = cut_labels };
                     security_state = self.ensureDelegationSecurity(
                         allocator,
-                        target_name,
+                        candidate_cut,
                         &.{},
                         servers[0..server_count],
                     );
