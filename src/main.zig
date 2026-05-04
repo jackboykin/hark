@@ -116,6 +116,7 @@ fn printUsage() void {
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
         \\  --no-dnssec         Disable DNSSEC validation (default)
+        \\  --verbose, -v       Enable debug logging
         \\
         \\Serve options:
         \\  --config <path>     Path to config file (default: ./hark.toml)
