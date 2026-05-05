@@ -23,6 +23,7 @@ const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
+const CaseState = @import("case_state.zig").CaseState;
 const log = std.log.scoped(.resolver);
 
 // ── Root Hints ─────────────────────────────────────────────────────────
@@ -106,6 +107,10 @@ pub const RecursiveResolver = struct {
     query_memory_limit: usize = 2 * 1024 * 1024,
     /// Staggered NS racing interval in ms (0 = disabled).
     stagger_ms: u32 = 0,
+
+    /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon). null when
+    /// disabled or in forwarder mode.
+    case_state: ?*CaseState = null,
 
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
@@ -848,6 +853,22 @@ pub const RecursiveResolver = struct {
         return response;
     }
 
+    /// Returns the RNG to randomize an outgoing query to `addr_key`, or
+    /// null if 0x20 is disabled or this server has been marked mangling.
+    fn caseRng(self: *RecursiveResolver, addr_key: AddressKey) ?std.Io {
+        const cs = self.case_state orelse return null;
+        return if (cs.shouldRandomize(addr_key)) self.io else null;
+    }
+
+    /// Mark a server as 0x20 case-mangling. Subsequent queries to it skip
+    /// randomization for `reprobe_sec`.
+    fn markCaseBroken(self: *RecursiveResolver, server: na.Address) void {
+        const cs = self.case_state orelse return;
+        cs.markBroken(AddressKey.fromAddress(server));
+        var addr_buf: [64]u8 = undefined;
+        log.debug("0x20 case mangled by {s}; marking non-conformant", .{na.format(server, &addr_buf)});
+    }
+
     // ── Staggered NS Racing ─────────────────────────────────────────────
 
     const StaggeredResponse = struct {
@@ -905,10 +926,28 @@ pub const RecursiveResolver = struct {
         var qids: [max_staggered_legs]u16 = undefined;
         var leg_addrs: [max_staggered_legs]na.Address = undefined;
 
+        // All legs share one case pattern (memcpy + ID-patch optimization),
+        // so disable 0x20 if any leg is marked. Per-leg builds would let
+        // unmarked legs keep 0x20, but cost extra serializes and a per-leg
+        // sent-name table to verify the winner against. The sequential
+        // fallback preserves per-server protection, so the staggered path
+        // can take the simpler hit. Trade reconsidered if measurement
+        // shows the sequential fallback is firing often.
+        var case_rng: ?std.Io = self.caseRng(AddressKey.fromAddress(servers[leg_idxs[0]]));
+        if (case_rng != null) {
+            for (leg_idxs[1..leg_count]) |idx| {
+                if (self.caseRng(AddressKey.fromAddress(servers[idx])) == null) {
+                    case_rng = null;
+                    break;
+                }
+            }
+        }
+
         qids[0] = rand.queryId(self.io);
         const msg0 = dns.buildQueryWithOptions(allocator, qids[0], query_name, query_type, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
+            .case_rng = case_rng,
         }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
         const w0 = dns.serializeMessage(&wires_storage[0], msg0) catch |err|
             return if (err == error.OutOfMemory) error.OutOfMemory else null;
@@ -956,6 +995,13 @@ pub const RecursiveResolver = struct {
         // the query. (The sequential path enforces this via queryAuthoritativeServers.)
         dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
 
+        // 0x20 echo verify. Mark and bail to sequential, which will rebuild
+        // lowercase against the same server and retry properly.
+        if (case_rng != null and !msg0.questions[0].name.eqlExact(resp.questions[0].name)) {
+            self.markCaseBroken(responding_addr);
+            return null;
+        }
+
         return .{ .message = resp, .server = responding_addr };
     }
 
@@ -997,15 +1043,8 @@ pub const RecursiveResolver = struct {
             }
         }
 
-        const query_msg = try dns.buildQueryWithOptions(allocator, 0, query_name, query_type, .{
-            .rd = false,
-            .edns = .{ .do_bit = self.dnssec_aware },
-        });
-        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-        const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
-
         const now_ms = self.rttNowMs();
-        for (server_order, 0..) |server_idx, server_i| {
+        server_loop: for (server_order, 0..) |server_idx, server_i| {
             const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
 
@@ -1018,83 +1057,109 @@ pub const RecursiveResolver = struct {
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
-            // RFC 5452: fresh id per attempt.
-            const query_id = rand.queryId(self.io);
-            dns.patchQueryId(wire_buf[0..wire_query.len], query_id);
+            // Per-server build: fresh 0x20 randomization per server, and
+            // the lowercase fallback retry can rebuild without 0x20.
+            var case_rng = self.caseRng(addr_key);
+            retry: while (true) {
+                const query_msg = try dns.buildQueryWithOptions(allocator, 0, query_name, query_type, .{
+                    .rd = false,
+                    .edns = .{ .do_bit = self.dnssec_aware },
+                    .case_rng = case_rng,
+                });
+                var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+                const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
-            // ── RFC 9539: Opportunistic encrypted query ──
-            if (self.transports.tls) |tls_t| {
-                if (self.encrypted_ns_cache) |oc| {
-                    const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
-                    switch (oc.getStatus(tls_key)) {
-                        .capable => {
-                            // Known-good server → try encrypted (pool or new connection)
-                            const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
-                                .rd = false,
-                                .edns = .{ .do_bit = self.dnssec_aware, .padding_target = dns.dot_padding_target },
-                            });
-                            var padded_buf: [dns.edns_udp_payload]u8 = undefined;
-                            const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
+                // RFC 5452: fresh id per attempt.
+                const query_id = rand.queryId(self.io);
+                dns.patchQueryId(wire_buf[0..wire_query.len], query_id);
 
-                            const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
-                            const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
-                            if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
-                                if (try tryParseMessage(allocator, tls_data, server)) |tls_response| {
-                                    if (tls_response.header.qr and
-                                        tls_response.header.rcode != .format_error and
-                                        dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
-                                    {
-                                        if (tls_response.header.rcode.isServerError()) {
-                                            last_server_failure = tls_response;
-                                            continue; // Try next server, don't repeat over Do53
+                // ── RFC 9539: Opportunistic encrypted query ──
+                // TLS authenticates the channel, so 0x20 is redundant there;
+                // the TLS variant always uses lowercase QNAME.
+                if (self.transports.tls) |tls_t| {
+                    if (self.encrypted_ns_cache) |oc| {
+                        const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+                        switch (oc.getStatus(tls_key)) {
+                            .capable => {
+                                const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                                    .rd = false,
+                                    .edns = .{ .do_bit = self.dnssec_aware, .padding_target = dns.dot_padding_target },
+                                });
+                                var padded_buf: [dns.edns_udp_payload]u8 = undefined;
+                                const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
+
+                                const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
+                                const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
+                                if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
+                                    if (try tryParseMessage(allocator, tls_data, server)) |tls_response| {
+                                        if (tls_response.header.qr and
+                                            tls_response.header.rcode != .format_error and
+                                            dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
+                                        {
+                                            if (tls_response.header.rcode.isServerError()) {
+                                                last_server_failure = tls_response;
+                                                continue :server_loop;
+                                            }
+                                            // Don't update RTT cache or NS selector from TLS —
+                                            // different transport latency would poison Do53 estimates.
+                                            return .{ .message = tls_response, .responding_server = null };
                                         }
-                                        // Don't update RTT cache or NS selector from TLS —
-                                        // different transport latency would poison Do53 estimates.
-                                        return .{ .message = tls_response, .responding_server = null };
                                     }
+                                    // TLS error/unparseable — fall through to Do53
+                                } else |_| {
+                                    oc.markFailed(tls_key);
                                 }
-                                // TLS error/unparseable — fall through to Do53
-                            } else |_| {
-                                oc.markFailed(tls_key);
-                            }
-                        },
-                        .unknown => {}, // First contact → Do53 now, probe after
-                        .probing, .failed => {}, // Skip, go straight to Do53
+                            },
+                            .unknown => {}, // First contact → Do53 now, probe after
+                            .probing, .failed => {}, // Skip, go straight to Do53
+                        }
                     }
                 }
-            }
 
-            // ── Do53: UDP with TCP fallback ──
-            const do53_start = monotonic.nowUs();
-            const response = try self.queryServerUdp(
-                allocator,
-                wire_query,
-                query_id,
-                server,
-                per_server_timeout,
-            ) orelse {
+                // ── Do53: UDP with TCP fallback ──
+                const do53_start = monotonic.nowUs();
+                const response = try self.queryServerUdp(
+                    allocator,
+                    wire_query,
+                    query_id,
+                    server,
+                    per_server_timeout,
+                ) orelse {
+                    if (self.ns_selector) |ns|
+                        ns.recordOutcome(parent_zone, server, .timeout, 0);
+                    continue :server_loop;
+                };
+                const do53_elapsed = monotonic.nowUs() - do53_start;
+
+                // RFC 5452 §9.1 / RFC 9619: question must match; error rcodes exempt.
+                dns.validateResponse(response, query_msg.questions[0].name, query_type) catch continue :server_loop;
+
+                // 0x20 echo verify: case-insensitive validation already passed,
+                // so an exact mismatch means the server (or a middlebox in front
+                // of it) mangled case. Mark and resend lowercase. We don't
+                // distinguish middlebox-vs-server with a TCP probe — the
+                // 1-hour reprobe TTL on the marker recovers automatically if
+                // the middlebox is later removed.
+                if (case_rng != null and !query_msg.questions[0].name.eqlExact(response.questions[0].name)) {
+                    self.markCaseBroken(server);
+                    case_rng = null;
+                    continue :retry;
+                }
+
+                // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
+                // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
+                if (response.header.rcode.isServerError()) {
+                    if (self.ns_selector) |ns|
+                        ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
+                    last_server_failure = response;
+                    continue :server_loop;
+                }
+
                 if (self.ns_selector) |ns|
-                    ns.recordOutcome(parent_zone, server, .timeout, 0);
-                continue;
-            };
-            const do53_elapsed = monotonic.nowUs() - do53_start;
-
-            // RFC 5452 §9.1 / RFC 9619: question must match; error rcodes exempt.
-            dns.validateResponse(response, query_msg.questions[0].name, query_type) catch continue;
-
-            // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
-            // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
-            if (response.header.rcode.isServerError()) {
-                if (self.ns_selector) |ns|
-                    ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
-                last_server_failure = response;
-                continue;
+                    ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
+                self.fireOteProbe(server);
+                return .{ .message = response, .responding_server = server };
             }
-
-            if (self.ns_selector) |ns|
-                ns.recordOutcome(parent_zone, server, .success, do53_elapsed);
-            self.fireOteProbe(server);
-            return .{ .message = response, .responding_server = server };
         }
 
         // Fall back to last SERVFAIL/REFUSED if all servers failed
@@ -1295,32 +1360,44 @@ pub const RecursiveResolver = struct {
                 if (rc.isDead(addr_key, now_ms) and i + 1 < try_count) continue;
             }
 
-            // Fresh TXID per server to prevent cross-server ID prediction.
-            const query_id = rand.queryId(self.io);
-            const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
-                .rd = false,
-                .edns = .{ .do_bit = do_bit },
-            });
+            var case_rng = self.caseRng(addr_key);
+            retry: while (true) {
+                // RFC 5452 §9.2: fresh TXID per attempt.
+                const query_id = rand.queryId(self.io);
+                const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
+                    .rd = false,
+                    .edns = .{ .do_bit = do_bit },
+                    .case_rng = case_rng,
+                });
 
-            var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-            const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
+                var wire_buf: [dns.edns_udp_payload]u8 = undefined;
+                const wire_query = dns.serializeMessage(&wire_buf, query_msg) catch return null;
 
-            const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
+                const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
 
-            const response = try self.queryServerUdp(
-                allocator,
-                wire_query,
-                query_id,
-                server,
-                timeout,
-            ) orelse continue;
-            // RFC 5452 §9.1: question section must match original query
-            if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, qtype)) continue;
-            if (response.header.rcode != .no_error) continue;
-            if (store_response) {
-                if (self.cache) |c| c.storeResponse(response, authority_zone);
+                const response = try self.queryServerUdp(
+                    allocator,
+                    wire_query,
+                    query_id,
+                    server,
+                    timeout,
+                ) orelse break :retry;
+                // RFC 5452 §9.1: question section must match original query
+                if (!dns.validateQuestionMatch(response, query_msg.questions[0].name, qtype)) break :retry;
+
+                // 0x20 echo verify. On mismatch, mark and retry lowercase.
+                if (case_rng != null and !query_msg.questions[0].name.eqlExact(response.questions[0].name)) {
+                    self.markCaseBroken(server);
+                    case_rng = null;
+                    continue :retry;
+                }
+
+                if (response.header.rcode != .no_error) break :retry;
+                if (store_response) {
+                    if (self.cache) |c| c.storeResponse(response, authority_zone);
+                }
+                return response;
             }
-            return response;
         }
         return null;
     }

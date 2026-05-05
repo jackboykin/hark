@@ -15,6 +15,7 @@ const RecursiveResolver = recursive.RecursiveResolver;
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
+const CaseState = @import("case_state.zig").CaseState;
 const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
 const RttCache = @import("ns_rtt.zig").RttCache;
@@ -232,6 +233,7 @@ pub const Server = struct {
     dedup: ?InFlightTable,
     ca_bundle: Certificate.Bundle,
     encrypted_ns_cache: ?EncryptedNsCache,
+    case_state: ?CaseState,
     enc_pool: ?ConnectionPool,
     nsec_cache: ?NsecCache,
     key_cache: ?RRsetCache,
@@ -309,6 +311,7 @@ pub const Server = struct {
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
             .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
+            .case_state = if (cfg.case_randomization and cfg.mode == .recursive) CaseState.init(allocator, io) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
                 .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
@@ -340,6 +343,7 @@ pub const Server = struct {
             oc.awaitProbes();
             oc.deinit();
         }
+        if (self.case_state) |*cs| cs.deinit();
         if (self.enc_pool) |*pool| pool.deinit();
         if (self.config.opportunistic) {
             self.ca_bundle.deinit(self.allocator);
@@ -560,6 +564,7 @@ pub const Server = struct {
             .loop = server_loop,
             .enc_pool = if (self.enc_pool) |*pool| pool else null,
             .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
+            .case_state = if (self.case_state) |*cs| cs else null,
             .cache = &self.cache,
             .key_cache = if (self.key_cache) |*kc| kc else null,
             .rtt_cache = &self.rtt_cache,
@@ -712,6 +717,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
         .ns_selector = &server.ns_selector,
         .bypass_cache = true,
         .stagger_ms = server.config.stagger_ms,
+        .case_state = if (server.case_state) |*cs| cs else null,
         .dedup = if (server.dedup) |*d| d else null,
         .tcp_pool = null,
         .gpa = server.allocator,
@@ -739,6 +745,7 @@ const WorkerState = struct {
     loop: *EventLoop,
     enc_pool: ?*ConnectionPool,
     encrypted_ns_cache: ?*EncryptedNsCache,
+    case_state: ?*CaseState,
     cache: *RRsetCache,
     key_cache: ?*RRsetCache,
     rtt_cache: *RttCache,
@@ -1087,6 +1094,7 @@ const WorkerState = struct {
                     .ns_selector = self.ns_selector,
                     .bypass_cache = bypass_cache,
                     .stagger_ms = self.config.stagger_ms,
+                    .case_state = self.case_state,
                     .dedup = self.dedup,
                     .tcp_pool = self.tcp_pool,
                     .gpa = self.allocator,

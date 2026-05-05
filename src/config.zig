@@ -22,6 +22,7 @@ pub const ServerConfig = struct {
     min_ttl: u32,
     dnssec: bool,
     qname_minimization: bool,
+    case_randomization: bool,
     query_memory_limit: usize,
     opportunistic: bool,
     workers: u16,
@@ -81,6 +82,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .min_ttl = 0,
         .dnssec = false,
         .qname_minimization = true,
+        .case_randomization = true,
         .query_memory_limit = 2 * 1024 * 1024,
         .opportunistic = false,
         // 2 workers is enough for most deployments. Each worker is one
@@ -153,6 +155,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
+        if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
         if (try nonNegativeClamped(usize, resolver, "query-memory-limit")) |val| {
             if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;

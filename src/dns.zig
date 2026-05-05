@@ -237,6 +237,16 @@ pub const Name = struct {
         return true;
     }
 
+    /// Strict byte-exact comparison — used to verify 0x20 echo
+    /// (RFC draft Vixie/Dagon "Use of Bit 0x20").
+    pub fn eqlExact(a: Name, b: Name) bool {
+        if (a.labels.len != b.labels.len) return false;
+        for (a.labels, b.labels) |la, lb| {
+            if (!mem.eql(u8, la, lb)) return false;
+        }
+        return true;
+    }
+
     /// Returns true if self is equal to or a subdomain of parent.
     /// E.g. "www.example.com".isSubdomainOf("example.com") == true
     pub fn isSubdomainOf(self: Name, parent: Name) bool {
@@ -537,6 +547,29 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     return .{ .labels = labels };
 }
 
+/// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels.
+/// `@constCast` is sound because `parseDottedName` `dupe`s each label, so
+/// the underlying storage is mutable. RFC draft Vixie/Dagon.
+pub fn applyCase0x20(io: std.Io, name: Name) void {
+    var pool: u64 = 0;
+    var bits_left: u8 = 0;
+    for (name.labels) |label| {
+        const bytes = @constCast(label);
+        for (bytes) |*b| {
+            if (!std.ascii.isAlphabetic(b.*)) continue;
+            if (bits_left == 0) {
+                var buf: [8]u8 = undefined;
+                io.random(&buf);
+                pool = mem.readInt(u64, &buf, .little);
+                bits_left = 64;
+            }
+            if (pool & 1 == 1) b.* ^= 0x20;
+            pool >>= 1;
+            bits_left -= 1;
+        }
+    }
+}
+
 /// RFC 8467 §4.1 recommended block-size for DoT query padding.
 pub const dot_padding_target: u16 = 468;
 
@@ -551,6 +584,10 @@ pub const EdnsConfig = struct {
 pub const QueryOptions = struct {
     rd: bool = true,
     edns: ?EdnsConfig = null,
+    /// RFC draft Vixie/Dagon "Use of Bit 0x20 in DNS Labels": when non-null,
+    /// randomize ASCII letter case in QNAME using this RNG. Caller verifies
+    /// the response echoes byte-for-byte.
+    case_rng: ?std.Io = null,
 };
 
 pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType) Error!Message {
@@ -559,6 +596,7 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
 
 pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
     const name = try parseDottedName(allocator, name_str);
+    if (options.case_rng) |io| applyCase0x20(io, name);
     const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
 
@@ -2605,4 +2643,95 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
     defer arena.deinit();
     const result = parseMessage(arena.allocator(), pkt[0..pos]);
     try testing.expectError(error.InvalidRDataLength, result);
+}
+
+// ── 0x20 case randomization ───────────────────────────────────────────
+
+test "applyCase0x20 only flips ASCII letters; round-trips eql" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const original = try parseDottedName(alloc, "Foo.Bar123-baz.com");
+    const randomized = try parseDottedName(alloc, "Foo.Bar123-baz.com");
+
+    applyCase0x20(testing.io, randomized);
+
+    for (randomized.labels, original.labels) |rl, ol| {
+        try testing.expectEqual(rl.len, ol.len);
+        for (rl, ol) |rb, ob| {
+            if (std.ascii.isAlphabetic(ob)) {
+                try testing.expectEqual(std.ascii.toLower(ob), std.ascii.toLower(rb));
+            } else {
+                try testing.expectEqual(ob, rb);
+            }
+        }
+    }
+
+    try testing.expect(original.eql(randomized));
+}
+
+test "eqlExact rejects case-flipped name; eql accepts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const a = try parseDottedName(alloc, "example.com");
+    const b = try parseDottedName(alloc, "ExAmPlE.com");
+
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eqlExact(b));
+    try testing.expect(a.eqlExact(a));
+}
+
+test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const iterations: usize = 10_000;
+    const letters = "abcdefghijklmnopqrstuvwxyz";
+    var upper_counts: [26]u32 = .{0} ** 26;
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const n = try parseDottedName(alloc, letters);
+        applyCase0x20(testing.io, n);
+        for (n.labels[0], 0..) |b, idx| {
+            if (std.ascii.isUpper(b)) upper_counts[idx] += 1;
+        }
+    }
+
+    for (upper_counts) |c| {
+        const ratio = @as(f64, @floatFromInt(c)) / @as(f64, @floatFromInt(iterations));
+        try testing.expect(ratio > 0.45 and ratio < 0.55);
+    }
+}
+
+test "applyCase0x20 on root and all-numeric is a no-op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try parseDottedName(alloc, ".");
+    applyCase0x20(testing.io, root);
+    try testing.expectEqual(@as(usize, 0), root.labels.len);
+
+    const numeric = try parseDottedName(alloc, "12345.com");
+    const numeric_copy = try parseDottedName(alloc, "12345.com");
+    applyCase0x20(testing.io, numeric);
+    try testing.expect(mem.eql(u8, numeric.labels[0], numeric_copy.labels[0]));
+}
+
+test "buildQueryWithOptions with case_randomize" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const lower = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{});
+    const randomized = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{
+        .case_rng = testing.io,
+    });
+
+    try testing.expect(lower.questions[0].name.eql(randomized.questions[0].name));
 }
