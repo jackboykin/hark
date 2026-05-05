@@ -63,26 +63,33 @@ hark dump < packet.bin
 ```toml
 [server]
 listen = ["127.0.0.1:53", "[::1]:53"]
-workers = 4
-resolution-threads = 4      # pool threads per worker for concurrent resolution
+workers = 2                   # range 1..65535; raise for high-QPS
+resolution-threads = 4        # pool threads per worker (1..256)
+max-udp-payload = 1232        # advertised OPT + outbound clamp (512..65535)
 
 [resolver]
-mode = "recursive"          # or "forward"
-dnssec = true
-qname-minimization = true
-opportunistic = true        # RFC 9539 encrypted transport to authoritatives
-stagger-ms = 150             # staggered NS racing delay (0 to disable)
+mode = "recursive"            # or "forward"
+dnssec = false
+qname-minimization = true     # RFC 9156
+opportunistic = false         # RFC 9539 encrypted to authoritatives
+stagger-ms = 150              # NS racing delay; 0 disables, max 1000
+query-memory-limit = 2097152  # per-query arena cap, bytes (0 disables; min 65536)
 
 [cache]
-prefetch = true
-serve-stale-ttl = 3600      # seconds to serve expired entries (RFC 8767)
-min-ttl = 300                # floor for aggressive CDN TTLs
+size = 16777216               # answer cache, bytes
+entries = 10000               # answer cache, max entries
+key-cache-size = 4194304      # DNSKEY/DS cache, bytes
+key-cache-entries = 2000      # DNSKEY/DS cache, max entries
+prefetch = false              # refresh near-expiry entries
+prefetch-cousin = false       # also fetch the other A/AAAA on lookup
+serve-stale-ttl = 0           # serve expired up to N seconds (RFC 8767)
+min-ttl = 0                   # floor for aggressive CDN TTLs
 
 [logging]
-queries = true
+queries = false               # per-query log lines
 ```
 
-All fields are optional. Defaults: localhost:53, recursive mode, workers = CPU count, 4 resolution threads per worker. Several features that the example above turns on are **off by default**: `dnssec`, `opportunistic`, `prefetch`, `serve-stale-ttl=0`, `min-ttl=0`. Copy the snippet above to opt in.
+Every value shown is the default — copying the snippet verbatim is a no-op. Omit a key to get the same default.
 
 ## Design
 

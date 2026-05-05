@@ -83,7 +83,11 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .qname_minimization = true,
         .query_memory_limit = 2 * 1024 * 1024,
         .opportunistic = false,
-        .workers = @intCast(@max(1, std.Thread.getCpuCount() catch 1)),
+        // 2 workers is enough for most deployments. Each worker is one
+        // io_uring ring; per-worker resolution-threads handle upstream
+        // concurrency. Raise this for high-QPS edge resolvers — io_uring
+        // drainage is rarely the bottleneck; resolution work dominates.
+        .workers = 2,
         .resolution_threads = 4,
         .stagger_ms = 150,
         .log_queries = false,
