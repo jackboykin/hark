@@ -121,19 +121,12 @@ pub fn getPeerName(fd: posix.fd_t) !Address {
 }
 
 /// Format an address as "ip:port" into a caller-provided buffer.
+/// Delegates to std.Io.net.IpAddress.format, which emits IPv6 in
+/// RFC 5952 canonical form ("[::1]:53" rather than "[0000:...:0001]:53").
 pub fn format(addr: Address, buf: []u8) []const u8 {
-    return switch (addr) {
-        .ip4 => |v4| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-            v4.bytes[0], v4.bytes[1], v4.bytes[2], v4.bytes[3], v4.port,
-        }) catch "?",
-        .ip6 => |v6| std.fmt.bufPrint(buf, "[{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}]:{d}", .{
-            mem.readInt(u16, v6.bytes[0..2], .big),   mem.readInt(u16, v6.bytes[2..4], .big),
-            mem.readInt(u16, v6.bytes[4..6], .big),   mem.readInt(u16, v6.bytes[6..8], .big),
-            mem.readInt(u16, v6.bytes[8..10], .big),  mem.readInt(u16, v6.bytes[10..12], .big),
-            mem.readInt(u16, v6.bytes[12..14], .big), mem.readInt(u16, v6.bytes[14..16], .big),
-            v6.port,
-        }) catch "?",
-    };
+    var w = std.Io.Writer.fixed(buf);
+    addr.format(&w) catch return "?";
+    return w.buffered();
 }
 
 /// Connect a socket to an Address (converts to sockaddr internally).
@@ -197,6 +190,16 @@ fn isNonRoutableIp6Zero(b: [16]u8) bool {
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "format produces ip:port and RFC 5952 IPv6" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("127.0.0.1:53", format(initIp4(.{ 127, 0, 0, 1 }, 53), &buf));
+    try testing.expectEqualStrings("[::1]:53884", format(initIp6(.{0} ** 15 ++ .{1}, 53884, 0, 0), &buf));
+    try testing.expectEqualStrings(
+        "[2001:db8::1]:53",
+        format(initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ .{0} ** 11 ++ .{1}, 53, 0, 0), &buf),
+    );
+}
 
 test "isNonRoutableNs blocks private/reserved IPv4" {
     // Loopback
