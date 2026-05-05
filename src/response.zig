@@ -10,8 +10,10 @@ const dns = @import("dns.zig");
 
 /// RFC 4035 §3.2.1: strip authenticating DNSSEC RRs (RRSIG, NSEC, NSEC3) when
 /// client didn't set the DO bit. Records whose type matches the QTYPE are kept
-/// in the answer section (explicit query for that type).
-fn stripDnssecRRs(alloc: mem.Allocator, records: []const dns.ResourceRecord, qtype: dns.RType, is_answer: bool) []const dns.ResourceRecord {
+/// in the answer section (explicit query for that type). On OOM the caller
+/// must surface a SERVFAIL — silently returning the unfiltered slice would
+/// leak DNSSEC RRs to a non-DO client.
+fn stripDnssecRRs(alloc: mem.Allocator, records: []const dns.ResourceRecord, qtype: dns.RType, is_answer: bool) mem.Allocator.Error![]const dns.ResourceRecord {
     var count: usize = 0;
     for (records) |rr| {
         if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) continue;
@@ -19,7 +21,7 @@ fn stripDnssecRRs(alloc: mem.Allocator, records: []const dns.ResourceRecord, qty
     }
     if (count == records.len) return records;
 
-    const filtered = alloc.alloc(dns.ResourceRecord, count) catch return records;
+    const filtered = try alloc.alloc(dns.ResourceRecord, count);
     var i: usize = 0;
     for (records) |rr| {
         if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) continue;
@@ -82,10 +84,12 @@ pub fn buildResponseWire(
 
     const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
 
-    // RFC 4035 §3.2.1: strip authenticating DNSSEC RRs when client didn't set DO
-    const answers = if (!ctx.client_do) stripDnssecRRs(alloc, response.answers, qtype, true) else response.answers;
-    const authorities = if (!ctx.client_do) stripDnssecRRs(alloc, response.authorities, qtype, false) else response.authorities;
-    const additionals = if (!ctx.client_do) stripDnssecRRs(alloc, response.additionals, qtype, false) else response.additionals;
+    // RFC 4035 §3.2.1: strip authenticating DNSSEC RRs when client didn't set DO.
+    // OOM here returns null — the I/O caller surfaces it as SERVFAIL rather than
+    // emitting a half-stripped response.
+    const answers = if (!ctx.client_do) (stripDnssecRRs(alloc, response.answers, qtype, true) catch return null) else response.answers;
+    const authorities = if (!ctx.client_do) (stripDnssecRRs(alloc, response.authorities, qtype, false) catch return null) else response.authorities;
+    const additionals = if (!ctx.client_do) (stripDnssecRRs(alloc, response.additionals, qtype, false) catch return null) else response.additionals;
 
     var msg = dns.Message{
         .header = .{
@@ -307,6 +311,73 @@ test "buildResponseWire with EDNS0" {
     const parsed = try dns.parseMessage(a, wire);
     try testing.expect(parsed.opt != null);
     try testing.expectEqual(@as(u16, dns.edns_udp_payload), parsed.opt.?.udp_payload_size);
+}
+
+test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const name = try dns.parseDottedName(a, "example.com");
+    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
+
+    // Build an answer section that includes RRSIG — would need stripping for
+    // a non-DO client, which forces stripDnssecRRs to allocate.
+    const a_rdata = dns.RData{ .a = .{ 192, 0, 2, 1 } };
+    const rrsig_rdata = dns.RData{ .rrsig = .{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 60,
+        .sig_expiration = 0,
+        .sig_inception = 0,
+        .key_tag = 0,
+        .signer_name = name,
+        .signature = &.{},
+    } };
+    const answers: []const dns.ResourceRecord = &.{
+        .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = a_rdata },
+        .{ .name = name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = rrsig_rdata },
+    };
+
+    const response = dns.Message{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 0,
+            .an_count = @intCast(answers.len),
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = answers,
+    };
+
+    // FailingAllocator with budget 0 fails every allocation; stripDnssecRRs
+    // must surface OOM as a null response, not return the unfiltered slice.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var buf: [dns.max_udp_payload]u8 = undefined;
+    const result = buildResponseWire(&buf, .{
+        .query_id = 0x1234,
+        .rd = true,
+        .cd = false,
+        .questions = questions,
+        .client_edns = false,
+        .client_do = false,
+        .client_wants_ad = false,
+        .max_payload = dns.max_udp_payload,
+    }, response, failing.allocator());
+
+    try testing.expect(result == null);
 }
 
 test "serializeErrorResponse produces valid DNS message" {
