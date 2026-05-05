@@ -235,11 +235,16 @@ pub const Server = struct {
     enc_pool: ?ConnectionPool,
     nsec_cache: ?NsecCache,
     key_cache: ?RRsetCache,
-    shutdown: std.atomic.Value(bool),
-    worker_errors: std.atomic.Value(u32),
-    udp_queue_drops: std.atomic.Value(u64),
-    tcp_queue_drops: std.atomic.Value(u64),
-    udp_send_drops: std.atomic.Value(u64),
+    /// Hot atomics — each on its own cache line to avoid false sharing.
+    /// `shutdown` is read every tick by every worker; the *_drops counters
+    /// are written by every worker on contention events. Without padding,
+    /// the read on `shutdown` would invalidate alongside writes to the
+    /// drop counters and bounce cache lines across cores.
+    shutdown: std.atomic.Value(bool) align(std.atomic.cache_line),
+    worker_errors: std.atomic.Value(u32) align(std.atomic.cache_line),
+    udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
+    tcp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
+    udp_send_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// One eventfd per worker. Only the main worker reads the signalfd;
     /// without per-worker wakes, peers would block in io_uring_enter forever
     /// waiting for a CQE that never arrives (no traffic = no wake). Spawned
@@ -247,7 +252,7 @@ pub const Server = struct {
     wake_fds: []posix.fd_t,
     /// Number of workers that have finished binding their listen sockets.
     /// Each worker drops privileges itself once this reaches `workers`.
-    bound_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    bound_count: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {

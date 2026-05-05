@@ -21,7 +21,7 @@ Runs on Linux with io_uring.
 
 ## Building
 
-Requires Zig 0.16 and Linux 5.19+ (io_uring buffer rings).
+Requires Zig 0.16 and Linux 6.1+ (io_uring buffer rings + DEFER_TASKRUN).
 
 ```
 zig build

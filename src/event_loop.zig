@@ -153,9 +153,27 @@ pub const EventLoop = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         var params = std.mem.zeroes(linux.io_uring_params);
-        params.flags = linux.IORING_SETUP_CQSIZE;
+        // COOP_TASKRUN: skip kernel→user IPI when the task is already running
+        //   (each worker owns its ring; CQEs are processed at next
+        //   submit_and_wait, no urgent preemption needed). Kernel 5.18+.
+        // SINGLE_ISSUER: only this thread submits SQEs to this ring; enables
+        //   the kernel's lock-free SQ optimizations. Kernel 6.0+.
+        // DEFER_TASKRUN: run task_work only at io_uring_enter (submit_and_wait
+        //   in our tick loop). Without this, every non-io_uring syscall
+        //   (sendto, fcntl, etc.) drains task_work and breaks completion
+        //   batching. Requires SINGLE_ISSUER. Kernel 6.1+.
+        params.flags = linux.IORING_SETUP_CQSIZE |
+            linux.IORING_SETUP_COOP_TASKRUN |
+            linux.IORING_SETUP_SINGLE_ISSUER |
+            linux.IORING_SETUP_DEFER_TASKRUN;
         params.cq_entries = max_operations * 4;
-        self.ring = try linux.IoUring.init_params(max_operations, &params);
+        self.ring = linux.IoUring.init_params(max_operations, &params) catch |err| {
+            std.log.scoped(.event_loop).err(
+                "failed to create io_uring ({s}); hark requires Linux 6.1+",
+                .{@errorName(err)},
+            );
+            return err;
+        };
         errdefer self.ring.deinit();
         std.debug.assert(params.features & linux.IORING_FEAT_NODROP != 0);
         self.free_count = max_operations;
@@ -165,7 +183,7 @@ pub const EventLoop = struct {
         }
         self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch |err| {
             std.log.scoped(.event_loop).err(
-                "failed to register io_uring buffer ring ({s}); hark requires Linux 5.19+",
+                "failed to register io_uring buffer ring ({s}); hark requires Linux 6.1+",
                 .{@errorName(err)},
             );
             return err;
