@@ -33,6 +33,11 @@ const transport_mod = @import("transport.zig");
 const Transports = transport_mod.Transports;
 const Certificate = std.crypto.Certificate;
 const na = @import("net_address.zig");
+const response = @import("response.zig");
+const ResponseContext = response.ResponseContext;
+const buildResponseWire = response.buildResponseWire;
+const serializeErrorResponse = response.serializeErrorResponse;
+const validateQuery = response.validateQuery;
 const sys = @import("sys.zig");
 const monotonic = @import("monotonic.zig");
 
@@ -137,7 +142,7 @@ const WorkQueue = struct {
 
 // ── Context tags for the event loop ────────────────────────────────────
 
-const CtxTag = enum { udp_recv, tcp_accept, signal };
+const CtxTag = enum { udp_recv, tcp_accept, signal, wake };
 
 const Ctx = struct {
     tag: CtxTag,
@@ -235,6 +240,14 @@ pub const Server = struct {
     udp_queue_drops: std.atomic.Value(u64),
     tcp_queue_drops: std.atomic.Value(u64),
     udp_send_drops: std.atomic.Value(u64),
+    /// eventfd in semaphore mode used to broadcast shutdown to every worker.
+    /// Only the main worker reads the signalfd; without this fanout the other
+    /// workers' io_uring_enter would block forever waiting for a CQE that
+    /// never arrives (no traffic = no wake).
+    wake_fd: posix.fd_t,
+    /// Number of workers that have finished binding their listen sockets.
+    /// Each worker drops privileges itself once this reaches `workers`.
+    bound_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
@@ -310,6 +323,7 @@ pub const Server = struct {
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
+            .wake_fd = try makeWakeEventFd(),
         };
     }
 
@@ -331,6 +345,15 @@ pub const Server = struct {
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
+        if (self.wake_fd >= 0) sys.close(self.wake_fd);
+    }
+
+    /// Flip the shared shutdown atomic and wake every worker out of its
+    /// io_uring tick or privilege barrier. Idempotent and safe from any
+    /// thread.
+    fn requestShutdown(self: *Server) void {
+        self.shutdown.store(true, .release);
+        broadcastWake(self.wake_fd, self.config.workers -| 1);
     }
 
     pub fn run(self: *Server) !void {
@@ -383,8 +406,7 @@ pub const Server = struct {
             for (threads, 0..) |*t, i| {
                 t.* = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), true }) catch |err| {
                     log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
-                    // Signal shutdown to already-spawned threads
-                    self.shutdown.store(true, .release);
+                    self.requestShutdown();
                     for (threads[0..i]) |prev| prev.join();
                     return err;
                 };
@@ -438,10 +460,17 @@ pub const Server = struct {
     }
 
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) void {
+        // Wake every peer out of the bound_count barrier and the io_uring
+        // tick if this worker dies before reaching serveLoop.
+        var failed = false;
+        defer if (failed) self.requestShutdown();
+
         // Per-thread EventLoop for server accept/recv
         const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
+            _ = self.bound_count.fetchAdd(1, .release);
+            failed = true;
             return;
         };
         defer server_loop.destroy();
@@ -479,7 +508,34 @@ pub const Server = struct {
         if (!any_ok) {
             log.err("worker failed to bind any listen address", .{});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
+            _ = self.bound_count.fetchAdd(1, .release);
+            failed = true;
             return;
+        }
+
+        _ = self.bound_count.fetchAdd(1, .release);
+
+        // setresuid is per-thread on Linux without libc's SIGSETXID broadcast,
+        // so every worker drops independently after the last peer binds.
+        if (self.config.drop_gid != null or self.config.drop_uid != null) {
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            while (self.bound_count.load(.acquire) < self.config.workers and
+                !self.shutdown.load(.acquire))
+            {
+                _ = std.os.linux.nanosleep(&ts, null);
+            }
+            if (self.shutdown.load(.acquire)) return;
+            dropPrivileges(self.config.drop_gid, self.config.drop_uid) catch |err| {
+                log.err("failed to drop privileges: {s}", .{@errorName(err)});
+                _ = self.worker_errors.fetchAdd(1, .monotonic);
+                self.requestShutdown();
+                return;
+            };
+            const is_main = sig_fd >= 0;
+            if (is_main) {
+                if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
+                if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
+            }
         }
 
         var queue = WorkQueue{ .io = self.io };
@@ -517,6 +573,7 @@ pub const Server = struct {
         const pool_threads = self.allocator.alloc(std.Thread, pool_size) catch |err| {
             log.err("failed to allocate pool threads: {s}", .{@errorName(err)});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
+            failed = true;
             return;
         };
         defer self.allocator.free(pool_threads);
@@ -533,6 +590,7 @@ pub const Server = struct {
         if (spawned == 0) {
             log.err("no pool threads spawned", .{});
             _ = self.worker_errors.fetchAdd(1, .monotonic);
+            failed = true;
             return;
         }
 
@@ -700,12 +758,22 @@ const WorkerState = struct {
         }
     }
 
+    fn logCacheStats(self: *const WorkerState) void {
+        const stats = self.cache.getStats();
+        const hit_total = stats.hits + stats.misses;
+        const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
+        log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions", .{
+            stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions,
+        });
+    }
+
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
         const n = udp_socks.len;
 
         var udp_ctxs: [max_listen_addrs]Ctx = undefined;
         var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
         var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
+        var wake_ctx = Ctx{ .tag = .wake, .fd = self.server.wake_fd };
 
         // Op IDs indexed by listen address; null means inactive
         var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
@@ -739,6 +807,19 @@ const WorkerState = struct {
         else
             null;
 
+        // Every worker reads the shared wake eventfd. The signal-receiving
+        // worker writes (workers - 1) so each peer's read consumes one byte
+        // and its tick() returns even with no traffic on its socket. If the
+        // read can't be registered, the worker would block in tick forever
+        // on shutdown — escalate to a process-wide shutdown so peers exit.
+        if (self.server.wake_fd >= 0) {
+            _ = self.loop.read(self.server.wake_fd, @ptrCast(&wake_ctx)) catch |err| {
+                log.err("failed to register wake_fd read: {s}", .{@errorName(err)});
+                self.server.requestShutdown();
+                return;
+            };
+        }
+
         var completions: [max_operations]Completion = undefined;
         var last_stats_ns: i128 = monotonic.nowNs();
         const stats_interval_ns: i128 = 60 * std.time.ns_per_s;
@@ -749,20 +830,28 @@ const WorkerState = struct {
             // Periodic cache stats logging
             const now_ns = monotonic.nowNs();
             if (now_ns - last_stats_ns >= stats_interval_ns) {
-                const stats = self.cache.getStats();
-                const hit_total = stats.hits + stats.misses;
-                const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-                log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions", .{
-                    stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions,
-                });
+                self.logCacheStats();
                 last_stats_ns = now_ns;
             }
 
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
-                    .signal => {
-                        log.info("shutting down", .{});
+                    .signal => switch (classifySignalRead(c.result)) {
+                        .stats => {
+                            self.logCacheStats();
+                            _ = self.loop.read(ctx.fd, @ptrCast(ctx)) catch |err|
+                                log.err("failed to re-arm signalfd: {s}", .{@errorName(err)});
+                            continue;
+                        },
+                        .shutdown => {
+                            log.info("shutting down", .{});
+                            self.server.requestShutdown();
+                            break;
+                        },
+                    },
+                    .wake => {
+                        // Counterpart wrote to wake_fd — shutdown is in flight.
                         self.shutdown.store(true, .release);
                         break;
                     },
@@ -903,6 +992,14 @@ const WorkerState = struct {
         _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
         sys.setNoDelay(client_fd);
 
+        // A TCP socket's remote address is fixed for its lifetime, so
+        // resolve once per connection rather than per query.
+        var peer_buf: [64]u8 = undefined;
+        const peer_str = if (na.getPeerName(client_fd)) |peer|
+            na.format(peer, &peer_buf)
+        else |_|
+            "?";
+
         var tcp_queries: u32 = 0;
         while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
             tcp_queries += 1;
@@ -944,7 +1041,7 @@ const WorkerState = struct {
             const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, transports) catch |err| {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
-                log.warn("{s} {s} SERVFAIL {d}ms (tcp, {s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
+                log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, 0, query.header.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
                 tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
@@ -953,7 +1050,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
             var rcode_buf: [24]u8 = undefined;
-            log.debug("{s} {s} {s} {d}ms (tcp)", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
+            log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
 
             const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, dns.max_message_len), result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
@@ -1109,20 +1206,27 @@ const WorkerState = struct {
         var name_buf: [dns.max_name_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
 
-        const max_payload: u16 = if (query_msg.opt) |opt| @max(opt.udp_payload_size, dns.max_udp_payload) else dns.max_udp_payload;
+        // Floor at the bare-EDNS-0 minimum, ceiling at the operator-configured
+        // server cap. Trusting an unbounded client claim is a reflection-amp
+        // surface — the kernel will fragment a 65 kB datagram, but we'd still
+        // amplify the wire serialization cost.
+        const client_payload = if (query_msg.opt) |opt| opt.udp_payload_size else dns.max_udp_payload;
+        const max_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
 
         const start_ns = monotonic.nowNs();
+        var peer_buf: [64]u8 = undefined;
+        const peer_str = na.format(client_addr, &peer_buf);
         const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, transports) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
-            log.warn("{s} {s} SERVFAIL {d}ms ({s})", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
+            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             self.sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
-        log.debug("{s} {s} {s} {d}ms", .{ name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
+        log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
 
         var wire_buf: [dns.max_message_len]u8 = undefined;
         if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
@@ -1215,185 +1319,6 @@ const WorkerState = struct {
     }
 };
 
-// ── Response building ──────────────────────────────────────────────────
-
-/// RFC 4035 §3.2.1: strip authenticating DNSSEC RRs (RRSIG, NSEC, NSEC3) when
-/// client didn't set the DO bit. Records whose type matches the QTYPE are kept
-/// in the answer section (explicit query for that type).
-fn stripDnssecRRs(alloc: mem.Allocator, records: []const dns.ResourceRecord, qtype: dns.RType, is_answer: bool) []const dns.ResourceRecord {
-    var count: usize = 0;
-    for (records) |rr| {
-        if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) {
-            continue;
-        }
-        count += 1;
-    }
-    if (count == records.len) return records;
-
-    const filtered = alloc.alloc(dns.ResourceRecord, count) catch return records;
-    var i: usize = 0;
-    for (records) |rr| {
-        if (isDnssecAuthRR(rr.rtype) and !(is_answer and rr.rtype == qtype)) {
-            continue;
-        }
-        filtered[i] = rr;
-        i += 1;
-    }
-    return filtered;
-}
-
-fn isDnssecAuthRR(rtype: dns.RType) bool {
-    return switch (rtype) {
-        .rrsig, .nsec, .nsec3 => true,
-        else => false,
-    };
-}
-
-const ResponseContext = struct {
-    query_id: u16,
-    rd: bool,
-    cd: bool,
-    questions: []const dns.Question,
-    client_edns: bool,
-    client_do: bool,
-    client_wants_ad: bool,
-    max_payload: u16,
-
-    fn fromQuery(query: dns.Message, max_payload: u16) ResponseContext {
-        const client_do = query.opt != null and query.opt.?.do_bit;
-        return .{
-            .query_id = query.header.id,
-            .rd = query.header.rd,
-            .cd = query.header.cd,
-            .questions = query.questions,
-            .client_edns = query.opt != null,
-            .client_do = client_do,
-            // RFC 6840 §5.8: set AD only if client signalled DO or AD
-            .client_wants_ad = client_do or query.header.ad,
-            .max_payload = max_payload,
-        };
-    }
-};
-
-fn buildResponseWire(
-    wire_buf: []u8,
-    ctx: ResponseContext,
-    response: dns.Message,
-    alloc: mem.Allocator,
-) ?[]const u8 {
-    const opt: ?dns.OptRecord = if (ctx.client_edns) .{
-        .udp_payload_size = dns.edns_udp_payload,
-        .extended_rcode = 0,
-        .version = 0,
-        .do_bit = ctx.client_do,
-        .options = &.{},
-    } else null;
-
-    const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
-
-    // RFC 4035 §3.2.1: strip authenticating DNSSEC RRs when client didn't set DO
-    const answers = if (!ctx.client_do) stripDnssecRRs(alloc, response.answers, qtype, true) else response.answers;
-    const authorities = if (!ctx.client_do) stripDnssecRRs(alloc, response.authorities, qtype, false) else response.authorities;
-    const additionals = if (!ctx.client_do) stripDnssecRRs(alloc, response.additionals, qtype, false) else response.additionals;
-
-    var msg = dns.Message{
-        .header = .{
-            .id = ctx.query_id,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = ctx.rd,
-            .ra = true,
-            .z = 0,
-            .ad = response.header.ad and ctx.client_wants_ad,
-            .cd = ctx.cd,
-            .rcode = response.header.rcode,
-            .qd_count = @intCast(ctx.questions.len),
-            .an_count = @intCast(answers.len),
-            .ns_count = @intCast(authorities.len),
-            .ar_count = @intCast(additionals.len),
-        },
-        .questions = ctx.questions,
-        .answers = answers,
-        .authorities = authorities,
-        .additionals = additionals,
-        .opt = opt,
-    };
-
-    // Try full response
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
-    } else |_| {}
-
-    // Drop additionals
-    msg.additionals = &.{};
-    msg.header.ar_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
-    } else |_| {}
-
-    // Drop authorities
-    msg.authorities = &.{};
-    msg.header.ns_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
-    } else |_| {}
-
-    // TC bit with answers
-    msg.header.tc = true;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
-    } else |_| {}
-
-    // TC with no answers
-    msg.answers = &.{};
-    msg.header.an_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        return wire[0..@min(wire.len, ctx.max_payload)];
-    } else |_| {}
-
-    return null;
-}
-
-fn serializeErrorResponse(
-    wire_buf: []u8,
-    query_id: u16,
-    rcode: dns.RCode,
-    extended_rcode: u8,
-    rd: bool,
-    questions: []const dns.Question,
-) ?[]const u8 {
-    const opt: ?dns.OptRecord = if (extended_rcode != 0) .{
-        .udp_payload_size = dns.edns_udp_payload,
-        .extended_rcode = extended_rcode,
-        .version = 0,
-        .do_bit = false,
-        .options = &.{},
-    } else null;
-    const msg = dns.Message{
-        .header = .{
-            .id = query_id,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = rd,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = rcode,
-            .qd_count = @intCast(questions.len),
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = questions,
-        .opt = opt,
-    };
-    return dns.serializeMessage(wire_buf, msg) catch null;
-}
 
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 
@@ -1414,25 +1339,6 @@ fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?voi
         const n = sys.write(fd, data[total..]) catch return null;
         total += n;
     }
-}
-
-const ValidationFailure = struct {
-    rcode: dns.RCode,
-    extended_rcode: u8 = 0,
-};
-
-fn validateQuery(query: dns.Message) ?ValidationFailure {
-    // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
-    // resolve it. Returning format_error keeps the TCP connection useful
-    // (UDP path drops silently before parse).
-    if (query.header.qr) return .{ .rcode = .format_error };
-    if (query.header.opcode != .query) return .{ .rcode = .not_implemented };
-    if (query.questions.len != 1) return .{ .rcode = .format_error };
-    if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
-    // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
-    // version. Header RCODE bits = 0; OPT extended_rcode field = 1.
-    if (query.opt) |opt| if (opt.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
-    return null;
 }
 
 fn tcpWriteMessage(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
@@ -1494,6 +1400,8 @@ fn setupSignalFd() !posix.fd_t {
     var mask = linux.sigemptyset();
     linux.sigaddset(&mask, linux.SIG.INT);
     linux.sigaddset(&mask, linux.SIG.TERM);
+    linux.sigaddset(&mask, linux.SIG.HUP);
+    linux.sigaddset(&mask, linux.SIG.USR1);
 
     // Block signals so they arrive via signalfd
     // SIG_BLOCK = 0 on Linux x86_64
@@ -1501,6 +1409,65 @@ fn setupSignalFd() !posix.fd_t {
 
     const SFD_NONBLOCK: u32 = 0o4000;
     return posix.signalfd(-1, &mask, SFD_NONBLOCK);
+}
+
+const SignalAction = enum { stats, shutdown };
+
+/// Walk every signalfd_siginfo record in the buffer (the kernel can pack
+/// many into one read). Shutdown signals win over stats.
+fn classifySignalRead(result: anytype) SignalAction {
+    const siginfo_size = @sizeOf(linux.signalfd_siginfo);
+    const r = switch (result) {
+        .read => |x| x,
+        else => return .shutdown,
+    };
+    if (r.err != null) return .shutdown;
+
+    var saw_stats = false;
+    var off: usize = 0;
+    while (off + 4 <= r.data.len) : (off += siginfo_size) {
+        const signo = std.mem.readInt(u32, r.data[off..][0..4], .little);
+        if (signo == @intFromEnum(linux.SIG.TERM) or signo == @intFromEnum(linux.SIG.INT)) {
+            return .shutdown;
+        }
+        if (signo == @intFromEnum(linux.SIG.USR1) or signo == @intFromEnum(linux.SIG.HUP)) {
+            saw_stats = true;
+        }
+    }
+    return if (saw_stats) .stats else .shutdown;
+}
+
+const EFD_SEMAPHORE: u32 = 1;
+const EFD_NONBLOCK: u32 = 0o4000;
+
+fn makeWakeEventFd() !posix.fd_t {
+    const rc = linux.eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
+    const sr = @as(isize, @bitCast(rc));
+    if (sr < 0) return error.EventFdFailed;
+    return @intCast(sr);
+}
+
+fn broadcastWake(fd: posix.fd_t, count: u64) void {
+    if (fd < 0 or count == 0) return;
+    var v: u64 = count;
+    const bytes = std.mem.asBytes(&v);
+    _ = sys.write(fd, bytes) catch {};
+}
+
+/// Drop credentials for the calling thread only (raw syscall). Every worker
+/// thread must call this independently — without libc we have no SIGSETXID
+/// broadcast to propagate the change across threads.
+fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
+    // Drop group first so setgid still has CAP_SETGID. Once setuid runs,
+    // the thread loses CAP_SETGID along with the rest of root's caps.
+    if (gid) |g| {
+        const rc = std.os.linux.setresgid(g, g, g);
+        if (rc != 0) return error.SetGidFailed;
+    }
+    if (uid) |u| {
+        const rc = std.os.linux.setresuid(u, u, u);
+        if (rc != 0) return error.SetUidFailed;
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1522,6 +1489,26 @@ test "server init and deinit" {
     try testing.expectEqual(false, server.shutdown.load(.acquire));
 }
 
+test "broadcastWake delivers one byte per peer in semaphore mode" {
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const fd = try makeWakeEventFd();
+    defer sys.close(fd);
+
+    broadcastWake(fd, 3);
+
+    // Three peers each consume one byte.
+    var buf: [8]u8 = undefined;
+    var n: usize = 0;
+    while (n < 3) : (n += 1) {
+        const r = sys.read(fd, &buf) catch break;
+        try testing.expectEqual(@as(usize, 8), r);
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // Fourth read returns EAGAIN (queue drained).
+    try testing.expectError(error.WouldBlock, sys.read(fd, &buf));
+}
+
 test "server init thread-safe cache when workers > 1" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const config = @import("config.zig");
@@ -1537,184 +1524,6 @@ test "server init thread-safe cache when workers > 1" {
     try testing.expect(server.cache.rwlock != null);
 }
 
-test "buildResponseWire sets correct header fields" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-
-    const alloc = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const questions = try a.alloc(dns.Question, 1);
-    const name = try dns.parseDottedName(a, "example.com");
-    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
-
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .server_failure,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-    };
-
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 0x1234,
-        .rd = true,
-        .cd = false,
-        .questions = questions,
-        .client_edns = false,
-        .client_do = false,
-        .client_wants_ad = false,
-        .max_payload = dns.max_udp_payload,
-    }, response, a).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(true, parsed.header.qr);
-    try testing.expectEqual(true, parsed.header.rd);
-    try testing.expectEqual(true, parsed.header.ra);
-    try testing.expectEqual(dns.RCode.server_failure, parsed.header.rcode);
-    try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
-}
-
-test "buildResponseWire with EDNS0" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-
-    const alloc = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const questions = try a.alloc(dns.Question, 1);
-    const name = try dns.parseDottedName(a, "example.com");
-    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
-
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-    };
-
-    var buf: [dns.edns_udp_payload]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 0x5678,
-        .rd = true,
-        .cd = false,
-        .questions = questions,
-        .client_edns = true,
-        .client_do = false,
-        .client_wants_ad = false,
-        .max_payload = dns.edns_udp_payload,
-    }, response, a).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expect(parsed.opt != null);
-    try testing.expectEqual(@as(u16, dns.edns_udp_payload), parsed.opt.?.udp_payload_size);
-}
-
-test "serializeErrorResponse produces valid DNS message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const name = try dns.parseDottedName(a, "example.com");
-    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
-
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, 0, true, questions).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
-    try testing.expectEqual(dns.RCode.refused, parsed.header.rcode);
-    try testing.expectEqual(true, parsed.header.rd);
-    try testing.expectEqual(true, parsed.header.ra);
-    try testing.expectEqual(true, parsed.header.qr);
-    try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
-}
-
-test "serializeErrorResponse with no question (parse failure)" {
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .format_error, 0, false, &.{}).?;
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const parsed = try dns.parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(dns.RCode.format_error, parsed.header.rcode);
-    try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
-}
-
-test "validateQuery rejects QR=1 (response posing as query)" {
-    // RFC 1035 §4.1.1: resolving a QR=1 packet would make hark a reflection vector.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
-    spoofed.header.qr = true;
-
-    try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
-}
-
-test "validateQuery returns BADVERS for unsupported EDNS version" {
-    // RFC 6891 §6.1.3: header RCODE = 0, OPT extended_rcode = 1.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
-    query.opt = .{
-        .udp_payload_size = 4096,
-        .extended_rcode = 0,
-        .version = 1, // unsupported
-        .do_bit = false,
-        .options = &.{},
-    };
-
-    const fail = validateQuery(query).?;
-    try testing.expectEqual(dns.RCode.no_error, fail.rcode);
-    try testing.expectEqual(@as(u8, 1), fail.extended_rcode);
-}
-
-test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .no_error, 1, false, &.{}).?;
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const parsed = try dns.parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(dns.RCode.no_error, parsed.header.rcode);
-    try testing.expect(parsed.opt != null);
-    try testing.expectEqual(@as(u8, 1), parsed.opt.?.extended_rcode);
-}
 
 test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

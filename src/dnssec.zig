@@ -850,6 +850,15 @@ pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     return result;
 }
 
+/// Decode a record's owner name as a SHA-1 NSEC3 hash. Skips records that
+/// aren't NSEC3 or use an unsupported hash algorithm — defence-in-depth so
+/// an unknown-algo NSEC3 can't contribute to a SHA-1 negative proof.
+fn supportedNsec3OwnerHash(rr: dns.ResourceRecord) ?[Sha1.digest_length]u8 {
+    if (rr.rtype != .nsec3) return null;
+    if (rr.rdata.nsec3.hash_algorithm != .sha1) return null;
+    return nsec3OwnerHash(rr.name);
+}
+
 pub const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
 
 /// Compute NSEC3 hash with per-resolution budget tracking. Callers map
@@ -972,28 +981,38 @@ fn validateNsec3NegativeProof(
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
     var found_nsec3 = false;
+    var saw_unknown_algo = false;
     for (authorities) |rr| {
-        if (rr.rtype == .nsec3) {
-            const nsec3 = rr.rdata.nsec3;
-            if (nsec3.hash_algorithm != .sha1) return .bogus;
-            // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Mirrors
-            // classifyDelegation — both paths share one policy.
-            if (nsec3.iterations > max_nsec3_iterations) return .insecure;
-            salt = nsec3.salt;
-            iterations = nsec3.iterations;
-            found_nsec3 = true;
-            break;
+        if (rr.rtype != .nsec3) continue;
+        const nsec3 = rr.rdata.nsec3;
+        // RFC 5155 §10.2 / RFC 6840 §5.11: skip NSEC3 records using unknown
+        // hash algorithms; do not treat as bogus.
+        if (nsec3.hash_algorithm != .sha1) {
+            saw_unknown_algo = true;
+            continue;
         }
+        // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Mirrors
+        // classifyDelegation — both paths share one policy.
+        if (nsec3.iterations > max_nsec3_iterations) return .insecure;
+        salt = nsec3.salt;
+        iterations = nsec3.iterations;
+        found_nsec3 = true;
+        break;
     }
-    if (!found_nsec3) return .unchecked;
+    if (!found_nsec3) {
+        // Only unknown-algorithm NSEC3 records present — validator can't
+        // verify; treat as insecure so a future SHA-256/SHA-3 transition
+        // doesn't SERVFAIL.
+        if (saw_unknown_algo) return .insecure;
+        return .unchecked;
+    }
 
     if (!is_nxdomain) {
         // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
         const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch |e|
             return budgetedHashStatus(e);
         for (authorities) |rr| {
-            if (rr.rtype != .nsec3) continue;
-            const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
                 const nsec3 = rr.rdata.nsec3;
                 // Must not have qtype AND must not have CNAME (RFC 5155 §8.5)
@@ -1019,8 +1038,7 @@ fn validateNsec3NegativeProof(
             return budgetedHashStatus(e);
 
         for (authorities) |rr| {
-            if (rr.rtype != .nsec3) continue;
-            const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &ancestor_hash)) {
                 ce_idx = label_offset;
                 break;
@@ -1049,8 +1067,7 @@ fn validateNsec3NegativeProof(
     var nc_covered = false;
     var wc_covered = false;
     for (authorities) |rr| {
-        if (rr.rtype != .nsec3) continue;
-        const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+        const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
         const nsec3 = rr.rdata.nsec3;
 
         if (!nc_covered and nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) {
@@ -2135,6 +2152,36 @@ test "nsec3OwnerHash extraction" {
     // Empty name
     const empty_name = dns.Name{ .labels = &.{} };
     try testing.expect(nsec3OwnerHash(empty_name) == null);
+}
+
+test "NSEC3 unknown hash algorithm yields .insecure (RFC 6840 §5.11)" {
+    // Single NSEC3 record using a hash algorithm we don't support.
+    // validateNegativeProof must not return .bogus — that would SERVFAIL
+    // legitimate zones during a future SHA3 transition.
+    const qname = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+    const owner_name = dns.Name{
+        .labels = &.{ @as([]const u8, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), @as([]const u8, "com") },
+    };
+    const next: [20]u8 = .{0xFF} ** 20;
+    const authorities = [_]dns.ResourceRecord{.{
+        .name = owner_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = @enumFromInt(2), // not sha1
+            .flags = 0,
+            .iterations = 0,
+            .salt = &.{},
+            .next_hashed_owner = &next,
+            .type_bit_maps = &.{},
+        } },
+    }};
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
 }
 
 test "NSEC3 NODATA - secure" {

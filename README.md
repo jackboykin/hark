@@ -82,7 +82,7 @@ min-ttl = 300                # floor for aggressive CDN TTLs
 queries = true
 ```
 
-All fields are optional — defaults are localhost:53, recursive mode, DNSSEC off, workers = CPU count, 4 resolution threads per worker.
+All fields are optional. Defaults: localhost:53, recursive mode, workers = CPU count, 4 resolution threads per worker. Several features that the example above turns on are **off by default**: `dnssec`, `opportunistic`, `prefetch`, `serve-stale-ttl=0`, `min-ttl=0`. Copy the snippet above to opt in.
 
 ## Design
 

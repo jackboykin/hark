@@ -28,6 +28,12 @@ pub const ServerConfig = struct {
     resolution_threads: u16,
     stagger_ms: u32,
     log_queries: bool,
+    max_udp_payload: u16,
+    /// uid to drop to after binding privileged ports. Numeric only — looking
+    /// up names would need NSS / /etc/passwd parsing; deploy via systemd
+    /// User=hark or pass the resolved uid.
+    drop_uid: ?u32,
+    drop_gid: ?u32,
 
     allocator: Allocator,
 
@@ -47,6 +53,7 @@ pub const ConfigError = error{
     InvalidWorkerCount,
     InvalidQueryMemoryLimit,
     ForwardingRequiresUpstreams,
+    ConfigFileTooLarge,
     OutOfMemory,
 };
 
@@ -80,6 +87,9 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .resolution_threads = 4,
         .stagger_ms = 150,
         .log_queries = false,
+        .max_udp_payload = @import("dns.zig").edns_udp_payload,
+        .drop_uid = null,
+        .drop_gid = null,
         .allocator = allocator,
     };
 }
@@ -113,6 +123,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             if (rt < 1 or rt > 256) return error.InvalidWorkerCount;
             cfg.resolution_threads = @intCast(rt);
         }
+        if (server.getInteger("max-udp-payload")) |m| {
+            const dns_mod = @import("dns.zig");
+            if (m < dns_mod.max_udp_payload or m > dns_mod.max_message_len) return error.InvalidValue;
+            cfg.max_udp_payload = @intCast(m);
+        }
+        if (try nonNegativeClamped(u32, server, "user")) |u| cfg.drop_uid = u;
+        if (try nonNegativeClamped(u32, server, "group")) |g| cfg.drop_gid = g;
     }
 
     // [resolver] section
@@ -184,7 +201,7 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
         const n = try sys.read(fd, &read_buf);
         if (n == 0) break;
         contents.appendSlice(allocator, read_buf[0..n]) catch return error.OutOfMemory;
-        if (contents.items.len > 1024 * 1024) return error.OutOfMemory;
+        if (contents.items.len > 1024 * 1024) return error.ConfigFileTooLarge;
     }
 
     return parseConfig(allocator, contents.items);

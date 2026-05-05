@@ -1,4 +1,5 @@
 pub const dns = @import("dns.zig");
+pub const dns_print = @import("dns_print.zig");
 pub const event_loop = @import("event_loop.zig");
 pub const resolver = @import("resolver.zig");
 pub const recursive = @import("recursive.zig");
@@ -24,6 +25,8 @@ pub const net_address = @import("net_address.zig");
 
 test {
     _ = dns;
+    _ = dns_print;
+    _ = @import("response.zig");
     _ = event_loop;
     _ = resolver;
     _ = recursive;

@@ -18,6 +18,38 @@ pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope } } };
 }
 
+/// Hashable, equality-comparable address-with-port. Used as a key in caches
+/// (RTT, NS-selector, encrypted_ns, connection pools).
+pub const AddressKey = struct {
+    family: u8,
+    addr: [16]u8,
+    port: u16,
+
+    /// Create a key from an address, overriding the port.
+    pub fn fromAddressWithPort(address: Address, port: u16) AddressKey {
+        var key = fromAddress(address);
+        key.port = port;
+        return key;
+    }
+
+    pub fn fromAddress(address: Address) AddressKey {
+        var key = AddressKey{ .family = 0, .addr = .{0} ** 16, .port = 0 };
+        switch (address) {
+            .ip4 => |v4| {
+                key.family = @intCast(posix.AF.INET);
+                @memcpy(key.addr[0..4], &v4.bytes);
+                key.port = v4.port;
+            },
+            .ip6 => |v6| {
+                key.family = @intCast(posix.AF.INET6);
+                @memcpy(&key.addr, &v6.bytes);
+                key.port = v6.port;
+            },
+        }
+        return key;
+    }
+};
+
 /// PosixAddress union for sockaddr conversion (matches Io.Threaded.PosixAddress).
 pub const PosixAddress = extern union {
     any: posix.sockaddr,
@@ -77,6 +109,14 @@ pub fn getSockName(fd: posix.fd_t) !Address {
     var pa: PosixAddress = undefined;
     var len: posix.socklen_t = @sizeOf(PosixAddress);
     try sys.getsockname(fd, @ptrCast(&pa), &len);
+    return fromSockaddr(&pa);
+}
+
+/// Get the remote peer address of a connected socket.
+pub fn getPeerName(fd: posix.fd_t) !Address {
+    var pa: PosixAddress = undefined;
+    var len: posix.socklen_t = @sizeOf(PosixAddress);
+    try sys.getpeername(fd, @ptrCast(&pa), &len);
     return fromSockaddr(&pa);
 }
 

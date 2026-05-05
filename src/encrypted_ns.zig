@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const na = @import("net_address.zig");
 const posix = std.posix;
-const AddressKey = @import("connection_pool.zig").AddressKey;
+const AddressKey = na.AddressKey;
 
 /// How long a failed probe is damped before re-probing (1 hour).
 const damping_sec: i64 = 3600;

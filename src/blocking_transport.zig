@@ -5,10 +5,10 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
-const AddressKey = @import("connection_pool.zig").AddressKey;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const TcpPooledConnection = @import("connection_pool.zig").TcpPooledConnection;
 const na = @import("net_address.zig");
+const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 
 pub const Config = struct {
@@ -316,43 +316,49 @@ pub const BlockingTcpTransport = struct {
         return .{ .config = config };
     }
 
-    pub fn query(self: *BlockingTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
-        const sock = try self.connectTcp(server);
-        defer sys.close(sock);
+    /// Send a DNS query over TCP. With pool != null, tries an idle pooled
+    /// connection first and stores a fresh one on success. Mirrors
+    /// TlsTransport.query's optional-pool shape.
+    pub fn query(
+        self: *BlockingTcpTransport,
+        wire_query: []const u8,
+        server: na.Address,
+        response_buf: []u8,
+        pool: ?*TcpConnectionPool,
+    ) ![]const u8 {
         const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
-        return sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns);
-    }
 
-    /// Query with TCP connection pooling. Tries a pooled connection first,
-    /// falls back to a fresh connection, and stores it for reuse on success.
-    pub fn queryPooled(self: *BlockingTcpTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, pool: *TcpConnectionPool) ![]const u8 {
-        const key = AddressKey.fromAddress(server);
-        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
-
-        // Try pooled connection
-        if (pool.acquire(key)) |conn| {
-            if (sendAndReceiveTcp(conn.sock, wire_query, response_buf, deadline_ns)) |data| {
-                pool.release(key, conn, true);
-                return data;
-            } else |_| {
-                pool.release(key, conn, false);
+        if (pool) |p| {
+            const key = AddressKey.fromAddress(server);
+            if (p.acquire(key)) |conn| {
+                if (sendAndReceiveTcp(conn.sock, wire_query, response_buf, deadline_ns)) |data| {
+                    p.release(key, conn, true);
+                    return data;
+                } else |_| {
+                    p.release(key, conn, false);
+                }
             }
         }
 
-        // Fresh connection
         const sock = try self.connectTcp(server);
         const data = sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns) catch |err| {
             sys.close(sock);
             return err;
         };
 
-        // Store in pool for reuse
-        const new_conn = pool.allocator.create(TcpPooledConnection) catch {
-            sys.close(sock);
+        if (pool) |p| {
+            const key = AddressKey.fromAddress(server);
+            const new_conn = p.allocator.create(TcpPooledConnection) catch {
+                // Pool out of memory — close the socket since no one will own it.
+                sys.close(sock);
+                return data;
+            };
+            new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
+            p.store(key, new_conn);
             return data;
-        };
-        new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
-        pool.store(key, new_conn);
+        }
+
+        sys.close(sock);
         return data;
     }
 

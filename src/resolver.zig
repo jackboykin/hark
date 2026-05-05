@@ -46,7 +46,7 @@ pub const ForwardingResolver = struct {
         if (dns.hasTcBit(response_data)) {
             if (blocking.tcp) |tcp| {
                 const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-                if (tcp.query(wire_query, upstream, tcp_buf)) |tcp_data| {
+                if (tcp.query(wire_query, upstream, tcp_buf, null)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
                     try dns.validateResponse(msg, expected_name, qtype);
                     return msg;

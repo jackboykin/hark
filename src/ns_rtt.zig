@@ -2,8 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
-const AddressKey = @import("connection_pool.zig").AddressKey;
 const na = @import("net_address.zig");
+const AddressKey = na.AddressKey;
 
 // ── Constants (Unbound/Knot consensus) ───────────────────────────────
 

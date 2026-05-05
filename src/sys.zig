@@ -123,6 +123,17 @@ pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t)
     };
 }
 
+pub fn getpeername(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
+    return switch (linux.errno(linux.getpeername(fd, addr, len))) {
+        .SUCCESS => {},
+        .BADF, .NOTSOCK => unreachable,
+        .FAULT => unreachable,
+        .NOTCONN => error.NotConnected,
+        .INVAL => error.AddressNotAvailable,
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     while (true) {
         const rc = linux.write(fd, buf.ptr, buf.len);

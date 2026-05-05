@@ -3,11 +3,11 @@ const mem = std.mem;
 const math = std.math;
 const testing = std.testing;
 const Allocator = mem.Allocator;
-const AddressKey = @import("connection_pool.zig").AddressKey;
+const na = @import("net_address.zig");
+const AddressKey = na.AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const dns = @import("dns.zig");
 const rand = @import("rand.zig");
-const na = @import("net_address.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 

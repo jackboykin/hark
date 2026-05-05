@@ -9,37 +9,7 @@ const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 const tls = @import("tls");
 
-// ── AddressKey ───────────────────────────────────────────────────────
-
-pub const AddressKey = struct {
-    family: u8,
-    addr: [16]u8,
-    port: u16,
-
-    /// Create a key from an address, overriding the port.
-    pub fn fromAddressWithPort(address: na.Address, port: u16) AddressKey {
-        var key = fromAddress(address);
-        key.port = port;
-        return key;
-    }
-
-    pub fn fromAddress(address: na.Address) AddressKey {
-        var key = AddressKey{ .family = 0, .addr = .{0} ** 16, .port = 0 };
-        switch (address) {
-            .ip4 => |v4| {
-                key.family = @intCast(posix.AF.INET);
-                @memcpy(key.addr[0..4], &v4.bytes);
-                key.port = v4.port;
-            },
-            .ip6 => |v6| {
-                key.family = @intCast(posix.AF.INET6);
-                @memcpy(&key.addr, &v6.bytes);
-                key.port = v6.port;
-            },
-        }
-        return key;
-    }
-};
+const AddressKey = na.AddressKey;
 
 // ── TcpPooledConnection ─────────────────────────────────────────────
 

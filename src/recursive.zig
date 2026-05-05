@@ -11,7 +11,7 @@ const Transport = transport_mod.Transport;
 const Transports = transport_mod.Transports;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
-const AddressKey = @import("connection_pool.zig").AddressKey;
+const AddressKey = @import("net_address.zig").AddressKey;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const rand = @import("rand.zig");
@@ -112,8 +112,7 @@ pub const RecursiveResolver = struct {
     resolving_ds: bool = false,
 
     /// DNSKEY zone needing proactive refresh — stored in fixed buffer (not arena)
-    /// to survive past the per-query arena lifetime. Set by fetchDnskey, propagated
-    /// to ResolveResult for async refresh by the server layer.
+    /// to survive past the per-query arena lifetime.
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
@@ -122,8 +121,7 @@ pub const RecursiveResolver = struct {
     validation_budget: dnssec.ValidationBudget = .{},
 
     /// Create a thread-local resolver clone with fresh transports. Shared
-    /// caches and config are inherited; transport and per-query mutable
-    /// state are reset so the clone is safe for independent resolution.
+    /// caches and config are inherited; per-query mutable state is reset.
     fn cloneForThread(self: *RecursiveResolver, transports: Transports) RecursiveResolver {
         var resolver = self.*;
         resolver.transports = transports;
@@ -423,27 +421,27 @@ pub const RecursiveResolver = struct {
 
                 // ── Final query response handling ──
 
-                // DNSSEC: when the server is authoritative for both parent
-                // and a child zone (possibly several labels deeper), it
-                // answers directly without a referral, so classifyDelegation
-                // never ran. Probe DS at one label below parent_zone — the
-                // shallowest name whose negative-DS proof signs against
-                // parent_zone's already-trusted DNSKEY. If the real cut is
-                // deeper, it lives inside the .insecure island this probe
-                // establishes, so deeper queries inherit the correct status
-                // (RFC 4035 §5.2).
+                // DNSSEC: a server authoritative for both parent and child
+                // can answer directly without a referral, so
+                // classifyDelegation never ran. Probe DS at every depth
+                // from parent+1 to the leaf — one of those names is the
+                // real cut.
                 if (self.dnssec_enabled and security_state == .secure and
                     target_name.labels.len > parent_zone.labels.len and
                     response.header.aa and !hasSignedRecords(response))
                 {
-                    const cut_labels = target_name.labels[target_name.labels.len - parent_zone.labels.len - 1 ..];
-                    const candidate_cut = dns.Name{ .labels = cut_labels };
-                    var cut_buf: [dns.max_name_len + 1]u8 = undefined;
-                    const cut_name = candidate_cut.formatInto(&cut_buf);
-                    if (self.reproveDelegationSecurity(allocator, cut_name, servers[0..server_count]) == null and
-                        hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
-                    {
-                        security_state = .insecure;
+                    var probe_depth: usize = parent_zone.labels.len + 1;
+                    while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
+                        const cut_labels = target_name.labels[target_name.labels.len - probe_depth ..];
+                        const candidate_cut = dns.Name{ .labels = cut_labels };
+                        var cut_buf: [dns.max_name_len + 1]u8 = undefined;
+                        const cut_name = candidate_cut.formatInto(&cut_buf);
+                        if (self.reproveDelegationSecurity(allocator, cut_name, servers[0..server_count]) == null and
+                            hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
+                        {
+                            security_state = .insecure;
+                            break;
+                        }
                     }
                 }
 
@@ -477,21 +475,22 @@ pub const RecursiveResolver = struct {
                         }
 
                         if (!has_target_type) {
-                            // Validate CNAME RRset before following in secure zones
+                            // Validate CNAME RRset before following in secure zones.
+                            // RFC 4035 §3.1: every authoritative RRset in a secure zone
+                            // must carry an RRSIG. validateAnswer returns .bogus when no
+                            // RRSIG is present, which closes the strip-RRSIG downgrade.
                             var cname_status: cache_mod.SecurityStatus = .unchecked;
                             if (self.dnssec_enabled and security_state == .secure) {
-                                if (dnssec.findRrsig(response.answers, .cname) != null) {
-                                    switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
-                                        .bogus => {
-                                            if (self.ns_selector) |ns| if (responding_server) |srv|
-                                                ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
-                                            return self.bogusServfail(current_name, qtype);
-                                        },
-                                        .valid => {
-                                            cname_status = .secure;
-                                        },
-                                        .skip => {},
-                                    }
+                                switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
+                                    .bogus => {
+                                        if (self.ns_selector) |ns| if (responding_server) |srv|
+                                            ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                                        return self.bogusServfail(current_name, qtype);
+                                    },
+                                    .valid => {
+                                        cname_status = .secure;
+                                    },
+                                    .skip => {},
                                 }
                             }
                             if (findCnameRecord(response, target_name)) |cname_rr| {
@@ -839,10 +838,7 @@ pub const RecursiveResolver = struct {
     ) error{OutOfMemory}!?dns.Message {
         const tcp_t = self.tcp() orelse return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = (if (self.tcp_pool) |p|
-            tcp_t.queryPooled(wire_query, server, tcp_buf, p)
-        else
-            tcp_t.query(wire_query, server, tcp_buf)) catch |err| {
+        const tcp_data = tcp_t.query(wire_query, server, tcp_buf, self.tcp_pool) catch |err| {
             var addr_buf: [64]u8 = undefined;
             log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
@@ -1238,7 +1234,10 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null;
                     },
-                    .negative => {}, // Insecure delegation — no DS validation needed
+                    // Proven-insecure delegation: no signed DNSKEYs to anchor.
+                    // Returning the unvalidated answers would let the caller
+                    // verify forged RRSIGs against forged DNSKEYs and stamp AD.
+                    .negative => return null,
                 }
             } else if (zone_name.len > 0) {
                 // DS not in cache. Re-fetch from parent and validate against the
@@ -1251,7 +1250,8 @@ pub const RecursiveResolver = struct {
                     validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, &self.validation_budget) catch return null;
                 } else if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                     switch (result) {
-                        .negative => {}, // insecure delegation proven during fetch
+                        // Insecure delegation proven during fetch — see above.
+                        .negative => return null,
                         .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null,
                     }
                 } else return null;

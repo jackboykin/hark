@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hark = @import("hark");
 const dns = hark.dns;
+const dns_print = hark.dns_print;
 const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
 const BlockingTcpTransport = hark.blocking_transport.BlockingTcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
@@ -83,7 +84,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const command = args[1];
-    if (std.mem.eql(u8, command, "dump")) {
+    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        printUsage();
+        return;
+    } else if (std.mem.eql(u8, command, "dump")) {
         return runDump(allocator, io);
     } else if (std.mem.eql(u8, command, "query")) {
         return runQuery(allocator, args[2..], io);
@@ -119,7 +123,7 @@ fn printUsage() void {
         \\  --verbose, -v       Enable debug logging
         \\
         \\Serve options:
-        \\  --config <path>     Path to config file (default: ./hark.toml)
+        \\  --config <path>     Path to config file (default: /etc/hark/hark.toml)
         \\  --verbose, -v       Enable debug logging (per-query log lines)
         \\
         \\Defaults: type=A, mode=recursive, QNAME minimization enabled, DNSSEC off
@@ -153,7 +157,7 @@ fn runDump(gpa_alloc: std.mem.Allocator, io: Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    dns.printMessage(msg, stdout) catch |err| {
+    dns_print.printMessage(msg, stdout) catch |err| {
         log.err("failed to print message: {}", .{err});
         std.process.exit(1);
     };
@@ -217,6 +221,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
                 log.err("invalid address: {s}", .{args[i]});
                 std.process.exit(1);
             };
+            forward_mode = true; // --upstream is meaningless in recursive mode
         } else {
             qtype = parseRType(args[i]) orelse {
                 log.err("unknown record type: {s}", .{args[i]});
@@ -315,7 +320,7 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    dns.printMessage(response, stdout) catch |err| {
+    dns_print.printMessage(response, stdout) catch |err| {
         log.err("failed to print response: {}", .{err});
         std.process.exit(1);
     };
@@ -353,7 +358,7 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     }
 
-    // Load config: explicit path → ./hark.toml → /etc/hark/hark.toml → defaults.
+    // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
     // Only fall through on FileNotFound; surface any other error (parse, I/O).
     var cfg = if (config_path) |path|
         hark.config.parseConfigFile(gpa_alloc, path) catch |err| {
@@ -383,16 +388,18 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 }
 
 fn loadDefaultConfig(gpa_alloc: std.mem.Allocator) !hark.config.ServerConfig {
-    for ([_][]const u8{ "hark.toml", "/etc/hark/hark.toml" }) |path| {
-        if (hark.config.parseConfigFile(gpa_alloc, path)) |cfg| {
-            return cfg;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => {
-                log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
-                return err;
-            },
-        }
+    // No CWD-relative search: under systemd or any non-interactive runner the
+    // working directory is unrelated to where the operator put the config.
+    // Pass --config <path> for non-default locations.
+    const default_path = "/etc/hark/hark.toml";
+    if (hark.config.parseConfigFile(gpa_alloc, default_path)) |cfg| {
+        return cfg;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            log.err("loading config '{s}': {s}", .{ default_path, @errorName(err) });
+            return err;
+        },
     }
     return hark.config.parseConfig(gpa_alloc, "") catch |err| {
         log.err("creating default config: {s}", .{@errorName(err)});
