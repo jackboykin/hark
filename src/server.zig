@@ -1469,7 +1469,25 @@ fn wakeWorker(fd: posix.fd_t) void {
 /// Drop credentials for the calling thread only (raw syscall). Every worker
 /// thread must call this independently — without libc we have no SIGSETXID
 /// broadcast to propagate the change across threads.
+///
+/// Scope: clears supplementary groups, sets r/e/s gid and r/e/s uid. On
+/// euid 0 → non-zero the kernel auto-drops the permitted cap set. NOT
+/// covered: ambient capabilities, the bounding set, and io_uring kernel
+/// io-wq workers (forked at ring creation, before this drop). Operators
+/// wanting full credential hygiene should prefer systemd User= /
+/// CapabilityBoundingSet= over this in-process drop.
 fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
+    // Clear supplementary groups while we still have CAP_SETGID. Without
+    // this, a process launched as root inherits root's groups (wheel, adm,
+    // disk, …) and keeps them after the uid drop. Skip when not root:
+    // setgroups would EPERM and there's nothing to clear anyway.
+    if (std.os.linux.geteuid() == 0) {
+        const rc = if (@hasField(std.os.linux.SYS, "setgroups32"))
+            std.os.linux.syscall2(.setgroups32, 0, 0)
+        else
+            std.os.linux.syscall2(.setgroups, 0, 0);
+        if (@as(isize, @bitCast(rc)) != 0) return error.SetGroupsFailed;
+    }
     // Drop group first so setgid still has CAP_SETGID. Once setuid runs,
     // the thread loses CAP_SETGID along with the rest of root's caps.
     if (gid) |g| {
