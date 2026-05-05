@@ -21,7 +21,7 @@ Runs on Linux with io_uring.
 
 ## Building
 
-Requires Zig 0.16 and a Linux kernel with io_uring support.
+Requires Zig 0.16 and Linux 5.19+ (io_uring buffer rings).
 
 ```
 zig build

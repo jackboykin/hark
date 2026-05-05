@@ -781,18 +781,13 @@ const WorkerState = struct {
         var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
         var tcp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
 
-        // Prefer multishot recvmsg — one SQE per socket stays armed and
-        // produces CQEs for every inbound packet. Fall back to one-shot
-        // if the kernel / buffer-ring setup rejected it.
-        const use_multishot_udp = self.loop.supportsMultishotRecv();
+        // Multishot recvmsg — one SQE per socket stays armed and produces
+        // CQEs for every inbound packet until the kernel terminates it.
         for (udp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
-            udp_ops[i] = (if (use_multishot_udp)
-                self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i]))
-            else
-                self.loop.recvFrom(fd, @ptrCast(&udp_ctxs[i]))) catch |err| blk: {
-                log.err("failed to register UDP recvFrom: {s}", .{@errorName(err)});
+            udp_ops[i] = self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i])) catch |err| blk: {
+                log.err("failed to register UDP recvmsg: {s}", .{@errorName(err)});
                 break :blk null;
             };
         }
@@ -872,11 +867,8 @@ const WorkerState = struct {
                         // Multishot stays armed across CQEs; re-arm only
                         // when the kernel terminated it.
                         if (self.loop.stillArmed(udp_ops[idx])) continue;
-                        udp_ops[idx] = (if (use_multishot_udp)
-                            self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx))
-                        else
-                            self.loop.recvFrom(ctx.fd, @ptrCast(ctx))) catch |err| {
-                            log.err("failed to re-register UDP recvFrom: {s}", .{@errorName(err)});
+                        udp_ops[idx] = self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx)) catch |err| {
+                            log.err("failed to re-register UDP recvmsg: {s}", .{@errorName(err)});
                             udp_ops[idx] = null;
                             continue;
                         };
@@ -915,7 +907,7 @@ const WorkerState = struct {
             // Placed after completion processing so freshly freed slots are available.
             for (0..n) |i| {
                 if (udp_ops[i] == null) {
-                    udp_ops[i] = self.loop.recvFrom(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
+                    udp_ops[i] = self.loop.recvFromMulti(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
                 }
                 if (tcp_ops[i] == null) {
                     tcp_ops[i] = self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])) catch null;

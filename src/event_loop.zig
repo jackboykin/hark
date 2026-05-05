@@ -56,14 +56,15 @@ pub const ReadResult = struct {
 
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { recv, recv_multi, accept, read };
+const OpKind = enum { recv_multi, accept, read };
 
 const Slot = struct {
     kind: OpKind,
     context: *anyopaque,
     active: bool,
 
-    // Storage for recv (must have pointer stability until CQE)
+    // Multishot recvmsg owns msghdr (kernel reads namelen/iovlen at
+    // submit time). accept/read own addr and recv_buf respectively.
     iov: [1]posix.iovec,
     addr: na.PosixAddress,
     addr_len: posix.socklen_t,
@@ -72,7 +73,7 @@ const Slot = struct {
 
     fn init() Slot {
         return .{
-            .kind = .recv,
+            .kind = .recv_multi,
             .context = undefined,
             .active = false,
             .iov = undefined,
@@ -143,9 +144,9 @@ pub const EventLoop = struct {
     slots: [max_operations]Slot,
     free_list: [max_operations]OperationId,
     free_count: u16,
-    /// Buffer ring backing multishot recvmsg. null if kernel/allocator
-    /// rejected setup — callers must fall back to one-shot `recvFrom`.
-    udp_buf_ring: ?UdpBufRing,
+    /// Buffer ring backing multishot recvmsg. Required — needs kernel
+    /// 5.19+ for `IORING_REGISTER_PBUF_RING`.
+    udp_buf_ring: UdpBufRing,
 
     pub fn create(allocator: std.mem.Allocator) !*EventLoop {
         const self = try allocator.create(EventLoop);
@@ -155,19 +156,26 @@ pub const EventLoop = struct {
         params.flags = linux.IORING_SETUP_CQSIZE;
         params.cq_entries = max_operations * 4;
         self.ring = try linux.IoUring.init_params(max_operations, &params);
+        errdefer self.ring.deinit();
         std.debug.assert(params.features & linux.IORING_FEAT_NODROP != 0);
         self.free_count = max_operations;
         for (0..max_operations) |i| {
             self.slots[i] = Slot.init();
             self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
         }
-        self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch null;
+        self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch |err| {
+            std.log.scoped(.event_loop).err(
+                "failed to register io_uring buffer ring ({s}); hark requires Linux 5.19+",
+                .{@errorName(err)},
+            );
+            return err;
+        };
         return self;
     }
 
     pub fn destroy(self: *EventLoop) void {
         const allocator = self.allocator;
-        if (self.udp_buf_ring) |*bg| bg.deinit(self.ring.fd, allocator);
+        self.udp_buf_ring.deinit(self.ring.fd, allocator);
         self.ring.deinit();
         allocator.destroy(self);
     }
@@ -197,11 +205,7 @@ pub const EventLoop = struct {
     /// inbound packet until the kernel stops the op (e.g. ENOBUFS).
     /// Callers receive a `RecvResult` with `buf_id` set and MUST call
     /// `releaseBuf` after processing the payload.
-    ///
-    /// Returns `error.MultishotNotAvailable` if the kernel rejected the
-    /// buffer-ring setup; callers should fall back to `recvFrom`.
     pub fn recvFromMulti(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const ring = self.udp_buf_ring orelse return error.MultishotNotAvailable;
         const id = try self.initOp(.recv_multi, context);
         errdefer self.freeSlot(id);
         const slot = &self.slots[id];
@@ -226,7 +230,7 @@ pub const EventLoop = struct {
         sqe.prep_recvmsg(fd, &slot.msghdr, 0);
         sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
         sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-        sqe.buf_index = ring.group_id;
+        sqe.buf_index = self.udp_buf_ring.group_id;
         sqe.user_data = id;
         return id;
     }
@@ -234,11 +238,7 @@ pub const EventLoop = struct {
     /// Release a multishot recv buffer back to the buffer ring so the
     /// kernel can reuse it for a subsequent packet.
     pub fn releaseBuf(self: *EventLoop, buf_id: u16) void {
-        if (self.udp_buf_ring) |*ring| ring.release(buf_id);
-    }
-
-    pub fn supportsMultishotRecv(self: *const EventLoop) bool {
-        return self.udp_buf_ring != null;
+        self.udp_buf_ring.release(buf_id);
     }
 
     /// True iff `op_id` refers to a multishot op whose slot the kernel
@@ -249,31 +249,6 @@ pub const EventLoop = struct {
         const id = op_id orelse return false;
         const slot = &self.slots[id];
         return slot.active and slot.kind == .recv_multi;
-    }
-
-    pub fn recvFrom(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.recv, context);
-        errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-
-        slot.iov[0] = .{ .base = &slot.recv_buf, .len = recv_buf_size };
-        slot.addr = std.mem.zeroes(na.PosixAddress);
-        slot.addr_len = @sizeOf(na.PosixAddress);
-
-        slot.msghdr = .{
-            .name = @ptrCast(&slot.addr),
-            .namelen = slot.addr_len,
-            .iov = &slot.iov,
-            .iovlen = 1,
-            .control = null,
-            .controllen = 0,
-            .flags = 0,
-        };
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_recvmsg(fd, &slot.msghdr, 0);
-        sqe.user_data = id;
-        return id;
     }
 
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
@@ -358,28 +333,6 @@ pub const EventLoop = struct {
             var free_after = true;
 
             switch (slot.kind) {
-                .recv => {
-                    if (cqe.res > 0) {
-                        const len: usize = @intCast(cqe.res);
-                        completion.result = .{ .recv = .{
-                            .data = slot.recv_buf[0..len],
-                            .addr = na.fromSockaddr(&slot.addr),
-                            .err = null,
-                        } };
-                    } else if (isCancelled(cqe)) {
-                        completion.result = .{ .recv = .{
-                            .data = &.{},
-                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = error.Cancelled,
-                        } };
-                    } else {
-                        completion.result = .{ .recv = .{
-                            .data = &.{},
-                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = error.RecvFailed,
-                        } };
-                    }
-                },
                 .recv_multi => {
                     // When F_MORE is clear, the kernel has terminated the
                     // multishot (e.g. on ENOBUFS); the slot must be freed
@@ -472,7 +425,7 @@ pub const EventLoop = struct {
     /// destructure the `io_uring_recvmsg_out` header, and return the
     /// sender address + payload slice (both aliased into the buffer).
     fn parseMultishotRecv(self: *EventLoop, cqe: linux.io_uring_cqe) !MultishotParsed {
-        const ring = &(self.udp_buf_ring orelse return error.MultishotNotAvailable);
+        const ring = &self.udp_buf_ring;
         if (cqe.res < 0) {
             const errno: linux.E = @enumFromInt(@as(u31, @intCast(-cqe.res)));
             return switch (errno) {
@@ -526,100 +479,9 @@ test "EventLoop create/destroy" {
     try testing.expectEqual(@as(u16, max_operations), loop.free_count);
 }
 
-test "EventLoop recvFrom with external sender (server pattern)" {
-    // This test mimics the server's exact pattern: recvFrom + accept + read
-    // on a non-seekable fd (pipe, like signalfd), with data from an external source.
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    // Create a "server" UDP socket (like the server does)
-    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(server_sock);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(server_sock, &bind_pa.any, bind_len);
-
-    const server_addr = try na.getSockName(server_sock);
-
-    // Also create a TCP listen socket (like server does)
-    const tcp_sock = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(tcp_sock);
-    const tcp_bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var tcp_bind_pa: na.PosixAddress = undefined;
-    const tcp_bind_len = na.toSockaddr(&tcp_bind_na, &tcp_bind_pa);
-    try sys.bind(tcp_sock, &tcp_bind_pa.any, tcp_bind_len);
-    try sys.listen(tcp_sock, 1);
-
-    // Create a pipe to simulate signalfd (non-seekable fd)
-    const pipe_fds = try sys.pipe();
-    defer sys.close(pipe_fds[0]);
-    defer sys.close(pipe_fds[1]);
-
-    // Submit recvFrom + accept + read (like serveLoop does)
-    var recv_ctx: u8 = 1;
-    var accept_ctx: u8 = 2;
-    var read_ctx: u8 = 3;
-    _ = try loop.recvFrom(server_sock, @ptrCast(&recv_ctx));
-    _ = try loop.accept(tcp_sock, @ptrCast(&accept_ctx));
-    _ = try loop.read(pipe_fds[0], @ptrCast(&read_ctx));
-
-    // Send data from a separate thread using plain posix (external client)
-    const payload = "external DNS query";
-    const SenderThread = struct {
-        fn run(addr: na.Address, data: []const u8) void {
-            const sock = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
-            defer sys.close(sock);
-            var pa: na.PosixAddress = undefined;
-            const sa_len = na.toSockaddr(&addr, &pa);
-            _ = sys.sendto(sock, data, 0, &pa.any, sa_len) catch return;
-        }
-    };
-    const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, payload });
-
-    // tick() should return with the recvFrom completion (not blocked by pipe/accept)
-    var completions: [max_operations]Completion = undefined;
-    var got_recv = false;
-
-    for (0..5) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            const tag = @as(*u8, @ptrCast(@alignCast(c.context))).*;
-            if (tag == 1) { // recv_ctx
-                switch (c.result) {
-                    .recv => |r| {
-                        if (r.err == null) {
-                            try testing.expectEqualStrings(payload, r.data);
-                            got_recv = true;
-                        }
-                    },
-                    else => {},
-                }
-            } else if (tag == 3) { // read_ctx - pipe read completed unexpectedly
-                switch (c.result) {
-                    .read => |r| {
-                        // If the pipe read failed (ESPIPE, etc), this is a bug
-                        // that would cause the real server to falsely trigger shutdown
-                        if (r.err != null) {
-                            std.debug.print("PIPE READ ERROR: {?}\n", .{r.err});
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
-        if (got_recv) break;
-    }
-
-    thread.join();
-    try testing.expect(got_recv);
-}
-
 test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     const loop = try createTestLoop();
     defer loop.destroy();
-
-    if (loop.udp_buf_ring == null) return error.SkipZigTest;
 
     const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer sys.close(sock);
@@ -686,7 +548,7 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     loop.flush();
 }
 
-test "EventLoop cancel pending recvFrom" {
+test "EventLoop cancel pending recvFromMulti" {
     const loop = try createTestLoop();
     defer loop.destroy();
 
@@ -698,7 +560,7 @@ test "EventLoop cancel pending recvFrom" {
     try sys.bind(sock, &bind_pa.any, bind_len);
 
     var ctx: u8 = 99;
-    const recv_id = try loop.recvFrom(sock, @ptrCast(&ctx));
+    const recv_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
     try loop.cancel(recv_id);
 
     var completions: [max_operations]Completion = undefined;
