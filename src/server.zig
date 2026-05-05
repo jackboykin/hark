@@ -240,11 +240,11 @@ pub const Server = struct {
     udp_queue_drops: std.atomic.Value(u64),
     tcp_queue_drops: std.atomic.Value(u64),
     udp_send_drops: std.atomic.Value(u64),
-    /// eventfd in semaphore mode used to broadcast shutdown to every worker.
-    /// Only the main worker reads the signalfd; without this fanout the other
-    /// workers' io_uring_enter would block forever waiting for a CQE that
-    /// never arrives (no traffic = no wake).
-    wake_fd: posix.fd_t,
+    /// One eventfd per worker. Only the main worker reads the signalfd;
+    /// without per-worker wakes, peers would block in io_uring_enter forever
+    /// waiting for a CQE that never arrives (no traffic = no wake). Spawned
+    /// workers take indices [0..workers-1]; the main thread takes the last.
+    wake_fds: []posix.fd_t,
     /// Number of workers that have finished binding their listen sockets.
     /// Each worker drops privileges itself once this reaches `workers`.
     bound_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -323,7 +323,7 @@ pub const Server = struct {
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
-            .wake_fd = try makeWakeEventFd(),
+            .wake_fds = try createWakeFds(allocator, cfg.workers),
         };
     }
 
@@ -345,15 +345,16 @@ pub const Server = struct {
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
-        if (self.wake_fd >= 0) sys.close(self.wake_fd);
+        for (self.wake_fds) |fd| if (fd >= 0) sys.close(fd);
+        self.allocator.free(self.wake_fds);
     }
 
-    /// Flip the shared shutdown atomic and wake every worker out of its
-    /// io_uring tick or privilege barrier. Idempotent and safe from any
-    /// thread.
+    /// Flip the shared shutdown atomic and post a wake to every worker's
+    /// eventfd. Idempotent and safe from any thread; over-posting is harmless
+    /// because each fd's counter accumulates and is drained on close.
     fn requestShutdown(self: *Server) void {
         self.shutdown.store(true, .release);
-        broadcastWake(self.wake_fd, self.config.workers -| 1);
+        for (self.wake_fds) |fd| wakeWorker(fd);
     }
 
     pub fn run(self: *Server) !void {
@@ -392,11 +393,12 @@ pub const Server = struct {
         if (workers <= 1) {
             // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
             log.info("{d} worker", .{workers});
-            self.runWorker(listen_addrs, sig_fd, false);
+            self.runWorker(listen_addrs, sig_fd, self.wake_fds[0], false);
         } else {
             log.info("{d} workers", .{workers});
 
-            // Spawn N-1 worker threads + run one on main thread
+            // Spawn N-1 worker threads + run one on main thread. Spawned
+            // workers take wake_fds[0..workers-1]; main takes the last slot.
             const threads = self.allocator.alloc(std.Thread, workers - 1) catch |err| {
                 log.err("failed to allocate thread array: {s}", .{@errorName(err)});
                 return err;
@@ -404,7 +406,7 @@ pub const Server = struct {
             defer self.allocator.free(threads);
 
             for (threads, 0..) |*t, i| {
-                t.* = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), true }) catch |err| {
+                t.* = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), self.wake_fds[i], true }) catch |err| {
                     log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
                     self.requestShutdown();
                     for (threads[0..i]) |prev| prev.join();
@@ -413,7 +415,7 @@ pub const Server = struct {
             }
 
             // Main thread runs a worker too, with signalfd for shutdown
-            self.runWorker(listen_addrs, sig_fd, true);
+            self.runWorker(listen_addrs, sig_fd, self.wake_fds[workers - 1], true);
 
             // Join all worker threads
             for (threads) |t| t.join();
@@ -459,7 +461,7 @@ pub const Server = struct {
         }
     }
 
-    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) void {
+    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, wake_fd: posix.fd_t, reuseport: bool) void {
         // Wake every peer out of the bound_count barrier and the io_uring
         // tick if this worker dies before reaching serveLoop.
         var failed = false;
@@ -594,7 +596,7 @@ pub const Server = struct {
             return;
         }
 
-        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
+        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd, wake_fd);
 
         queue.signalShutdown();
         for (pool_threads[0..spawned]) |pt| pt.join();
@@ -767,13 +769,13 @@ const WorkerState = struct {
         });
     }
 
-    fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) void {
+    fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t, wake_fd: posix.fd_t) void {
         const n = udp_socks.len;
 
         var udp_ctxs: [max_listen_addrs]Ctx = undefined;
         var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
         var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
-        var wake_ctx = Ctx{ .tag = .wake, .fd = self.server.wake_fd };
+        var wake_ctx = Ctx{ .tag = .wake, .fd = wake_fd };
 
         // Op IDs indexed by listen address; null means inactive
         var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
@@ -807,13 +809,13 @@ const WorkerState = struct {
         else
             null;
 
-        // Every worker reads the shared wake eventfd. The signal-receiving
-        // worker writes (workers - 1) so each peer's read consumes one byte
-        // and its tick() returns even with no traffic on its socket. If the
-        // read can't be registered, the worker would block in tick forever
-        // on shutdown — escalate to a process-wide shutdown so peers exit.
-        if (self.server.wake_fd >= 0) {
-            _ = self.loop.read(self.server.wake_fd, @ptrCast(&wake_ctx)) catch |err| {
+        // Every worker reads its own wake eventfd. requestShutdown writes 1
+        // to each fd, so each worker's tick() returns with no need to
+        // reason about who else is consuming. If the read can't be
+        // registered the worker would block in tick forever on shutdown —
+        // escalate to a process-wide shutdown so peers exit.
+        if (wake_fd >= 0) {
+            _ = self.loop.read(wake_fd, @ptrCast(&wake_ctx)) catch |err| {
                 log.err("failed to register wake_fd read: {s}", .{@errorName(err)});
                 self.server.requestShutdown();
                 return;
@@ -1319,7 +1321,6 @@ const WorkerState = struct {
     }
 };
 
-
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 
 fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
@@ -1437,21 +1438,32 @@ fn classifySignalRead(result: anytype) SignalAction {
     return if (saw_stats) .stats else .shutdown;
 }
 
-const EFD_SEMAPHORE: u32 = 1;
 const EFD_NONBLOCK: u32 = 0o4000;
 
 fn makeWakeEventFd() !posix.fd_t {
-    const rc = linux.eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
+    const rc = linux.eventfd(0, EFD_NONBLOCK);
     const sr = @as(isize, @bitCast(rc));
     if (sr < 0) return error.EventFdFailed;
     return @intCast(sr);
 }
 
-fn broadcastWake(fd: posix.fd_t, count: u64) void {
-    if (fd < 0 or count == 0) return;
-    var v: u64 = count;
-    const bytes = std.mem.asBytes(&v);
-    _ = sys.write(fd, bytes) catch {};
+fn createWakeFds(allocator: mem.Allocator, n: usize) ![]posix.fd_t {
+    const fds = try allocator.alloc(posix.fd_t, n);
+    var created: usize = 0;
+    errdefer {
+        for (fds[0..created]) |fd| sys.close(fd);
+        allocator.free(fds);
+    }
+    while (created < n) : (created += 1) {
+        fds[created] = try makeWakeEventFd();
+    }
+    return fds;
+}
+
+fn wakeWorker(fd: posix.fd_t) void {
+    if (fd < 0) return;
+    var v: u64 = 1;
+    _ = sys.write(fd, std.mem.asBytes(&v)) catch {};
 }
 
 /// Drop credentials for the calling thread only (raw syscall). Every worker
@@ -1489,24 +1501,38 @@ test "server init and deinit" {
     try testing.expectEqual(false, server.shutdown.load(.acquire));
 }
 
-test "broadcastWake delivers one byte per peer in semaphore mode" {
+test "wakeWorker delivers a read-ready event" {
     if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
     const fd = try makeWakeEventFd();
     defer sys.close(fd);
 
-    broadcastWake(fd, 3);
+    wakeWorker(fd);
 
-    // Three peers each consume one byte.
     var buf: [8]u8 = undefined;
-    var n: usize = 0;
-    while (n < 3) : (n += 1) {
-        const r = sys.read(fd, &buf) catch break;
-        try testing.expectEqual(@as(usize, 8), r);
-    }
-    try testing.expectEqual(@as(usize, 3), n);
+    const r = try sys.read(fd, &buf);
+    try testing.expectEqual(@as(usize, 8), r);
 
-    // Fourth read returns EAGAIN (queue drained).
+    // Counter drained — subsequent read returns EAGAIN.
     try testing.expectError(error.WouldBlock, sys.read(fd, &buf));
+}
+
+test "createWakeFds allocates one eventfd per worker" {
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const fds = try createWakeFds(testing.allocator, 4);
+    defer {
+        for (fds) |fd| sys.close(fd);
+        testing.allocator.free(fds);
+    }
+    try testing.expectEqual(@as(usize, 4), fds.len);
+
+    // Wake worker 2 only — its fd reads ready, the others don't.
+    wakeWorker(fds[2]);
+    var buf: [8]u8 = undefined;
+    const r = try sys.read(fds[2], &buf);
+    try testing.expectEqual(@as(usize, 8), r);
+    for ([_]usize{ 0, 1, 3 }) |i| {
+        try testing.expectError(error.WouldBlock, sys.read(fds[i], &buf));
+    }
 }
 
 test "server init thread-safe cache when workers > 1" {
@@ -1523,7 +1549,6 @@ test "server init thread-safe cache when workers > 1" {
 
     try testing.expect(server.cache.rwlock != null);
 }
-
 
 test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
