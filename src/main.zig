@@ -112,7 +112,7 @@ fn printUsage() void {
         \\
         \\Query options:
         \\  --forward           Use forwarding mode instead of recursive resolution
-        \\  --upstream <addr>   Upstream server (IPv4, IPv6, or [IPv6]:port; default: 8.8.8.8)
+        \\  --upstream <addr>   Upstream server (IPv4, IPv6, or [IPv6]:port; default: 8.8.8.8; implies --forward)
         \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
         \\  --dot-host <name>   TLS server hostname for SNI/cert verification
         \\  --dot-strict        Require hostname verification (RFC 7858 strict mode)
@@ -395,7 +395,9 @@ fn loadDefaultConfig(gpa_alloc: std.mem.Allocator) !hark.config.ServerConfig {
     if (hark.config.parseConfigFile(gpa_alloc, default_path)) |cfg| {
         return cfg;
     } else |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound => {
+            log.warn("no config at {s} — using built-in defaults; pass --config <path> for a custom location", .{default_path});
+        },
         else => {
             log.err("loading config '{s}': {s}", .{ default_path, @errorName(err) });
             return err;
