@@ -47,6 +47,19 @@ const CacheKeyContext = struct {
     }
 };
 
+/// Adapter context for `ArrayHashMap.getIndexAdapted`: returns a hash that
+/// the caller has already computed (for shard selection), avoiding the
+/// double-hash cost of `getIndex` on the lookup hot path.
+const PrecomputedCtx = struct {
+    precomputed: u32,
+    pub fn hash(self: @This(), _: CacheKey) u32 {
+        return self.precomputed;
+    }
+    pub fn eql(_: @This(), a: CacheKey, b: CacheKey, _: usize) bool {
+        return a.rtype == b.rtype and a.rclass == b.rclass and mem.eql(u8, a.name, b.name);
+    }
+};
+
 // ── Security status ───────────────────────────────────────────────────
 
 /// DNSSEC validation status for cached RRsets.
@@ -335,8 +348,10 @@ fn toLowerNameAlloc(alloc: Allocator, name: []const u8) ![]const u8 {
 // ── RRsetCache ────────────────────────────────────────────────────────
 
 /// Number of cache shards. Power-of-2 so shard selection is `& mask`.
-/// At N=1, behaves identically to the pre-sharded single-lock design.
-pub const shard_count: u32 = 1;
+/// 16 = 2^4 sits in the industry sweet spot (Unbound auto-sets *-slabs to
+/// a power of 2 close to thread count; dnsdist defaults to 20 packet-cache
+/// shards). Matches dev-host physical core count.
+pub const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
 
 /// Per-shard state. Each shard owns its lock, map, allocator, eviction
@@ -422,6 +437,14 @@ pub const RRsetCache = struct {
         return &self.shards[h & shard_mask];
     }
 
+    /// Compute hash + shard pointer once. Caller passes the hash to
+    /// `getIndexAdapted` (read paths) to avoid recomputing it inside the map.
+    fn shardWithHash(self: *RRsetCache, key: CacheKey) struct { *Shard, u32 } {
+        const h = CacheKeyContext.hash(.{}, key);
+        const idx = if (comptime shard_count == 1) 0 else h & shard_mask;
+        return .{ &self.shards[idx], h };
+    }
+
     pub const Stats = struct {
         entries: u32,
         memory_bytes: usize,
@@ -501,10 +524,10 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const shard = self.shardOf(probe);
+        const shard, const h = self.shardWithHash(probe);
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
-        const idx = shard.map.getIndex(probe) orelse return false;
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const now = self.now_fn();
         const fresh = now < shard.map.values()[idx].expiresAt();
         if (fresh) markVisited(shard, idx);
@@ -524,10 +547,10 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const shard = self.shardOf(probe);
+        const shard, const h = self.shardWithHash(probe);
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
-        const idx = shard.map.getIndex(probe) orelse {
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse {
             _ = shard.misses.fetchAdd(1, .monotonic);
             return null;
         };
@@ -775,10 +798,14 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const shard = self.shardOf(key);
+        const shard, const h = self.shardWithHash(key);
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
-        return self.hasProtectedPositive(shard, key);
+        const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
+        return switch (shard.map.values()[idx]) {
+            .positive => |p| self.now_fn() < p.expires_at and p.security_status != .unchecked,
+            .negative => false,
+        };
     }
 
     // ── Internal ──────────────────────────────────────────────────────
@@ -803,15 +830,6 @@ pub const RRsetCache = struct {
             .unchecked => 0,
             .insecure => 1,
             .secure => 2,
-        };
-    }
-
-    /// True if `key` has a non-expired validated positive entry (RFC 9520 §3.4).
-    fn hasProtectedPositive(self: *RRsetCache, shard: *Shard, key: CacheKey) bool {
-        const existing = shard.map.get(key) orelse return false;
-        return switch (existing) {
-            .positive => |p| self.now_fn() < p.expires_at and p.security_status != .unchecked,
-            .negative => false,
         };
     }
 
@@ -1344,24 +1362,26 @@ test "cache eviction when full" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 2, .io = testing.io }); // max 2 entries
+    // Configure cap so each shard floors at 1 entry; storing cap+1 names
+    // forces eviction in at least one shard regardless of N.
+    const cap = shard_count;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = cap, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    // Store 3 different entries
-    const names = [_][]const u8{ "a.com", "b.com", "c.com" };
-    for (names) |n| {
-        const parsed = try dns.parseDottedName(alloc, n);
+    var i: u32 = 0;
+    while (i < cap + 1) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const dotted = try std.fmt.bufPrint(&name_buf, "n{d}.com", .{i});
+        const parsed = try dns.parseDottedName(alloc, dotted);
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
         const response = makeTestResponse(answers);
         cache.storeResponse(response, dns.Name{ .labels = &.{} });
         dns.freeMessage(alloc, response);
     }
 
-    // Should not exceed max_entries (sum across shards)
-    try testing.expect(cache.getStats().entries <= 2);
+    try testing.expect(cache.getStats().entries <= cap);
 }
 
 test "cache deep copy independence" {
@@ -1756,4 +1776,99 @@ test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
         .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
         .negative => return error.TestExpectedHitAfterProtection,
     }
+}
+
+test "shard distribution is reasonable for random names" {
+    if (shard_count == 1) return; // degenerate; nothing to distribute
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    const n_keys: u32 = 1024;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 16 * 1024 * 1024, .max_entries = n_keys * 2, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    var i: u32 = 0;
+    while (i < n_keys) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const dotted = try std.fmt.bufPrint(&name_buf, "host{d}.example.com", .{i});
+        const parsed = try dns.parseDottedName(alloc, dotted);
+        const answers = try alloc.alloc(dns.ResourceRecord, 1);
+        answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+        const response = makeTestResponse(answers);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        dns.freeMessage(alloc, response);
+    }
+
+    // Pigeonhole: expected mean = n_keys / shard_count. Allow up to 3× mean
+    // before flagging as a hash regression. (3× is loose; Wyhash usually
+    // stays within 1.5× even for adversarial inputs.)
+    const mean_per_shard: usize = n_keys / shard_count;
+    const max_allowed: usize = mean_per_shard * 3;
+    for (&cache.shards) |*shard| {
+        try testing.expect(shard.map.count() <= max_allowed);
+    }
+}
+
+test "eviction stays within shard" {
+    if (shard_count == 1) return;
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    // 1 entry per shard. Find two names that hash to distinct shards;
+    // fill shard X to capacity + 1 (force eviction in X), assert Y survives.
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = shard_count, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Pick two names that land in distinct shards.
+    var name_a_buf: [16]u8 = undefined;
+    var name_b_buf: [16]u8 = undefined;
+    const a_idx: u32 = 0;
+    var b_idx: u32 = 1;
+    while (true) {
+        const a = try std.fmt.bufPrint(&name_a_buf, "a{d}.com", .{a_idx});
+        const b = try std.fmt.bufPrint(&name_b_buf, "b{d}.com", .{b_idx});
+        const ka = CacheKey{ .name = a, .rtype = .a, .rclass = .in };
+        const kb = CacheKey{ .name = b, .rtype = .a, .rclass = .in };
+        const sa = CacheKeyContext.hash(.{}, ka) & shard_mask;
+        const sb = CacheKeyContext.hash(.{}, kb) & shard_mask;
+        if (sa != sb) break;
+        b_idx += 1;
+    }
+    const name_a = name_a_buf[0 .. std.mem.indexOfScalar(u8, &name_a_buf, 'm').? + 1];
+    const name_b = name_b_buf[0 .. std.mem.indexOfScalar(u8, &name_b_buf, 'm').? + 1];
+
+    // Store name_b first so it sits in its shard.
+    {
+        const parsed = try dns.parseDottedName(alloc, name_b);
+        const answers = try alloc.alloc(dns.ResourceRecord, 1);
+        answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+        const response = makeTestResponse(answers);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        dns.freeMessage(alloc, response);
+    }
+
+    // Hammer name_a's shard: store many names that all hash there.
+    var stored: u32 = 0;
+    var probe: u32 = 0;
+    const a_shard = CacheKeyContext.hash(.{}, .{ .name = name_a, .rtype = .a, .rclass = .in }) & shard_mask;
+    while (stored < 4) : (probe += 1) {
+        var nb: [16]u8 = undefined;
+        const dotted = try std.fmt.bufPrint(&nb, "x{d}.com", .{probe});
+        const sh = CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }) & shard_mask;
+        if (sh != a_shard) continue;
+        const parsed = try dns.parseDottedName(alloc, dotted);
+        const answers = try alloc.alloc(dns.ResourceRecord, 1);
+        answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
+        const response = makeTestResponse(answers);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        dns.freeMessage(alloc, response);
+        stored += 1;
+    }
+
+    // name_b's shard was untouched; its entry must still be there.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), name_b, .a, .in) != null);
 }

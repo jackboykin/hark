@@ -1,0 +1,20 @@
+[sieve_worst] p50=26021ns p99=35690ns mean=26665ns min=11663ns max=73072ns n=2000
+  storeResponse, fully-visited full cache (worst-case SIEVE scan)
+s p99=210ns mean=140ns min=110ns max=9388ns n=20000
+  lookup only (proposed hot path)
+[dedup_f01] p50=171ns p99=230ns mean=177ns min=140ns max=4308ns n=20000
+  lookupExists + lookup (dedup-skip fast path on hit)
+max=271760ns n=800000
+  threads=4 qps=12455616 reader_iters=800000 elapsed_ms=64
+[cache_contention_ro/t=8] p50=280ns p99=722ns mean=302ns min=100ns max=271839ns n=1600000
+  threads=8 qps=21922934 reader_iters=1600000 elapsed_ms=72
+[cache_contention_ro/t=16] p50=360ns p99=842ns mean=378ns min=100ns max=278722ns n=3200000
+  threads=16 qps=38787939 reader_iters=3200000 elapsed_ms=82
+[cache_contention_rw/t=2] p50=130ns p99=1212ns mean=481ns min=100ns max=153980ns n=200000
+  threads=2 qps=1986721 reader_iters=200000 elapsed_ms=100
+[cache_contention_rw/t=4] p50=150ns p99=942ns mean=556ns min=90ns max=287069ns n=600000
+  threads=4 qps=5035557 reader_iters=600000 elapsed_ms=119
+[cache_contention_rw/t=8] p50=200ns p99=992ns mean=655ns min=100ns max=284244ns n=1400000
+  threads=8 qps=9700149 reader_iters=1400000 elapsed_ms=144
+[cache_contention_rw/t=16] p50=350ns p99=1072ns mean=815ns min=100ns max=1019896ns n=3000000
+  threads=16 qps=17569744 reader_iters=3000000 elapsed_ms=170
