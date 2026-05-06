@@ -32,7 +32,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         .max_bytes = 64 * 1024 * 1024,
         .max_entries = n_zones * 8,
         .io = io,
-        .thread_safe = true,
     });
     defer cache.deinit();
 

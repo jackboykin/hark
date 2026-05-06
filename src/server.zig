@@ -271,7 +271,6 @@ pub const Server = struct {
             .max_bytes = cfg.cache_size,
             .max_entries = cfg.cache_entries,
             .io = io,
-            .thread_safe = cfg.workers > 1,
             .prefetch = cfg.prefetch,
             .serve_stale_ttl = cfg.serve_stale_ttl,
             .min_ttl = cfg.min_ttl,
@@ -324,7 +323,6 @@ pub const Server = struct {
                 .max_bytes = cfg.key_cache_size,
                 .max_entries = cfg.key_cache_entries,
                 .io = io,
-                .thread_safe = cfg.workers > 1,
             }) else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
@@ -1556,21 +1554,6 @@ test "createWakeFds allocates one eventfd per worker" {
     for ([_]usize{ 0, 1, 3 }) |i| {
         try testing.expectError(error.WouldBlock, sys.read(fds[i], &buf));
     }
-}
-
-test "server init thread-safe cache when workers > 1" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
-    const config = @import("config.zig");
-    var cfg = config.parseConfig(testing.allocator,
-        \\[server]
-        \\workers = 4
-    ) catch return error.SkipZigTest;
-    defer cfg.deinit();
-
-    var server = try Server.init(testing.allocator, cfg, testing.io);
-    defer server.deinit();
-
-    try testing.expect(server.cache.shards[0].rwlock != null);
 }
 
 test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {

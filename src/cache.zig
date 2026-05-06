@@ -360,7 +360,7 @@ const shard_mask: u32 = shard_count - 1;
 const Shard = struct {
     counting: CountingAllocator,
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true),
-    rwlock: ?std.Io.RwLock = null,
+    rwlock: std.Io.RwLock = std.Io.RwLock.init,
     /// SIEVE eviction state: per-entry visited flag and circular scan pointer.
     visited: ?[]std.atomic.Value(u8) = null,
     hand: u32 = 0,
@@ -390,7 +390,6 @@ pub const RRsetCache = struct {
         max_bytes: usize,
         max_entries: u32,
         io: std.Io,
-        thread_safe: bool = false,
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
         min_ttl: u32 = 0,
@@ -421,7 +420,6 @@ pub const RRsetCache = struct {
             shard.* = .{
                 .counting = CountingAllocator.init(cfg.backing, per_shard_bytes),
                 .map = .empty,
-                .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
                 .visited = visited,
                 .max_entries = per_shard_entries,
             };
@@ -475,9 +473,9 @@ pub const RRsetCache = struct {
             .stale_hits = 0,
         };
         for (&self.shards) |*shard| {
-            if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+            shard.rwlock.lockSharedUncancelable(self.io);
             stats.entries += @intCast(shard.map.count());
-            if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+            shard.rwlock.unlockShared(self.io);
             stats.memory_bytes += shard.counting.current_bytes.load(.monotonic);
             stats.max_bytes += shard.counting.max_bytes;
             stats.hits += shard.hits.load(.monotonic);
@@ -525,8 +523,8 @@ pub const RRsetCache = struct {
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const now = self.now_fn();
         const fresh = now < shard.map.values()[idx].expiresAt();
@@ -548,8 +546,8 @@ pub const RRsetCache = struct {
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse {
             _ = shard.misses.fetchAdd(1, .monotonic);
             return null;
@@ -695,8 +693,8 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
         const shard = self.shardOf(probe);
 
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
 
         const alloc = shard.counting.allocator();
         const key_name = toLowerNameAlloc(alloc, name) catch return;
@@ -752,8 +750,8 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
         const shard = self.shardOf(probe);
 
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
 
         const alloc = shard.counting.allocator();
         const key_name = toLowerNameAlloc(alloc, name) catch return;
@@ -799,8 +797,8 @@ pub const RRsetCache = struct {
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(key);
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         return switch (shard.map.values()[idx]) {
             .positive => |p| self.now_fn() < p.expires_at and p.security_status != .unchecked,
@@ -903,8 +901,8 @@ pub const RRsetCache = struct {
     ) void {
         const probe = CacheKey{ .name = lower_name, .rtype = rr.rtype, .rclass = rr.rclass };
         const shard = self.shardOf(probe);
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
 
         const alloc = shard.counting.allocator();
         const key_name = alloc.dupe(u8, lower_name) catch return;

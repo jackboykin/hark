@@ -39,7 +39,6 @@ fn populateCache(allocator: std.mem.Allocator, io: std.Io) !CacheSetup {
         .max_bytes = 64 * 1024 * 1024,
         .max_entries = n_entries * 2,
         .io = io,
-        .thread_safe = true,
     });
     errdefer cache.deinit();
 
