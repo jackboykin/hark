@@ -55,8 +55,8 @@ const PrecomputedCtx = struct {
     pub fn hash(self: @This(), _: CacheKey) u32 {
         return self.precomputed;
     }
-    pub fn eql(_: @This(), a: CacheKey, b: CacheKey, _: usize) bool {
-        return a.rtype == b.rtype and a.rclass == b.rclass and mem.eql(u8, a.name, b.name);
+    pub fn eql(_: @This(), a: CacheKey, b: CacheKey, i: usize) bool {
+        return CacheKeyContext.eql(.{}, a, b, i);
     }
 };
 
@@ -339,12 +339,6 @@ fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
     return lowerInto(buf, name);
 }
 
-/// Allocate a lowercased copy of a name string.
-fn toLowerNameAlloc(alloc: Allocator, name: []const u8) ![]const u8 {
-    const buf = try alloc.alloc(u8, name.len);
-    return lowerInto(buf, name);
-}
-
 // ── RRsetCache ────────────────────────────────────────────────────────
 
 /// Number of cache shards. Power-of-2 so shard selection is `& mask`.
@@ -355,8 +349,13 @@ pub const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
 
 /// Per-shard state. Each shard owns its lock, map, allocator, eviction
-/// state, and stat counters. Aligned to 64B so adjacent shards don't
-/// share cache lines for their lock state words and counters.
+/// state, and stat counters. The shards array is cache-line aligned so
+/// shard 0 starts on a line boundary. Field-level alignment was tried
+/// to force `@sizeOf(Shard)` to a multiple of cache_line (preventing
+/// boundary cache lines from straddling two shards) but the resulting
+/// layout shift hurt single-thread cache_hit by ~40% with no measurable
+/// gain on the contention bench. Boundary sharing is accepted as a
+/// second-order effect; the dominant win comes from per-shard locks.
 const Shard = struct {
     counting: CountingAllocator,
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true),
@@ -377,7 +376,7 @@ const Shard = struct {
 };
 
 pub const RRsetCache = struct {
-    shards: [shard_count]Shard align(64),
+    shards: [shard_count]Shard align(std.atomic.cache_line),
     io: std.Io,
     now_fn: *const fn () i64,
     serve_stale_ttl: u32 = 0,
@@ -385,6 +384,10 @@ pub const RRsetCache = struct {
     prefetch: bool = false,
     skip_key_types: bool = false,
 
+    /// `max_bytes` and `max_entries` are split evenly across shards with
+    /// floors of 4096 bytes and 1 entry per shard. Configurations smaller
+    /// than `shard_count * floor` round up to the floor — production sizes
+    /// (≥1 MB, ≥shard_count entries) divide cleanly.
     pub const Config = struct {
         backing: Allocator,
         max_bytes: usize,
@@ -427,22 +430,18 @@ pub const RRsetCache = struct {
         return cache;
     }
 
-    fn shardOf(self: *RRsetCache, key: CacheKey) *Shard {
-        // At N=1 the hash is redundant — map.getIndex computes it anyway.
-        // Comptime-eliminate the shard-select hash when there's one shard.
-        if (comptime shard_count == 1) return &self.shards[0];
-        const h = CacheKeyContext.hash(.{}, key);
-        return &self.shards[h & shard_mask];
-    }
-
     /// Compute hash + shard pointer once. Caller passes the hash to
-    /// `getIndexAdapted` (read paths) to avoid recomputing it inside the map.
+    /// `getIndexAdapted` to avoid recomputing it inside the map.
     fn shardWithHash(self: *RRsetCache, key: CacheKey) struct { *Shard, u32 } {
         const h = CacheKeyContext.hash(.{}, key);
         const idx = if (comptime shard_count == 1) 0 else h & shard_mask;
         return .{ &self.shards[idx], h };
     }
 
+    /// Aggregated across shards. Not a consistent snapshot — a put racing
+    /// `getStats` may be reflected in some counters but not others.
+    /// Acceptable for monitoring; do not assert invariants like
+    /// `stores == entries + evictions` on these values.
     pub const Stats = struct {
         entries: u32,
         memory_bytes: usize,
@@ -687,35 +686,19 @@ pub const RRsetCache = struct {
         const neg_ttl = @min(soa.ttl, soa.rdata.soa.minimum);
         if (neg_ttl == 0) return;
 
-        // Locate shard from the lowercased name view; key is owned later.
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
-        const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
-        const shard, const h = self.shardWithHash(probe);
+        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status) orelse return;
+        defer slot.shard.rwlock.unlock(self.io);
 
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-
-        const alloc = shard.counting.allocator();
-        const key_name = toLowerNameAlloc(alloc, name) catch return;
-        const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
-
-        if (self.shouldBlockOverwrite(shard, h, key, security_status)) {
-            alloc.free(key_name);
-            return;
-        }
-        removeAndFreeHashed(shard, h, key);
-
-        const cached_soa = buildCachedRecord(alloc, soa) catch {
-            alloc.free(key_name);
+        const cached_soa = buildCachedRecord(slot.alloc, soa) catch {
+            slot.alloc.free(slot.key.name);
             return;
         };
 
-        self.evictIfNeeded(shard);
-
         const now = self.now_fn();
         const capped_ttl = clampTtl(self.min_ttl, neg_ttl);
-        shard.map.put(alloc, key, .{ .negative = .{
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
@@ -723,12 +706,12 @@ pub const RRsetCache = struct {
             .soa = cached_soa,
             .security_status = security_status,
         } }) catch {
-            freeCachedRecord(alloc, cached_soa);
-            alloc.free(key_name);
+            freeCachedRecord(slot.alloc, cached_soa);
+            slot.alloc.free(slot.key.name);
             return;
         };
-        markLastVisited(shard);
-        _ = shard.negative_stores.fetchAdd(1, .monotonic);
+        markLastVisited(slot.shard);
+        _ = slot.shard.negative_stores.fetchAdd(1, .monotonic);
     }
 
     /// Store a bare negative entry (no SOA required).
@@ -747,28 +730,14 @@ pub const RRsetCache = struct {
 
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
-        const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
-        const shard, const h = self.shardWithHash(probe);
-
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-
-        const alloc = shard.counting.allocator();
-        const key_name = toLowerNameAlloc(alloc, name) catch return;
-        const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
-
-        if (self.shouldBlockOverwrite(shard, h, key, security_status)) {
-            alloc.free(key_name);
-            return;
-        }
-        removeAndFreeHashed(shard, h, key);
-        self.evictIfNeeded(shard);
+        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status) orelse return;
+        defer slot.shard.rwlock.unlock(self.io);
 
         const now = self.now_fn();
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
         // DNSSEC SERVFAIL). Only cap at max_cache_ttl.
         const capped_ttl = @min(ttl, max_cache_ttl);
-        shard.map.put(alloc, key, .{ .negative = .{
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
@@ -776,11 +745,11 @@ pub const RRsetCache = struct {
             .soa = null,
             .security_status = security_status,
         } }) catch {
-            alloc.free(key_name);
+            slot.alloc.free(slot.key.name);
             return;
         };
-        markLastVisited(shard);
-        _ = shard.negative_stores.fetchAdd(1, .monotonic);
+        markLastVisited(slot.shard);
+        _ = slot.shard.negative_stores.fetchAdd(1, .monotonic);
     }
 
     /// True if a non-expired positive entry exists for (name, rtype, rclass)
@@ -892,6 +861,34 @@ pub const RRsetCache = struct {
         }
     }
 
+    /// Acquire the shard write lock and reserve a slot. Caller defers
+    /// unlock on success and frees `key.name` on later failure paths.
+    fn prepareSlot(
+        self: *RRsetCache,
+        lower_name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+        status: SecurityStatus,
+    ) ?struct { shard: *Shard, alloc: Allocator, key: CacheKey } {
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        const shard, const h = self.shardWithHash(probe);
+        shard.rwlock.lockUncancelable(self.io);
+        const alloc = shard.counting.allocator();
+        const key_name = alloc.dupe(u8, lower_name) catch {
+            shard.rwlock.unlock(self.io);
+            return null;
+        };
+        const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
+        if (self.shouldBlockOverwrite(shard, h, key, status)) {
+            alloc.free(key_name);
+            shard.rwlock.unlock(self.io);
+            return null;
+        }
+        removeAndFree(shard, h, key);
+        self.evictIfNeeded(shard);
+        return .{ .shard = shard, .alloc = alloc, .key = key };
+    }
+
     /// Store a single (name, rtype) RRset group. Acquires the shard's write
     /// lock for just this group; held only across the put + eviction work.
     fn storeOneRRset(
@@ -901,57 +898,42 @@ pub const RRsetCache = struct {
         matches: []const dns.ResourceRecord,
         status: SecurityStatus,
     ) void {
-        const probe = CacheKey{ .name = lower_name, .rtype = rr.rtype, .rclass = rr.rclass };
-        const shard, const h = self.shardWithHash(probe);
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
+        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status) orelse return;
+        defer slot.shard.rwlock.unlock(self.io);
 
-        const alloc = shard.counting.allocator();
-        const key_name = alloc.dupe(u8, lower_name) catch return;
-        const key = CacheKey{ .name = key_name, .rtype = rr.rtype, .rclass = rr.rclass };
-
-        if (self.shouldBlockOverwrite(shard, h, key, status)) {
-            alloc.free(key_name);
-            return;
-        }
-        removeAndFreeHashed(shard, h, key);
-
-        const cached_records = alloc.alloc(CachedRecord, matches.len) catch {
-            alloc.free(key_name);
+        const cached_records = slot.alloc.alloc(CachedRecord, matches.len) catch {
+            slot.alloc.free(slot.key.name);
             return;
         };
         var idx: usize = 0;
         for (matches) |other| {
-            cached_records[idx] = buildCachedRecord(alloc, other) catch break;
+            cached_records[idx] = buildCachedRecord(slot.alloc, other) catch break;
             idx += 1;
         }
-
         if (idx == 0 or idx < matches.len) {
             // Partial clone failure — don't cache an incomplete RRset.
-            for (cached_records[0..idx]) |cr| freeCachedRecord(alloc, cr);
-            alloc.free(cached_records);
-            alloc.free(key_name);
+            for (cached_records[0..idx]) |cr| freeCachedRecord(slot.alloc, cr);
+            slot.alloc.free(cached_records);
+            slot.alloc.free(slot.key.name);
             return;
         }
 
-        self.evictIfNeeded(shard);
-
         const now = self.now_fn();
         const capped_ttl = clampTtl(self.min_ttl, rr.ttl);
-        shard.map.put(alloc, key, .{ .positive = .{
+        slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .records = cached_records,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
             .stored_at = now,
             .security_status = status,
         } }) catch {
-            for (cached_records) |cr| freeCachedRecord(alloc, cr);
-            alloc.free(cached_records);
-            alloc.free(key_name);
+            for (cached_records) |cr| freeCachedRecord(slot.alloc, cr);
+            slot.alloc.free(cached_records);
+            slot.alloc.free(slot.key.name);
             return;
         };
-        markLastVisited(shard);
-        _ = shard.stores.fetchAdd(1, .monotonic);
+        markLastVisited(slot.shard);
+        _ = slot.shard.stores.fetchAdd(1, .monotonic);
     }
 
     fn evictIfNeeded(self: *RRsetCache, shard: *Shard) void {
@@ -992,7 +974,7 @@ pub const RRsetCache = struct {
 // private container type and these helpers need no access to RRsetCache
 // global config (now_fn, prefetch, etc.).
 
-fn removeAndFreeHashed(shard: *Shard, h: u32, key: CacheKey) void {
+fn removeAndFree(shard: *Shard, h: u32, key: CacheKey) void {
     const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return;
     removeAtIndex(shard, idx);
 }
@@ -1815,49 +1797,26 @@ test "eviction stays within shard" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    // 1 entry per shard. Find two names that hash to distinct shards;
-    // fill shard X to capacity + 1 (force eviction in X), assert Y survives.
+    // 1 entry per shard. Hammer one specific shard with many stores
+    // (forces eviction there); a victim entry on a different shard must
+    // survive — eviction must not cross shard boundaries.
     var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = shard_count, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    // Pick two names that land in distinct shards.
-    var name_a_buf: [16]u8 = undefined;
-    var name_b_buf: [16]u8 = undefined;
-    const a_idx: u32 = 0;
-    var b_idx: u32 = 1;
-    while (true) {
-        const a = try std.fmt.bufPrint(&name_a_buf, "a{d}.com", .{a_idx});
-        const b = try std.fmt.bufPrint(&name_b_buf, "b{d}.com", .{b_idx});
-        const ka = CacheKey{ .name = a, .rtype = .a, .rclass = .in };
-        const kb = CacheKey{ .name = b, .rtype = .a, .rclass = .in };
-        const sa = CacheKeyContext.hash(.{}, ka) & shard_mask;
-        const sb = CacheKeyContext.hash(.{}, kb) & shard_mask;
-        if (sa != sb) break;
-        b_idx += 1;
-    }
-    const name_a = name_a_buf[0 .. std.mem.indexOfScalar(u8, &name_a_buf, 'm').? + 1];
-    const name_b = name_b_buf[0 .. std.mem.indexOfScalar(u8, &name_b_buf, 'm').? + 1];
+    const victim = "victim.test";
+    const victim_shard = CacheKeyContext.hash(.{}, .{ .name = victim, .rtype = .a, .rclass = .in }) & shard_mask;
+    const target_shard = (victim_shard +% 1) & shard_mask;
 
-    // Store name_b first so it sits in its shard.
-    {
-        const parsed = try dns.parseDottedName(alloc, name_b);
-        const answers = try alloc.alloc(dns.ResourceRecord, 1);
-        answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-        const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} });
-        dns.freeMessage(alloc, response);
-    }
+    try storeTestA(&cache, alloc, &.{ "victim", "test" }, 300, .{ 1, 2, 3, 4 });
 
-    // Hammer name_a's shard: store many names that all hash there.
     var stored: u32 = 0;
     var probe: u32 = 0;
-    const a_shard = CacheKeyContext.hash(.{}, .{ .name = name_a, .rtype = .a, .rclass = .in }) & shard_mask;
     while (stored < 4) : (probe += 1) {
         var nb: [16]u8 = undefined;
         const dotted = try std.fmt.bufPrint(&nb, "x{d}.com", .{probe});
         const sh = CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }) & shard_mask;
-        if (sh != a_shard) continue;
+        if (sh != target_shard) continue;
         const parsed = try dns.parseDottedName(alloc, dotted);
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
@@ -1867,8 +1826,7 @@ test "eviction stays within shard" {
         stored += 1;
     }
 
-    // name_b's shard was untouched; its entry must still be there.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    try testing.expect(cache.lookup(arena.allocator(), name_b, .a, .in) != null);
+    try testing.expect(cache.lookup(arena.allocator(), victim, .a, .in) != null);
 }
