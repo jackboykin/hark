@@ -1570,7 +1570,7 @@ test "server init thread-safe cache when workers > 1" {
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
 
-    try testing.expect(server.cache.rwlock != null);
+    try testing.expect(server.cache.shards[0].rwlock != null);
 }
 
 test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
