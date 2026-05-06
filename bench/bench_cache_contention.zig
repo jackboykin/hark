@@ -7,7 +7,9 @@
 //!       ~iters/100, forcing readers through the mutex fallback in
 //!       lockSharedUncancelable.
 //!
-//! Sweep capped at 16 (physical cores on dev host; SMT artifacts above).
+//! Sweep extends to 32 (SMT region) and 64 (oversubscribed). With 16 shards
+//! the rwlock contention should stay flat past physical cores; t=64 stresses
+//! the kernel scheduler and shard distribution under heavy oversubscription.
 //! Aggregate QPS is the primary metric — compare before/after sharding.
 //! Per-iter samples include ~30-60ns of clock-read overhead; treat p50/p99
 //! as upper-bound estimates of lookup latency under load.
@@ -26,7 +28,7 @@ const n_entries: u32 = 2000;
 const iters_per_thread: u32 = 200_000;
 const writer_period: u32 = 100;
 const arena_warmup: u32 = 256;
-const max_threads: usize = 16;
+const max_threads: usize = 64;
 
 const Mode = enum { ro, rw };
 
@@ -207,8 +209,8 @@ fn makeRun(
     }.r;
 }
 
-const ro_counts = [_]u32{ 1, 2, 4, 8, 16 };
-const rw_counts = [_]u32{ 2, 4, 8, 16 };
+const ro_counts = [_]u32{ 1, 2, 4, 8, 16, 32, 64 };
+const rw_counts = [_]u32{ 2, 4, 8, 16, 32, 64 };
 
 pub const benchmarks = blk: {
     var list: [ro_counts.len + rw_counts.len]Benchmark = undefined;

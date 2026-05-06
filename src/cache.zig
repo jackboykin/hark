@@ -691,7 +691,7 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
         const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
-        const shard = self.shardOf(probe);
+        const shard, const h = self.shardWithHash(probe);
 
         shard.rwlock.lockUncancelable(self.io);
         defer shard.rwlock.unlock(self.io);
@@ -700,11 +700,11 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        if (self.shouldBlockOverwrite(shard, key, security_status)) {
+        if (self.shouldBlockOverwrite(shard, h, key, security_status)) {
             alloc.free(key_name);
             return;
         }
-        removeAndFree(shard, key);
+        removeAndFreeHashed(shard, h, key);
 
         const cached_soa = buildCachedRecord(alloc, soa) catch {
             alloc.free(key_name);
@@ -748,7 +748,7 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
         const probe = CacheKey{ .name = lower_view, .rtype = rtype, .rclass = rclass };
-        const shard = self.shardOf(probe);
+        const shard, const h = self.shardWithHash(probe);
 
         shard.rwlock.lockUncancelable(self.io);
         defer shard.rwlock.unlock(self.io);
@@ -757,11 +757,11 @@ pub const RRsetCache = struct {
         const key_name = toLowerNameAlloc(alloc, name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
 
-        if (self.shouldBlockOverwrite(shard, key, security_status)) {
+        if (self.shouldBlockOverwrite(shard, h, key, security_status)) {
             alloc.free(key_name);
             return;
         }
-        removeAndFree(shard, key);
+        removeAndFreeHashed(shard, h, key);
         self.evictIfNeeded(shard);
 
         const now = self.now_fn();
@@ -813,8 +813,10 @@ pub const RRsetCache = struct {
     /// (refresh, zone-state flip), upgrades land (CD=1 revalidation),
     /// downgrades skip — so a forged `.insecure` cannot displace a real
     /// `.secure`, and a CD=1 `.unchecked` cannot displace either.
-    fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, key: CacheKey, new_status: SecurityStatus) bool {
-        const existing = shard.map.get(key) orelse return false;
+    /// Caller passes the precomputed hash to avoid double-hashing.
+    fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus) bool {
+        const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
+        const existing = shard.map.values()[idx];
         if (self.now_fn() >= existing.expiresAt()) return false;
         const existing_status: SecurityStatus = switch (existing) {
             .positive => |p| p.security_status,
@@ -900,7 +902,7 @@ pub const RRsetCache = struct {
         status: SecurityStatus,
     ) void {
         const probe = CacheKey{ .name = lower_name, .rtype = rr.rtype, .rclass = rr.rclass };
-        const shard = self.shardOf(probe);
+        const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockUncancelable(self.io);
         defer shard.rwlock.unlock(self.io);
 
@@ -908,11 +910,11 @@ pub const RRsetCache = struct {
         const key_name = alloc.dupe(u8, lower_name) catch return;
         const key = CacheKey{ .name = key_name, .rtype = rr.rtype, .rclass = rr.rclass };
 
-        if (self.shouldBlockOverwrite(shard, key, status)) {
+        if (self.shouldBlockOverwrite(shard, h, key, status)) {
             alloc.free(key_name);
             return;
         }
-        removeAndFree(shard, key);
+        removeAndFreeHashed(shard, h, key);
 
         const cached_records = alloc.alloc(CachedRecord, matches.len) catch {
             alloc.free(key_name);
@@ -990,8 +992,8 @@ pub const RRsetCache = struct {
 // private container type and these helpers need no access to RRsetCache
 // global config (now_fn, prefetch, etc.).
 
-fn removeAndFree(shard: *Shard, key: CacheKey) void {
-    const idx = shard.map.getIndex(key) orelse return;
+fn removeAndFreeHashed(shard: *Shard, h: u32, key: CacheKey) void {
+    const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return;
     removeAtIndex(shard, idx);
 }
 

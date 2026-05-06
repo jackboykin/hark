@@ -1,20 +1,29 @@
-[sieve_worst] p50=26021ns p99=35690ns mean=26665ns min=11663ns max=73072ns n=2000
+[sieve_worst] p50=26532ns p99=35950ns mean=27208ns min=11963ns max=77511ns n=2000
   storeResponse, fully-visited full cache (worst-case SIEVE scan)
-s p99=210ns mean=140ns min=110ns max=9388ns n=20000
+sieve---
+ns mean=127ns min=100ns max=47232ns n=20000
   lookup only (proposed hot path)
-[dedup_f01] p50=171ns p99=230ns mean=177ns min=140ns max=4308ns n=20000
+[dedup_f01] p50=171ns p99=231ns mean=175ns min=140ns max=9127ns n=20000
   lookupExists + lookup (dedup-skip fast path on hit)
-max=271760ns n=800000
-  threads=4 qps=12455616 reader_iters=800000 elapsed_ms=64
-[cache_contention_ro/t=8] p50=280ns p99=722ns mean=302ns min=100ns max=271839ns n=1600000
-  threads=8 qps=21922934 reader_iters=1600000 elapsed_ms=72
-[cache_contention_ro/t=16] p50=360ns p99=842ns mean=378ns min=100ns max=278722ns n=3200000
-  threads=16 qps=38787939 reader_iters=3200000 elapsed_ms=82
-[cache_contention_rw/t=2] p50=130ns p99=1212ns mean=481ns min=100ns max=153980ns n=200000
-  threads=2 qps=1986721 reader_iters=200000 elapsed_ms=100
-[cache_contention_rw/t=4] p50=150ns p99=942ns mean=556ns min=90ns max=287069ns n=600000
-  threads=4 qps=5035557 reader_iters=600000 elapsed_ms=119
-[cache_contention_rw/t=8] p50=200ns p99=992ns mean=655ns min=100ns max=284244ns n=1400000
-  threads=8 qps=9700149 reader_iters=1400000 elapsed_ms=144
-[cache_contention_rw/t=16] p50=350ns p99=1072ns mean=815ns min=100ns max=1019896ns n=3000000
-  threads=16 qps=17569744 reader_iters=3000000 elapsed_ms=170
+x=23074ns n=800000
+  threads=4 qps=17776771 reader_iters=800000 elapsed_ms=45
+[cache_contention_ro/t=8] p50=241ns p99=622ns mean=261ns min=100ns max=70878ns n=1600000
+  threads=8 qps=27687973 reader_iters=1600000 elapsed_ms=57
+[cache_contention_ro/t=16] p50=261ns p99=721ns mean=291ns min=90ns max=271879ns n=3200000
+  threads=16 qps=49352278 reader_iters=3200000 elapsed_ms=64
+[cache_contention_ro/t=32] p50=421ns p99=1062ns mean=445ns min=100ns max=3007031ns n=6400000
+  threads=32 qps=64904844 reader_iters=6400000 elapsed_ms=98
+[cache_contention_ro/t=64] p50=400ns p99=1032ns mean=709ns min=100ns max=15015925ns n=12800000
+  threads=64 qps=63058914 reader_iters=12800000 elapsed_ms=202
+[cache_contention_rw/t=2] p50=121ns p99=882ns mean=448ns min=100ns max=181233ns n=200000
+  threads=2 qps=2127456 reader_iters=200000 elapsed_ms=94
+[cache_contention_rw/t=4] p50=150ns p99=862ns mean=559ns min=100ns max=340623ns n=600000
+  threads=4 qps=5044536 reader_iters=600000 elapsed_ms=118
+[cache_contention_rw/t=8] p50=191ns p99=912ns mean=640ns min=100ns max=1007380ns n=1400000
+  threads=8 qps=10042057 reader_iters=1400000 elapsed_ms=139
+[cache_contention_rw/t=16] p50=260ns p99=952ns mean=724ns min=100ns max=393316ns n=3000000
+  threads=16 qps=19332293 reader_iters=3000000 elapsed_ms=155
+[cache_contention_rw/t=32] p50=400ns p99=1232ns mean=931ns min=100ns max=1709947ns n=6200000
+  threads=32 qps=31851731 reader_iters=6200000 elapsed_ms=194
+[cache_contention_rw/t=64] p50=400ns p99=1172ns mean=1271ns min=100ns max=57796421ns n=12600000
+  threads=64 qps=40767225 reader_iters=12600000 elapsed_ms=309
