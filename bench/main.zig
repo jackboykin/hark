@@ -7,6 +7,7 @@ pub const BenchResult = struct {
     alloc_bytes: u64 = 0,
     alloc_count: u64 = 0,
     label: ?[]const u8 = null,
+    label_owner: ?std.mem.Allocator = null,
 };
 
 pub const Benchmark = struct {
@@ -21,6 +22,7 @@ const cache_hit = @import("bench_cache_hit.zig");
 const dedup = @import("bench_dedup.zig");
 const upstream = @import("bench_upstream.zig");
 const delegation = @import("bench_delegation.zig");
+const cache_contention = @import("bench_cache_contention.zig");
 
 const benchmarks = [_]Benchmark{
     .{ .name = "self_test", .run = self_test.run },
@@ -34,7 +36,7 @@ const benchmarks = [_]Benchmark{
     .{ .name = "upstream_perquery", .run = upstream.runPerQuery },
     .{ .name = "upstream_persistent", .run = upstream.runPersistent },
     .{ .name = "delegation", .run = delegation.run },
-};
+} ++ cache_contention.benchmarks;
 
 fn percentile(sorted: []const i64, p: f64) i64 {
     const idx_f = @as(f64, @floatFromInt(sorted.len)) * p;
@@ -69,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
 
         const result = try b.run(allocator, io);
         defer allocator.free(result.samples_ns);
+        defer if (result.label_owner) |a| a.free(result.label.?);
 
         std.mem.sort(i64, result.samples_ns, {}, std.sort.asc(i64));
 
