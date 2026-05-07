@@ -1,0 +1,12 @@
+# hark throughput sweep — 2026-05-07T23:01:00Z
+# duration=15s inflight=8000 workers=2 latency_ms=25 (netem limit=200000)
+# threads > 256 measured with config cap (config.zig:129) bumped to 4096; reverted after.
+# Build: ReleaseFast. Peak NOERROR at t=3072 = 57k QPS; t=4096 regresses on thread overhead.
+# workload  threads     totqps   noerrqps     servfail%   lost%
+  miss      4           111408         78        99.93     0.13
+  miss      64          128883       1315        98.98     0.15
+  miss      256         130801       5232        96.00     0.12
+  miss      1024        116761      20188        82.71     0.13
+  miss      2048        109153      40256        63.12     0.02
+  miss      3072         88465      57299        35.23     0.07
+  miss      4096         71843      46346        35.49     0.00
