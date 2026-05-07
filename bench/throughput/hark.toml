@@ -1,0 +1,21 @@
+# Hark config for throughput bench. Listens on 127.0.0.1:5354 inside the
+# user+net namespace. Default hardcoded root_hints are reachable because run.sh
+# aliases 198.41.0.4 onto lo and points NSD at it.
+
+[server]
+listen = ["127.0.0.1:5354"]
+workers = 2
+resolution-threads = 4
+
+[resolver]
+mode = "recursive"
+dnssec = false
+qname-minimization = false
+case-randomization = false
+
+[cache]
+size = 16777216
+entries = 10000
+
+[logging]
+queries = false

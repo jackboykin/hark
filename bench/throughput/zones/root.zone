@@ -1,0 +1,14 @@
+$TTL 86400
+.       IN SOA a.root-servers.net. nstld.verisign-grs.com. (
+                2026050700      ; serial
+                1800            ; refresh
+                900             ; retry
+                604800          ; expire
+                86400 )         ; minimum
+
+.                       IN NS   a.root-servers.net.
+a.root-servers.net.     IN A    198.41.0.4
+
+; Delegation for test. — single NSD instance also serves the TLD.
+test.                   IN NS   ns.test.
+ns.test.                IN A    198.41.0.4

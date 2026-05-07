@@ -1,0 +1,26 @@
+# NSD config for hark throughput bench. Bound to 198.41.0.4 (a.root-servers.net)
+# inside a user+net namespace — that IP is aliased onto lo so hark's hardcoded
+# root_hints work unmodified. The literal __TMPDIR__ is replaced by run.sh.
+
+server:
+    ip-address: 198.41.0.4@53
+    do-ip4: yes
+    do-ip6: no
+    server-count: 1
+    username: ""
+    chroot: ""
+    zonesdir: "__BENCHDIR__/zones"
+    database: ""
+    pidfile: "__TMPDIR__/nsd.pid"
+    zonelistfile: "__TMPDIR__/nsd.zonelist"
+    xfrdfile: "__TMPDIR__/nsd.xfrd.state"
+    logfile: "__TMPDIR__/nsd.log"
+    verbosity: 1
+
+zone:
+    name: "."
+    zonefile: "root.zone"
+
+zone:
+    name: "test."
+    zonefile: "test.zone"
