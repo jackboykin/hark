@@ -171,7 +171,7 @@ pub const NsSelector = struct {
             // Float == is bit-exact here because discountZone floors both
             // fields back to the prior via @max with the same constants.
             samples[live_count] = if (state.alpha == alpha_prior and state.beta == beta_prior)
-                rand.uniformFloat(self.io)
+                rand.fastUniformFloat(self.io)
             else
                 betaSample(self.io, state.alpha, state.beta);
             live_count += 1;
@@ -186,7 +186,7 @@ pub const NsSelector = struct {
             for (0..dead_count) |d| {
                 dead_buf[d] = order_buf[max_order - 1 - d];
             }
-            rand.shuffle(usize, self.io, dead_buf[0..dead_count]);
+            rand.fastShuffle(usize, self.io, dead_buf[0..dead_count]);
             @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
         }
 
@@ -307,7 +307,7 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
         }
         v = v * v * v;
 
-        const u = rand.uniformFloat(io);
+        const u = rand.fastUniformFloat(io);
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
         // Slow accept
@@ -317,8 +317,8 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
 
 /// Standard normal via Box-Muller transform.
 fn normalSample(io: std.Io) f32 {
-    const r1 = rand.uniformFloat(io);
-    const r2 = rand.uniformFloat(io);
+    const r1 = rand.fastUniformFloat(io);
+    const r2 = rand.fastUniformFloat(io);
     // Avoid log(0)
     const safe_r1 = @max(r1, 1e-10);
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);

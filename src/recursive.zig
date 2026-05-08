@@ -1028,7 +1028,7 @@ pub const RecursiveResolver = struct {
         const server_order = if (self.ns_selector) |ns|
             ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
         else blk: {
-            rand.shuffle(na.Address, self.io, servers[0..server_count]);
+            rand.fastShuffle(na.Address, self.io, servers[0..server_count]);
             for (0..server_count) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..server_count];
         };
