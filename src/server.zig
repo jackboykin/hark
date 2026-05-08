@@ -282,6 +282,10 @@ pub const Server = struct {
     /// Number of workers that have finished binding their listen sockets.
     /// Each worker drops privileges itself once this reaches `workers`.
     bound_count: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
+    /// RFC 8109 priming: first pool thread to win the CAS issues a single
+    /// `. NS` recursive query so subsequent resolutions hit a warm cache
+    /// with the live root NS RRset (not just the in-source root_hints).
+    primed: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
@@ -1199,6 +1203,21 @@ const WorkerState = struct {
         var prefetch_pta: PerThreadArena = undefined;
         prefetch_pta.init(self.allocator, self.config.query_memory_limit);
         defer prefetch_pta.deinit();
+
+        // RFC 8109: first pool thread anywhere on this Server primes the
+        // cache with a live "." NS lookup. Single CAS gates the work, so
+        // sibling pool threads start serving immediately. On failure
+        // (no network at boot, all root hints unreachable) reset the flag
+        // so the next pool thread can retry — otherwise the resolver
+        // would run from root_hints permanently with no priming refresh.
+        if (self.server.primed.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
+            const alloc = query_pta.reset();
+            if (self.resolveWithDedupUsing(alloc, ".", .ns, false, transports)) |_| {
+                // success — leave primed=true; the prefetch path handles refresh.
+            } else |_| {
+                self.server.primed.store(false, .release);
+            }
+        }
 
         var pop_scratch: [max_work_query_bytes]u8 = undefined;
         while (self.queue.pop(&pop_scratch)) |item| {
