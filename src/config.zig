@@ -5,6 +5,7 @@ const Allocator = mem.Allocator;
 const toml = @import("toml.zig");
 const net_addr = @import("net_address.zig");
 const Address = net_addr.Address;
+const acl = @import("acl.zig");
 
 // ── ServerConfig ───────────────────────────────────────────────────────
 
@@ -36,6 +37,11 @@ pub const ServerConfig = struct {
     drop_uid: ?u32,
     drop_gid: ?u32,
 
+    /// BCP 140: per-listener client ACL. Empty list means "no ACL" — every
+    /// client allowed. Operators binding non-loopback addresses MUST set
+    /// this or accept that they have an open recursive resolver.
+    allow_from: []acl.Cidr,
+
     allocator: Allocator,
 
     pub const Mode = enum { recursive, forward };
@@ -43,6 +49,7 @@ pub const ServerConfig = struct {
     pub fn deinit(self: *ServerConfig) void {
         self.allocator.free(self.listen);
         self.allocator.free(self.upstreams);
+        self.allocator.free(self.allow_from);
     }
 };
 
@@ -53,6 +60,7 @@ pub const ConfigError = error{
     InvalidValue,
     InvalidWorkerCount,
     InvalidQueryMemoryLimit,
+    InvalidAclEntry,
     ForwardingRequiresUpstreams,
     ConfigFileTooLarge,
     OutOfMemory,
@@ -67,6 +75,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
     const empty_upstreams = allocator.alloc(Address, 0) catch return error.OutOfMemory;
+    const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
 
     return .{
         .listen = listen,
@@ -96,6 +105,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .max_udp_payload = @import("dns.zig").edns_udp_payload,
         .drop_uid = null,
         .drop_gid = null,
+        .allow_from = empty_acl,
         .allocator = allocator,
     };
 }
@@ -136,6 +146,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (try nonNegativeClamped(u32, server, "user")) |u| cfg.drop_uid = u;
         if (try nonNegativeClamped(u32, server, "group")) |g| cfg.drop_gid = g;
+        if (server.getStringArray("allow-from")) |entries| {
+            allocator.free(cfg.allow_from);
+            cfg.allow_from = try parseCidrList(allocator, entries);
+        }
     }
 
     // [resolver] section
@@ -212,6 +226,15 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
     }
 
     return parseConfig(allocator, contents.items);
+}
+
+fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
+    const list = allocator.alloc(acl.Cidr, strs.len) catch return error.OutOfMemory;
+    errdefer allocator.free(list);
+    for (strs, 0..) |s, i| {
+        list[i] = acl.parse(s) orelse return error.InvalidAclEntry;
+    }
+    return list;
 }
 
 fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]Address {

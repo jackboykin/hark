@@ -12,6 +12,7 @@ const max_operations = @import("event_loop.zig").max_operations;
 const OperationId = @import("event_loop.zig").OperationId;
 const recursive = @import("recursive.zig");
 const RecursiveResolver = recursive.RecursiveResolver;
+const acl = @import("acl.zig");
 const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
@@ -421,11 +422,11 @@ pub const Server = struct {
             log.info("listening on {s} (UDP+TCP)", .{addr_str});
         }
 
-        if (self.config.mode == .recursive) {
+        if (self.config.mode == .recursive and self.config.allow_from.len == 0) {
             for (listen_addrs) |addr| {
                 if (isNonLoopback(addr)) {
-                    log.warn("listening on a non-loopback address with recursion enabled — " ++
-                        "this server is an open resolver; consider adding access controls", .{});
+                    log.warn("listening on a non-loopback address with recursion enabled and no [server].allow-from set — " ++
+                        "this server is an open resolver (BCP 140)", .{});
                     break;
                 }
             }
@@ -921,6 +922,21 @@ const WorkerState = struct {
                         switch (c.result) {
                             .accept => |acc| {
                                 if (acc.err == null and acc.fd >= 0) {
+                                    // BCP 140: drop TCP from disallowed sources by
+                                    // closing the connection without reading. ACL
+                                    // check is gated on a non-empty list to avoid
+                                    // a getpeername syscall in the open-recursive
+                                    // / loopback-only common case.
+                                    if (self.config.allow_from.len > 0) {
+                                        const peer = na.getPeerName(acc.fd) catch {
+                                            sys.close(acc.fd);
+                                            continue;
+                                        };
+                                        if (!acl.allow(self.config.allow_from, peer)) {
+                                            sys.close(acc.fd);
+                                            continue;
+                                        }
+                                    }
                                     if (!self.queue.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), acc.fd, .tcp)) {
                                         // Drop silently (no SERVFAIL): we haven't read the
                                         // query yet so we don't have an ID, and reading it
@@ -990,6 +1006,11 @@ const WorkerState = struct {
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
         if (data.len < 12) return;
+        // BCP 140: silently drop UDP from sources outside allow-from. Replying
+        // with REFUSED would still amplify and confirm the resolver exists;
+        // a drop is the only correct anti-reflection behavior. Empty list ==
+        // no ACL == accept all (back-compat).
+        if (!acl.allow(self.config.allow_from, client_addr)) return;
         // RFC 1035 §4.1.1: drop QR=1 silently. Treating a spoofed response
         // as a query would let an attacker reflect upstream resolutions
         // off this server.

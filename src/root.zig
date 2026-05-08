@@ -24,6 +24,7 @@ pub const monotonic = @import("monotonic.zig");
 pub const sys = @import("sys.zig");
 pub const net_address = @import("net_address.zig");
 pub const special_use = @import("special_use.zig");
+pub const acl = @import("acl.zig");
 
 test {
     _ = dns;
@@ -53,4 +54,5 @@ test {
     _ = sys;
     _ = net_address;
     _ = special_use;
+    _ = acl;
 }
