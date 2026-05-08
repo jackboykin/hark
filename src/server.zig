@@ -84,13 +84,28 @@ const PerThreadArena = struct {
 
 // ── Work Queue for resolution thread pool ─────────────────────────────
 
+/// Buffer slot for a queued query. Sized for any reasonable Do53 wire
+/// query (RFC 1035 caps QNAME at 255 bytes; with EDNS this fits well
+/// under 4 KiB). Dispatch ignores items > this on push.
+const max_work_query_bytes = 4096;
+
 const WorkItem = struct {
-    query_buf: [4096]u8 = undefined,
+    query_buf: [max_work_query_bytes]u8 = undefined,
     query_len: u16 = 0,
     client_addr: na.Address = na.initIp4(.{ 0, 0, 0, 0 }, 0),
     sock_fd: posix.fd_t = -1,
     protocol: Protocol = .udp,
     const Protocol = enum { udp, tcp };
+};
+
+/// What `pop` hands back: small metadata + a slice into the caller's
+/// scratch buffer holding the live query bytes only. Avoids a 4 KiB
+/// by-value copy of WorkItem on every dispatch.
+const PopResult = struct {
+    query_data: []const u8,
+    client_addr: na.Address,
+    sock_fd: posix.fd_t,
+    protocol: WorkItem.Protocol,
 };
 
 const WorkQueue = struct {
@@ -107,7 +122,7 @@ const WorkQueue = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.count >= work_queue_capacity) return false;
-        if (data.len > 4096) return false;
+        if (data.len > max_work_query_bytes) return false;
         const item = &self.items[self.tail];
         @memcpy(item.query_buf[0..data.len], data);
         item.query_len = @intCast(data.len);
@@ -120,17 +135,29 @@ const WorkQueue = struct {
         return true;
     }
 
-    fn pop(self: *WorkQueue) ?WorkItem {
+    /// Pop a slot, copying only the live query bytes into `scratch` so we
+    /// can release the slot for re-push immediately. The returned slice
+    /// borrows from `scratch` and is valid until the next `pop` on the
+    /// same buffer.
+    fn pop(self: *WorkQueue, scratch: *[max_work_query_bytes]u8) ?PopResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         while (self.count == 0 and !self.shutdown) {
             self.not_empty.waitUncancelable(self.io, &self.mutex);
         }
         if (self.count == 0) return null;
-        const item = self.items[self.head];
+        const slot = &self.items[self.head];
+        const len = slot.query_len;
+        @memcpy(scratch[0..len], slot.query_buf[0..len]);
+        const result = PopResult{
+            .query_data = scratch[0..len],
+            .client_addr = slot.client_addr,
+            .sock_fd = slot.sock_fd,
+            .protocol = slot.protocol,
+        };
         self.head = (self.head + 1) % work_queue_capacity;
         self.count -= 1;
-        return item;
+        return result;
     }
 
     fn signalShutdown(self: *WorkQueue) void {
@@ -1162,11 +1189,12 @@ const WorkerState = struct {
         prefetch_pta.init(self.allocator, self.config.query_memory_limit);
         defer prefetch_pta.deinit();
 
-        while (self.queue.pop()) |item| {
+        var pop_scratch: [max_work_query_bytes]u8 = undefined;
+        while (self.queue.pop(&pop_scratch)) |item| {
             switch (item.protocol) {
                 .udp => self.processUdpQuery(
                     item.sock_fd,
-                    item.query_buf[0..item.query_len],
+                    item.query_data,
                     item.client_addr,
                     transports,
                     &query_pta,
