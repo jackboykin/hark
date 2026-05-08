@@ -266,6 +266,32 @@ pub const RecursiveResolver = struct {
                 }
             }
 
+            // RFC 8020: NXDOMAIN means there is nothing underneath. If any
+            // unsigned ancestor has a cached NXDOMAIN, this child does not
+            // exist either — short-circuit. Signed-zone NXDOMAIN cuts go
+            // through the NSEC aggressive-use path below.
+            if (!self.bypass_cache) {
+                if (self.cache) |c| {
+                    if (c.lookupNxdomainAncestor(allocator, current_name, qtype, .in)) |result| {
+                        switch (result) {
+                            .negative => |n| {
+                                const authorities = if (n.soa) |soa| blk: {
+                                    const auths = try allocator.alloc(dns.ResourceRecord, 1);
+                                    auths[0] = soa;
+                                    break :blk auths;
+                                } else &[_]dns.ResourceRecord{};
+                                return .{
+                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, .name_error, false)),
+                                    .prefetch_name = null,
+                                    .prefetch_qtype = qtype,
+                                };
+                            },
+                            .hit => {},
+                        }
+                    }
+                }
+            }
+
             var target_name = try dns.parseDottedName(allocator, current_name);
 
             // NSEC CACHE: synthesize negative responses from cached NSEC proofs (RFC 8198).

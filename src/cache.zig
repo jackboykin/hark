@@ -592,6 +592,39 @@ pub const RRsetCache = struct {
         }
     }
 
+    /// RFC 8020: if any ancestor of `name` is cached as NXDOMAIN for the same
+    /// qtype, every name beneath it is non-existent — short-circuit without
+    /// going to network. Restricted to unsigned cached negatives: signed
+    /// zones go through NSEC/NSEC3 aggressive use (RFC 8198) which has its
+    /// own dedicated cache. Returns the matching negative if found.
+    pub fn lookupNxdomainAncestor(
+        self: *RRsetCache,
+        caller_alloc: Allocator,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+    ) ?CacheLookupResult {
+        var rest = name;
+        // Strip the leftmost label and probe every suffix.
+        while (mem.indexOfScalar(u8, rest, '.')) |dot| {
+            if (dot + 1 >= rest.len) break; // trailing dot only
+            const ancestor = rest[dot + 1 ..];
+            if (ancestor.len == 0) break;
+            if (self.lookup(caller_alloc, ancestor, rtype, rclass)) |result| {
+                switch (result) {
+                    .negative => |n| {
+                        if (n.rcode == .name_error and n.security_status != .secure) {
+                            return result;
+                        }
+                    },
+                    .hit => {},
+                }
+            }
+            rest = ancestor;
+        }
+        return null;
+    }
+
     /// Evaluate freshness for a cache entry, bumping hit/miss/stale counters.
     /// Returns null on full miss (expired beyond stale window, or stale disabled).
     /// On stale hit, returns force_unchecked=true: RRSIGs may have expired since
@@ -1339,6 +1372,39 @@ test "storeNegative accepts parent-zone SOA" {
         },
         .hit => return error.TestUnexpectedResult,
     }
+}
+
+test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // Cache NXDOMAIN at "missing.example.com" for qtype A.
+    const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
+    cache.storeNegative("missing.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Looking up the *parent* directly returns the NXDOMAIN.
+    const direct = cache.lookup(arena.allocator(), "missing.example.com", .a, .in);
+    try testing.expect(direct != null);
+
+    // Querying a *child* of the cached NXDOMAIN should walk up via
+    // lookupNxdomainAncestor and find the parent NXDOMAIN.
+    const result = cache.lookupNxdomainAncestor(arena.allocator(), "child.missing.example.com", .a, .in);
+    try testing.expect(result != null);
+    switch (result.?) {
+        .negative => |n| try testing.expectEqual(dns.RCode.name_error, n.rcode),
+        .hit => return error.TestUnexpectedResult,
+    }
+
+    // A query for an unrelated parent miss returns null.
+    const miss = cache.lookupNxdomainAncestor(arena.allocator(), "child.exists.example.com", .a, .in);
+    try testing.expect(miss == null);
 }
 
 test "storeNegative caps TTL at 3h (RFC 2308 §5)" {
