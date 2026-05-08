@@ -964,9 +964,9 @@ const WorkerState = struct {
         self.loop.flush();
     }
 
-    fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
+    fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
-        if (serializeErrorResponse(&wire_buf, id, rcode, extended_rcode, rd, questions)) |wire| {
+        if (serializeErrorResponse(&wire_buf, id, opcode, rcode, extended_rcode, rd, questions)) |wire| {
             self.sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -994,14 +994,15 @@ const WorkerState = struct {
         const rd = data[2] & 0x01 != 0; // RFC 1035 §4.1.1: echo RD in response
         // Pre-validate from raw header bytes to avoid wasting pool threads
         // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
-        const opcode: u4 = @truncate(data[2] >> 3);
-        if (opcode != 0) { // Only QUERY (0) supported
-            self.sendErrorUdp(sock, id, .not_implemented, 0, rd, &.{}, client_addr);
+        const opcode_bits: u4 = @truncate(data[2] >> 3);
+        const client_opcode: dns.OpCode = @enumFromInt(opcode_bits);
+        if (opcode_bits != 0) { // Only QUERY (0) supported
+            self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, client_addr);
             return;
         }
         const qdcount = mem.readInt(u16, data[4..6], .big);
         if (qdcount != 1) {
-            self.sendErrorUdp(sock, id, .format_error, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, .query, .format_error, 0, rd, &.{}, client_addr);
             return;
         }
         if (!self.queue.push(data, client_addr, sock, .udp)) {
@@ -1060,9 +1061,10 @@ const WorkerState = struct {
             const data = query_buf[0..msg_len];
 
             const query = dns.parseMessage(alloc, data) catch {
-                if (data.len >= 2) {
+                if (data.len >= 3) {
                     const id = mem.readInt(u16, data[0..2], .big);
-                    const w = serializeErrorResponse(&response_wire, id, .format_error, 0, false, &.{}) orelse return;
+                    const op_bits: u4 = @truncate(data[2] >> 3);
+                    const w = serializeErrorResponse(&response_wire, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}) orelse return;
                     tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
@@ -1070,7 +1072,7 @@ const WorkerState = struct {
             };
 
             if (validateQuery(query)) |fail| {
-                const w = serializeErrorResponse(&response_wire, query.header.id, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.opcode, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
                 tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
@@ -1085,7 +1087,7 @@ const WorkerState = struct {
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 self.cache.cacheServfail(name_str, question.qtype);
-                const w = serializeErrorResponse(&response_wire, query.header.id, .server_failure, 0, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.opcode, .server_failure, 0, query.header.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
                 tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
                 continue;
@@ -1235,15 +1237,17 @@ const WorkerState = struct {
         const alloc = query_pta.reset();
 
         const query_msg = dns.parseMessage(alloc, data) catch {
-            if (data.len >= 2) {
+            if (data.len >= 3) {
                 const id = mem.readInt(u16, data[0..2], .big);
-                self.sendErrorUdp(sock, id, .format_error, 0, false, &.{}, client_addr);
+                // Best-effort opcode echo from raw header even when parse failed.
+                const op_bits: u4 = @truncate(data[2] >> 3);
+                self.sendErrorUdp(sock, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}, client_addr);
             }
             return;
         };
 
         if (validateQuery(query_msg)) |fail| {
-            self.sendErrorUdp(sock, query_msg.header.id, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1266,7 +1270,7 @@ const WorkerState = struct {
             var qtype_buf1: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             self.cache.cacheServfail(name_str, question.qtype);
-            self.sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1288,7 +1292,7 @@ const WorkerState = struct {
                 self.sendUdpResponse(sock, wire, client_addr);
             }
         } else {
-            self.sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
         }
 
         self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
@@ -1714,6 +1718,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     var buf: [dns.edns_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 1,
+        .opcode = .query,
         .rd = true,
         .cd = false, // CD=0 client — asking us to validate
         .questions = questions,
@@ -1736,6 +1741,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     var buf2: [dns.edns_udp_payload]u8 = undefined;
     const wire2 = buildResponseWire(&buf2, .{
         .query_id = 2,
+        .opcode = .query,
         .rd = true,
         .cd = false,
         .questions = questions,

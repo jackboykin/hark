@@ -42,6 +42,7 @@ fn isDnssecAuthRR(rtype: dns.RType) bool {
 
 pub const ResponseContext = struct {
     query_id: u16,
+    opcode: dns.OpCode,
     rd: bool,
     cd: bool,
     questions: []const dns.Question,
@@ -54,6 +55,7 @@ pub const ResponseContext = struct {
         const client_do = query.opt != null and query.opt.?.do_bit;
         return .{
             .query_id = query.header.id,
+            .opcode = query.header.opcode,
             .rd = query.header.rd,
             .cd = query.header.cd,
             .questions = query.questions,
@@ -95,7 +97,7 @@ pub fn buildResponseWire(
         .header = .{
             .id = ctx.query_id,
             .qr = true,
-            .opcode = .query,
+            .opcode = ctx.opcode,
             .aa = false,
             .tc = false,
             .rd = ctx.rd,
@@ -121,27 +123,26 @@ pub fn buildResponseWire(
         if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
-    // Drop additionals
+    // Drop additionals (RFC 1035 §4.2.1: additionals are advisory; their
+    // omission alone does not require TC=1).
     msg.additionals = &.{};
     msg.header.ar_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
         if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
-    // Drop authorities
+    // Drop authorities — TC=1 from this point on. RFC 1035 §4.2.1 / 2181 §9:
+    // when an authoritative section that the client may need (negative SOA,
+    // referral NS) is omitted, the truncation flag MUST be set so the client
+    // knows to retry over TCP.
+    msg.header.tc = true;
     msg.authorities = &.{};
     msg.header.ns_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
         if (wire.len <= ctx.max_payload) return wire;
     } else |_| {}
 
-    // TC bit with answers
-    msg.header.tc = true;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
-    } else |_| {}
-
-    // TC with no answers
+    // Last resort: drop answers, keep TC=1.
     msg.answers = &.{};
     msg.header.an_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
@@ -154,6 +155,7 @@ pub fn buildResponseWire(
 pub fn serializeErrorResponse(
     wire_buf: []u8,
     query_id: u16,
+    opcode: dns.OpCode,
     rcode: dns.RCode,
     extended_rcode: u8,
     rd: bool,
@@ -170,7 +172,10 @@ pub fn serializeErrorResponse(
         .header = .{
             .id = query_id,
             .qr = true,
-            .opcode = .query,
+            // RFC 1035 §4.1.1: response OPCODE echoes the query's OPCODE.
+            // Hardcoding .query here would mislabel NOTIMP responses to
+            // OPCODE=4/5 (Notify/Update) as ordinary QUERY replies.
+            .opcode = opcode,
             .aa = false,
             .tc = false,
             .rd = rd,
@@ -247,6 +252,7 @@ test "buildResponseWire sets correct header fields" {
     var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x1234,
+        .opcode = .query,
         .rd = true,
         .cd = false,
         .questions = questions,
@@ -299,6 +305,7 @@ test "buildResponseWire with EDNS0" {
     var buf: [dns.edns_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x5678,
+        .opcode = .query,
         .rd = true,
         .cd = false,
         .questions = questions,
@@ -368,6 +375,7 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
     var buf: [dns.max_udp_payload]u8 = undefined;
     const result = buildResponseWire(&buf, .{
         .query_id = 0x1234,
+        .opcode = .query,
         .rd = true,
         .cd = false,
         .questions = questions,
@@ -389,7 +397,7 @@ test "serializeErrorResponse produces valid DNS message" {
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .refused, 0, true, questions).?;
+    const wire = serializeErrorResponse(&buf, 0xABCD, .query, .refused, 0, true, questions).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
@@ -402,7 +410,7 @@ test "serializeErrorResponse produces valid DNS message" {
 
 test "serializeErrorResponse with no question (parse failure)" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .format_error, 0, false, &.{}).?;
+    const wire = serializeErrorResponse(&buf, 0x1234, .query, .format_error, 0, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -439,9 +447,98 @@ test "validateQuery returns BADVERS for unsupported EDNS version" {
     try testing.expectEqual(@as(u8, 1), fail.extended_rcode);
 }
 
+test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
+    // OPCODE 5 (Update — not in the named enum, use @enumFromInt). A server
+    // replying NOTIMP must echo the OPCODE so the client can match the
+    // response to its request.
+    const opcode_update: dns.OpCode = @enumFromInt(5);
+    var buf: [dns.max_udp_payload]u8 = undefined;
+    const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, &.{}).?;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns.parseMessage(arena.allocator(), wire);
+    try testing.expectEqual(@as(u4, 5), @intFromEnum(parsed.header.opcode));
+    try testing.expectEqual(dns.RCode.not_implemented, parsed.header.rcode);
+}
+
+test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.2.1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const name = try dns.parseDottedName(a, "example.com");
+    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
+
+    // Build a response whose authority section forces a payload between
+    // (additionals-dropped fits) and (answers fits but authorities don't).
+    // 12 NS records overflow the small payload but the answers alone fit.
+    var ns_authorities: [12]dns.ResourceRecord = undefined;
+    for (&ns_authorities, 0..) |*rr, i| {
+        const ns_label = try std.fmt.allocPrint(a, "ns{d}.long.example.com.", .{i});
+        const ns_name = try dns.parseDottedName(a, ns_label);
+        rr.* = .{
+            .name = name,
+            .rtype = .ns,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .ns = ns_name },
+        };
+    }
+    const a_record = dns.ResourceRecord{
+        .name = name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 60,
+        .rdata = .{ .a = .{ 192, 0, 2, 1 } },
+    };
+
+    const response = dns.Message{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 0,
+            .an_count = 1,
+            .ns_count = ns_authorities.len,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = &.{a_record},
+        .authorities = &ns_authorities,
+    };
+
+    // Tight payload — answers fit, authorities don't.
+    var buf: [120]u8 = undefined;
+    const wire = buildResponseWire(&buf, .{
+        .query_id = 0x4242,
+        .opcode = .query,
+        .rd = false,
+        .cd = false,
+        .questions = questions,
+        .client_edns = false,
+        .client_do = false,
+        .client_wants_ad = false,
+        .max_payload = buf.len,
+    }, response, a).?;
+
+    const parsed = try dns.parseMessage(a, wire);
+    try testing.expectEqual(true, parsed.header.tc);
+    try testing.expectEqual(@as(u16, 0), parsed.header.ns_count);
+    try testing.expectEqual(@as(u16, 1), parsed.header.an_count);
+}
+
 test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .no_error, 1, false, &.{}).?;
+    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
