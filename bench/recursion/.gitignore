@@ -1,0 +1,10 @@
+# Shotgun + dnsjit checkouts (cloned by run.sh).
+.shotgun/
+.dnsjit/
+
+# Captured pellets contain real DNS queries — keep out of git.
+*.pcap
+*.pcapng
+
+# Bench outputs.
+outputs/

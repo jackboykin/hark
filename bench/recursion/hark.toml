@@ -1,0 +1,24 @@
+# Hark config for recursion-time bench. Runs on the host (no netns) so the
+# resolver can reach real roots/TLDs/auths on the public internet.
+#
+# Production-representative defaults: DNSSEC on, qname minimization on,
+# 0x20 case randomization on (when supported). Cache sized large enough that
+# pellet replay doesn't churn on capacity eviction.
+
+[server]
+listen = ["127.0.0.1:5354"]
+workers = 4
+resolution-threads = 16
+
+[resolver]
+mode = "recursive"
+dnssec = true
+qname-minimization = true
+case-randomization = true
+
+[cache]
+size = 268435456    # 256 MiB
+entries = 200000
+
+[logging]
+queries = false

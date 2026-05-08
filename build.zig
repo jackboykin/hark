@@ -62,4 +62,17 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&bench_run.step);
     if (b.args) |args| bench_run.addArgs(args);
+
+    const synth_pellet_exe = b.addExecutable(.{
+        .name = "synth-pellet",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/recursion/synth_pellet.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "hark", .module = mod }},
+        }),
+    });
+    const synth_pellet_install = b.addInstallArtifact(synth_pellet_exe, .{});
+    const synth_pellet_step = b.step("synth-pellet", "Build the recursion-bench pellet synthesizer (zig-out/bin/synth-pellet)");
+    synth_pellet_step.dependOn(&synth_pellet_install.step);
 }
