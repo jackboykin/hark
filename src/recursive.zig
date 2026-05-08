@@ -464,6 +464,11 @@ pub const RecursiveResolver = struct {
                             .skip_cache => {},
                             .bogus => return self.bogusServfail(current_name, qtype),
                         }
+                    } else if (response.header.rcode == .server_failure or response.header.rcode == .refused) {
+                        // RFC 9520 §3: cache the resolution failure so the
+                        // next stub retry doesn't re-walk the whole upstream
+                        // chain. 5 s TTL is enforced by storeNegativeBare.
+                        if (self.cache) |c| c.cacheServfail(current_name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -581,6 +586,12 @@ pub const RecursiveResolver = struct {
                             .skip_cache => {},
                             .bogus => return self.bogusServfail(current_name, qtype),
                         }
+                    } else {
+                        // Non-authoritative server returned no answer and no
+                        // referral — we can't continue resolution. RFC 9520 §3
+                        // calls this a resolution failure; cache so the next
+                        // stub retry doesn't re-walk the chain.
+                        if (self.cache) |c| c.cacheServfail(current_name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };

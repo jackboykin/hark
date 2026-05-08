@@ -10,6 +10,8 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 /// Maximum TTL for cached entries (1 week). Prevents unreasonably long
 /// cache lifetimes from malicious or misconfigured responses.
 const max_cache_ttl: u32 = 604_800;
+/// RFC 9520 §3: resolution-failure cache MUST NOT exceed 5 minutes.
+const servfail_max_ttl: u32 = 300;
 
 /// Max records per RRset in single-pass store (DNS wire format bounds the total).
 const max_rrset_collect: usize = 64;
@@ -735,8 +737,11 @@ pub const RRsetCache = struct {
 
         const now = self.now_fn();
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
-        // DNSSEC SERVFAIL). Only cap at max_cache_ttl.
-        const capped_ttl = @min(ttl, max_cache_ttl);
+        // DNSSEC SERVFAIL). RFC 9520 §3 caps resolution-failure caching at
+        // 5 minutes; NXDOMAIN/NODATA still get the full max_cache_ttl
+        // (those are RFC 2308-shaped definitive answers, not failures).
+        const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else max_cache_ttl;
+        const capped_ttl = @min(ttl, ceiling);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
@@ -750,6 +755,13 @@ pub const RRsetCache = struct {
         };
         markLastVisited(slot.shard);
         _ = slot.shard.negative_stores.fetchAdd(1, .monotonic);
+    }
+
+    /// Cache a resolution failure per RFC 9520 §3. TTL chosen short (5 s)
+    /// — long enough to absorb a misbehaving stub's retry storm, short
+    /// enough that recovery from a transient upstream failure is fast.
+    pub fn cacheServfail(self: *RRsetCache, name: []const u8, rtype: dns.RType) void {
+        self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked);
     }
 
     /// True if a non-expired positive entry exists for (name, rtype, rclass)
@@ -1567,6 +1579,48 @@ test "SERVFAIL never serves stale" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), "bogus.test", .a, .in) == null);
+}
+
+test "RFC 9520: SERVFAIL TTL clamped to 5 minutes" {
+    // Per §3, the resolution-failure cache MUST NOT exceed 5 minutes,
+    // even if a caller passes a larger TTL.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    cache.storeNegativeBare("flooded.test", .a, .in, .server_failure, 86400, .unchecked);
+
+    // 301s after store: must miss. If the clamp regresses to max_cache_ttl
+    // the entry would still be live for hours.
+    test_time = 1000 + 301;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), "flooded.test", .a, .in) == null);
+}
+
+test "cacheServfail caches with sub-5-minute TTL" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    cache.cacheServfail("broken.test", .a);
+
+    // Cache hit during the failure window short-circuits upstream walk.
+    test_time = 1003;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "broken.test", .a, .in);
+    try testing.expect(result != null);
+    switch (result.?) {
+        .negative => |n| try testing.expectEqual(dns.RCode.server_failure, n.rcode),
+        .hit => return error.TestUnexpectedResult,
+    }
 }
 
 test "cache min TTL floor" {
