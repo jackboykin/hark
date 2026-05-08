@@ -10,6 +10,11 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 /// Maximum TTL for cached entries (1 week). Prevents unreasonably long
 /// cache lifetimes from malicious or misconfigured responses.
 const max_cache_ttl: u32 = 604_800;
+/// RFC 2308 §5: MAX_NCACHE_TTL SHOULD be a maximum default of 3 hours.
+/// BIND/Unbound default to 24h, but pedantic compliance keeps the
+/// receiver inside the spec recommendation. Stops a misconfigured or
+/// malicious authority from pinning a stale negative for up to a week.
+const negative_max_ttl: u32 = 10_800;
 /// RFC 9520 §3: resolution-failure cache MUST NOT exceed 5 minutes.
 const servfail_max_ttl: u32 = 300;
 
@@ -699,7 +704,8 @@ pub const RRsetCache = struct {
         };
 
         const now = self.now_fn();
-        const capped_ttl = clampTtl(self.min_ttl, neg_ttl);
+        // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
+        const capped_ttl = @min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
@@ -738,9 +744,8 @@ pub const RRsetCache = struct {
         const now = self.now_fn();
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
         // DNSSEC SERVFAIL). RFC 9520 §3 caps resolution-failure caching at
-        // 5 minutes; NXDOMAIN/NODATA still get the full max_cache_ttl
-        // (those are RFC 2308-shaped definitive answers, not failures).
-        const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else max_cache_ttl;
+        // 5 minutes; NXDOMAIN/NODATA at RFC 2308 §5's 3h SHOULD ceiling.
+        const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         const capped_ttl = @min(ttl, ceiling);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
@@ -930,8 +935,15 @@ pub const RRsetCache = struct {
             return;
         }
 
+        // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
+        // facing heterogeneous TTLs MUST treat the RRset as having a single
+        // TTL — the minimum of the members.
+        var min_ttl: u32 = std.math.maxInt(u32);
+        for (matches) |m| {
+            if (m.ttl < min_ttl) min_ttl = m.ttl;
+        }
         const now = self.now_fn();
-        const capped_ttl = clampTtl(self.min_ttl, rr.ttl);
+        const capped_ttl = clampTtl(self.min_ttl, min_ttl);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .records = cached_records,
             .expires_at = now + @as(i64, capped_ttl),
@@ -1326,6 +1338,75 @@ test "storeNegative accepts parent-zone SOA" {
             try testing.expectEqual(dns.RCode.name_error, n.rcode);
         },
         .hit => return error.TestUnexpectedResult,
+    }
+}
+
+test "storeNegative caps TTL at 3h (RFC 2308 §5)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // SOA with TTL = MINIMUM = 1 week. RFC 2308 §5 caps the negative cache
+    // lifetime at 3 hours (SHOULD) regardless of what the SOA advertises.
+    const big_ttl: u32 = 604_800;
+    const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, big_ttl, big_ttl);
+    defer freeTestAuthorities(alloc, authorities);
+
+    cache.storeNegative("missing.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "missing.com", .a, .in);
+    try testing.expect(result != null);
+    switch (result.?) {
+        .negative => |n| {
+            try testing.expect(n.remaining_ttl <= negative_max_ttl);
+            try testing.expect(n.remaining_ttl > 0);
+        },
+        .hit => return error.TestUnexpectedResult,
+    }
+}
+
+test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // Two A records for the same name, deliberately heterogeneous TTLs.
+    // The cache must adopt the minimum (60), not the first-seen value (300).
+    const name = try makeTestName(alloc, &.{ "example", "com" });
+    defer dns.freeName(alloc, name);
+    const records = [_]dns.ResourceRecord{
+        .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
+        .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } },
+    };
+
+    const question = dns.Question{ .name = name, .qtype = .a, .qclass = .in };
+    const msg = dns.Message{
+        .header = .{
+            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
+            .rd = false, .ra = true, .z = 0, .ad = false, .cd = false,
+            .rcode = .no_error,
+            .qd_count = 1, .an_count = records.len, .ns_count = 0, .ar_count = 0,
+        },
+        .questions = &.{question},
+        .answers = &records,
+    };
+    cache.storeResponse(msg, dns.Name{ .labels = &.{} });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
+    try testing.expect(result != null);
+    switch (result.?) {
+        .hit => |h| {
+            try testing.expectEqual(@as(u32, 60), h.remaining_ttl);
+        },
+        .negative => return error.TestUnexpectedResult,
     }
 }
 
