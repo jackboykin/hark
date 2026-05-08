@@ -1179,11 +1179,16 @@ pub const RecursiveResolver = struct {
                                     }
                                     // TLS error/unparseable — fall through to Do53
                                 } else |_| {
-                                    oc.markFailed(tls_key);
+                                    // RFC 9539 §4.3: a query-time TLS error
+                                    // on a previously-capable server is soft
+                                    // (timeout, RST, transient). Don't evict
+                                    // the encrypted path for an hour because
+                                    // of one flaky packet.
+                                    oc.markSoftFailed(tls_key);
                                 }
                             },
                             .unknown => {}, // First contact → Do53 now, probe after
-                            .probing, .failed => {}, // Skip, go straight to Do53
+                            .probing, .failed, .soft_failed => {}, // Skip, go straight to Do53
                         }
                     }
                 }

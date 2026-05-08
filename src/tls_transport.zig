@@ -240,8 +240,11 @@ pub const TlsTransport = struct {
 
         var self = transport; // value copy owned by this thread
 
+        // RFC 9539 §4.3: TCP connect failure is "soft" — could be a
+        // transient network blip; retry sooner. TLS handshake failure is
+        // "hard" — server reached us but rejected the protocol; damp longer.
         const sock = connectTcpBlocking(tls_server, 4000) catch {
-            enc_ns_cache.markFailed(addr_key);
+            enc_ns_cache.markSoftFailed(addr_key);
             return;
         };
 

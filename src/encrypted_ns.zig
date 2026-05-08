@@ -5,8 +5,17 @@ const na = @import("net_address.zig");
 const posix = std.posix;
 const AddressKey = na.AddressKey;
 
-/// How long a failed probe is damped before re-probing (1 hour).
+/// How long a hard-failed probe is damped (1 hour). Hard failures are
+/// definitive signals the server does not speak DoT — TLS handshake
+/// rejection, ALPN mismatch, cert validation in strict mode.
 const damping_sec: i64 = 3600;
+
+/// How long a soft-failed probe is damped (60 s). Soft failures are
+/// transient: TCP connect timeout, network unreachable, RST mid-stream.
+/// RFC 9539 §4.3 contemplates this distinction so a flaky network blip
+/// does not evict a known-capable server from the encrypted path for
+/// an hour.
+const soft_damping_sec: i64 = 60;
 
 /// How long a .capable result persists before re-probing (3 days, per RFC 9539).
 const persistence_sec: i64 = 3 * 24 * 3600;
@@ -29,8 +38,10 @@ pub const ServerStatus = enum {
     probing,
     /// TLS probe succeeded — server supports encrypted transport.
     capable,
-    /// TLS probe failed — damped for `damping_sec`.
+    /// TLS probe failed (hard) — damped for `damping_sec`.
     failed,
+    /// TLS probe failed (soft / transient) — damped for `soft_damping_sec`.
+    soft_failed,
 };
 
 const NsEntry = struct {
@@ -70,6 +81,7 @@ pub const EncryptedNsCache = struct {
             .capable => if (self.now_fn() - entry.last_probe >= persistence_sec) .unknown else .capable,
             .probing => if (self.now_fn() - entry.last_probe >= probe_timeout_sec) .unknown else .probing,
             .failed => if (self.now_fn() - entry.last_probe >= damping_sec) .unknown else .failed,
+            .soft_failed => if (self.now_fn() - entry.last_probe >= soft_damping_sec) .unknown else .soft_failed,
             .unknown => .unknown,
         };
     }
@@ -87,6 +99,7 @@ pub const EncryptedNsCache = struct {
                 .capable => if (now - entry.last_probe < persistence_sec) return false,
                 .probing => if (now - entry.last_probe < probe_timeout_sec) return false,
                 .failed => if (now - entry.last_probe < damping_sec) return false,
+                .soft_failed => if (now - entry.last_probe < soft_damping_sec) return false,
                 .unknown => {},
             }
         }
@@ -112,12 +125,25 @@ pub const EncryptedNsCache = struct {
         }) catch {};
     }
 
-    /// Mark a server as failed (probe failed).
+    /// Mark a server as hard-failed (TLS handshake reject, ALPN mismatch,
+    /// strict-mode cert validation fail). Damped for `damping_sec`.
     pub fn markFailed(self: *EncryptedNsCache, key: AddressKey) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.entries.put(key, .{
             .status = .failed,
+            .last_probe = self.now_fn(),
+        }) catch {};
+    }
+
+    /// Mark a server as soft-failed (transient TCP/network error).
+    /// Damped for the shorter `soft_damping_sec` so a flaky-but-capable
+    /// server is not evicted from the encrypted path for an hour.
+    pub fn markSoftFailed(self: *EncryptedNsCache, key: AddressKey) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.entries.put(key, .{
+            .status = .soft_failed,
             .last_probe = self.now_fn(),
         }) catch {};
     }
@@ -203,6 +229,37 @@ test "EncryptedNsCache markFailed with damping" {
 
     // Past damping window — should revert to unknown
     fake_time = 100_000 + damping_sec;
+    try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
+}
+
+test "EncryptedNsCache markSoftFailed uses shorter damping" {
+    var fake_time: i64 = 100_000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
+    cache.now_fn = &now_fn.now;
+    defer cache.deinit();
+
+    const key = makeKey(.{ 8, 8, 4, 4 });
+    cache.markSoftFailed(key);
+
+    // Within soft-damping window — should report soft_failed.
+    fake_time = 100_000 + soft_damping_sec - 1;
+    try testing.expectEqual(ServerStatus.soft_failed, cache.getStatus(key));
+
+    // Past soft-damping window — reverts to unknown so a retry can fire.
+    fake_time = 100_000 + soft_damping_sec;
+    try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
+
+    // Crucially, the soft window is much shorter than the hard one — a
+    // soft-failed entry must not still be damped at the hard threshold.
+    fake_time = 100_000 + damping_sec - 1;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
