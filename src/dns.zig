@@ -467,10 +467,27 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
 
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
 
+/// Well-known EDNS option codes consumed/emitted by hark.
+pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
+pub const edns_opt_padding: u16 = 12; // RFC 7830
+
 pub const EdnsOption = struct {
     code: u16,
     data: []const u8,
 };
+
+/// RFC 7828 §3: extract the TIMEOUT field (u16, 100-ms units) from a
+/// TCP-keepalive EDNS option. Returns null when the option is absent or
+/// the data length disagrees with the spec (clients send empty data,
+/// servers send 2 bytes).
+pub fn findTcpKeepaliveTimeout(options: []const EdnsOption) ?u16 {
+    for (options) |o| {
+        if (o.code != edns_opt_tcp_keepalive) continue;
+        if (o.data.len == 2) return std.mem.readInt(u16, o.data[0..2], .big);
+        return null;
+    }
+    return null;
+}
 
 pub const OptRecord = struct {
     udp_payload_size: u16,
@@ -1282,7 +1299,7 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 
         // Write padding option if needed
         if (opt.padding_target > 0) {
-            try ser.writeU16(12); // EDNS0 Padding option code (RFC 7830)
+            try ser.writeU16(edns_opt_padding);
             try ser.writeU16(padding_len);
             // Write zero-filled padding
             try ser.ensureSpace(padding_len);

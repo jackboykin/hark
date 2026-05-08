@@ -45,7 +45,6 @@ const monotonic = @import("monotonic.zig");
 
 const log = std.log.scoped(.server);
 
-
 const work_queue_capacity = 256;
 
 // Per-thread query arena, owned by a pool thread and reused across queries
@@ -1126,7 +1125,11 @@ const WorkerState = struct {
             var rcode_buf: [24]u8 = undefined;
             log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
 
-            const wire = buildResponseWire(&response_wire, ResponseContext.fromQuery(query, dns.max_message_len), result.message, alloc) orelse return;
+            // RFC 7828: advertise our TCP idle timeout so the stub can
+            // size its keepalive expectations. Units are 100 ms.
+            var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
+            ctx.tcp_keepalive = @intCast(self.config.tcp_idle_timeout_ms / 100);
+            const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 

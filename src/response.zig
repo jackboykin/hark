@@ -50,6 +50,11 @@ pub const ResponseContext = struct {
     client_do: bool,
     client_wants_ad: bool,
     max_payload: u16,
+    /// RFC 7828 edns-tcp-keepalive TIMEOUT (100-ms units). Emitted only
+    /// when non-null AND the client sent EDNS — null on UDP, or when
+    /// the operator disabled the option. Servers MUST only advertise
+    /// this on stream transports.
+    tcp_keepalive: ?u16 = null,
 
     pub fn fromQuery(query: dns.Message, max_payload: u16) ResponseContext {
         const client_do = query.opt != null and query.opt.?.do_bit;
@@ -74,6 +79,19 @@ pub fn buildResponseWire(
     response: dns.Message,
     alloc: mem.Allocator,
 ) ?[]const u8 {
+    // RFC 7828: emit the keepalive option (code 11) on TCP/DoT responses
+    // only — servers MUST NOT include it on UDP. Caller signals stream
+    // transport via ctx.tcp_keepalive being non-null.
+    var opt_options_buf: [1]dns.EdnsOption = undefined;
+    var keepalive_data: [2]u8 = undefined;
+    const opt_options: []const dns.EdnsOption = blk: {
+        if (ctx.tcp_keepalive) |timeout| {
+            std.mem.writeInt(u16, &keepalive_data, timeout, .big);
+            opt_options_buf[0] = .{ .code = dns.edns_opt_tcp_keepalive, .data = &keepalive_data };
+            break :blk opt_options_buf[0..1];
+        }
+        break :blk &.{};
+    };
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         // Echo back the per-request budget so a client knows our willingness
         // to accept large queries — matches what we're willing to emit.
@@ -81,7 +99,7 @@ pub fn buildResponseWire(
         .extended_rcode = 0,
         .version = 0,
         .do_bit = ctx.client_do,
-        .options = &.{},
+        .options = opt_options,
     } else null;
 
     const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
