@@ -948,11 +948,31 @@ pub fn validateNegativeProof(
         );
         // CE must be a proper ancestor of qname (strictly fewer labels).
         if (ce_depth >= qname.labels.len) return .bogus;
+        const ce = dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
+
+        // RFC 4035 §5.4: the CE must be *proven* to exist via an NSEC that
+        // explicitly names it as owner or next. A "covering range strictly
+        // contains CE" branch was considered for empty-non-terminal CEs,
+        // but the CE is by construction a common-suffix ancestor of both
+        // NSEC bounds — canonical order sorts ancestors strictly before
+        // descendants of the same suffix, so any legitimate NSEC has both
+        // bounds sorting *after* the CE and the in-range check is dead.
+        // The branch fires only on attacker-forged NSECs that geometrically
+        // straddle a CE candidate; dropping it closes that pin-CE class
+        // without losing any real ENT-CE proof (real ENT denial uses
+        // NSEC3, which has its own dedicated CE proof in this validator).
+        var ce_proven = false;
+        for (authorities) |rr| {
+            if (rr.rtype != .nsec) continue;
+            if (rr.name.eql(ce) or rr.rdata.nsec.next_domain_name.eql(ce)) {
+                ce_proven = true;
+                break;
+            }
+        }
+        if (!ce_proven) return .unchecked;
+
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
-        const wildcard = dns.makeWildcardName(
-            &wc_labels_buf,
-            dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] },
-        ) orelse return .unchecked;
+        const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
 
         var wildcard_denied = false;
         for (authorities) |rr| {
@@ -2053,6 +2073,25 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
     };
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, &b));
+}
+
+test "validateNegativeProof NSEC NXDOMAIN requires CE existence proof (RFC 4035 §5.4)" {
+    // qname = a.b.c.example.com. A single NSEC covers qname between two
+    // unrelated bounds — the derived CE (example.com) is neither named by
+    // any NSEC nor strictly between this NSEC's bounds. Without an
+    // independent CE existence proof, an attacker could pin an arbitrary
+    // CE inside any range. Must return .unchecked, not .secure.
+    const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
+    const zzz = dns.Name{ .labels = &.{ "zzz", "example", "com" } };
+    const qname = dns.Name{ .labels = &.{ "a", "b", "c", "example", "com" } };
+    // covering = (aaa.example.com, zzz.example.com); qname sorts between
+    // (a.b.c.example.com is between a... and z... in the example.com range).
+    const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
+    var b: ValidationBudget = .{};
+    // Without a CE-proving NSEC, the answer is unchecked even though the
+    // covering NSEC validly denies qname.
+    const status = validateNegativeProof(&authorities, qname, .a, true, &b);
+    try testing.expectEqual(SecurityStatus.unchecked, status);
 }
 
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
