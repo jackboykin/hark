@@ -1233,9 +1233,21 @@ const WorkerState = struct {
         var rcode_buf2: [24]u8 = undefined;
         log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
 
-        var wire_buf: [dns.max_message_len]u8 = undefined;
-        if (buildResponseWire(&wire_buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
-            self.sendUdpResponse(sock, wire, client_addr);
+        // 4 KB stack buffer covers EDNS-0 default (1232) and the common
+        // operator cap of 4096; larger configured caps fall through to the
+        // per-query arena. The 64 KiB frame this used to reserve was a
+        // ReleaseSafe memset hotspot and a stack-prologue tax in ReleaseFast.
+        var wire_stack: [4096]u8 = undefined;
+        const wire_buf: ?[]u8 = if (max_payload <= wire_stack.len)
+            wire_stack[0..]
+        else
+            alloc.alloc(u8, max_payload) catch null;
+        if (wire_buf) |buf| {
+            if (buildResponseWire(buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
+                self.sendUdpResponse(sock, wire, client_addr);
+            }
+        } else {
+            self.sendErrorUdp(sock, query_msg.header.id, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
         }
 
         self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
