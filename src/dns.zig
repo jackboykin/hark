@@ -673,7 +673,10 @@ pub const Parser = struct {
     /// each `labels[i]` byte slice points into `self.msg`. Caller must
     /// keep the wire buffer alive for the lifetime of the parsed Name.
     pub fn parseName(self: *Parser, allocator: Allocator) Error!Name {
-        var labels: ArrayList([]const u8) = .empty;
+        // Collect on the stack and dupe once at the end — N ArrayList grow
+        // allocs per name (4-5 typical) showed up at ~0.5% of CPU on miss.
+        var labels_buf: [max_label_count][]const u8 = undefined;
+        var labels_len: usize = 0;
         var total_len: usize = 0;
         var jumps: usize = 0;
         const max_jumps = 32;
@@ -706,11 +709,12 @@ pub const Parser = struct {
                 // Normal label
                 const label_len: usize = len_byte;
                 if (label_len > max_label_len) return error.LabelTooLong;
-                if (labels.items.len >= max_label_count) return error.TooManyLabels;
+                if (labels_len >= max_label_count) return error.TooManyLabels;
                 cursor += 1;
                 if (cursor + label_len > self.msg.len) return error.EndOfData;
                 const label_data = self.msg[cursor..][0..label_len];
-                labels.append(allocator, label_data) catch return error.OutOfMemory;
+                labels_buf[labels_len] = label_data;
+                labels_len += 1;
                 cursor += label_len;
                 total_len += label_len + 1; // +1 for the dot separator
                 if (total_len > max_name_len + 1) return error.NameTooLong;
@@ -722,7 +726,8 @@ pub const Parser = struct {
 
         if (saved_pos) |sp| self.pos = sp;
 
-        return .{ .labels = labels.toOwnedSlice(allocator) catch return error.OutOfMemory };
+        const labels = allocator.dupe([]const u8, labels_buf[0..labels_len]) catch return error.OutOfMemory;
+        return .{ .labels = labels };
     }
 
     pub fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
