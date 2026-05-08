@@ -16,12 +16,12 @@
 ///   example. / example.{com,net,org}   IANA-hosted; authoritative answers
 ///                                      already correct, intercepting
 ///                                      breaks documentation tests.
-
 const std = @import("std");
 const mem = std.mem;
 const dns = @import("dns.zig");
+const synthesisedMessage = @import("response.zig").synthesisedMessage;
 
-pub const Action = union(enum) {
+pub const Action = enum {
     /// Not a special-use name — fall through to normal resolution.
     none,
     /// RFC 1035 §4.1.1 NXDOMAIN. No SOA synthesised; client gets RA-only.
@@ -84,7 +84,6 @@ fn eqlOrSubdomainOf(name: []const u8, tail: []const u8) bool {
 pub fn synthesise(
     allocator: mem.Allocator,
     name: []const u8,
-    qtype: dns.RType,
     action: Action,
 ) !dns.Message {
     std.debug.assert(action != .none);
@@ -134,28 +133,7 @@ pub fn synthesise(
         },
     }
 
-    _ = qtype;
-    return .{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = rcode,
-            .qd_count = 0,
-            .an_count = @intCast(answers.len),
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-    };
+    return synthesisedMessage(answers, &.{}, rcode, false);
 }
 
 /// Synthetic responses are stable forever — RFC 6761 names cannot be
@@ -204,7 +182,7 @@ test "classify no match falls through" {
 test "synthesise localhost A produces 127.0.0.1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try synthesise(arena.allocator(), "localhost.", .a, .localhost_a);
+    const msg = try synthesise(arena.allocator(), "localhost.", .localhost_a);
     try testing.expectEqual(@as(u16, 1), msg.header.an_count);
     try testing.expectEqual(dns.RCode.no_error, msg.header.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
@@ -213,7 +191,7 @@ test "synthesise localhost A produces 127.0.0.1" {
 test "synthesise nxdomain has no answers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try synthesise(arena.allocator(), "invalid.", .a, .nxdomain);
+    const msg = try synthesise(arena.allocator(), "invalid.", .nxdomain);
     try testing.expectEqual(dns.RCode.name_error, msg.header.rcode);
     try testing.expectEqual(@as(u16, 0), msg.header.an_count);
 }

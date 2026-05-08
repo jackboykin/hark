@@ -8,7 +8,6 @@
 /// (BCP 140). Default-loopback config keeps the absent-ACL case safe;
 /// operators flipping listen= to a public address must opt in to a
 /// CIDR list to deserve service.
-
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -94,7 +93,7 @@ fn normaliseInPlace(buf: []u8, prefix: u8) void {
             for (buf[full..]) |*b| b.* = 0;
         } else {
             const shift: u4 = @as(u4, 8) - @as(u4, rem);
-    const mask: u8 = @truncate(@as(u16, 0xFF) << shift);
+            const mask: u8 = @truncate(@as(u16, 0xFF) << shift);
             buf[full] &= mask;
             for (buf[full + 1 ..]) |*b| b.* = 0;
         }

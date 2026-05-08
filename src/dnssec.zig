@@ -2276,14 +2276,16 @@ test "NSEC3 unknown hash algorithm yields .insecure (RFC 6840 §5.11)" {
         .rtype = .nsec3,
         .rclass = .in,
         .ttl = 300,
-        .rdata = .{ .nsec3 = .{
-            .hash_algorithm = @enumFromInt(2), // not sha1
-            .flags = 0,
-            .iterations = 0,
-            .salt = &.{},
-            .next_hashed_owner = &next,
-            .type_bit_maps = &.{},
-        } },
+        .rdata = .{
+            .nsec3 = .{
+                .hash_algorithm = @enumFromInt(2), // not sha1
+                .flags = 0,
+                .iterations = 0,
+                .salt = &.{},
+                .next_hashed_owner = &next,
+                .type_bit_maps = &.{},
+            },
+        },
     }};
 
     var b: ValidationBudget = .{};

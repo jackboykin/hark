@@ -4,6 +4,7 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const special_use = @import("special_use.zig");
+const synthesisedMessage = @import("response.zig").synthesisedMessage;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
@@ -207,16 +208,14 @@ pub const RecursiveResolver = struct {
             // RFC 6761 / 7686 / 8375: short-circuit special-use names before
             // any cache lookup or upstream traffic. Pure synthesis — no I/O,
             // no privacy leak to root.
-            switch (special_use.classify(current_name, qtype)) {
-                .none => {},
-                else => |action| {
-                    const synth = try special_use.synthesise(allocator, current_name, qtype, action);
-                    return .{
-                        .message = try withCnameChain(allocator, cname_chain.items, synth),
-                        .prefetch_name = null,
-                        .prefetch_qtype = qtype,
-                    };
-                },
+            const action = special_use.classify(current_name, qtype);
+            if (action != .none) {
+                const synth = try special_use.synthesise(allocator, current_name, action);
+                return .{
+                    .message = try withCnameChain(allocator, cname_chain.items, synth),
+                    .prefetch_name = null,
+                    .prefetch_qtype = qtype,
+                };
             }
 
             // RFC 8482: minimise ANY responses to a synthetic HINFO answer
@@ -245,7 +244,7 @@ pub const RecursiveResolver = struct {
                         }
                         switch (result) {
                             .hit => |h| return .{
-                                .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),
+                                .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),
                                 .prefetch_name = prefetch_name,
                                 .prefetch_qtype = qtype,
                             },
@@ -256,7 +255,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
@@ -281,7 +280,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, authorities, .name_error, false)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, authorities, .name_error, false)),
                                     .prefetch_name = null,
                                     .prefetch_qtype = qtype,
                                 };
@@ -303,7 +302,7 @@ pub const RecursiveResolver = struct {
                             .nxdomain, .nodata => |rc| {
                                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, makeCachedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, &.{synth.soa}, rcode, true)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
@@ -766,7 +765,7 @@ pub const RecursiveResolver = struct {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
                 // target_name is arena-allocated and outlives the response — direct assignment.
                 for (h.records) |*rr| rr.name = target_name;
-                return try withCnameChain(allocator, cname_chain_items, makeCachedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
+                return try withCnameChain(allocator, cname_chain_items, synthesisedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
@@ -1270,7 +1269,7 @@ pub const RecursiveResolver = struct {
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
         if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked);
-        return .{ .message = makeCachedMessage(&.{}, &.{}, .server_failure, false) };
+        return .{ .message = synthesisedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
     /// Fetch DNSKEY records for a zone, checking cache first.
@@ -1494,11 +1493,9 @@ pub const RecursiveResolver = struct {
 
         // Derive parent zone: strip first label (e.g. "example.com" → "com")
         // TLDs have no dot — parent is root, query root hints (RFC 4035 §3.1.4.1).
-        const pos = mem.indexOfScalar(u8, zone_name, '.') orelse
+        const parent_zone = parentZoneOf(zone_name);
+        if (parent_zone.len == 0) // root parent — query root hints
             return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
-        if (pos + 1 >= zone_name.len) // trailing dot (e.g. "com.")
-            return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
-        const parent_zone = zone_name[pos + 1 ..];
 
         const cache = self.cache orelse return null;
         const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return null) {
@@ -1591,6 +1588,9 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         parent_servers: []const na.Address,
     ) ?[]const dns.ResourceRecord {
+        // Root has no parent to reprove DS against — caller chose root_hints
+        // anchor, not this path. parentZoneOf("") returns "" and would loop.
+        std.debug.assert(zone_name.len > 0);
         const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return null) orelse return null;
         const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
@@ -1623,20 +1623,31 @@ pub const RecursiveResolver = struct {
             if (ds_status != .secure) return null;
 
             // Cache only after the parent-signed DS verifies. NS/glue go to
-            // the answer cache; DS goes to the key cache as .secure so that
-            // fetchAndValidateDnskey can trust it on the next lookup.
-            // When DS arrives in the authority section (parent referral
-            // shape), the answersOnly() projection would strip it; build a
-            // synthetic message with the verified DS slice as answers so
-            // storeResponseWithStatus actually persists it.
+            // the answer cache; the key cache gets the DS RRset alone.
+            // Filtering to DS-only avoids polluting the key cache with the
+            // RRSIG/NSEC records that travel alongside the DS — those would
+            // otherwise be written as .secure under their own owners and
+            // sit there as unreachable noise (key cache only reads DS and
+            // DNSKEY).
             if (self.cache) |c| c.storeResponse(response, zone);
             if (self.key_cache) |kc| {
-                var key_msg = answersOnly(response);
-                if (ds_section.ptr == response.authorities.ptr) {
-                    key_msg.answers = ds_section;
-                    key_msg.header.an_count = @intCast(ds_section.len);
+                var ds_only_buf: [16]dns.ResourceRecord = undefined;
+                var ds_only_count: usize = 0;
+                for (ds_section) |rr| {
+                    if (rr.rtype != .ds or ds_only_count >= ds_only_buf.len) continue;
+                    ds_only_buf[ds_only_count] = rr;
+                    ds_only_count += 1;
                 }
-                kc.storeResponseWithStatus(key_msg, zone, .secure);
+                if (ds_only_count > 0) {
+                    var key_msg = response;
+                    key_msg.answers = ds_only_buf[0..ds_only_count];
+                    key_msg.authorities = &.{};
+                    key_msg.additionals = &.{};
+                    key_msg.header.an_count = @intCast(ds_only_count);
+                    key_msg.header.ns_count = 0;
+                    key_msg.header.ar_count = 0;
+                    kc.storeResponseWithStatus(key_msg, zone, .secure);
+                }
             }
             return ds_section;
         }
@@ -2218,34 +2229,11 @@ fn cacheSecurityStatus(state: dnssec.SecurityStatus) cache_mod.SecurityStatus {
     };
 }
 
-// ── Response synthesis (for cache hits) ────────────────────────────────
-
-fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const dns.ResourceRecord, rcode: dns.RCode, authenticated: bool) dns.Message {
-    return .{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = authenticated,
-            .cd = false,
-            .rcode = rcode,
-            .qd_count = 0,
-            .an_count = @intCast(answers.len),
-            .ns_count = @intCast(authorities.len),
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = authorities,
-    };
-}
-
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/// RFC 8482 §6 example uses 3789s; matches BIND's default and signals to
+/// debuggers that the answer is a synthetic HINFO and not a real RRset.
+const ttl_any_hinfo: u32 = 3789;
 
 /// RFC 8482: synthesise a minimal HINFO answer for a qtype=ANY query.
 /// Wire-encodes RDATA as two character-strings: cpu="RFC8482", os="".
@@ -2260,30 +2248,10 @@ fn synthesiseAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
         .name = qname,
         .rtype = @enumFromInt(13), // HINFO
         .rclass = .in,
-        .ttl = 3789,
+        .ttl = ttl_any_hinfo,
         .rdata = .{ .unknown = rdata_bytes },
     };
-    return .{
-        .header = .{
-            .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
-        },
-        .questions = &.{},
-        .answers = arr,
-    };
+    return synthesisedMessage(arr, &.{}, .no_error, false);
 }
 
 /// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.

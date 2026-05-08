@@ -195,6 +195,45 @@ pub fn serializeErrorResponse(
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
 
+// ── Synthesised messages ───────────────────────────────────────────────
+
+/// Build a `dns.Message` value for a cached or synthesised response. The
+/// header is the canonical recursive-resolver shape: aa=false (we are not
+/// authoritative for any zone), ra=true (recursion available), no question
+/// section (the wire builder copies questions from `ResponseContext`).
+/// Used by the cache-hit fast path, the RFC 6761 special-use short-circuit,
+/// and the RFC 8482 ANY/HINFO synthesiser — anywhere a response is built
+/// without going through actual recursion.
+pub fn synthesisedMessage(
+    answers: []const dns.ResourceRecord,
+    authorities: []const dns.ResourceRecord,
+    rcode: dns.RCode,
+    authenticated: bool,
+) dns.Message {
+    return .{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = authenticated,
+            .cd = false,
+            .rcode = rcode,
+            .qd_count = 0,
+            .an_count = @intCast(answers.len),
+            .ns_count = @intCast(authorities.len),
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = answers,
+        .authorities = authorities,
+    };
+}
+
 // ── Query validation ───────────────────────────────────────────────────
 
 const ValidationFailure = struct {

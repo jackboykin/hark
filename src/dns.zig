@@ -1981,11 +1981,12 @@ test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     const wire = [_]u8{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         // QNAME example.com.
-        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00,
         // QTYPE=A, QCLASS=IN
         0x00, 0x01, 0x00, 0x01,
         // OPT owner "x." (label "x" then root)
-        0x01, 'x', 0x00,
+        0x01, 'x',  0x00,
         // TYPE=OPT (41), CLASS=4096 (UDP payload)
         0x00, 0x29, 0x10, 0x00,
         // TTL: ext_rcode=0, version=0, flags=0

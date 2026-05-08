@@ -1228,13 +1228,24 @@ const WorkerState = struct {
         // RFC 8109: first pool thread anywhere on this Server primes the
         // cache with a live "." NS lookup. Single CAS gates the work, so
         // sibling pool threads start serving immediately. On failure
-        // (no network at boot, all root hints unreachable) reset the flag
-        // so the next pool thread can retry — otherwise the resolver
-        // would run from root_hints permanently with no priming refresh.
+        // (no network at boot, all root hints unreachable, SERVFAIL) reset
+        // the flag so a *later* pool thread can retry. In practice all
+        // pool threads spawn before priming I/O completes, so the retry
+        // window is "next pool thread that observes primed=false after
+        // the failing thread releases the flag" — which is bounded by
+        // pool-thread loop iteration cadence. Real client queries that
+        // need root NS still self-heal via the normal root_hints fallback
+        // and populate the cache through ordinary recursion.
         if (self.server.primed.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
             const alloc = query_pta.reset();
-            if (self.resolveWithDedupUsing(alloc, ".", .ns, false, transports)) |_| {
-                // success — leave primed=true; the prefetch path handles refresh.
+            if (self.resolveWithDedupUsing(alloc, ".", .ns, false, transports)) |result| {
+                // SERVFAIL counts as failure even though Zig sees a normal
+                // return — otherwise the .unchecked SERVFAIL written into
+                // the cache by the resolver (5 min ceiling) would shadow
+                // root NS lookups for the entire boot window.
+                if (result.message.header.rcode != .no_error) {
+                    self.server.primed.store(false, .release);
+                }
             } else |_| {
                 self.server.primed.store(false, .release);
             }
@@ -1476,6 +1487,10 @@ fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: 
     errdefer sys.close(sock);
 
     if (af == posix.AF.INET6) {
+        // V6ONLY=1 keeps v4 and v6 listeners on disjoint socket families.
+        // The ACL in `acl.zig` is family-strict (a v4 CIDR will not match a
+        // v4-mapped-v6 peer); without V6ONLY a v6 socket would deliver
+        // ::ffff:0:0/96-mapped peers and silently bypass v4 allow rules.
         const v6only: c_int = 1;
         try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(v6only));
     }

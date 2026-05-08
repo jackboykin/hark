@@ -592,11 +592,14 @@ pub const RRsetCache = struct {
         }
     }
 
-    /// RFC 8020: if any ancestor of `name` is cached as NXDOMAIN for the same
-    /// qtype, every name beneath it is non-existent — short-circuit without
-    /// going to network. Restricted to unsigned cached negatives: signed
-    /// zones go through NSEC/NSEC3 aggressive use (RFC 8198) which has its
-    /// own dedicated cache. Returns the matching negative if found.
+    /// RFC 8020: NXDOMAIN at any ancestor proves every name beneath it is
+    /// also non-existent, regardless of qtype. Hark's negative cache is
+    /// keyed by `(name, rtype, rclass)`, so this scan finds only ancestor
+    /// NXDOMAINs that were *cached for the matching qtype* — a real but
+    /// conservative loss of coverage versus a qtype-agnostic store. Never
+    /// false-cuts; sometimes misses a cut that a name-keyed cache would
+    /// catch. Restricted to non-secure negatives: signed-zone NXDOMAIN cuts
+    /// flow through the dedicated RFC 8198 NSEC aggressive-use cache.
     pub fn lookupNxdomainAncestor(
         self: *RRsetCache,
         caller_alloc: Allocator,
@@ -604,12 +607,21 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
+        // Bound suffix-walk depth: each `lookup` call clones records into
+        // the arena on a positive ancestor hit even when we discard the
+        // result. Real query workloads almost never have NXDOMAIN cuts
+        // deeper than 4–5 labels above the leaf, and the cuts that exist
+        // in practice are at zone-cut depth, not at every intermediate
+        // label. 8 covers TLD + apex + a couple of subdomain levels.
+        const max_suffix_depth: u8 = 8;
         var rest = name;
+        var depth: u8 = 0;
         // Strip the leftmost label and probe every suffix.
         while (mem.indexOfScalar(u8, rest, '.')) |dot| {
             if (dot + 1 >= rest.len) break; // trailing dot only
+            if (depth >= max_suffix_depth) break;
+            depth += 1;
             const ancestor = rest[dot + 1 ..];
-            if (ancestor.len == 0) break;
             if (self.lookup(caller_alloc, ancestor, rtype, rclass)) |result| {
                 switch (result) {
                     .negative => |n| {
@@ -948,6 +960,12 @@ pub const RRsetCache = struct {
         matches: []const dns.ResourceRecord,
         status: SecurityStatus,
     ) void {
+        // Empty matches would leave min_ttl = maxInt(u32) and store a
+        // 1-week-pinned entry once clampTtl saturates. Belt-and-braces:
+        // the existing partial-clone guard would catch this downstream,
+        // but bailing early keeps the invariant ("matches has data")
+        // explicit at the function boundary.
+        if (matches.len == 0) return;
         const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
@@ -1454,10 +1472,21 @@ test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
     const question = dns.Question{ .name = name, .qtype = .a, .qclass = .in };
     const msg = dns.Message{
         .header = .{
-            .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false,
-            .rd = false, .ra = true, .z = 0, .ad = false, .cd = false,
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = true,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
             .rcode = .no_error,
-            .qd_count = 1, .an_count = records.len, .ns_count = 0, .ar_count = 0,
+            .qd_count = 1,
+            .an_count = records.len,
+            .ns_count = 0,
+            .ar_count = 0,
         },
         .questions = &.{question},
         .answers = &records,
