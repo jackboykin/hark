@@ -219,6 +219,19 @@ pub const RecursiveResolver = struct {
                 },
             }
 
+            // RFC 8482: minimise ANY responses to a synthetic HINFO answer
+            // to deny amplification. Modern resolvers refuse ANY entirely or
+            // return RFC8482; we choose the latter so legacy clients still
+            // get a valid response.
+            if (qtype == .any) {
+                const synth = try synthesiseAnyHinfo(allocator, current_name);
+                return .{
+                    .message = try withCnameChain(allocator, cname_chain.items, synth),
+                    .prefetch_name = null,
+                    .prefetch_qtype = qtype,
+                };
+            }
+
             // CACHE CHECK 1: Do we already have a cached answer?
             if (!self.bypass_cache) {
                 if (self.cache) |c| {
@@ -2207,6 +2220,45 @@ fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const d
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/// RFC 8482: synthesise a minimal HINFO answer for a qtype=ANY query.
+/// Wire-encodes RDATA as two character-strings: cpu="RFC8482", os="".
+/// Uses the RType=13 / RData.unknown path so we don't have to teach the
+/// rest of the parser/cache/printer about HINFO.
+fn synthesiseAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
+    const qname = try dns.parseDottedName(allocator, name);
+    // <len=7> R F C 8 4 8 2  <len=0>
+    const rdata_bytes = try allocator.dupe(u8, &[_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 });
+    const arr = try allocator.alloc(dns.ResourceRecord, 1);
+    arr[0] = .{
+        .name = qname,
+        .rtype = @enumFromInt(13), // HINFO
+        .rclass = .in,
+        .ttl = 3789,
+        .rdata = .{ .unknown = rdata_bytes },
+    };
+    return .{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = true,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 0,
+            .an_count = 1,
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = arr,
+    };
+}
 
 /// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.
 fn parentZoneOf(zone_name: []const u8) []const u8 {
