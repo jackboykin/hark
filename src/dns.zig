@@ -1021,6 +1021,10 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
         if (rr.rtype == .opt) {
             // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
             if (opt != null) return error.MultipleOptRecords;
+            // RFC 6891 §6.1.2: OPT owner name MUST be root ("."). Non-root
+            // OPT is malformed; treat as FormatError so the server replies
+            // FORMERR rather than silently absorbing whatever owner appears.
+            if (rr.name.labels.len != 0) return error.FormatError;
             opt = .{
                 .udp_payload_size = @intFromEnum(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
@@ -1964,6 +1968,33 @@ test "EDNS0: buildQuery without edns has no opt" {
     // ar_count should be 0
     const ar_count = mem.readInt(u16, wire[10..12], .big);
     try testing.expectEqual(@as(u16, 0), ar_count);
+}
+
+test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Header: id=0x1234, flags=0x0100 (RD), qdcount=1, arcount=1
+    // Question: example.com A IN
+    // Additional: OPT with owner = "x." (NOT root) — RFC 6891 §6.1.2 violation.
+    const wire = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        // QNAME example.com.
+        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
+        // QTYPE=A, QCLASS=IN
+        0x00, 0x01, 0x00, 0x01,
+        // OPT owner "x." (label "x" then root)
+        0x01, 'x', 0x00,
+        // TYPE=OPT (41), CLASS=4096 (UDP payload)
+        0x00, 0x29, 0x10, 0x00,
+        // TTL: ext_rcode=0, version=0, flags=0
+        0x00, 0x00, 0x00, 0x00,
+        // RDLENGTH=0
+        0x00, 0x00,
+    };
+
+    try testing.expectError(error.FormatError, parseMessage(alloc, &wire));
 }
 
 // ── Name helpers ──────────────────────────────────────────────────────
