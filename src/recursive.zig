@@ -3,6 +3,7 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
+const special_use = @import("special_use.zig");
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
@@ -203,6 +204,21 @@ pub const RecursiveResolver = struct {
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
 
         cname_loop: while (true) {
+            // RFC 6761 / 7686 / 8375: short-circuit special-use names before
+            // any cache lookup or upstream traffic. Pure synthesis — no I/O,
+            // no privacy leak to root.
+            switch (special_use.classify(current_name, qtype)) {
+                .none => {},
+                else => |action| {
+                    const synth = try special_use.synthesise(allocator, current_name, qtype, action);
+                    return .{
+                        .message = try withCnameChain(allocator, cname_chain.items, synth),
+                        .prefetch_name = null,
+                        .prefetch_qtype = qtype,
+                    };
+                },
+            }
+
             // CACHE CHECK 1: Do we already have a cached answer?
             if (!self.bypass_cache) {
                 if (self.cache) |c| {
