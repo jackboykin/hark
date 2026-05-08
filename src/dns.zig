@@ -333,6 +333,13 @@ pub const DnskeyData = struct {
     pub fn isZoneKey(self: DnskeyData) bool {
         return (self.flags & 0x100) != 0; // bit 7 (ZONE flag)
     }
+
+    /// RFC 5011 §2.1: bit 8 (REVOKE). A revoked key MUST NOT be used to
+    /// validate RRSIGs. keyTag() still includes the revoke bit per
+    /// RFC 4034 Appendix B, so do not change tag computation.
+    pub fn isRevoked(self: DnskeyData) bool {
+        return (self.flags & 0x80) != 0;
+    }
 };
 
 pub const DsData = struct {

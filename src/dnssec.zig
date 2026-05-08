@@ -104,8 +104,9 @@ pub const root_ds_records = [_]dns.DsData{
 
 /// RFC 4034 §2.1.1–2: a DNSKEY is usable for RRSIG verification only if
 /// the Zone Key flag (bit 7) is set and the protocol field is 3.
+/// RFC 5011 §2.1 additionally bars revoked keys (bit 8) from validating.
 fn isValidZoneKey(dk: dns.DnskeyData) bool {
-    return dk.isZoneKey() and dk.protocol == 3;
+    return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
 /// Find a DNSKEY in a set that matches a DS record.
@@ -1313,6 +1314,9 @@ test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
     // Wrong protocol
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 0, .algorithm = .rsasha256, .public_key = &.{} }));
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 1, .algorithm = .rsasha256, .public_key = &.{} }));
+    // RFC 5011 §2.1: REVOKE bit set — must reject even with zone key + correct protocol
+    try testing.expect(!isValidZoneKey(.{ .flags = 256 | 0x80, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
+    try testing.expect(!isValidZoneKey(.{ .flags = 257 | 0x80, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
 }
 
 test "canonical name wire format" {
