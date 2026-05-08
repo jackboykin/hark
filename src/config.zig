@@ -42,6 +42,17 @@ pub const ServerConfig = struct {
     /// this or accept that they have an open recursive resolver.
     allow_from: []acl.Cidr,
 
+    /// RFC 7766 §6.2.1: TCP idle timeout. Hark closes a TCP client
+    /// connection after this many ms of inactivity. 5000 matches the
+    /// previous hard-coded default; raise for long-lived stub clients.
+    tcp_idle_timeout_ms: u32,
+    /// Cap on queries served over a single TCP connection before the
+    /// server closes it (load-shedding + memory bound).
+    tcp_queries_per_conn: u32,
+    /// Upstream TCP / DoT connection-pool idle timeout (seconds). Closes
+    /// pooled connections to authoritatives after this much inactivity.
+    upstream_tcp_idle_sec: i64,
+
     allocator: Allocator,
 
     pub const Mode = enum { recursive, forward };
@@ -106,6 +117,9 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .drop_uid = null,
         .drop_gid = null,
         .allow_from = empty_acl,
+        .tcp_idle_timeout_ms = 5_000,
+        .tcp_queries_per_conn = 128,
+        .upstream_tcp_idle_sec = 30,
         .allocator = allocator,
     };
 }
@@ -150,6 +164,17 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.allow_from);
             cfg.allow_from = try parseCidrList(allocator, entries);
         }
+        if (try nonNegativeClamped(u32, server, "tcp-idle-timeout-ms")) |v| {
+            // RFC 7828 §3.4 caps the wire TIMEOUT field (100-ms units) at u16.
+            // Reject configs that would overflow the @intCast at emit time.
+            if (v > 6_553_500) return error.InvalidValue;
+            cfg.tcp_idle_timeout_ms = v;
+        }
+        if (try nonNegativeClamped(u32, server, "tcp-queries-per-conn")) |v| {
+            if (v == 0) return error.InvalidValue;
+            cfg.tcp_queries_per_conn = v;
+        }
+        if (try nonNegativeClamped(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
     }
 
     // [resolver] section
@@ -414,6 +439,32 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(true, cfg.prefetch);
     try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
+}
+
+test "tcp idle/queries/upstream knobs parse and validate" {
+    var cfg = try parseConfig(testing.allocator,
+        \\[server]
+        \\tcp-idle-timeout-ms = 8000
+        \\tcp-queries-per-conn = 64
+        \\upstream-tcp-idle-sec = 45
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 8000), cfg.tcp_idle_timeout_ms);
+    try testing.expectEqual(@as(u32, 64), cfg.tcp_queries_per_conn);
+    try testing.expectEqual(@as(i64, 45), cfg.upstream_tcp_idle_sec);
+
+    // Zero queries-per-conn would loop forever; parser must reject.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\tcp-queries-per-conn = 0
+    ));
+
+    // RFC 7828 §3.4 caps the wire TIMEOUT field at u16 (100-ms units);
+    // reject configs that would overflow the @intCast at emit time.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\tcp-idle-timeout-ms = 7000000
+    ));
 }
 
 test "prefetch-cousin defaults off and parses" {

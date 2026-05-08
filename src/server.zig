@@ -45,8 +45,6 @@ const monotonic = @import("monotonic.zig");
 
 const log = std.log.scoped(.server);
 
-const tcp_idle_timeout_ns: i128 = 5_000 * std.time.ns_per_ms;
-const max_tcp_queries_per_conn: u32 = 128;
 
 const work_queue_capacity = 256;
 
@@ -587,6 +585,11 @@ pub const Server = struct {
         // Per-worker Do53 TCP connection pool (RFC 7766)
         var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
         defer do53_tcp_pool.deinit();
+        do53_tcp_pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
+        // DoT pool lives on Server (per-process) but the idle timeout is
+        // a runtime knob; honour the config here too so the docstring
+        // ("Upstream TCP / DoT") matches reality.
+        if (self.enc_pool) |*pool| pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
 
         // Worker state
         var ws = WorkerState{
@@ -1068,8 +1071,9 @@ const WorkerState = struct {
         else |_|
             "?";
 
+        const tcp_idle_timeout_ns: i128 = @as(i128, self.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
         var tcp_queries: u32 = 0;
-        while (!self.shutdown.load(.acquire) and tcp_queries < max_tcp_queries_per_conn) {
+        while (!self.shutdown.load(.acquire) and tcp_queries < self.config.tcp_queries_per_conn) {
             tcp_queries += 1;
             const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             var len_buf: [2]u8 = undefined;
