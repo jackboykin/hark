@@ -1005,9 +1005,14 @@ const WorkerState = struct {
             return;
         }
         if (!self.queue.push(data, client_addr, sock, .udp)) {
+            // Silent drop on pool saturation (matches Unbound ip-ratelimit,
+            // PowerDNS over-capacity, dnsdist default). A SERVFAIL here
+            // would get pinned in every downstream cache for up to 5
+            // minutes (RFC 9520), turning a transient queue blip into a
+            // multi-minute outage from each client's perspective. Drop
+            // applies natural backpressure via the client's retry timeout.
             _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
             log.warn("resolution queue full, dropping query", .{});
-            self.sendErrorUdp(sock, id, .server_failure, 0, rd, &.{}, client_addr);
         }
     }
 
