@@ -56,12 +56,27 @@ const RttState = struct {
 
 const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
 
-pub const RttCache = struct {
+/// Shard count: same scheme as cache.zig — distribute lock + probe cost
+/// across N independent maps keyed on the high bits of AddressKey.HashCtx.
+/// The single-rwlock RttCache showed lock-acquire/release at ~5–8% of CPU
+/// on the miss workload at thread counts ≥ 32.
+const shard_count: u32 = 16;
+const shard_mask: u32 = shard_count - 1;
+
+const Shard = struct {
     entries: EntryMap,
     rwlock: ?std.Io.RwLock,
+};
+
+pub const RttCache = struct {
+    shards: [shard_count]Shard,
     io: std.Io,
     now_fn: *const fn () i64,
+    /// Caller-visible global cap (referenced in tests as the saturation point).
     max_entries: u32,
+    /// Precomputed `ceilDiv(max_entries, shard_count)`. Each insert checks it
+    /// against the local shard count, so storing it avoids a redundant divide.
+    per_shard_cap: u32,
 
     pub const Config = struct {
         allocator: Allocator,
@@ -71,35 +86,50 @@ pub const RttCache = struct {
     };
 
     pub fn init(cfg: Config) RttCache {
-        return .{
+        var shards: [shard_count]Shard = undefined;
+        for (&shards) |*s| s.* = .{
             .entries = EntryMap.init(cfg.allocator),
             .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
+        };
+        return .{
+            .shards = shards,
             .io = cfg.io,
             .now_fn = &@import("monotonic.zig").nowMs,
             .max_entries = cfg.max_entries,
+            .per_shard_cap = (cfg.max_entries + shard_count - 1) / shard_count,
         };
     }
 
     pub fn deinit(self: *RttCache) void {
-        self.entries.deinit();
+        for (&self.shards) |*s| s.entries.deinit();
+    }
+
+    fn shardOf(self: *RttCache, key: AddressKey) *Shard {
+        // Use the upper bits — the FNV-1a chain in HashCtx propagates input
+        // bits leftward, so the bottom 4 bits stay constant for inputs that
+        // share their low 4 bits (which IPv4 keys do, with addr[0..3] alone).
+        const h: u32 = @truncate(AddressKey.HashCtx.hash(.{}, key) >> 32);
+        return &self.shards[h & shard_mask];
     }
 
     /// Return the recommended timeout in ms for this server.
     pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
-        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        const shard = self.shardOf(key);
+        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
 
-        const state = self.entries.get(key) orelse return initial_timeout_ms;
+        const state = shard.entries.get(key) orelse return initial_timeout_ms;
         return computeTimeout(state);
     }
 
     /// Record a successful response with measured RTT (microseconds).
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
         const now_ms = self.now_fn();
-        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlock(self.io);
+        const shard = self.shardOf(key);
+        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
 
-        const gop = self.entries.getOrPut(key) catch return;
+        const gop = shard.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
             // First sample: srtt = R, rttvar = R/2
             gop.value_ptr.* = .{
@@ -128,17 +158,18 @@ pub const RttCache = struct {
                 gop.value_ptr.min_rtt_stamp_ms = now_ms;
             }
         }
-        if (self.entries.count() > self.max_entries) self.evictOne(key);
+        if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
     }
 
     /// Hedge stagger for the leading-leg server, in ms. Callers must filter
     /// dead servers (via `isDead`) before calling — this returns a stagger
     /// even for entries with stale samples.
     pub fn getHedgeStagger(self: *RttCache, key: AddressKey) u32 {
-        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        const shard = self.shardOf(key);
+        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
 
-        const state = self.entries.get(key) orelse return hedge_cold_default_ms;
+        const state = shard.entries.get(key) orelse return hedge_cold_default_ms;
         if (state.min_rtt_us <= 0) return hedge_cold_default_ms;
 
         const stagger_us = @as(i64, hedge_multiplier) * state.min_rtt_us;
@@ -148,10 +179,11 @@ pub const RttCache = struct {
 
     /// Record a timeout for this server (exponential backoff + dead marking).
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
-        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlock(self.io);
+        const shard = self.shardOf(key);
+        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
 
-        const gop = self.entries.getOrPut(key) catch return;
+        const gop = shard.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
             gop.value_ptr.* = .{
                 .srtt_us = @as(i64, initial_timeout_ms) * 1000,
@@ -169,26 +201,27 @@ pub const RttCache = struct {
                 gop.value_ptr.dead_until_ms = self.now_fn() + dead_duration_ms;
             }
         }
-        if (self.entries.count() > self.max_entries) self.evictOne(key);
+        if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
     }
 
     /// Evict one non-`protected` entry; a flood across many servers must not
-    /// erase healthy root/TLD scoring all at once.
-    fn evictOne(self: *RttCache, protected: AddressKey) void {
-        var it = self.entries.iterator();
+    /// erase healthy root/TLD scoring all at once. Lock is held by caller.
+    fn evictOneFrom(shard: *Shard, protected: AddressKey) void {
+        var it = shard.entries.iterator();
         while (it.next()) |kv| {
             if (std.meta.eql(kv.key_ptr.*, protected)) continue;
-            self.entries.removeByPtr(kv.key_ptr);
+            shard.entries.removeByPtr(kv.key_ptr);
             return;
         }
     }
 
     /// Check whether the server is currently marked dead.
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
-        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        const shard = self.shardOf(key);
+        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
 
-        const state = self.entries.get(key) orelse return false;
+        const state = shard.entries.get(key) orelse return false;
         return state.dead_until_ms > now_ms;
     }
 
@@ -197,7 +230,9 @@ pub const RttCache = struct {
     }
 
     pub fn count(self: *const RttCache) usize {
-        return self.entries.count();
+        var total: usize = 0;
+        for (&self.shards) |*s| total += s.entries.count();
+        return total;
     }
 };
 

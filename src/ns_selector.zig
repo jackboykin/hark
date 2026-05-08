@@ -127,6 +127,16 @@ pub const NsSelector = struct {
         return self.arms.count();
     }
 
+    /// Returned ordering: live servers (sorted by Thompson sample, descending)
+    /// followed by dead servers (shuffled). `live_count` tells callers where
+    /// the boundary is so they can skip the per-server `isDead` re-check on
+    /// the primary path; a final fallback can still reach `order[live_count..]`
+    /// when every live attempt has failed.
+    pub const Selection = struct {
+        order: []const usize,
+        live_count: usize,
+    };
+
     /// Select servers using Thompson Sampling. Returns ordered indices
     /// into `servers`: best Thompson draw first, dead servers last.
     /// RttCache is still consulted for dead-server status.
@@ -136,7 +146,7 @@ pub const NsSelector = struct {
         servers: []const na.Address,
         rtt_cache: ?*RttCache,
         order_buf: *[max_order]usize,
-    ) []usize {
+    ) Selection {
         if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
         defer if (self.mutex) |*mtx| mtx.unlock(self.io);
 
@@ -190,7 +200,10 @@ pub const NsSelector = struct {
             @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
         }
 
-        return order_buf[0 .. live_count + dead_count];
+        return .{
+            .order = order_buf[0 .. live_count + dead_count],
+            .live_count = live_count,
+        };
     }
 
     /// Record the outcome of querying a nameserver.
@@ -419,7 +432,7 @@ test "selectServers basic ordering" {
     var order_buf: [max_order]usize = undefined;
     for (0..100) |_| {
         const order = sel.selectServers(zone, &servers, null, &order_buf);
-        if (order.len > 0 and order[0] == 1) server1_first += 1;
+        if (order.order.len > 0 and order.order[0] == 1) server1_first += 1;
     }
     // Should be first >90% of the time
     try testing.expect(server1_first > 90);
@@ -448,7 +461,7 @@ test "discount causes re-exploration" {
     var server0_first: usize = 0;
     for (0..200) |_| {
         const order = sel.selectServers(zone, &servers, null, &order_buf);
-        if (order.len > 0 and order[0] == 0) server0_first += 1;
+        if (order.order.len > 0 and order.order[0] == 0) server0_first += 1;
     }
     // After heavy discounting, server 0 should get picked sometimes (re-explored)
     try testing.expect(server0_first > 10);

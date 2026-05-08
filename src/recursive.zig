@@ -890,18 +890,18 @@ pub const RecursiveResolver = struct {
         query_name: []const u8,
         query_type: dns.RType,
         servers: *[max_servers_per_level]na.Address,
-        server_order: []const usize,
+        sel: NsSelector.Selection,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
-        // Collect up to max_staggered_legs distinct-IP non-dead servers in
-        // preferred order. Racing duplicate IPs wouldn't add birthday entropy
-        // (RFC 5452) or latency diversity, so dedupe by IP.
+        // Collect up to max_staggered_legs distinct-IP servers from the
+        // live prefix of `sel.order`. selectServers already classified
+        // dead-vs-live via RttCache.isDead and put live first; iterating
+        // `[0..sel.live_count]` skips the dead tail without a second
+        // lock+probe per server. Racing duplicate IPs wouldn't add
+        // birthday entropy (RFC 5452) or latency diversity — dedupe by IP.
         var leg_idxs: [max_staggered_legs]usize = undefined;
         var leg_count: usize = 0;
-        const now_ms = self.rttNowMs();
-        outer: for (server_order) |idx| {
-            const addr_key = AddressKey.fromAddress(servers[idx]);
-            if (self.rtt_cache) |rc| if (rc.isDead(addr_key, now_ms)) continue;
+        outer: for (sel.order[0..sel.live_count]) |idx| {
             for (leg_idxs[0..leg_count]) |prev| {
                 if (na.ipEqual(servers[idx], servers[prev])) continue :outer;
             }
@@ -1025,35 +1025,39 @@ pub const RecursiveResolver = struct {
     ) anyerror!ServerQueryResult {
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
         var order_buf: [max_servers_per_level]usize = undefined;
-        const server_order = if (self.ns_selector) |ns|
+        const sel = if (self.ns_selector) |ns|
             ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
         else blk: {
             rand.fastShuffle(na.Address, self.io, servers[0..server_count]);
             for (0..server_count) |idx| order_buf[idx] = idx;
-            break :blk order_buf[0..server_count];
+            break :blk NsSelector.Selection{
+                .order = order_buf[0..server_count],
+                .live_count = server_count,
+            };
         };
 
         var last_server_failure: ?dns.Message = null;
 
         // ── Staggered NS racing ──
-        if (server_order.len >= 2 and self.stagger_ms > 0) {
-            if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, server_order, parent_zone)) |stag| {
+        if (sel.order.len >= 2 and self.stagger_ms > 0) {
+            if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
                 self.fireOteProbe(stag.server);
                 return .{ .message = stag.message, .responding_server = stag.server };
             }
         }
 
-        const now_ms = self.rttNowMs();
-        server_loop: for (server_order, 0..) |server_idx, server_i| {
+        server_loop: for (sel.order, 0..) |server_idx, server_i| {
             const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
 
-            const is_last_server = (server_i + 1 >= server_order.len);
-
-            // Skip dead servers unless last (fallback when all are dead)
-            if (self.rtt_cache) |rc| {
-                if (rc.isDead(addr_key, now_ms) and !is_last_server) continue;
-            }
+            // Live servers come first; dead are appended at the tail. Skip
+            // dead servers unless we have no live ones (`live_count == 0`,
+            // partial-zone outage — every NS gets a retry shot, matching the
+            // pre-dedupe behaviour) or this is the very last entry (always
+            // try *something*).
+            const is_last_server = (server_i + 1 >= sel.order.len);
+            const dead_skip = server_i >= sel.live_count and sel.live_count > 0 and !is_last_server;
+            if (dead_skip) continue;
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
