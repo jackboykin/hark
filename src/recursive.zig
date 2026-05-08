@@ -467,8 +467,11 @@ pub const RecursiveResolver = struct {
                     } else if (response.header.rcode == .server_failure or response.header.rcode == .refused) {
                         // RFC 9520 §3: cache the resolution failure so the
                         // next stub retry doesn't re-walk the whole upstream
-                        // chain. 5 s TTL is enforced by storeNegativeBare.
-                        if (self.cache) |c| c.cacheServfail(current_name, qtype);
+                        // chain. Pin against the original qname (`name`) —
+                        // mid-CNAME failures should still short-circuit the
+                        // stub's retry of the outer query. 5 s TTL is
+                        // enforced by storeNegativeBare.
+                        if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -589,9 +592,9 @@ pub const RecursiveResolver = struct {
                     } else {
                         // Non-authoritative server returned no answer and no
                         // referral — we can't continue resolution. RFC 9520 §3
-                        // calls this a resolution failure; cache so the next
-                        // stub retry doesn't re-walk the chain.
-                        if (self.cache) |c| c.cacheServfail(current_name, qtype);
+                        // calls this a resolution failure; cache against the
+                        // original qname so the stub's retry short-circuits.
+                        if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };

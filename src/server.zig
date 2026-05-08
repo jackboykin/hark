@@ -1011,8 +1011,11 @@ const WorkerState = struct {
             // minutes (RFC 9520), turning a transient queue blip into a
             // multi-minute outage from each client's perspective. Drop
             // applies natural backpressure via the client's retry timeout.
+            // Per-drop log stays at debug — under a UDP flood, a warn
+            // here would itself become the DoS surface; the
+            // `udp_queue_drops` atomic is the operator-facing signal.
             _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
-            log.warn("resolution queue full, dropping query", .{});
+            log.debug("resolution queue full, dropping query", .{});
         }
     }
 
