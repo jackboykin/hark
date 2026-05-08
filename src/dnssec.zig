@@ -28,10 +28,14 @@ pub const VerifyError = error{
 // ── Per-Resolution CPU Budgets ───────────────────────────────────────
 
 /// Caps RRSIG verifications per query to bound DS×DNSKEY×RRSIG amplification
-/// (CVE-2023-50387, KeyTrap). 64 ≈ 2× the worst legitimate case (~25 verifies
-/// for cold-cache lookups under KSK rollover with multi-algorithm signing).
-/// Raise if legitimately complex zones SERVFAIL; lower under tight CPU budgets.
-pub const max_sig_verify_per_resolution: u16 = 64;
+/// (CVE-2023-50387, KeyTrap). 96 covers the realistic worst-case mix of
+/// cold-cache 5-level chain × KSK rollover × dual-algo signing (RSASHA256 +
+/// ECDSAP256) × the per-level DS-RRSIG verify added by RFC 4035 §5.2 fix:
+/// roughly 5 levels × 3 verifies/level (DS + KSK self-sig + ZSK answer)
+/// × 2 algos = ~60, plus headroom for repeated KSKs. Raise if legitimately
+/// complex zones SERVFAIL during real KSK rollover windows; lower under
+/// tight CPU budgets.
+pub const max_sig_verify_per_resolution: u16 = 96;
 
 /// Caps NSEC3 hash invocations per query (CVE-2023-50868 + salt-cache-defeat
 /// in `classifyDelegation`). 96 covers the worst legitimate case (~78 hashes
@@ -1434,6 +1438,30 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
         error.InvalidSignature,
         validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, null),
     );
+}
+
+test "validateAnswerRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
+    // A DS RRset that arrives at the resolver without a covering RRSIG
+    // signed by the parent zone's DNSKEY MUST NOT be trusted as a chain
+    // anchor. Without C4's verify step, hark used to cache such records
+    // as .unchecked and let DNSKEY validation indirectly bless them.
+    const owner = dns.Name{ .labels = &.{ "example", "com" } };
+    const ds_record = dns.ResourceRecord{
+        .name = owner,
+        .rtype = .ds,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .ds = .{
+            .key_tag = 12345,
+            .algorithm = .rsasha256,
+            .digest_type = .sha256,
+            .digest = &[_]u8{0} ** 32,
+        } },
+    };
+    const records = [_]dns.ResourceRecord{ds_record}; // No RRSIG present.
+    var b: ValidationBudget = .{};
+    const status = validateAnswerRrset(&records, .ds, &.{}, 1700000000, &b);
+    try testing.expectEqual(SecurityStatus.bogus, status);
 }
 
 test "DS hash verification - wrong digest fails" {

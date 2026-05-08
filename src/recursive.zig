@@ -1309,13 +1309,22 @@ pub const RecursiveResolver = struct {
 
         const zone_parsed = try dns.parseDottedName(allocator, zone_name);
 
-        // Validate DNSKEY against cached DS before caching (RFC 4035 §5.2)
+        // Validate DNSKEY against cached DS before caching (RFC 4035 §5.2).
+        // Only .secure DS is a valid trust anchor — any other status means
+        // the parent-zone RRSIG never verified, so trusting it would let
+        // forged DS + forged DNSKEY self-validate.
         const kc = self.keyCache();
         if (kc) |c| {
             if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                 switch (result) {
                     .hit => |h| {
-                        validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null;
+                        if (h.security_status != .secure) {
+                            if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
+                                validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, &self.validation_budget) catch return null;
+                            } else return null;
+                        } else {
+                            validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null;
+                        }
                     },
                     // Proven-insecure delegation: no signed DNSKEYs to anchor.
                     // Returning the unvalidated answers would let the caller
@@ -1530,28 +1539,56 @@ pub const RecursiveResolver = struct {
         const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return null) orelse return null;
         const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
-        // Cache DS response: main cache for NS/glue (skip_key_types skips DS),
-        // key cache for DS only (avoid polluting with NS/glue). Stores no-op
-        // when the response carries TTL=0 — the returned slice keeps the
-        // records alive for the in-flight transaction (RFC 1035 §3.2.1).
+        // Locate the section that carries the DS RRset (RFC 4035 §5.2: DS
+        // travels in answers when the parent answers a DS query directly).
+        const ds_section: []const dns.ResourceRecord = blk: {
+            for (response.answers) |rr| {
+                if (rr.rtype == .ds) break :blk response.answers;
+            }
+            for (response.authorities) |rr| {
+                if (rr.rtype == .ds) break :blk response.authorities;
+            }
+            break :blk &.{};
+        };
+
+        if (ds_section.len > 0) {
+            // RFC 4035 §5.2: the DS RRset MUST be authenticated by an RRSIG
+            // signed with the parent zone's DNSKEY before it can anchor child
+            // trust. Without this verify step, an on-path attacker who forges
+            // both DS and DNSKEY can mint a self-validating chain.
+            const parent_dotted = parentZoneOf(zone_name);
+            const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
+            const ds_status = dnssec.validateAnswerRrset(
+                ds_section,
+                .ds,
+                parent_dnskeys,
+                epochNowU32(),
+                &self.validation_budget,
+            );
+            if (ds_status != .secure) return null;
+
+            // Cache only after the parent-signed DS verifies. NS/glue go to
+            // the answer cache; DS goes to the key cache as .secure so that
+            // fetchAndValidateDnskey can trust it on the next lookup.
+            // When DS arrives in the authority section (parent referral
+            // shape), the answersOnly() projection would strip it; build a
+            // synthetic message with the verified DS slice as answers so
+            // storeResponseWithStatus actually persists it.
+            if (self.cache) |c| c.storeResponse(response, zone);
+            if (self.key_cache) |kc| {
+                var key_msg = answersOnly(response);
+                if (ds_section.ptr == response.authorities.ptr) {
+                    key_msg.answers = ds_section;
+                    key_msg.header.an_count = @intCast(ds_section.len);
+                }
+                kc.storeResponseWithStatus(key_msg, zone, .secure);
+            }
+            return ds_section;
+        }
+
+        // No DS section — verify NSEC/NSEC3 proof of insecure delegation. NS
+        // and glue are still useful for resolution, so cache them.
         if (self.cache) |c| c.storeResponse(response, zone);
-        // DS stored as .unchecked — validated indirectly via DNSKEY RRSIG.
-        if (self.key_cache) |kc| kc.storeResponseWithStatus(answersOnly(response), zone, .unchecked);
-
-        // Positive DS — zone is signed. Return the section that holds the DS
-        // records; validateDnskeyAgainstDs filters by rtype, so RRSIGs and
-        // glue ride along harmlessly.
-        for (response.answers) |rr| {
-            if (rr.rtype == .ds) return response.answers;
-        }
-        for (response.authorities) |rr| {
-            if (rr.rtype == .ds) return response.authorities;
-        }
-
-        // No DS — verify NSEC/NSEC3 proof and cache insecure delegation. The
-        // negative-DS entry uses NSEC TTLs (not the DS's TTL=0), so callers
-        // that fall back to the cache after a null return can still
-        // distinguish insecure from outright failure.
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, &self.validation_budget);
@@ -2154,6 +2191,13 @@ fn makeCachedMessage(answers: []const dns.ResourceRecord, authorities: []const d
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.
+fn parentZoneOf(zone_name: []const u8) []const u8 {
+    const pos = mem.indexOfScalar(u8, zone_name, '.') orelse return "";
+    if (pos + 1 >= zone_name.len) return "";
+    return zone_name[pos + 1 ..];
+}
 
 /// Strip authority/additional sections from a message for targeted cache stores.
 fn answersOnly(msg: dns.Message) dns.Message {
