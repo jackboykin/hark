@@ -239,9 +239,35 @@ pub const RecursiveResolver = struct {
                             .hit => |h| h.needs_prefetch,
                             .negative => |n| n.needs_prefetch,
                         };
+                        const is_stale = switch (result) {
+                            .hit => |h| h.is_stale,
+                            .negative => |n| n.is_stale,
+                        };
                         if (needs_prefetch and cname_count == 0) {
                             prefetch_name = name;
                         }
+
+                        // RFC 8767 §6: a stale cache entry must not be the
+                        // first answer when fresh resolution is achievable.
+                        // Try fresh once with bypass_cache; on success serve
+                        // it, on any failure fall back to the stale answer.
+                        // Restricted to the top of a CNAME chain — re-entry
+                        // mid-chain would re-walk preceding labels.
+                        if (is_stale and cname_count == 0) {
+                            // Save/restore so a future caller that arrives
+                            // here with bypass_cache already set doesn't
+                            // get its flag silently flipped to false.
+                            const prev_bypass = self.bypass_cache;
+                            self.bypass_cache = true;
+                            defer self.bypass_cache = prev_bypass;
+                            if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
+                                return fresh;
+                            } else |_| {
+                                // Fresh attempt failed; fall through to the
+                                // stale return below.
+                            }
+                        }
+
                         switch (result) {
                             .hit => |h| return .{
                                 .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),

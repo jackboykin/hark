@@ -155,6 +155,10 @@ pub const CacheLookupResult = union(enum) {
         remaining_ttl: u32,
         needs_prefetch: bool = false,
         security_status: SecurityStatus = .unchecked,
+        /// RFC 8767 §6: true when the entry has expired but is still inside
+        /// the serve-stale window. Resolvers SHOULD attempt fresh resolution
+        /// before serving a stale answer.
+        is_stale: bool = false,
     },
     negative: struct {
         rcode: dns.RCode,
@@ -162,6 +166,7 @@ pub const CacheLookupResult = union(enum) {
         soa: ?dns.ResourceRecord,
         needs_prefetch: bool = false,
         security_status: SecurityStatus = .unchecked,
+        is_stale: bool = false,
     },
 };
 
@@ -573,6 +578,7 @@ pub const RRsetCache = struct {
                     .remaining_ttl = hit.remaining_ttl,
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = if (hit.force_unchecked) .unchecked else rrset.security_status,
+                    .is_stale = hit.is_stale,
                 } };
             },
             .negative => |neg| {
@@ -587,6 +593,7 @@ pub const RRsetCache = struct {
                     .soa = soa,
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = if (hit.force_unchecked) .unchecked else neg.security_status,
+                    .is_stale = hit.is_stale,
                 } };
             },
         }
@@ -650,14 +657,14 @@ pub const RRsetCache = struct {
         original_ttl: u32,
         now: i64,
         disable_stale: bool,
-    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, force_unchecked: bool } {
+    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, force_unchecked: bool, is_stale: bool } {
         if (now < expires_at) {
             const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
             const remaining = original_ttl - elapsed;
             const needs_prefetch = self.prefetch and (remaining * 10 <= original_ttl);
             _ = shard.hits.fetchAdd(1, .monotonic);
             if (needs_prefetch) _ = shard.prefetch_eligible.fetchAdd(1, .monotonic);
-            return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false };
+            return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false, .is_stale = false };
         }
         if (disable_stale or self.serve_stale_ttl == 0 or (now - expires_at) >= self.serve_stale_ttl) {
             // Deferred eviction: under shared read lock we cannot mutate the map;
@@ -668,7 +675,11 @@ pub const RRsetCache = struct {
         _ = shard.hits.fetchAdd(1, .monotonic);
         _ = shard.stale_hits.fetchAdd(1, .monotonic);
         _ = shard.prefetch_eligible.fetchAdd(1, .monotonic);
-        return .{ .remaining_ttl = 30, .needs_prefetch = true, .force_unchecked = true };
+        // is_stale is computed from now/expires_at directly (not derived from
+        // force_unchecked) so a future change that flips force_unchecked for
+        // a non-stale reason can't silently lie to the resolver's RFC 8767
+        // try-fresh-first branch.
+        return .{ .remaining_ttl = 30, .needs_prefetch = true, .force_unchecked = true, .is_stale = true };
     }
 
     // ── Store ─────────────────────────────────────────────────────────
@@ -1714,6 +1725,37 @@ test "cache serve stale within window" {
     }
 
     try testing.expectEqual(@as(u64, 1), cache.getStats().stale_hits);
+}
+
+test "cache lookup is_stale flag set on stale hit, clear on fresh (RFC 8767 §6)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    try storeTestA(&cache, alloc, &.{ "fresh", "test" }, 60, .{ 1, 2, 3, 4 });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Fresh hit must clear is_stale.
+    const fresh = cache.lookup(arena.allocator(), "fresh.test", .a, .in);
+    try testing.expect(fresh != null);
+    switch (fresh.?) {
+        .hit => |h| try testing.expectEqual(false, h.is_stale),
+        .negative => return error.TestUnexpectedResult,
+    }
+
+    // Same entry, past expiry but inside the serve-stale window.
+    test_time = 1100;
+    const stale = cache.lookup(arena.allocator(), "fresh.test", .a, .in);
+    try testing.expect(stale != null);
+    switch (stale.?) {
+        .hit => |h| try testing.expectEqual(true, h.is_stale),
+        .negative => return error.TestUnexpectedResult,
+    }
 }
 
 test "cache serve stale beyond window returns null" {
