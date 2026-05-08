@@ -802,8 +802,11 @@ pub fn nsecProvesTypeNonexistence(
 
 // ── NSEC3 Hashing (RFC 5155) ─────────────────────────────────────────
 
-/// Maximum allowed NSEC3 iterations (per RFC 9276 / BIND precedent).
-pub const max_nsec3_iterations: u16 = 150;
+/// Maximum allowed NSEC3 iterations. RFC 9276 §3.2 recommends treating any
+/// iteration count as a configuration smell; 100 is the modern BIND/Unbound
+/// soft ceiling above which proofs are downgraded to .insecure rather than
+/// burning hash budget.
+pub const max_nsec3_iterations: u16 = 100;
 
 /// Compute NSEC3 hash: iterated SHA-1 over canonical_name_wire || salt.
 /// Returns the raw hash bytes (20 bytes for SHA-1).
