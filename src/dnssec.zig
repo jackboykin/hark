@@ -779,7 +779,11 @@ pub fn nsecProvesNameNonexistence(
 }
 
 /// Check if an NSEC record proves that `qtype` does not exist at `qname`.
-/// The NSEC owner must match qname, and qtype must not be in the bitmap.
+/// RFC 4035 §5.4 + RFC 6840 §4.3: the bitmap must show qtype absent AND
+/// CNAME absent — otherwise the name has a CNAME and the answer should
+/// have followed it. (When qtype itself is CNAME, only that absence
+/// matters; the dual check would be self-redundant.) Mirrors the NSEC3
+/// NODATA path in validateNegativeProofNsec3.
 pub fn nsecProvesTypeNonexistence(
     nsec_owner: dns.Name,
     nsec: dns.NsecData,
@@ -787,7 +791,9 @@ pub fn nsecProvesTypeNonexistence(
     qtype: dns.RType,
 ) bool {
     if (!nsec_owner.eql(qname)) return false;
-    return !dns.typeBitmapContains(nsec.type_bit_maps, qtype);
+    if (dns.typeBitmapContains(nsec.type_bit_maps, qtype)) return false;
+    if (qtype == .cname) return true;
+    return !dns.typeBitmapContains(nsec.type_bit_maps, .cname);
 }
 
 // ── NSEC3 Hashing (RFC 5155) ─────────────────────────────────────────
@@ -1828,6 +1834,32 @@ test "NSEC type non-existence" {
     // Different name — not a proof
     const other = dns.Name{ .labels = &.{@as([]const u8, "other")} };
     try testing.expect(!nsecProvesTypeNonexistence(name, nsec_data, other, .aaaa));
+}
+
+test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
+    const name = dns.Name{
+        .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
+    };
+
+    // Bitmap with CNAME (5) at byte 0 bit 2 (0x04) and TXT (16) at byte 2 bit 7 (0x80).
+    // Block: window 0, length 3, bytes 0x04, 0x00, 0x80.
+    const cname_present = dns.NsecData{
+        .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
+        .type_bit_maps = &[_]u8{ 0x00, 0x03, 0x04, 0x00, 0x80 },
+    };
+    // A query for AAAA must NOT be proved nonexistent — the CNAME would chain it.
+    try testing.expect(!nsecProvesTypeNonexistence(name, cname_present, name, .aaaa));
+    // A query for CNAME itself: the bit IS set, so proof fails (correctly).
+    try testing.expect(!nsecProvesTypeNonexistence(name, cname_present, name, .cname));
+
+    // Bitmap with TXT only — no CNAME, no AAAA.
+    const cname_absent = dns.NsecData{
+        .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
+        .type_bit_maps = &[_]u8{ 0x00, 0x03, 0x00, 0x00, 0x80 },
+    };
+    try testing.expect(nsecProvesTypeNonexistence(name, cname_absent, name, .aaaa));
+    // Direct CNAME query against a name without CNAME passes.
+    try testing.expect(nsecProvesTypeNonexistence(name, cname_absent, name, .cname));
 }
 
 test "NSEC3 hash computation - RFC 5155 Appendix B" {
