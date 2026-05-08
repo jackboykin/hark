@@ -15,6 +15,10 @@ trap 'rm -rf "$TMP_PARENT"' EXIT
 DURATION="${DURATION:-15}"
 INFLIGHT="${INFLIGHT:-1000}"
 WORKERS="${WORKERS:-2}"
+# Recorded into the baseline header. ReleaseSafe vs ReleaseFast diverge by ~20%
+# on hot paths (e.g. wire_buf 0xAA-init in safe mode), so capturing the build
+# mode is the difference between a comparable baseline and an unverifiable one.
+BUILD_MODE="${BUILD_MODE:-unset}"
 # Default spans default → I/O-bound regime (latency runs need t≥256). Above
 # 256 requires bumping config.zig:129's hard cap; keep default within bounds.
 THREADS_LIST="${THREADS_LIST:-8 32 128 256}"
@@ -31,11 +35,16 @@ CACHE_ENTRIES="$(awk -F'=' '/^[[:space:]]*entries[[:space:]]*=/ {gsub(/[[:space:
 LATENCY_TAG=""
 [[ -n "$LATENCY_MS" ]] && LATENCY_TAG="-rtt${LATENCY_MS}ms"
 
+if [[ "$BUILD_MODE" == "unset" ]]; then
+    echo "WARN: BUILD_MODE not set; baseline will record build=unset" >&2
+    echo "      set BUILD_MODE=ReleaseFast (or matching -Doptimize) for a recordable run" >&2
+fi
+
 OUT="$BENCH_DIR/../baselines/throughput-$(date +%Y-%m-%d)${LATENCY_TAG}.txt"
 
 {
     echo "# hark throughput sweep — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "# duration=${DURATION}s inflight=${INFLIGHT} workers=${WORKERS} latency_ms=${LATENCY_MS:-0}"
+    echo "# build=${BUILD_MODE} duration=${DURATION}s inflight=${INFLIGHT} workers=${WORKERS} latency_ms=${LATENCY_MS:-0}"
     echo "# cache.size=${CACHE_SIZE} cache.entries=${CACHE_ENTRIES}"
     echo "# workload  threads     totqps   noerrqps     servfail%   lost%"
 } > "$OUT"

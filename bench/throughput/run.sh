@@ -44,6 +44,7 @@ fi
 TMPDIR="$(mktemp -d -t hark-bench-XXXXXX)"
 NSD_CONF="$TMPDIR/nsd.conf"
 HARK_LOG="$TMPDIR/hark.log"
+NSD_LOG="$TMPDIR/nsd.stderr"
 NSD_PID=""
 HARK_PID=""
 
@@ -67,6 +68,36 @@ dnsperf_timeout() {
     else
         echo 5
     fi
+}
+
+# dig +time= takes integer seconds. Cold-cache misses through netem cost
+# ~6N × LATENCY_MS each direction; pad and floor at 2s. Used for ready-probes
+# and smoke checks so they survive high-LATENCY_MS sweeps.
+dig_timeout() {
+    if [[ -n "${LATENCY_MS:-}" ]]; then
+        local t=$(( LATENCY_MS * 6 / 1000 + 2 ))
+        echo $(( t < 2 ? 2 : t ))
+    else
+        echo 2
+    fi
+}
+
+# Poll dig until <addr>:<port> answers, or fail after ~5s (50 × 0.1s).
+# Extra args are appended to the dig command line (e.g. the query name+type).
+wait_for_listener() {
+    local label="$1" addr="$2" port="$3"
+    shift 3
+    local timeout
+    timeout="$(dig_timeout)"
+    for i in $(seq 1 50); do
+        if dig +short +time="$timeout" +tries=1 @"$addr" -p "$port" "$@" >/dev/null 2>&1; then
+            echo ">>> $label ready"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "$label failed to come up in 5s" >&2
+    return 1
 }
 
 generate_queries() {
@@ -99,39 +130,17 @@ echo ">>> materializing nsd.conf at $NSD_CONF"
 sed -e "s|__BENCHDIR__|$BENCH_DIR|g" -e "s|__TMPDIR__|$TMPDIR|g" \
     "$BENCH_DIR/nsd.conf.template" > "$NSD_CONF"
 
-echo ">>> starting NSD on 198.41.0.4:53"
-nsd -c "$NSD_CONF" -d &
+echo ">>> starting NSD on 198.41.0.4:53 (stderr → $NSD_LOG)"
+nsd -c "$NSD_CONF" -d 2>"$NSD_LOG" &
 NSD_PID=$!
 
-# Wait for NSD to bind. dig with a tiny timeout polls until ready.
-for i in $(seq 1 50); do
-    if dig +short +time=1 +tries=1 @198.41.0.4 . SOA >/dev/null 2>&1; then
-        echo ">>> NSD ready"
-        break
-    fi
-    sleep 0.1
-    if [[ $i -eq 50 ]]; then
-        echo "NSD failed to come up in 5s" >&2
-        exit 1
-    fi
-done
+wait_for_listener NSD 198.41.0.4 53 . SOA
 
 echo ">>> starting hark on 127.0.0.1:5354 (config: $HARK_CONFIG)"
 "$HARK_BIN" serve --config "$HARK_CONFIG" >"$HARK_LOG" 2>&1 &
 HARK_PID=$!
 
-# Wait for hark to bind.
-for i in $(seq 1 50); do
-    if dig +short +time=1 +tries=1 @127.0.0.1 -p 5354 smoke.test. A >/dev/null 2>&1; then
-        echo ">>> hark ready"
-        break
-    fi
-    sleep 0.1
-    if [[ $i -eq 50 ]]; then
-        echo "hark failed to come up in 5s" >&2
-        exit 1
-    fi
-done
+wait_for_listener hark 127.0.0.1 5354 smoke.test. A
 
 case "$CMD" in
     direct-nsd)
@@ -208,11 +217,12 @@ case "$CMD" in
             exit 1
         fi
 
+        SMOKE_T="$(dig_timeout)"
         echo ">>> raw dig direct to NSD (RTT sanity check)"
-        dig +tries=1 +time=2 @198.41.0.4 . SOA | awk '/Query time/'
+        dig +tries=1 +time="$SMOKE_T" @198.41.0.4 . SOA | awk '/Query time/'
 
         echo ">>> raw dig via hark (cold-cache miss, RTT sanity check)"
-        dig +tries=1 +time=5 @127.0.0.1 -p 5354 "rtt-$(date +%s%N).test." A | awk '/Query time/'
+        dig +tries=1 +time="$SMOKE_T" @127.0.0.1 -p 5354 "rtt-$(date +%s%N).test." A | awk '/Query time/'
         ;;
     bench)
         WORKLOAD="${2:-hit}"
@@ -223,8 +233,9 @@ case "$CMD" in
         generate_queries "$WORKLOAD" "$QFILE"
         if [[ "$WORKLOAD" == "hit" ]]; then
             echo ">>> warming cache (8 names)"
+            warm_t="$(dig_timeout)"
             for i in {1..8}; do
-                dig +short +tries=1 +time=2 @127.0.0.1 -p 5354 "host${i}.test." A >/dev/null
+                dig +short +tries=1 +time="$warm_t" @127.0.0.1 -p 5354 "host${i}.test." A >/dev/null
             done
         fi
 

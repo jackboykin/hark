@@ -16,7 +16,10 @@ import sys
 
 SEED = 42
 N_QUERIES = 200_000
-HIT_SET_SIZE = 16
+# Must match the warm-up loop in run.sh — names host1..hostN are primed before
+# `hit` and `mix` runs, so anything beyond the warmed range would arrive cold
+# and skew early samples.
+HIT_SET_SIZE = 8
 
 
 def random_name(rng: random.Random) -> str:
