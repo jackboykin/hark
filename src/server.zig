@@ -258,9 +258,12 @@ pub const Server = struct {
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
-        // Randomize hash seeds for cache and dedup tables (hash collision attack defense).
+        // Randomize hash seeds for cache, dedup, and AddressKey-keyed tables
+        // (RttCache, NsSelector arms) so an authoritative can't engineer
+        // bucket collisions via crafted glue addresses or query keys.
         cache_mod.randomizeHashSeed(io);
         dedup_mod.randomizeHashSeed(io);
+        na.randomizeHashSeed(io);
 
         const cache_alloc = if (builtin.single_threaded)
             allocator

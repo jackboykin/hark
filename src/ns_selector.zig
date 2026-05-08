@@ -68,6 +68,24 @@ const ArmKey = struct {
     addr_key: AddressKey,
 };
 
+/// Compose AddressKey's hash with the precomputed `zone_hash` so we skip
+/// rehashing 32 bytes through Wyhash on every `discountZone` /
+/// `recordOutcome` lookup, while still picking up the randomized seed
+/// AddressKey.HashCtx already applies.
+const ArmKeyContext = struct {
+    pub fn hash(_: @This(), key: ArmKey) u64 {
+        var h = AddressKey.HashCtx.hash(.{}, key.addr_key);
+        h ^= key.zone_hash;
+        h *%= 0x100000001b3;
+        return h;
+    }
+
+    pub fn eql(_: @This(), a: ArmKey, b: ArmKey) bool {
+        return a.zone_hash == b.zone_hash and
+            AddressKey.HashCtx.eql(.{}, a.addr_key, b.addr_key);
+    }
+};
+
 const ArmState = struct {
     alpha: f32 = alpha_prior,
     beta: f32 = beta_prior,
@@ -75,8 +93,10 @@ const ArmState = struct {
 
 // ── NsSelector ───────────────────────────────────────────────────────
 
+const ArmMap = std.HashMap(ArmKey, ArmState, ArmKeyContext, std.hash_map.default_max_load_percentage);
+
 pub const NsSelector = struct {
-    arms: std.AutoHashMap(ArmKey, ArmState),
+    arms: ArmMap,
     mutex: ?std.Io.Mutex,
     io: std.Io,
     gamma: f32,
@@ -91,7 +111,7 @@ pub const NsSelector = struct {
 
     pub fn init(cfg: Config) NsSelector {
         return .{
-            .arms = std.AutoHashMap(ArmKey, ArmState).init(cfg.allocator),
+            .arms = ArmMap.init(cfg.allocator),
             .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
             .io = cfg.io,
             .gamma = default_gamma,

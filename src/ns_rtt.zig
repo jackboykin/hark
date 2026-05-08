@@ -54,8 +54,10 @@ const RttState = struct {
 
 // ── RttCache ─────────────────────────────────────────────────────────
 
+const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
+
 pub const RttCache = struct {
-    entries: std.AutoHashMap(AddressKey, RttState),
+    entries: EntryMap,
     rwlock: ?std.Io.RwLock,
     io: std.Io,
     now_fn: *const fn () i64,
@@ -70,7 +72,7 @@ pub const RttCache = struct {
 
     pub fn init(cfg: Config) RttCache {
         return .{
-            .entries = std.AutoHashMap(AddressKey, RttState).init(cfg.allocator),
+            .entries = EntryMap.init(cfg.allocator),
             .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
             .io = cfg.io,
             .now_fn = &@import("monotonic.zig").nowMs,

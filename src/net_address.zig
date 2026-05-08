@@ -5,6 +5,17 @@ const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
 const sys = @import("sys.zig");
+const rand = @import("rand.zig");
+
+/// Hash seed randomized at startup so an authoritative serving crafted glue
+/// addresses can't engineer bucket collisions against `RttCache` /
+/// `NsSelector`. Stays 0 in tests (deterministic); production calls
+/// `randomizeHashSeed`.
+var hash_seed: u64 = 0;
+
+pub fn randomizeHashSeed(io: std.Io) void {
+    hash_seed = rand.hashSeed(io);
+}
 
 pub const Address = std.Io.net.IpAddress;
 pub const Ip4 = std.Io.net.Ip4Address;
@@ -48,6 +59,42 @@ pub const AddressKey = struct {
         }
         return key;
     }
+
+    /// Hash context tuned for AddressKey: reads the 16-byte addr as two u64s
+    /// and mixes via FNV-1a-style multiply, avoiding Wyhash's variable-length
+    /// dispatch + final mixing chain. Wyhash showed at ~20% of CPU on miss
+    /// workloads where this key is hashed per upstream selection.
+    pub const HashCtx = struct {
+        pub fn hash(_: @This(), key: AddressKey) u64 {
+            const lo = mem.readInt(u64, key.addr[0..8], .little);
+            const hi = mem.readInt(u64, key.addr[8..16], .little);
+            const tag = (@as(u64, key.family) << 16) | key.port;
+            var h: u64 = hash_seed ^ 0xcbf29ce484222325;
+            h ^= lo;
+            h *%= 0x100000001b3;
+            h ^= hi;
+            h *%= 0x100000001b3;
+            h ^= tag;
+            h *%= 0x100000001b3;
+            // FNV-1a's multiply only propagates input bits leftward — without
+            // a finalizer, the bottom bits stay invariant whenever inputs
+            // share their low bits (e.g. IPv4 keys with addr[0]=0).
+            // Consumers (RttCache shard selector) subset these bits, so we
+            // run the canonical Murmur3 fmix64 to break that structure.
+            // This is collision-mitigation, not cryptographic — the input
+            // is small and `hash_seed` is the only randomness.
+            h ^= h >> 33;
+            h *%= 0xff51afd7ed558ccd;
+            h ^= h >> 33;
+            h *%= 0xc4ceb9fe1a85ec53;
+            h ^= h >> 33;
+            return h;
+        }
+
+        pub fn eql(_: @This(), a: AddressKey, b: AddressKey) bool {
+            return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
+        }
+    };
 };
 
 /// PosixAddress union for sockaddr conversion (matches Io.Threaded.PosixAddress).
@@ -190,6 +237,63 @@ fn isNonRoutableIp6Zero(b: [16]u8) bool {
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
+    const ctx: AddressKey.HashCtx = .{};
+    const a = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
+    const b = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
+    const c = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 5353));
+    const d = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 5 }, 53));
+    const e = AddressKey.fromAddress(initIp6(.{ 1, 2, 3, 4 } ++ .{0} ** 12, 53, 0, 0));
+
+    try testing.expect(ctx.eql(a, b));
+    try testing.expectEqual(ctx.hash(a), ctx.hash(b));
+    try testing.expect(!ctx.eql(a, c));
+    try testing.expect(ctx.hash(a) != ctx.hash(c));
+    try testing.expect(!ctx.eql(a, d));
+    try testing.expect(ctx.hash(a) != ctx.hash(d));
+    // v4 1.2.3.4 vs v6 ::102:304 share addr bytes — family must disambiguate.
+    try testing.expect(!ctx.eql(a, e));
+    try testing.expect(ctx.hash(a) != ctx.hash(e));
+}
+
+test "AddressKey.HashCtx: 16-shard distribution on sequential IPv4 keys" {
+    // Pre-finalizer, every IPv4 key with addr[0]=0 collapsed to a single
+    // shard because the FNV chain didn't propagate input bits to bit 32+.
+    // Pin the floor so any future tweak that re-introduces that pathology
+    // fails loudly.
+    const ctx: AddressKey.HashCtx = .{};
+    var counts: [16]u32 = .{0} ** 16;
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const k = AddressKey.fromAddress(initIp4(.{
+            @intCast((i >> 16) & 0xff),
+            @intCast((i >> 8) & 0xff),
+            @intCast(i & 0xff),
+            1,
+        }, 53));
+        const h32: u32 = @truncate(ctx.hash(k) >> 32);
+        counts[h32 & 15] += 1;
+    }
+    // Uniform expectation: 4096 / 16 = 256 per bucket. Allow ±60% (worst
+    // observed ~190 with the post-finalizer hash); a bucket at 0 or > 700
+    // would mean the finalizer regressed.
+    for (counts) |c| {
+        try testing.expect(c >= 100);
+        try testing.expect(c <= 700);
+    }
+}
+
+test "AddressKey.HashCtx: randomizeHashSeed shifts the hash space" {
+    const ctx: AddressKey.HashCtx = .{};
+    const k = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
+    const h0 = ctx.hash(k);
+    const saved = hash_seed;
+    defer hash_seed = saved;
+    hash_seed = 0xdeadbeefcafef00d;
+    const h1 = ctx.hash(k);
+    try testing.expect(h0 != h1);
+}
 
 test "format produces ip:port and RFC 5952 IPv6" {
     var buf: [64]u8 = undefined;
