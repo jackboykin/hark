@@ -1820,6 +1820,20 @@ pub const RecursiveResolver = struct {
             else => 1,
         };
 
+        // Per-query Fisher-Yates so distinct queries to the same delegation
+        // don't repeatedly attempt the same prefix and strand the same tail.
+        // Auth servers often return NS records in a stable order; without
+        // randomization the fanout's `[0..ns_fetch_limit]` slice would be
+        // deterministic, and a partial outage on those specific names would
+        // consistently hit the serial-fallback path (or fail entirely when
+        // ns_names.len <= ns_fetch_limit). Matches PowerDNS's std::sample
+        // over s_maxnsperresolve and Unbound's RTT-weighted random selection.
+        std.debug.assert(ns_names.len <= max_servers_per_level);
+        var shuffled: [max_servers_per_level]dns.Name = undefined;
+        @memcpy(shuffled[0..ns_names.len], ns_names);
+        rand.fastShuffle(dns.Name, self.io, shuffled[0..ns_names.len]);
+        const names = shuffled[0..ns_names.len];
+
         // Parallel path: one helper thread per (ns_name × rtype) task beyond
         // the caller's. Bounded by ns_fetch_limit so the worst-case fanout is
         // `ns_fetch_limit * 2 - 1` helpers (5 at depth 0). Fanout caps attempts
@@ -1827,14 +1841,14 @@ pub const RecursiveResolver = struct {
         // over the remaining NS names — matches serial's recovery behaviour
         // for partially-broken delegations.
         if (self.gpa != null) {
-            if (try self.resolveNsAddressesFanout(allocator, ns_names, depth, ns_fetch_limit)) |r| return r;
-            if (ns_names.len > ns_fetch_limit) {
-                return self.resolveNsAddressesSerial(allocator, ns_names[ns_fetch_limit..], depth, ns_fetch_limit);
+            if (try self.resolveNsAddressesFanout(allocator, names, depth, ns_fetch_limit)) |r| return r;
+            if (names.len > ns_fetch_limit) {
+                return self.resolveNsAddressesSerial(allocator, names[ns_fetch_limit..], depth, ns_fetch_limit);
             }
             return null;
         }
 
-        return self.resolveNsAddressesSerial(allocator, ns_names, depth, ns_fetch_limit);
+        return self.resolveNsAddressesSerial(allocator, names, depth, ns_fetch_limit);
     }
 
     const address_rtypes = [_]dns.RType{ .a, .aaaa };
