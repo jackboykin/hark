@@ -1205,7 +1205,7 @@ pub const RecursiveResolver = struct {
                 // the TLS variant always uses lowercase QNAME.
                 if (self.transports.tls) |tls_t| {
                     if (self.encrypted_ns_cache) |oc| {
-                        const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+                        const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
                         switch (oc.getStatus(tls_key)) {
                             .capable => {
                                 const padded_msg = try dns.buildQuery(allocator, query_id, query_name, query_type, .{
@@ -1304,7 +1304,7 @@ pub const RecursiveResolver = struct {
     fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
         const oc = self.encrypted_ns_cache orelse return;
         const tls_t = self.transports.tls orelse return;
-        const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
+        const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
         if (oc.claimProbe(tls_key)) {
             tls_t.probeInBackground(server, oc);
         }
@@ -2073,7 +2073,7 @@ pub const RecursiveResolver = struct {
         fn run(ctx: *NsTaskCtx) void {
             var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
             defer udp_t.deinit();
-            var tcp_t = BlockingTcpTransport.init(.{});
+            var tcp_t = BlockingTcpTransport.init();
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp = &tcp_t,
@@ -2777,32 +2777,13 @@ test "findCnameRecord returns null when no CNAME present" {
 // ── QNAME minimization tests ──────────────────────────────────────────
 
 test "probe name construction from label sub-slice" {
-    // Verify that Name{ .labels = sub_slice }.format() produces correct dotted names
     const full_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
+    var buf: [dns.max_name_len + 1]u8 = undefined;
 
-    // 1 label: "com"
-    const view1 = dns.Name{ .labels = full_labels[3..] };
-    const buf1 = view1.format();
-    const len1 = mem.indexOfScalar(u8, &buf1, 0) orelse buf1.len;
-    try testing.expectEqualStrings("com", buf1[0..len1]);
-
-    // 2 labels: "example.com"
-    const view2 = dns.Name{ .labels = full_labels[2..] };
-    const buf2 = view2.format();
-    const len2 = mem.indexOfScalar(u8, &buf2, 0) orelse buf2.len;
-    try testing.expectEqualStrings("example.com", buf2[0..len2]);
-
-    // 3 labels: "sub.example.com"
-    const view3 = dns.Name{ .labels = full_labels[1..] };
-    const buf3 = view3.format();
-    const len3 = mem.indexOfScalar(u8, &buf3, 0) orelse buf3.len;
-    try testing.expectEqualStrings("sub.example.com", buf3[0..len3]);
-
-    // All 4 labels: "www.sub.example.com"
-    const view4 = dns.Name{ .labels = full_labels[0..] };
-    const buf4 = view4.format();
-    const len4 = mem.indexOfScalar(u8, &buf4, 0) orelse buf4.len;
-    try testing.expectEqualStrings("www.sub.example.com", buf4[0..len4]);
+    try testing.expectEqualStrings("com", (dns.Name{ .labels = full_labels[3..] }).formatInto(&buf));
+    try testing.expectEqualStrings("example.com", (dns.Name{ .labels = full_labels[2..] }).formatInto(&buf));
+    try testing.expectEqualStrings("sub.example.com", (dns.Name{ .labels = full_labels[1..] }).formatInto(&buf));
+    try testing.expectEqualStrings("www.sub.example.com", (dns.Name{ .labels = full_labels[0..] }).formatInto(&buf));
 }
 
 test "minimization stepping — probes advance one label at a time" {
@@ -2812,24 +2793,15 @@ test "minimization stepping — probes advance one label at a time" {
     const parent_zone_labels: usize = 1; // "com"
 
     var label_count: usize = parent_zone_labels + 1; // start at 2
+    var buf: [dns.max_name_len + 1]u8 = undefined;
 
-    // First probe: "example.com"
     try testing.expectEqual(@as(usize, 2), label_count);
-    const v1 = dns.Name{ .labels = target_labels[target_labels.len - label_count ..] };
-    const b1 = v1.format();
-    const l1 = mem.indexOfScalar(u8, &b1, 0) orelse b1.len;
-    try testing.expectEqualStrings("example.com", b1[0..l1]);
+    try testing.expectEqualStrings("example.com", (dns.Name{ .labels = target_labels[target_labels.len - label_count ..] }).formatInto(&buf));
+    label_count += 1;
 
-    label_count += 1; // advance
-
-    // Second probe: "sub.example.com"
     try testing.expectEqual(@as(usize, 3), label_count);
-    const v2 = dns.Name{ .labels = target_labels[target_labels.len - label_count ..] };
-    const b2 = v2.format();
-    const l2 = mem.indexOfScalar(u8, &b2, 0) orelse b2.len;
-    try testing.expectEqualStrings("sub.example.com", b2[0..l2]);
-
-    label_count += 1; // advance
+    try testing.expectEqualStrings("sub.example.com", (dns.Name{ .labels = target_labels[target_labels.len - label_count ..] }).formatInto(&buf));
+    label_count += 1;
 
     // Now label_count == target_labels.len → is_final
     try testing.expectEqual(@as(usize, 4), label_count);

@@ -31,26 +31,6 @@ pub fn ephemeralPort(io: Io) u16 {
     return intRangeAtMost(u16, io, 1024, 65535);
 }
 
-/// Uniform(0,1) float from crypto random, excluding exact 0.
-pub fn uniformFloat(io: Io) f32 {
-    var buf: [4]u8 = undefined;
-    io.random(&buf);
-    const bits: u32 = mem.readInt(u32, &buf, .little);
-    return (@as(f32, @floatFromInt(bits)) + 0.5) / 4294967296.0;
-}
-
-/// Fisher-Yates shuffle using crypto random.
-pub fn shuffle(comptime T: type, io: Io, items: []T) void {
-    if (items.len <= 1) return;
-    var i: usize = items.len - 1;
-    while (i > 0) : (i -= 1) {
-        const j = uintLessThan(usize, io, i + 1);
-        const tmp = items[i];
-        items[i] = items[j];
-        items[j] = tmp;
-    }
-}
-
 // ── Fast tactical RNG ────────────────────────────────────────────────
 //
 // std.Io.random funnels every call to a global mutex when the calling

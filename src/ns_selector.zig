@@ -19,11 +19,11 @@ const alpha_prior: f32 = 1.0;
 const beta_prior: f32 = 1.0;
 
 /// Max NS per zone (13 IPv4 + 13 IPv6).
-pub const max_order = 26;
+const max_order = 26;
 
 /// Cap on tracked (zone, server) arms; bounds memory under random-zone
 /// load. Lost arms reset to the Beta(1,1) prior on next observation.
-pub const default_max_arms: u32 = 16_384;
+const default_max_arms: u32 = 16_384;
 
 // ── Outcome ──────────────────────────────────────────────────────────
 

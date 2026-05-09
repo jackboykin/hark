@@ -728,7 +728,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     // refresh doesn't need amortized pooling.
     var udp_t = BlockingUdpTransport.init(.{}, server.io);
     defer udp_t.deinit();
-    var tcp_t = BlockingTcpTransport.init(.{});
+    var tcp_t = BlockingTcpTransport.init();
 
     var tls_t: ?TlsTransport = if (server.config.opportunistic) blk: {
         var t = TlsTransport.init(server.allocator, .{}, server.ca_bundle, server.io);
@@ -1217,7 +1217,7 @@ const WorkerState = struct {
     fn poolThread(self: *WorkerState) void {
         var udp_t = BlockingUdpTransport.init(.{}, self.io);
         defer udp_t.deinit();
-        var tcp_t = BlockingTcpTransport.init(.{});
+        var tcp_t = BlockingTcpTransport.init();
 
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
             var t = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);

@@ -8,7 +8,7 @@ const AddressKey = na.AddressKey;
 // ── Constants (Unbound/Knot consensus) ───────────────────────────────
 
 /// Initial timeout for unknown servers (Unbound 376, Knot 400).
-pub const initial_timeout_ms: u32 = 400;
+const initial_timeout_ms: u32 = 400;
 
 /// Minimum RTO floor. With the rttvar floor (srtt/4) guaranteeing
 /// jitter headroom, this only catches degenerate sub-millisecond RTTs.
@@ -28,7 +28,7 @@ const max_backoff_shifts: u8 = 8;
 
 /// Cap on tracked nameserver entries; bounds memory under random-server
 /// load. Dropped entries revert to `initial_timeout_ms` next observation.
-pub const default_max_entries: u32 = 4_096;
+const default_max_entries: u32 = 4_096;
 
 /// Hedge stagger = `hedge_multiplier × min_rtt`. 3× lands roughly at p95 for
 /// well-behaved RTT distributions (Dean–Barroso "Tail at Scale", CACM 2013).

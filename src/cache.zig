@@ -342,13 +342,10 @@ fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.Res
     };
 }
 
-/// Lowercase src into dest, returning the written slice.
-const lowerInto = dns.lowerNameIntoBuf;
-
 /// Lowercase a name into a stack buffer for lookup. Returns null if name too long.
 fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
     if (name.len > dns.max_name_len) return null;
-    return lowerInto(buf, name);
+    return dns.lowerNameIntoBuf(buf, name);
 }
 
 // ── RRsetCache ────────────────────────────────────────────────────────
@@ -357,7 +354,7 @@ fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
 /// 16 = 2^4 sits in the industry sweet spot (Unbound auto-sets *-slabs to
 /// a power of 2 close to thread count; dnsdist defaults to 20 packet-cache
 /// shards). Matches dev-host physical core count.
-pub const shard_count: u32 = 16;
+const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
 
 /// Per-shard state: lock, map, allocator, eviction state, stat counters.

@@ -13,7 +13,7 @@ const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-pub const VerifyError = error{
+const VerifyError = error{
     InvalidSignature,
     UnsupportedAlgorithm,
     InvalidKey,
@@ -30,12 +30,12 @@ pub const VerifyError = error{
 /// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per query. Sized for a
 /// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
 /// zones SERVFAIL during rollover windows.
-pub const max_sig_verify_per_resolution: u16 = 96;
+const max_sig_verify_per_resolution: u16 = 96;
 
 /// NSEC3 hash cap per query (CVE-2023-50868 plus salt-cache-defeat in
 /// `classifyDelegation`). Exhaustion fails open to `.insecure`. Each
 /// invocation is bounded to `max_nsec3_iterations` SHA-1 ops.
-pub const max_nsec3_hashes_per_resolution: u16 = 96;
+const max_nsec3_hashes_per_resolution: u16 = 96;
 
 /// Per-resolution CPU counters; reset at the top of each `resolve()`.
 pub const ValidationBudget = struct {
@@ -563,7 +563,7 @@ fn serialAfter(s1: u32, s2: u32) bool {
 }
 
 /// 5 minutes — covers typical NTP drift; stricter than Unbound (1h floor).
-pub const clock_skew_tolerance: u32 = 300;
+const clock_skew_tolerance: u32 = 300;
 
 /// Verify an RRSIG, returning true on success, false on non-budget failure.
 /// Propagates ValidationBudgetExhausted so callers can bail out of loops.
@@ -797,7 +797,7 @@ pub fn nsecProvesTypeNonexistence(
 /// iteration count as a configuration smell; 100 is the modern BIND/Unbound
 /// soft ceiling above which proofs are downgraded to .insecure rather than
 /// burning hash budget.
-pub const max_nsec3_iterations: u16 = 100;
+const max_nsec3_iterations: u16 = 100;
 
 /// Compute NSEC3 hash: iterated SHA-1 over canonical_name_wire || salt.
 /// Returns the raw hash bytes (20 bytes for SHA-1).
@@ -864,7 +864,7 @@ fn supportedNsec3OwnerHash(rr: dns.ResourceRecord) ?[Sha1.digest_length]u8 {
     return nsec3OwnerHash(rr.name);
 }
 
-pub const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
+const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
 
 /// Compute NSEC3 hash with per-resolution budget tracking. Callers map
 /// ValidationBudgetExhausted to .insecure (CVE-2023-50868 + salt-cache-defeat

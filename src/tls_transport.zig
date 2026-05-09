@@ -23,15 +23,16 @@ const log = std.log.scoped(.tls_transport);
 const alpn_dot = "dot";
 
 pub const TlsConfig = struct {
-    connect_timeout_ms: u32 = 5000,
-    response_timeout_ms: u32 = 10000,
     server_name: ?[]const u8 = null,
     /// RFC 7858 strict mode: require hostname verification (server_name must be set).
     strict: bool = false,
-    port: u16 = 853,
 };
 
 pub const TlsTransport = struct {
+    pub const port: u16 = 853;
+    const connect_timeout_ms: u32 = 5000;
+    const response_timeout_ms: u32 = 10000;
+
     allocator: Allocator,
     config: TlsConfig,
     ca_bundle: Certificate.Bundle,
@@ -57,9 +58,9 @@ pub const TlsTransport = struct {
     }
 
     pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
-        const tls_server = toPort(server, self.config.port);
+        const tls_server = toPort(server, TlsTransport.port);
         const key = AddressKey.fromAddress(tls_server);
-        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * std.time.ns_per_ms;
+        const deadline_ns = monotonic.nowNs() + @as(i128, response_timeout_ms) * std.time.ns_per_ms;
 
         if (self.tryPooledQuery(key, wire_query, response_buf, deadline_ns)) |data| return data;
 
@@ -106,9 +107,9 @@ pub const TlsTransport = struct {
         const server_name = self.config.server_name orelse return error.ServerNameRequired;
         if (server_name.len == 0) return error.ServerNameRequired;
 
-        const sock = try connectTcpBlocking(tls_server, self.config.connect_timeout_ms);
+        const sock = try connectTcpBlocking(tls_server, connect_timeout_ms);
         errdefer sys.close(sock);
-        sys.setSocketTimeouts(sock, self.config.response_timeout_ms);
+        sys.setSocketTimeouts(sock, response_timeout_ms);
 
         const conn = try self.newPooledConnection(sock);
         errdefer self.allocator.destroy(conn);
@@ -150,7 +151,7 @@ pub const TlsTransport = struct {
     /// first, pools new connections on success. `deadline_ns` is an absolute
     /// monotonic deadline that bounds both connect and query.
     pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, deadline_ns: i128) ![]const u8 {
-        const tls_server = toPort(server, self.config.port);
+        const tls_server = toPort(server, TlsTransport.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
         if (self.tryPooledQuery(addr_key, wire_query, response_buf, deadline_ns)) |data| return data;
@@ -203,7 +204,7 @@ pub const TlsTransport = struct {
     /// Fire a background probe for a nameserver. Detached thread does blocking
     /// TCP connect + TLS handshake. On success, the connection is pooled.
     pub fn probeInBackground(self: *TlsTransport, server: na.Address, enc_ns_cache: *EncryptedNsCache) void {
-        const tls_server = toPort(server, self.config.port);
+        const tls_server = toPort(server, TlsTransport.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
         // Cap concurrent probe threads (CAS loop to avoid TOCTOU overcount)

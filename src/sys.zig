@@ -277,14 +277,3 @@ test "setNoDelay and setQuickAck flip the kernel TCP options" {
         try std.testing.expectEqual(@as(c_int, 1), val);
     }
 }
-
-pub fn pipe() ![2]posix.fd_t {
-    var fds: [2]i32 = undefined;
-    return switch (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true }))) {
-        .SUCCESS => .{ fds[0], fds[1] },
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOMEM => error.SystemResources,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}

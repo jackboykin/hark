@@ -294,19 +294,15 @@ pub const BlockingUdpTransport = struct {
     }
 };
 
-pub const TcpConfig = struct {
-    connect_timeout_ms: u32 = 5000,
-    response_timeout_ms: u32 = 10000,
-};
-
 /// TCP transport using blocking sockets for thread-pool resolution.
 /// Tracks total deadline to mitigate slow-trickle attacks where an
 /// attacker sends one byte at a time to reset per-recv SO_RCVTIMEO.
 pub const BlockingTcpTransport = struct {
-    config: TcpConfig,
+    const connect_timeout_ms: u32 = 5000;
+    const response_timeout_ms: u32 = 10000;
 
-    pub fn init(config: TcpConfig) BlockingTcpTransport {
-        return .{ .config = config };
+    pub fn init() BlockingTcpTransport {
+        return .{};
     }
 
     /// Send a DNS query over TCP. With pool != null, tries an idle pooled
@@ -319,7 +315,7 @@ pub const BlockingTcpTransport = struct {
         response_buf: []u8,
         pool: ?*TcpConnectionPool,
     ) ![]const u8 {
-        const deadline_ns = monotonic.nowNs() + @as(i128, self.config.response_timeout_ms) * 1_000_000;
+        const deadline_ns = monotonic.nowNs() + @as(i128, response_timeout_ms) * 1_000_000;
 
         if (pool) |p| {
             const key = AddressKey.fromAddress(server);
@@ -355,11 +351,11 @@ pub const BlockingTcpTransport = struct {
         return data;
     }
 
-    fn connectTcp(self: *BlockingTcpTransport, server: na.Address) !posix.fd_t {
+    fn connectTcp(_: *BlockingTcpTransport, server: na.Address) !posix.fd_t {
         const af: u32 = na.afU32(server);
         const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
         errdefer sys.close(sock);
-        sys.setSocketTimeout(sock, posix.SO.SNDTIMEO, self.config.connect_timeout_ms);
+        sys.setSocketTimeout(sock, posix.SO.SNDTIMEO, connect_timeout_ms);
         sys.setNoDelay(sock);
         na.connectTo(sock, &server) catch return error.ConnectFailed;
         return sock;

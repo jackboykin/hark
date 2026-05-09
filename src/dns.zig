@@ -188,23 +188,6 @@ pub const Header = struct {
 pub const Name = struct {
     labels: []const []const u8,
 
-    pub fn format(self: Name) [max_name_len + 1]u8 {
-        var buf: [max_name_len + 1]u8 = undefined;
-        var pos: usize = 0;
-        for (self.labels) |label| {
-            if (pos > 0) {
-                buf[pos] = '.';
-                pos += 1;
-            }
-            for (label) |byte| {
-                buf[pos] = if (byte >= 0x21 and byte <= 0x7e) byte else '?';
-                pos += 1;
-            }
-        }
-        buf[pos] = 0;
-        return buf;
-    }
-
     /// Format `self` into `buf` as a dotted string. Returns the written slice so
     /// callers don't need to re-scan for the null terminator.
     pub fn formatInto(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
@@ -469,25 +452,12 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
 
 /// Well-known EDNS option codes consumed/emitted by hark.
 pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
-pub const edns_opt_padding: u16 = 12; // RFC 7830
+const edns_opt_padding: u16 = 12; // RFC 7830
 
 pub const EdnsOption = struct {
     code: u16,
     data: []const u8,
 };
-
-/// RFC 7828 §3: extract the TIMEOUT field (u16, 100-ms units) from a
-/// TCP-keepalive EDNS option. Returns null when the option is absent or
-/// the data length disagrees with the spec (clients send empty data,
-/// servers send 2 bytes).
-pub fn findTcpKeepaliveTimeout(options: []const EdnsOption) ?u16 {
-    for (options) |o| {
-        if (o.code != edns_opt_tcp_keepalive) continue;
-        if (o.data.len == 2) return std.mem.readInt(u16, o.data[0..2], .big);
-        return null;
-    }
-    return null;
-}
 
 pub const OptRecord = struct {
     udp_payload_size: u16,
@@ -597,7 +567,7 @@ pub fn applyCase0x20(io: std.Io, name: Name) void {
 /// RFC 8467 §4.1 recommended block-size for DoT query padding.
 pub const dot_padding_target: u16 = 468;
 
-pub const EdnsConfig = struct {
+const EdnsConfig = struct {
     udp_payload_size: u16 = edns_udp_payload,
     do_bit: bool = false,
     /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) to reach
@@ -605,7 +575,7 @@ pub const EdnsConfig = struct {
     padding_target: u16 = 0,
 };
 
-pub const QueryOptions = struct {
+const QueryOptions = struct {
     rd: bool = true,
     edns: ?EdnsConfig = null,
     /// RFC draft Vixie/Dagon "Use of Bit 0x20 in DNS Labels": when non-null,
@@ -2142,12 +2112,12 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
     }
 }
 
-pub fn freeOpt(allocator: Allocator, opt: OptRecord) void {
+fn freeOpt(allocator: Allocator, opt: OptRecord) void {
     for (opt.options) |o| allocator.free(o.data);
     if (opt.options.len > 0) allocator.free(opt.options);
 }
 
-pub fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
+fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
     for (rrs) |rr| {
         freeName(allocator, rr.name);
         freeRData(allocator, rr.rdata);

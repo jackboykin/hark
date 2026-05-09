@@ -181,8 +181,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 const conn = slots.pop();
                 self.total_conns -= 1;
                 const is_stale = now - conn.last_used > self.max_idle_sec;
-                const is_expired = if (comptime @hasDecl(Conn, "isExpired")) conn.isExpired() else false;
-                if (is_stale or is_expired) {
+                if (is_stale or conn.isExpired()) {
                     conn.destroyBroken(self.allocator);
                     continue;
                 }
@@ -202,7 +201,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             conn.last_used = self.now_fn();
-            if (comptime @hasDecl(Conn, "recordUse")) conn.recordUse();
+            conn.recordUse();
             self.insertLocked(key, conn);
         }
 
@@ -211,7 +210,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             conn.last_used = self.now_fn();
-            if (comptime @hasDecl(Conn, "initCounters")) conn.initCounters();
+            conn.initCounters();
             self.insertLocked(key, conn);
         }
 
