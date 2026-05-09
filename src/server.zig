@@ -419,12 +419,19 @@ pub const Server = struct {
             log.info("listening on {s} (UDP+TCP)", .{addr_str});
         }
 
+        // Fail closed: a non-loopback recursive bind without an explicit ACL
+        // is an open resolver (BCP 140). Operators who genuinely want to
+        // serve a public network must say so explicitly via allow-from
+        // (e.g. ["0.0.0.0/0", "::/0"] for fully-open). The kernel firewall
+        // is the right place for most ACLs; this check just stops the
+        // accidental amplifier-on-startup case.
         if (self.config.mode == .recursive and self.config.allow_from.len == 0) {
             for (listen_addrs) |addr| {
                 if (isNonLoopback(addr)) {
-                    log.warn("listening on a non-loopback address with recursion enabled and no [server].allow-from set — " ++
-                        "this server is an open resolver (BCP 140)", .{});
-                    break;
+                    var addr_buf: [64]u8 = undefined;
+                    log.err("refusing to start: recursive resolver bound to non-loopback {s} without [server].allow-from — " ++
+                        "this would be an open resolver (BCP 140). Set allow-from to an explicit CIDR list.", .{na.format(addr, &addr_buf)});
+                    return error.OpenResolverRefused;
                 }
             }
         }
