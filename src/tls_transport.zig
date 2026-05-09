@@ -352,7 +352,7 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
         .server_name = "one.one.one.one",
     }, ca_bundle, io);
 
-    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -385,7 +385,7 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
         .server_name = "dns.google",
     }, ca_bundle, io);
 
-    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -417,7 +417,7 @@ test "TlsTransport queryOpportunistic against 1.1.1.1:853" {
 
     var tls_t = TlsTransport.init(testing.allocator, .{}, ca_bundle, io);
 
-    const msg = try dns.buildQuery(testing.allocator, 0xC0DE, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0xC0DE, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -455,7 +455,7 @@ test "TlsTransport connection pooling reuses connection" {
     }, ca_bundle, io);
     tls_t.pool = &pool;
 
-    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -583,7 +583,7 @@ fn runHostnameMismatchTest(strict: bool) !void {
         .strict = strict,
     }, ca_bundle, io);
 
-    const msg = try dns.buildQuery(testing.allocator, 0xDEAD, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0xDEAD, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);

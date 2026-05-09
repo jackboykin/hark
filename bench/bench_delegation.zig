@@ -21,7 +21,7 @@ const warmup: usize = 500;
 
 fn storeRecord(cache: *RRsetCache, alloc: std.mem.Allocator, rr: dns.ResourceRecord, authority_zone: dns.Name) !void {
     const msg = try bench_common.singleAnswerMessage(alloc, rr);
-    cache.storeResponse(msg, authority_zone);
+    cache.storeResponse(msg, authority_zone, .unchecked);
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
@@ -75,7 +75,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     var transport = BlockingUdpTransport.init(.{}, io);
     var resolver = RecursiveResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
         .cache = &cache,
     };

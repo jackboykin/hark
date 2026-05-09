@@ -1,7 +1,7 @@
 //! Dedup overhead on cache hits. Two variants against a pre-populated cache:
 //!  - with_dedup:     acquireOrWait → lookup → releaseLeader
 //!  - without_dedup:  lookup only
-//!  - f01:            lookupExists → lookup (skip dedup if the probe hit)
+//!  - f01:            containsFresh → lookup (skip dedup if the probe hit)
 
 const std = @import("std");
 const hark = @import("hark");
@@ -136,7 +136,7 @@ pub fn runF01(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     for (0..warmup) |i| {
         _ = arena.reset(.retain_capacity);
         const name = setup.names[i % n_entries];
-        if (setup.cache.lookupExists(name, .a, .in)) {
+        if (setup.cache.containsFresh(name, .a, .in)) {
             const lookup = setup.cache.lookup(arena.allocator(), name, .a, .in) orelse return error.MissedLookup;
             std.mem.doNotOptimizeAway(lookup);
         } else {
@@ -153,7 +153,7 @@ pub fn runF01(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         _ = arena.reset(.retain_capacity);
         const name = setup.names[i % n_entries];
         const t0 = monotonic.nowNs();
-        if (setup.cache.lookupExists(name, .a, .in)) {
+        if (setup.cache.containsFresh(name, .a, .in)) {
             const lookup = setup.cache.lookup(arena.allocator(), name, .a, .in) orelse return error.MissedLookup;
             std.mem.doNotOptimizeAway(lookup);
         } else {
@@ -167,5 +167,5 @@ pub fn runF01(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         samples[i] = @intCast(t1 - t0);
     }
 
-    return .{ .samples_ns = samples, .label = "lookupExists + lookup (dedup-skip fast path on hit)" };
+    return .{ .samples_ns = samples, .label = "containsFresh + lookup (dedup-skip fast path on hit)" };
 }

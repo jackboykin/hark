@@ -27,23 +27,14 @@ pub const VerifyError = error{
 
 // ── Per-Resolution CPU Budgets ───────────────────────────────────────
 
-/// Caps RRSIG verifications per query to bound DS×DNSKEY×RRSIG amplification
-/// (CVE-2023-50387, KeyTrap). 96 covers the realistic worst-case mix of
-/// cold-cache 5-level chain × KSK rollover × dual-algo signing (RSASHA256 +
-/// ECDSAP256) × the per-level DS-RRSIG verify added by RFC 4035 §5.2 fix:
-/// roughly 5 levels × 3 verifies/level (DS + KSK self-sig + ZSK answer)
-/// × 2 algos = ~60, plus headroom for repeated KSKs. Raise if legitimately
-/// complex zones SERVFAIL during real KSK rollover windows; lower under
-/// tight CPU budgets.
+/// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per query. Sized for a
+/// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
+/// zones SERVFAIL during rollover windows.
 pub const max_sig_verify_per_resolution: u16 = 96;
 
-/// Caps NSEC3 hash invocations per query (CVE-2023-50868 + salt-cache-defeat
-/// in `classifyDelegation`). 96 covers the worst legitimate case (~78 hashes
-/// across max-CNAME-chain × max-referrals with deep IDN qnames) with modest
-/// headroom; exhaustion fails open to `.insecure` (skip_cache, no SERVFAIL).
-/// Each invocation is bounded to `max_nsec3_iterations` SHA-1 ops, so worst-
-/// case spend is 96 × 150 ≈ 14.4k SHA-1 compressions per resolution.
-/// Raise to 128 if telemetry shows legitimate zones tripping the cap.
+/// NSEC3 hash cap per query (CVE-2023-50868 plus salt-cache-defeat in
+/// `classifyDelegation`). Exhaustion fails open to `.insecure`. Each
+/// invocation is bounded to `max_nsec3_iterations` SHA-1 ops.
 pub const max_nsec3_hashes_per_resolution: u16 = 96;
 
 /// Per-resolution CPU counters; reset at the top of each `resolve()`.

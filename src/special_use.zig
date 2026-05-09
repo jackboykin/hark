@@ -19,18 +19,18 @@
 const std = @import("std");
 const mem = std.mem;
 const dns = @import("dns.zig");
-const synthesisedMessage = @import("response.zig").synthesisedMessage;
+const synthesizedMessage = @import("response.zig").synthesizedMessage;
 
 pub const Action = enum {
     /// Not a special-use name — fall through to normal resolution.
     none,
-    /// RFC 1035 §4.1.1 NXDOMAIN. No SOA synthesised; client gets RA-only.
+    /// RFC 1035 §4.1.1 NXDOMAIN. No SOA synthesized; client gets RA-only.
     nxdomain,
-    /// Synthesise an A record for 127.0.0.1.
+    /// Synthesize an A record for 127.0.0.1.
     localhost_a,
-    /// Synthesise an AAAA record for ::1.
+    /// Synthesize an AAAA record for ::1.
     localhost_aaaa,
-    /// Synthesise a PTR record pointing at localhost.
+    /// Synthesize a PTR record pointing at localhost.
     localhost_ptr,
     /// NOERROR with empty answer (the name exists but the qtype does not).
     nodata,
@@ -78,10 +78,10 @@ fn eqlOrSubdomainOf(name: []const u8, tail: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name[name.len - tail.len ..], tail);
 }
 
-/// Synthesise a complete dns.Message for the matched action. The returned
+/// Synthesize a complete dns.Message for the matched action. The returned
 /// records reference allocator-owned memory; caller (the resolver) typically
 /// passes its per-query arena.
-pub fn synthesise(
+pub fn synthesize(
     allocator: mem.Allocator,
     name: []const u8,
     action: Action,
@@ -133,7 +133,7 @@ pub fn synthesise(
         },
     }
 
-    return synthesisedMessage(answers, &.{}, rcode, false);
+    return synthesizedMessage(answers, &.{}, rcode, false);
 }
 
 /// Synthetic responses are stable forever — RFC 6761 names cannot be
@@ -179,19 +179,19 @@ test "classify no match falls through" {
     try testing.expectEqual(Action.none, classify("testing.com", .a));
 }
 
-test "synthesise localhost A produces 127.0.0.1" {
+test "synthesize localhost A produces 127.0.0.1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try synthesise(arena.allocator(), "localhost.", .localhost_a);
+    const msg = try synthesize(arena.allocator(), "localhost.", .localhost_a);
     try testing.expectEqual(@as(u16, 1), msg.header.an_count);
     try testing.expectEqual(dns.RCode.no_error, msg.header.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
 }
 
-test "synthesise nxdomain has no answers" {
+test "synthesize nxdomain has no answers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try synthesise(arena.allocator(), "invalid.", .nxdomain);
+    const msg = try synthesize(arena.allocator(), "invalid.", .nxdomain);
     try testing.expectEqual(dns.RCode.name_error, msg.header.rcode);
     try testing.expectEqual(@as(u16, 0), msg.header.an_count);
 }

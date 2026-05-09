@@ -1,4 +1,5 @@
 const std = @import("std");
+const monotonic = @import("monotonic.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const na = @import("net_address.zig");
@@ -57,7 +58,7 @@ pub const EncryptedNsCache = struct {
     io: std.Io,
     active_probes: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    now_fn: *const fn () i64 = &defaultNow,
+    now_fn: *const fn () i64 = &monotonic.nowSec,
 
     pub fn init(allocator: Allocator, io: std.Io) EncryptedNsCache {
         return .{
@@ -184,10 +185,6 @@ pub const EncryptedNsCache = struct {
         if (oldest_key) |k| {
             _ = self.entries.fetchRemove(k);
         }
-    }
-
-    fn defaultNow() i64 {
-        return @import("monotonic.zig").nowSec();
     }
 };
 

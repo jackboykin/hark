@@ -122,13 +122,9 @@ pub const InFlightTable = struct {
             return .follower;
         }
 
-        // At cap: graceful degradation. Return `.leader` without inserting so
-        // every overflow caller runs uncoordinated. Eviction would be worse
-        // under water-torture floods: at cap by definition we're under attack
-        // load, mostly unique keys, no dedup benefit from eviction — but each
-        // eviction wakes a real query's followers who retry, doubling upstream
-        // amplification per arrival. Concurrent identical-key callers at cap
-        // both becoming uncoordinated leaders is the lesser evil here.
+        // At cap: degrade by returning `.leader` without inserting. Eviction
+        // under flood would wake real queries' followers and double upstream
+        // amplification; uncoordinated leaders is the lesser evil.
         if (self.map.count() >= max_entries) return .leader;
         self.map.put(self.allocator, key, false) catch return .leader;
         return .leader;

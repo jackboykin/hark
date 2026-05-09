@@ -71,7 +71,7 @@ fn setup(allocator: std.mem.Allocator) !Setup {
     const thread = try std.Thread.spawn(.{}, echoServer, .{ server_sock, stop });
 
     // Build one wire query; reuse across iterations (query ID patched each call).
-    const msg = try dns.buildQuery(allocator, 0, "bench.test", .a);
+    const msg = try dns.buildQuery(allocator, 0, "bench.test", .a, .{});
     defer dns.freeMessage(allocator, msg);
     var tmp: [dns.max_udp_payload]u8 = undefined;
     const w = try dns.serializeMessage(&tmp, msg);

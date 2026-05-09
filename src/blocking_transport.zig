@@ -51,15 +51,10 @@ fn openUdpSocket(dest: na.Address, io: std.Io) !posix.fd_t {
     return error.AddressInUse;
 }
 
-/// UDP transport using blocking sockets for thread-pool resolution.
-///
-/// `queryWithTimeout` uses per-thread persistent unconnected sockets (one per
-/// address family) bound to a random ephemeral port. Source-port randomness
-/// (RFC 5452 §9.1) is preserved by rebinding every `rebind_after_queries`
-/// queries. The `queryStaggered` path still opens short-lived connected
-/// sockets per call — racing two responses on one shared socket is doable
-/// but needs more care, and the staggered path only fires when
-/// `stagger_ms > 0` and 2+ NS are available.
+/// Blocking UDP transport. Per-thread persistent unconnected sockets per
+/// address family, rebound every `rebind_after_queries` to refresh source-port
+/// randomness (RFC 5452 §9.1). The staggered path uses short-lived connected
+/// sockets per leg.
 pub const BlockingUdpTransport = struct {
     config: Config,
     io: std.Io,
@@ -197,17 +192,15 @@ pub const BlockingUdpTransport = struct {
     /// Must be >= any caller's effective cap.
     pub const max_staggered_legs = 4;
 
-    /// Race up to `max_staggered_legs` nameservers with staggered launches; take
-    /// the first valid response. Each leg uses a connected UDP socket with a
-    /// unique random source port (RFC 5452 §9.1). Callers must supply distinct
-    /// destination IPs per leg — racing the same IP would not amplify birthday
-    /// entropy beyond a single query.
+    /// Race up to `max_staggered_legs` nameservers; return the first valid
+    /// response. Each leg gets a connected UDP socket with a unique random
+    /// source port (RFC 5452 §9.1). Callers must pass distinct destination IPs
+    /// — racing the same IP would not increase birthday entropy.
     ///
-    /// `wire_queries`, `query_ids`, and `servers` must be the same length
-    /// (2..`max_staggered_legs`), one entry per leg. Leg 0 launches immediately;
-    /// leg `i` launches at `query_start + i*stagger_ms` if no earlier leg has
-    /// responded by then. `response_buf` must outlive every slice the caller
-    /// holds from the returned response (see queryWithTimeout).
+    /// `wire_queries`, `query_ids`, `servers` must be parallel arrays of length
+    /// 2..`max_staggered_legs`. Leg `i` launches at `query_start + i*stagger_ms`
+    /// unless an earlier leg responds first. `response_buf` lifetime: see
+    /// queryWithTimeout.
     pub fn queryStaggered(
         self: *BlockingUdpTransport,
         wire_queries: []const []const u8,
@@ -372,12 +365,9 @@ pub const BlockingTcpTransport = struct {
         return sock;
     }
 
-    /// Send a length-prefixed DNS query and receive the response on an
-    /// already-connected TCP socket, enforcing an absolute deadline.
-    ///
-    /// SO_SNDTIMEO/SO_RCVTIMEO are set once to the remaining deadline as a
-    /// per-syscall upper bound; the userspace deadline check before each
-    /// read/write enforces the total bound (slow-trickle mitigation).
+    /// Length-prefixed DNS query/response on a connected TCP socket. The
+    /// per-syscall SO_*TIMEO is the remaining deadline; the userspace check
+    /// before each read/write enforces the total deadline (slow-trickle).
     fn sendAndReceiveTcp(sock: posix.fd_t, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
         try sys.updateTimeout(sock, posix.SO.SNDTIMEO, deadline_ns);
         try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
@@ -445,7 +435,7 @@ test "BlockingUdpTransport loopback query" {
     const server_addr = try na.getSockName(server_sock);
 
     // Build a DNS query
-    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -478,7 +468,7 @@ test "BlockingUdpTransport timeout" {
 
     const server_addr = try na.getSockName(server_sock);
 
-    const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a);
+    const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
@@ -507,7 +497,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
     const port = (try na.getSockName(server_sock)).getPort();
     const server_addr = na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
 
-    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa);
+    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);

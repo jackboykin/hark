@@ -16,7 +16,7 @@ const na = @import("net_address.zig");
 pub const Family = enum(u8) { v4, v6 };
 
 pub const Cidr = struct {
-    /// Network bytes, normalised so all bits past `prefix` are zero.
+    /// Network bytes, normalized so all bits past `prefix` are zero.
     /// 4 bytes for v4, 16 for v6.
     bytes: [16]u8,
     prefix: u8,
@@ -51,7 +51,7 @@ pub fn parse(s: []const u8) ?Cidr {
         if (prefix > 128) return null;
         var c = Cidr{ .bytes = .{0} ** 16, .prefix = prefix, .family = .v6 };
         @memcpy(&c.bytes, &ip6.bytes);
-        normaliseInPlace(c.bytes[0..16], prefix);
+        normalizeInPlace(c.bytes[0..16], prefix);
         return c;
     }
 
@@ -61,7 +61,7 @@ pub fn parse(s: []const u8) ?Cidr {
     if (prefix > 32) return null;
     var c = Cidr{ .bytes = .{0} ** 16, .prefix = prefix, .family = .v4 };
     @memcpy(c.bytes[0..4], &ip4.bytes);
-    normaliseInPlace(c.bytes[0..4], prefix);
+    normalizeInPlace(c.bytes[0..4], prefix);
     return c;
 }
 
@@ -85,7 +85,7 @@ fn prefixMatch(addr: []const u8, network: []const u8, prefix: u8) bool {
     return (addr[full] & mask) == (network[full] & mask);
 }
 
-fn normaliseInPlace(buf: []u8, prefix: u8) void {
+fn normalizeInPlace(buf: []u8, prefix: u8) void {
     const full = prefix / 8;
     const rem: u3 = @intCast(prefix % 8);
     if (full < buf.len) {
@@ -109,7 +109,7 @@ test "parse v4 with prefix" {
     try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, c.bytes[0..4]);
 }
 
-test "parse v4 normalises host bits" {
+test "parse v4 normalizes host bits" {
     const c = parse("192.168.1.255/24") orelse return error.ParseFailed;
     try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, c.bytes[0..4]);
 }

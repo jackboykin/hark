@@ -29,7 +29,7 @@ pub const default_max_arms: u32 = 16_384;
 
 pub const Outcome = enum {
     /// Valid answer received (may be referral, NODATA, NXDOMAIN — all are
-    /// legitimate authoritative behaviour).
+    /// legitimate authoritative behavior).
     success,
     /// TC bit set, required TCP fallback (server alive but costly).
     truncated,

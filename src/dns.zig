@@ -496,7 +496,7 @@ pub const OptRecord = struct {
     do_bit: bool,
     options: []const EdnsOption,
     /// If non-zero, serializeMessage adds an EDNS0 padding option (code 12)
-    /// so the total message reaches this size. Set by buildQueryWithOptions.
+    /// so the total message reaches this size. Set by buildQuery.
     padding_target: u16 = 0,
 };
 
@@ -614,11 +614,7 @@ pub const QueryOptions = struct {
     case_rng: ?std.Io = null,
 };
 
-pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType) Error!Message {
-    return buildQueryWithOptions(allocator, id, name_str, qtype, .{});
-}
-
-pub fn buildQueryWithOptions(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
+pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
     const name = try parseDottedName(allocator, name_str);
     if (options.case_rng) |io| applyCase0x20(io, name);
     const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
@@ -1874,7 +1870,7 @@ test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{ .rd = true, .edns = .{ .do_bit = true } });
+    const msg = try buildQuery(alloc, 0x1234, "example.com", .a, .{ .rd = true, .edns = .{ .do_bit = true } });
 
     // Verify opt was set on the built message
     try testing.expect(msg.opt != null);
@@ -1908,7 +1904,7 @@ test "EDNS0: parse non-EDNS response has null opt" {
     const alloc = arena.allocator();
 
     // Build a query without EDNS
-    const msg = try buildQuery(alloc, 0x5678, "example.com", .a);
+    const msg = try buildQuery(alloc, 0x5678, "example.com", .a, .{});
     try testing.expect(msg.opt == null);
 
     // Serialize and parse
@@ -1925,7 +1921,7 @@ test "EDNS0: serialized OPT has correct wire format" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQueryWithOptions(alloc, 0xABCD, "x.com", .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
+    const msg = try buildQuery(alloc, 0xABCD, "x.com", .a, .{ .rd = true, .edns = .{ .do_bit = true, .udp_payload_size = 4096 } });
 
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
@@ -1956,7 +1952,7 @@ test "EDNS0: padding_target produces wire of exactly that size" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQueryWithOptions(alloc, 0xBEEF, "example.com", .a, .{
+    const msg = try buildQuery(alloc, 0xBEEF, "example.com", .a, .{
         .rd = true,
         .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_target = dot_padding_target },
     });
@@ -1976,7 +1972,7 @@ test "EDNS0: buildQuery without edns has no opt" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = try buildQueryWithOptions(alloc, 0x1111, "test.com", .aaaa, .{ .rd = false });
+    const msg = try buildQuery(alloc, 0x1111, "test.com", .aaaa, .{ .rd = false });
     try testing.expect(msg.opt == null);
 
     var buf: [max_udp_payload]u8 = undefined;
@@ -2245,7 +2241,7 @@ test "isSubdomainOf case insensitive" {
 test "buildQuery roundtrip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try buildQuery(arena.allocator(), 0x1234, "example.com", .a);
+    const msg = try buildQuery(arena.allocator(), 0x1234, "example.com", .a, .{});
 
     try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
     try testing.expect(!msg.header.qr);
@@ -2264,10 +2260,10 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(msg.questions[0].qtype, msg2.questions[0].qtype);
 }
 
-test "buildQueryWithOptions rd=false roundtrip" {
+test "buildQuery rd=false roundtrip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try buildQueryWithOptions(arena.allocator(), 0x5678, "example.com", .a, .{ .rd = false });
+    const msg = try buildQuery(arena.allocator(), 0x5678, "example.com", .a, .{ .rd = false });
 
     try testing.expect(!msg.header.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
@@ -2784,13 +2780,13 @@ test "applyCase0x20 on root and all-numeric is a no-op" {
     try testing.expect(mem.eql(u8, numeric.labels[0], numeric_copy.labels[0]));
 }
 
-test "buildQueryWithOptions with case_randomize" {
+test "buildQuery with case_randomize" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const lower = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{});
-    const randomized = try buildQueryWithOptions(alloc, 0x1234, "example.com", .a, .{
+    const lower = try buildQuery(alloc, 0x1234, "example.com", .a, .{});
+    const randomized = try buildQuery(alloc, 0x1234, "example.com", .a, .{
         .case_rng = testing.io,
     });
 

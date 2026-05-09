@@ -8,8 +8,7 @@ const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransp
 const rand = @import("rand.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const na = @import("net_address.zig");
-const transport_mod = @import("transport.zig");
-const Transports = transport_mod.Transports;
+const Transports = @import("transport.zig").Transports;
 
 pub const ForwardingResolver = struct {
     transports: Transports,
@@ -19,7 +18,7 @@ pub const ForwardingResolver = struct {
         const query_id = rand.queryId(self.io);
 
         // Build query message (with EDNS0)
-        const query_msg = try dns.buildQueryWithOptions(allocator, query_id, name, qtype, .{ .edns = .{} });
+        const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{ .edns = .{} });
 
         // Serialize to wire format
         var wire_buf: [dns.edns_udp_payload]u8 = undefined;
@@ -36,15 +35,13 @@ pub const ForwardingResolver = struct {
             return msg;
         }
 
-        const blocking = self.transports.do53.asBlocking();
-
         // Do53 path: UDP with TCP fallback on truncation.
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const response_data = try blocking.udp.query(wire_query, query_id, upstream, response_buf);
+        const response_data = try self.transports.udp.query(wire_query, query_id, upstream, response_buf);
 
         // TC bit: retry over TCP before parsing (RFC 2181 — ignore truncated data)
         if (dns.hasTcBit(response_data)) {
-            if (blocking.tcp) |tcp| {
+            if (self.transports.tcp) |tcp| {
                 const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
                 if (tcp.query(wire_query, upstream, tcp_buf, null)) |tcp_data| {
                     const msg = try dns.parseMessage(allocator, tcp_data);
@@ -71,7 +68,7 @@ test "ForwardingResolver resolve example.com A via 8.8.8.8" {
     var transport = BlockingUdpTransport.init(.{}, io);
 
     var resolver = ForwardingResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
     };
 

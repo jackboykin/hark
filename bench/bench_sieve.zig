@@ -53,7 +53,7 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const root_zone = dns.Name{ .labels = &.{} };
 
     // Fill cache
-    for (0..cache_size) |i| cache.storeResponse(messages[i], root_zone);
+    for (0..cache_size) |i| cache.storeResponse(messages[i], root_zone, .unchecked);
 
     var mark_arena = std.heap.ArenaAllocator.init(backing);
     defer mark_arena.deinit();
@@ -61,14 +61,14 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     // Warmup
     for (0..warmup) |i| {
         markAllVisited(&cache, &mark_arena);
-        cache.storeResponse(messages[cache_size + i], root_zone);
+        cache.storeResponse(messages[cache_size + i], root_zone, .unchecked);
     }
 
     const samples = try allocator.alloc(i64, bench_iters);
     for (0..bench_iters) |i| {
         markAllVisited(&cache, &mark_arena);
         const t0 = monotonic.nowNs();
-        cache.storeResponse(messages[cache_size + warmup + i], root_zone);
+        cache.storeResponse(messages[cache_size + warmup + i], root_zone, .unchecked);
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
     }

@@ -31,8 +31,7 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
-const transport_mod = @import("transport.zig");
-const Transports = transport_mod.Transports;
+const Transports = @import("transport.zig").Transports;
 const Certificate = std.crypto.Certificate;
 const na = @import("net_address.zig");
 const response = @import("response.zig");
@@ -429,20 +428,19 @@ pub const Server = struct {
             for (listen_addrs) |addr| {
                 if (isNonLoopback(addr)) {
                     var addr_buf: [64]u8 = undefined;
-                    log.err("refusing to start: recursive resolver bound to non-loopback {s} without [server].allow-from — " ++
-                        "this would be an open resolver (BCP 140). Set allow-from to an explicit CIDR list.", .{na.format(addr, &addr_buf)});
+                    log.err("refusing to start: recursive resolver bound to non-loopback {s} without [server].allow-from. " ++
+                        "This would be an open resolver (BCP 140). Set allow-from to an explicit CIDR list.", .{na.format(addr, &addr_buf)});
                     return error.OpenResolverRefused;
                 }
             }
         }
 
+        log.info("workers={d}", .{workers});
+
         if (workers <= 1) {
             // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
-            log.info("{d} worker", .{workers});
             self.runWorker(listen_addrs, sig_fd, self.wake_fds[0], false);
         } else {
-            log.info("{d} workers", .{workers});
-
             // Spawn N-1 worker threads + run one on main thread. Spawned
             // workers take wake_fds[0..workers-1]; main takes the last slot.
             const threads = self.allocator.alloc(std.Thread, workers - 1) catch |err| {
@@ -470,7 +468,7 @@ pub const Server = struct {
         // Check for worker failures
         const failed = self.worker_errors.load(.monotonic);
         if (failed > 0) {
-            log.warn("{d} worker(s) failed to initialize — running with degraded capacity", .{failed});
+            log.warn("{d} worker(s) failed to initialize; running with degraded capacity", .{failed});
         }
 
         // Log cache stats on shutdown
@@ -746,12 +744,13 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
 
     var resolver = RecursiveResolver{
         .transports = .{
-            .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+            .udp = &udp_t,
+            .tcp = &tcp_t,
             .tls = tls_ptr,
         },
         .io = server.io,
         .cache = &server.cache,
-        .qname_minimisation = server.config.qname_minimization,
+        .qname_minimization = server.config.qname_minimization,
         .dnssec_aware = server.config.dnssec,
         .dnssec_enabled = server.config.dnssec,
         .encrypted_ns_cache = if (server.encrypted_ns_cache) |*oc| oc else null,
@@ -1162,7 +1161,7 @@ const WorkerState = struct {
                     .transports = transports,
                     .io = self.io,
                     .cache = self.cache,
-                    .qname_minimisation = self.config.qname_minimization,
+                    .qname_minimization = self.config.qname_minimization,
                     // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
                     .dnssec_aware = self.config.dnssec,
                     // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
@@ -1227,7 +1226,8 @@ const WorkerState = struct {
         } else null;
 
         const transports: Transports = .{
-            .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+            .udp = &udp_t,
+            .tcp = &tcp_t,
             .tls = if (tls_t) |*t| t else null,
         };
 
@@ -1325,7 +1325,7 @@ const WorkerState = struct {
         // surface — the kernel will fragment a 65 kB datagram, but we'd still
         // amplify the wire serialization cost.
         const client_payload = if (query_msg.opt) |opt| opt.udp_payload_size else dns.max_udp_payload;
-        const max_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
+        const resolved_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
 
         const start_ns = monotonic.nowNs();
         var peer_buf: [64]u8 = undefined;
@@ -1348,12 +1348,12 @@ const WorkerState = struct {
         // per-query arena. The 64 KiB frame this used to reserve was a
         // ReleaseSafe memset hotspot and a stack-prologue tax in ReleaseFast.
         var wire_stack: [4096]u8 = undefined;
-        const wire_buf: ?[]u8 = if (max_payload <= wire_stack.len)
+        const wire_buf: ?[]u8 = if (resolved_payload <= wire_stack.len)
             wire_stack[0..]
         else
-            alloc.alloc(u8, max_payload) catch null;
+            alloc.alloc(u8, resolved_payload) catch null;
         if (wire_buf) |buf| {
-            if (buildResponseWire(buf, ResponseContext.fromQuery(query_msg, max_payload), result.message, alloc)) |wire| {
+            if (buildResponseWire(buf, ResponseContext.fromQuery(query_msg, resolved_payload), result.message, alloc)) |wire| {
                 self.sendUdpResponse(sock, wire, client_addr);
             }
         } else {
@@ -1381,7 +1381,7 @@ const WorkerState = struct {
         // RFC 8305 cousin co-prefetch: fire-and-forget, gated on a cache miss.
         const cousin_qtype = result.cousin_prefetch_qtype orelse return;
         if (!self.config.prefetch_cousin) return;
-        if (self.cache.lookupExists(query_name, cousin_qtype, .in)) return;
+        if (self.cache.containsFresh(query_name, cousin_qtype, .in)) return;
         _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .prefetch);
     }
 
@@ -1421,7 +1421,7 @@ const WorkerState = struct {
         // upstream I/O happens, so the InFlightTable mutex pair is pure
         // overhead; a shared-lock existence probe skips it. On miss we fall
         // through to the normal dedup + resolve path.
-        if (self.cache.lookupExists(name, qtype, .in)) {
+        if (self.cache.containsFresh(name, qtype, .in)) {
             return self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         }
 
@@ -1687,7 +1687,7 @@ test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
     defer arena.deinit();
 
     // Build a query, then manually append a second OPT to additionals.
-    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
     query.opt = .{
         .udp_payload_size = 4096,
         .extended_rcode = 0,
@@ -1794,7 +1794,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
         .client_edns = true,
         .client_do = true, // DO=1 → client_wants_ad via fromQuery; exercise the AD-strip path
         .client_wants_ad = true,
-        .max_payload = dns.edns_udp_payload,
+        .max_udp_payload = dns.edns_udp_payload,
     }, response_unchecked, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
@@ -1817,7 +1817,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
         .client_edns = true,
         .client_do = true,
         .client_wants_ad = true,
-        .max_payload = dns.edns_udp_payload,
+        .max_udp_payload = dns.edns_udp_payload,
     }, response_secure, a).?;
     const parsed2 = try dns.parseMessage(a, wire2);
     try testing.expectEqual(true, parsed2.header.ad);
@@ -1856,7 +1856,7 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
         .questions = &.{},
         .answers = answers,
     };
-    server.cache.storeResponseWithStatus(resp, dns.Name{ .labels = &.{} }, .secure);
+    server.cache.storeResponse(resp, dns.Name{ .labels = &.{} }, .secure);
 
     try testing.expect(server.cache.hasValidatedPositive("example.com", .a, .in));
     // .unchecked entries are NOT protected — bg scheduler should still fire.

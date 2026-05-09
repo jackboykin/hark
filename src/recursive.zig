@@ -4,13 +4,11 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const special_use = @import("special_use.zig");
-const synthesisedMessage = @import("response.zig").synthesisedMessage;
+const synthesizedMessage = @import("response.zig").synthesizedMessage;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const transport_mod = @import("transport.zig");
-const Transport = transport_mod.Transport;
-const Transports = transport_mod.Transports;
+const Transports = @import("transport.zig").Transports;
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("net_address.zig").AddressKey;
@@ -66,7 +64,7 @@ pub const root_hints: [26]na.Address = .{
 const max_referrals = 10;
 const max_servers_per_level = 26;
 const max_cname_chain = 8;
-const max_minimise_count = 10;
+const max_minimize_count = 10;
 
 /// Parse a DNS message, propagating OOM and converting other parse
 /// errors to null so callers can skip malformed responses. Logs the
@@ -89,7 +87,7 @@ pub const RecursiveResolver = struct {
     transports: Transports,
     io: std.Io,
     cache: ?*RRsetCache = null,
-    qname_minimisation: bool = true,
+    qname_minimization: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
     dnssec_enabled: bool = false,
     /// Whether to request DNSSEC data (DO bit) — always true if server is DNSSEC-capable.
@@ -140,11 +138,11 @@ pub const RecursiveResolver = struct {
     }
 
     fn udp(self: *const RecursiveResolver) *BlockingUdpTransport {
-        return self.transports.do53.asBlocking().udp;
+        return self.transports.udp;
     }
 
     fn tcp(self: *const RecursiveResolver) ?*BlockingTcpTransport {
-        return self.transports.do53.asBlocking().tcp;
+        return self.transports.tcp;
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -210,7 +208,7 @@ pub const RecursiveResolver = struct {
             // no privacy leak to root.
             const action = special_use.classify(current_name, qtype);
             if (action != .none) {
-                const synth = try special_use.synthesise(allocator, current_name, action);
+                const synth = try special_use.synthesize(allocator, current_name, action);
                 return .{
                     .message = try withCnameChain(allocator, cname_chain.items, synth),
                     .prefetch_name = null,
@@ -218,12 +216,12 @@ pub const RecursiveResolver = struct {
                 };
             }
 
-            // RFC 8482: minimise ANY responses to a synthetic HINFO answer
+            // RFC 8482: minimize ANY responses to a synthetic HINFO answer
             // to deny amplification. Modern resolvers refuse ANY entirely or
             // return RFC8482; we choose the latter so legacy clients still
             // get a valid response.
             if (qtype == .any) {
-                const synth = try synthesiseAnyHinfo(allocator, current_name);
+                const synth = try synthesizeAnyHinfo(allocator, current_name);
                 return .{
                     .message = try withCnameChain(allocator, cname_chain.items, synth),
                     .prefetch_name = null,
@@ -270,7 +268,7 @@ pub const RecursiveResolver = struct {
 
                         switch (result) {
                             .hit => |h| return .{
-                                .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),
+                                .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),
                                 .prefetch_name = prefetch_name,
                                 .prefetch_qtype = qtype,
                             },
@@ -281,7 +279,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
@@ -306,7 +304,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, authorities, .name_error, false)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, authorities, .name_error, false)),
                                     .prefetch_name = null,
                                     .prefetch_qtype = qtype,
                                 };
@@ -328,7 +326,7 @@ pub const RecursiveResolver = struct {
                             .nxdomain, .nodata => |rc| {
                                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesisedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, &.{synth.soa}, rcode, true)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
@@ -372,19 +370,19 @@ pub const RecursiveResolver = struct {
 
             // QNAME minimization (RFC 9156): start probing one label past the
             // current zone cut and advance toward the full target name.
-            var minimise_label_count: usize = if (self.qname_minimisation)
+            var minimize_label_count: usize = if (self.qname_minimization)
                 parent_zone.labels.len + 1
             else
                 target_name.labels.len; // disabled: always send full name
 
             for (0..max_referrals) |_| {
                 // Determine if this iteration sends the full (final) query or a probe.
-                const is_final = minimise_label_count >= target_name.labels.len or
-                    !self.qname_minimisation or total_probes >= max_minimise_count;
+                const is_final = minimize_label_count >= target_name.labels.len or
+                    !self.qname_minimization or total_probes >= max_minimize_count;
 
                 // Build probe name from target's trailing labels, or use the full name.
                 const query_name: []const u8 = if (is_final) current_name else blk: {
-                    const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                    const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                     var child_buf: [dns.max_name_len + 1]u8 = undefined;
                     break :blk try allocator.dupe(u8, child_view.formatInto(&child_buf));
                 };
@@ -399,17 +397,17 @@ pub const RecursiveResolver = struct {
                             switch (result) {
                                 .hit => {
                                     // Name exists — advance probe
-                                    minimise_label_count += 1;
+                                    minimize_label_count += 1;
                                     continue;
                                 },
                                 .negative => |n| {
                                     if (n.rcode == .name_error) {
-                                        // Cached NXDOMAIN — relaxed mode: stop minimising
-                                        minimise_label_count = target_name.labels.len;
+                                        // Cached NXDOMAIN — relaxed mode: stop minimizing
+                                        minimize_label_count = target_name.labels.len;
                                         continue;
                                     }
                                     // Cached NODATA — name exists, advance
-                                    minimise_label_count += 1;
+                                    minimize_label_count += 1;
                                     continue;
                                 },
                             }
@@ -427,9 +425,9 @@ pub const RecursiveResolver = struct {
                     // may contain NS records in authority that are not valid delegations)
                     if (response.header.rcode == .no_error) {
                         if (extractReferral(response, target_name, parent_zone)) |referral| {
-                            if (self.cache) |c| c.storeResponse(response, parent_zone);
+                            if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
-                            minimise_label_count = parent_zone.labels.len + 1;
+                            minimize_label_count = parent_zone.labels.len + 1;
                             continue;
                         }
                     }
@@ -446,13 +444,13 @@ pub const RecursiveResolver = struct {
                         // e.g. ns1.p07.dynect.net under x.com's delegation for
                         // the negative TTL window (up to 3 hours).
                         //
-                        // Stop minimising (relaxed mode) but only cache when
+                        // Stop minimizing (relaxed mode) but only cache when
                         // DNSSEC NSEC has proved the cut. Secure-cached entries
                         // are then doubly inert: the NX-cut path's `!= .secure`
                         // filter routes them through the dedicated NSEC
                         // aggressive-use cache instead, so this branch caches
                         // *only* entries the NX-cut will skip by design.
-                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, servers[0..server_count])) {
                             .proceed => {
                                 // .secure here means verifiedNegativeResponse
@@ -464,46 +462,46 @@ pub const RecursiveResolver = struct {
                             },
                             .skip_cache => {},
                             .bogus => {
-                                minimise_label_count = target_name.labels.len;
+                                minimize_label_count = target_name.labels.len;
                                 continue;
                             },
                         }
-                        minimise_label_count = target_name.labels.len;
+                        minimize_label_count = target_name.labels.len;
                         continue;
                     }
 
                     if (response.header.rcode != .no_error and response.header.rcode != .name_error) {
-                        // Probe error (SERVFAIL, REFUSED, FORMERR, etc.) — stop minimising, send full QNAME
-                        minimise_label_count = target_name.labels.len;
+                        // Probe error (SERVFAIL, REFUSED, FORMERR, etc.) — stop minimizing, send full QNAME
+                        minimize_label_count = target_name.labels.len;
                         continue;
                     }
 
                     if (response.answers.len > 0) {
                         // Probe got an answer — name exists, advance
-                        minimise_label_count += 1;
+                        minimize_label_count += 1;
                         continue;
                     }
 
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
                     {
-                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
+                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.aa) {
                                     if (self.cache) |c| {
-                                        c.storeResponse(response, parent_zone);
+                                        c.storeResponse(response, parent_zone, .unchecked);
                                         c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                     }
                                 }
                             },
                             .skip_cache => {},
                             .bogus => {
-                                minimise_label_count = target_name.labels.len;
+                                minimize_label_count = target_name.labels.len;
                                 continue;
                             },
                         }
                     }
-                    minimise_label_count += 1;
+                    minimize_label_count += 1;
                     continue;
                 }
 
@@ -616,7 +614,7 @@ pub const RecursiveResolver = struct {
                             }
                             if (findCnameRecord(response, target_name)) |cname_rr| {
                                 // Store before following CNAME — won't reach final answer validation
-                                if (self.cache) |c| c.storeResponseWithStatus(response, parent_zone, cname_status);
+                                if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status);
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
@@ -631,7 +629,7 @@ pub const RecursiveResolver = struct {
                                 {
                                     current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
                                     target_name = try dns.parseDottedName(allocator, current_name);
-                                    minimise_label_count = if (self.qname_minimisation)
+                                    minimize_label_count = if (self.qname_minimization)
                                         parent_zone.labels.len + 1
                                     else
                                         target_name.labels.len;
@@ -670,7 +668,7 @@ pub const RecursiveResolver = struct {
                     // policy, so unauthenticated constituents would become a
                     // poisoning channel for later per-type lookups.
                     if (self.cache) |c| if (qtype != .any) {
-                        c.storeResponseWithStatus(response, parent_zone, answer_status);
+                        c.storeResponse(response, parent_zone, answer_status);
                         if (answer_status == .secure and self.nsec_cache != null) {
                             self.storeWildcardRRsets(response.answers, qtype);
                         }
@@ -690,7 +688,7 @@ pub const RecursiveResolver = struct {
                                     self.storeNsec(response.authorities, parent_zone);
                                 }
                                 if (self.cache) |c| {
-                                    c.storeResponse(response, parent_zone);
+                                    c.storeResponse(response, parent_zone, .unchecked);
                                     c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                 }
                             },
@@ -710,9 +708,9 @@ pub const RecursiveResolver = struct {
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };
 
-                if (self.cache) |c| c.storeResponse(response, parent_zone);
+                if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
-                minimise_label_count = parent_zone.labels.len + 1;
+                minimize_label_count = parent_zone.labels.len + 1;
             }
 
             return error.MaxReferralsExceeded;
@@ -822,7 +820,7 @@ pub const RecursiveResolver = struct {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
                 // target_name is arena-allocated and outlives the response — direct assignment.
                 for (h.records) |*rr| rr.name = target_name;
-                return try withCnameChain(allocator, cname_chain_items, synthesisedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
+                return try withCnameChain(allocator, cname_chain_items, synthesizedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
@@ -883,7 +881,7 @@ pub const RecursiveResolver = struct {
 
         const signer_zone = sig.signer_name;
         if (self.cache) |c| {
-            c.storeResponseWithStatus(.{
+            c.storeResponse(.{
                 .header = .{
                     .id = 0,
                     .qr = true,
@@ -1069,7 +1067,7 @@ pub const RecursiveResolver = struct {
         }
 
         qids[0] = rand.queryId(self.io);
-        const msg0 = dns.buildQueryWithOptions(allocator, qids[0], query_name, query_type, .{
+        const msg0 = dns.buildQuery(allocator, qids[0], query_name, query_type, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
             .case_rng = case_rng,
@@ -1178,7 +1176,7 @@ pub const RecursiveResolver = struct {
             // Live servers come first; dead are appended at the tail. Skip
             // dead servers unless we have no live ones (`live_count == 0`,
             // partial-zone outage — every NS gets a retry shot, matching the
-            // pre-dedupe behaviour) or this is the very last entry (always
+            // pre-dedupe behavior) or this is the very last entry (always
             // try *something*).
             const is_last_server = (server_i + 1 >= sel.order.len);
             const dead_skip = server_i >= sel.live_count and sel.live_count > 0 and !is_last_server;
@@ -1190,7 +1188,7 @@ pub const RecursiveResolver = struct {
             // the lowercase fallback retry can rebuild without 0x20.
             var case_rng = self.caseRng(addr_key);
             retry: while (true) {
-                const query_msg = try dns.buildQueryWithOptions(allocator, 0, query_name, query_type, .{
+                const query_msg = try dns.buildQuery(allocator, 0, query_name, query_type, .{
                     .rd = false,
                     .edns = .{ .do_bit = self.dnssec_aware },
                     .case_rng = case_rng,
@@ -1210,7 +1208,7 @@ pub const RecursiveResolver = struct {
                         const tls_key = AddressKey.fromAddressWithPort(server, tls_t.config.port);
                         switch (oc.getStatus(tls_key)) {
                             .capable => {
-                                const padded_msg = try dns.buildQueryWithOptions(allocator, query_id, query_name, query_type, .{
+                                const padded_msg = try dns.buildQuery(allocator, query_id, query_name, query_type, .{
                                     .rd = false,
                                     .edns = .{ .do_bit = self.dnssec_aware, .padding_target = dns.dot_padding_target },
                                 });
@@ -1331,7 +1329,7 @@ pub const RecursiveResolver = struct {
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
         if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked);
-        return .{ .message = synthesisedMessage(&.{}, &.{}, .server_failure, false) };
+        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
     /// Fetch DNSKEY records for a zone, checking cache first.
@@ -1472,7 +1470,7 @@ pub const RecursiveResolver = struct {
 
         // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation.
         // Store only answers to avoid polluting the key cache with NS/glue.
-        if (kc) |c| c.storeResponseWithStatus(answersOnly(resp), zone_parsed, .unchecked);
+        if (kc) |c| c.storeResponse(answersOnly(resp), zone_parsed, .unchecked);
 
         return resp.answers;
     }
@@ -1507,7 +1505,7 @@ pub const RecursiveResolver = struct {
             retry: while (true) {
                 // RFC 5452 §9.2: fresh TXID per attempt.
                 const query_id = rand.queryId(self.io);
-                const query_msg = try dns.buildQueryWithOptions(allocator, query_id, zone_name, qtype, .{
+                const query_msg = try dns.buildQuery(allocator, query_id, zone_name, qtype, .{
                     .rd = false,
                     .edns = .{ .do_bit = do_bit },
                     .case_rng = case_rng,
@@ -1537,7 +1535,7 @@ pub const RecursiveResolver = struct {
 
                 if (response.header.rcode != .no_error) break :retry;
                 if (store_response) {
-                    if (self.cache) |c| c.storeResponse(response, authority_zone);
+                    if (self.cache) |c| c.storeResponse(response, authority_zone, .unchecked);
                 }
                 return response;
             }
@@ -1691,7 +1689,7 @@ pub const RecursiveResolver = struct {
             // otherwise be written as .secure under their own owners and
             // sit there as unreachable noise (key cache only reads DS and
             // DNSKEY).
-            if (self.cache) |c| c.storeResponse(response, zone);
+            if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
             if (self.key_cache) |kc| {
                 var ds_only_buf: [16]dns.ResourceRecord = undefined;
                 var ds_only_count: usize = 0;
@@ -1708,7 +1706,7 @@ pub const RecursiveResolver = struct {
                     key_msg.header.an_count = @intCast(ds_only_count);
                     key_msg.header.ns_count = 0;
                     key_msg.header.ar_count = 0;
-                    kc.storeResponseWithStatus(key_msg, zone, .secure);
+                    kc.storeResponse(key_msg, zone, .secure);
                 }
             }
             return ds_section;
@@ -1716,7 +1714,7 @@ pub const RecursiveResolver = struct {
 
         // No DS section — verify NSEC/NSEC3 proof of insecure delegation. NS
         // and glue are still useful for resolution, so cache them.
-        if (self.cache) |c| c.storeResponse(response, zone);
+        if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, &self.validation_budget);
@@ -1857,7 +1855,7 @@ pub const RecursiveResolver = struct {
         // the caller's. Bounded by ns_fetch_limit so the worst-case fanout is
         // `ns_fetch_limit * 2 - 1` helpers (5 at depth 0). Fanout caps attempts
         // (not successes) at ns_fetch_limit, so on null fall back to serial
-        // over the remaining NS names — matches serial's recovery behaviour
+        // over the remaining NS names — matches serial's recovery behavior
         // for partially-broken delegations.
         if (self.gpa != null) {
             if (try self.resolveNsAddressesFanout(allocator, names, depth, ns_fetch_limit)) |r| return r;
@@ -1967,15 +1965,9 @@ pub const RecursiveResolver = struct {
     }
 
     /// Fan out NS-address resolution across one thread per (ns_name × rtype)
-    /// task. Task 0 (NS[0], A) runs on the caller thread; tasks 1..N run on
-    /// helper threads so A and AAAA for each NS name execute in parallel. If
-    /// a spawn fails, the task falls back to the caller thread after the
-    /// helpers join — correctness is preserved, latency reverts to serial.
-    ///
-    /// Caps ATTEMPTS at ns_fetch_limit (not successes, which is what the
-    /// serial path caps). Callers must fall back to serial over
-    /// ns_names[ns_fetch_limit..] when this returns null, or partially-broken
-    /// delegations strand the remaining healthy NS names.
+    /// task. Task 0 runs on the caller thread; spawn failures fall back to it
+    /// after helpers join. Caps ATTEMPTS (not successes) at ns_fetch_limit;
+    /// callers must serial-resolve the tail when this returns null.
     fn resolveNsAddressesFanout(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -2083,7 +2075,8 @@ pub const RecursiveResolver = struct {
             defer udp_t.deinit();
             var tcp_t = BlockingTcpTransport.init(.{});
             var resolver = ctx.parent.cloneForThread(.{
-                .do53 = .{ .blocking = .{ .udp = &udp_t, .tcp = &tcp_t } },
+                .udp = &udp_t,
+                .tcp = &tcp_t,
                 .tls = ctx.parent.transports.tls,
             });
 
@@ -2215,7 +2208,7 @@ pub const RecursiveResolver = struct {
             // cache refresh) before falling back to referral re-walk.
             if (self.dnssec_enabled) {
                 const ds_cache = self.keyCache() orelse break;
-                if (!ds_cache.lookupExists(zone_str, .ds, .in)) {
+                if (!ds_cache.containsFresh(zone_str, .ds, .in)) {
                     const records = if (best) |parent_deleg|
                         self.reproveDelegationSecurity(
                             allocator,
@@ -2227,7 +2220,7 @@ pub const RecursiveResolver = struct {
                     // Records non-null = signed (may not be cached if TTL=0,
                     // but DS status is known). Null + cache hit (negative)
                     // = insecure. Null + cache miss = unknown, give up.
-                    if (records == null and !ds_cache.lookupExists(zone_str, .ds, .in)) break;
+                    if (records == null and !ds_cache.containsFresh(zone_str, .ds, .in)) break;
                 }
             }
 
@@ -2323,11 +2316,11 @@ fn cacheSecurityStatus(state: dnssec.SecurityStatus) cache_mod.SecurityStatus {
 /// debuggers that the answer is a synthetic HINFO and not a real RRset.
 const ttl_any_hinfo: u32 = 3789;
 
-/// RFC 8482: synthesise a minimal HINFO answer for a qtype=ANY query.
+/// RFC 8482: synthesize a minimal HINFO answer for a qtype=ANY query.
 /// Wire-encodes RDATA as two character-strings: cpu="RFC8482", os="".
 /// Uses the RType=13 / RData.unknown path so we don't have to teach the
 /// rest of the parser/cache/printer about HINFO.
-fn synthesiseAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
+fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
     const qname = try dns.parseDottedName(allocator, name);
     // <len=7> R F C 8 4 8 2  <len=0>
     const rdata_bytes = try allocator.dupe(u8, &[_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 });
@@ -2339,7 +2332,7 @@ fn synthesiseAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
         .ttl = ttl_any_hinfo,
         .rdata = .{ .unknown = rdata_bytes },
     };
-    return synthesisedMessage(arr, &.{}, .no_error, false);
+    return synthesizedMessage(arr, &.{}, .no_error, false);
 }
 
 /// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.
@@ -2812,7 +2805,7 @@ test "probe name construction from label sub-slice" {
     try testing.expectEqualStrings("www.sub.example.com", buf4[0..len4]);
 }
 
-test "minimisation stepping — probes advance one label at a time" {
+test "minimization stepping — probes advance one label at a time" {
     // Simulate: target = "www.sub.example.com", parent_zone = "com" (1 label)
     // Expected probes: label_count 2 → "example.com", 3 → "sub.example.com", 4 → final "www.sub.example.com"
     const target_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
@@ -2843,7 +2836,7 @@ test "minimisation stepping — probes advance one label at a time" {
     try testing.expect(label_count >= target_labels.len);
 }
 
-test "referral resets minimise_label_count" {
+test "referral resets minimize_label_count" {
     // parent_zone = "." (0 labels) → label_count = 1
     // After referral to "com" (1 label) → label_count should reset to 2
     // After referral to "example.com" (2 labels) → label_count should reset to 3
@@ -2862,56 +2855,56 @@ test "referral resets minimise_label_count" {
     try testing.expectEqual(@as(usize, 3), label_count);
 }
 
-test "max_minimise_count cap forces full QNAME" {
-    // After max_minimise_count probes, is_final should be true
+test "max_minimize_count cap forces full QNAME" {
+    // After max_minimize_count probes, is_final should be true
     const target_label_count: usize = 20; // very deep name
     var total_probes: usize = 0;
-    var minimise_label_count: usize = 1; // start from root
+    var minimize_label_count: usize = 1; // start from root
 
     // Simulate probes
-    while (total_probes < max_minimise_count) : (total_probes += 1) {
-        const is_final = minimise_label_count >= target_label_count or
-            total_probes >= max_minimise_count;
+    while (total_probes < max_minimize_count) : (total_probes += 1) {
+        const is_final = minimize_label_count >= target_label_count or
+            total_probes >= max_minimize_count;
         try testing.expect(!is_final); // should still be probing
-        minimise_label_count += 1;
+        minimize_label_count += 1;
     }
 
-    // Now total_probes == max_minimise_count, should be final
-    const is_final = minimise_label_count >= target_label_count or
-        total_probes >= max_minimise_count;
+    // Now total_probes == max_minimize_count, should be final
+    const is_final = minimize_label_count >= target_label_count or
+        total_probes >= max_minimize_count;
     try testing.expect(is_final);
 }
 
-test "NXDOMAIN during probe — relaxed mode stops minimising" {
+test "NXDOMAIN during probe — relaxed mode stops minimizing" {
     // Simulate: probe returns NXDOMAIN → set label_count to target length
     const target_label_count: usize = 4;
-    var minimise_label_count: usize = 2;
+    var minimize_label_count: usize = 2;
 
     // Probe NXDOMAIN → relaxed mode
     const probe_nxdomain = true;
     if (probe_nxdomain) {
-        minimise_label_count = target_label_count;
+        minimize_label_count = target_label_count;
     }
 
     // Next iteration should be final
-    try testing.expect(minimise_label_count >= target_label_count);
+    try testing.expect(minimize_label_count >= target_label_count);
 }
 
-test "qname_minimisation=false sends full name immediately" {
-    // When disabled, minimise_label_count starts at target_name.labels.len
+test "qname_minimization=false sends full name immediately" {
+    // When disabled, minimize_label_count starts at target_name.labels.len
     const target_label_count: usize = 4;
-    const qname_minimisation = false;
+    const qname_minimization = false;
     const parent_zone_labels: usize = 0;
 
-    const minimise_label_count: usize = if (qname_minimisation)
+    const minimize_label_count: usize = if (qname_minimization)
         parent_zone_labels + 1
     else
         target_label_count;
 
     // Should always be final
-    const is_final = minimise_label_count >= target_label_count or !qname_minimisation;
+    const is_final = minimize_label_count >= target_label_count or !qname_minimization;
     try testing.expect(is_final);
-    try testing.expectEqual(target_label_count, minimise_label_count);
+    try testing.expectEqual(target_label_count, minimize_label_count);
 }
 
 // ── Integration tests (require Linux + network) ────────────────────────
@@ -2927,7 +2920,7 @@ test "recursive resolve example.com A from root hints" {
     var transport = BlockingUdpTransport.init(.{}, io);
 
     var resolver = RecursiveResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
     };
 
@@ -2965,7 +2958,7 @@ test "recursive resolve nonexistent domain returns name_error" {
     var transport = BlockingUdpTransport.init(.{}, io);
 
     var resolver = RecursiveResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
     };
 
@@ -2992,7 +2985,7 @@ test "recursive resolve domain with glueless NS" {
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
     var resolver = RecursiveResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
     };
 
@@ -3030,7 +3023,7 @@ test "recursive resolve with CNAME chain" {
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
     var resolver = RecursiveResolver{
-        .transports = .{ .do53 = .{ .blocking = .{ .udp = &transport, .tcp = null } } },
+        .transports = .{ .udp = &transport, .tcp = null },
         .io = io,
     };
 

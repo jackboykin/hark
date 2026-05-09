@@ -279,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
         const id: u16 = @truncate(r.int(u32));
         // EDNS+DO matches what real DNSSEC-aware clients send and what
         // shotgun's stock configs assume, so latency comparisons stay valid.
-        const msg = try dns.buildQueryWithOptions(qa, id, name, args.qtype, .{
+        const msg = try dns.buildQuery(qa, id, name, args.qtype, .{
             .edns = .{ .do_bit = true },
         });
         const dns_payload = try dns.serializeMessage(&dns_buf, msg);

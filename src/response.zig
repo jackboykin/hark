@@ -49,14 +49,14 @@ pub const ResponseContext = struct {
     client_edns: bool,
     client_do: bool,
     client_wants_ad: bool,
-    max_payload: u16,
+    max_udp_payload: u16,
     /// RFC 7828 edns-tcp-keepalive TIMEOUT (100-ms units). Emitted only
     /// when non-null AND the client sent EDNS — null on UDP, or when
     /// the operator disabled the option. Servers MUST only advertise
     /// this on stream transports.
     tcp_keepalive: ?u16 = null,
 
-    pub fn fromQuery(query: dns.Message, max_payload: u16) ResponseContext {
+    pub fn fromQuery(query: dns.Message, max_udp_payload: u16) ResponseContext {
         const client_do = query.opt != null and query.opt.?.do_bit;
         return .{
             .query_id = query.header.id,
@@ -68,7 +68,7 @@ pub const ResponseContext = struct {
             .client_do = client_do,
             // RFC 6840 §5.8: set AD only if client signalled DO or AD
             .client_wants_ad = client_do or query.header.ad,
-            .max_payload = max_payload,
+            .max_udp_payload = max_udp_payload,
         };
     }
 };
@@ -95,7 +95,7 @@ pub fn buildResponseWire(
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         // Echo back the per-request budget so a client knows our willingness
         // to accept large queries — matches what we're willing to emit.
-        .udp_payload_size = ctx.max_payload,
+        .udp_payload_size = ctx.max_udp_payload,
         .extended_rcode = 0,
         .version = 0,
         .do_bit = ctx.client_do,
@@ -138,7 +138,7 @@ pub fn buildResponseWire(
 
     // Try full response
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
+        if (wire.len <= ctx.max_udp_payload) return wire;
     } else |_| {}
 
     // Drop additionals (RFC 1035 §4.2.1: additionals are advisory; their
@@ -146,7 +146,7 @@ pub fn buildResponseWire(
     msg.additionals = &.{};
     msg.header.ar_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
+        if (wire.len <= ctx.max_udp_payload) return wire;
     } else |_| {}
 
     // Drop authorities — TC=1 from this point on. RFC 1035 §4.2.1 / 2181 §9:
@@ -157,14 +157,14 @@ pub fn buildResponseWire(
     msg.authorities = &.{};
     msg.header.ns_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_payload) return wire;
+        if (wire.len <= ctx.max_udp_payload) return wire;
     } else |_| {}
 
     // Last resort: drop answers, keep TC=1.
     msg.answers = &.{};
     msg.header.an_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        return wire[0..@min(wire.len, ctx.max_payload)];
+        return wire[0..@min(wire.len, ctx.max_udp_payload)];
     } else |_| {}
 
     return null;
@@ -213,16 +213,16 @@ pub fn serializeErrorResponse(
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
 
-// ── Synthesised messages ───────────────────────────────────────────────
+// ── Synthesized messages ───────────────────────────────────────────────
 
-/// Build a `dns.Message` value for a cached or synthesised response. The
+/// Build a `dns.Message` value for a cached or synthesized response. The
 /// header is the canonical recursive-resolver shape: aa=false (we are not
 /// authoritative for any zone), ra=true (recursion available), no question
 /// section (the wire builder copies questions from `ResponseContext`).
 /// Used by the cache-hit fast path, the RFC 6761 special-use short-circuit,
-/// and the RFC 8482 ANY/HINFO synthesiser — anywhere a response is built
+/// and the RFC 8482 ANY/HINFO synthesizer — anywhere a response is built
 /// without going through actual recursion.
-pub fn synthesisedMessage(
+pub fn synthesizedMessage(
     answers: []const dns.ResourceRecord,
     authorities: []const dns.ResourceRecord,
     rcode: dns.RCode,
@@ -316,7 +316,7 @@ test "buildResponseWire sets correct header fields" {
         .client_edns = false,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = dns.max_udp_payload,
+        .max_udp_payload = dns.max_udp_payload,
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
@@ -369,7 +369,7 @@ test "buildResponseWire with EDNS0" {
         .client_edns = true,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = dns.edns_udp_payload,
+        .max_udp_payload = dns.edns_udp_payload,
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
@@ -439,7 +439,7 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
         .client_edns = false,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = dns.max_udp_payload,
+        .max_udp_payload = dns.max_udp_payload,
     }, response, failing.allocator());
 
     try testing.expect(result == null);
@@ -481,7 +481,7 @@ test "serializeErrorResponse with no question (parse failure)" {
 test "validateQuery rejects QR=1 (response posing as query)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
     spoofed.header.qr = true;
 
     try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
@@ -490,7 +490,7 @@ test "validateQuery rejects QR=1 (response posing as query)" {
 test "validateQuery returns BADVERS for unsupported EDNS version" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a);
+    var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
     query.opt = .{
         .udp_payload_size = 4096,
         .extended_rcode = 0,
@@ -584,7 +584,7 @@ test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.
         .client_edns = false,
         .client_do = false,
         .client_wants_ad = false,
-        .max_payload = buf.len,
+        .max_udp_payload = buf.len,
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);

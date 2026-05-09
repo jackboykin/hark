@@ -92,7 +92,7 @@ fn writerWorker(
         const msg = bench_common.makeAResponse(arena.allocator(), idx, &bench_common.host_labels_spec, .{
             10, 0, @intCast((idx >> 8) & 0xff), @intCast(idx & 0xff),
         }) catch return;
-        cache.storeResponse(msg, root);
+        cache.storeResponse(msg, root, .unchecked);
     }
     _ = arena.reset(.retain_capacity);
 
@@ -109,7 +109,7 @@ fn writerWorker(
             continue;
         };
         const t0 = monotonic.nowNs();
-        cache.storeResponse(msg, root);
+        cache.storeResponse(msg, root, .unchecked);
         const t1 = monotonic.nowNs();
         s.* = @intCast(t1 - t0);
     }

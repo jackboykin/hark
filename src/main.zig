@@ -131,8 +131,8 @@ fn printUsage() void {
     , .{});
 }
 
-fn runDump(gpa_alloc: std.mem.Allocator, io: Io) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa_alloc);
+fn runDump(gpa: std.mem.Allocator, io: Io) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 
@@ -144,7 +144,7 @@ fn runDump(gpa_alloc: std.mem.Allocator, io: Io) !void {
     };
 
     if (input.len == 0) {
-        log.err("no input — pipe a raw DNS packet via stdin", .{});
+        log.err("no input; pipe a raw DNS packet via stdin", .{});
         std.process.exit(1);
     }
 
@@ -165,7 +165,7 @@ fn runDump(gpa_alloc: std.mem.Allocator, io: Io) !void {
     stdout.flush() catch {};
 }
 
-fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !void {
+fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     if (args.len == 0) {
         log.err("query requires a domain name", .{});
         printUsage();
@@ -243,23 +243,23 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     var ca_bundle: Certificate.Bundle = .empty;
     var ca_bundle_loaded = false;
     if (dot_mode) {
-        ca_bundle.rescan(gpa_alloc, io, Io.Timestamp.now(io, .real)) catch {
+        ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch {
             log.err("failed to load system CA certificates", .{});
             std.process.exit(1);
         };
         ca_bundle_loaded = true;
     }
-    defer if (ca_bundle_loaded) ca_bundle.deinit(gpa_alloc);
+    defer if (ca_bundle_loaded) ca_bundle.deinit(allocator);
 
     // TLS transport (only when --dot is set)
-    var tls_t = TlsTransport.init(gpa_alloc, .{
+    var tls_t = TlsTransport.init(allocator, .{
         .server_name = dot_host,
         .strict = dot_strict,
     }, ca_bundle, io);
 
     // Cache: 16MB cap, 10k max entries
     const cache_alloc = if (builtin.single_threaded)
-        gpa_alloc
+        allocator
     else
         std.heap.smp_allocator;
     hark.cache.randomizeHashSeed(io);
@@ -267,13 +267,14 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer cache.deinit();
 
     // DNS message data uses arena
-    var arena = std.heap.ArenaAllocator.init(gpa_alloc);
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     const response = if (forward_mode) blk: {
         var resolver = ForwardingResolver{
             .transports = .{
-                .do53 = .{ .blocking = .{ .udp = &t, .tcp = &tcp_t } },
+                .udp = &t,
+                .tcp = &tcp_t,
                 .tls = if (dot_mode) &tls_t else null,
             },
             .io = io,
@@ -283,8 +284,8 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
             std.process.exit(1);
         };
     } else blk: {
-        var enc_ns = EncryptedNsCache.init(gpa_alloc, io);
-        var enc_pool = ConnectionPool.init(gpa_alloc, io);
+        var enc_ns = EncryptedNsCache.init(allocator, io);
+        var enc_pool = ConnectionPool.init(allocator, io);
         defer {
             enc_ns.awaitProbes();
             enc_pool.deinit();
@@ -293,16 +294,17 @@ fn runQuery(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
         if (opportunistic) tls_t.pool = &enc_pool;
 
-        var rtt_cache = RttCache.init(.{ .allocator = gpa_alloc, .io = io });
+        var rtt_cache = RttCache.init(.{ .allocator = allocator, .io = io });
         defer rtt_cache.deinit();
 
         var resolver = RecursiveResolver{
             .transports = .{
-                .do53 = .{ .blocking = .{ .udp = &t, .tcp = &tcp_t } },
+                .udp = &t,
+                .tcp = &tcp_t,
                 .tls = if (opportunistic) &tls_t else null,
             },
             .cache = &cache,
-            .qname_minimisation = !no_qmin,
+            .qname_minimization = !no_qmin,
             .dnssec_enabled = dnssec_enabled,
             .dnssec_aware = dnssec_enabled,
             .rtt_cache = &rtt_cache,
@@ -337,7 +339,7 @@ fn parseRType(s: []const u8) ?dns.RType {
     return result;
 }
 
-fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !void {
+fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     // Parse serve flags
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
@@ -361,12 +363,12 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
     // Only fall through on FileNotFound; surface any other error (parse, I/O).
     var cfg = if (config_path) |path|
-        hark.config.parseConfigFile(gpa_alloc, path) catch |err| {
+        hark.config.parseConfigFile(allocator, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
         }
     else
-        loadDefaultConfig(gpa_alloc) catch std.process.exit(1);
+        loadDefaultConfig(allocator) catch std.process.exit(1);
     defer cfg.deinit();
 
     // Enable verbose logging from CLI flag or config
@@ -375,7 +377,7 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     }
 
     // Start server
-    var server = Server.init(gpa_alloc, cfg, io) catch |err| {
+    var server = Server.init(allocator, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -387,23 +389,23 @@ fn runServe(gpa_alloc: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     };
 }
 
-fn loadDefaultConfig(gpa_alloc: std.mem.Allocator) !hark.config.ServerConfig {
+fn loadDefaultConfig(allocator: std.mem.Allocator) !hark.config.ServerConfig {
     // No CWD-relative search: under systemd or any non-interactive runner the
     // working directory is unrelated to where the operator put the config.
     // Pass --config <path> for non-default locations.
     const default_path = "/etc/hark/hark.toml";
-    if (hark.config.parseConfigFile(gpa_alloc, default_path)) |cfg| {
+    if (hark.config.parseConfigFile(allocator, default_path)) |cfg| {
         return cfg;
     } else |err| switch (err) {
         error.FileNotFound => {
-            log.warn("no config at {s} — using built-in defaults; pass --config <path> for a custom location", .{default_path});
+            log.warn("no config at {s}; using built-in defaults (pass --config <path> for a custom location)", .{default_path});
         },
         else => {
             log.err("loading config '{s}': {s}", .{ default_path, @errorName(err) });
             return err;
         },
     }
-    return hark.config.parseConfig(gpa_alloc, "") catch |err| {
+    return hark.config.parseConfig(allocator, "") catch |err| {
         log.err("creating default config: {s}", .{@errorName(err)});
         return err;
     };

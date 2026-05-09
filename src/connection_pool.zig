@@ -1,4 +1,5 @@
 const std = @import("std");
+const monotonic = @import("monotonic.zig");
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -85,12 +86,8 @@ pub const PooledConnection = struct {
 // ── ConnectionPool (comptime generic) ───────────────────────────────
 
 const max_entries_default: usize = 32;
-/// Per-upstream warm-connection cap. Each pool thread can acquire its
-/// own slot, so this bounds the concurrent in-flight TCP/DoT queries to
-/// a single authoritative. RFC 7766 §6.2.2 implicitly permits this via
-/// "client SHOULD attempt to maintain connections for as long as needed";
-/// 8 lets a heavy-traffic recursive resolver pipeline against busy
-/// upstreams without queuing on a 4-slot cap.
+/// Per-upstream warm-connection cap (RFC 7766 §6.2.2). Bounds concurrent
+/// in-flight TCP/DoT queries to a single authoritative.
 const per_key_cap: usize = 8;
 
 pub fn ConnectionPool(comptime Conn: type) type {
@@ -146,7 +143,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
         io: Io,
         max_idle_sec: i64 = 30,
         max_entries: usize = max_entries_default,
-        now_fn: *const fn () i64 = &defaultNow,
+        now_fn: *const fn () i64 = &monotonic.nowSec,
 
         pub fn init(allocator: Allocator, io: Io) Self {
             return .{
@@ -304,10 +301,6 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 self.total_conns -= 1;
                 if (slots.isEmpty()) _ = self.entries.remove(k);
             }
-        }
-
-        fn defaultNow() i64 {
-            return @import("monotonic.zig").nowSec();
         }
     };
 }

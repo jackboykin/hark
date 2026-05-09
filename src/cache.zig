@@ -21,7 +21,7 @@ const servfail_max_ttl: u32 = 300;
 /// Max records per RRset in single-pass store (DNS wire format bounds the total).
 const max_rrset_collect: usize = 64;
 
-const defaultNowSeconds = @import("monotonic.zig").nowSec;
+const monotonic = @import("monotonic.zig");
 
 // ── Cache key ─────────────────────────────────────────────────────────
 
@@ -360,14 +360,10 @@ fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
 pub const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
 
-/// Per-shard state. Each shard owns its lock, map, allocator, eviction
-/// state, and stat counters. The shards array is cache-line aligned so
-/// shard 0 starts on a line boundary. Field-level alignment was tried
-/// to force `@sizeOf(Shard)` to a multiple of cache_line (preventing
-/// boundary cache lines from straddling two shards) but the resulting
-/// layout shift hurt single-thread cache_hit by ~40% with no measurable
-/// gain on the contention bench. Boundary sharing is accepted as a
-/// second-order effect; the dominant win comes from per-shard locks.
+/// Per-shard state: lock, map, allocator, eviction state, stat counters.
+/// The shards array is cache-line aligned so shard 0 starts on a boundary.
+/// Field-level alignment to make `@sizeOf(Shard)` a cache-line multiple was
+/// tried — hurt single-thread cache_hit by ~40% with no contention-bench win.
 const Shard = struct {
     counting: CountingAllocator,
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true),
@@ -416,7 +412,7 @@ pub const RRsetCache = struct {
         var cache: RRsetCache = .{
             .shards = undefined,
             .io = cfg.io,
-            .now_fn = &defaultNowSeconds,
+            .now_fn = &monotonic.nowSec,
             .serve_stale_ttl = cfg.serve_stale_ttl,
             .min_ttl = cfg.min_ttl,
             .prefetch = cfg.prefetch,
@@ -524,7 +520,7 @@ pub const RRsetCache = struct {
     /// dedup table on cache hits. Marks the entry visited on hit so
     /// SIEVE eviction sees the fast-path access (otherwise hot entries
     /// that always take this path could be evicted as cold).
-    pub fn lookupExists(
+    pub fn containsFresh(
         self: *RRsetCache,
         name: []const u8,
         rtype: dns.RType,
@@ -599,14 +595,10 @@ pub const RRsetCache = struct {
         }
     }
 
-    /// RFC 8020: NXDOMAIN at any ancestor proves every name beneath it is
-    /// also non-existent, regardless of qtype. Hark's negative cache is
-    /// keyed by `(name, rtype, rclass)`, so this scan finds only ancestor
-    /// NXDOMAINs that were *cached for the matching qtype* — a real but
-    /// conservative loss of coverage versus a qtype-agnostic store. Never
-    /// false-cuts; sometimes misses a cut that a name-keyed cache would
-    /// catch. Restricted to non-secure negatives: signed-zone NXDOMAIN cuts
-    /// flow through the dedicated RFC 8198 NSEC aggressive-use cache.
+    /// RFC 8020: NXDOMAIN at an ancestor proves all names beneath are also
+    /// non-existent. The qtype-keyed negative cache only catches matches for
+    /// the same qtype — never false-cuts, sometimes misses. Non-secure only;
+    /// signed-zone cuts go through the RFC 8198 NSEC aggressive-use cache.
     pub fn lookupNxdomainAncestor(
         self: *RRsetCache,
         caller_alloc: Allocator,
@@ -684,21 +676,15 @@ pub const RRsetCache = struct {
 
     // ── Store ─────────────────────────────────────────────────────────
 
-    /// Cache all RRsets from a DNS response. Applies bailiwick filtering
-    /// to all sections to prevent cache poisoning.
-    pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name) void {
-        self.storeResponseWithStatus(response, authority_zone, .unchecked);
-    }
-
-    /// Cache answer RRsets with an explicit security status, and
-    /// authorities/additionals with .unchecked (delegation data).
-    /// Used by validate-then-store to cache with the correct status
-    /// directly, avoiding the unchecked→secure race window.
+    /// Cache all RRsets from a DNS response with bailiwick filtering.
+    /// Answers get `status`; authorities/additionals always get `.unchecked`
+    /// (delegation data). Validate-then-store passes the resolved status
+    /// directly to avoid an unchecked→secure race window.
     ///
     /// Locking is per-RRset (per shard), not per-response. A reader may
     /// observe a partial-response cache state mid-store; DNS clients
     /// tolerate this as they would tolerate a not-yet-arrived response.
-    pub fn storeResponseWithStatus(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
+    pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
         if (response.header.rcode != .no_error) return;
         self.storeRRsetsImpl(response.answers, authority_zone, status);
         // Skip authority/additional from positive responses (CVE-2025-11411).
@@ -1203,7 +1189,7 @@ fn storeTestAWithStatus(cache: *RRsetCache, alloc: Allocator, comptime labels: [
     answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = ttl, .rdata = .{ .a = ip } };
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
-    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, status);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, status);
 }
 
 fn expectCachedHitStatus(alloc: Allocator, cache: *RRsetCache, name: []const u8, expected: SecurityStatus) !void {
@@ -1502,7 +1488,7 @@ test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
         .questions = &.{question},
         .answers = &records,
     };
-    cache.storeResponse(msg, dns.Name{ .labels = &.{} });
+    cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1558,7 +1544,7 @@ test "cache eviction when full" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
         dns.freeMessage(alloc, response);
     }
 
@@ -1582,7 +1568,7 @@ test "cache deep copy independence" {
         const answers = try a.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 10, 20, 30, 40 } } };
 
-        cache.storeResponse(makeTestResponse(answers), dns.Name{ .labels = &.{} });
+        cache.storeResponse(makeTestResponse(answers), dns.Name{ .labels = &.{} }, .unchecked);
         // arena destroyed here — cache must still work
     }
 
@@ -1935,7 +1921,7 @@ test "BOGUS invalidates .unchecked positive to SERVFAIL" {
 
     // Step 1: a CD=1 query populates the cache as .unchecked (the CD=1
     // resolver skips inline validation per server.zig's dnssec_enabled gate).
-    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2019,7 +2005,7 @@ test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
-    cache.storeResponseWithStatus(response, dns.Name{ .labels = &.{} }, .secure);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure);
 
     cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
 
@@ -2050,7 +2036,7 @@ test "shard distribution is reasonable for random names" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
         dns.freeMessage(alloc, response);
     }
 
@@ -2093,7 +2079,7 @@ test "eviction stays within shard" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} });
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
         dns.freeMessage(alloc, response);
         stored += 1;
     }
