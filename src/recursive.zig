@@ -1810,9 +1810,16 @@ pub const RecursiveResolver = struct {
 
         // Parallel path: one helper thread per (ns_name × rtype) task beyond
         // the caller's. Bounded by ns_fetch_limit so the worst-case fanout is
-        // `ns_fetch_limit * 2 - 1` helpers (5 at depth 0).
-        if (self.gpa != null and ns_names.len >= 1) {
-            return self.resolveNsAddressesFanout(allocator, ns_names, depth, ns_fetch_limit);
+        // `ns_fetch_limit * 2 - 1` helpers (5 at depth 0). Fanout caps attempts
+        // (not successes) at ns_fetch_limit, so on null fall back to serial
+        // over the remaining NS names — matches serial's recovery behaviour
+        // for partially-broken delegations.
+        if (self.gpa != null) {
+            if (try self.resolveNsAddressesFanout(allocator, ns_names, depth, ns_fetch_limit)) |r| return r;
+            if (ns_names.len > ns_fetch_limit) {
+                return self.resolveNsAddressesSerial(allocator, ns_names[ns_fetch_limit..], depth, ns_fetch_limit);
+            }
+            return null;
         }
 
         return self.resolveNsAddressesSerial(allocator, ns_names, depth, ns_fetch_limit);
@@ -1919,6 +1926,11 @@ pub const RecursiveResolver = struct {
     /// helper threads so A and AAAA for each NS name execute in parallel. If
     /// a spawn fails, the task falls back to the caller thread after the
     /// helpers join — correctness is preserved, latency reverts to serial.
+    ///
+    /// Caps ATTEMPTS at ns_fetch_limit (not successes, which is what the
+    /// serial path caps). Callers must fall back to serial over
+    /// ns_names[ns_fetch_limit..] when this returns null, or partially-broken
+    /// delegations strand the remaining healthy NS names.
     fn resolveNsAddressesFanout(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
