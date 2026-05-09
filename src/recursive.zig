@@ -435,11 +435,30 @@ pub const RecursiveResolver = struct {
                     }
 
                     if (response.header.rcode == .name_error) {
-                        // Probe NXDOMAIN — relaxed mode: cache negative and stop minimising
+                        // RFC 9156 §4 + RFC 8020 interaction: an unsigned-zone
+                        // probe NXDOMAIN from an RFC 8020 violator (e.g.,
+                        // dynect.net returning NXDOMAIN at empty non-terminals
+                        // like p07.dynect.net) would otherwise poison the
+                        // NX-cut consumer at cache.lookupNxdomainAncestor —
+                        // it returns negatives when security_status != .secure,
+                        // so an .insecure or .unchecked probe-NX entry there
+                        // makes every child name appear non-existent, bricking
+                        // e.g. ns1.p07.dynect.net under x.com's delegation for
+                        // the negative TTL window (up to 3 hours).
+                        //
+                        // Stop minimising (relaxed mode) but only cache when
+                        // DNSSEC NSEC has proved the cut. Secure-cached entries
+                        // are then doubly inert: the NX-cut path's `!= .secure`
+                        // filter routes them through the dedicated NSEC
+                        // aggressive-use cache instead, so this branch caches
+                        // *only* entries the NX-cut will skip by design.
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimise_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, servers[0..server_count])) {
                             .proceed => {
-                                if (response.header.aa) {
+                                // .secure here means verifiedNegativeResponse
+                                // ran NSEC and accepted it; AA is redundant
+                                // (cryptographic proof supersedes the bit).
+                                if (security_state == .secure) {
                                     if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                 }
                             },
