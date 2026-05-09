@@ -73,18 +73,31 @@ pub const EncryptedNsCache = struct {
         self.entries.deinit();
     }
 
+    /// Damping period a non-.unknown entry is "live" for.
+    fn dampingPeriod(status: ServerStatus) i64 {
+        return switch (status) {
+            .capable => persistence_sec,
+            .probing => probe_timeout_sec,
+            .failed => damping_sec,
+            .soft_failed => soft_damping_sec,
+            .unknown => 0,
+        };
+    }
+
+    /// Status for `entry` at `now`, decayed to `.unknown` once the damping
+    /// period elapses.
+    fn effectiveStatus(entry: NsEntry, now: i64) ServerStatus {
+        if (entry.status == .unknown) return .unknown;
+        if (now - entry.last_probe >= dampingPeriod(entry.status)) return .unknown;
+        return entry.status;
+    }
+
     /// Return the current status for a nameserver.
     pub fn getStatus(self: *EncryptedNsCache, key: AddressKey) ServerStatus {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const entry = self.entries.get(key) orelse return .unknown;
-        return switch (entry.status) {
-            .capable => if (self.now_fn() - entry.last_probe >= persistence_sec) .unknown else .capable,
-            .probing => if (self.now_fn() - entry.last_probe >= probe_timeout_sec) .unknown else .probing,
-            .failed => if (self.now_fn() - entry.last_probe >= damping_sec) .unknown else .failed,
-            .soft_failed => if (self.now_fn() - entry.last_probe >= soft_damping_sec) .unknown else .soft_failed,
-            .unknown => .unknown,
-        };
+        return effectiveStatus(entry, self.now_fn());
     }
 
     /// Atomically claim a probe slot for `key`. Returns true if this caller
@@ -96,13 +109,7 @@ pub const EncryptedNsCache = struct {
         const now = self.now_fn();
 
         if (self.entries.get(key)) |entry| {
-            switch (entry.status) {
-                .capable => if (now - entry.last_probe < persistence_sec) return false,
-                .probing => if (now - entry.last_probe < probe_timeout_sec) return false,
-                .failed => if (now - entry.last_probe < damping_sec) return false,
-                .soft_failed => if (now - entry.last_probe < soft_damping_sec) return false,
-                .unknown => {},
-            }
+            if (effectiveStatus(entry, now) != .unknown) return false;
         }
 
         if (self.entries.count() >= max_entries) {
@@ -116,35 +123,16 @@ pub const EncryptedNsCache = struct {
         return true;
     }
 
-    /// Mark a server as TLS-capable (probe succeeded).
-    pub fn markCapable(self: *EncryptedNsCache, key: AddressKey) void {
+    /// Record a probe outcome for `key`. Caller selects the damping band
+    /// (.capable persists 3 days; .failed 1 hour; .soft_failed 60 s).
+    /// `.probing` is reserved for `claimProbe`'s atomic gate; `.unknown` is
+    /// implied by absence — callers should not write either.
+    pub fn setStatus(self: *EncryptedNsCache, key: AddressKey, status: ServerStatus) void {
+        std.debug.assert(status != .unknown and status != .probing);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.entries.put(key, .{
-            .status = .capable,
-            .last_probe = self.now_fn(),
-        }) catch {};
-    }
-
-    /// Mark a server as hard-failed (TLS handshake reject, ALPN mismatch,
-    /// strict-mode cert validation fail). Damped for `damping_sec`.
-    pub fn markFailed(self: *EncryptedNsCache, key: AddressKey) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.entries.put(key, .{
-            .status = .failed,
-            .last_probe = self.now_fn(),
-        }) catch {};
-    }
-
-    /// Mark a server as soft-failed (transient TCP/network error).
-    /// Damped for the shorter `soft_damping_sec` so a flaky-but-capable
-    /// server is not evicted from the encrypted path for an hour.
-    pub fn markSoftFailed(self: *EncryptedNsCache, key: AddressKey) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.entries.put(key, .{
-            .status = .soft_failed,
+            .status = status,
             .last_probe = self.now_fn(),
         }) catch {};
     }
@@ -194,16 +182,16 @@ fn makeKey(ip: [4]u8) AddressKey {
     return AddressKey.fromAddress(na.initIp4(ip, 853));
 }
 
-test "EncryptedNsCache markCapable and getStatus" {
+test "EncryptedNsCache setStatus capable, getStatus" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
-    cache.markCapable(key);
+    cache.setStatus(key, .capable);
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 }
 
-test "EncryptedNsCache markFailed with damping" {
+test "EncryptedNsCache failed with damping" {
     var fake_time: i64 = 100_000;
     const now_fn = struct {
         var time_ptr: *i64 = undefined;
@@ -218,7 +206,7 @@ test "EncryptedNsCache markFailed with damping" {
     defer cache.deinit();
 
     const key = makeKey(.{ 8, 8, 8, 8 });
-    cache.markFailed(key);
+    cache.setStatus(key, .failed);
 
     // Within damping window — should be failed
     fake_time = 100_000 + damping_sec - 1;
@@ -229,7 +217,7 @@ test "EncryptedNsCache markFailed with damping" {
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
-test "EncryptedNsCache markSoftFailed uses shorter damping" {
+test "EncryptedNsCache soft_failed uses shorter damping" {
     var fake_time: i64 = 100_000;
     const now_fn = struct {
         var time_ptr: *i64 = undefined;
@@ -244,7 +232,7 @@ test "EncryptedNsCache markSoftFailed uses shorter damping" {
     defer cache.deinit();
 
     const key = makeKey(.{ 8, 8, 4, 4 });
-    cache.markSoftFailed(key);
+    cache.setStatus(key, .soft_failed);
 
     // Within soft-damping window — should report soft_failed.
     fake_time = 100_000 + soft_damping_sec - 1;
@@ -289,7 +277,7 @@ test "EncryptedNsCache claimProbe respects damping" {
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 0, 0, 1 });
-    cache.markFailed(key);
+    cache.setStatus(key, .failed);
 
     // Within damping — claim should fail
     fake_time = 100_000 + damping_sec - 1;
@@ -305,7 +293,7 @@ test "EncryptedNsCache claimProbe skips capable" {
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
-    cache.markCapable(key);
+    cache.setStatus(key, .capable);
 
     // Should not re-probe a capable server
     try testing.expect(!cache.claimProbe(key));
@@ -316,8 +304,8 @@ test "EncryptedNsCache capable after failed" {
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 0, 0, 1 });
-    cache.markFailed(key);
-    cache.markCapable(key);
+    cache.setStatus(key, .failed);
+    cache.setStatus(key, .capable);
 
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 }
@@ -337,7 +325,7 @@ test "EncryptedNsCache capable expires after persistence_sec" {
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
-    cache.markCapable(key);
+    cache.setStatus(key, .capable);
 
     // Within persistence window — should be capable
     fake_time = 100_000 + persistence_sec - 1;
@@ -371,7 +359,7 @@ test "EncryptedNsCache revertProbing is no-op for capable" {
     defer cache.deinit();
 
     const key = makeKey(.{ 5, 5, 5, 5 });
-    cache.markCapable(key);
+    cache.setStatus(key, .capable);
 
     cache.revertProbing(key);
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));

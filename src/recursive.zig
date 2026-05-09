@@ -1239,7 +1239,7 @@ pub const RecursiveResolver = struct {
                                     // (timeout, RST, transient). Don't evict
                                     // the encrypted path for an hour because
                                     // of one flaky packet.
-                                    oc.markSoftFailed(tls_key);
+                                    oc.setStatus(tls_key, .soft_failed);
                                 }
                             },
                             .unknown => {}, // First contact → Do53 now, probe after

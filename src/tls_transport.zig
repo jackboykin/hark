@@ -225,7 +225,7 @@ pub const TlsTransport = struct {
         // caller; they must outlive every detached probe. Hark's main
         // bundle is process-lifetime, so this holds.
         const thread = std.Thread.spawn(.{}, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
-            enc_ns_cache.markFailed(addr_key);
+            enc_ns_cache.setStatus(addr_key, .failed);
             _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
             return;
         };
@@ -245,18 +245,18 @@ pub const TlsTransport = struct {
         // transient network blip; retry sooner. TLS handshake failure is
         // "hard" — server reached us but rejected the protocol; damp longer.
         const sock = connectTcpBlocking(tls_server, 4000) catch {
-            enc_ns_cache.markSoftFailed(addr_key);
+            enc_ns_cache.setStatus(addr_key, .soft_failed);
             return;
         };
 
         // ── TLS handshake ──
         const conn = self.initOpportunisticConnection(sock) catch {
-            enc_ns_cache.markFailed(addr_key);
+            enc_ns_cache.setStatus(addr_key, .failed);
             return;
         };
 
         // Success — mark capable and pool the connection
-        enc_ns_cache.markCapable(addr_key);
+        enc_ns_cache.setStatus(addr_key, .capable);
         var addr_buf: [64]u8 = undefined;
         log.info("server {s} supports DoT (RFC 9539)", .{na.format(tls_server, &addr_buf)});
         if (self.pool) |pool| {
