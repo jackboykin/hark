@@ -551,7 +551,16 @@ pub const RecursiveResolver = struct {
                         // mid-CNAME failures should still short-circuit the
                         // stub's retry of the outer query. 5 s TTL is
                         // enforced by storeNegativeBare.
-                        if (self.cache) |c| c.cacheServfail(name, qtype);
+                        //
+                        // Only at the user-facing query (depth == 0). At
+                        // sub-recursion depths the caller is the resolver
+                        // itself (NS A/AAAA fanout, internal DS probes); a
+                        // cached failure there collapses sibling fanout and
+                        // turns one transient blip into a 5 s outage for
+                        // every name whose delegation NSes overlap with the
+                        // failed lookup — which is exactly the NoGlueRecords
+                        // path on out-of-bailiwick NS like dynect.net.
+                        if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 }
@@ -674,7 +683,10 @@ pub const RecursiveResolver = struct {
                         // referral — we can't continue resolution. RFC 9520 §3
                         // calls this a resolution failure; cache against the
                         // original qname so the stub's retry short-circuits.
-                        if (self.cache) |c| c.cacheServfail(name, qtype);
+                        // depth == 0 only — see the SERVFAIL/REFUSED branch
+                        // above for why sub-recursion must not poison the
+                        // user-facing failure cache.
+                        if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
                     return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
                 };
