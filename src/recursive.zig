@@ -1332,6 +1332,77 @@ pub const RecursiveResolver = struct {
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
+    /// Sliced cache result the dedup helper hands back to its follower
+    /// paths. `hit` carries the records, `negative` is the cached
+    /// NXDOMAIN/NODATA sentinel — both come from a `CacheLookupResult`
+    /// whose extra fields the dedup gate doesn't care about.
+    const DedupCacheResult = union(enum) {
+        hit: []const dns.ResourceRecord,
+        negative,
+
+        fn from(result: ?cache_mod.CacheLookupResult) ?DedupCacheResult {
+            return switch (result orelse return null) {
+                .hit => |h| .{ .hit = h.records },
+                .negative => .negative,
+            };
+        }
+    };
+
+    /// Coalesce concurrent fetches for the same `(name, rtype)` through the
+    /// dedup table. Leader runs `ctx.fetch`; followers wait, re-check the
+    /// key cache, and if the leader produced nothing one follower retries
+    /// as leader at half the timeout (the leader's partial work warmed
+    /// intermediate caches, so a full timeout would over-wait). With no
+    /// dedup table, calls `ctx.fetch` directly.
+    ///
+    /// Return type tracks `ctx.fetch` so non-erroring callers don't pay
+    /// for an `anyerror` wrap and a matching `catch` at the call site.
+    ///
+    /// The caller does its own initial fast-path cache lookup so any read
+    /// side effects (e.g. DNSKEY near-expiry prefetch flag) stay co-located
+    /// with the lookup that triggered them.
+    fn dedupedFetch(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        name: []const u8,
+        rtype: dns.RType,
+        timeout_ns: u64,
+        ctx: anytype,
+    ) @TypeOf(ctx.fetch()) {
+        const dedup = self.dedup orelse return ctx.fetch();
+        // Follower re-check of the key cache: same `(name, rtype)` the
+        // leader just ran. Pulled into a closure so both follower hops
+        // share one body.
+        const recheck = struct {
+            fn call(r: *RecursiveResolver, a: mem.Allocator, n: []const u8, t: dns.RType) ?DedupCacheResult {
+                const cache = r.keyCache() orelse return null;
+                return DedupCacheResult.from(cache.lookup(a, n, t, .in));
+            }
+        }.call;
+        switch (dedup.acquireOrWaitWithTimeout(name, rtype, 0, monotonic.nowNs() + timeout_ns)) {
+            .leader => {
+                defer dedup.releaseLeader(name, rtype, 0);
+                return ctx.fetch();
+            },
+            .follower => {
+                if (recheck(self, allocator, name, rtype)) |r| return switch (r) {
+                    .hit => |rr| rr,
+                    .negative => null,
+                };
+                switch (dedup.acquireOrWaitWithTimeout(name, rtype, 0, monotonic.nowNs() + timeout_ns / 2)) {
+                    .leader => {
+                        defer dedup.releaseLeader(name, rtype, 0);
+                        return ctx.fetch();
+                    },
+                    .follower => return switch (recheck(self, allocator, name, rtype) orelse return null) {
+                        .hit => |rr| rr,
+                        .negative => null,
+                    },
+                }
+            },
+        }
+    }
+
     /// Fetch DNSKEY records for a zone, checking cache first.
     /// Uses the dedup table to coalesce concurrent DNSKEY fetches for the
     /// same zone — prevents N parallel queries from each firing their own
@@ -1342,71 +1413,39 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         servers: []const na.Address,
     ) !?[]const dns.ResourceRecord {
-        const kc = self.keyCache();
-
-        // Fast path: cache hit — no dedup needed.
-        if (kc) |c| {
-            if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        // Signal near-expiry DNSKEY for async refresh after responding.
-                        if (h.needs_prefetch and self.pending_dnskey_prefetch == null) {
-                            @memcpy(self.pending_dnskey_buf[0..zone_name.len], zone_name);
-                            self.pending_dnskey_prefetch = self.pending_dnskey_buf[0..zone_name.len];
-                        }
-                        return h.records;
-                    },
-                    .negative => return null,
-                }
-            }
+        // Fast path: cache hit. The needs_prefetch side effect lives here,
+        // not in the follower re-check — a leader that just populated fresh
+        // records can't be near-expiry.
+        if (self.keyCache()) |c| {
+            if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| switch (result) {
+                .hit => |h| {
+                    if (h.needs_prefetch and self.pending_dnskey_prefetch == null) {
+                        @memcpy(self.pending_dnskey_buf[0..zone_name.len], zone_name);
+                        self.pending_dnskey_prefetch = self.pending_dnskey_buf[0..zone_name.len];
+                    }
+                    return h.records;
+                },
+                .negative => return null,
+            };
         }
 
-        // Dedup: coalesce concurrent DNSKEY fetches for the same zone.
-        if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, monotonic.nowNs() + dnskey_dedup_timeout_ns)) {
-                .leader => {
-                    // We're the leader — do the actual fetch, then release.
-                    defer dedup.releaseLeader(zone_name, .dnskey, 0);
-                    return self.fetchAndValidateDnskey(allocator, zone_name, servers);
-                },
-                .follower => {
-                    // Leader finished (or timed out). Re-check cache — leader
-                    // should have populated it on success.
-                    if (kc) |c| {
-                        if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
-                            switch (result) {
-                                .hit => |h| return h.records,
-                                .negative => return null,
-                            }
-                        }
-                    }
-                    // Cache still empty — leader failed. Re-acquire dedup so only
-                    // one follower retries (prevents thundering herd). Shorter
-                    // timeout: leader's partial work warmed intermediate caches.
-                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .dnskey, 0, monotonic.nowNs() + dnskey_dedup_timeout_ns / 2)) {
-                        .leader => {
-                            defer dedup.releaseLeader(zone_name, .dnskey, 0);
-                            return self.fetchAndValidateDnskey(allocator, zone_name, servers);
-                        },
-                        .follower => {
-                            // Another follower is already retrying — check cache once more.
-                            if (kc) |c| {
-                                if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| {
-                                    switch (result) {
-                                        .hit => |h| return h.records,
-                                        .negative => return null,
-                                    }
-                                }
-                            }
-                            return null;
-                        },
-                    }
-                },
-            }
-        }
+        const Ctx = struct {
+            self: *RecursiveResolver,
+            allocator: mem.Allocator,
+            zone_name: []const u8,
+            servers: []const na.Address,
 
-        // No dedup table (single-threaded mode) — fetch directly.
-        return self.fetchAndValidateDnskey(allocator, zone_name, servers);
+            fn fetch(c: @This()) !?[]const dns.ResourceRecord {
+                return c.self.fetchAndValidateDnskey(c.allocator, c.zone_name, c.servers);
+            }
+        };
+
+        return self.dedupedFetch(allocator, zone_name, .dnskey, dnskey_dedup_timeout_ns, Ctx{
+            .self = self,
+            .allocator = allocator,
+            .zone_name = zone_name,
+            .servers = servers,
+        });
     }
 
     /// Fetch DNSKEY from network, validate against cached DS (RFC 4035 §5.3),
@@ -1593,53 +1632,35 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         parent_servers: []const na.Address,
     ) ?[]const dns.ResourceRecord {
-        const kc = self.keyCache();
-
         // Fast path: DS already in cache (another thread may have fetched it).
-        if (kc) |c| {
+        if (self.keyCache()) |c| {
             if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
                 .hit => |h| h.records,
                 .negative => null,
             };
         }
 
-        // Dedup: coalesce concurrent DS fetches for the same zone.
-        if (self.dedup) |dedup| {
-            switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, monotonic.nowNs() + ds_dedup_timeout_ns)) {
-                .leader => {
-                    defer dedup.releaseLeader(zone_name, .ds, 0);
-                    return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
-                },
-                .follower => {
-                    // Leader finished — re-check cache.
-                    if (kc) |c| {
-                        if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
-                            .hit => |h| h.records,
-                            .negative => null,
-                        };
-                    }
-                    // Cache still empty — leader failed (or TTL=0 DS that the
-                    // cache silently drops). One follower retries.
-                    switch (dedup.acquireOrWaitWithTimeout(zone_name, .ds, 0, monotonic.nowNs() + ds_dedup_timeout_ns / 2)) {
-                        .leader => {
-                            defer dedup.releaseLeader(zone_name, .ds, 0);
-                            return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
-                        },
-                        .follower => {
-                            if (kc) |c| {
-                                if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
-                                    .hit => |h| h.records,
-                                    .negative => null,
-                                };
-                            }
-                            return null;
-                        },
-                    }
-                },
-            }
-        }
+        const Ctx = struct {
+            self: *RecursiveResolver,
+            allocator: mem.Allocator,
+            zone_name: []const u8,
+            parent_servers: []const na.Address,
 
-        return self.reproveDelegationSecurityImpl(allocator, zone_name, parent_servers);
+            fn fetch(c: @This()) ?[]const dns.ResourceRecord {
+                return c.self.reproveDelegationSecurityImpl(c.allocator, c.zone_name, c.parent_servers);
+            }
+        };
+
+        // Note: a TTL=0 DS that the cache silently drops will land the
+        // follower in dedupedFetch's cache-miss-after-leader retry path
+        // even though the leader succeeded. The retry-as-leader covers
+        // it; one extra fetch under that rare combination is acceptable.
+        return self.dedupedFetch(allocator, zone_name, .ds, ds_dedup_timeout_ns, Ctx{
+            .self = self,
+            .allocator = allocator,
+            .zone_name = zone_name,
+            .parent_servers = parent_servers,
+        });
     }
 
     fn reproveDelegationSecurityImpl(
