@@ -1,0 +1,19 @@
+dedup leader fast-path (commit d61b759, "skip clock read on leader fast path")
+
+method: 5 passes each side, ReleaseFast, hark commit d61b759 vs d61b759^
+        median-of-medians on p50 reported below.
+
+                pre      post     delta
+dedup_with      281ns    271ns    -10ns  (-3.5%)   leader path: acquireOrWait+lookup+releaseLeader
+dedup_without   120ns    120ns      0ns           control: lookup only
+dedup_f01       171ns    170ns     -1ns           cache-hit fast path (no dedup taken)
+
+interpretation: deferring the monotonic.nowNs() vDSO read out of acquireOrWait
+into the follower branch shaves ~10ns at p50 on the leader path. Modest but
+reproducible across 5 passes; control workload (dedup_without) is unchanged,
+ruling out drift. dedup_f01 within noise (it never enters acquireOrWait at all).
+
+raw runs (post):
+  dedup_with: 270, 270, 291, 271, 271
+raw runs (pre):
+  dedup_with: 290, 280, 281, 301, 280

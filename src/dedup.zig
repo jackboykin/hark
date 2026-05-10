@@ -94,8 +94,9 @@ pub const InFlightTable = struct {
     /// The default 2s budget bounds how long a follower waits on the leader.
     /// It's shorter than typical recursive-resolver client timeouts (5-10s);
     /// a sub-second client API would need explicit deadline propagation here.
+    /// Passing `null` defers the clock read so the leader fast path skips it.
     pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) AcquireResult {
-        return self.acquireOrWaitWithTimeout(name, qtype, flags, monotonic.nowNs() + 2 * std.time.ns_per_s);
+        return self.acquireOrWaitImpl(name, qtype, flags, null);
     }
 
     /// Like `acquireOrWait` but takes an absolute monotonic deadline. Callers
@@ -103,6 +104,10 @@ pub const InFlightTable = struct {
     /// remaining budget. DNSKEY fetches use a longer (6s) deadline because
     /// cold-cache DNSSEC chains (root → TLD → SLD → DNSKEY) can take 3-5s.
     pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns: i128) AcquireResult {
+        return self.acquireOrWaitImpl(name, qtype, flags, deadline_ns);
+    }
+
+    fn acquireOrWaitImpl(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns_opt: ?i128) AcquireResult {
         const key = DedupKey.init(name, qtype, flags) orelse return .leader;
 
         self.mutex.lockUncancelable(self.io);
@@ -113,6 +118,7 @@ pub const InFlightTable = struct {
             // A releaseLeader for any key in the same shard will wake us to
             // recheck; releases for keys in other shards will not broadcast
             // here at all.
+            const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + 2 * std.time.ns_per_s);
             const shard = shardOf(key);
             while (self.map.get(key)) |completed| {
                 if (completed) break;
