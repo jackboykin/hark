@@ -140,7 +140,7 @@ echo ">>> starting hark on 127.0.0.1:5354 (config: $HARK_CONFIG)"
 "$HARK_BIN" serve --config "$HARK_CONFIG" >"$HARK_LOG" 2>&1 &
 HARK_PID=$!
 
-wait_for_listener hark 127.0.0.1 5354 smoke.test. A
+wait_for_listener hark 127.0.0.1 5354 smoke.bench. A
 
 case "$CMD" in
     direct-nsd)
@@ -205,13 +205,13 @@ case "$CMD" in
         echo "    $DATA"
         ;;
     smoke)
-        echo ">>> smoke test: dig smoke.test. via hark"
-        ANSWER="$(dig +short @127.0.0.1 -p 5354 smoke.test. A)"
-        # smoke.test. has an explicit A record at 127.0.0.42 in test.zone —
+        echo ">>> smoke test: dig smoke.bench. via hark"
+        ANSWER="$(dig +short @127.0.0.1 -p 5354 smoke.bench. A)"
+        # smoke.bench. has an explicit A record at 127.0.0.42 in bench.zone —
         # distinct from the wildcard's 127.0.0.1, so this verifies the explicit
         # path rather than passing by accident on wildcard fallthrough.
         if [[ "$ANSWER" == "127.0.0.42" ]]; then
-            echo "PASS: smoke.test. → $ANSWER"
+            echo "PASS: smoke.bench. → $ANSWER"
         else
             echo "FAIL: expected 127.0.0.42, got '$ANSWER'" >&2
             exit 1
@@ -222,7 +222,7 @@ case "$CMD" in
         dig +tries=1 +time="$SMOKE_T" @198.41.0.4 . SOA | awk '/Query time/'
 
         echo ">>> raw dig via hark (cold-cache miss, RTT sanity check)"
-        dig +tries=1 +time="$SMOKE_T" @127.0.0.1 -p 5354 "rtt-$(date +%s%N).test." A | awk '/Query time/'
+        dig +tries=1 +time="$SMOKE_T" @127.0.0.1 -p 5354 "rtt-$(date +%s%N).bench." A | awk '/Query time/'
         ;;
     bench)
         WORKLOAD="${2:-hit}"
@@ -235,7 +235,7 @@ case "$CMD" in
             echo ">>> warming cache (8 names)"
             warm_t="$(dig_timeout)"
             for i in {1..8}; do
-                dig +short +tries=1 +time="$warm_t" @127.0.0.1 -p 5354 "host${i}.test." A >/dev/null
+                dig +short +tries=1 +time="$warm_t" @127.0.0.1 -p 5354 "host${i}.bench." A >/dev/null
             done
         fi
 

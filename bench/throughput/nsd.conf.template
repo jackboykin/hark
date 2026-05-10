@@ -22,5 +22,5 @@ zone:
     zonefile: "root.zone"
 
 zone:
-    name: "test."
-    zonefile: "test.zone"
+    name: "bench."
+    zonefile: "bench.zone"

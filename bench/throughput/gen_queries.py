@@ -32,17 +32,17 @@ def main(workload: str) -> int:
         # 8 stable names — enough to exercise multiple cache shards but small
         # enough to fully fit and remain hit-only after warm-up.
         for i in range(1, 9):
-            print(f"host{i}.test. A")
+            print(f"host{i}.bench. A")
     elif workload == "miss":
         for _ in range(N_QUERIES):
-            print(f"{random_name(rng)}.test. A")
+            print(f"{random_name(rng)}.bench. A")
     elif workload == "mix":
-        hits = [f"host{i}.test. A" for i in range(1, HIT_SET_SIZE + 1)]
+        hits = [f"host{i}.bench. A" for i in range(1, HIT_SET_SIZE + 1)]
         for _ in range(N_QUERIES):
             if rng.random() < 0.5:
                 print(rng.choice(hits))
             else:
-                print(f"{random_name(rng)}.test. A")
+                print(f"{random_name(rng)}.bench. A")
     else:
         print(f"unknown workload: {workload} (use hit | miss | mix)", file=sys.stderr)
         return 2

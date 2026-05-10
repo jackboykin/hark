@@ -9,6 +9,7 @@ $TTL 86400
 .                       IN NS   a.root-servers.net.
 a.root-servers.net.     IN A    198.41.0.4
 
-; Delegation for test. — single NSD instance also serves the TLD.
-test.                   IN NS   ns.test.
-ns.test.                IN A    198.41.0.4
+; Delegation for bench. — single NSD instance also serves the TLD.
+; Not `test.` (RFC 6761 §6.2 short-circuits to NXDOMAIN in special_use.zig).
+bench.                  IN NS   ns.bench.
+ns.bench.               IN A    198.41.0.4
