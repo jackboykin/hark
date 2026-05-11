@@ -20,7 +20,18 @@ Currently blocked (NOT in the manifest, can't even run):
     harness *requires* 127/8 (the responder binds 127.0.10.x). Would need
     a per-CIDR `allow-loopback-upstreams` whitelist in hark plus a lifter
     rule to preserve specific 127/8 IPs without remapping. Structural,
-    1 scenario.
+    1 scenario. The underlying behaviour is covered by the
+    `isNonRoutableNs` unit test in `src/net_address.zig`.
+
+Non-portable upstream scenarios (intentionally NOT in the manifest):
+
+  - `iter_cname_minimise_nx.rpl`, `iter_class_any.rpl` — both depend on
+    Unbound's testbound-only `fake-sha1: yes` algorithm,
+    `val-override-date` clock override, and a hardcoded test key fused
+    into the Unbound binary. The signatures are unverifiable by any
+    conformant validator. Replacements live as hark-authored DNSSEC
+    scenarios under `test/scenarios/hark/dnssec/` using the harness's
+    real ECDSA signing.
 
 Previously blocked, now in the manifest:
 
@@ -60,7 +71,8 @@ MANIFEST: list[LiftedEntry] = [
     # iter_cname — CNAME-chase edges; cluster of hark divergences (xfail strict)
     LiftedEntry("iter_cname_double.rpl",                  "iter_cname",       None),
     LiftedEntry("iter_cname_minimise.rpl",                "iter_cname",       None),
-    LiftedEntry("iter_cname_minimise_nx.rpl",             "iter_cname",       "scenario requires DNSSEC trust-anchor + fake-sha1 (CHECK_ANSWER asserts AD+RRSIG); harness doesn't model trust anchors yet — same blocker as iter_class_any"),
+    # iter_cname_minimise_nx is intentionally *not* in this manifest — see
+    # the "Non-portable upstream scenarios" section of the module docstring.
     LiftedEntry("iter_cname_nx.rpl",                      "iter_cname",       None),
     LiftedEntry("iter_cname_qnamecopy.rpl",               "iter_cname",       None),
     # iter_cname_cache uses an IPv6 ADDRESS (`2002::5`). The lifter maps
@@ -78,9 +90,8 @@ MANIFEST: list[LiftedEntry] = [
     LiftedEntry("iter_dname_ttl.rpl",                     "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
     LiftedEntry("iter_dname_ttl0.rpl",                    "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
 
-    # iter_class_any — non-IN class handling. Scenario also requires DNSSEC
-    # trust-anchor + fake-sha1 — out of scope for plain-DNS scenarios.
-    LiftedEntry("iter_class_any.rpl",                     "iter_class_any",   "scenario requires DNSSEC trust-anchor + fake-sha1; harness doesn't model trust anchors yet"),
+    # iter_class_any is intentionally *not* in this manifest — see the
+    # "Non-portable upstream scenarios" section of the module docstring.
 
     # iter_domain_sale — needs test-clock to observe TTL expiry. Hark
     # implements one behind `-Dtesting=true` (see `src/monotonic.zig`); the

@@ -1,0 +1,46 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN qtype=ANY synthesizes RFC 8482 HINFO and never reaches upstream
+
+; Regression guard for hark's RFC 8482 §3 ANY-query implementation.
+; Hark MAY (and does) synthesize a HINFO response for qtype=ANY locally
+; instead of forwarding to authoritatives — minimizes reflection / DDoS
+; amplification surface, since signed ANY responses are server-policy
+; per RFC 8482 §4.3 and validate to nothing useful anyway.
+;
+; The signed zone is set up so any actual forwarding would be visible:
+; the responder declares NO entry for `leaf. IN ANY`, so a forwarding
+; bug would surface as REFUSED on the wire (the responder's default
+; mirror-a-lame-auth behavior).
+;
+; AD=0 is the load-bearing assertion alongside the HINFO content: a
+; locally-synthesized response is unauthenticated.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ; Deliberately no entry — hark must not forward qtype=ANY upstream.
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    leaf. IN ANY
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; The responder declares no entry for leaf. — any forwarded query
+  ; would come back as REFUSED, propagated to the client. CHECK_ANSWER
+  ; matching NOERROR+HINFO implicitly proves hark synthesized the
+  ; response locally rather than forwarding.
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    leaf. IN ANY
+  SECTION ANSWER
+    leaf. 0 IN HINFO "rfc8482" ""
+ENTRY_END
+
+SCENARIO_END
