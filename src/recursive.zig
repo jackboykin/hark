@@ -219,6 +219,14 @@ pub const RecursiveResolver = struct {
         var total_probes: usize = 0;
         var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
         defer cname_chain.deinit(allocator);
+        // RFC 4035 §3.1.3.4 wildcard-expansion proofs accumulated from each
+        // intermediate CNAME hop's authority. Mirrors Unbound's
+        // `iter_add_prepend_auth` (iterator.c:500). Members borrow from
+        // the parse-response arena buffers — safe because the per-query
+        // arena outlives every parse buffer it produces; would dangle
+        // under a heap allocator.
+        var cname_auth_aggregate: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        defer cname_auth_aggregate.deinit(allocator);
         var prefetch_name: ?[]const u8 = null;
 
         // DNSSEC chain of trust state — starts as secure at root
@@ -232,7 +240,7 @@ pub const RecursiveResolver = struct {
             if (action != .none) {
                 const synth = try special_use.synthesize(allocator, current_name, action);
                 return .{
-                    .message = try withCnameChain(allocator, cname_chain.items, synth),
+                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synth),
                     .prefetch_name = null,
                     .prefetch_qtype = qtype,
                 };
@@ -245,7 +253,7 @@ pub const RecursiveResolver = struct {
             if (qtype == .any) {
                 const synth = try synthesizeAnyHinfo(allocator, current_name);
                 return .{
-                    .message = try withCnameChain(allocator, cname_chain.items, synth),
+                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synth),
                     .prefetch_name = null,
                     .prefetch_qtype = qtype,
                 };
@@ -290,7 +298,12 @@ pub const RecursiveResolver = struct {
 
                         switch (result) {
                             .hit => |h| return .{
-                                .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(h.records, &.{}, .no_error, h.security_status == .secure)),
+                                // RFC 4035 §5.3.1: RRSIGs travel in the same
+                                // section as their covered RRset. Concatenate
+                                // sigs onto the answer-section records so a
+                                // DO=1 / CD=1 cache-served client can validate;
+                                // the wire shaper strips them for DO=0.
+                                .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), &.{}, .no_error, h.security_status == .secure)),
                                 .prefetch_name = prefetch_name,
                                 .prefetch_qtype = qtype,
                             },
@@ -301,7 +314,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
@@ -326,7 +339,7 @@ pub const RecursiveResolver = struct {
                                     break :blk auths;
                                 } else &[_]dns.ResourceRecord{};
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, authorities, .name_error, false)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, .name_error, false)),
                                     .prefetch_name = null,
                                     .prefetch_qtype = qtype,
                                 };
@@ -348,14 +361,14 @@ pub const RecursiveResolver = struct {
                             .nxdomain, .nodata => |rc| {
                                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, synthesizedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, &.{synth.soa}, rcode, true)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
                             },
                             .wildcard_match => {
                                 // RFC 8198 §5.3: synthesize answer from cached wildcard RRset.
-                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, target_name, qtype, cname_chain.items)) |result| {
+                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, target_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| {
                                     return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
                                 }
                                 // Wildcard RRset not in cache — fall through to upstream (RFC 8198 §5.3 MUST)
@@ -603,7 +616,7 @@ pub const RecursiveResolver = struct {
                         // path on out-of-bailiwick NS like dynect.net.
                         if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
                 }
 
                 if (response.answers.len > 0) {
@@ -642,6 +655,31 @@ pub const RecursiveResolver = struct {
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
+
+                                // Aggregate wildcard-expansion NSEC/NSEC3 proofs
+                                // from this hop's authority before moving past it.
+                                // Three gates: secure CNAME (DNSKEY warm), proof-
+                                // material pre-scan with cheap bailiwick to skip
+                                // the DNSKEY fetch on the common no-proof case,
+                                // then `verifyAuthoritySigs` for crypto truth.
+                                // An unverified scoop here is an injection path —
+                                // attacker stuffs forged NSEC into a `.secure`
+                                // chain and AD-trusting downstream believes it.
+                                if (cname_status == .secure and response.authorities.len > 0) {
+                                    var has_proof = false;
+                                    for (response.authorities) |auth_rr| {
+                                        if (isCnameAuthProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
+                                            has_proof = true;
+                                            break;
+                                        }
+                                    }
+                                    if (has_proof and self.verifyAuthoritySigs(allocator, response.authorities, servers[0..server_count]) == .secure) {
+                                        for (response.authorities) |auth_rr| {
+                                            if (isCnameAuthProofMaterial(auth_rr))
+                                                try cname_auth_aggregate.append(allocator, auth_rr);
+                                        }
+                                    }
+                                }
 
                                 // Same-zone CNAME: keep current auth servers, delegation,
                                 // and security_state. The DNSSEC chain of trust is
@@ -698,7 +736,7 @@ pub const RecursiveResolver = struct {
                         }
                     };
 
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
                 }
 
                 // Check for referral (NS records in authority section)
@@ -729,7 +767,7 @@ pub const RecursiveResolver = struct {
                         // user-facing failure cache.
                         if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
                     }
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, response) };
+                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
                 };
 
                 if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
@@ -828,6 +866,7 @@ pub const RecursiveResolver = struct {
         target_name: dns.Name,
         qtype: dns.RType,
         cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
     ) !?dns.Message {
         if (ce_label_count == 0 or target_name.labels.len < ce_label_count) return null;
         // Build *.CE from qname labels and format as dotted string for cache lookup
@@ -844,7 +883,7 @@ pub const RecursiveResolver = struct {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
                 // target_name is arena-allocated and outlives the response — direct assignment.
                 for (h.records) |*rr| rr.name = target_name;
-                return try withCnameChain(allocator, cname_chain_items, synthesizedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
+                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
@@ -873,7 +912,7 @@ pub const RecursiveResolver = struct {
         // NSEC at this zone, no poisoning).
         var rrsig: ?dns.RrsigData = null;
         for (answers) |rr| {
-            if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != qtype) continue;
+            if (dns.rrsigCovers(rr) != qtype) continue;
             if (rrsig == null or rr.rdata.rrsig.labels > rrsig.?.labels) {
                 rrsig = rr.rdata.rrsig;
             }
@@ -893,8 +932,7 @@ pub const RecursiveResolver = struct {
                 wildcard_owner = dns.makeWildcardName(&wc_labels_buf, ce);
             }
             const wco = wildcard_owner orelse continue;
-            const dominated = ans_rr.rtype == qtype or
-                (ans_rr.rtype == .rrsig and ans_rr.rdata.rrsig.type_covered == qtype);
+            const dominated = ans_rr.rtype == qtype or dns.rrsigCovers(ans_rr) == qtype;
             if (dominated) {
                 wc_records[wc_count] = ans_rr;
                 wc_records[wc_count].name = wco;
@@ -1125,11 +1163,6 @@ pub const RecursiveResolver = struct {
         const responding_addr = leg_addrs[winner];
         const addr_key = AddressKey.fromAddress(responding_addr);
 
-        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
-        if (self.ns_selector) |ns| {
-            ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
-        }
-
         // RFC 2181 §9: TC-set response cannot be used. Retry the winning
         // server over TCP immediately; falling through to the sequential loop
         // would re-query servers that already lost the race (wasted UDP RTTs).
@@ -1148,6 +1181,23 @@ pub const RecursiveResolver = struct {
             self.markCaseBroken(responding_addr);
             return null;
         }
+
+        // RFC 1034 §4.3.5 lame-NS fallthrough. The sequential server_loop
+        // handles this via `last_server_failure`, but the race path returns
+        // first-by-latency — so a fast-failing NS would propagate verbatim
+        // without this check. Score and bail to sequential.
+        if (resp.header.rcode.isServerError()) {
+            if (self.ns_selector) |ns|
+                ns.recordOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
+            return null;
+        }
+
+        // Bookkeeping fires *after* every bail-out path above, so a fast
+        // SERVFAIL / 0x20-mismatch / TC-then-TCP-failed winner isn't
+        // double-counted as a healthy success on the Thompson arm.
+        if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
+        if (self.ns_selector) |ns|
+            ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
 
         return .{ .message = resp, .server = responding_addr };
     }
@@ -2420,15 +2470,58 @@ fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord 
     return null;
 }
 
-fn withCnameChain(allocator: mem.Allocator, chain: []const dns.ResourceRecord, response: dns.Message) !dns.Message {
-    if (chain.len == 0) return response;
-    const new_answers = try allocator.alloc(dns.ResourceRecord, chain.len + response.answers.len);
-    @memcpy(new_answers[0..chain.len], chain);
-    @memcpy(new_answers[chain.len..], response.answers);
+/// Concatenate two RR slices. Returns the input slice unchanged when one
+/// side is empty (zero-alloc fast path for the dominant non-DNSSEC case).
+fn concatRRs(allocator: mem.Allocator, a: []const dns.ResourceRecord, b: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
+    if (b.len == 0) return a;
+    if (a.len == 0) return b;
+    const out = try allocator.alloc(dns.ResourceRecord, a.len + b.len);
+    @memcpy(out[0..a.len], a);
+    @memcpy(out[a.len..], b);
+    return out;
+}
+
+/// Stitch CNAME chain (prepends answers) and aggregated wildcard proofs
+/// (prepends authority) into `response`. Mirrors Unbound's
+/// `iter_add_prepend_auth`. Section trimming is the shaper's job.
+fn withCnameChain(
+    allocator: mem.Allocator,
+    chain: []const dns.ResourceRecord,
+    auth_aggregate: []const dns.ResourceRecord,
+    response: dns.Message,
+) !dns.Message {
+    if (chain.len == 0 and auth_aggregate.len == 0) return response;
     var msg = response;
-    msg.answers = new_answers;
-    msg.header.an_count = @intCast(new_answers.len);
+    if (chain.len > 0) {
+        const new_answers = try allocator.alloc(dns.ResourceRecord, chain.len + response.answers.len);
+        @memcpy(new_answers[0..chain.len], chain);
+        @memcpy(new_answers[chain.len..], response.answers);
+        msg.answers = new_answers;
+        msg.header.an_count = @intCast(new_answers.len);
+    }
+    if (auth_aggregate.len > 0) {
+        const new_auths = try allocator.alloc(dns.ResourceRecord, auth_aggregate.len + response.authorities.len);
+        @memcpy(new_auths[0..auth_aggregate.len], auth_aggregate);
+        @memcpy(new_auths[auth_aggregate.len..], response.authorities);
+        msg.authorities = new_auths;
+        msg.header.ns_count = @intCast(new_auths.len);
+    }
     return msg;
+}
+
+/// Returns true for record types that are wildcard-expansion / negative-
+/// existence DNSSEC proof material. RFC 4035 §3.1.3.4. We accumulate
+/// these (plus their RRSIGs) from intermediate CNAME-hop authority
+/// sections so a chained final response carries the full proof chain.
+fn isCnameAuthProofMaterial(rr: dns.ResourceRecord) bool {
+    return switch (rr.rtype) {
+        .nsec, .nsec3 => true,
+        .rrsig => switch (dns.rrsigCovers(rr) orelse return false) {
+            .nsec, .nsec3 => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 // ── Referral extraction ────────────────────────────────────────────────
@@ -2507,10 +2600,10 @@ fn extractReferral(
         const is_aaaa = rr.rtype == .aaaa;
         if (!is_a and !is_aaaa) continue;
         // Bailiwick: glue name must be within the parent zone (the zone
-        // the referring server is authoritative for). For root referrals
-        // parent_zone is "." so all glue is accepted; for .com referrals,
-        // glue under .com is accepted, etc.
-        if (parent_zone.labels.len > 0 and !rr.name.isSubdomainOf(parent_zone)) continue;
+        // the referring server is authoritative for). `isSubdomainOf`
+        // already returns true when parent is root, so all glue is
+        // accepted under root referrals.
+        if (!rr.name.isSubdomainOf(parent_zone)) continue;
 
         for (ns_names[0..ns_count]) |ns_name| {
             if (ns_name.eql(rr.name)) {
@@ -3062,4 +3155,129 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
         NegativeValidation.bogus,
         validateNegativeResponse(.secure, &authorities, beta, .a, true, &b),
     );
+}
+
+test "isCnameAuthProofMaterial classifies the chain-aggregate keep set" {
+    const sample_name = dns.Name{ .labels = &.{ "x", "example", "com" } };
+    const sample_next = dns.Name{ .labels = &.{ "y", "example", "com" } };
+
+    const nsec_rr = dns.ResourceRecord{
+        .name = sample_name,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .nsec = .{ .next_domain_name = sample_next, .type_bit_maps = &.{} } },
+    };
+    const nsec3_rr = dns.ResourceRecord{
+        .name = sample_name,
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .nsec3 = .{
+            .hash_algorithm = .sha1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = &.{},
+            .next_hashed_owner = &.{},
+            .type_bit_maps = &.{},
+        } },
+    };
+    const mkrrsig = struct {
+        fn f(covered: dns.RType) dns.ResourceRecord {
+            return .{
+                .name = dns.Name{ .labels = &.{ "x", "example", "com" } },
+                .rtype = .rrsig,
+                .rclass = .in,
+                .ttl = 3600,
+                .rdata = .{ .rrsig = .{
+                    .type_covered = covered,
+                    .algorithm = .ecdsap256sha256,
+                    .labels = 3,
+                    .original_ttl = 3600,
+                    .sig_expiration = 0,
+                    .sig_inception = 0,
+                    .key_tag = 0,
+                    .signer_name = dns.Name{ .labels = &.{ "example", "com" } },
+                    .signature = &.{},
+                } },
+            };
+        }
+    }.f;
+    const ns_rr = dns.ResourceRecord{
+        .name = sample_name,
+        .rtype = .ns,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .ns = sample_next },
+    };
+
+    try testing.expect(isCnameAuthProofMaterial(nsec_rr));
+    try testing.expect(isCnameAuthProofMaterial(nsec3_rr));
+    try testing.expect(isCnameAuthProofMaterial(mkrrsig(.nsec)));
+    try testing.expect(isCnameAuthProofMaterial(mkrrsig(.nsec3)));
+    try testing.expect(!isCnameAuthProofMaterial(mkrrsig(.ns)));
+    try testing.expect(!isCnameAuthProofMaterial(mkrrsig(.a)));
+    try testing.expect(!isCnameAuthProofMaterial(ns_rr));
+}
+
+test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proof case)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const owner = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "z", "example", "com" } };
+    const cname_target = dns.Name{ .labels = &.{ "tgt", "example", "com" } };
+
+    const cname_rr = dns.ResourceRecord{
+        .name = owner,
+        .rtype = .cname,
+        .rclass = .in,
+        .ttl = 60,
+        .rdata = .{ .cname = cname_target },
+    };
+    const a_rr = dns.ResourceRecord{
+        .name = cname_target,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 60,
+        .rdata = .{ .a = .{ 192, 0, 2, 1 } },
+    };
+    const nsec_rr = dns.ResourceRecord{
+        .name = owner,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = &.{} } },
+    };
+
+    const terminal_response = dns.Message{
+        .header = .{
+            .id = 0,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 0,
+            .an_count = 1,
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = &.{a_rr},
+    };
+
+    const stitched = try withCnameChain(a, &.{cname_rr}, &.{nsec_rr}, terminal_response);
+
+    try testing.expectEqual(@as(usize, 2), stitched.answers.len); // CNAME + A
+    try testing.expectEqual(dns.RType.cname, stitched.answers[0].rtype);
+    try testing.expectEqual(dns.RType.a, stitched.answers[1].rtype);
+    try testing.expectEqual(@as(usize, 1), stitched.authorities.len); // NSEC aggregated
+    try testing.expectEqual(dns.RType.nsec, stitched.authorities[0].rtype);
 }
