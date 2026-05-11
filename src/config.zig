@@ -59,6 +59,15 @@ pub const ServerConfig = struct {
     /// this or accept that they have an open recursive resolver.
     allow_from: []acl.Cidr,
 
+    /// Operator policy: when true (default) responses to clients carry only
+    /// load-bearing records (answer, SOA on negatives, DNSSEC proofs on DO=1
+    /// / CD=1). When false, the wire shaper passes the upstream's authority
+    /// and additional sections through unchanged except for the RFC 4035
+    /// §3.2.3 DO=0 strip (which remains mandatory). Mirrors Unbound's
+    /// `minimal-responses` knob (default-on since 1.7.x). See
+    /// `~/Documents/hark-notes/response-shaping-2026-05-11.md` for the matrix.
+    minimal_responses: bool,
+
     /// RFC 7766 §6.2.1: TCP idle timeout. Hark closes a TCP client
     /// connection after this many ms of inactivity. 5000 matches the
     /// previous hard-coded default; raise for long-lived stub clients.
@@ -150,6 +159,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .drop_uid = null,
         .drop_gid = null,
         .allow_from = empty_acl,
+        .minimal_responses = true,
         .tcp_idle_timeout_ms = 5_000,
         .tcp_queries_per_conn = 128,
         .upstream_tcp_idle_sec = 30,
@@ -208,6 +218,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             cfg.tcp_queries_per_conn = v;
         }
         if (try nonNegativeClamped(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
+        if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
     }
 
     // [resolver] section

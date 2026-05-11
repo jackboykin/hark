@@ -1158,6 +1158,7 @@ const WorkerState = struct {
             // size its keepalive expectations. Units are 100 ms.
             var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
             ctx.tcp_keepalive = @intCast(self.config.tcp_idle_timeout_ms / 100);
+            ctx.minimal_responses = self.config.minimal_responses;
             const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
@@ -1392,7 +1393,9 @@ const WorkerState = struct {
         else
             alloc.alloc(u8, resolved_payload) catch null;
         if (wire_buf) |buf| {
-            if (buildResponseWire(buf, ResponseContext.fromQuery(query_msg, resolved_payload), result.message, alloc)) |wire| {
+            var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
+            ctx.minimal_responses = self.config.minimal_responses;
+            if (buildResponseWire(buf, ctx, result.message, alloc)) |wire| {
                 self.sendUdpResponse(sock, wire, client_addr);
             }
         } else {
