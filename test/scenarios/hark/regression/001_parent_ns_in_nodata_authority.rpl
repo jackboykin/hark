@@ -1,0 +1,105 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN parent-zone NS records in NODATA authority do not trigger a referral
+;
+; Regression for the Hickory-class bug (hickory-dns#3477). When an
+; authoritative server returns a NODATA response (NOERROR rcode, empty
+; ANSWER) for a record type it doesn't have, including NS records for the
+; zone (or a *parent* zone) in the AUTHORITY section is RFC 2308 §2.2 legal.
+; A broken resolver would treat those NS records as a delegation and either
+; loop, re-query against itself, or narrow the bailiwick wrongly. Correct
+; behavior: recognise the NS as same-zone-or-above, treat the response as
+; NODATA, return NOERROR with empty answer.
+;
+; To actually fire the buggy path this scenario:
+;   - asks for a type the auth has no record of (AAAA on a name with only A)
+;   - has the auth return NODATA with same-zone NS in AUTHORITY
+;   - has the auth ALSO leak parent-zone NS (which would point a buggy
+;     resolver at a wholly different server, making the bug observable)
+; If hark wrongly followed the leaked NS it would re-query the parent auth
+; for `missing.example.com. AAAA` and produce a different query log; if it
+; wrongly followed the same-zone NS it would loop. Either failure mode
+; surfaces as either a wrong rcode or a timeout.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ; AAAA query for a name with no AAAA: NOERROR + empty ANSWER (NODATA).
+  ; AUTHORITY section leaks both same-zone (example.com.) and parent-zone
+  ; (com.) NS records. A correct resolver ignores both: same-zone NS is
+  ; not a child delegation; parent-zone NS is above the current bailiwick.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      missing.example.com. IN AAAA
+    SECTION AUTHORITY
+      example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
+      example.com. 3600 IN NS ns.example.com.
+      com. 3600 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      ns.example.com. 3600 IN A 127.0.10.3
+      a.gtld.fake. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    missing.example.com. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    missing.example.com. IN AAAA
+ENTRY_END
+
+; Trip conditions: a Hickory-class bug here would manifest as either
+;   (a) wrong rcode — e.g. NXDOMAIN if hark wrongly believed the leaked
+;       parent NS made `missing.example.com.` its own zone with no records
+;   (b) SERVFAIL from a referral loop (`MaxReferralsExceeded`) if hark
+;       kept re-following the same-zone NS records
+;   (c) test timeout if hark hangs chasing its tail
+; CHECK_ANSWER above catches (a) and (b); the harness's 5s UDP timeout
+; catches (c). A more discriminating assertion (e.g. "hark hit exactly
+; one auth for the final AAAA") requires the CHECK_QUERY_LOG format
+; extension tracked in test-suite-plan-2026-05-10.md.
+
+SCENARIO_END

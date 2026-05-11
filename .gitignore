@@ -5,3 +5,5 @@ flake.lock
 zig-cache/
 zig-out/
 .zig-cache/
+__pycache__/
+.pytest_cache/

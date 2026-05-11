@@ -1,0 +1,72 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN clean root -> tld -> auth referral chain
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ; QMIN probes the root for `com. A`. Root returns a referral to com.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ; com is asked example.com. A. It is authoritative for com but example.com
+  ; is delegated, so it returns a referral with glue.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ─────────────────────────────────────────────
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+SCENARIO_END

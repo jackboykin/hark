@@ -1,12 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
-const testing = std.testing;
-const posix = std.posix;
 const dns = @import("dns.zig");
-const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
-const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const rand = @import("rand.zig");
-const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const na = @import("net_address.zig");
 const Transports = @import("transport.zig").Transports;
 
@@ -58,30 +53,3 @@ pub const ForwardingResolver = struct {
         return msg;
     }
 };
-
-// ── Tests ───────────────────────────────────────────────────────────────
-
-test "ForwardingResolver resolve example.com A via 8.8.8.8" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-    const io = testing.io;
-
-    var transport = BlockingUdpTransport.init(.{}, io);
-
-    var resolver = ForwardingResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
-        .io = io,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const upstream = na.initIp4(.{ 8, 8, 8, 8 }, 53);
-    const response = resolver.resolve(arena.allocator(), "example.com", .a, upstream) catch |err| switch (err) {
-        error.Timeout => return error.SkipZigTest, // no network
-        else => return err,
-    };
-
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
-    try testing.expect(response.answers.len > 0);
-}

@@ -13,6 +13,20 @@ pub const ServerConfig = struct {
     listen: []Address,
     mode: Mode,
     upstreams: []Address,
+    /// Override IANA root hints. Empty means "use the compile-time
+    /// defaults from recursive.root_hints_default". Tests redirect at
+    /// scripted authoritatives via this; operators in split-horizon
+    /// deployments point at private roots. Applied at boot — hark does
+    /// not hot-reload config, and the cache starts empty on restart, so
+    /// no invalidation path is needed when this value changes.
+    root_hints: []Address,
+    /// Default port for upstream queries when not encoded in the address.
+    /// Glue records have no port; this gives every glue-extracted upstream
+    /// its target port. Production is 53; tests use non-privileged ports.
+    upstream_port: u16,
+    /// Bypass the 127/8 rebinding-defense check on upstream addresses.
+    /// Tests only — scripted authoritatives bind on loopback.
+    allow_loopback_upstreams: bool,
     cache_size: usize,
     cache_entries: u32,
     key_cache_size: usize,
@@ -60,13 +74,23 @@ pub const ServerConfig = struct {
     pub fn deinit(self: *ServerConfig) void {
         self.allocator.free(self.listen);
         self.allocator.free(self.upstreams);
+        self.allocator.free(self.root_hints);
         self.allocator.free(self.allow_from);
+    }
+
+    /// Effective root-hints slice for the recursor: config-supplied if any,
+    /// else the compile-time IANA defaults. Centralized so every
+    /// RecursiveResolver construction site picks the same fallback.
+    pub fn rootHints(self: ServerConfig) []const Address {
+        const recursive = @import("recursive.zig");
+        return if (self.root_hints.len > 0) self.root_hints else &recursive.root_hints_default;
     }
 };
 
 pub const ConfigError = error{
     InvalidListenAddress,
     InvalidUpstreamAddress,
+    InvalidRootHintAddress,
     InvalidMode,
     InvalidValue,
     InvalidWorkerCount,
@@ -86,12 +110,16 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
     const empty_upstreams = allocator.alloc(Address, 0) catch return error.OutOfMemory;
+    const empty_root_hints = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
 
     return .{
         .listen = listen,
         .mode = .recursive,
         .upstreams = empty_upstreams,
+        .root_hints = empty_root_hints,
+        .upstream_port = 53,
+        .allow_loopback_upstreams = false,
         .cache_size = 16 * 1024 * 1024,
         .cache_entries = 10_000,
         .key_cache_size = 4 * 1024 * 1024,
@@ -192,6 +220,15 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.upstreams);
             cfg.upstreams = try parseAddressList(allocator, addrs, 53, error.InvalidUpstreamAddress);
         }
+        if (resolver.getStringArray("root-hints")) |addrs| {
+            allocator.free(cfg.root_hints);
+            cfg.root_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
+        }
+        if (resolver.getInteger("upstream-port")) |p| {
+            if (p < 1 or p > 65535) return error.InvalidValue;
+            cfg.upstream_port = @intCast(p);
+        }
+        if (resolver.getBool("allow-loopback-upstreams")) |b| cfg.allow_loopback_upstreams = b;
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
@@ -223,6 +260,16 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // Validation
     if (cfg.mode == .forward and cfg.upstreams.len == 0) {
         return error.ForwardingRequiresUpstreams;
+    }
+
+    // Root hints in 127/8 / private space create a self-referencing or
+    // loopback-targeting recursor — a class of operator footgun that the
+    // glue-time rebinding defence already blocks for delegated NSes. Reject
+    // unless the operator opted in via allow-loopback-upstreams (tests do).
+    if (!cfg.allow_loopback_upstreams) {
+        for (cfg.root_hints) |addr| {
+            if (net_addr.isNonRoutableNs(addr)) return error.InvalidRootHintAddress;
+        }
     }
 
     return cfg;

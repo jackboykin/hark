@@ -286,6 +286,10 @@ pub const Server = struct {
     bg_tasks: BackgroundTasks = .{},
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
+        if (cfg.allow_loopback_upstreams) {
+            log.warn("allow-loopback-upstreams is enabled — DNS rebinding defence is disabled for upstream addresses; intended for test environments only", .{});
+        }
+
         // Randomize hash seeds for cache, dedup, and AddressKey-keyed tables
         // (RttCache, NsSelector arms) so an authoritative can't engineer
         // bucket collisions via crafted glue addresses or query keys.
@@ -749,6 +753,9 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
             .tls = tls_ptr,
         },
         .io = server.io,
+        .root_hints = server.config.rootHints(),
+        .upstream_port = server.config.upstream_port,
+        .allow_loopback_upstreams = server.config.allow_loopback_upstreams,
         .cache = &server.cache,
         .qname_minimization = server.config.qname_minimization,
         .dnssec_aware = server.config.dnssec,
@@ -1160,6 +1167,9 @@ const WorkerState = struct {
                 var resolver = RecursiveResolver{
                     .transports = transports,
                     .io = self.io,
+                    .root_hints = self.config.rootHints(),
+                    .upstream_port = self.config.upstream_port,
+                    .allow_loopback_upstreams = self.config.allow_loopback_upstreams,
                     .cache = self.cache,
                     .qname_minimization = self.config.qname_minimization,
                     // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable

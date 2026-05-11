@@ -30,7 +30,7 @@ const log = std.log.scoped(.resolver);
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
 // Source: https://www.internic.net/domain/named.root
 
-pub const root_hints: [26]na.Address = .{
+pub const root_hints_default: [26]na.Address = .{
     // IPv4
     na.initIp4(.{ 198, 41, 0, 4 }, 53), // a
     na.initIp4(.{ 170, 247, 170, 2 }, 53), // b
@@ -86,6 +86,21 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 pub const RecursiveResolver = struct {
     transports: Transports,
     io: std.Io,
+    /// Override the built-in IANA root hints. Defaults to the hardcoded
+    /// production list. The server passes a config-supplied slice when
+    /// `[resolver] root-hints = [...]` is set — used by tests to redirect
+    /// at scripted authoritatives, and by operators running split-horizon
+    /// deployments against private root servers.
+    root_hints: []const na.Address = &root_hints_default,
+    /// Default port for upstream queries. Used when constructing addresses
+    /// from glue records (which have no port field per RFC 1035). Set via
+    /// `[resolver] upstream-port` for tests pointing at scripted authorities
+    /// on non-default ports. Production is always 53.
+    upstream_port: u16 = 53,
+    /// Bypass the 127/8 rebinding defense for upstream addresses. Tests only —
+    /// scripted authoritatives bind on loopback. Set via
+    /// `[resolver] allow-loopback-upstreams`.
+    allow_loopback_upstreams: bool = false,
     cache: ?*RRsetCache = null,
     qname_minimization: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
@@ -150,6 +165,13 @@ pub const RecursiveResolver = struct {
         if (self.key_cache) |kc| return kc;
         std.debug.assert(!self.dnssec_enabled or self.cache != null);
         return self.cache;
+    }
+
+    fn referralPolicy(self: *RecursiveResolver) ReferralAddrPolicy {
+        return .{
+            .upstream_port = self.upstream_port,
+            .allow_loopback = self.allow_loopback_upstreams,
+        };
     }
 
     /// Non-last server timeout cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2s).
@@ -344,8 +366,10 @@ pub const RecursiveResolver = struct {
             }
 
             var servers: [max_servers_per_level]na.Address = undefined;
-            var server_count: usize = root_hints.len;
-            @memcpy(servers[0..root_hints.len], &root_hints);
+            const hints = self.root_hints;
+            std.debug.assert(hints.len <= max_servers_per_level);
+            var server_count: usize = hints.len;
+            @memcpy(servers[0..hints.len], hints);
 
             var seen_zones: [max_referrals]dns.Name = undefined;
             var seen_zone_count: usize = 0;
@@ -424,7 +448,7 @@ pub const RecursiveResolver = struct {
                     // Check for referral — only from successful responses (error responses
                     // may contain NS records in authority that are not valid delegations)
                     if (response.header.rcode == .no_error) {
-                        if (extractReferral(response, target_name, parent_zone)) |referral| {
+                        if (extractReferral(response, target_name, parent_zone, self.referralPolicy())) |referral| {
                             if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
                             minimize_label_count = parent_zone.labels.len + 1;
@@ -678,7 +702,7 @@ pub const RecursiveResolver = struct {
                 }
 
                 // Check for referral (NS records in authority section)
-                const referral = extractReferral(response, target_name, parent_zone) orelse {
+                const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse {
                     // NODATA: no answers, no referral. Cache only if authoritative.
                     if (response.header.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
@@ -1594,7 +1618,7 @@ pub const RecursiveResolver = struct {
         // TLDs have no dot — parent is root, query root hints (RFC 4035 §3.1.4.1).
         const parent_zone = parentZoneOf(zone_name);
         if (parent_zone.len == 0) // root parent — query root hints
-            return self.reproveDelegationSecurity(allocator, zone_name, &root_hints);
+            return self.reproveDelegationSecurity(allocator, zone_name, self.root_hints);
 
         const cache = self.cache orelse return null;
         const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return null) {
@@ -1898,6 +1922,7 @@ pub const RecursiveResolver = struct {
     /// Append A+AAAA addresses from `records` to `addrs`, skipping non-routable.
     /// Returns true if at least one address was appended.
     fn appendAddressesFromRecords(
+        self: *RecursiveResolver,
         records: []const dns.ResourceRecord,
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
@@ -1906,11 +1931,11 @@ pub const RecursiveResolver = struct {
         for (records) |rr| {
             if (count.* >= max_servers_per_level) break;
             const addr: na.Address = switch (rr.rtype) {
-                .a => na.initIp4(rr.rdata.a, 53),
-                .aaaa => na.initIp6(rr.rdata.aaaa, 53, 0, 0),
+                .a => na.initIp4(rr.rdata.a, self.upstream_port),
+                .aaaa => na.initIp6(rr.rdata.aaaa, self.upstream_port, 0, 0),
                 else => continue,
             };
-            if (na.isNonRoutableNs(addr)) continue;
+            if (!self.allow_loopback_upstreams and na.isNonRoutableNs(addr)) continue;
             addrs[count.*] = addr;
             count.* += 1;
             added = true;
@@ -1940,7 +1965,7 @@ pub const RecursiveResolver = struct {
         defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, 0);
 
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
-            _ = appendAddressesFromRecords(r.message.answers, addrs, count);
+            _ = self.appendAddressesFromRecords(r.message.answers, addrs, count);
         } else |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
         }
@@ -2138,7 +2163,7 @@ pub const RecursiveResolver = struct {
             for (address_rtypes) |qtype| {
                 if (cache.lookup(allocator, ns_dotted, qtype, .in)) |result| {
                     switch (result) {
-                        .hit => |h| _ = appendAddressesFromRecords(h.records, &addrs, &count),
+                        .hit => |h| _ = self.appendAddressesFromRecords(h.records, &addrs, &count),
                         .negative => {},
                     }
                 }
@@ -2428,7 +2453,20 @@ fn hasSignedRecords(response: dns.Message) bool {
     return false;
 }
 
-fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Name) ?ReferralResult {
+/// Address-construction policy applied when materializing referral glue.
+/// Defaults are production-safe; tests override to redirect at scripted
+/// authorities on non-privileged ports in 127/8.
+const ReferralAddrPolicy = struct {
+    upstream_port: u16 = 53,
+    allow_loopback: bool = false,
+};
+
+fn extractReferral(
+    response: dns.Message,
+    target: dns.Name,
+    parent_zone: dns.Name,
+    policy: ReferralAddrPolicy,
+) ?ReferralResult {
     // Find the most specific zone cut: NS owner where target is a subdomain
     var zone_cut: ?dns.Name = null;
     var zone_cut_depth: usize = 0;
@@ -2478,10 +2516,10 @@ fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Nam
             if (ns_name.eql(rr.name)) {
                 if (glue_count < max_servers_per_level) {
                     const addr = if (is_a)
-                        na.initIp4(rr.rdata.a, 53)
+                        na.initIp4(rr.rdata.a, policy.upstream_port)
                     else
-                        na.initIp6(rr.rdata.aaaa, 53, 0, 0);
-                    if (na.isNonRoutableNs(addr)) break;
+                        na.initIp6(rr.rdata.aaaa, policy.upstream_port, 0, 0);
+                    if (!policy.allow_loopback and na.isNonRoutableNs(addr)) break;
                     glue_addrs[glue_count] = addr;
                     glue_count += 1;
                 }
@@ -2605,7 +2643,7 @@ test "extractReferral with NS and glue A records" {
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
-    const result = extractReferral(response, target, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, target, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     switch (result) {
         .referral => |ref| {
             try testing.expectEqual(@as(usize, 1), ref.count);
@@ -2623,7 +2661,7 @@ test "extractReferral with no NS records returns null" {
         .header = makeHeader(0, 0, 0),
         .questions = &.{},
     };
-    try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }) == null);
+    try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) == null);
 }
 
 test "extractReferral with NS but no glue returns no_glue" {
@@ -2633,7 +2671,7 @@ test "extractReferral with NS but no glue returns no_glue" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     switch (result) {
         .no_glue => |ng| {
             try testing.expectEqual(@as(usize, 1), ng.ns_count);
@@ -2654,7 +2692,7 @@ test "extractReferral case-insensitive glue matching" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 198, 51, 100, 1 })});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     try testing.expect(result == .referral);
     try testing.expectEqual(@as(usize, 1), result.referral.count);
 }
@@ -2668,9 +2706,32 @@ test "extractReferral rejects private IP glue (DNS rebinding defense)" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     // Private glue is dropped, so we should get no_glue (triggers glueless resolution)
     try testing.expect(result == .no_glue);
+}
+
+test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
+    // Locks in the test-only opt-in branch: with allow_loopback=true,
+    // loopback glue is *not* rejected. Without this test, inverting the
+    // boolean default would silently pass every other test.
+    const alloc = testing.allocator;
+    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    const zone_name = try makeName(alloc, &.{ "example", "com" });
+    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
+    defer dns.freeMessage(alloc, response);
+
+    const result = extractReferral(
+        response,
+        dns.Name{ .labels = &.{ "www", "example", "com" } },
+        dns.Name{ .labels = &.{} },
+        .{ .allow_loopback = true, .upstream_port = 5353 },
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(result == .referral);
+    try testing.expectEqual(@as(usize, 1), result.referral.count);
+    // Confirm the policy-supplied port is what gets stamped onto the address.
+    try testing.expectEqual(@as(u16, 5353), result.referral.addrs[0].getPort());
 }
 
 test "extractReferral rejects out-of-zone glue" {
@@ -2682,7 +2743,7 @@ test "extractReferral rejects out-of-zone glue" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 6, 6, 6, 6 })});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{"com"} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{"com"} }, .{}) orelse return error.TestUnexpectedResult;
     try testing.expect(result == .no_glue);
 }
 
@@ -2695,7 +2756,7 @@ test "extractReferral no_glue carries multiple NS names" {
     const response = try makeResponse(alloc, &.{ makeNsRr(zone1, ns1), makeNsRr(zone2, ns2) }, &.{});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     switch (result) {
         .no_glue => |ng| {
             try testing.expectEqual(@as(usize, 2), ng.ns_count);
@@ -2713,7 +2774,7 @@ test "extractReferral accepts in-zone glue" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 53 })});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     try testing.expect(result == .referral);
     try testing.expectEqual(@as(usize, 1), result.referral.count);
 }
@@ -2727,7 +2788,7 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueAaaa(glue_name, ipv6)});
     defer dns.freeMessage(alloc, response);
 
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }) orelse return error.TestUnexpectedResult;
+    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
     switch (result) {
         .referral => |ref| {
             try testing.expectEqual(@as(usize, 1), ref.count);
@@ -2753,7 +2814,7 @@ test "extractReferral rejects same-zone NS as non-referral" {
     const target = dns.Name{ .labels = &.{ "api", "example", "com" } };
     // parent_zone == zone_cut → same zone, must return null
     const parent_zone = dns.Name{ .labels = &.{ "example", "com" } };
-    try testing.expect(extractReferral(response, target, parent_zone) == null);
+    try testing.expect(extractReferral(response, target, parent_zone, .{}) == null);
 }
 
 // ── findCnameRecord / nameToDotted tests ──────────────────────────────
@@ -2898,153 +2959,6 @@ test "qname_minimization=false sends full name immediately" {
     const is_final = minimize_label_count >= target_label_count or !qname_minimization;
     try testing.expect(is_final);
     try testing.expectEqual(target_label_count, minimize_label_count);
-}
-
-// ── Integration tests (require Linux + network) ────────────────────────
-
-fn skipIfNotLinux() !void {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-}
-
-test "recursive resolve example.com A from root hints" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var transport = BlockingUdpTransport.init(.{}, io);
-
-    var resolver = RecursiveResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
-        .io = io,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = resolver.resolve(arena.allocator(), "example.com", .a) catch |err| switch (err) {
-        error.Timeout => return error.SkipZigTest,
-        error.NoGlueRecords => return error.SkipZigTest,
-        error.ReferralLoop => return error.SkipZigTest,
-        error.CnameChainTooLong => return error.SkipZigTest,
-        error.MaxReferralsExceeded => return error.SkipZigTest,
-        else => return err,
-    };
-
-    try testing.expect(result.message.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
-    try testing.expect(result.message.answers.len > 0);
-
-    // Verify we got an A record
-    var found_a = false;
-    for (result.message.answers) |rr| {
-        if (rr.rtype == .a) {
-            found_a = true;
-            break;
-        }
-    }
-    try testing.expect(found_a);
-}
-
-test "recursive resolve nonexistent domain returns name_error" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var transport = BlockingUdpTransport.init(.{}, io);
-
-    var resolver = RecursiveResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
-        .io = io,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = resolver.resolve(arena.allocator(), "this-domain-does-not-exist-xyzzy.example.com", .a) catch |err| switch (err) {
-        error.Timeout => return error.SkipZigTest,
-        error.NoGlueRecords => return error.SkipZigTest,
-        error.ReferralLoop => return error.SkipZigTest,
-        error.CnameChainTooLong => return error.SkipZigTest,
-        error.MaxReferralsExceeded => return error.SkipZigTest,
-        else => return err,
-    };
-
-    try testing.expectEqual(dns.RCode.name_error, result.message.header.rcode);
-}
-
-test "recursive resolve domain with glueless NS" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    // Shorter timeouts: glueless path issues many sub-queries
-    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
-
-    var resolver = RecursiveResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
-        .io = io,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    // ietf.org uses ns0.amsl.com etc. — glueless from .org zone
-    const result = resolver.resolve(arena.allocator(), "ietf.org", .a) catch |err| switch (err) {
-        error.Timeout => return error.SkipZigTest,
-        error.NoGlueRecords => return error.SkipZigTest,
-        error.ReferralLoop => return error.SkipZigTest,
-        error.CnameChainTooLong => return error.SkipZigTest,
-        error.MaxReferralsExceeded => return error.SkipZigTest,
-        else => return err,
-    };
-
-    try testing.expect(result.message.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
-    try testing.expect(result.message.answers.len > 0);
-
-    var found_a = false;
-    for (result.message.answers) |rr| {
-        if (rr.rtype == .a) {
-            found_a = true;
-            break;
-        }
-    }
-    try testing.expect(found_a);
-}
-
-test "recursive resolve with CNAME chain" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
-
-    var resolver = RecursiveResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
-        .io = io,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    // www.github.com is a CNAME to github.github.io
-    const result = resolver.resolve(arena.allocator(), "www.github.com", .a) catch |err| switch (err) {
-        error.Timeout => return error.SkipZigTest,
-        error.NoGlueRecords => return error.SkipZigTest,
-        error.ReferralLoop => return error.SkipZigTest,
-        error.CnameChainTooLong => return error.SkipZigTest,
-        error.MaxReferralsExceeded => return error.SkipZigTest,
-        else => return err,
-    };
-
-    try testing.expect(result.message.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, result.message.header.rcode);
-    try testing.expect(result.message.answers.len > 0);
-
-    var found_a = false;
-    var found_cname = false;
-    for (result.message.answers) |rr| {
-        if (rr.rtype == .a) found_a = true;
-        if (rr.rtype == .cname) found_cname = true;
-    }
-    try testing.expect(found_a);
-    try testing.expect(found_cname);
 }
 
 // ── validateNegativeResponse tests ─────────────────────────────────────
