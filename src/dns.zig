@@ -307,6 +307,14 @@ pub const RrsigData = struct {
     signature: []const u8,
 };
 
+/// Returns the rtype an RRSIG record covers, or null if `rr` isn't an RRSIG.
+/// Centralised because RFC 4035 RRSIG-vs-covered-RRset bookkeeping recurs
+/// across the cache, shaper, and validator paths.
+pub fn rrsigCovers(rr: ResourceRecord) ?RType {
+    if (rr.rtype != .rrsig) return null;
+    return rr.rdata.rrsig.type_covered;
+}
+
 pub const DnskeyData = struct {
     flags: u16,
     protocol: u8,

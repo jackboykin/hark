@@ -120,6 +120,14 @@ fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
 
 const CachedRRset = struct {
     records: []CachedRecord,
+    /// RRSIGs covering `records` (same name, RRSIG.type_covered == records'
+    /// rtype). Stored alongside the covered RRset because RFC 4035 §5.3.1
+    /// says they travel together — an RRset without RRSIG is unvalidable,
+    /// an RRSIG without its covered RRset is useless. Empty when the zone
+    /// is unsigned or hark stripped DNSSEC for any reason. The wire shaper
+    /// at response-build time decides whether to ship sigs to the client
+    /// (kept for DO=1 / CD=1; stripped for DO=0).
+    sigs: []CachedRecord = &.{},
     expires_at: i64,
     original_ttl: u32,
     stored_at: i64,
@@ -152,6 +160,10 @@ const CacheEntry = union(enum) {
 pub const CacheLookupResult = union(enum) {
     hit: struct {
         records: []dns.ResourceRecord,
+        /// RRSIGs covering `records`. Wire shaper strips for DO=0 clients;
+        /// kept for DO=1 / CD=1. Empty when zone is unsigned or hark
+        /// caches `.unchecked` material.
+        sigs: []dns.ResourceRecord = &.{},
         remaining_ttl: u32,
         needs_prefetch: bool = false,
         security_status: SecurityStatus = .unchecked,
@@ -401,7 +413,7 @@ pub const RRsetCache = struct {
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
         min_ttl: u32 = 0,
-        /// Skip .dnskey and .ds records in storeRRsetsImpl (routed to key cache).
+        /// Skip .dnskey and .ds records in storeRRsetsExcept (routed to key cache).
         skip_key_types: bool = false,
     };
 
@@ -536,9 +548,11 @@ pub const RRsetCache = struct {
         return fresh;
     }
 
-    /// Look up a cached RRset. Returns null if not found or expired.
-    /// On hit, returns records allocated with caller_alloc (the per-query arena),
-    /// with TTLs adjusted to reflect remaining time.
+    /// Look up an RRset by (name, rtype, rclass). On hit, records and sigs
+    /// are cloned into `caller_alloc` with TTLs adjusted to remaining time.
+    ///
+    /// Trust-at-store: `hit.security_status` reflects the validator's
+    /// verdict at store time; sigs are not re-verified on each read.
     pub fn lookup(
         self: *RRsetCache,
         caller_alloc: Allocator,
@@ -566,8 +580,11 @@ pub const RRsetCache = struct {
             .positive => |rrset| {
                 const hit = self.evalFreshness(shard, rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
                 const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
+                // Best-effort sigs clone — OOM degrades to empty (see storeOneRRset).
+                const sigs: []dns.ResourceRecord = if (rrset.sigs.len == 0) &.{} else cloneRRset(caller_alloc, rrset.sigs, hit.remaining_ttl) catch &.{};
                 return .{ .hit = .{
                     .records = records,
+                    .sigs = sigs,
                     .remaining_ttl = hit.remaining_ttl,
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = if (hit.force_unchecked) .unchecked else rrset.security_status,
@@ -683,11 +700,19 @@ pub const RRsetCache = struct {
     /// tolerate this as they would tolerate a not-yet-arrived response.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
         if (response.header.rcode != .no_error) return;
-        self.storeRRsetsImpl(response.answers, authority_zone, status);
-        // Skip authority/additional from positive responses (CVE-2025-11411).
+        self.storeRRsetsExcept(response.answers, authority_zone, status, &.{});
         if (response.answers.len == 0) {
-            self.storeRRsetsImpl(response.authorities, authority_zone, .unchecked);
-            self.storeRRsetsImpl(response.additionals, authority_zone, .unchecked);
+            // Referral / NODATA-without-SOA: cache everything (bailiwick filter
+            // handles cross-zone poisoning).
+            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{});
+            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{});
+        } else {
+            // CVE-2025-11411: child auth listing parent NS in its own authority
+            // would overwrite a valid delegation. Strip NS from authority and
+            // A/AAAA glue from additional. NSEC/NSEC3 + RRSIGs survive — DO=1
+            // clients still get proof material on cache-served wildcards.
+            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{.ns});
+            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{ .a, .aaaa });
         }
     }
 
@@ -725,7 +750,7 @@ pub const RRsetCache = struct {
             if (!queried.isSubdomainOf(soa.name)) return;
             // AuthS3 (draft-qiu-dnsop-enhanced-bailiwick): SOA must also be
             // within the delegation chain, not above the zone cut.
-            if (authority_zone.labels.len > 0 and !soa.name.isSubdomainOf(authority_zone)) return;
+            if (!soa.name.isSubdomainOf(authority_zone)) return;
         }
 
         // TTL = min(SOA record TTL, SOA MINIMUM field) per RFC 2308 §5
@@ -858,7 +883,17 @@ pub const RRsetCache = struct {
         };
     }
 
-    fn storeRRsetsImpl(self: *RRsetCache, records: []const dns.ResourceRecord, authority_zone: dns.Name, status: SecurityStatus) void {
+    /// Cache every (name, rtype, rclass) rrset in `records`, skipping
+    /// any whose rtype is in `skip_types`. RRSIGs are bundled with the
+    /// rrset they cover (RFC 4035 §5.3.1) — pass `skip_types = &.{}` to
+    /// admit everything (the default for unfiltered store paths).
+    fn storeRRsetsExcept(
+        self: *RRsetCache,
+        records: []const dns.ResourceRecord,
+        authority_zone: dns.Name,
+        status: SecurityStatus,
+        skip_types: []const dns.RType,
+    ) void {
         if (records.len == 0) return;
 
         // Track which (name, type) groups we've already processed in this batch
@@ -866,19 +901,25 @@ pub const RRsetCache = struct {
         var processed: [64]struct { name_hash: u64, rtype: dns.RType } = undefined;
         var processed_count: usize = 0;
 
-        for (records) |rr| {
+        record_loop: for (records) |rr| {
             // Skip records we shouldn't cache
             if (rr.ttl == 0) continue;
-            if (authority_zone.labels.len > 0 and !rr.name.isSubdomainOf(authority_zone)) continue;
+            if (!rr.name.isSubdomainOf(authority_zone)) continue;
 
             // Skip SOA in authority — these are for negative caching, handled separately
             if (rr.rtype == .soa) continue;
             // Skip OPT pseudo-records (belt-and-suspenders; parseMessage excludes them)
             if (rr.rtype == .opt) continue;
-            // Skip standalone RRSIG — bundled with their signed RRset instead
+            // RRSIG is bundled into its covered RRset's `sigs` slot below;
+            // don't drive a standalone-RRSIG cache entry.
             if (rr.rtype == .rrsig) continue;
             // Skip DNSKEY/DS when configured (routed to dedicated key cache)
             if (self.skip_key_types and (rr.rtype == .dnskey or rr.rtype == .ds)) continue;
+            // Caller-supplied type filter (e.g. surgical NS strip for
+            // CVE-2025-11411 from positive-response authority).
+            for (skip_types) |st| {
+                if (rr.rtype == st) continue :record_loop;
+            }
 
             // Check if we already processed this (name, type) group
             var lower_buf: [dns.max_name_len + 1]u8 = undefined;
@@ -903,17 +944,27 @@ pub const RRsetCache = struct {
             // Single-pass collect into stack buffer (avoids double scan).
             var match_buf: [max_rrset_collect]dns.ResourceRecord = undefined;
             var match_count: usize = 0;
+            var sig_buf: [max_rrset_collect]dns.ResourceRecord = undefined;
+            var sig_count: usize = 0;
             for (records) |other| {
-                if (other.rtype == rr.rtype and other.rclass == rr.rclass and rr.name.eql(other.name)) {
+                if (other.rclass != rr.rclass) continue;
+                if (!rr.name.eql(other.name)) continue;
+                if (other.rtype == rr.rtype) {
                     if (match_count < match_buf.len) {
                         match_buf[match_count] = other;
                     }
                     match_count += 1;
+                } else if (dns.rrsigCovers(other) == rr.rtype) {
+                    if (sig_count < sig_buf.len) {
+                        sig_buf[sig_count] = other;
+                    }
+                    sig_count += 1;
                 }
             }
             const collect_count = @min(match_count, match_buf.len);
+            const sig_collect = @min(sig_count, sig_buf.len);
 
-            self.storeOneRRset(lower_name, rr, match_buf[0..collect_count], status);
+            self.storeOneRRset(lower_name, rr, match_buf[0..collect_count], sig_buf[0..sig_collect], status);
         }
     }
 
@@ -947,11 +998,15 @@ pub const RRsetCache = struct {
 
     /// Store a single (name, rtype) RRset group. Acquires the shard's write
     /// lock for just this group; held only across the put + eviction work.
+    /// `sigs` are RRSIGs covering the rrset (same name, type_covered ==
+    /// rr.rtype); stored alongside under RFC 4035 §5.3.1's invariant that
+    /// signature and covered RRset travel together.
     fn storeOneRRset(
         self: *RRsetCache,
         lower_name: []const u8,
         rr: dns.ResourceRecord,
         matches: []const dns.ResourceRecord,
+        sigs: []const dns.ResourceRecord,
         status: SecurityStatus,
     ) void {
         // Empty matches would leave min_ttl = maxInt(u32) and store a
@@ -980,6 +1035,22 @@ pub const RRsetCache = struct {
             return;
         }
 
+        // Best-effort: an RRSIG OOM degrades to empty sigs, doesn't fail the store.
+        const cached_sigs: []CachedRecord = if (sigs.len == 0) &.{} else blk: {
+            const arr = slot.alloc.alloc(CachedRecord, sigs.len) catch break :blk &.{};
+            var s_idx: usize = 0;
+            for (sigs) |sg| {
+                arr[s_idx] = buildCachedRecord(slot.alloc, sg) catch break;
+                s_idx += 1;
+            }
+            if (s_idx < sigs.len) {
+                for (arr[0..s_idx]) |cr| freeCachedRecord(slot.alloc, cr);
+                slot.alloc.free(arr);
+                break :blk &.{};
+            }
+            break :blk arr;
+        };
+
         // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
         // facing heterogeneous TTLs MUST treat the RRset as having a single
         // TTL — the minimum of the members.
@@ -987,10 +1058,17 @@ pub const RRsetCache = struct {
         for (matches) |m| {
             if (m.ttl < min_ttl) min_ttl = m.ttl;
         }
+        // RRSIG TTL contributes too — RFC 4035 §5.3.3 ties the cached TTL
+        // to the RRSIG's expiration window, so an RRSIG-driven shorter TTL
+        // shouldn't be ignored.
+        for (sigs) |s| {
+            if (s.ttl < min_ttl) min_ttl = s.ttl;
+        }
         const now = self.now_fn();
         const capped_ttl = clampTtl(self.min_ttl, min_ttl);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .records = cached_records,
+            .sigs = cached_sigs,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
             .stored_at = now,
@@ -998,6 +1076,8 @@ pub const RRsetCache = struct {
         } }) catch {
             for (cached_records) |cr| freeCachedRecord(slot.alloc, cr);
             slot.alloc.free(cached_records);
+            for (cached_sigs) |cr| freeCachedRecord(slot.alloc, cr);
+            if (cached_sigs.len > 0) slot.alloc.free(cached_sigs);
             slot.alloc.free(slot.key.name);
             return;
         };
@@ -1123,6 +1203,8 @@ fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
         .positive => |rrset| {
             for (rrset.records) |cr| freeCachedRecord(alloc, cr);
             alloc.free(rrset.records);
+            for (rrset.sigs) |cr| freeCachedRecord(alloc, cr);
+            if (rrset.sigs.len > 0) alloc.free(rrset.sigs);
         },
         .negative => |neg| {
             if (neg.soa) |soa| freeCachedRecord(alloc, soa);
