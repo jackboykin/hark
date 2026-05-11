@@ -6,6 +6,7 @@ import dns.flags
 import dns.message
 import dns.query
 import dns.rcode
+import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
 
@@ -20,6 +21,14 @@ def send_query(entry: rpl.Entry, hark_addr: tuple[str, int], timeout: float = 5.
     q = entry.question[0]
     msg = dns.message.make_query(q.name, q.rdtype, q.rdclass)
     msg.flags = entry.reply_flags  # in QUERY entries, REPLY carries client flags
+    return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
+
+
+def send_raw_query(qname: str, rdtype: str, hark_addr: tuple[str, int], timeout: float = 5.0) -> dns.message.Message:
+    """Send a query without an `Entry`. Used by the TIME_PASSES handler to
+    hit hark's `_advance-clock` control channel without modelling it as a
+    scenario query."""
+    msg = dns.message.make_query(qname, rdtype)
     return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
 
 
@@ -99,52 +108,78 @@ def _normalize_rrset(r: dns.rrset.RRset, compare_ttl: bool) -> tuple:
 # ── Query-log assertions ─────────────────────────────────────────────────
 
 
+def assert_out_query_matches(rec: QueryLog, expected: rpl.Entry) -> None:
+    """Assert a single logged upstream query matches an expected ENTRY template.
+
+    Used by `STEP n CHECK_OUT_QUERY`. The expected entry's QUESTION carries
+    `qname [qclass] qtype`; MATCH flags pick which fields are compared.
+    `qname`, `qtype`, `qclass`, and `opcode` are supported (opcode is checked
+    only nominally since the responder always sees QUERY in test traffic).
+    """
+    if not expected.question:
+        raise ValueError("CHECK_OUT_QUERY entry has no QUESTION section")
+    flags = expected.match or {"question"}
+    if "question" in flags:
+        flags = flags | {"qname", "qtype", "qclass"}
+    eq = expected.question[0]
+    expected_qname = eq.name.to_text().lower()
+    expected_qtype = dns.rdatatype.to_text(eq.rdtype)
+    expected_qclass = dns.rdataclass.to_text(eq.rdclass)
+
+    failures: list[str] = []
+    if "qname" in flags and rec.qname != expected_qname:
+        failures.append(f"qname: got {rec.qname!r}, want {expected_qname!r}")
+    if "qtype" in flags and rec.qtype != expected_qtype:
+        failures.append(f"qtype: got {rec.qtype!r}, want {expected_qtype!r}")
+    if "qclass" in flags and rec.qclass != expected_qclass:
+        failures.append(f"qclass: got {rec.qclass!r}, want {expected_qclass!r}")
+    if failures:
+        raise AssertionError(
+            "CHECK_OUT_QUERY mismatch:\n  " + "\n  ".join(failures)
+            + f"\n  (dest={rec.address})"
+        )
+
+
 def assert_query_log_matches(log: list[QueryLog], expected: rpl.Entry) -> None:
     """Assert that the captured upstream-query log matches a CHECK_QUERY_LOG entry.
 
-    Expected entry's QUESTION section is interpreted as: each `name type` record
-    is one expected upstream query. `MATCH order` requires the listed sequence
-    to appear in the log in order; otherwise we check presence only.
-
-    If the ANSWER section is present, each A record's rdata is interpreted as
-    the expected destination address; otherwise the assertion is on (qname, qtype).
+    Expects `SECTION QUERY_LOG` rows of `<qname> <qtype> [<dest>]`. `MATCH order`
+    requires the listed sequence to appear as an ordered subsequence of the log;
+    otherwise we check presence only. If `dest` is present on a row, the log
+    record's destination address is also asserted; otherwise dest is wildcarded
+    on a row-by-row basis (mixing dest-bound and dest-free rows is allowed).
     """
-    if not expected.answer and not expected.question:
-        raise ValueError("CHECK_QUERY_LOG entry has no expectations")
+    if not expected.query_log:
+        raise ValueError("CHECK_QUERY_LOG entry has no SECTION QUERY_LOG rows")
 
-    flags = expected.match or set()
-    require_order = "order" in flags
-    require_address = bool(expected.answer)
+    require_order = "order" in (expected.match or set())
 
-    # Build expected list. If ANSWER section has A records, those are the
-    # destination IPs. Otherwise we only check (qname, qtype) in QUESTION.
-    expected_records: list[tuple[str, str, str | None]] = []
-    source = expected.answer if require_address else expected.question
-    for rrset in source:
-        qname = rrset.name.to_text().lower()
-        qtype = dns.rdatatype.to_text(rrset.rdtype)
-        if require_address:
-            expected_records.extend((qname, qtype, rd.to_text()) for rd in rrset)
-        else:
-            expected_records.append((qname, qtype, None))
-
-    log_records = [
-        (rec.qname, rec.qtype, rec.address if require_address else None)
-        for rec in log
+    expected_records: list[tuple[str, str, str | None]] = [
+        (qname.lower(), qtype, dest)
+        for (qname, qtype, dest) in expected.query_log
     ]
 
+    def matches(rec: QueryLog, want: tuple[str, str, str | None]) -> bool:
+        qname, qtype, dest = want
+        return (
+            rec.qname == qname
+            and rec.qtype == qtype
+            and (dest is None or rec.address == dest)
+        )
+
+    log_records = [(rec.qname, rec.qtype, rec.address) for rec in log]
+
     if require_order:
-        # Subsequence check: expected must appear as an ordered subsequence of log.
         idx = 0
-        for rec in log_records:
-            if idx < len(expected_records) and rec == expected_records[idx]:
+        for rec in log:
+            if idx < len(expected_records) and matches(rec, expected_records[idx]):
                 idx += 1
         if idx != len(expected_records):
             raise AssertionError(
                 f"CHECK_QUERY_LOG order mismatch:\n  log:  {log_records}\n  want: {expected_records}"
             )
     else:
-        missing = [r for r in expected_records if r not in log_records]
+        missing = [w for w in expected_records if not any(matches(rec, w) for rec in log)]
         if missing:
             raise AssertionError(
                 f"CHECK_QUERY_LOG missing entries: {missing}\n  log: {log_records}"

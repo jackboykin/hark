@@ -6,15 +6,28 @@ Stelline. Covers what hark's day-one scenarios need; not a complete .rpl spec.
 Reference: https://github.com/NLnetLabs/unbound/blob/master/testcode/testbound.c
            https://docs.rs/domain/latest/domain/stelline/
 
+Step kinds split into *actions* (do something to the system under test) and
+*assertions* (CHECK_* — observe and verify):
+  actions     — QUERY, TIME_PASSES, TIMEOUT
+  assertions  — CHECK_ANSWER, CHECK_QUERY_LOG, CHECK_OUT_QUERY
+
+`TIMEOUT` is a responder-side directive disguised as a step: it pre-positions
+a "drop the next incoming query" on the responder before the QUERY fires.
+
 Hark-only extensions:
-  - ; hark: root-hints = <ip> [, <ip>...]   directive in scenario header
-  - STEP n CHECK_QUERY_LOG                  (parsed, runtime support deferred)
+  - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
+  - ; hark: qname-minimisation = no         header directive (optional)
+  - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
+  - STEP n CHECK_OUT_QUERY                  positional upstream-query check
+  - SECTION QUERY_LOG                       `<qname> <qtype> [<dest>]` rows
+  - MATCH UDP / MATCH TCP                   per-transport entry discrimination
 """
 
 from __future__ import annotations
 
 import dataclasses
 import re
+import shlex
 from pathlib import Path
 
 import dns.flags
@@ -32,6 +45,10 @@ import dns.rrset
 MATCH_VALID_FLAGS = frozenset({
     # responder-side (entry-matching)
     "opcode", "qname", "qtype", "qclass", "question", "subdomain",
+    # transport-discrimination (Unbound testbound convention; flags are
+    # uppercase on the wire `MATCH TCP` / `MATCH UDP`, normalized to
+    # lowercase at parse time)
+    "tcp", "udp",
     # CHECK_ANSWER
     "all", "answer", "authority", "additional", "flags", "rcode", "ttl",
     # CHECK_QUERY_LOG
@@ -42,8 +59,11 @@ MATCH_VALID_FLAGS = frozenset({
 # copy_id is a no-op; copy_query echoes the query's QUESTION section.
 ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query"})
 
-# Section names → dnspython section indices via parse helper.
-SECTION_NAMES = frozenset({"QUESTION", "ANSWER", "AUTHORITY", "ADDITIONAL"})
+# Section names → dnspython section indices via parse helper. QUERY_LOG is a
+# hark-only section used inside CHECK_QUERY_LOG entries; lines are
+# `<qname> <qtype> [<dest_ip>]`, decoupling qtype from rdata-type so
+# AAAA-on-IPv4-dest is expressible.
+SECTION_NAMES = frozenset({"QUESTION", "ANSWER", "AUTHORITY", "ADDITIONAL", "QUERY_LOG"})
 
 # Reply flag tokens that map to DNS header bits.
 REPLY_FLAGS = {
@@ -64,7 +84,14 @@ REPLY_RCODES = {
     "NXDOMAIN": dns.rcode.NXDOMAIN,
     "NOTIMP": dns.rcode.NOTIMP,
     "REFUSED": dns.rcode.REFUSED,
+    "YXDOMAIN": dns.rcode.YXDOMAIN,
 }
+
+# Tokens that appear in Unbound corpus REPLY lines but live in the EDNS OPT
+# RR rather than the message header. The responder doesn't model OPT in its
+# template so we parse and ignore — keeps lifted scenarios working without
+# pretending to handle DNSSEC.
+REPLY_IGNORED_TOKENS = frozenset({"DO"})
 
 # Opcode tokens (rare in REPLY but valid in MATCH opcode contexts).
 REPLY_OPCODES = {
@@ -78,7 +105,6 @@ REPLY_OPCODES = {
 class Entry:
     """One ENTRY_BEGIN..ENTRY_END block: a query template or response template."""
     match: set[str] = dataclasses.field(default_factory=set)
-    adjust: set[str] = dataclasses.field(default_factory=set)
     reply_flags: int = 0
     reply_rcode: int = dns.rcode.NOERROR
     reply_opcode: int = dns.opcode.QUERY
@@ -86,6 +112,8 @@ class Entry:
     answer: list[dns.rrset.RRset] = dataclasses.field(default_factory=list)
     authority: list[dns.rrset.RRset] = dataclasses.field(default_factory=list)
     additional: list[dns.rrset.RRset] = dataclasses.field(default_factory=list)
+    # CHECK_QUERY_LOG: each row is (qname, qtype, dest_ip_or_None).
+    query_log: list[tuple[str, str, str | None]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -113,6 +141,10 @@ class Scenario:
     root_hints: list[str] = dataclasses.field(default_factory=list)
     ranges: list[Range] = dataclasses.field(default_factory=list)
     steps: list[Step] = dataclasses.field(default_factory=list)
+    # Hark config overrides parsed from `; hark:` directives in the file
+    # header. `None` means "harness default". Unbound scenarios that set
+    # `qname-minimisation: no` come through here as `False`.
+    qname_minimization: bool | None = None
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -121,9 +153,13 @@ _HARK_DIRECTIVE_RE = re.compile(r"^\s*;\s*hark\s*:\s*([a-z\-]+)\s*=\s*(.+?)\s*$"
 
 
 def parse(path: Path) -> Scenario:
-    text = path.read_text()
-    lines = text.splitlines()
-    return _Parser(path, lines).parse()
+    """Parse hark-shaped .rpl. Callers handling lifted Unbound corpus must
+    run text through `unbound_lift.lift_unbound_text` first."""
+    return parse_text(path, path.read_text())
+
+
+def parse_text(path: Path, text: str) -> Scenario:
+    return _Parser(path, text.splitlines()).parse()
 
 
 class _ParseError(Exception):
@@ -159,8 +195,13 @@ class _Parser:
         return None
 
     def _apply_hark_directive(self, key: str, val: str) -> None:
-        if key == "root-hints" and self.scenario is not None:
+        # `parse()` creates the scenario sentinel before any line is read,
+        # so this is always safe to call.
+        assert self.scenario is not None
+        if key == "root-hints":
             self.scenario.root_hints = [s.strip() for s in val.split(",") if s.strip()]
+        elif key in {"qname-minimisation", "qname-minimization"}:
+            self.scenario.qname_minimization = val.strip().lower() in {"yes", "true", "on", "1"}
 
     def parse(self) -> Scenario:
         # Header may contain `; hark: x = y` directives before SCENARIO_BEGIN.
@@ -216,27 +257,37 @@ class _Parser:
             elif line == "RANGE_END":
                 self.i += 1
                 if address is None:
-                    raise self.err("RANGE without ADDRESS")
+                    # Unbound's corpus omits ADDRESS for the default server;
+                    # fall back to the scenario's first root hint.
+                    if not self.scenario.root_hints:
+                        raise self.err("RANGE without ADDRESS and no root-hints to default to")
+                    address = self.scenario.root_hints[0]
                 return Range(start=start, end=end, address=address, entries=entries)
             else:
                 raise self.err(f"unexpected in RANGE: {line!r}")
         raise self.err("missing RANGE_END")
 
     def _parse_step(self, line: str) -> Step:
-        parts = line.split(maxsplit=2)
+        parts = line.split()
         if len(parts) < 3:
             raise self.err("STEP takes <n> <KIND> ...")
         try:
             n = int(parts[1])
         except ValueError as e:
             raise self.err(f"STEP number: {e}")
-        kind = parts[2].strip()
+        kind = parts[2]
         self.i += 1
 
         if kind == "TIME_PASSES":
-            # `STEP n TIME_PASSES EVAL "<seconds>"`
-            m = re.search(r'EVAL\s+"(\d+)"', line)
+            # Accept both `EVAL "<n>"` (docs) and `ELAPSE <n>` (corpus convention).
+            m = re.search(r'EVAL\s+"(\d+)"', line) or re.search(r"ELAPSE\s+(\d+)", line)
             return Step(n=n, kind=kind, time_seconds=int(m.group(1)) if m else 0)
+
+        if kind == "TIMEOUT":
+            # `STEP n TIMEOUT` — instructs the responder to drop the next
+            # outgoing upstream query as if the auth had silently timed out.
+            # No ENTRY block.
+            return Step(n=n, kind=kind)
 
         # All remaining kinds wrap an ENTRY block.
         if self._next_line() != "ENTRY_BEGIN":
@@ -259,11 +310,14 @@ class _Parser:
             tokens = line.split()
             head = tokens[0]
             if head == "MATCH":
-                self._validate_flags(tokens[1:], MATCH_VALID_FLAGS, "MATCH")
-                entry.match.update(tokens[1:])
+                flags = [t.lower() for t in tokens[1:]]
+                self._validate_flags(flags, MATCH_VALID_FLAGS, "MATCH")
+                entry.match.update(flags)
             elif head == "ADJUST":
+                # Parsed for typo-rejection only — copy_id is implicit in
+                # `make_response`, copy_query is implicit since the responder
+                # echoes the query verbatim.
                 self._validate_flags(tokens[1:], ADJUST_VALID_FLAGS, "ADJUST")
-                entry.adjust.update(tokens[1:])
             elif head == "REPLY":
                 self._parse_reply(entry, tokens[1:])
             elif head == "SECTION":
@@ -285,6 +339,8 @@ class _Parser:
                 entry.reply_rcode = REPLY_RCODES[t]
             elif t in REPLY_OPCODES:
                 entry.reply_opcode = REPLY_OPCODES[t]
+            elif t in REPLY_IGNORED_TOKENS:
+                pass
             else:
                 raise self.err(f"unknown REPLY token: {t!r}")
 
@@ -292,6 +348,18 @@ class _Parser:
         # Heuristic split into ANSWER-style ("name ttl class type rdata") vs
         # QUESTION-style ("name [class] type"). dnspython's from_text handles
         # both, but we need to know which slot to drop the rrset into.
+        if section == "QUERY_LOG":
+            parts = line.split()
+            if len(parts) not in (2, 3):
+                raise self.err(f"bad QUERY_LOG line (want `qname qtype [dest]`): {line!r}")
+            qname, qtype, *rest = parts
+            dest: str | None = rest[0] if rest else None
+            try:
+                dns.rdatatype.from_text(qtype)
+            except Exception as e:
+                raise self.err(f"bad QUERY_LOG qtype: {e}")
+            entry.query_log.append((qname, qtype.upper(), dest))
+            return
         if section == "QUESTION":
             # "name [class] type"
             parts = line.split()
@@ -321,6 +389,12 @@ class _Parser:
         getattr(entry, section.lower()).append(rrset)
 
 
+# Unbound testbound's corpus omits TTLs on most RRs. Hark refuses to cache
+# TTL=0 records (RFC 1035 §4.1.3 / RFC 2181 §8), so the default has to be
+# non-zero or no delegation ever sticks. 3600 matches testbound's default.
+_DEFAULT_RR_TTL = 3600
+
+
 def _split_rr_line(line: str) -> tuple:
     """Split a zone-file RR line into (name, ttl, rdclass, rdtype, [rdata]).
 
@@ -328,14 +402,20 @@ def _split_rr_line(line: str) -> tuple:
         name ttl class type rdata...
         name class ttl type rdata...
         name ttl type rdata...        (class defaults to IN)
-        name type rdata...            (ttl defaults to 0)
+        name type rdata...            (ttl defaults to 3600 — see above)
+
+    Multi-token rdata (SOA, MX, multi-string TXT) is preserved in full;
+    quoted strings stay quoted so dnspython's from_text reads them as one
+    rdata token rather than splitting on the embedded whitespace.
     """
-    tokens = line.split(maxsplit=4)
-    if len(tokens) < 3:
+    # `posix=False` preserves the surrounding quotes on quoted strings
+    # (TXT rdata) so dnspython's from_text reads them as one rdata token.
+    tokens = shlex.split(line, posix=False)
+    if len(tokens) < 2:
         raise ValueError(f"too few tokens: {line!r}")
     name = tokens[0]
     rest = tokens[1:]
-    ttl = 0
+    ttl = _DEFAULT_RR_TTL
     rdclass = "IN"
     if rest[0].isdigit():
         ttl = int(rest[0])
@@ -349,7 +429,7 @@ def _split_rr_line(line: str) -> tuple:
     if not rest:
         raise ValueError(f"no rdtype in {line!r}")
     rdtype = rest[0]
-    rdata = rest[1] if len(rest) > 1 else ""
+    rdata = " ".join(rest[1:])
     return (
         name,
         ttl,

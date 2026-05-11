@@ -7,9 +7,15 @@ let
   pyEnv = pkgs.python3.withPackages (p: with p; [
     dnspython
     pytest
+    pytest-timeout
     pytest-xdist
   ]);
 in
 pkgs.mkShell {
-  packages = [ pyEnv ];
+  # `unbound` is the oracle for differential tests (run with `pytest -m differential`).
+  # Note: the differential suite assumes Unbound ≥ 1.24.0, which shipped the
+  # TTL=0 caching fix (NLnetLabs/unbound#1337, 2025-09). Older Unbounds cached
+  # TTL=0 records by default, which would invalidate the test's premise about
+  # the cache-min-ttl divergence being the surviving cheeky bit.
+  packages = [ pyEnv pkgs.unbound ];
 }

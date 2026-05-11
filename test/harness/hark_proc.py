@@ -8,6 +8,7 @@ probing it with a SOA query for the root, and tears it down at exit.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import socket
 import subprocess
@@ -25,6 +26,7 @@ class HarkConfig:
     workers: int = 1
     qname_minimization: bool = True
     dnssec: bool = False
+    cache_min_ttl: int = 0
 
     def to_toml(self) -> str:
         listen = f'"{self.listen_ip}:{self.listen_port}"'
@@ -49,6 +51,11 @@ class HarkConfig:
             f"upstream-port = {self.upstream_port}\n"
             f"allow-loopback-upstreams = true\n"
             + (f"root-hints = [{hints}]\n" if hints else "")
+            + (
+                f"\n[cache]\nmin-ttl = {self.cache_min_ttl}\n"
+                if self.cache_min_ttl
+                else ""
+            )
         )
 
 
@@ -129,19 +136,30 @@ class HarkProcess:
         )
 
 
+@functools.cache
 def find_hark_binary() -> Path:
-    """Locate the hark binary built by `zig build`. Fails fast if any
-    source under `src/` is newer than the binary — silent stale-binary
-    runs mask regressions."""
+    """Build hark with the test-only knobs enabled and return the binary path.
+
+    Memoised so the per-session `zig build` runs once. `-Dtesting=true`
+    enables the `[resolver] upstream-port` and `allow-loopback-upstreams`
+    keys; without them hark refuses the test config with
+    `error.TestOnlyConfigKey`.
+    """
     repo = Path(__file__).resolve().parents[2]
+    try:
+        subprocess.run(
+            ["zig", "build", "-Dtesting=true"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("`zig` not found in PATH; install zig 0.16+") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"`zig build -Dtesting=true` failed:\n{e.stderr.decode(errors='replace')}"
+        ) from e
     cand = repo / "zig-out" / "bin" / "hark"
     if not cand.exists():
-        raise FileNotFoundError(f"hark binary not found at {cand}; run `zig build`")
-    binary_mtime = cand.stat().st_mtime
-    for src in (repo / "src").rglob("*.zig"):
-        if src.stat().st_mtime > binary_mtime:
-            raise RuntimeError(
-                f"hark binary at {cand} is stale (older than {src.relative_to(repo)}); "
-                f"run `zig build`"
-            )
+        raise FileNotFoundError(f"hark binary not produced at {cand}")
     return cand

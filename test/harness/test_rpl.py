@@ -119,7 +119,29 @@ def test_duplicate_step_number_rejected(tmp_path):
     )
 
 
-def test_range_without_address_rejected(tmp_path):
+def test_range_without_address_defaults_to_first_root_hint(tmp_path):
+    # Unbound's corpus omits ADDRESS in single-server scenarios; we inherit
+    # the scenario's first root hint so those .rpl files lift unmodified.
+    s = _parse(
+        """\
+        ; hark: root-hints = 127.0.10.1, 127.0.10.2
+
+        SCENARIO_BEGIN default_addr
+        RANGE_BEGIN 0 100
+          ENTRY_BEGIN
+            REPLY QR NOERROR
+            SECTION QUESTION
+              x. IN A
+          ENTRY_END
+        RANGE_END
+        SCENARIO_END
+        """,
+        tmp_path,
+    )
+    assert s.ranges[0].address == "127.0.10.1"
+
+
+def test_range_without_address_or_root_hints_rejected(tmp_path):
     _parse_fails(
         """\
         SCENARIO_BEGIN no_addr
@@ -206,6 +228,47 @@ def test_root_hints_directive_parsed(tmp_path):
         tmp_path,
     )
     assert s.root_hints == ["127.0.10.1", "127.0.10.2"]
+
+
+def test_query_log_section_parses(tmp_path):
+    s = _parse(
+        """\
+        SCENARIO_BEGIN qlog
+        STEP 1 CHECK_QUERY_LOG
+        ENTRY_BEGIN
+          MATCH order
+          SECTION QUERY_LOG
+            . NS 127.0.10.1
+            example.com. AAAA 127.0.10.3
+            example.com. A
+        ENTRY_END
+        SCENARIO_END
+        """,
+        tmp_path,
+    )
+    step = s.steps[0]
+    assert step.kind == "CHECK_QUERY_LOG"
+    assert step.entry.query_log == [
+        (".", "NS", "127.0.10.1"),
+        ("example.com.", "AAAA", "127.0.10.3"),
+        ("example.com.", "A", None),
+    ]
+
+
+def test_query_log_bad_qtype_rejected(tmp_path):
+    _parse_fails(
+        """\
+        SCENARIO_BEGIN bad_qlog
+        STEP 1 CHECK_QUERY_LOG
+        ENTRY_BEGIN
+          SECTION QUERY_LOG
+            example.com. NOTAQTYPE 127.0.10.1
+        ENTRY_END
+        SCENARIO_END
+        """,
+        tmp_path,
+        match="bad QUERY_LOG qtype",
+    )
 
 
 def test_missing_root_hints_is_empty(tmp_path):
