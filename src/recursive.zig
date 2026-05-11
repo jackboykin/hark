@@ -93,13 +93,13 @@ pub const RecursiveResolver = struct {
     /// deployments against private root servers.
     root_hints: []const na.Address = &root_hints_default,
     /// Default port for upstream queries. Used when constructing addresses
-    /// from glue records (which have no port field per RFC 1035). Set via
-    /// `[resolver] upstream-port` for tests pointing at scripted authorities
-    /// on non-default ports. Production is always 53.
+    /// from glue records (which have no port field per RFC 1035). Production
+    /// is always 53. The corresponding `[resolver] upstream-port` config key
+    /// is gated behind `-Dtesting=true`.
     upstream_port: u16 = 53,
-    /// Bypass the 127/8 rebinding defense for upstream addresses. Tests only —
-    /// scripted authoritatives bind on loopback. Set via
-    /// `[resolver] allow-loopback-upstreams`.
+    /// Bypass the 127/8 rebinding defense for upstream addresses. Tests only.
+    /// The corresponding `[resolver] allow-loopback-upstreams` config key is
+    /// gated behind `-Dtesting=true`.
     allow_loopback_upstreams: bool = false,
     cache: ?*RRsetCache = null,
     qname_minimization: bool = true,

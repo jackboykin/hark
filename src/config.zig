@@ -6,6 +6,7 @@ const toml = @import("toml.zig");
 const net_addr = @import("net_address.zig");
 const Address = net_addr.Address;
 const acl = @import("acl.zig");
+const build_options = @import("build_options");
 
 // ── ServerConfig ───────────────────────────────────────────────────────
 
@@ -20,12 +21,14 @@ pub const ServerConfig = struct {
     /// not hot-reload config, and the cache starts empty on restart, so
     /// no invalidation path is needed when this value changes.
     root_hints: []Address,
-    /// Default port for upstream queries when not encoded in the address.
-    /// Glue records have no port; this gives every glue-extracted upstream
-    /// its target port. Production is 53; tests use non-privileged ports.
+    /// Default port for glue-extracted upstreams. Production is always 53;
+    /// the field exists so tests can point at non-privileged scripted
+    /// authoritatives. Parsing of `[resolver] upstream-port` is gated behind
+    /// `-Dtesting=true`; production binaries reject the key.
     upstream_port: u16,
     /// Bypass the 127/8 rebinding-defense check on upstream addresses.
-    /// Tests only — scripted authoritatives bind on loopback.
+    /// Tests only. Parsing of `[resolver] allow-loopback-upstreams` is gated
+    /// behind `-Dtesting=true`; production binaries reject the key.
     allow_loopback_upstreams: bool,
     cache_size: usize,
     cache_entries: u32,
@@ -97,6 +100,8 @@ pub const ConfigError = error{
     InvalidQueryMemoryLimit,
     InvalidAclEntry,
     ForwardingRequiresUpstreams,
+    /// Operator set a key gated behind `-Dtesting=true` in a production build.
+    TestOnlyConfigKey,
     ConfigFileTooLarge,
     OutOfMemory,
 };
@@ -224,11 +229,18 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.root_hints);
             cfg.root_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
         }
-        if (resolver.getInteger("upstream-port")) |p| {
-            if (p < 1 or p > 65535) return error.InvalidValue;
-            cfg.upstream_port = @intCast(p);
+        // Test-only knobs: gated at build time so a production binary can't
+        // be reconfigured into a test-only posture by an operator config.
+        if (build_options.testing_enabled) {
+            if (resolver.getInteger("upstream-port")) |p| {
+                if (p < 1 or p > 65535) return error.InvalidValue;
+                cfg.upstream_port = @intCast(p);
+            }
+            if (resolver.getBool("allow-loopback-upstreams")) |b| cfg.allow_loopback_upstreams = b;
+        } else {
+            if (resolver.getInteger("upstream-port") != null) return error.TestOnlyConfigKey;
+            if (resolver.getBool("allow-loopback-upstreams") != null) return error.TestOnlyConfigKey;
         }
-        if (resolver.getBool("allow-loopback-upstreams")) |b| cfg.allow_loopback_upstreams = b;
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
@@ -540,4 +552,20 @@ test "logging config" {
     );
     defer cfg2.deinit();
     try testing.expectEqual(true, cfg2.log_queries);
+}
+
+test "test-only knobs gated on -Dtesting" {
+    const cfg_text =
+        \\[resolver]
+        \\upstream-port = 5353
+        \\allow-loopback-upstreams = true
+    ;
+    if (build_options.testing_enabled) {
+        var cfg = try parseConfig(testing.allocator, cfg_text);
+        defer cfg.deinit();
+        try testing.expectEqual(@as(u16, 5353), cfg.upstream_port);
+        try testing.expectEqual(true, cfg.allow_loopback_upstreams);
+    } else {
+        try testing.expectError(error.TestOnlyConfigKey, parseConfig(testing.allocator, cfg_text));
+    }
 }

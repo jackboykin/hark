@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Test-only knobs (upstream-port, allow-loopback-upstreams) only parse
+    // when this is true. Default false keeps production builds clean; the
+    // pytest harness runs `zig build -Dtesting=true`.
+    const testing_enabled = b.option(bool, "testing", "Enable test-only config knobs") orelse false;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "testing_enabled", testing_enabled);
+    const build_options_mod = build_opts.createModule();
+
     const tls_mod = b.addModule("tls", .{
         .root_source_file = b.path("src/vendor/tls-ianic/root.zig"),
         .target = target,
@@ -16,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "tls", .module = tls_mod },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 
