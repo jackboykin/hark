@@ -1,8 +1,8 @@
-"""Manifest of Unbound `.rpl` scenarios lifted from `vendor/unbound/testdata/`.
+"""Manifest of Unbound `.rpl` scenarios lifted from `test/corpus/unbound/`.
 
-The .rpl source of truth lives in the submodule. This manifest is the
-only hark-repo record of the lift: which files run, and which document a
-hark/Unbound behavioural divergence. We don't copy or symlink — conftest
+The .rpl files are vendored (BSD-3-Clause; see PROVENANCE for upstream
+commit). This manifest is the hark-repo record of the lift: which files
+run, and which document a hark/Unbound behavioural divergence. Conftest
 walks this manifest, applies the on-the-fly transform in
 `test/harness/unbound_lift.py` (strips the `server:` / `CONFIG_END`
 prelude, remaps real internet IPs to loopback), and yields pytest items.

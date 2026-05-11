@@ -42,7 +42,7 @@ HARK_LISTEN = ("127.0.0.1", 5354 + _worker_offset() * 10)
 
 # ── Scenario collection ────────────────────────────────────────────────────
 
-VENDOR_UNBOUND_TESTDATA = Path(__file__).resolve().parent.parent / "vendor" / "unbound" / "testdata"
+UNBOUND_CORPUS = Path(__file__).resolve().parent / "corpus" / "unbound"
 
 
 class RplFile(pytest.File):
@@ -74,7 +74,7 @@ class LiftedManifestCollector(pytest.Module):
     def collect(self):
         from scenarios.lifted import manifest as lifted_manifest
         for entry in lifted_manifest.all_entries():
-            scenario_path = VENDOR_UNBOUND_TESTDATA / entry.filename
+            scenario_path = UNBOUND_CORPUS / entry.filename
             name = f"{entry.category}/{Path(entry.filename).stem}"
             item = RplItem.from_parent(self, name=name, scenario_path=scenario_path, lift=True)
             if entry.xfail_reason is not None:

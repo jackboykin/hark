@@ -1,6 +1,6 @@
 """Lift Unbound's `.rpl` scenarios into the hark-flavoured subset.
 
-Unbound's `testbound` corpus (`vendor/unbound/testdata/*.rpl`) is the
+Unbound's `testbound` corpus (`test/corpus/unbound/*.rpl`) is the
 reference for delegation, CNAME, QMIN, and NSEC3 behaviour. Two shape
 differences keep us from running them verbatim:
 

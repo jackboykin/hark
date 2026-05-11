@@ -1,3 +1,0 @@
-[submodule "vendor/unbound"]
-	path = vendor/unbound
-	url = https://github.com/NLnetLabs/unbound

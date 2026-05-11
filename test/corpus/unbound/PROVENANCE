@@ -1,0 +1,20 @@
+Upstream:  https://github.com/NLnetLabs/unbound
+Commit:    8ada1bd88d2bc406c7a674d0e949ef5c63d648bd
+Date:      2026-05-08
+Path:      testdata/
+
+These .rpl scenarios are testbound fixtures from Unbound. We don't compile
+or link any Unbound source — only the text fixtures are used, transformed
+on-the-fly by test/harness/unbound_lift.py and indexed by
+test/scenarios/lifted/manifest.py.
+
+Licensed under Unbound's BSD-3-Clause; see LICENSE in this directory.
+
+To refresh from upstream:
+
+  tmp=$(mktemp -d)
+  git clone --depth=1 https://github.com/NLnetLabs/unbound "$tmp/u"
+  for f in $(ls test/corpus/unbound/*.rpl | xargs -n1 basename); do
+    cp "$tmp/u/testdata/$f" test/corpus/unbound/
+  done
+  ( cd "$tmp/u" && git rev-parse HEAD )   # update Commit: above
