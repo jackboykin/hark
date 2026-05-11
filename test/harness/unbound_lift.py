@@ -74,6 +74,11 @@ def lift_unbound_text(text: str) -> str:
     extras = ""
     if re.search(r"qname-minimisation\s*:\s*\"?no\"?", prelude):
         extras += "; hark: qname-minimisation = no\n"
+    # Translate Unbound's `minimal-responses: no`. Unbound's default is yes
+    # (since 1.7.x); hark's default also yes. Scenarios that need the
+    # passthrough shape say so explicitly.
+    if re.search(r"minimal-responses\s*:\s*\"?no\"?", prelude):
+        extras += "; hark: minimal-responses = no\n"
 
     return root_hint + extras + body
 

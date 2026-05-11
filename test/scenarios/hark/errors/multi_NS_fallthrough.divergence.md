@@ -1,4 +1,15 @@
-# Multi-NS fallthrough on upstream error rcodes — divergence
+# Multi-NS fallthrough on upstream error rcodes — divergence (mostly closed)
+
+**Status (2026-05-11): fixed for SERVFAIL/REFUSED.** The two-NS fallthrough
+scenarios are now committed as `004_servfail_first_NS_fallthrough_to_second
+.rpl` and `005_refused_first_NS_fallthrough_to_second.rpl` and run as
+ordinary green tests. The remaining gap is FORMERR (treated as a hard
+parse error rather than a lame-NS signal) and the stale-glue fallback
+case surfaced by `iter_cname_cache` (when one NS's glue TTL expires and
+the remaining sibling NSes all SERVFAIL, hark doesn't re-resolve the
+expired NS's address).
+
+The original narrative is preserved below for context.
 
 ## What the scenarios *wanted* to assert
 

@@ -119,6 +119,8 @@ def run_scenario(path: Path, lift: bool = False) -> None:
     )
     if scenario.qname_minimization is not None:
         cfg.qname_minimization = scenario.qname_minimization
+    if scenario.minimal_responses is not None:
+        cfg.minimal_responses = scenario.minimal_responses
 
     resp = responder.Responder(scenario, port=RESP_PORT)
     resp.start()

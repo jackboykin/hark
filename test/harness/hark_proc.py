@@ -27,6 +27,7 @@ class HarkConfig:
     qname_minimization: bool = True
     dnssec: bool = False
     cache_min_ttl: int = 0
+    minimal_responses: bool = True
 
     def to_toml(self) -> str:
         listen = f'"{self.listen_ip}:{self.listen_port}"'
@@ -42,6 +43,7 @@ class HarkConfig:
             f"[server]\n"
             f"listen = [{listen}]\n"
             f"workers = {self.workers}\n"
+            f"minimal-responses = {str(self.minimal_responses).lower()}\n"
             f"\n"
             f"[resolver]\n"
             f"mode = \"recursive\"\n"

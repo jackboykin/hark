@@ -59,18 +59,18 @@ MANIFEST: list[LiftedEntry] = [
 
     # iter_cname — CNAME-chase edges; cluster of hark divergences (xfail strict)
     LiftedEntry("iter_cname_double.rpl",                  "iter_cname",       None),
-    LiftedEntry("iter_cname_minimise.rpl",                "iter_cname",       "hark behaviour diverges: SERVFAIL on CNAME chase under QMIN (hark sends `<name>. CNAME` probes; the .com auth has no CNAME entry → REFUSED → propagates)"),
-    LiftedEntry("iter_cname_minimise_nx.rpl",             "iter_cname",       "hark behaviour diverges: CNAME chase under QMIN to NXDOMAIN (same root cause as iter_cname_minimise)"),
+    LiftedEntry("iter_cname_minimise.rpl",                "iter_cname",       None),
+    LiftedEntry("iter_cname_minimise_nx.rpl",             "iter_cname",       "scenario requires DNSSEC trust-anchor + fake-sha1 (CHECK_ANSWER asserts AD+RRSIG); harness doesn't model trust anchors yet — same blocker as iter_class_any"),
     LiftedEntry("iter_cname_nx.rpl",                      "iter_cname",       None),
     LiftedEntry("iter_cname_qnamecopy.rpl",               "iter_cname",       None),
     # iter_cname_cache uses an IPv6 ADDRESS (`2002::5`). The lifter maps
     # the single v6 address to `::1` (the only unprivileged v6 loopback)
     # and the responder binds an AF_INET6 socket alongside the v4 sockets.
-    LiftedEntry("iter_cname_cache.rpl",                   "iter_cname",       "hark behaviour diverges: doesn't fall through to sibling NS after first NS returns SERVFAIL (RFC 1034 §4.3.5). Same gap as iterative-dispatch-gaps.md."),
+    LiftedEntry("iter_cname_cache.rpl",                   "iter_cname",       "hark behaviour diverges: when one delegation NS's glue expires (TTL=1) and the remaining sibling NSes all SERVFAIL, hark doesn't re-resolve the expired NS's address (stale-glue corner of the lame-NS fallthrough class)"),
 
     # iter_cycle — NS-cycle / loop-detection
     LiftedEntry("iter_cycle.rpl",                         "iter_cycle",       None),
-    LiftedEntry("iter_cycle_noh.rpl",                     "iter_cycle",       "hark behaviour diverges: NoGlueRecords SERVFAIL on NS-pointing-to-self cycle without bootstrap hint"),
+    LiftedEntry("iter_cycle_noh.rpl",                     "iter_cycle",       "scenario requires accepting out-of-bailiwick glue (Unbound `harden-glue: no`) to break a NS-A↔NS-B delegation cycle. Hark's strict-bailiwick default is the secure choice; a future `accept-promiscuous-glue` knob would let this pass — defensible difference."),
 
     # iter_dname — DNAME synthesis (RFC 6672); hark diverges across the board
     LiftedEntry("iter_dname_yx.rpl",                      "iter_dname",       None),
@@ -90,7 +90,7 @@ MANIFEST: list[LiftedEntry] = [
     # AUTHORITY section, which hark intentionally strips from cached
     # positive responses per CVE-2025-11411 — Unbound caches authority,
     # we don't. Defensible difference.
-    LiftedEntry("iter_domain_sale.rpl",                   "iter_domain_sale", "hark behaviour diverges: cached positive responses don't carry AUTHORITY NS records (CVE-2025-11411 mitigation; see src/cache.zig:687). TTL expiry itself works correctly."),
+    LiftedEntry("iter_domain_sale.rpl",                   "iter_domain_sale", "hark behaviour diverges: cached positive responses don't carry AUTHORITY NS records (CVE-2025-11411 mitigation; see src/cache.zig:storeResponse). TTL expiry itself works correctly."),
     LiftedEntry("iter_domain_sale_nschange.rpl",          "iter_domain_sale", "hark behaviour diverges: see iter_domain_sale (CVE-2025-11411 mitigation)"),
 ]
 

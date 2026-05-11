@@ -1,0 +1,101 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN REFUSED from one of two NSes falls through to the second (RFC 1034 §4.3.5)
+
+; Companion to 004 with REFUSED instead of SERVFAIL — covers the lame-
+; delegation case (one listed NS no longer serves the zone). Both rcodes
+; flow through the same `RCode.isServerError` predicate, so the same fix
+; applies; the explicit scenario locks the REFUSED variant in.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority: delegates example.com to TWO NSes ─────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns1.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+    SECTION ADDITIONAL
+      ns1.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── ns1.example.com: lame — REFUSES everything ─────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ── ns2.example.com: answers the leaf ──────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END

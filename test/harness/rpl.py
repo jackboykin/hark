@@ -31,6 +31,7 @@ import shlex
 from pathlib import Path
 
 import dns.flags
+import dns.name
 import dns.opcode
 import dns.rcode
 import dns.rdataclass
@@ -145,6 +146,11 @@ class Scenario:
     # header. `None` means "harness default". Unbound scenarios that set
     # `qname-minimisation: no` come through here as `False`.
     qname_minimization: bool | None = None
+    # `minimal-responses: no` in the Unbound config translates here. None
+    # means "harness default" (hark default = True, matching Unbound's
+    # default since 1.7.x). False = passthrough — the wire shaper skips
+    # the delegation-NS / glue strip on positive answers.
+    minimal_responses: bool | None = None
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -202,6 +208,8 @@ class _Parser:
             self.scenario.root_hints = [s.strip() for s in val.split(",") if s.strip()]
         elif key in {"qname-minimisation", "qname-minimization"}:
             self.scenario.qname_minimization = val.strip().lower() in {"yes", "true", "on", "1"}
+        elif key == "minimal-responses":
+            self.scenario.minimal_responses = val.strip().lower() in {"yes", "true", "on", "1"}
 
     def parse(self) -> Scenario:
         # Header may contain `; hark: x = y` directives before SCENARIO_BEGIN.
@@ -371,11 +379,14 @@ class _Parser:
             else:
                 raise self.err(f"bad QUESTION line: {line!r}")
             try:
-                rrset = dns.rrset.from_text(
-                    name,
+                rrset = dns.rrset.from_text_list(
+                    _absolutize(name),
                     0,
                     dns.rdataclass.from_text(rdclass),
                     dns.rdatatype.from_text(qtype),
+                    [],
+                    origin=dns.name.root,
+                    relativize=False,
                 )
             except Exception as e:
                 raise self.err(f"bad QUESTION rr: {e}")
@@ -383,7 +394,10 @@ class _Parser:
             return
         # Answer/authority/additional: full RR with rdata.
         try:
-            rrset = dns.rrset.from_text_list(*_split_rr_line(line))
+            args = _split_rr_line(line)
+            rrset = dns.rrset.from_text_list(
+                *args, origin=dns.name.root, relativize=False
+            )
         except Exception as e:
             raise self.err(f"bad RR ({section}): {e}")
         getattr(entry, section.lower()).append(rrset)
@@ -393,6 +407,13 @@ class _Parser:
 # TTL=0 records (RFC 1035 §4.1.3 / RFC 2181 §8), so the default has to be
 # non-zero or no delegation ever sticks. 3600 matches testbound's default.
 _DEFAULT_RR_TTL = 3600
+
+
+def _absolutize(name: str) -> str:
+    """Ensure trailing dot. Testbound treats partials as absolute, but
+    dnspython's `to_wire()` raises `NeedAbsoluteNameOrOrigin` without it,
+    killing the responder thread mid-reply."""
+    return name if name.endswith(".") else name + "."
 
 
 def _split_rr_line(line: str) -> tuple:
@@ -413,7 +434,7 @@ def _split_rr_line(line: str) -> tuple:
     tokens = shlex.split(line, posix=False)
     if len(tokens) < 2:
         raise ValueError(f"too few tokens: {line!r}")
-    name = tokens[0]
+    name = _absolutize(tokens[0])
     rest = tokens[1:]
     ttl = _DEFAULT_RR_TTL
     rdclass = "IN"
