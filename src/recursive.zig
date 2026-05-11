@@ -24,6 +24,7 @@ const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CaseState = @import("case_state.zig").CaseState;
+const ServerConfig = @import("config.zig").ServerConfig;
 const log = std.log.scoped(.resolver);
 
 // ── Root Hints ─────────────────────────────────────────────────────────
@@ -101,6 +102,11 @@ pub const RecursiveResolver = struct {
     /// The corresponding `[resolver] allow-loopback-upstreams` config key is
     /// gated behind `-Dtesting=true`.
     allow_loopback_upstreams: bool = false,
+    /// Root trust anchors. Defaults to the hardcoded IANA list. The server
+    /// passes a config-supplied slice when `[resolver] trust-anchors = [...]`
+    /// is set (test-only key) — used by the scripted DNSSEC harness to
+    /// validate against zone-keys it generated itself.
+    trust_anchors: []const dns.DsData = &dnssec.root_ds_records,
     cache: ?*RRsetCache = null,
     qname_minimization: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
@@ -139,6 +145,63 @@ pub const RecursiveResolver = struct {
     /// Per-resolution DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes). Reset
     /// at every `resolve()` entry so it bounds work for one user-facing query.
     validation_budget: dnssec.ValidationBudget = .{},
+
+    /// Stable inputs that come from the surrounding Server / WorkerState.
+    /// Both server-side construction sites build one of these and call
+    /// `fromContext` — the single source of truth for the field mapping.
+    pub const Context = struct {
+        config: *const ServerConfig,
+        io: std.Io,
+        gpa: mem.Allocator,
+        cache: *RRsetCache,
+        rtt_cache: *RttCache,
+        ns_selector: *NsSelector,
+        encrypted_ns_cache: ?*EncryptedNsCache,
+        case_state: ?*CaseState,
+        dedup: ?*InFlightTable,
+        nsec_cache: ?*NsecCache,
+        key_cache: ?*RRsetCache,
+        tcp_pool: ?*TcpConnectionPool,
+    };
+
+    /// Per-query knobs that vary across calls within the same Context.
+    pub const RuntimeOpts = struct {
+        /// Client CD bit (RFC 4035 §3.2.2): when true, skip our validation
+        /// — the client validates itself. Also disables the NSEC cache for
+        /// this query so a downstream validator gets the raw proof.
+        cd: bool = false,
+        /// Skip the response cache (bg prefetch path; per-query overrides).
+        bypass_cache: bool = false,
+    };
+
+    pub fn fromContext(ctx: Context, transports: Transports, opts: RuntimeOpts) RecursiveResolver {
+        return .{
+            .transports = transports,
+            .io = ctx.io,
+            .root_hints = ctx.config.rootHints(),
+            .upstream_port = ctx.config.upstream_port,
+            .allow_loopback_upstreams = ctx.config.allow_loopback_upstreams,
+            .trust_anchors = ctx.config.trustAnchors(),
+            .cache = ctx.cache,
+            .qname_minimization = ctx.config.qname_minimization,
+            // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable.
+            .dnssec_aware = ctx.config.dnssec,
+            // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours.
+            .dnssec_enabled = ctx.config.dnssec and !opts.cd,
+            .encrypted_ns_cache = ctx.encrypted_ns_cache,
+            .rtt_cache = ctx.rtt_cache,
+            .ns_selector = ctx.ns_selector,
+            .bypass_cache = opts.bypass_cache,
+            .stagger_ms = ctx.config.stagger_ms,
+            .case_state = ctx.case_state,
+            .dedup = ctx.dedup,
+            .tcp_pool = ctx.tcp_pool,
+            .gpa = ctx.gpa,
+            .query_memory_limit = ctx.config.query_memory_limit,
+            .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
+            .key_cache = if (ctx.config.dnssec) ctx.key_cache else null,
+        };
+    }
 
     /// Create a thread-local resolver clone with fresh transports. Shared
     /// caches and config are inherited; per-query mutable state is reset.
@@ -1575,9 +1638,10 @@ pub const RecursiveResolver = struct {
                     }
                 } else return null;
             } else {
-                // Root zone: validate against hardcoded trust anchor
+                // Root zone: validate against the configured trust anchors
+                // (default IANA; test harness overrides via ServerConfig).
                 const now_u32 = epochNowU32();
-                dnssec.validateDnskeyRrset(resp.answers, &dnssec.root_ds_records, zone_parsed, now_u32, &self.validation_budget) catch return null;
+                dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, &self.validation_budget) catch return null;
             }
         }
 

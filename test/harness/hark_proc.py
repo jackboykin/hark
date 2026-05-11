@@ -28,37 +28,45 @@ class HarkConfig:
     dnssec: bool = False
     cache_min_ttl: int = 0
     minimal_responses: bool = True
+    # Each entry is a `"<key-tag> <alg> <dtype> <hex>"` string fed to
+    # hark's test-only `[resolver] trust-anchors = [...]` knob. Implies
+    # `dnssec = true`; conftest enforces that pairing.
+    trust_anchors: list[str] = dataclasses.field(default_factory=list)
+    # Pass `--verbose` so per-query debug lines reach the test log.
+    # Cheap; failing-scenario triage is impossible without them.
+    verbose: bool = True
 
     def to_toml(self) -> str:
-        listen = f'"{self.listen_ip}:{self.listen_port}"'
         # Root hints are passed in "ip:port" form so the existing parseAddress
         # path lifts them; the upstream-port knob covers glue records, which
         # have no port.
-        hints = ", ".join(f'"{h}"' for h in self.root_hints) if self.root_hints else ""
         # `opportunistic` is explicitly off: hark's TLS transport hardcodes
         # port 853 (src/tls_transport.zig:32) and would bypass `upstream_port`,
         # silently mis-targeting the responder. Future scenarios needing
         # encrypted upstreams will require threading a `tls_port` knob first.
-        return (
-            f"[server]\n"
-            f"listen = [{listen}]\n"
-            f"workers = {self.workers}\n"
-            f"minimal-responses = {str(self.minimal_responses).lower()}\n"
-            f"\n"
-            f"[resolver]\n"
-            f"mode = \"recursive\"\n"
-            f"qname-minimization = {str(self.qname_minimization).lower()}\n"
-            f"dnssec = {str(self.dnssec).lower()}\n"
-            f"opportunistic = false\n"
-            f"upstream-port = {self.upstream_port}\n"
-            f"allow-loopback-upstreams = true\n"
-            + (f"root-hints = [{hints}]\n" if hints else "")
-            + (
-                f"\n[cache]\nmin-ttl = {self.cache_min_ttl}\n"
-                if self.cache_min_ttl
-                else ""
-            )
-        )
+        lines = [
+            "[server]",
+            f'listen = ["{self.listen_ip}:{self.listen_port}"]',
+            f"workers = {self.workers}",
+            f"minimal-responses = {str(self.minimal_responses).lower()}",
+            "",
+            "[resolver]",
+            'mode = "recursive"',
+            f"qname-minimization = {str(self.qname_minimization).lower()}",
+            f"dnssec = {str(self.dnssec).lower()}",
+            "opportunistic = false",
+            f"upstream-port = {self.upstream_port}",
+            "allow-loopback-upstreams = true",
+        ]
+        if self.root_hints:
+            hints = ", ".join(f'"{h}"' for h in self.root_hints)
+            lines.append(f"root-hints = [{hints}]")
+        if self.trust_anchors:
+            anchors = ", ".join(f'"{a}"' for a in self.trust_anchors)
+            lines.append(f"trust-anchors = [{anchors}]")
+        if self.cache_min_ttl:
+            lines += ["", "[cache]", f"min-ttl = {self.cache_min_ttl}"]
+        return "\n".join(lines) + "\n"
 
 
 class HarkProcess:
@@ -80,8 +88,11 @@ class HarkProcess:
         self._log_fd = self.log_path.open("wb")
         env = os.environ.copy()
         # Hark logs to stderr.
+        argv = [str(self.binary), "serve", "--config", str(self.config_path)]
+        if self.config.verbose:
+            argv.append("--verbose")
         self.proc = subprocess.Popen(
-            [str(self.binary), "serve", "--config", str(self.config_path)],
+            argv,
             stdout=self._log_fd,
             stderr=self._log_fd,
             env=env,

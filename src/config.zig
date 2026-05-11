@@ -6,6 +6,7 @@ const toml = @import("toml.zig");
 const net_addr = @import("net_address.zig");
 const Address = net_addr.Address;
 const acl = @import("acl.zig");
+const dns = @import("dns.zig");
 const build_options = @import("build_options");
 
 // ── ServerConfig ───────────────────────────────────────────────────────
@@ -79,6 +80,11 @@ pub const ServerConfig = struct {
     /// pooled connections to authoritatives after this much inactivity.
     upstream_tcp_idle_sec: i64,
 
+    /// Override the IANA root trust anchors. Empty falls back to
+    /// `dnssec.root_ds_records`. Test-only; `-Dtesting=true` gates the
+    /// `[resolver] trust-anchors` config key.
+    trust_anchors: []dns.DsData,
+
     allocator: Allocator,
 
     pub const Mode = enum { recursive, forward };
@@ -88,6 +94,8 @@ pub const ServerConfig = struct {
         self.allocator.free(self.upstreams);
         self.allocator.free(self.root_hints);
         self.allocator.free(self.allow_from);
+        for (self.trust_anchors) |ta| self.allocator.free(ta.digest);
+        self.allocator.free(self.trust_anchors);
     }
 
     /// Effective root-hints slice for the recursor: config-supplied if any,
@@ -96,6 +104,16 @@ pub const ServerConfig = struct {
     pub fn rootHints(self: ServerConfig) []const Address {
         const recursive = @import("recursive.zig");
         return if (self.root_hints.len > 0) self.root_hints else &recursive.root_hints_default;
+    }
+
+    /// Effective root trust anchors: config-supplied if any, else the
+    /// compile-time IANA defaults. The override is only reachable on
+    /// `-Dtesting=true` builds — the production branch is elided at
+    /// compile time so the IANA anchors are the sole reachable choice.
+    pub fn trustAnchors(self: ServerConfig) []const dns.DsData {
+        const dnssec = @import("dnssec.zig");
+        if (comptime !build_options.testing_enabled) return &dnssec.root_ds_records;
+        return if (self.trust_anchors.len > 0) self.trust_anchors else &dnssec.root_ds_records;
     }
 };
 
@@ -126,6 +144,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     const empty_upstreams = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_root_hints = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
+    const empty_trust_anchors = allocator.alloc(dns.DsData, 0) catch return error.OutOfMemory;
 
     return .{
         .listen = listen,
@@ -163,6 +182,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .tcp_idle_timeout_ms = 5_000,
         .tcp_queries_per_conn = 128,
         .upstream_tcp_idle_sec = 30,
+        .trust_anchors = empty_trust_anchors,
         .allocator = allocator,
     };
 }
@@ -240,17 +260,22 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.root_hints);
             cfg.root_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
         }
-        // Test-only knobs: gated at build time so a production binary can't
-        // be reconfigured into a test-only posture by an operator config.
-        if (build_options.testing_enabled) {
-            if (resolver.getInteger("upstream-port")) |p| {
-                if (p < 1 or p > 65535) return error.InvalidValue;
-                cfg.upstream_port = @intCast(p);
-            }
-            if (resolver.getBool("allow-loopback-upstreams")) |b| cfg.allow_loopback_upstreams = b;
-        } else {
-            if (resolver.getInteger("upstream-port") != null) return error.TestOnlyConfigKey;
-            if (resolver.getBool("allow-loopback-upstreams") != null) return error.TestOnlyConfigKey;
+        // Test-only knobs. Each is gated by `build_options.testing_enabled`
+        // so a production binary refuses the key — adding a new one means
+        // adding one block, not synchronizing two branches.
+        if (resolver.getInteger("upstream-port")) |p| {
+            if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
+            if (p < 1 or p > 65535) return error.InvalidValue;
+            cfg.upstream_port = @intCast(p);
+        }
+        if (resolver.getBool("allow-loopback-upstreams")) |b| {
+            if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
+            cfg.allow_loopback_upstreams = b;
+        }
+        if (resolver.getStringArray("trust-anchors")) |entries| {
+            if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
+            allocator.free(cfg.trust_anchors);
+            cfg.trust_anchors = try parseTrustAnchors(allocator, entries);
         }
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
@@ -321,6 +346,69 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
     }
 
     return parseConfig(allocator, contents.items);
+}
+
+/// Parse a list of trust-anchor strings in the form
+/// `"<key-tag> <algorithm> <digest-type> <hex-digest>"` (whitespace-delimited).
+/// All four fields are required. Algorithm and digest-type are decimal IANA
+/// numbers (e.g. `8` = RSA/SHA-256, `2` = SHA-256). Owner name is implicit
+/// root — the override targets the same anchor slot as `dnssec.root_ds_records`.
+fn parseTrustAnchors(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
+    const list = allocator.alloc(dns.DsData, strs.len) catch return error.OutOfMemory;
+    var i: usize = 0;
+    errdefer {
+        for (list[0..i]) |ta| allocator.free(ta.digest);
+        allocator.free(list);
+    }
+    while (i < strs.len) : (i += 1) {
+        list[i] = try parseTrustAnchor(allocator, strs[i]);
+    }
+    return list;
+}
+
+fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData {
+    var it = mem.tokenizeAny(u8, s, " \t");
+    const tag_str = it.next() orelse return error.InvalidValue;
+    const alg_str = it.next() orelse return error.InvalidValue;
+    const dtype_str = it.next() orelse return error.InvalidValue;
+    const digest_str = it.next() orelse return error.InvalidValue;
+    if (it.next() != null) return error.InvalidValue;
+
+    const key_tag = std.fmt.parseInt(u16, tag_str, 10) catch return error.InvalidValue;
+    const alg_int = std.fmt.parseInt(u8, alg_str, 10) catch return error.InvalidValue;
+    const dtype_int = std.fmt.parseInt(u8, dtype_str, 10) catch return error.InvalidValue;
+    // Reject unknown algorithm/digest-type at parse time. Both enums are
+    // open (`_` trailing) so a typo in test configs would otherwise reach
+    // the validator and surface as a cryptic SERVFAIL instead of a clear
+    // config error.
+    // Both enums are open (`_` trailing) so @enumFromInt accepts any u8;
+    // tagName returns null for values that don't match a named variant —
+    // the cheapest known-variant check for this shape.
+    const algorithm: dns.DnssecAlgorithm = @enumFromInt(alg_int);
+    if (std.enums.tagName(dns.DnssecAlgorithm, algorithm) == null) return error.InvalidValue;
+    const digest_type: dns.DigestType = @enumFromInt(dtype_int);
+    if (std.enums.tagName(dns.DigestType, digest_type) == null) return error.InvalidValue;
+    if (digest_str.len % 2 != 0) return error.InvalidValue;
+    const digest_len = digest_str.len / 2;
+    // RFC 4034 §5.1.4 + RFC 6605 §3: digest length is fixed per digest type.
+    const expected_len: usize = switch (digest_type) {
+        .sha1 => 20,
+        .sha256 => 32,
+        .sha384 => 48,
+        _ => unreachable, // tagName check above rejected unknown variants
+    };
+    if (digest_len != expected_len) return error.InvalidValue;
+
+    const digest = allocator.alloc(u8, digest_len) catch return error.OutOfMemory;
+    errdefer allocator.free(digest);
+    _ = std.fmt.hexToBytes(digest, digest_str) catch return error.InvalidValue;
+
+    return .{
+        .key_tag = key_tag,
+        .algorithm = algorithm,
+        .digest_type = digest_type,
+        .digest = digest,
+    };
 }
 
 fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
@@ -565,17 +653,93 @@ test "logging config" {
     try testing.expectEqual(true, cfg2.log_queries);
 }
 
+test "trust-anchors override parses and round-trips" {
+    if (!build_options.testing_enabled) return;
+    var cfg = try parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
+    const ta = cfg.trust_anchors[0];
+    try testing.expectEqual(@as(u16, 20326), ta.key_tag);
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(ta.algorithm));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ta.digest_type));
+    try testing.expectEqual(@as(usize, 32), ta.digest.len);
+
+    // Accessor returns config-supplied when non-empty.
+    const eff = cfg.trustAnchors();
+    try testing.expectEqual(@as(usize, 1), eff.len);
+    try testing.expectEqual(@as(u16, 20326), eff[0].key_tag);
+}
+
+test "trust-anchors accessor falls back to IANA defaults when empty" {
+    var cfg = try parseConfig(testing.allocator, "");
+    defer cfg.deinit();
+    const dnssec = @import("dnssec.zig");
+    const eff = cfg.trustAnchors();
+    try testing.expectEqual(dnssec.root_ds_records.len, eff.len);
+    try testing.expectEqual(dnssec.root_ds_records[0].key_tag, eff[0].key_tag);
+}
+
+test "trust-anchors rejects malformed entries" {
+    if (!build_options.testing_enabled) return;
+    // Odd-length hex
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 ABC"]
+    ));
+    // Missing field
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2"]
+    ));
+    // Extra field
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 AB EXTRA"]
+    ));
+    // Non-hex digest
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 ZZZZ"]
+    ));
+    // Unknown algorithm (255 is reserved/unassigned per IANA DNSSEC alg registry)
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 255 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
+    ));
+    // Unknown digest type
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 99 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
+    ));
+    // 16-byte digest is too short for any standard digest type
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D084"]
+    ));
+    // Digest length doesn't match digest type (SHA-256 declared, 20-byte SHA-1 supplied)
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E88040"]
+    ));
+}
+
 test "test-only knobs gated on -Dtesting" {
     const cfg_text =
         \\[resolver]
         \\upstream-port = 5353
         \\allow-loopback-upstreams = true
+        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
     ;
     if (build_options.testing_enabled) {
         var cfg = try parseConfig(testing.allocator, cfg_text);
         defer cfg.deinit();
         try testing.expectEqual(@as(u16, 5353), cfg.upstream_port);
         try testing.expectEqual(true, cfg.allow_loopback_upstreams);
+        try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
     } else {
         try testing.expectError(error.TestOnlyConfigKey, parseConfig(testing.allocator, cfg_text));
     }

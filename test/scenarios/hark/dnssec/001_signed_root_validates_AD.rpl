@@ -1,0 +1,53 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN root-signed answer validates and gets AD=1 to the client
+;
+; Smoke test for the harness DNSSEC pipeline:
+;   - `; hark: dnssec-zone = .` tells conftest to generate a zone key for
+;     root and publish its DS as hark's trust anchor.
+;   - The responder pre-signs every RRset whose owner is under `.` and
+;     auto-synthesizes `. DNSKEY` responses (since this scenario doesn't
+;     declare any).
+;
+; Topology
+;   root  127.0.10.1   serves a single signed leaf, NO delegation
+;
+; Expected: hark fetches `. DNSKEY`, validates it against the trust anchor,
+; validates the leaf's RRSIG, and returns AD=1 to the client.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION ANSWER
+      example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  ; RD asks hark to recurse; DO requests DNSSEC data so AD has meaning.
+  REPLY RD DO
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` checks the full response-flag mask (QR/AA/TC/RA/AD),
+  ; which is how we assert AD=1 — load-bearing for this scenario.
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    example. IN A
+  SECTION ANSWER
+    example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

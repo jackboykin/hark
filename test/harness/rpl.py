@@ -17,6 +17,7 @@ a "drop the next incoming query" on the responder before the QUERY fires.
 Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
+  - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
   - STEP n CHECK_OUT_QUERY                  positional upstream-query check
   - SECTION QUERY_LOG                       `<qname> <qtype> [<dest>]` rows
@@ -88,11 +89,10 @@ REPLY_RCODES = {
     "YXDOMAIN": dns.rcode.YXDOMAIN,
 }
 
-# Tokens that appear in Unbound corpus REPLY lines but live in the EDNS OPT
-# RR rather than the message header. The responder doesn't model OPT in its
-# template so we parse and ignore — keeps lifted scenarios working without
-# pretending to handle DNSSEC.
-REPLY_IGNORED_TOKENS = frozenset({"DO"})
+# `DO` lives in the EDNS OPT extended-flags, not the header. On a STEP
+# QUERY entry it sets `want_dnssec` so the client asks for DNSSEC data;
+# on response-template entries it's a no-op (the responder serves whatever
+# records the scenario declared).
 
 # Opcode tokens (rare in REPLY but valid in MATCH opcode contexts).
 REPLY_OPCODES = {
@@ -115,6 +115,10 @@ class Entry:
     additional: list[dns.rrset.RRset] = dataclasses.field(default_factory=list)
     # CHECK_QUERY_LOG: each row is (qname, qtype, dest_ip_or_None).
     query_log: list[tuple[str, str, str | None]] = dataclasses.field(default_factory=list)
+    # `REPLY DO` on a STEP QUERY entry: request DNSSEC data via EDNS.
+    # No-op on response-template entries (the responder always returns
+    # whatever records the scenario declared).
+    want_dnssec: bool = False
 
 
 @dataclasses.dataclass
@@ -151,6 +155,13 @@ class Scenario:
     # default since 1.7.x). False = passthrough — the wire shaper skips
     # the delegation-NS / glue strip on positive answers.
     minimal_responses: bool | None = None
+    # Zones the harness should sign on the fly. Each entry is an absolute
+    # zone name (trailing dot canonical). Conftest generates a keypair per
+    # entry, writes the DS as a hark trust anchor, and the responder signs
+    # every RRset whose owner falls in/under the zone. Hark validates
+    # trust anchors at root only, so the first declared zone must be the
+    # root in the scripted setup (typically ".").
+    dnssec_zones: list[str] = dataclasses.field(default_factory=list)
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -210,6 +221,22 @@ class _Parser:
             self.scenario.qname_minimization = val.strip().lower() in {"yes", "true", "on", "1"}
         elif key == "minimal-responses":
             self.scenario.minimal_responses = val.strip().lower() in {"yes", "true", "on", "1"}
+        elif key == "dnssec-zone":
+            # Canonicalize: lowercase, ensure trailing dot. Multiple
+            # directives accumulate; same value collapses (idempotent).
+            name = val.strip().lower()
+            if not name.endswith("."):
+                name = name + "."
+            # Hark validates trust anchors at the root only, so the first
+            # declared zone MUST be `.` — additional zones can be deeper
+            # for content signing.
+            if not self.scenario.dnssec_zones and name != ".":
+                raise self.err(
+                    f"first dnssec-zone must be `.` (hark validates trust "
+                    f"anchors at root only); got {name!r}"
+                )
+            if name not in self.scenario.dnssec_zones:
+                self.scenario.dnssec_zones.append(name)
 
     def parse(self) -> Scenario:
         # Header may contain `; hark: x = y` directives before SCENARIO_BEGIN.
@@ -347,8 +374,8 @@ class _Parser:
                 entry.reply_rcode = REPLY_RCODES[t]
             elif t in REPLY_OPCODES:
                 entry.reply_opcode = REPLY_OPCODES[t]
-            elif t in REPLY_IGNORED_TOKENS:
-                pass
+            elif t == "DO":
+                entry.want_dnssec = True
             else:
                 raise self.err(f"unknown REPLY token: {t!r}")
 

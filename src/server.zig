@@ -384,6 +384,26 @@ pub const Server = struct {
         };
     }
 
+    /// Build a resolver Context from the server-level (background) state.
+    /// The bg-prefetch path always passes `tcp_pool = null` (it creates
+    /// fresh transports per task; no shared pool semantics).
+    pub fn resolverContext(self: *Server) recursive.RecursiveResolver.Context {
+        return .{
+            .config = &self.config,
+            .io = self.io,
+            .gpa = self.allocator,
+            .cache = &self.cache,
+            .rtt_cache = &self.rtt_cache,
+            .ns_selector = &self.ns_selector,
+            .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
+            .case_state = if (self.case_state) |*cs| cs else null,
+            .dedup = if (self.dedup) |*d| d else null,
+            .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
+            .key_cache = if (self.key_cache) |*kc| kc else null,
+            .tcp_pool = null,
+        };
+    }
+
     pub fn deinit(self: *Server) void {
         // awaitProbes MUST precede ca_bundle.deinit: each probe holds a
         // by-value TlsTransport whose ca_bundle slices alias this owner.
@@ -762,33 +782,11 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var resolver = RecursiveResolver{
-        .transports = .{
-            .udp = &udp_t,
-            .tcp = &tcp_t,
-            .tls = tls_ptr,
-        },
-        .io = server.io,
-        .root_hints = server.config.rootHints(),
-        .upstream_port = server.config.upstream_port,
-        .allow_loopback_upstreams = server.config.allow_loopback_upstreams,
-        .cache = &server.cache,
-        .qname_minimization = server.config.qname_minimization,
-        .dnssec_aware = server.config.dnssec,
-        .dnssec_enabled = server.config.dnssec,
-        .encrypted_ns_cache = if (server.encrypted_ns_cache) |*oc| oc else null,
-        .rtt_cache = &server.rtt_cache,
-        .ns_selector = &server.ns_selector,
-        .bypass_cache = true,
-        .stagger_ms = server.config.stagger_ms,
-        .case_state = if (server.case_state) |*cs| cs else null,
-        .dedup = if (server.dedup) |*d| d else null,
-        .tcp_pool = null,
-        .gpa = server.allocator,
-        .query_memory_limit = server.config.query_memory_limit,
-        .nsec_cache = if (server.nsec_cache) |*nc| nc else null,
-        .key_cache = if (server.key_cache) |*kc| kc else null,
-    };
+    var resolver = recursive.RecursiveResolver.fromContext(
+        server.resolverContext(),
+        .{ .udp = &udp_t, .tcp = &tcp_t, .tls = tls_ptr },
+        .{ .bypass_cache = true },
+    );
 
     // Errors are common (network flakiness, upstream SERVFAIL) and not
     // actionable here — the task runs for cache side effects only.
@@ -825,6 +823,25 @@ const WorkerState = struct {
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     max_tcp_clients: u32 = 0,
+
+    /// Build a resolver Context from the per-worker pointer-style state.
+    /// Per-query knobs (cd, bypass_cache) go through RuntimeOpts, not here.
+    fn resolverContext(self: *WorkerState) recursive.RecursiveResolver.Context {
+        return .{
+            .config = self.config,
+            .io = self.io,
+            .gpa = self.allocator,
+            .cache = self.cache,
+            .rtt_cache = self.rtt_cache,
+            .ns_selector = self.ns_selector,
+            .encrypted_ns_cache = self.encrypted_ns_cache,
+            .case_state = self.case_state,
+            .dedup = self.dedup,
+            .nsec_cache = self.nsec_cache,
+            .key_cache = self.key_cache,
+            .tcp_pool = self.tcp_pool,
+        };
+    }
 
     /// Try to claim a TCP client slot. Returns true on success (caller
     /// must fetchSub when done). CAS loop prevents overcount.
@@ -1194,31 +1211,11 @@ const WorkerState = struct {
         }
         switch (self.config.mode) {
             .recursive => {
-                var resolver = RecursiveResolver{
-                    .transports = transports,
-                    .io = self.io,
-                    .root_hints = self.config.rootHints(),
-                    .upstream_port = self.config.upstream_port,
-                    .allow_loopback_upstreams = self.config.allow_loopback_upstreams,
-                    .cache = self.cache,
-                    .qname_minimization = self.config.qname_minimization,
-                    // RFC 4035 §3.2.1: always request DNSSEC data (DO bit) if capable
-                    .dnssec_aware = self.config.dnssec,
-                    // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours
-                    .dnssec_enabled = self.config.dnssec and !cd,
-                    .encrypted_ns_cache = self.encrypted_ns_cache,
-                    .rtt_cache = self.rtt_cache,
-                    .ns_selector = self.ns_selector,
-                    .bypass_cache = bypass_cache,
-                    .stagger_ms = self.config.stagger_ms,
-                    .case_state = self.case_state,
-                    .dedup = self.dedup,
-                    .tcp_pool = self.tcp_pool,
-                    .gpa = self.allocator,
-                    .query_memory_limit = self.config.query_memory_limit,
-                    .nsec_cache = if (self.config.dnssec and !cd) self.nsec_cache else null,
-                    .key_cache = if (self.config.dnssec) self.key_cache else null,
-                };
+                var resolver = recursive.RecursiveResolver.fromContext(
+                    self.resolverContext(),
+                    transports,
+                    .{ .cd = cd, .bypass_cache = bypass_cache },
+                );
                 var result = try resolver.resolve(alloc, name, qtype);
                 // Dupe into arena — points into stack-local resolver.pending_dnskey_buf
                 if (result.prefetch_dnskey_zone) |z| {

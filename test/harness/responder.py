@@ -8,6 +8,11 @@ Design: per address, one thread for UDP recvfrom and one thread for TCP
 accept. TCP connections are handled synchronously, one query per connection
 (RFC 7766 allows pipelining; the test load doesn't need it). Adequate for
 scenarios with <20 fake auths and dozens of queries.
+
+DNSSEC harness mode: when constructed with `signers={zone: KeyMaterial}`,
+the responder pre-signs every RRset whose owner is under a signed zone and
+auto-synthesizes DNSKEY responses for declared signed zones. See
+test/harness/dnssec.py.
 """
 
 from __future__ import annotations
@@ -19,10 +24,13 @@ import time
 
 import dns.flags
 import dns.message
+import dns.name
 import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
+import dns.rrset
 
+from . import dnssec as harness_dnssec
 from . import rpl
 
 
@@ -40,7 +48,12 @@ class QueryLog:
 class Responder:
     """Owns the sockets and worker threads for one scenario."""
 
-    def __init__(self, scenario: rpl.Scenario, port: int):
+    def __init__(
+        self,
+        scenario: rpl.Scenario,
+        port: int,
+        signers: list[harness_dnssec.KeyMaterial] | None = None,
+    ):
         self.scenario = scenario
         self.port = port
         self.addresses: list[str] = sorted({r.address for r in scenario.ranges})
@@ -62,6 +75,18 @@ class Responder:
         # have already happened.
         self._pending_drops = 0
         self._drops_lock = threading.Lock()
+        # Empty list in non-DNSSEC scenarios. Pre-baking and DNSKEY
+        # synthesis are no-ops when there are no signers.
+        self._signers: list[harness_dnssec.KeyMaterial] = signers or []
+        # Per-address signer routing: an auth synthesizes DNSKEY for zone Z
+        # only if it actually serves entries under Z. Prevents the root auth
+        # from answering authoritatively for `example.com DNSKEY` in a
+        # nested-zone scenario — which would paper over a real hark
+        # chain-walk bug.
+        self._zones_by_address: dict[str, list[harness_dnssec.KeyMaterial]] = {}
+        if self._signers:
+            self._bake_signatures()
+            self._zones_by_address = self._build_address_zone_map()
 
     def start(self) -> None:
         for addr in self.addresses:
@@ -145,6 +170,12 @@ class Responder:
                 continue
             except OSError:
                 return
+            # Recheck after blocking accept — stop() may have fired during
+            # the 0.2s timeout window, in which case spawning an untracked
+            # handler races teardown.
+            if self._stop.is_set():
+                conn.close()
+                return
             # Track the handler thread so `stop()` can join it — otherwise a
             # mid-flight `_handle_tcp` can race the scenario teardown (the
             # ranges/log are about to be GC'd) and read freed state.
@@ -200,8 +231,15 @@ class Responder:
     def _build_response(self, address: str, query: dns.message.Message, transport: str) -> dns.message.Message | None:
         entry = self._find_entry(address, query, transport)
         if entry is None:
-            # Unmatched query: REFUSED. Mirrors a lame auth and surfaces
-            # gaps in scenario coverage rather than silently dropping.
+            # No scenario entry matches; if it's a DNSKEY query for one of
+            # our signed zones, synthesize the canonical response rather
+            # than REFUSE. Scenarios that want to test DNSKEY-fetch failure
+            # can still declare an explicit REFUSED/SERVFAIL entry.
+            synth = self._synthesize_dnskey_response(address, query)
+            if synth is not None:
+                return synth
+            # Otherwise: REFUSED. Mirrors a lame auth and surfaces gaps
+            # in scenario coverage rather than silently dropping.
             r = dns.message.make_response(query)
             r.set_rcode(dns.rcode.REFUSED)
             return r
@@ -222,6 +260,78 @@ class Responder:
         r.additional = list(entry.additional)
         return r
 
+    # ── DNSSEC pre-baking + DNSKEY synthesis ──────────────────────────────
+
+    def _bake_signatures(self) -> None:
+        """Append an RRSIG to every signable RRset in every entry.
+
+        Run once at construction time, before sockets are open. Records
+        whose owner doesn't fall under any declared signed zone are left
+        alone — the scenario can still declare unsigned auths.
+        """
+        for rng in self.scenario.ranges:
+            for entry in rng.entries:
+                for section in (entry.answer, entry.authority, entry.additional):
+                    self._sign_section_inplace(section)
+
+    def _sign_section_inplace(self, rrsets: list[dns.rrset.RRset]) -> None:
+        # Snapshot original RRsets first — appending RRSIGs while iterating
+        # would re-feed signatures back into the signer.
+        originals = [rr for rr in rrsets if rr.rdtype != dns.rdatatype.RRSIG]
+        for rrset in originals:
+            signer = self._signer_for(rrset.name)
+            if signer is None:
+                continue
+            if _has_covering_rrsig(rrsets, rrset):
+                continue  # scenario declared its own — don't double-sign
+            rrsets.append(signer.sign(rrset))
+
+    def _signer_for(self, owner: dns.name.Name) -> harness_dnssec.KeyMaterial | None:
+        """Return the deepest enclosing signed zone's KeyMaterial, or None.
+
+        `example.com.` signed by both `.` and `example.com.` picks the
+        latter — RRSIGs are minted by the closest enclosing zone.
+        """
+        best: harness_dnssec.KeyMaterial | None = None
+        for km in self._signers:
+            if not owner.is_subdomain(km.zone_name):
+                continue
+            if best is None or len(km.zone_name) > len(best.zone_name):
+                best = km
+        return best
+
+    def _synthesize_dnskey_response(self, address: str, query: dns.message.Message) -> dns.message.Message | None:
+        if not query.question:
+            return None
+        q = query.question[0]
+        if q.rdtype != dns.rdatatype.DNSKEY:
+            return None
+        for km in self._zones_by_address.get(address, ()):
+            if km.zone_name == q.name:
+                r = dns.message.make_response(query, recursion_available=False)
+                r.flags |= dns.flags.AA | dns.flags.QR
+                r.answer = list(km.signed_dnskey_response)
+                return r
+        return None
+
+    def _build_address_zone_map(self) -> dict[str, list[harness_dnssec.KeyMaterial]]:
+        """For each bind address, the signed zones whose content it serves.
+
+        An auth is considered to serve zone Z if any entry in any of its
+        ranges declares an RR whose owner falls under Z. DNSKEY synthesis
+        then only answers for those zones from that address — a root auth
+        can't pretend to be authoritative for `example.com.` DNSKEY.
+        """
+        result: dict[str, list[harness_dnssec.KeyMaterial]] = {addr: [] for addr in self.addresses}
+        for rng in self.scenario.ranges:
+            for entry in rng.entries:
+                for section in (entry.answer, entry.authority, entry.additional):
+                    for rrset in section:
+                        km = self._signer_for(rrset.name)
+                        if km is not None and km not in result[rng.address]:
+                            result[rng.address].append(km)
+        return result
+
     def _find_entry(self, address: str, query: dns.message.Message, transport: str) -> rpl.Entry | None:
         with self._step_lock:
             step = self._current_step
@@ -234,6 +344,19 @@ class Responder:
                 if _entry_matches_query(entry, query, transport):
                     return entry
         return None
+
+
+def _has_covering_rrsig(rrsets: list[dns.rrset.RRset], target: dns.rrset.RRset) -> bool:
+    """True if `rrsets` already contains an RRSIG over `target`. Lets a
+    scenario hand-roll its own signatures (e.g., to assert a *bogus*
+    response) without the harness clobbering them."""
+    for rr in rrsets:
+        if rr.rdtype != dns.rdatatype.RRSIG or rr.name != target.name:
+            continue
+        for sig in rr:
+            if sig.type_covered == target.rdtype:
+                return True
+    return False
 
 
 def _recv_exactly(conn: socket.socket, n: int) -> bytes | None:

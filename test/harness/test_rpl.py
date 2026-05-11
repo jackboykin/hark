@@ -230,6 +230,41 @@ def test_root_hints_directive_parsed(tmp_path):
     assert s.root_hints == ["127.0.10.1", "127.0.10.2"]
 
 
+def test_dnssec_zone_directive_parsed(tmp_path):
+    s = _parse(
+        """\
+        ; hark: dnssec-zone = .
+        ; hark: dnssec-zone = example.com
+        ; hark: dnssec-zone = EXAMPLE.COM
+        SCENARIO_BEGIN signed
+        SCENARIO_END
+        """,
+        tmp_path,
+    )
+    # Trailing dot added if missing; case normalized; duplicates collapsed.
+    assert s.dnssec_zones == [".", "example.com."]
+
+
+def test_dnssec_zone_directive_absent(tmp_path):
+    s = _parse("SCENARIO_BEGIN nosign\nSCENARIO_END\n", tmp_path)
+    assert s.dnssec_zones == []
+
+
+def test_dnssec_zone_first_must_be_root(tmp_path):
+    """Hark only consults trust anchors at root; rejecting a non-root first
+    zone at parse time gives a sharp error instead of a cryptic SERVFAIL."""
+    import pytest
+    with pytest.raises(Exception, match="first dnssec-zone must be"):
+        _parse(
+            """\
+            ; hark: dnssec-zone = example.com.
+            SCENARIO_BEGIN bad
+            SCENARIO_END
+            """,
+            tmp_path,
+        )
+
+
 def test_query_log_section_parses(tmp_path):
     s = _parse(
         """\

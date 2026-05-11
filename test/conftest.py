@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from harness import client, hark_proc, responder, rpl, unbound_lift
+from harness import dnssec as harness_dnssec
 
 
 def _worker_offset() -> int:
@@ -122,7 +123,16 @@ def run_scenario(path: Path, lift: bool = False) -> None:
     if scenario.minimal_responses is not None:
         cfg.minimal_responses = scenario.minimal_responses
 
-    resp = responder.Responder(scenario, port=RESP_PORT)
+    # DNSSEC harness: generate a key per declared zone, publish the root's
+    # DS as hark's trust anchor, and hand the keys to the responder for
+    # on-the-fly RRSIG signing. The parser already enforces that the first
+    # zone is `.` (hark validates trust anchors at root only).
+    signers = [harness_dnssec.KeyMaterial.generate(z) for z in scenario.dnssec_zones]
+    if signers:
+        cfg.dnssec = True
+        cfg.trust_anchors = [signers[0].ds_presentation()]
+
+    resp = responder.Responder(scenario, port=RESP_PORT, signers=signers)
     resp.start()
     try:
         with tempfile.TemporaryDirectory(prefix="harktest-") as td:

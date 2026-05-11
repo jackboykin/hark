@@ -19,7 +19,7 @@ def send_query(entry: rpl.Entry, hark_addr: tuple[str, int], timeout: float = 5.
     if not entry.question:
         raise ValueError("STEP QUERY entry has no QUESTION section")
     q = entry.question[0]
-    msg = dns.message.make_query(q.name, q.rdtype, q.rdclass)
+    msg = dns.message.make_query(q.name, q.rdtype, q.rdclass, want_dnssec=entry.want_dnssec)
     msg.flags = entry.reply_flags  # in QUERY entries, REPLY carries client flags
     return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
 
@@ -69,15 +69,27 @@ def assert_answer_matches(actual: dns.message.Message, expected: rpl.Entry) -> N
             raise AssertionError(f"QUESTION mismatch:\n  got: {actual.question}\n  want: {expected.question}")
 
     if "answer" in checks:
-        _assert_section_matches("ANSWER", actual.answer, expected.answer, compare_ttl)
+        _assert_section_matches("ANSWER", _filter_rrsig_if_unwanted(actual.answer, expected.answer), expected.answer, compare_ttl)
     if "authority" in checks:
         # Authority sections often include implementation-specific SOA TTLs
         # in NODATA/NXDOMAIN; only compare names/types/rdata.
-        _assert_section_matches("AUTHORITY", actual.authority, expected.authority, compare_ttl)
+        _assert_section_matches("AUTHORITY", _filter_rrsig_if_unwanted(actual.authority, expected.authority), expected.authority, compare_ttl)
     if "additional" in checks:
         # Skip OPT pseudo-RR in additional comparisons unless explicitly requested.
         filtered = [rs for rs in actual.additional if rs.rdtype != dns.rdatatype.OPT]
-        _assert_section_matches("ADDITIONAL", filtered, expected.additional, compare_ttl)
+        _assert_section_matches("ADDITIONAL", _filter_rrsig_if_unwanted(filtered, expected.additional), expected.additional, compare_ttl)
+
+
+def _filter_rrsig_if_unwanted(actual: list, expected: list) -> list:
+    """Drop RRSIG records from `actual` unless `expected` declares any.
+    RRSIG contents (signature bytes, inception/expiration) are non-
+    deterministic across harness runs — a scenario opts in to RRSIG
+    comparison only when it has the means to express the exact rdata,
+    which today it doesn't. Presence vs absence is the meaningful axis,
+    asserted via the AD flag in `MATCH flags`."""
+    if any(rs.rdtype == dns.rdatatype.RRSIG for rs in expected):
+        return actual
+    return [rs for rs in actual if rs.rdtype != dns.rdatatype.RRSIG]
 
 
 def _q_tuple(r: dns.rrset.RRset) -> tuple:
