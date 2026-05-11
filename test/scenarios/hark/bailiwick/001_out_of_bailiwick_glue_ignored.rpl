@@ -1,0 +1,214 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN out-of-bailiwick glue from a foreign zone is ignored
+
+; Bug-mode: cache-poisoning by accepting unsolicited additional-section glue
+; that lies outside the responding auth's bailiwick. RFC 1035 §7.3 and
+; RFC 2181 §5.4.1 require a resolver to discard RRs whose owner name is not
+; within the bailiwick of the server that supplied them. RFC 8499 codifies
+; the term "in-bailiwick" / "out-of-bailiwick".
+;
+; Here the `.com` authority returns a referral for `example.com.` but
+; smuggles a stray glue record `ns.evil.org. IN A 127.0.10.99` in the
+; ADDITIONAL section. A naive resolver might cache that A and later use it
+; verbatim when resolving anything under `.org`. The legitimate `.org`
+; authority lives at 127.0.10.4 and returns a totally different (correct)
+; answer; the poisoned IP 127.0.10.99 has no responder bound to it, so a
+; buggy resolver would either timeout or (under a more permissive bug
+; surface) return the wrong rdata.
+;
+; A correct resolver, when asked for `evil.org. A`, walks root -> org auth
+; -> evil.org auth and never contacts 127.0.10.99. STEP 5 (CHECK_QUERY_LOG)
+; pins both the presence of the .org auth on the path and the absence of
+; any query to the poisoned address.
+
+; ── Fake root server ───────────────────────────────────────────────
+; Knows about com. (127.0.10.2) and org. (127.0.10.4) only. Answers QMIN
+; probes for either TLD with the matching referral.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ; QMIN probe / first query: `com. A` -> referral to com auth.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+
+  ; QMIN probe / first query: `org. A` -> referral to org auth. This is the
+  ; canonical path the resolver MUST follow for any `.org` name regardless
+  ; of any spurious glue cached from prior .com responses.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.org-auth.fake.
+    SECTION ADDITIONAL
+      a.org-auth.fake. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority (poisoner) ─────────────────────────────────
+; Returns a legitimate referral for example.com. AND smuggles an
+; out-of-bailiwick glue record for ns.evil.org. — pointing at the
+; black-hole IP 127.0.10.99 which has no responder.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ; ── The poison ──
+      ; ns.evil.org. lives in .org, NOT in .com — this auth has zero
+      ; authority over it. A correct resolver discards this RR.
+      ns.evil.org. 86400 IN A 127.0.10.99
+  ENTRY_END
+
+  ; QMIN probe for example.com. (qtype=A, no rdata) gets the same referral.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ns.evil.org. 86400 IN A 127.0.10.99
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Fake .org authority ────────────────────────────────────────────
+; The legitimate path. Returns a referral for evil.org. to its real auth.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION AUTHORITY
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.evil.org. 86400 IN A 127.0.10.5
+  ENTRY_END
+
+  ; QMIN probe at evil.org.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION AUTHORITY
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.evil.org. 86400 IN A 127.0.10.5
+  ENTRY_END
+RANGE_END
+
+; ── Fake evil.org authority (the genuine one) ──────────────────────
+; Bound to 127.0.10.5, distinct from the poison address 127.0.10.99.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION ANSWER
+      evil.org. 3600 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ─────────────────────────────────────────────
+
+; STEP 1: Resolve example.com first. This is what plants the poisoned
+; ns.evil.org. glue in the resolver's view of the world (if the resolver
+; were buggy enough to cache it).
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+; STEP 3: Now ask for evil.org. A. A buggy resolver that cached the
+; ns.evil.org. -> 127.0.10.99 glue from the com auth's leak would skip the
+; org-auth path entirely and direct the query at 127.0.10.99 (no responder
+; -> REFUSED upstream; downstream behaviour varies). A correct resolver
+; goes root -> org auth -> evil.org auth and returns 10.20.30.40.
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    evil.org. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    evil.org. IN A
+  SECTION ANSWER
+    evil.org. 3600 IN A 10.20.30.40
+ENTRY_END
+
+; STEP 5: Pin the query path. The presence of `evil.org. A 127.0.10.4`
+; proves hark went through the org auth (not the leaked glue), and the
+; absence of any line targeting 127.0.10.99 is enforced implicitly by
+; the responder log (a buggy hark would have tried it and timed out).
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    org. A 127.0.10.1
+    evil.org. A 127.0.10.4
+    evil.org. A 127.0.10.5
+ENTRY_END
+
+SCENARIO_END

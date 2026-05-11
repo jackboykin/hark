@@ -1,0 +1,108 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN in-bailiwick glue is trusted: no separate NS A lookup
+;
+; RFC 1034 §4.3.1 / RFC 8499 (bailiwick): when a parent zone refers to a
+; child whose NS lives INSIDE the child zone (e.g. example.com. delegated
+; with NS ns.example.com.), the parent MUST include glue or the delegation
+; is unresolvable — and a correct resolver MAY trust that glue because it
+; is in-bailiwick of the parent. No separate A lookup for the NS is needed.
+;
+; Bug-mode this scenario catches: a resolver that ignores in-bailiwick
+; glue and re-resolves `ns.example.com. A` would either loop (the NS lives
+; inside the very zone it is meant to serve) or add a needless round-trip.
+; The CHECK_QUERY_LOG asserts the negative: the leaf query reaches
+; 127.0.10.3 with NO prior `ns.example.com. A` query in the log.
+;
+; Topology
+;   root  127.0.10.1   refers com to 127.0.10.2
+;   com   127.0.10.2   refers example.com to ns.example.com. WITH glue
+;                      ns.example.com. A 127.0.10.3 (in-bailiwick, trusted)
+;   xcom  127.0.10.3   authoritative for example.com.
+
+; ── Root ───────────────────────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── .com authority — referral with in-bailiwick glue ───────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ; ns.example.com. is a subdomain of example.com., which is a subdomain
+      ; of com. (this auth's bailiwick). RFC 8499: glue is in-bailiwick of
+      ; the answering zone, so it is trustworthy.
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+
+  ; Defensive: if a buggy resolver tried to ask .com for ns.example.com. A,
+  ; .com is NOT authoritative for example.com. — it must NOT answer the A.
+  ; The harness's default REFUSED on unmatched is what we want here, so we
+  ; simply omit a matching entry. A logged query to 127.0.10.2 for
+  ; `ns.example.com. A` would still surface as an unexpected QUERY_LOG row.
+RANGE_END
+
+; ── example.com auth ───────────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ────────────────────────────────────────────────
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+; The example.com A query MUST land on 127.0.10.3 — the address we got
+; straight from the parent's glue. This presence-check is the positive
+; assertion; the absence-of-`ns.example.com. A`-lookup is implied by the
+; fact that no auth in this scenario answers such a query, so a resolver
+; that tried would either time out (SERVFAIL) or burn the responder's
+; REFUSED budget and never reach 127.0.10.3.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    example.com. A 127.0.10.3
+ENTRY_END
+
+SCENARIO_END

@@ -1,0 +1,101 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN FORMERR from sole authority surfaces (does not hang)
+
+; The single listed NS for example.com returns FORMERR (RFC 1035 §4.1.1,
+; "the name server was unable to interpret the query"). Real-world causes:
+; auths that reject EDNS options, COOKIE-aware middleboxes, or genuinely
+; malformed forwarding. RFC 8914 categorises this as advisory-grade
+; failure; resolvers commonly retry without EDNS, but with only one NS
+; available the resolver must still produce a response.
+;
+; With a single NS, hark has nowhere to fall through. This scenario asserts
+; that hark *does respond at all* (no hang, no drop) within the test
+; window. The exact rcode is whatever hark currently emits; the scenario
+; pins that down to catch regressions.
+;
+; Bug-modes this catches:
+;   (a) FORMERR causes hark to short-circuit without responding to the stub
+;   (b) Hark loops retrying FORMERR forever -> test timeout
+;   (c) Hark crashes on FORMERR mid-resolution
+;
+; Multi-NS FORMERR-on-all-auths -> SERVFAIL behaviour is the more
+; interesting RFC 1034 §4.3.5 case; see the .divergence sidecar.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Sole example.com auth: FORMERRs everything ─────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Hark currently passes FORMERR through to the client. A future change
+; that maps it to SERVFAIL (FORMERR semantically means "the server
+; couldn't parse the stub's query", which is false from the stub's
+; perspective) would need to flip this.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA FORMERR
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    www.example.com. A 127.0.10.3
+ENTRY_END
+
+SCENARIO_END

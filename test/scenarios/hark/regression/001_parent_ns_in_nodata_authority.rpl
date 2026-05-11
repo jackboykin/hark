@@ -91,15 +91,22 @@ ENTRY_BEGIN
     missing.example.com. IN AAAA
 ENTRY_END
 
+; The final AAAA must land on the example.com auth (127.0.10.3). A buggy
+; resolver that followed the parent-zone NS leak would direct it elsewhere
+; (or loop re-resolving NS); presence-checking this single row catches that.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    missing.example.com. AAAA 127.0.10.3
+ENTRY_END
+
 ; Trip conditions: a Hickory-class bug here would manifest as either
 ;   (a) wrong rcode — e.g. NXDOMAIN if hark wrongly believed the leaked
 ;       parent NS made `missing.example.com.` its own zone with no records
 ;   (b) SERVFAIL from a referral loop (`MaxReferralsExceeded`) if hark
 ;       kept re-following the same-zone NS records
 ;   (c) test timeout if hark hangs chasing its tail
-; CHECK_ANSWER above catches (a) and (b); the harness's 5s UDP timeout
-; catches (c). A more discriminating assertion (e.g. "hark hit exactly
-; one auth for the final AAAA") requires the CHECK_QUERY_LOG format
-; extension tracked in test-suite-plan-2026-05-10.md.
+;   (d) AAAA dispatched to wrong auth — caught by STEP 3 above.
+; CHECK_ANSWER catches (a) and (b); the 5s UDP timeout catches (c).
 
 SCENARIO_END

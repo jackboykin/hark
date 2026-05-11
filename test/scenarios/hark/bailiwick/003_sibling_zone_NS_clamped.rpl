@@ -1,0 +1,193 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN child zone cannot usurp parent or sibling zone NS
+
+; Bug-mode: a child authoritative server (example.com.) returns a response
+; whose AUTHORITY section claims NS records for its PARENT zone (`com.`)
+; with out-of-bailiwick glue. A resolver with weak bailiwick discipline
+; would replace its cached / referred `com.` NS RRset with the child's
+; bogus version, then route every subsequent `.com` query at the poison
+; address.
+;
+; This is the classic "child usurps parent" attack. Spec basis:
+;   - RFC 2181 §5.4.1: ranking trust. Data from a child auth about its
+;     parent is at a lower trust level than data from the parent itself
+;     and must not override the latter.
+;   - RFC 1035 §7.3: discard data not within the bailiwick of the
+;     responding server.
+;
+; Layout:
+;   root  (127.0.10.1) — knows com. -> 127.0.10.2
+;   com.  (127.0.10.2) — knows example.com. -> 127.0.10.3, other.com. -> 127.0.10.6
+;   example.com. (127.0.10.3) — POISONER: claims com. NS -> 127.0.10.99
+;   other.com.   (127.0.10.6) — clean target for the second query
+;
+; STEP 1 resolves example.com. to plant the poison. STEP 3 resolves
+; other.com.; CHECK_QUERY_LOG asserts the legitimate path through the
+; real .com auth (127.0.10.2), proving hark did NOT swap in the
+; child-supplied parent NS.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority (the legitimate one) ───────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other.com. IN A
+    SECTION AUTHORITY
+      other.com. 86400 IN NS ns.other.com.
+    SECTION ADDITIONAL
+      ns.other.com. 86400 IN A 127.0.10.6
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other.com. IN A
+    SECTION AUTHORITY
+      other.com. 86400 IN NS ns.other.com.
+    SECTION ADDITIONAL
+      ns.other.com. 86400 IN A 127.0.10.6
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority (the poisoner) ──────────────────────
+; Authoritative for example.com. Returns the requested A answer, but
+; ALSO injects a parent-zone NS claim in AUTHORITY with out-of-bailiwick
+; glue pointing at a black-hole (127.0.10.99). A correctly-implemented
+; resolver discards the parent-NS claim because example.com. has no
+; authority over com. (RFC 2181 §5.4.1 trust ranking).
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+      ; ── Poison: child claiming the parent's NS ──
+      com. 86400 IN NS evil-gtld.attacker.fake.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ; Out-of-bailiwick glue for the bogus parent NS.
+      evil-gtld.attacker.fake. 86400 IN A 127.0.10.99
+  ENTRY_END
+RANGE_END
+
+; ── Fake other.com authority ───────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      other.com. IN A
+    SECTION ANSWER
+      other.com. 3600 IN A 198.51.100.7
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ─────────────────────────────────────────────
+
+; Resolve example.com. — this plants the poisoned com. NS in any
+; resolver that fails to clamp child-supplied parent NS data.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+; Resolve other.com. — must go via 127.0.10.2 (the real com auth), not
+; via the poisoned `evil-gtld.attacker.fake. -> 127.0.10.99` NS that the
+; previous response tried to graft onto com.
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    other.com. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    other.com. IN A
+  SECTION ANSWER
+    other.com. 3600 IN A 198.51.100.7
+ENTRY_END
+
+; Pin the path: the second query for other.com. A landed on 127.0.10.2
+; (legitimate .com auth) and 127.0.10.6 (legitimate other.com auth).
+; A resolver that swallowed the child-supplied parent NS would have
+; sent the other.com. probe at 127.0.10.99 instead.
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    other.com. A 127.0.10.2
+    other.com. A 127.0.10.6
+ENTRY_END
+
+SCENARIO_END

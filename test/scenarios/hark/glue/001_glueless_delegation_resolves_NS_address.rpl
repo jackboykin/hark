@@ -1,0 +1,146 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN glueless out-of-bailiwick NS triggers sub-resolution for its address
+;
+; RFC 1034 §4.2.1 / RFC 8499: a referral's NS may live outside the child
+; zone. When it does, the parent CANNOT supply trustworthy glue (the glue
+; would be out-of-bailiwick and SHOULD be ignored — see scenario 003), so a
+; correct iterative resolver MUST recursively resolve the NS's address
+; before it can ask the child auth anything.
+;
+; Bug-mode this scenario catches: a resolver that aborts on glueless
+; delegation (SERVFAIL) or that wrongly trusts out-of-bailiwick glue would
+; both fail here. The example.com auth sits at 127.0.10.4; hark only
+; learns that address by chasing `ns.example.org. A` through the org tree.
+;
+; Topology
+;   root  127.0.10.1   knows com (-> 127.0.10.2) and org (-> 127.0.10.5)
+;   com   127.0.10.2   refers example.com to ns.example.org. (NO glue)
+;   org   127.0.10.5   refers example.org to ns.example.org. WITH glue
+;                      (ns.example.org. A 127.0.10.4 — in-bailiwick, trusted)
+;   exorg 127.0.10.4   authoritative for example.org AND example.com
+;                      (one box, two zones — keeps the scenario small)
+
+; ── Root ───────────────────────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ; QMIN probe `com. A` (or `com. NS`) → refer to com.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+
+  ; QMIN probe `org. A` → refer to org. Required because the glueless
+  ; sub-resolution for ns.example.org has to start at root.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.org-tld.fake.
+    SECTION ADDITIONAL
+      a.org-tld.fake. 86400 IN A 127.0.10.5
+  ENTRY_END
+RANGE_END
+
+; ── .com authority — glueless referral for example.com ─────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ; The point of this scenario: NS is ns.example.org. (out-of-bailiwick
+  ; from com.), and ADDITIONAL is EMPTY. com cannot vouch for an org name.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.org.
+  ENTRY_END
+RANGE_END
+
+; ── .org authority — refers example.org with TRUSTED in-bailiwick glue ─
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ; QMIN may probe `example.org. A` before asking for `ns.example.org. A`.
+  ; Same referral works for both — MATCH subdomain catches the family.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.org. IN A
+    SECTION AUTHORITY
+      example.org. 86400 IN NS ns.example.org.
+    SECTION ADDITIONAL
+      ns.example.org. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── example.org / example.com auth (same box) ──────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ; Answers the sub-resolution `ns.example.org. A` …
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.example.org. IN A
+    SECTION ANSWER
+      ns.example.org. 3600 IN A 127.0.10.4
+  ENTRY_END
+
+  ; … and the original leaf query for example.com A once hark has the
+  ; nameserver address in hand.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ────────────────────────────────────────────────
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+; The path-of-record: the leaf example.com A query MUST land on 127.0.10.4
+; (the address discovered via ns.example.org sub-resolution), and the
+; sub-resolution itself MUST have happened (asking ns.example.org A
+; *somewhere* in the org chain). Unordered presence is enough — order
+; varies with QMIN probe interleaving.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    ns.example.org. A 127.0.10.4
+    example.com. A 127.0.10.4
+ENTRY_END
+
+SCENARIO_END

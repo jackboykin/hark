@@ -1,0 +1,99 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN SERVFAIL from sole authority surfaces as SERVFAIL to the client
+
+; A leaf query against the only NS for a zone returns SERVFAIL (transient
+; auth backend failure, RFC 2308 §7.1). Hark has no alternative NS to try,
+; so the correct behaviour per RFC 1034 §4.3 is to relay the failure to
+; the stub as SERVFAIL.
+;
+; What this scenario asserts (and what hark currently does):
+;   - the leaf SERVFAIL is propagated as a SERVFAIL response to the stub
+;   - hark does not hang, crash, or invent a synthetic answer
+;   - the upstream is contacted exactly once for the leaf (no spin loop)
+;
+; What it does NOT exercise (see .divergence sidecar): the more interesting
+; multi-NS fallthrough required by RFC 1034 §4.3.5. Hark currently treats
+; a SERVFAIL from one listed NS as terminal for the whole resolution
+; rather than iterating to siblings; that's tracked separately. This
+; single-NS shape isolates the passthrough-vs-synthesis property.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Sole example.com auth: returns SERVFAIL for the leaf ───────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ; QMIN probe at example.com. answers NODATA so iteration continues
+  ; (matches the shape used in regression/002).
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ; The leaf query: SERVFAIL with empty body. Stand-in for a broken auth
+  ; backend or post-DNS-software bug at the upstream.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; The leaf query must have reached the auth — proves the failure mode was
+; the auth's SERVFAIL, not a hark-side bailiwick reject or timeout.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    www.example.com. A 127.0.10.3
+ENTRY_END
+
+SCENARIO_END

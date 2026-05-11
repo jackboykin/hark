@@ -1,0 +1,102 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN REFUSED from sole authority surfaces (does not hang or crash)
+
+; The single listed NS for example.com is lame: it REFUSEs the query
+; (RFC 1035 §4.1.1, "the name server refuses to perform the specified
+; operation for policy reasons"). In production this happens when a host
+; is delegated to but no longer serves the zone, or when a firewall in
+; front of the auth rewrites responses.
+;
+; With only one NS to try, hark has nowhere to fall through to. The RFC
+; doesn't mandate one specific rcode in this case, but hark MUST produce
+; *some* response (rather than hanging or dropping) so the stub can move
+; on. This scenario locks in hark's current behaviour: pass the REFUSED
+; through to the client, exactly once, in well under the 5s test timeout.
+;
+; Bug-modes this catches:
+;   (a) silent drop — no response at all, test times out
+;   (b) infinite retry loop against the lame NS — test times out
+;   (c) hark crashes on unexpected REFUSED rcode mid-resolution
+;
+; Companion test for the multi-NS fallthrough case lives in the
+; .divergence sidecar (RFC 1034 §4.3.5; not yet implemented in hark).
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Sole example.com auth: lame, REFUSES everything ────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ; REFUSED has no AA bit (it's a policy refusal, not an authoritative
+  ; answer). Hark must accept the rcode and not bailiwick-reject it.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Hark's current behaviour: REFUSED is propagated. (A future change that
+; rewrites the rcode to SERVFAIL — which some resolvers do, treating
+; REFUSED as a lame signal — would need to flip this expectation.)
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA REFUSED
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    www.example.com. A 127.0.10.3
+ENTRY_END
+
+SCENARIO_END

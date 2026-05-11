@@ -1,0 +1,75 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN single-server iter_resolve-style scenario exercising day-1 prereqs
+
+; Smoke test for the Week-2 day-1 prerequisites:
+;   - RANGE_BEGIN with no `ADDRESS` directive (defaults to first root hint)
+;   - `SECTION QUERY_LOG` for `(qname, qtype, dest)` assertions decoupled
+;     from rdata-type, so we can express AAAA-on-IPv4-dest.
+;
+; Shape mirrors Unbound's `iter_resolve_*` testdata: a single authoritative
+; server is "the root" and answers for the entire tree directly. With QMIN
+; on, hark probes `com. ?`, then `example.com. ?`, then issues the AAAA
+; query for the leaf — all to 127.0.10.1.
+
+; ── Single auth (the root), ADDRESS omitted ────────────────────────
+RANGE_BEGIN 0 100
+  ; QMIN probe at `com.`: NOERROR, no answers, no delegation. Hark widens
+  ; back out and continues.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      com. IN A
+  ENTRY_END
+
+  ; QMIN probe at `example.com.`: same shape.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+
+  ; The leaf AAAA: NOERROR + answer. AAAA on IPv4-bound auth is exactly
+  ; what the old ANSWER-encoded CHECK_QUERY_LOG could not express.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      leaf.example.com. IN AAAA
+    SECTION ANSWER
+      leaf.example.com. 3600 IN AAAA 2001:db8::1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    leaf.example.com. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    leaf.example.com. IN AAAA
+  SECTION ANSWER
+    leaf.example.com. 3600 IN AAAA 2001:db8::1
+ENTRY_END
+
+; The AAAA query must land on the (only) auth at 127.0.10.1 — proving
+; both the parser default (RANGE inherited the root-hint address) and
+; the new SECTION QUERY_LOG shape (AAAA qtype + IPv4 dest in one row).
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    leaf.example.com. AAAA 127.0.10.1
+ENTRY_END
+
+SCENARIO_END

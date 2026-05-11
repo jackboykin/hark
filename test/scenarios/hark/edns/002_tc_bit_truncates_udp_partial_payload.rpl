@@ -1,0 +1,106 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN UDP response with TC=1 and a partial answer is ignored; TCP retry wins
+
+; RFC 6891 §6.2.4: when an authoritative server's response would exceed
+; the sender's advertised UDP payload size, the server returns as much
+; of the message as fits and sets TC=1 to signal truncation. RFC 5966 §3
+; (and RFC 7766) require the resolver to retry over TCP for the full
+; answer.
+;
+; This scenario is the *evil* truncated case: the UDP response carries
+; TC=1 AND a partially-fitted ANSWER record. A buggy resolver might
+; opportunistically cache or return the partial UDP payload instead of
+; re-fetching over TCP — opening a downgrade where an attacker who can
+; spoof UDP responses gets to seed cache with arbitrary partial data.
+;
+; Correct behavior: TC=1 means "do not trust UDP payload; retry TCP".
+; The 192.0.2.1 (UDP-leg, "evil") vs 192.0.2.99 (TCP-leg, "real")
+; split makes the assertion sharp — if hark wrongly trusted UDP we'd
+; see 192.0.2.1 in the client answer.
+;
+; Distinct from regression/003: that test's UDP leg has no ANSWER at all,
+; so a "use UDP payload anyway" bug couldn't manifest. This one would
+; expose it.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+; UDP leg: TC=1 AND a fake ANSWER record. A correct resolver discards
+; the payload and retries TCP. A naive one would return 192.0.2.1.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype udp
+    ADJUST copy_id copy_query
+    REPLY QR AA TC NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+
+  ; TCP leg: full, authoritative answer. The address differs so the
+  ; CHECK_ANSWER step can distinguish "retried over TCP" from "trusted
+  ; the truncated UDP payload".
+  ENTRY_BEGIN
+    MATCH opcode qname qtype tcp
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 192.0.2.99
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+; The TCP answer (192.0.2.99) is the real one. If we see 192.0.2.1 here
+; the resolver trusted the truncated UDP payload — RFC 5966 violation.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 192.0.2.99
+ENTRY_END
+
+SCENARIO_END

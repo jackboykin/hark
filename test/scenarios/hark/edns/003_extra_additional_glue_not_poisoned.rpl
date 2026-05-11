@@ -1,0 +1,101 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN extra unsolicited records in ADDITIONAL do not poison the answer
+
+; RFC 6891 §6 + RFC 2181 §5.4.1 (ranking of trust): records in the
+; ADDITIONAL section are advisory; a resolver MUST NOT promote them
+; into the ANSWER section, and MUST NOT accept out-of-bailiwick or
+; otherwise-unsolicited records into cache as if they were authoritative.
+;
+; This scenario asks for `example.com. A` and the auth answers correctly,
+; but its ADDITIONAL section is salted with:
+;   - an out-of-bailiwick A record (`evil.example. -> 6.6.6.6`) that
+;     a Kaminsky-style downgrade would try to inject;
+;   - a same-name-different-type record (`example.com. AAAA -> ::1`)
+;     that a sloppy cache might key on the qname and persist as if it
+;     were the answer to a separate AAAA query.
+;
+; Bug-mode this catches: hark mis-attributes ADDITIONAL records to the
+; client's question (returns 6.6.6.6 or ::1 instead of the A answer) or
+; FORMERR's the response because additional looked "weird". Either way
+; the client wouldn't see the legitimate 93.184.216.34 ANSWER.
+;
+; This is the closest the harness can get to RFC 8914 / RFC 6891 §6.1.2
+; unknown-EDNS-option pass-through territory: the auth-side responder
+; cannot emit a controlled OPT record (dnspython auto-adds its own
+; OPT, see ./opt_record_passthrough.gap), so we settle for "extra
+; advisory records in ADDITIONAL are ignored" as the closest viable
+; signal.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority with extra ADDITIONAL salt ──────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+    SECTION ADDITIONAL
+      ; Out-of-bailiwick A record — Kaminsky-style injection candidate.
+      evil.example. 3600 IN A 6.6.6.6
+      ; Same name, different type — sloppy caches that index on (name)
+      ; rather than (name, type) would shadow the real A answer.
+      example.com. 3600 IN AAAA ::1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+; Strict ANSWER match: 93.184.216.34 only. The 6.6.6.6 / ::1 garbage
+; in ADDITIONAL must not surface as the client-facing answer.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+SCENARIO_END

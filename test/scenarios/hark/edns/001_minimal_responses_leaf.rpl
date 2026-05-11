@@ -1,0 +1,87 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN leaf auth with minimal-responses style answer (no authority/additional)
+
+; RFC 6891 §7: implementations are encouraged to use EDNS-aware response
+; sizing; the "minimal-responses" convention (Unbound default since 1.5.x,
+; BIND `minimal-responses yes`) drops the AUTHORITY section from positive
+; answers to keep replies inside the EDNS UDP buffer budget. RFC 2181 §6.1
+; and RFC 1034 §3.7 do not require authoritative answers to carry NS or
+; SOA in AUTHORITY — those sections are advisory for positive responses.
+;
+; Bug-mode this catches: a resolver that *requires* AUTHORITY-section NS
+; records on positive answers (to refresh delegation state, or to bind
+; the answer to a zone cut) would reject this response and SERVFAIL.
+; Hark must accept the bare ANSWER section.
+;
+; Adjacent to EDNS: minimal-responses is the operator-facing knob that
+; trades AUTHORITY/ADDITIONAL fidelity for buffer headroom under the
+; RFC 6891 §6.2.3 sender's UDP-payload-size cap.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority (minimal-responses shape) ───────────
+; Note the absence of SECTION AUTHORITY and SECTION ADDITIONAL — the
+; only RR in the message is the requested A record. This is the wire
+; shape an Unbound auth with `minimal-responses: yes` emits.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+SCENARIO_END

@@ -1,0 +1,198 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN out-of-bailiwick NS records in AUTHORITY do not poison cache
+
+; Bug-mode: a foreign authority injects an NS RRset for a zone outside its
+; bailiwick into the AUTHORITY section of an otherwise-legitimate referral.
+; If the resolver caches that NS RRset (or, worse, treats it as authoritative
+; delegation data), a later query for the foreign zone gets routed at the
+; attacker's chosen nameserver and rdata.
+;
+; This is the "sibling-zone delegation poisoning" footgun. Spec basis:
+;   - RFC 2181 §5.4.1: ranking trust by source; out-of-bailiwick RRs from a
+;     non-authoritative source MUST NOT supersede authoritative data.
+;   - RFC 8499: definitions of in-bailiwick / out-of-bailiwick referrals.
+;
+; Scenario: .com auth returns a referral for example.com. (normal), AND
+; sneaks in an extra NS+glue for `evil.org.` -> `ns.evil.org. A 127.0.10.99`.
+; The .org auth at 127.0.10.4 returns the legitimate delegation to a
+; different IP (127.0.10.5). If the smuggled NS/glue from .com survives in
+; cache, hark will skip the .org auth and the answer (or query path) will
+; expose the bug. The CHECK_QUERY_LOG step asserts the legitimate path.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.org-auth.fake.
+    SECTION ADDITIONAL
+      a.org-auth.fake. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority (the poisoner) ─────────────────────────────
+; Authoritative for `com.` only. Smuggles AUTHORITY-section NS for
+; `evil.org.` plus matching glue. The NS owner name (evil.org.) is OUTSIDE
+; the com auth's bailiwick.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+      ; ── Poisoned NS RRset, out of bailiwick ──
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ; Matching out-of-bailiwick glue.
+      ns.evil.org. 86400 IN A 127.0.10.99
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ns.evil.org. 86400 IN A 127.0.10.99
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION ANSWER
+      example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Fake .org authority (legitimate delegator) ─────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION AUTHORITY
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.evil.org. 86400 IN A 127.0.10.5
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION AUTHORITY
+      evil.org. 86400 IN NS ns.evil.org.
+    SECTION ADDITIONAL
+      ns.evil.org. 86400 IN A 127.0.10.5
+  ENTRY_END
+RANGE_END
+
+; ── Fake evil.org authority (legitimate) ───────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      evil.org. IN A
+    SECTION ANSWER
+      evil.org. 3600 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ─────────────────────────────────────────────
+
+; Plant the poison by resolving example.com first. The com auth will leak
+; an NS RRset for evil.org. in AUTHORITY.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN A
+  SECTION ANSWER
+    example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+; Now resolve evil.org. — the smuggled NS RRset must not affect this.
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    evil.org. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    evil.org. IN A
+  SECTION ANSWER
+    evil.org. 3600 IN A 10.20.30.40
+ENTRY_END
+
+; The query path must pass through the legitimate .org auth (127.0.10.4)
+; on its way to the real evil.org auth (127.0.10.5). A resolver that
+; honoured the AUTHORITY-section NS poison would either query 127.0.10.99
+; (dark — no responder) or skip the .org auth entirely.
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    org. A 127.0.10.1
+    evil.org. A 127.0.10.4
+    evil.org. A 127.0.10.5
+ENTRY_END
+
+SCENARIO_END
