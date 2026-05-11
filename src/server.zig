@@ -41,8 +41,24 @@ const serializeErrorResponse = response.serializeErrorResponse;
 const validateQuery = response.validateQuery;
 const sys = @import("sys.zig");
 const monotonic = @import("monotonic.zig");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.server);
+
+/// Parse the test-harness clock-advance control qname. Returns the number
+/// of seconds to advance, or null if the qname doesn't match. Format:
+/// `_advance-clock.<seconds>.testharness.invalid` (server layer strips the
+/// trailing dot). RFC 6761 reserves `invalid.` so the name is unrouted in
+/// production; gating on `build_options.testing_enabled` compiles the
+/// intercept out of release builds entirely.
+inline fn parseAdvanceClockQname(name: []const u8) ?i64 {
+    const prefix = "_advance-clock.";
+    const suffix = ".testharness.invalid";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    const middle = name[prefix.len .. name.len - suffix.len];
+    return std.fmt.parseInt(i64, middle, 10) catch null;
+}
 
 const work_queue_capacity = 256;
 
@@ -1162,6 +1178,19 @@ const WorkerState = struct {
         bypass_cache: bool,
         transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
+        // Test harness control channel: `_advance-clock.<N>.testharness.invalid.`
+        // advances the synthetic monotonic clock by <N> seconds and returns
+        // an empty NOERROR. Used by `STEP n TIME_PASSES` to observe TTL
+        // expiry without wall-clock sleeps. Gated on `-Dtesting=true` — the
+        // intercept doesn't exist in production builds.
+        if (build_options.testing_enabled) {
+            if (parseAdvanceClockQname(name)) |secs| {
+                monotonic.advanceTestClock(secs);
+                return .{
+                    .message = response.synthesizedMessage(&.{}, &.{}, .no_error, false),
+                };
+            }
+        }
         switch (self.config.mode) {
             .recursive => {
                 var resolver = RecursiveResolver{
