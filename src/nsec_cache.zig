@@ -17,23 +17,33 @@ const NsecEntry = struct {
     next_domain: dns.Name,
     type_bit_maps: []const u8,
     expires_at: i64,
+    /// RRSIGs covering this NSEC (cloned, owned by zone allocator).
+    /// Typically 1-2; multiple during key rollover (RFC 6781). Empty when
+    /// upstream omitted the covering RRSIG — synthesis verdict still works
+    /// for AD-trusting clients, DO=1 clients see the proof bundle as
+    /// insecure rather than secure.
+    sigs: []dns.ResourceRecord = &.{},
 };
+
+/// Deep-clone a non-NSEC record (e.g. RRSIG covering NSEC, SOA).
+/// Assumes `wire` is not load-bearing — we re-emit from rdata on serve.
+fn cloneRecord(alloc: Allocator, rr: dns.ResourceRecord) !dns.ResourceRecord {
+    const name = try dns.cloneName(alloc, rr.name);
+    errdefer dns.freeName(alloc, name);
+    const rdata = try cache_mod.cloneRData(alloc, rr.rdata);
+    return .{ .name = name, .rtype = rr.rtype, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = rdata };
+}
+
+fn freeRecord(alloc: Allocator, rr: *dns.ResourceRecord) void {
+    dns.freeName(alloc, rr.name);
+    dns.freeRData(alloc, rr.rdata);
+}
 
 // ── Zone NSEC list ────────────────────────────────────────────────────
 // Sorted by canonical name order for binary search.
 
-/// Deep-clone a SOA ResourceRecord.
-fn cloneSoaRecord(alloc: Allocator, rr: dns.ResourceRecord) !dns.ResourceRecord {
-    const name = try dns.cloneName(alloc, rr.name);
-    errdefer dns.freeName(alloc, name);
-    const rdata = try cache_mod.cloneRData(alloc, rr.rdata);
-    return .{ .name = name, .rtype = .soa, .rclass = .in, .ttl = rr.ttl, .rdata = rdata };
-}
-
-fn freeSoaRecord(alloc: Allocator, rr: *dns.ResourceRecord) void {
-    dns.freeName(alloc, rr.name);
-    dns.freeRData(alloc, rr.rdata);
-}
+const cloneSoaRecord = cloneRecord;
+const freeSoaRecord = freeRecord;
 
 const ZoneNsecList = struct {
     entries: []NsecEntry,
@@ -166,13 +176,48 @@ const ZoneNsecList = struct {
     }
 };
 
-fn cloneEntry(alloc: Allocator, rr: dns.ResourceRecord, expires_at: i64) !NsecEntry {
+fn cloneEntry(
+    alloc: Allocator,
+    rr: dns.ResourceRecord,
+    expires_at: i64,
+    nsec_ttl: u32,
+    authorities: []const dns.ResourceRecord,
+) !NsecEntry {
     const owner = try dns.cloneName(alloc, rr.name);
     errdefer dns.freeName(alloc, owner);
     const next = try dns.cloneName(alloc, rr.rdata.nsec.next_domain_name);
     errdefer dns.freeName(alloc, next);
     const bitmaps = try alloc.dupe(u8, rr.rdata.nsec.type_bit_maps);
-    return .{ .owner = owner, .next_domain = next, .type_bit_maps = bitmaps, .expires_at = expires_at };
+    errdefer alloc.free(bitmaps);
+
+    // Collect RRSIGs covering this NSEC at the same owner. Bailiwick is
+    // already enforced by storeFromAuthority's NSEC filter. Cap at 4 —
+    // dual-algo + KSK-rollover transient is the realistic ceiling (RFC
+    // 6781 §4.1.4 produces at most 4 RRSIGs per RRset during rollover).
+    var sig_buf: [4]dns.ResourceRecord = undefined;
+    var sig_count: usize = 0;
+    for (authorities) |a| {
+        if (a.rtype != .rrsig) continue;
+        if (a.rdata.rrsig.type_covered != .nsec) continue;
+        if (!a.name.eql(rr.name)) continue;
+        if (sig_count >= sig_buf.len) break;
+        var cloned = cloneRecord(alloc, a) catch continue;
+        // Match the NSEC's RFC 9077 clamp so a defense-in-depth read of
+        // entry.sigs[i].ttl would never over-cache.
+        cloned.ttl = nsec_ttl;
+        sig_buf[sig_count] = cloned;
+        sig_count += 1;
+    }
+    const sigs: []dns.ResourceRecord = if (sig_count == 0) &.{} else blk: {
+        const arr = alloc.alloc(dns.ResourceRecord, sig_count) catch {
+            for (sig_buf[0..sig_count]) |*s| freeRecord(alloc, s);
+            break :blk &.{};
+        };
+        @memcpy(arr, sig_buf[0..sig_count]);
+        break :blk arr;
+    };
+
+    return .{ .owner = owner, .next_domain = next, .type_bit_maps = bitmaps, .expires_at = expires_at, .sigs = sigs };
 }
 
 /// Detect minimal/black-lies NSEC ranges where next_domain is owner with
@@ -188,6 +233,8 @@ fn freeEntry(alloc: Allocator, e: *NsecEntry) void {
     dns.freeName(alloc, e.owner);
     dns.freeName(alloc, e.next_domain);
     alloc.free(e.type_bit_maps);
+    for (e.sigs) |*s| freeRecord(alloc, s);
+    if (e.sigs.len > 0) alloc.free(e.sigs);
 }
 
 /// Determine closest encloser: walk up qname labels from left to right.
@@ -212,6 +259,11 @@ pub const SynthResult = struct {
     /// For wildcard_match: label count of the closest encloser. Caller reconstructs
     /// *.CE from the qname it already has (CE is the last ce_label_count labels).
     ce_label_count: u8 = 0,
+    /// NSEC records (and their covering RRSIGs) that justify `rcode` for
+    /// this specific qname (RFC 4035 §3.1.3.x). Cloned into caller_alloc;
+    /// caller appends to authority for downstream revalidation. Empty when
+    /// upstream omitted RRSIGs or only the SOA proves the negative.
+    proofs: []dns.ResourceRecord = &.{},
 
     pub const RCode = enum { nxdomain, nodata, wildcard_match };
 };
@@ -306,7 +358,7 @@ pub const NsecCache = struct {
             if (isMinimalNsec(rr.name, rr.rdata.nsec.next_domain_name)) continue;
             if (clone_count >= max_store_batch) break;
             const effective_ttl = @min(rr.ttl, soa_minimum, soa_ttl, max_aggressive_ttl);
-            cloned[clone_count] = cloneEntry(alloc, rr, now + @as(i64, effective_ttl)) catch continue;
+            cloned[clone_count] = cloneEntry(alloc, rr, now + @as(i64, effective_ttl), effective_ttl, authorities) catch continue;
             clone_count += 1;
         }
         if (clone_count == 0) return;
@@ -425,10 +477,26 @@ pub const NsecCache = struct {
             }
         }
 
+        var proof_refs: [2]*const NsecEntry = undefined;
+        var proof_ref_count: usize = 0;
         const rcode: SynthResult.RCode, const ce_len: u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
-            .nxdomain => .{ .nxdomain, 0 },
-            .wildcard_nodata => .{ .nodata, 0 },
-            .wildcard_match => |ce| .{ .wildcard_match, ce },
+            .nxdomain => |refs| blk: {
+                proof_refs[0] = refs.qname_cover;
+                proof_refs[1] = refs.wildcard_cover;
+                proof_ref_count = 2;
+                break :blk .{ .nxdomain, 0 };
+            },
+            .wildcard_nodata => |refs| blk: {
+                proof_refs[0] = refs.qname_cover;
+                proof_refs[1] = refs.wildcard_owner;
+                proof_ref_count = 2;
+                break :blk .{ .nodata, 0 };
+            },
+            .wildcard_match => |refs| blk: {
+                proof_refs[0] = refs.qname_cover;
+                proof_ref_count = 1;
+                break :blk .{ .wildcard_match, refs.ce_label_count };
+            },
             .unknown => nodata: {
                 const nsec = list.findExact(qname, now) orelse return null;
                 // Don't synthesize NODATA if CNAME exists — query must follow the
@@ -436,13 +504,18 @@ pub const NsecCache = struct {
                 if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
                     return null;
                 if (!dns.typeBitmapContains(nsec.type_bit_maps, qtype))
-                    break :nodata .{ .nodata, 0 };
+                    break :nodata blk: {
+                        proof_refs[0] = nsec;
+                        proof_ref_count = 1;
+                        break :blk .{ .nodata, 0 };
+                    };
                 return null;
             },
         };
         const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
+        const proofs = cloneProofs(caller_alloc, proof_refs[0..proof_ref_count], now);
         _ = self.hits.fetchAdd(1, .monotonic);
-        return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len };
+        return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len, .proofs = proofs };
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
@@ -467,17 +540,78 @@ fn zoneLabelsLen(zone_lower: []const u8) usize {
     return count;
 }
 
-/// Result of name non-existence proof (RFC 8198 §5.3).
+/// Clone an NSEC entry as a fresh ResourceRecord. Owns its name, next, and
+/// bitmap independently — freeRecord cleans up via dns.freeRData.
+fn nsecEntryToRecord(alloc: Allocator, entry: *const NsecEntry, ttl: u32) !dns.ResourceRecord {
+    const name = try dns.cloneName(alloc, entry.owner);
+    errdefer dns.freeName(alloc, name);
+    const next = try dns.cloneName(alloc, entry.next_domain);
+    errdefer dns.freeName(alloc, next);
+    const bitmap = try alloc.dupe(u8, entry.type_bit_maps);
+    return .{
+        .name = name,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = ttl,
+        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = bitmap } },
+    };
+}
+
+/// Clone N NSEC proofs (each with covering RRSIGs) into a fresh slice.
+/// Best-effort: on any allocation failure, unwinds anything written so far
+/// and returns empty (DO=1 clients see the response as insecure rather
+/// than secure; AD-trusting clients are unaffected because hark's verdict
+/// already authenticated the synthesis).
+fn cloneProofs(alloc: Allocator, refs: []const *const NsecEntry, now: i64) []dns.ResourceRecord {
+    if (refs.len == 0) return &.{};
+    var total: usize = 0;
+    for (refs) |r| total += 1 + r.sigs.len;
+    if (total == 0) return &.{};
+    const out = alloc.alloc(dns.ResourceRecord, total) catch return &.{};
+    var pos: usize = 0;
+    for (refs) |r| {
+        const remaining_i: i64 = r.expires_at - now;
+        if (remaining_i <= 0) {
+            unwindProofs(alloc, out, pos);
+            return &.{};
+        }
+        const remaining: u32 = @intCast(@min(remaining_i, @as(i64, std.math.maxInt(u32))));
+
+        out[pos] = nsecEntryToRecord(alloc, r, remaining) catch {
+            unwindProofs(alloc, out, pos);
+            return &.{};
+        };
+        pos += 1;
+        for (r.sigs) |sig| {
+            out[pos] = cloneRecord(alloc, sig) catch {
+                unwindProofs(alloc, out, pos);
+                return &.{};
+            };
+            out[pos].ttl = remaining;
+            pos += 1;
+        }
+    }
+    return out[0..pos];
+}
+
+fn unwindProofs(alloc: Allocator, out: []dns.ResourceRecord, written: usize) void {
+    for (out[0..written]) |*rr| freeRecord(alloc, rr);
+    alloc.free(out);
+}
+
+/// Result of name non-existence proof (RFC 8198 §5.3). Variants carry
+/// pointers to the cached NSECs the verdict relied on so tryZone can
+/// clone them into the caller's allocator as proof material.
 const NameNonExistence = union(enum) {
-    nxdomain, // name and wildcard both don't exist
-    wildcard_nodata, // name doesn't exist, wildcard exists but lacks qtype
-    wildcard_match: u8, // name doesn't exist, wildcard has qtype — CE label count
-    unknown, // can't prove anything
+    nxdomain: struct { qname_cover: *const NsecEntry, wildcard_cover: *const NsecEntry },
+    wildcard_nodata: struct { qname_cover: *const NsecEntry, wildcard_owner: *const NsecEntry },
+    wildcard_match: struct { qname_cover: *const NsecEntry, ce_label_count: u8 },
+    unknown,
 };
 
 fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RType, now: i64) NameNonExistence {
     // (a) Find NSEC covering qname
-    _ = list.findCovering(qname, now) orelse return .unknown;
+    const qname_cover = list.findCovering(qname, now) orelse return .unknown;
 
     // (b) Determine closest encloser, then check wildcard
     const ce = findClosestEncloser(list, qname, now) orelse return .unknown;
@@ -492,14 +626,14 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
         if (qtype != .cname and dns.typeBitmapContains(wc_nsec.type_bit_maps, .cname))
             return .unknown;
         if (!dns.typeBitmapContains(wc_nsec.type_bit_maps, qtype)) {
-            return .wildcard_nodata;
+            return .{ .wildcard_nodata = .{ .qname_cover = qname_cover, .wildcard_owner = wc_nsec } };
         }
-        return .{ .wildcard_match = @intCast(ce.labels.len) };
+        return .{ .wildcard_match = .{ .qname_cover = qname_cover, .ce_label_count = @intCast(ce.labels.len) } };
     }
 
     // Prove wildcard name is covered by an NSEC (doesn't exist)
-    _ = list.findCovering(wildcard_name, now) orelse return .unknown;
-    return .nxdomain;
+    const wildcard_cover = list.findCovering(wildcard_name, now) orelse return .unknown;
+    return .{ .nxdomain = .{ .qname_cover = qname_cover, .wildcard_cover = wildcard_cover } };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -541,9 +675,15 @@ fn testCache(alloc: Allocator) NsecCache {
     return nc;
 }
 
+fn freeSynth(alloc: Allocator, r: *SynthResult) void {
+    freeSoaRecord(alloc, &r.soa);
+    for (r.proofs) |*p| freeRecord(alloc, p);
+    if (r.proofs.len > 0) alloc.free(r.proofs);
+}
+
 fn expectSynth(alloc: Allocator, result: ?SynthResult, expected: SynthResult.RCode) !void {
     var r = result orelse return error.TestExpectedEqual;
-    defer freeSoaRecord(alloc, &r.soa);
+    defer freeSynth(alloc, &r);
     try testing.expectEqual(expected, r.rcode);
 }
 
@@ -706,8 +846,8 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
     // → wildcard_match (not NXDOMAIN). Caller synthesizes from RRset cache.
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
     defer dns.freeName(alloc, qname);
-    const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
-    defer freeSoaRecord(alloc, @constCast(&result.soa));
+    var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
+    defer freeSynth(alloc, &result);
     try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
     try testing.expect(result.ce_label_count > 0);
 }
@@ -927,10 +1067,67 @@ test "NSEC cache: wildcard match returns wildcard_match" {
     // "foo.example.com" A — wildcard has A → wildcard_match
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
     defer dns.freeName(alloc, qname);
-    const result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
-    defer freeSoaRecord(alloc, @constCast(&result.soa));
+    var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
+    defer freeSynth(alloc, &result);
     try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
     try testing.expect(result.ce_label_count > 0);
+}
+
+test "NSEC cache: wildcard_match proofs carry NSEC + covering RRSIG" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex_owner = try dns.parseDottedName(alloc, "example.com");
+    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
+    const z_name = try dns.parseDottedName(alloc, "z.example.com");
+    defer dns.freeName(alloc, apex_owner);
+    defer dns.freeName(alloc, wc_name);
+    defer dns.freeName(alloc, z_name);
+    const sig_signer = try dns.parseDottedName(alloc, "example.com");
+    defer dns.freeName(alloc, sig_signer);
+
+    // Authority section now includes RRSIGs covering the NSEC records —
+    // these get bundled onto NsecEntry.sigs and emitted as proofs.
+    // Canonical order: `*.example.com` < `foo.example.com` < `z.example.com`,
+    // so the qname-covering NSEC for `foo` is the one at `*.example.com`.
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
+        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
+        .{ .name = wc_name, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = .{
+            .type_covered = .nsec,
+            .algorithm = .ecdsap256sha256,
+            .labels = 2,
+            .original_ttl = 3600,
+            .sig_expiration = 0,
+            .sig_inception = 0,
+            .key_tag = 0,
+            .signer_name = sig_signer,
+            .signature = "",
+        } } },
+    }, example_zone);
+
+    const qname = try dns.parseDottedName(alloc, "foo.example.com");
+    defer dns.freeName(alloc, qname);
+    var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
+    defer freeSynth(alloc, &result);
+    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    // 1 NSEC (qname cover) + 1 RRSIG covering it.
+    try testing.expectEqual(@as(usize, 2), result.proofs.len);
+    var saw_nsec = false;
+    var saw_rrsig = false;
+    for (result.proofs) |p| {
+        if (p.rtype == .nsec) saw_nsec = true;
+        if (p.rtype == .rrsig) saw_rrsig = true;
+    }
+    try testing.expect(saw_nsec);
+    try testing.expect(saw_rrsig);
 }
 
 test "NSEC cache: wildcard CNAME suppression" {

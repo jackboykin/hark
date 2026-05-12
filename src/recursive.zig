@@ -423,15 +423,16 @@ pub const RecursiveResolver = struct {
                         switch (synth.rcode) {
                             .nxdomain, .nodata => |rc| {
                                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
+                                const authority = try buildNegativeAuthority(allocator, synth.soa, synth.proofs);
                                 return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, &.{synth.soa}, rcode, true)),
+                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authority, rcode, true)),
                                     .prefetch_name = prefetch_name,
                                     .prefetch_qtype = qtype,
                                 };
                             },
                             .wildcard_match => {
                                 // RFC 8198 §5.3: synthesize answer from cached wildcard RRset.
-                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, target_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| {
+                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| {
                                     return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
                                 }
                                 // Wildcard RRset not in cache — fall through to upstream (RFC 8198 §5.3 MUST)
@@ -926,6 +927,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         ce_label_count: u8,
         soa: dns.ResourceRecord,
+        nsec_proofs: []const dns.ResourceRecord,
         target_name: dns.Name,
         qtype: dns.RType,
         cname_chain_items: []const dns.ResourceRecord,
@@ -948,15 +950,11 @@ pub const RecursiveResolver = struct {
                 // direct assignment. RFC 4035 §3.1.3.4: the RRSIG's labels
                 // field stays at the wildcard depth, so a DO=1 client
                 // reconstructs `*.CE` from qname and revalidates correctly.
-                //
-                // NSEC proof of qname's nonexistence is not shipped here —
-                // a separate change extends NsecCache to expose per-qname
-                // proofs (the wildcard cache entry can't tell which qname
-                // the NSECs would cover).
                 for (h.records) |*rr| rr.name = target_name;
                 for (h.sigs) |*rr| rr.name = target_name;
                 const answer = try concatRRs(allocator, h.records, h.sigs);
-                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(answer, &.{soa}, .no_error, h.security_status == .secure));
+                const authority = try buildNegativeAuthority(allocator, soa, nsec_proofs);
+                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(answer, authority, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
