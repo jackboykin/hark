@@ -1,0 +1,208 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN long CNAME chain with same-zone segment resolves end-to-end
+
+; Mirrors the shape of `ba.dn.nexoncdn.co.kr` (8-hop Akamai chain):
+;   - 1 cross-zone CNAME (alpha.fake → beta.fake)
+;   - 5 same-zone CNAMEs (hop1..hop6 inside beta.fake)
+;   - 2 cross-zone CNAMEs (beta.fake → gamma.fake → delta.fake)
+;   = 8 CNAMEs total, terminal A on delta.fake
+;
+; Regression for budget conflation between network calls and same-zone
+; CNAME continuations: a single counter that charged both would exhaust
+; before the chain completed.
+
+; ── Fake root ─────────────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      fake. IN A
+    SECTION AUTHORITY
+      fake. 86400 IN NS a.tld.fake.
+    SECTION ADDITIONAL
+      a.tld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── .fake TLD authority ──────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      alpha.fake. IN A
+    SECTION AUTHORITY
+      alpha.fake. 86400 IN NS ns.alpha.fake.
+    SECTION ADDITIONAL
+      ns.alpha.fake. 86400 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      beta.fake. IN A
+    SECTION AUTHORITY
+      beta.fake. 86400 IN NS ns.beta.fake.
+    SECTION ADDITIONAL
+      ns.beta.fake. 86400 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      gamma.fake. IN A
+    SECTION AUTHORITY
+      gamma.fake. 86400 IN NS ns.gamma.fake.
+    SECTION ADDITIONAL
+      ns.gamma.fake. 86400 IN A 127.0.10.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      delta.fake. IN A
+    SECTION AUTHORITY
+      delta.fake. 86400 IN NS ns.delta.fake.
+    SECTION ADDITIONAL
+      ns.delta.fake. 86400 IN A 127.0.10.6
+  ENTRY_END
+RANGE_END
+
+; ── alpha.fake authority ──────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      target.alpha.fake. IN A
+    SECTION ANSWER
+      target.alpha.fake. 3600 IN CNAME hop1.beta.fake.
+  ENTRY_END
+RANGE_END
+
+; ── beta.fake authority — 5-hop same-zone CNAME run ─────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop1.beta.fake. IN A
+    SECTION ANSWER
+      hop1.beta.fake. 3600 IN CNAME hop2.beta.fake.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop2.beta.fake. IN A
+    SECTION ANSWER
+      hop2.beta.fake. 3600 IN CNAME hop3.beta.fake.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop3.beta.fake. IN A
+    SECTION ANSWER
+      hop3.beta.fake. 3600 IN CNAME hop4.beta.fake.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop4.beta.fake. IN A
+    SECTION ANSWER
+      hop4.beta.fake. 3600 IN CNAME hop5.beta.fake.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop5.beta.fake. IN A
+    SECTION ANSWER
+      hop5.beta.fake. 3600 IN CNAME hop6.beta.fake.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      hop6.beta.fake. IN A
+    SECTION ANSWER
+      hop6.beta.fake. 3600 IN CNAME bridge.gamma.fake.
+  ENTRY_END
+RANGE_END
+
+; ── gamma.fake authority ──────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      bridge.gamma.fake. IN A
+    SECTION ANSWER
+      bridge.gamma.fake. 3600 IN CNAME final.delta.fake.
+  ENTRY_END
+RANGE_END
+
+; ── delta.fake authority — terminal A ─────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      final.delta.fake. IN A
+    SECTION ANSWER
+      final.delta.fake. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    target.alpha.fake. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; Assert: terminal A is reached and the full CNAME chain rides along.
+  ; rcode=NOERROR (not SERVFAIL=MaxQueriesExceeded), final A present.
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    target.alpha.fake. IN A
+  SECTION ANSWER
+    target.alpha.fake. 3600 IN CNAME hop1.beta.fake.
+    hop1.beta.fake. 3600 IN CNAME hop2.beta.fake.
+    hop2.beta.fake. 3600 IN CNAME hop3.beta.fake.
+    hop3.beta.fake. 3600 IN CNAME hop4.beta.fake.
+    hop4.beta.fake. 3600 IN CNAME hop5.beta.fake.
+    hop5.beta.fake. 3600 IN CNAME hop6.beta.fake.
+    hop6.beta.fake. 3600 IN CNAME bridge.gamma.fake.
+    bridge.gamma.fake. 3600 IN CNAME final.delta.fake.
+    final.delta.fake. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

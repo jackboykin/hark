@@ -103,8 +103,8 @@ ENTRY_END
 ; Trip conditions: a Hickory-class bug here would manifest as either
 ;   (a) wrong rcode — e.g. NXDOMAIN if hark wrongly believed the leaked
 ;       parent NS made `missing.example.com.` its own zone with no records
-;   (b) SERVFAIL from a referral loop (`MaxReferralsExceeded`) if hark
-;       kept re-following the same-zone NS records
+;   (b) SERVFAIL from a referral loop (`ReferralLoop` or `MaxQueriesExceeded`)
+;       if hark kept re-following the same-zone NS records
 ;   (c) test timeout if hark hangs chasing its tail
 ;   (d) AAAA dispatched to wrong auth — caught by STEP 3 above.
 ; CHECK_ANSWER catches (a) and (b); the 5s UDP timeout catches (c).

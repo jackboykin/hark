@@ -62,9 +62,23 @@ pub const root_hints_default: [26]na.Address = .{
     na.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
 };
 
-const max_referrals = 10;
+// Per-resolveImpl-call ceiling on calls to queryAuthoritativeServers.
+// The single network-touching counter — same-zone CNAME continuations,
+// QMIN cache-hit advances, and other zero-I/O loop iterations cost zero
+// against this. Bounded by `max_resolve_depth` × this value across the
+// full call tree (sub-recursions for NS A/AAAA + DNSKEY get their own
+// budget). Picked to clear an 8-hop CDN chain (`ba.dn.nexoncdn.co.kr`)
+// observed at ~9 queries with comfortable headroom for DNSSEC retries.
+const max_upstream_queries = 32;
+// Sizes `seen_zones` and bounds the per-cross-zone-walk delegation count.
+// Real DNS depth tops out around 5; 16 covers QMIN-with-referrals stacks
+// without giving up loop-detection.
+const max_delegations = 16;
 const max_servers_per_level = 26;
-const max_cname_chain = 8;
+// Total CNAME hops per resolveImpl call. Bumped from 8 to clear the same
+// 8-hop CDN chain (Akamai/edgesuite stacks); matches PowerDNS post-fix
+// and Hickory.
+const max_cname_chain = 16;
 const max_minimize_count = 10;
 
 /// Parse a DNS message, propagating OOM and converting other parse
@@ -279,6 +293,9 @@ pub const RecursiveResolver = struct {
     fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
         var current_name: []const u8 = name;
         var cname_count: usize = 0;
+        // Counts queryAuthoritativeServers calls only; total_probes
+        // bounds QMIN iterations (including cache-hit advances).
+        var upstream_queries: usize = 0;
         var total_probes: usize = 0;
         var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
         defer cname_chain.deinit(allocator);
@@ -448,7 +465,7 @@ pub const RecursiveResolver = struct {
             var server_count: usize = hints.len;
             @memcpy(servers[0..hints.len], hints);
 
-            var seen_zones: [max_referrals]dns.Name = undefined;
+            var seen_zones: [max_delegations]dns.Name = undefined;
             var seen_zone_count: usize = 0;
 
             // Parent zone tracks the zone the current servers are authoritative for.
@@ -476,7 +493,7 @@ pub const RecursiveResolver = struct {
             else
                 target_name.labels.len; // disabled: always send full name
 
-            for (0..max_referrals) |_| {
+            while (true) {
                 // Determine if this iteration sends the full (final) query or a probe.
                 const is_final = minimize_label_count >= target_name.labels.len or
                     !self.qname_minimization or total_probes >= max_minimize_count;
@@ -516,6 +533,8 @@ pub const RecursiveResolver = struct {
                     }
                 }
 
+                if (upstream_queries >= max_upstream_queries) return error.MaxQueriesExceeded;
+                upstream_queries += 1;
                 const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, &servers, server_count, parent_zone);
                 var response = sqr.message;
                 const responding_server = sqr.responding_server;
@@ -839,7 +858,7 @@ pub const RecursiveResolver = struct {
                 minimize_label_count = parent_zone.labels.len + 1;
             }
 
-            return error.MaxReferralsExceeded;
+            unreachable; // while(true) only exits via inner returns / continue :cname_loop
         }
     }
 
@@ -857,7 +876,7 @@ pub const RecursiveResolver = struct {
         parent_zone: *dns.Name,
         servers: *[max_servers_per_level]na.Address,
         server_count: *usize,
-        seen_zones: *[max_referrals]dns.Name,
+        seen_zones: *[max_delegations]dns.Name,
         seen_zone_count: *usize,
     ) !void {
         const zone_cut = switch (referral) {
@@ -880,7 +899,9 @@ pub const RecursiveResolver = struct {
             },
         };
 
-        // Loop detection
+        // Depth cap first: cheaper than the dup-scan and prevents the
+        // OOB write at the bottom (seen_zones is sized to max_delegations).
+        if (seen_zone_count.* >= max_delegations) return error.MaxDelegationsExceeded;
         for (seen_zones.*[0..seen_zone_count.*]) |sz| {
             if (sz.eql(zone_cut)) return error.ReferralLoop;
         }
