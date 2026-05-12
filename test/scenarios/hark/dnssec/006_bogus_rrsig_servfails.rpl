@@ -1,0 +1,63 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN bogus RRSIG must SERVFAIL with no AD bit
+
+; Security-critical negative: a validating resolver that stamps AD=1 on an
+; orphan/forged RRSIG is broken in a way that nullifies DNSSEC. This
+; scenario ships a leaf A record with a hand-rolled RRSIG using key_tag=1,
+; which won't match the harness's randomly-generated DNSKEY. Hark's
+; classification path is "no DNSKEY with matching key_tag covers this
+; rrset" → bogus → SERVFAIL.
+;
+; Coverage scope: this exercises the orphan-RRSIG rejection path, NOT
+; signature-byte verification. To test the latter the scenario would need
+; a key_tag colliding with the random per-run harness DNSKEY (impractical
+; in a static .rpl). Both paths must classify as bogus; this covers one.
+;
+; Mechanism: the responder's `_has_covering_rrsig` check skips harness
+; signing when the entry already declares an RRSIG covering the target
+; rdtype (responder.py:349). So the bogus signature reaches hark verbatim,
+; and the harness still synthesizes a legitimate `. DNSKEY` answer when
+; hark fetches it.
+;
+; Expected: rcode=SERVFAIL, AD=0, no answer section. If hark ever returns
+; NOERROR + AD=1 here, the validator is forging trust.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION ANSWER
+      example. 3600 IN A 192.0.2.1
+      ; Hand-rolled bogus RRSIG: alg 13 (ECDSAP256SHA256), key_tag 1 (won't
+      ; match the harness's randomly-generated DNSKEY), zero signature
+      ; bytes. dnspython parses this; harness sees a covering RRSIG and
+      ; doesn't overwrite it.
+      example. 3600 IN RRSIG A 13 1 3600 20990101000000 20200101000000 1 . AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` covers rcode + AD; the assertion fails if hark either
+  ; returns NOERROR or sets AD=1 on this forged answer.
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+SCENARIO_END
