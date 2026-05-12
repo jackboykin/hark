@@ -1,0 +1,60 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN signed NXDOMAIN with NSEC proof validates to AD=1
+
+; Equivalent to the Unbound iter_cname_minimise_nx scenario, minus the
+; fake-sha1 dependency. The CNAME-chasing piece of the original was
+; incidental; the load-bearing coverage is "hark accepts a properly-
+; constructed NSEC NXDOMAIN proof and stamps AD=1 on the response."
+;
+; Zone layout (signed root, harness-generated key):
+;   `.`   — apex (SOA + NS + DNSKEY)
+;   `a.`  — A 192.0.2.1
+;   `c.`  — A 192.0.2.2
+;
+; Canonical name ordering: `.` < `a.` < `b.` < `c.`. A query for `b. A`
+; must NXDOMAIN with two NSEC proofs:
+;
+;   1. `a. NSEC c. ...` — covers `b.` since `a. < b. < c.` (proves the
+;      queried name doesn't exist).
+;   2. `. NSEC a. ...`  — covers `*.` since `*` (0x2A) < `a` (0x61)
+;      (proves no wildcard expansion).
+;
+; Both NSEC RRsets, plus the SOA, get auto-signed by the harness with
+; the root key. Hark must validate all three signatures and the
+; closest-encloser/cover bitmap logic, then set AD=1.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` covers AD + the NXDOMAIN rcode in one check.
+  MATCH flags question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+SCENARIO_END
