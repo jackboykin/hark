@@ -2281,19 +2281,60 @@ pub const RecursiveResolver = struct {
         var count: usize = 0;
 
         for (ns_names) |ns_name| {
-            const ns_dotted = try nameToDotted(allocator, ns_name);
-            for (address_rtypes) |qtype| {
-                if (cache.lookup(allocator, ns_dotted, qtype, .in)) |result| {
-                    switch (result) {
-                        .hit => |h| _ = self.appendAddressesFromRecords(h.records, &addrs, &count),
-                        .negative => {},
-                    }
-                }
-            }
+            try self.collectCachedNsAddresses(allocator, cache, ns_name, &addrs, &count, 0);
         }
 
         if (count == 0) return null;
         return .{ .addrs = addrs, .count = count };
+    }
+
+    // Max alias hops we'll follow when collecting NS addresses from cache.
+    // 1 covers the legitimate case (single CNAME); deeper chains are vanishingly
+    // rare and would cost extra arena allocs inside cache.lookup per hop.
+    const max_ns_cname_chain: u8 = 1;
+
+    /// Follow one cached CNAME if no A/AAAA — repairs stale-glue when the
+    /// alias chain is fresh (cf. `iter_cname_cache.rpl`). RFC 2181 §10.3
+    /// forbids NS pointing to an alias, but tolerating on read costs nothing.
+    fn collectCachedNsAddresses(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        cache: *RRsetCache,
+        ns_name: dns.Name,
+        addrs: *[max_servers_per_level]na.Address,
+        count: *usize,
+        depth: u8,
+    ) error{OutOfMemory}!void {
+        if (depth > max_ns_cname_chain) return;
+
+        // cache.lookup re-copies the name into its own buffer; pass the
+        // stack-formatted slice directly instead of duping into the arena.
+        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        const ns_dotted = ns_name.formatInto(&name_buf);
+
+        const before = count.*;
+        for (address_rtypes) |qtype| {
+            if (cache.lookup(allocator, ns_dotted, qtype, .in)) |result| {
+                switch (result) {
+                    .hit => |h| _ = self.appendAddressesFromRecords(h.records, addrs, count),
+                    .negative => {},
+                }
+            }
+        }
+        if (count.* > before) return;
+
+        const cname_lookup = cache.lookup(allocator, ns_dotted, .cname, .in) orelse return;
+        switch (cname_lookup) {
+            .hit => |h| {
+                for (h.records) |rr| {
+                    if (rr.rtype == .cname) {
+                        try self.collectCachedNsAddresses(allocator, cache, rr.rdata.cname, addrs, count, depth + 1);
+                        return; // RFC 2181 §10.1: at most one CNAME per name
+                    }
+                }
+            },
+            .negative => {},
+        }
     }
 
     /// Walk the domain name from TLD to find the closest cached delegation.

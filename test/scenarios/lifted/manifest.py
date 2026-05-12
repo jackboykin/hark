@@ -78,7 +78,7 @@ MANIFEST: list[LiftedEntry] = [
     # iter_cname_cache uses an IPv6 ADDRESS (`2002::5`). The lifter maps
     # the single v6 address to `::1` (the only unprivileged v6 loopback)
     # and the responder binds an AF_INET6 socket alongside the v4 sockets.
-    LiftedEntry("iter_cname_cache.rpl",                   "iter_cname",       "hark behaviour diverges: when one delegation NS's glue expires (TTL=1) and the remaining sibling NSes all SERVFAIL, hark doesn't re-resolve the expired NS's address (stale-glue corner of the lame-NS fallthrough class)"),
+    LiftedEntry("iter_cname_cache.rpl",                   "iter_cname",       None),
 
     # iter_cycle — NS-cycle / loop-detection
     LiftedEntry("iter_cycle.rpl",                         "iter_cycle",       None),
