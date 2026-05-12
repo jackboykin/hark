@@ -6,11 +6,32 @@ const Allocator = mem.Allocator;
 const Io = std.Io;
 const File = Io.File;
 const testing = std.testing;
+const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
 const tls = @import("tls");
 
 const AddressKey = na.AddressKey;
+
+/// Floor and ceiling for upstream-advertised keepalive timeouts. Bounds
+/// `applyKeepaliveHint` against weaponized values: TIMEOUT=0 ("close ASAP")
+/// would induce per-query reconnect storms — handshake amplification by any
+/// hostile upstream. TIMEOUT=0xFFFF (~109 min) would let a single zombie
+/// session linger far past pool policy. Honour the advertised value within
+/// the operator's normal idle envelope.
+const min_keepalive_sec: i64 = 5;
+const max_keepalive_sec: i64 = 300;
+
+/// Apply the upstream's RFC 7828 edns-tcp-keepalive TIMEOUT (if present in
+/// `response`) as a per-connection idle bound, overriding the pool default
+/// on the next acquire/sweep. Works for both `TcpPooledConnection` and
+/// `PooledConnection` (TLS) — both expose `idle_timeout_sec: ?i64`.
+pub fn applyKeepaliveHint(conn: anytype, response: []const u8) void {
+    if (dns.extractKeepaliveTimeout(response)) |ka| {
+        const raw = dns.keepaliveToSeconds(ka);
+        conn.idle_timeout_sec = @max(min_keepalive_sec, @min(raw, max_keepalive_sec));
+    }
+}
 
 // ── TcpPooledConnection ─────────────────────────────────────────────
 
@@ -19,6 +40,10 @@ pub const TcpPooledConnection = struct {
     last_used: i64,
     query_count: u16,
     max_queries: u16 = 200,
+    /// RFC 7828 edns-tcp-keepalive TIMEOUT advertised by the upstream, in
+    /// seconds, clamped to [min_keepalive_sec, max_keepalive_sec] by
+    /// `applyKeepaliveHint`. null falls back to the pool's `max_idle_sec`.
+    idle_timeout_sec: ?i64 = null,
 
     pub fn destroyBroken(self: *TcpPooledConnection, allocator: Allocator) void {
         sys.close(self.sock);
@@ -52,6 +77,9 @@ pub const PooledConnection = struct {
     /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
     query_count: u16 = 0,
     max_queries: u16 = 200,
+    /// RFC 7828 edns-tcp-keepalive TIMEOUT advertised by the upstream, in
+    /// seconds. null falls back to the pool's `max_idle_sec`.
+    idle_timeout_sec: ?i64 = null,
 
     // Inline buffers — stable addresses since struct is heap-allocated.
     net_read_buf: [tls.input_buffer_len]u8,
@@ -180,7 +208,8 @@ pub fn ConnectionPool(comptime Conn: type) type {
             while (!slots.isEmpty()) {
                 const conn = slots.pop();
                 self.total_conns -= 1;
-                const is_stale = now - conn.last_used > self.max_idle_sec;
+                const limit = conn.idle_timeout_sec orelse self.max_idle_sec;
+                const is_stale = now - conn.last_used > limit;
                 if (is_stale or conn.isExpired()) {
                     conn.destroyBroken(self.allocator);
                     continue;
@@ -257,7 +286,8 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 const slots = entry.value_ptr;
                 var write: u8 = 0;
                 for (slots.items[0..slots.len]) |conn| {
-                    if (now - conn.last_used > self.max_idle_sec) {
+                    const limit = conn.idle_timeout_sec orelse self.max_idle_sec;
+                    if (now - conn.last_used > limit) {
                         conn.destroyBroken(self.allocator);
                         self.total_conns -= 1;
                     } else {
@@ -598,6 +628,102 @@ test "TlsPool max queries eviction (RFC 7766 §6.2.1)" {
     const result = pool.acquire(key);
     try testing.expect(result == null);
     try testing.expect(pool.entries.count() == 0);
+}
+
+test "applyKeepaliveHint clamps weaponized values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var conn = TcpPooledConnection{ .sock = -1, .last_used = 0, .query_count = 0 };
+    var buf: [256]u8 = undefined;
+
+    const buildKeepalive = struct {
+        fn run(a: Allocator, b: []u8, raw_timeout_100ms: u16) ![]const u8 {
+            var data: [2]u8 = undefined;
+            mem.writeInt(u16, &data, raw_timeout_100ms, .big);
+            return dns.serializeOptOptionResponse(a, b, "x.", false, dns.edns_opt_tcp_keepalive, &data);
+        }
+    }.run;
+
+    // TIMEOUT=0 → would be 0s without clamp → forced eviction. Floor catches it.
+    applyKeepaliveHint(&conn, try buildKeepalive(arena.allocator(), &buf, 0));
+    try testing.expect(conn.idle_timeout_sec.? >= min_keepalive_sec);
+
+    // TIMEOUT=0xFFFF (~109 min) → ceiling caps it.
+    applyKeepaliveHint(&conn, try buildKeepalive(arena.allocator(), &buf, 0xFFFF));
+    try testing.expect(conn.idle_timeout_sec.? <= max_keepalive_sec);
+
+    // Reasonable mid-range value passes through (100*100ms = 10s).
+    applyKeepaliveHint(&conn, try buildKeepalive(arena.allocator(), &buf, 100));
+    try testing.expectEqual(@as(?i64, 10), conn.idle_timeout_sec);
+}
+
+test "TcpConnectionPool per-connection idle_timeout_sec overrides pool default" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    pool.max_idle_sec = 60; // pool default would keep this alive at t+20
+    defer pool.deinit();
+
+    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const conn = try createTestTcpConnection(testing.allocator);
+    conn.idle_timeout_sec = 5; // RFC 7828 advertised: 5s
+    pool.store(key, conn);
+
+    fake_time = 1010; // 10s later: past per-conn limit, under pool default
+    try testing.expect(pool.acquire(key) == null);
+    try testing.expect(pool.entries.count() == 0);
+}
+
+test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLocked" {
+    var fake_time: i64 = 1000;
+    const now_fn = struct {
+        var time_ptr: *i64 = undefined;
+        fn now() i64 {
+            return time_ptr.*;
+        }
+    };
+    now_fn.time_ptr = &fake_time;
+
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
+    pool.now_fn = &now_fn.now;
+    pool.max_idle_sec = 120;
+    pool.max_entries = 4;
+    defer pool.deinit();
+
+    // Two distinct keys: short-lived (per-conn = 3s) and pool-default.
+    const key_short = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
+    const short_conn = try createTestTcpConnection(testing.allocator);
+    short_conn.idle_timeout_sec = 3;
+    pool.store(key_short, short_conn);
+
+    const key_long = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 53));
+    const long_conn = try createTestTcpConnection(testing.allocator);
+    pool.store(key_long, long_conn);
+
+    try testing.expectEqual(@as(usize, 2), pool.total_conns);
+
+    // Trigger idle sweep via acquire on a third key past the half-cap heuristic.
+    fake_time = 1010; // short_conn expired, long_conn still fine
+    // Fill above max_entries/2 to ensure evictIdleLocked actually runs.
+    const filler_conn = try createTestTcpConnection(testing.allocator);
+    pool.store(key_long, filler_conn);
+    _ = pool.acquire(AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 53))); // triggers sweep
+
+    // short_conn evicted, long_conn + filler retained.
+    try testing.expect(pool.entries.get(key_short) == null);
+    const remaining = pool.entries.getPtr(key_long).?;
+    try testing.expectEqual(@as(u8, 2), remaining.len);
+
+    // Drain the rest to satisfy testing.allocator leak detection.
+    while (pool.acquire(key_long)) |c| c.destroyBroken(pool.allocator);
 }
 
 test "TcpConnectionPool max queries eviction" {

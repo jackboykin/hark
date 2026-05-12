@@ -49,6 +49,7 @@ pub const TlsTransport = struct {
         const pool = self.pool orelse return null;
         const conn = pool.acquire(key) orelse return null;
         if (queryOnConnection(conn, wire_query, response_buf, deadline_ns)) |data| {
+            pool_mod.applyKeepaliveHint(conn, data);
             pool.release(key, conn, true);
             return data;
         } else |_| {
@@ -73,6 +74,7 @@ pub const TlsTransport = struct {
         };
 
         if (self.pool) |pool| {
+            pool_mod.applyKeepaliveHint(conn, data);
             pool.store(key, conn);
         } else {
             conn.closeAndDestroy(self.allocator);
@@ -90,6 +92,7 @@ pub const TlsTransport = struct {
         conn.last_used = 0;
         conn.query_count = 0;
         conn.max_queries = 200;
+        conn.idle_timeout_sec = null;
         conn.net_reader = File.Reader.initStreaming(file, self.io, &conn.net_read_buf);
         conn.net_writer = File.Writer.initStreaming(file, self.io, &conn.net_write_buf);
         return conn;
@@ -169,6 +172,7 @@ pub const TlsTransport = struct {
         };
 
         if (self.pool) |pool| {
+            pool_mod.applyKeepaliveHint(conn, data);
             pool.store(addr_key, conn);
         } else {
             conn.closeAndDestroy(self.allocator);

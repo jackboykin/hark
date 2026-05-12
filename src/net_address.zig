@@ -43,6 +43,10 @@ pub const AddressKey = struct {
         return key;
     }
 
+    pub fn eql(a: AddressKey, b: AddressKey) bool {
+        return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
+    }
+
     pub fn fromAddress(address: Address) AddressKey {
         var key = AddressKey{ .family = 0, .addr = .{0} ** 16, .port = 0 };
         switch (address) {
@@ -92,7 +96,7 @@ pub const AddressKey = struct {
         }
 
         pub fn eql(_: @This(), a: AddressKey, b: AddressKey) bool {
-            return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
+            return a.eql(b);
         }
     };
 };

@@ -946,6 +946,92 @@ pub const Parser = struct {
 
 // ── EDNS option parsing ────────────────────────────────────────────────
 
+/// Advance past one wire-format name starting at `start`. Names are either
+/// a chain of length-prefixed labels terminated by a zero byte, or a 2-byte
+/// compression pointer (top two bits set). Returns the position one past
+/// the name, or null if the wire is malformed.
+fn skipWireName(wire: []const u8, start: usize) ?usize {
+    var p = start;
+    while (p < wire.len) {
+        const b = wire[p];
+        if (b == 0) return p + 1;
+        if (b & 0xC0 == 0xC0) {
+            if (p + 1 >= wire.len) return null;
+            return p + 2;
+        }
+        if (b & 0xC0 != 0) return null; // reserved label types
+        p += 1 + b;
+    }
+    return null;
+}
+
+/// Convert an RFC 7828 TIMEOUT (100-ms units) into whole seconds. Sub-second
+/// non-zero values round up so a 100-ms hint doesn't evict the connection on
+/// the same tick. TIMEOUT=0 ("close ASAP" per RFC 7828 §3.3) passes through
+/// as 0; callers that pool a connection must clamp against weaponized 0
+/// before applying — see `connection_pool.applyKeepaliveHint`.
+pub fn keepaliveToSeconds(timeout_100ms: u16) i64 {
+    return @divFloor(@as(i64, @intCast(timeout_100ms)) + 9, 10);
+}
+
+/// RFC 7828 §3.3: read the edns-tcp-keepalive TIMEOUT (option 11) advertised
+/// in a TCP/DoT response. Returns the value in 100-ms units, or null if no
+/// OPT record carries it. Cheap wire scan — does not allocate, does not
+/// touch rdata bodies beyond OPT's option list.
+pub fn extractKeepaliveTimeout(wire: []const u8) ?u16 {
+    if (wire.len < header_len) return null;
+    const ar = mem.readInt(u16, wire[10..][0..2], .big);
+    if (ar == 0) return null;
+    const qd = mem.readInt(u16, wire[4..][0..2], .big);
+    const an = mem.readInt(u16, wire[6..][0..2], .big);
+    const ns = mem.readInt(u16, wire[8..][0..2], .big);
+
+    var pos: usize = header_len;
+    for (0..qd) |_| {
+        pos = skipWireName(wire, pos) orelse return null;
+        if (pos + 4 > wire.len) return null;
+        pos += 4;
+    }
+    const rr_no_opt = @as(usize, an) + @as(usize, ns);
+    for (0..rr_no_opt) |_| {
+        pos = skipWireName(wire, pos) orelse return null;
+        if (pos + 10 > wire.len) return null;
+        const rdlen = mem.readInt(u16, wire[pos + 8 ..][0..2], .big);
+        pos += 10 + @as(usize, rdlen);
+        if (pos > wire.len) return null;
+    }
+    for (0..ar) |_| {
+        const name_start = pos;
+        pos = skipWireName(wire, pos) orelse return null;
+        if (pos + 10 > wire.len) return null;
+        const rtype = mem.readInt(u16, wire[pos..][0..2], .big);
+        const rdlen = mem.readInt(u16, wire[pos + 8 ..][0..2], .big);
+        if (pos + 10 + @as(usize, rdlen) > wire.len) return null;
+        if (rtype == @intFromEnum(RType.opt)) {
+            // RFC 6891 §6.1.2: OPT owner MUST be root (single zero byte).
+            if (wire[name_start] != 0) return null;
+            const opt_rdata = wire[pos + 10 .. pos + 10 + rdlen];
+            var op: usize = 0;
+            while (op + 4 <= opt_rdata.len) {
+                const code = mem.readInt(u16, opt_rdata[op..][0..2], .big);
+                const length = mem.readInt(u16, opt_rdata[op + 2 ..][0..2], .big);
+                op += 4;
+                if (op + length > opt_rdata.len) return null;
+                if (code == edns_opt_tcp_keepalive) {
+                    // RFC 7828 §3.2: 0 octets is the client form; the
+                    // server-to-client TIMEOUT form is always 2 octets.
+                    if (length == 2) return mem.readInt(u16, opt_rdata[op..][0..2], .big);
+                    return null;
+                }
+                op += length;
+            }
+            return null;
+        }
+        pos += 10 + @as(usize, rdlen);
+    }
+    return null;
+}
+
 fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsOption {
     if (rdata.len == 0) return &.{};
 
@@ -2784,4 +2870,106 @@ test "buildQuery with case_randomize" {
     });
 
     try testing.expect(lower.questions[0].name.eql(randomized.questions[0].name));
+}
+
+/// Serialize a minimal "1-question, optional A answer, OPT-with-one-option"
+/// response for `extractKeepaliveTimeout` tests.
+pub fn serializeOptOptionResponse(
+    arena: Allocator,
+    buf: []u8,
+    qname: []const u8,
+    include_answer: bool,
+    opt_code: u16,
+    opt_data: []const u8,
+) ![]const u8 {
+    const name = try parseDottedName(arena, qname);
+    const questions = try arena.alloc(Question, 1);
+    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
+
+    var answers: []ResourceRecord = &.{};
+    if (include_answer) {
+        answers = try arena.alloc(ResourceRecord, 1);
+        answers[0] = .{
+            .name = name,
+            .rtype = .a,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .a = .{ 192, 0, 2, 1 } },
+        };
+    }
+
+    const options = try arena.alloc(EdnsOption, 1);
+    options[0] = .{ .code = opt_code, .data = opt_data };
+
+    const msg: Message = .{
+        .header = .{
+            .id = 0x1234,
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = true,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+            .qd_count = 1,
+            .an_count = if (include_answer) 1 else 0,
+            .ns_count = 0,
+            .ar_count = 1,
+        },
+        .questions = questions,
+        .answers = answers,
+        .opt = .{
+            .udp_payload_size = edns_udp_payload,
+            .extended_rcode = 0,
+            .version = 0,
+            .do_bit = false,
+            .options = options,
+        },
+    };
+    return serializeMessage(buf, msg);
+}
+
+test "extractKeepaliveTimeout reads RFC 7828 option 11" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    const ka_data = [_]u8{ 0x00, 0x64 }; // 100 * 100ms = 10s
+    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", true, edns_opt_tcp_keepalive, &ka_data);
+    try testing.expectEqual(@as(?u16, 100), extractKeepaliveTimeout(wire));
+}
+
+test "extractKeepaliveTimeout returns null when option absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    const padding = [_]u8{ 0, 0, 0, 0 };
+    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", false, 12, &padding);
+    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(wire));
+}
+
+test "extractKeepaliveTimeout returns null on zero-length client form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    const empty = [_]u8{};
+    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", false, edns_opt_tcp_keepalive, &empty);
+    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(wire));
+}
+
+test "extractKeepaliveTimeout rejects malformed wire" {
+    // Header-only buffer claiming 1 question but zero bytes follow.
+    var buf: [12]u8 = .{ 0, 0, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0 };
+    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(&buf));
+}
+
+test "keepaliveToSeconds rounds up" {
+    try testing.expectEqual(@as(i64, 0), keepaliveToSeconds(0));
+    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(1)); // 100ms → ≥1s
+    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(9));
+    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(10)); // exactly 1s
+    try testing.expectEqual(@as(i64, 2), keepaliveToSeconds(11)); // 1.1s → 2s
+    try testing.expectEqual(@as(i64, 10), keepaliveToSeconds(100)); // 10s
 }

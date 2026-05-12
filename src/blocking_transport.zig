@@ -5,8 +5,9 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
-const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
-const TcpPooledConnection = @import("connection_pool.zig").TcpPooledConnection;
+const pool_mod = @import("connection_pool.zig");
+const TcpConnectionPool = pool_mod.TcpConnectionPool;
+const TcpPooledConnection = pool_mod.TcpPooledConnection;
 const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
@@ -321,6 +322,7 @@ pub const BlockingTcpTransport = struct {
             const key = AddressKey.fromAddress(server);
             if (p.acquire(key)) |conn| {
                 if (sendAndReceiveTcp(conn.sock, wire_query, response_buf, deadline_ns)) |data| {
+                    pool_mod.applyKeepaliveHint(conn, data);
                     p.release(key, conn, true);
                     return data;
                 } else |_| {
@@ -343,6 +345,7 @@ pub const BlockingTcpTransport = struct {
                 return data;
             };
             new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
+            pool_mod.applyKeepaliveHint(new_conn, data);
             p.store(key, new_conn);
             return data;
         }
@@ -511,7 +514,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
 }
 
 /// Mock UDP echo server for tests: reads one query, echoes it back with QR bit set.
-fn echoServerThread(sock: posix.fd_t) void {
+pub fn echoServerThread(sock: posix.fd_t) void {
     var polls = [1]posix.pollfd{.{ .fd = sock, .events = posix.POLL.IN, .revents = 0 }};
     const poll_result = posix.poll(&polls, 2000) catch return;
     if (poll_result == 0) return;
@@ -526,4 +529,16 @@ fn echoServerThread(sock: posix.fd_t) void {
     @memcpy(resp[0..n], recv_buf[0..n]);
     resp[2] |= 0x80;
     _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
+}
+
+/// Ephemeral-port UDP loopback socket for tests. Pair with `echoServerThread`
+/// or any mock that wants a `(sock, addr)` it can recv/sendto from.
+pub fn bindLoopbackUdpSock() !struct { sock: posix.fd_t, addr: na.Address } {
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    errdefer sys.close(sock);
+    const bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_storage: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind, &bind_storage);
+    try sys.bind(sock, &bind_storage.any, bind_len);
+    return .{ .sock = sock, .addr = try na.getSockName(sock) };
 }
