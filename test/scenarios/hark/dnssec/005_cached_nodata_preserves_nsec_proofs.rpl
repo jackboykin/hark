@@ -1,0 +1,70 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN cache-served NODATA carries NSEC proof of type non-existence
+
+; Cache-vs-live divergence (response-shaping plan, case #2):
+; before the fix, hark stored only the SOA on the negative entry; the NSEC
+; proving "qname has A but not AAAA" lived under a separate cache key. A
+; second query for `a. AAAA` came back AD=1 with no NSEC, breaking
+; downstream validators.
+;
+; Zone layout (signed root, harness-generated key):
+;   `.`  — apex (SOA + NS + DNSKEY)
+;   `a.` — A 192.0.2.1
+;
+; Query `a. AAAA` is NODATA — `a.` exists but has no AAAA. NSEC at `a.`
+; proves the type-bit-map omits AAAA.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a. IN AAAA
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a. IN AAAA
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    a. 3600 IN NSEC c. A RRSIG NSEC
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a. IN AAAA
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a. IN AAAA
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    a. 3600 IN NSEC c. A RRSIG NSEC
+ENTRY_END
+
+SCENARIO_END

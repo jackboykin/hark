@@ -315,6 +315,21 @@ pub fn rrsigCovers(rr: ResourceRecord) ?RType {
     return rr.rdata.rrsig.type_covered;
 }
 
+/// Wildcard-expansion / negative-existence DNSSEC proof material per
+/// RFC 4035 §3.1.3. True for NSEC, NSEC3, and RRSIGs covering either.
+/// Used by the CNAME-chain aggregator and the cache's wildcard / negative
+/// proof capture — same predicate, multiple call sites.
+pub fn isNsecProofMaterial(rr: ResourceRecord) bool {
+    return switch (rr.rtype) {
+        .nsec, .nsec3 => true,
+        .rrsig => switch (rrsigCovers(rr) orelse return false) {
+            .nsec, .nsec3 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 pub const DnskeyData = struct {
     flags: u16,
     protocol: u8,

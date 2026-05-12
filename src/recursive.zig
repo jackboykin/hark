@@ -366,16 +366,15 @@ pub const RecursiveResolver = struct {
                                 // sigs onto the answer-section records so a
                                 // DO=1 / CD=1 cache-served client can validate;
                                 // the wire shaper strips them for DO=0.
-                                .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), &.{}, .no_error, h.security_status == .secure)),
+                                // For wildcard-expanded answers, h.nsec_proofs
+                                // carries the §3.1.3.4 "no closer match" NSEC
+                                // proofs from the original response.
+                                .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
                                 .prefetch_name = prefetch_name,
                                 .prefetch_qtype = qtype,
                             },
                             .negative => |n| {
-                                const authorities = if (n.soa) |soa| blk: {
-                                    const auths = try allocator.alloc(dns.ResourceRecord, 1);
-                                    auths[0] = soa;
-                                    break :blk auths;
-                                } else &[_]dns.ResourceRecord{};
+                                const authorities = try buildNegativeAuthority(allocator, n.soa, n.nsec_proofs);
                                 return .{
                                     .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
                                     .prefetch_name = prefetch_name,
@@ -396,11 +395,12 @@ pub const RecursiveResolver = struct {
                     if (c.lookupNxdomainAncestor(allocator, current_name, qtype, .in)) |result| {
                         switch (result) {
                             .negative => |n| {
-                                const authorities = if (n.soa) |soa| blk: {
-                                    const auths = try allocator.alloc(dns.ResourceRecord, 1);
-                                    auths[0] = soa;
-                                    break :blk auths;
-                                } else &[_]dns.ResourceRecord{};
+                                // Ancestor NXDOMAIN (RFC 8020) is always served
+                                // as AD=0: the cached entry proves the ancestor
+                                // doesn't exist, not the descendant qname.
+                                // n.nsec_proofs flows through anyway so a CD=1
+                                // client can chase the proof itself.
+                                const authorities = try buildNegativeAuthority(allocator, n.soa, n.nsec_proofs);
                                 return .{
                                     .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, .name_error, false)),
                                     .prefetch_name = null,
@@ -731,14 +731,14 @@ pub const RecursiveResolver = struct {
                                 if (cname_status == .secure and response.authorities.len > 0) {
                                     var has_proof = false;
                                     for (response.authorities) |auth_rr| {
-                                        if (isCnameAuthProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
+                                        if (dns.isNsecProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
                                             has_proof = true;
                                             break;
                                         }
                                     }
                                     if (has_proof and self.verifyAuthoritySigs(allocator, response.authorities, servers[0..server_count]) == .secure) {
                                         for (response.authorities) |auth_rr| {
-                                            if (isCnameAuthProofMaterial(auth_rr))
+                                            if (dns.isNsecProofMaterial(auth_rr))
                                                 try cname_auth_aggregate.append(allocator, auth_rr);
                                         }
                                     }
@@ -944,9 +944,19 @@ pub const RecursiveResolver = struct {
         switch (wc_result) {
             .hit => |h| {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
-                // target_name is arena-allocated and outlives the response — direct assignment.
+                // target_name is arena-allocated and outlives the response —
+                // direct assignment. RFC 4035 §3.1.3.4: the RRSIG's labels
+                // field stays at the wildcard depth, so a DO=1 client
+                // reconstructs `*.CE` from qname and revalidates correctly.
+                //
+                // NSEC proof of qname's nonexistence is not shipped here —
+                // a separate change extends NsecCache to expose per-qname
+                // proofs (the wildcard cache entry can't tell which qname
+                // the NSECs would cover).
                 for (h.records) |*rr| rr.name = target_name;
-                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(h.records, &.{soa}, .no_error, h.security_status == .secure));
+                for (h.sigs) |*rr| rr.name = target_name;
+                const answer = try concatRRs(allocator, h.records, h.sigs);
+                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(answer, &.{soa}, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
@@ -2545,6 +2555,28 @@ fn concatRRs(allocator: mem.Allocator, a: []const dns.ResourceRecord, b: []const
     return out;
 }
 
+/// Build the authority section for a cached negative response: SOA followed
+/// by the cached NSEC/NSEC3 proofs (RFC 4035 §3.1.3.2 / §3.1.3.3). Returns
+/// an empty slice when both inputs are empty so the wire shaper sees the
+/// same `&.{}` it would receive from a sigless unsigned-zone negative.
+fn buildNegativeAuthority(
+    allocator: mem.Allocator,
+    soa: ?dns.ResourceRecord,
+    proofs: []const dns.ResourceRecord,
+) ![]const dns.ResourceRecord {
+    const have_soa: usize = if (soa != null) 1 else 0;
+    const total = have_soa + proofs.len;
+    if (total == 0) return &.{};
+    const out = try allocator.alloc(dns.ResourceRecord, total);
+    var i: usize = 0;
+    if (soa) |s| {
+        out[i] = s;
+        i += 1;
+    }
+    @memcpy(out[i..], proofs);
+    return out;
+}
+
 /// Stitch CNAME chain (prepends answers) and aggregated wildcard proofs
 /// (prepends authority) into `response`. Mirrors Unbound's
 /// `iter_add_prepend_auth`. Section trimming is the shaper's job.
@@ -2571,21 +2603,6 @@ fn withCnameChain(
         msg.header.ns_count = @intCast(new_auths.len);
     }
     return msg;
-}
-
-/// Returns true for record types that are wildcard-expansion / negative-
-/// existence DNSSEC proof material. RFC 4035 §3.1.3.4. We accumulate
-/// these (plus their RRSIGs) from intermediate CNAME-hop authority
-/// sections so a chained final response carries the full proof chain.
-fn isCnameAuthProofMaterial(rr: dns.ResourceRecord) bool {
-    return switch (rr.rtype) {
-        .nsec, .nsec3 => true,
-        .rrsig => switch (dns.rrsigCovers(rr) orelse return false) {
-            .nsec, .nsec3 => true,
-            else => false,
-        },
-        else => false,
-    };
 }
 
 // ── Referral extraction ────────────────────────────────────────────────
@@ -3221,7 +3238,7 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
     );
 }
 
-test "isCnameAuthProofMaterial classifies the chain-aggregate keep set" {
+test "dns.isNsecProofMaterial classifies the chain-aggregate keep set" {
     const sample_name = dns.Name{ .labels = &.{ "x", "example", "com" } };
     const sample_next = dns.Name{ .labels = &.{ "y", "example", "com" } };
 
@@ -3275,13 +3292,13 @@ test "isCnameAuthProofMaterial classifies the chain-aggregate keep set" {
         .rdata = .{ .ns = sample_next },
     };
 
-    try testing.expect(isCnameAuthProofMaterial(nsec_rr));
-    try testing.expect(isCnameAuthProofMaterial(nsec3_rr));
-    try testing.expect(isCnameAuthProofMaterial(mkrrsig(.nsec)));
-    try testing.expect(isCnameAuthProofMaterial(mkrrsig(.nsec3)));
-    try testing.expect(!isCnameAuthProofMaterial(mkrrsig(.ns)));
-    try testing.expect(!isCnameAuthProofMaterial(mkrrsig(.a)));
-    try testing.expect(!isCnameAuthProofMaterial(ns_rr));
+    try testing.expect(dns.isNsecProofMaterial(nsec_rr));
+    try testing.expect(dns.isNsecProofMaterial(nsec3_rr));
+    try testing.expect(dns.isNsecProofMaterial(mkrrsig(.nsec)));
+    try testing.expect(dns.isNsecProofMaterial(mkrrsig(.nsec3)));
+    try testing.expect(!dns.isNsecProofMaterial(mkrrsig(.ns)));
+    try testing.expect(!dns.isNsecProofMaterial(mkrrsig(.a)));
+    try testing.expect(!dns.isNsecProofMaterial(ns_rr));
 }
 
 test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proof case)" {

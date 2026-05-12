@@ -1,0 +1,72 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN cache-served NXDOMAIN carries NSEC proofs for downstream validators
+
+; Cache-vs-live divergence (response-shaping plan, case #3):
+; before the cache-side fix, hark stored only SOA on the negative entry and
+; cached the NSEC records under separate keys — never recombined. A second
+; query for `b. A` hit the cache, returned AD=1 with SOA-only authority,
+; and any downstream validator (systemd-resolved strict, stacked Unbound)
+; fell over because it lacked the NSEC chain proving b.'s nonexistence.
+;
+; Step 1 fills the cache via a live query. Step 3 issues an identical
+; query that must come from cache. Both CHECK_ANSWER steps assert the
+; same authority shape: SOA + the two NSEC records that prove (a) b.
+; doesn't exist and (b) no wildcard would have matched. AD=1 must survive.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b. IN A
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+    a. 3600 IN NSEC c. A RRSIG NSEC
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b. IN A
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+    a. 3600 IN NSEC c. A RRSIG NSEC
+ENTRY_END
+
+SCENARIO_END
