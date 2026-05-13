@@ -354,6 +354,10 @@ pub const Server = struct {
     udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     tcp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     udp_send_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
+    /// Bumped when the recv-thread cache-hit fast path's cache-only resolver
+    /// returns anything other than `CacheOnlyMiss`. Slow path re-runs the
+    /// resolve, so the work is duplicated when this happens.
+    fast_path_errors: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
@@ -454,6 +458,7 @@ pub const Server = struct {
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
+            .fast_path_errors = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
             .wake_fds = try createWakeFds(allocator, cfg.workers),
         };
@@ -619,6 +624,10 @@ pub const Server = struct {
         const udp_send_drops = self.udp_send_drops.load(.monotonic);
         if (udp_send_drops > 0) {
             log.info("UDP send-buffer drops: {d}", .{udp_send_drops});
+        }
+        const fast_path_errors = self.fast_path_errors.load(.monotonic);
+        if (fast_path_errors > 0) {
+            log.info("fast-path resolver errors (fell through to slow path): {d}", .{fast_path_errors});
         }
     }
 
@@ -1230,7 +1239,10 @@ const WorkerState = struct {
             // CacheOnlyMiss is the expected miss signal — anything else (OOM,
             // validation budget exhaustion, etc.) is operationally interesting
             // and would otherwise be silently re-tried on the slow path.
-            if (err != error.CacheOnlyMiss) log.debug("fast-path resolver error: {s}", .{@errorName(err)});
+            if (err != error.CacheOnlyMiss) {
+                _ = self.server.fast_path_errors.fetchAdd(1, .monotonic);
+                log.debug("fast-path resolver error: {s}", .{@errorName(err)});
+            }
             return false;
         };
 

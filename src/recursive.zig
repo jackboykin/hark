@@ -271,6 +271,10 @@ pub const RecursiveResolver = struct {
         return self.transports.?.tcp;
     }
 
+    fn tls(self: *const RecursiveResolver) ?*TlsTransport {
+        return self.transports.?.tls;
+    }
+
     /// Close and discard any pending anticipated query. Safe to call when no
     /// slot is armed.
     fn dropAnticipated(self: *RecursiveResolver) void {
@@ -1554,7 +1558,7 @@ pub const RecursiveResolver = struct {
                 // ── RFC 9539: Opportunistic encrypted query ──
                 // TLS authenticates the channel, so 0x20 is redundant there;
                 // the TLS variant always uses lowercase QNAME.
-                if (self.transports.?.tls) |tls_t| {
+                if (self.tls()) |tls_t| {
                     if (self.encrypted_ns_cache) |oc| {
                         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
                         switch (oc.getStatus(tls_key)) {
@@ -1654,7 +1658,7 @@ pub const RecursiveResolver = struct {
 
     fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
         const oc = self.encrypted_ns_cache orelse return;
-        const tls_t = self.transports.?.tls orelse return;
+        const tls_t = self.tls() orelse return;
         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
         if (oc.claimProbe(tls_key)) {
             tls_t.probeInBackground(server, oc);
@@ -2451,7 +2455,7 @@ pub const RecursiveResolver = struct {
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp = &tcp_t,
-                .tls = ctx.parent.transports.?.tls,
+                .tls = ctx.parent.tls(),
             });
 
             var arena = std.heap.ArenaAllocator.init(ctx.shared_cap.allocator());
