@@ -97,80 +97,93 @@ const PerThreadArena = struct {
 
 // ── Work Queue for resolution thread pool ─────────────────────────────
 
-/// Buffer slot for a queued query. Sized for any reasonable Do53 wire
-/// query (RFC 1035 caps QNAME at 255 bytes; with EDNS this fits well
-/// under 4 KiB). Dispatch ignores items > this on push.
+/// Matches `multishot_payload_max` in event_loop.zig — the kernel never
+/// hands us more than this per UDP datagram.
 const max_work_query_bytes = 4096;
 
-const WorkItem = struct {
-    query_buf: [max_work_query_bytes]u8 = undefined,
-    query_len: u16 = 0,
+const Protocol = enum { udp, tcp };
+
+const Slot = struct {
+    buf: [max_work_query_bytes]u8 = undefined,
+    len: u16 = 0,
     client_addr: na.Address = na.initIp4(.{ 0, 0, 0, 0 }, 0),
     sock_fd: posix.fd_t = -1,
     protocol: Protocol = .udp,
-    const Protocol = enum { udp, tcp };
 };
 
-/// What `pop` hands back: small metadata + a slice into the caller's
-/// scratch buffer holding the live query bytes only. Avoids a 4 KiB
-/// by-value copy of WorkItem on every dispatch.
 const PopResult = struct {
-    query_data: []const u8,
+    payload: []const u8,
+    reservation: u16,
     client_addr: na.Address,
     sock_fd: posix.fd_t,
-    protocol: WorkItem.Protocol,
+    protocol: Protocol,
 };
 
 const WorkQueue = struct {
-    items: [work_queue_capacity]WorkItem = undefined,
-    head: usize = 0,
-    tail: usize = 0,
-    count: usize = 0,
+    slots: [work_queue_capacity]Slot = [_]Slot{.{}} ** work_queue_capacity,
+    order: [work_queue_capacity]u16 = undefined,
+    head: u16 = 0,
+    tail: u16 = 0,
+    queued: u16 = 0,
+    free_list: [work_queue_capacity]u16 = undefined,
+    free_count: u16 = 0,
     mutex: Io.Mutex = Io.Mutex.init,
     not_empty: Io.Condition = Io.Condition.init,
     io: Io,
     shutdown: bool = false,
 
-    fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: WorkItem.Protocol) bool {
+    fn init(self: *WorkQueue, io: Io) void {
+        self.* = .{ .io = io };
+        for (0..work_queue_capacity) |i| self.free_list[i] = @intCast(work_queue_capacity - 1 - i);
+        self.free_count = work_queue_capacity;
+    }
+
+    fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: Protocol) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.count >= work_queue_capacity) return false;
         if (data.len > max_work_query_bytes) return false;
-        const item = &self.items[self.tail];
-        @memcpy(item.query_buf[0..data.len], data);
-        item.query_len = @intCast(data.len);
-        item.client_addr = client_addr;
-        item.sock_fd = sock_fd;
-        item.protocol = protocol;
+        if (self.free_count == 0) return false;
+        self.free_count -= 1;
+        const slot_idx = self.free_list[self.free_count];
+        const slot = &self.slots[slot_idx];
+        @memcpy(slot.buf[0..data.len], data);
+        slot.len = @intCast(data.len);
+        slot.client_addr = client_addr;
+        slot.sock_fd = sock_fd;
+        slot.protocol = protocol;
+        self.order[self.tail] = slot_idx;
         self.tail = (self.tail + 1) % work_queue_capacity;
-        self.count += 1;
+        self.queued += 1;
         self.not_empty.signal(self.io);
         return true;
     }
 
-    /// Pop a slot, copying only the live query bytes into `scratch` so we
-    /// can release the slot for re-push immediately. The returned slice
-    /// borrows from `scratch` and is valid until the next `pop` on the
-    /// same buffer.
-    fn pop(self: *WorkQueue, scratch: *[max_work_query_bytes]u8) ?PopResult {
+    /// Returned payload borrows from the slot until `release(reservation)`.
+    fn pop(self: *WorkQueue) ?PopResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (self.count == 0 and !self.shutdown) {
+        while (self.queued == 0 and !self.shutdown) {
             self.not_empty.waitUncancelable(self.io, &self.mutex);
         }
-        if (self.count == 0) return null;
-        const slot = &self.items[self.head];
-        const len = slot.query_len;
-        @memcpy(scratch[0..len], slot.query_buf[0..len]);
-        const result = PopResult{
-            .query_data = scratch[0..len],
+        if (self.queued == 0) return null;
+        const slot_idx = self.order[self.head];
+        self.head = (self.head + 1) % work_queue_capacity;
+        self.queued -= 1;
+        const slot = &self.slots[slot_idx];
+        return PopResult{
+            .payload = slot.buf[0..slot.len],
+            .reservation = slot_idx,
             .client_addr = slot.client_addr,
             .sock_fd = slot.sock_fd,
             .protocol = slot.protocol,
         };
-        self.head = (self.head + 1) % work_queue_capacity;
-        self.count -= 1;
-        return result;
+    }
+
+    fn release(self: *WorkQueue, reservation: u16) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.free_list[self.free_count] = reservation;
+        self.free_count += 1;
     }
 
     fn signalShutdown(self: *WorkQueue) void {
@@ -287,6 +300,9 @@ pub const Server = struct {
     udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     tcp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     udp_send_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
+    /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
+    /// off Server's stack frame at init.
+    work_queue: *WorkQueue,
     /// One eventfd per worker. Only the main worker reads the signalfd;
     /// without per-worker wakes, peers would block in io_uring_enter forever
     /// waiting for a CQE that never arrives (no traffic = no wake). Spawned
@@ -351,6 +367,10 @@ pub const Server = struct {
             };
         }
 
+        const work_queue = try allocator.create(WorkQueue);
+        errdefer allocator.destroy(work_queue);
+        work_queue.init(io);
+
         return .{
             .config = cfg,
             .allocator = allocator,
@@ -380,6 +400,7 @@ pub const Server = struct {
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
+            .work_queue = work_queue,
             .wake_fds = try createWakeFds(allocator, cfg.workers),
         };
     }
@@ -423,6 +444,7 @@ pub const Server = struct {
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
+        self.allocator.destroy(self.work_queue);
         for (self.wake_fds) |fd| if (fd >= 0) sys.close(fd);
         self.allocator.free(self.wake_fds);
     }
@@ -432,6 +454,7 @@ pub const Server = struct {
     /// because each fd's counter accumulates and is drained on close.
     fn requestShutdown(self: *Server) void {
         self.shutdown.store(true, .release);
+        self.work_queue.signalShutdown();
         for (self.wake_fds) |fd| wakeWorker(fd);
     }
 
@@ -624,8 +647,6 @@ pub const Server = struct {
             }
         }
 
-        var queue = WorkQueue{ .io = self.io };
-
         // Per-worker Do53 TCP connection pool (RFC 7766)
         var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
         defer do53_tcp_pool.deinit();
@@ -652,7 +673,7 @@ pub const Server = struct {
             .dedup = if (self.dedup) |*d| d else null,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .shutdown = &self.shutdown,
-            .queue = &queue,
+            .queue = self.work_queue,
             .udp_queue_drops = &self.udp_queue_drops,
             .tcp_queue_drops = &self.tcp_queue_drops,
             .udp_send_drops = &self.udp_send_drops,
@@ -688,7 +709,6 @@ pub const Server = struct {
 
         ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd, wake_fd);
 
-        queue.signalShutdown();
         for (pool_threads[0..spawned]) |pt| pt.join();
 
         // Drain detached DoT probe threads before the per-pool-thread
@@ -823,6 +843,7 @@ const WorkerState = struct {
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     max_tcp_clients: u32 = 0,
+    recv_pta: PerThreadArena = undefined,
 
     /// Build a resolver Context from the per-worker pointer-style state.
     /// Per-query knobs (cd, bypass_cache) go through RuntimeOpts, not here.
@@ -864,6 +885,9 @@ const WorkerState = struct {
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t, wake_fd: posix.fd_t) void {
         const n = udp_socks.len;
+
+        self.recv_pta.init(self.allocator, self.config.query_memory_limit);
+        defer self.recv_pta.deinit();
 
         var udp_ctxs: [max_listen_addrs]Ctx = undefined;
         var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
@@ -1052,6 +1076,40 @@ const WorkerState = struct {
         };
     }
 
+    /// Send the resolver response or SERVFAIL the client. Handles both
+    /// failure modes internally — wire-buffer alloc OOM and serializer OOM
+    /// both fall through to `sendErrorUdp`, which uses a stack buffer and
+    /// doesn't share the failing arena.
+    fn sendUdpResponseFromResult(
+        self: *WorkerState,
+        sock: posix.fd_t,
+        query_msg: dns.Message,
+        result_msg: dns.Message,
+        alloc: mem.Allocator,
+        client_addr: na.Address,
+    ) void {
+        // Floor at the bare-EDNS-0 minimum, ceiling at the operator cap.
+        // Trusting an unbounded client claim is a reflection-amp surface.
+        const client_payload = if (query_msg.opt) |opt| opt.udp_payload_size else dns.max_udp_payload;
+        const resolved_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
+
+        var wire_stack: [4096]u8 = undefined;
+        const wire_buf: ?[]u8 = if (resolved_payload <= wire_stack.len)
+            wire_stack[0..]
+        else
+            alloc.alloc(u8, resolved_payload) catch null;
+
+        if (wire_buf) |buf| {
+            var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
+            ctx.minimal_responses = self.config.minimal_responses;
+            if (buildResponseWire(buf, ctx, result_msg, alloc)) |wire| {
+                self.sendUdpResponse(sock, wire, client_addr);
+                return;
+            }
+        }
+        self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+    }
+
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
         if (data.len < 12) return;
         // BCP 140: silently drop UDP from sources outside allow-from. Replying
@@ -1078,6 +1136,9 @@ const WorkerState = struct {
             self.sendErrorUdp(sock, id, .query, .format_error, 0, rd, &.{}, client_addr);
             return;
         }
+
+        if (self.tryCacheHitReply(sock, data, client_addr)) return;
+
         if (!self.queue.push(data, client_addr, sock, .udp)) {
             // Silent drop on pool saturation (matches Unbound ip-ratelimit,
             // PowerDNS over-capacity, dnsdist default). A SERVFAIL here
@@ -1091,6 +1152,39 @@ const WorkerState = struct {
             _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
             log.debug("resolution queue full, dropping query", .{});
         }
+    }
+
+    /// Recv-thread cache-hit fast path. Returns true when the query was
+    /// fully handled inline; false to fall through to the slow-path queue.
+    fn tryCacheHitReply(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) bool {
+        if (self.config.mode != .recursive) return false;
+
+        const alloc = self.recv_pta.reset();
+        const query_msg = dns.parseMessage(alloc, data) catch return false;
+        if (validateQuery(query_msg)) |_| return false;
+        const question = query_msg.questions[0];
+
+        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        const name_str = question.name.formatInto(&name_buf);
+
+        var resolver = recursive.RecursiveResolver.fromContext(
+            self.resolverContext(),
+            null,
+            .{ .cd = query_msg.header.cd, .cache_only = true },
+        );
+        const result = resolver.resolve(alloc, name_str, question.qtype) catch |err| {
+            // CacheOnlyMiss is the expected miss signal — anything else (OOM,
+            // validation budget exhaustion, etc.) is operationally interesting
+            // and would otherwise be silently re-tried on the slow path.
+            if (err != error.CacheOnlyMiss) log.debug("fast-path resolver error: {s}", .{@errorName(err)});
+            return false;
+        };
+
+        self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
+
+        self.dispatchPrefetches(result, name_str, null);
+        if (query_msg.header.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
+        return true;
     }
 
     fn processTcpClient(
@@ -1180,7 +1274,7 @@ const WorkerState = struct {
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
-            self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
+            self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
             if (query.header.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
@@ -1302,18 +1396,28 @@ const WorkerState = struct {
             }
         }
 
-        var pop_scratch: [max_work_query_bytes]u8 = undefined;
-        while (self.queue.pop(&pop_scratch)) |item| {
+        while (self.queue.pop()) |item| {
             switch (item.protocol) {
-                .udp => self.processUdpQuery(
-                    item.sock_fd,
-                    item.query_data,
-                    item.client_addr,
-                    transports,
-                    &query_pta,
-                    &prefetch_pta,
-                ),
+                .udp => {
+                    // item.payload borrows from the slot; parseMessage
+                    // copies what it keeps into the per-thread arena, so
+                    // releasing right after processUdpQuery is safe.
+                    defer self.queue.release(item.reservation);
+                    self.processUdpQuery(
+                        item.sock_fd,
+                        item.payload,
+                        item.client_addr,
+                        transports,
+                        &query_pta,
+                        &prefetch_pta,
+                    );
+                },
                 .tcp => {
+                    // Release before processTcpClient: the TCP connection
+                    // can live for seconds and the slot is just an fd
+                    // courier — holding it ties up queue capacity for
+                    // nothing.
+                    self.queue.release(item.reservation);
                     if (self.claimTcpSlot()) {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
                         self.processTcpClient(item.sock_fd, transports, &query_pta, &prefetch_pta);
@@ -1357,13 +1461,6 @@ const WorkerState = struct {
         var name_buf: [dns.max_name_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
 
-        // Floor at the bare-EDNS-0 minimum, ceiling at the operator-configured
-        // server cap. Trusting an unbounded client claim is a reflection-amp
-        // surface — the kernel will fragment a 65 kB datagram, but we'd still
-        // amplify the wire serialization cost.
-        const client_payload = if (query_msg.opt) |opt| opt.udp_payload_size else dns.max_udp_payload;
-        const resolved_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
-
         const start_ns = monotonic.nowNs();
         var peer_buf: [64]u8 = undefined;
         const peer_str = na.format(client_addr, &peer_buf);
@@ -1380,60 +1477,38 @@ const WorkerState = struct {
         var rcode_buf2: [24]u8 = undefined;
         log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
 
-        // 4 KB stack buffer covers EDNS-0 default (1232) and the common
-        // operator cap of 4096; larger configured caps fall through to the
-        // per-query arena. The 64 KiB frame this used to reserve was a
-        // ReleaseSafe memset hotspot and a stack-prologue tax in ReleaseFast.
-        var wire_stack: [4096]u8 = undefined;
-        const wire_buf: ?[]u8 = if (resolved_payload <= wire_stack.len)
-            wire_stack[0..]
-        else
-            alloc.alloc(u8, resolved_payload) catch null;
-        if (wire_buf) |buf| {
-            var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
-            ctx.minimal_responses = self.config.minimal_responses;
-            if (buildResponseWire(buf, ctx, result.message, alloc)) |wire| {
-                self.sendUdpResponse(sock, wire, client_addr);
-            }
-        } else {
-            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
-        }
+        self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
-        self.dispatchPrefetches(result, name_str, transports, prefetch_pta);
+        self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
 
         if (query_msg.header.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
         }
     }
 
+    const PrefetchInlineFallback = struct { transports: Transports, prefetch_pta: *PerThreadArena };
+
     fn dispatchPrefetches(
         self: *WorkerState,
         result: recursive.RecursiveResolver.ResolveResult,
         query_name: []const u8,
-        transports: Transports,
-        prefetch_pta: *PerThreadArena,
+        inline_fallback: ?PrefetchInlineFallback,
     ) void {
-        // TTL-refresh: bg thread, with inline fallback so a refresh is never dropped.
-        if (result.prefetch_name) |n| self.spawnOrInline(n, result.prefetch_qtype, transports, prefetch_pta);
-        if (result.prefetch_dnskey_zone) |z| self.spawnOrInline(z, .dnskey, transports, prefetch_pta);
+        // TTL-refresh: bg thread; inline fallback (slow path only) prevents
+        // dropping a refresh when the bg cap is hit.
+        if (result.prefetch_name) |n| self.spawnPrefetch(n, result.prefetch_qtype, inline_fallback);
+        if (result.prefetch_dnskey_zone) |z| self.spawnPrefetch(z, .dnskey, inline_fallback);
 
-        // RFC 8305 cousin co-prefetch: fire-and-forget, gated on a cache miss.
+        // RFC 8305 cousin co-prefetch: fire-and-forget, bg-only on both paths.
         const cousin_qtype = result.cousin_prefetch_qtype orelse return;
         if (!self.config.prefetch_cousin) return;
         if (self.cache.containsFresh(query_name, cousin_qtype, .in)) return;
         _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .prefetch);
     }
 
-    fn spawnOrInline(
-        self: *WorkerState,
-        name: []const u8,
-        qtype: dns.RType,
-        transports: Transports,
-        prefetch_pta: *PerThreadArena,
-    ) void {
-        if (!self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) {
-            self.doPrefetchWith(name, qtype, transports, prefetch_pta);
-        }
+    fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType, inline_fallback: ?PrefetchInlineFallback) void {
+        if (self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) return;
+        if (inline_fallback) |f| self.doPrefetchWith(name, qtype, f.transports, f.prefetch_pta);
     }
 
     /// Schedule background DNSSEC validation for a cache entry populated by

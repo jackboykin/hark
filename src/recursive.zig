@@ -101,7 +101,9 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
 pub const RecursiveResolver = struct {
-    transports: Transports,
+    /// `null` IFF `cache_only` — the type-level invariant lets the resolver
+    /// short-circuit before any transport access on the recv-thread fast path.
+    transports: ?Transports,
     io: std.Io,
     /// Override the built-in IANA root hints. Defaults to the hardcoded
     /// production list. The server passes a config-supplied slice when
@@ -134,6 +136,8 @@ pub const RecursiveResolver = struct {
     rtt_cache: ?*RttCache = null,
     ns_selector: ?*NsSelector = null,
     bypass_cache: bool = false,
+    /// When set, any upstream attempt returns `error.CacheOnlyMiss`.
+    cache_only: bool = false,
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
@@ -210,9 +214,12 @@ pub const RecursiveResolver = struct {
         cd: bool = false,
         /// Skip the response cache (bg prefetch path; per-query overrides).
         bypass_cache: bool = false,
+        /// Cache-only fast path. See `RecursiveResolver.cache_only`.
+        cache_only: bool = false,
     };
 
-    pub fn fromContext(ctx: Context, transports: Transports, opts: RuntimeOpts) RecursiveResolver {
+    pub fn fromContext(ctx: Context, transports: ?Transports, opts: RuntimeOpts) RecursiveResolver {
+        std.debug.assert((transports == null) == opts.cache_only);
         return .{
             .transports = transports,
             .io = ctx.io,
@@ -230,6 +237,7 @@ pub const RecursiveResolver = struct {
             .rtt_cache = ctx.rtt_cache,
             .ns_selector = ctx.ns_selector,
             .bypass_cache = opts.bypass_cache,
+            .cache_only = opts.cache_only,
             .stagger_ms = ctx.config.stagger_ms,
             .case_state = ctx.case_state,
             .dedup = ctx.dedup,
@@ -244,6 +252,7 @@ pub const RecursiveResolver = struct {
     /// Create a thread-local resolver clone with fresh transports. Shared
     /// caches and config are inherited; per-query mutable state is reset.
     fn cloneForThread(self: *RecursiveResolver, transports: Transports) RecursiveResolver {
+        std.debug.assert(!self.cache_only); // clone implies real upstream work
         var resolver = self.*;
         resolver.transports = transports;
         resolver.gpa = null;
@@ -255,11 +264,11 @@ pub const RecursiveResolver = struct {
     }
 
     fn udp(self: *const RecursiveResolver) *BlockingUdpTransport {
-        return self.transports.udp;
+        return self.transports.?.udp;
     }
 
     fn tcp(self: *const RecursiveResolver) ?*BlockingTcpTransport {
-        return self.transports.tcp;
+        return self.transports.?.tcp;
     }
 
     /// Close and discard any pending anticipated query. Safe to call when no
@@ -1478,6 +1487,8 @@ pub const RecursiveResolver = struct {
         server_count: usize,
         parent_zone: dns.Name,
     ) anyerror!ServerQueryResult {
+        if (self.cache_only) return error.CacheOnlyMiss;
+
         // Fast path: a same-zone CNAME chase may have pre-fired this exact
         // query while the prior hop did cache-write + NSEC aggregation. Drain
         // it before re-running NS selection / stagger / send.
@@ -1543,7 +1554,7 @@ pub const RecursiveResolver = struct {
                 // ── RFC 9539: Opportunistic encrypted query ──
                 // TLS authenticates the channel, so 0x20 is redundant there;
                 // the TLS variant always uses lowercase QNAME.
-                if (self.transports.tls) |tls_t| {
+                if (self.transports.?.tls) |tls_t| {
                     if (self.encrypted_ns_cache) |oc| {
                         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
                         switch (oc.getStatus(tls_key)) {
@@ -1643,7 +1654,7 @@ pub const RecursiveResolver = struct {
 
     fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
         const oc = self.encrypted_ns_cache orelse return;
-        const tls_t = self.transports.tls orelse return;
+        const tls_t = self.transports.?.tls orelse return;
         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
         if (oc.claimProbe(tls_key)) {
             tls_t.probeInBackground(server, oc);
@@ -2440,7 +2451,7 @@ pub const RecursiveResolver = struct {
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp = &tcp_t,
-                .tls = ctx.parent.transports.tls,
+                .tls = ctx.parent.transports.?.tls,
             });
 
             var arena = std.heap.ArenaAllocator.init(ctx.shared_cap.allocator());
