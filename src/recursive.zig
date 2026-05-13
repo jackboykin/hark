@@ -3737,3 +3737,34 @@ test "prepareAnticipated does not clobber a live outer slot" {
     try testing.expectEqual(outer_sock, resolver.anticipated_query.?.sock);
     try testing.expectEqual(dns.RType.a, resolver.anticipated_query.?.qtype);
 }
+
+// ── cache_only guard tests ────────────────────────────────────────────
+// Pin the recv-thread fast-path invariant: every upstream-reaching entry
+// must short-circuit before any `transports.?` access. Two guards cover
+// the surface: `queryAuthoritativeServers` (the main recursion entry) and
+// `fetchRRset` (reached via `findClosestCachedDelegation` →
+// `reproveDelegationSecurity`). A real crash motivated the second guard.
+
+test "fetchRRset returns CacheOnlyMiss when cache_only=true" {
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache_only = true,
+    };
+    const servers: []const na.Address = &.{na.initIp4(.{ 192, 0, 2, 1 }, 53)};
+    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1, false, false);
+    try testing.expectError(error.CacheOnlyMiss, result);
+}
+
+test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache_only = true,
+    };
+    var servers: [max_servers_per_level]na.Address = undefined;
+    servers[0] = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+    const parent_zone = dns.Name{ .labels = &.{} };
+    const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, &servers, 1, parent_zone);
+    try testing.expectError(error.CacheOnlyMiss, result);
+}
