@@ -95,6 +95,89 @@ const PerThreadArena = struct {
     }
 };
 
+// ── Slot pool ─────────────────────────────────────────────────────────
+// Bounded MPMC queue over a fixed slot array. Two rings: an order ring
+// holding queued indices (FIFO), and a free-list stack holding indices
+// available for claim. All primitives assume the caller holds `mutex`
+// — keeping push/pop atomic across claim+enqueue / dequeue+copy means
+// the wrapper does one lock acquisition per operation, not two.
+
+fn SlotPool(comptime T: type, comptime cap: u16) type {
+    return struct {
+        const Self = @This();
+
+        slots: [cap]T = [_]T{.{}} ** cap,
+        order: [cap]u16 = undefined,
+        head: u16 = 0,
+        tail: u16 = 0,
+        queued: u16 = 0,
+        free_list: [cap]u16 = undefined,
+        free_count: u16 = 0,
+        mutex: Io.Mutex = Io.Mutex.init,
+        not_empty: Io.Condition = Io.Condition.init,
+        io: Io,
+        shutdown: bool = false,
+
+        fn init(self: *Self, io: Io) void {
+            self.* = .{ .io = io };
+            for (0..cap) |i| self.free_list[i] = @intCast(cap - 1 - i);
+            self.free_count = cap;
+        }
+
+        fn lock(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+        }
+
+        fn unlock(self: *Self) void {
+            self.mutex.unlock(self.io);
+        }
+
+        /// Reserve a free slot. Caller MUST follow with `enqueueLocked(idx)`
+        /// once the slot is populated, or `releaseLocked(idx)` to abandon.
+        fn claimLocked(self: *Self) ?struct { idx: u16, slot: *T } {
+            if (self.free_count == 0) return null;
+            self.free_count -= 1;
+            const idx = self.free_list[self.free_count];
+            return .{ .idx = idx, .slot = &self.slots[idx] };
+        }
+
+        /// Publish a populated slot to the FIFO and wake one waiter.
+        fn enqueueLocked(self: *Self, idx: u16) void {
+            self.order[self.tail] = idx;
+            self.tail = (self.tail + 1) % cap;
+            self.queued += 1;
+            self.not_empty.signal(self.io);
+        }
+
+        /// Block until a slot is queued or shutdown. Returns null on
+        /// shutdown with empty queue.
+        fn dequeueLocked(self: *Self) ?struct { idx: u16, slot: *T } {
+            while (self.queued == 0 and !self.shutdown) {
+                self.not_empty.waitUncancelable(self.io, &self.mutex);
+            }
+            if (self.queued == 0) return null;
+            const idx = self.order[self.head];
+            self.head = (self.head + 1) % cap;
+            self.queued -= 1;
+            return .{ .idx = idx, .slot = &self.slots[idx] };
+        }
+
+        fn releaseLocked(self: *Self, idx: u16) void {
+            self.free_list[self.free_count] = idx;
+            self.free_count += 1;
+        }
+
+        /// Self-locking; the `*Locked` siblings assume the caller holds
+        /// the lock, but shutdown is a one-shot edge from any thread.
+        fn signalShutdown(self: *Self) void {
+            self.lock();
+            defer self.unlock();
+            self.shutdown = true;
+            self.not_empty.broadcast(self.io);
+        }
+    };
+}
+
 // ── Work Queue for resolution thread pool ─────────────────────────────
 
 /// Matches `multishot_payload_max` in event_loop.zig — the kernel never
@@ -120,77 +203,48 @@ const PopResult = struct {
 };
 
 const WorkQueue = struct {
-    slots: [work_queue_capacity]Slot = [_]Slot{.{}} ** work_queue_capacity,
-    order: [work_queue_capacity]u16 = undefined,
-    head: u16 = 0,
-    tail: u16 = 0,
-    queued: u16 = 0,
-    free_list: [work_queue_capacity]u16 = undefined,
-    free_count: u16 = 0,
-    mutex: Io.Mutex = Io.Mutex.init,
-    not_empty: Io.Condition = Io.Condition.init,
-    io: Io,
-    shutdown: bool = false,
+    pool: SlotPool(Slot, work_queue_capacity),
 
     fn init(self: *WorkQueue, io: Io) void {
-        self.* = .{ .io = io };
-        for (0..work_queue_capacity) |i| self.free_list[i] = @intCast(work_queue_capacity - 1 - i);
-        self.free_count = work_queue_capacity;
+        self.pool.init(io);
     }
 
     fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: Protocol) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         if (data.len > max_work_query_bytes) return false;
-        if (self.free_count == 0) return false;
-        self.free_count -= 1;
-        const slot_idx = self.free_list[self.free_count];
-        const slot = &self.slots[slot_idx];
-        @memcpy(slot.buf[0..data.len], data);
-        slot.len = @intCast(data.len);
-        slot.client_addr = client_addr;
-        slot.sock_fd = sock_fd;
-        slot.protocol = protocol;
-        self.order[self.tail] = slot_idx;
-        self.tail = (self.tail + 1) % work_queue_capacity;
-        self.queued += 1;
-        self.not_empty.signal(self.io);
+        self.pool.lock();
+        defer self.pool.unlock();
+        const claimed = self.pool.claimLocked() orelse return false;
+        @memcpy(claimed.slot.buf[0..data.len], data);
+        claimed.slot.len = @intCast(data.len);
+        claimed.slot.client_addr = client_addr;
+        claimed.slot.sock_fd = sock_fd;
+        claimed.slot.protocol = protocol;
+        self.pool.enqueueLocked(claimed.idx);
         return true;
     }
 
     /// Returned payload borrows from the slot until `release(reservation)`.
     fn pop(self: *WorkQueue) ?PopResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        while (self.queued == 0 and !self.shutdown) {
-            self.not_empty.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.queued == 0) return null;
-        const slot_idx = self.order[self.head];
-        self.head = (self.head + 1) % work_queue_capacity;
-        self.queued -= 1;
-        const slot = &self.slots[slot_idx];
+        self.pool.lock();
+        defer self.pool.unlock();
+        const taken = self.pool.dequeueLocked() orelse return null;
         return PopResult{
-            .payload = slot.buf[0..slot.len],
-            .reservation = slot_idx,
-            .client_addr = slot.client_addr,
-            .sock_fd = slot.sock_fd,
-            .protocol = slot.protocol,
+            .payload = taken.slot.buf[0..taken.slot.len],
+            .reservation = taken.idx,
+            .client_addr = taken.slot.client_addr,
+            .sock_fd = taken.slot.sock_fd,
+            .protocol = taken.slot.protocol,
         };
     }
 
     fn release(self: *WorkQueue, reservation: u16) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.free_list[self.free_count] = reservation;
-        self.free_count += 1;
+        self.pool.lock();
+        defer self.pool.unlock();
+        self.pool.releaseLocked(reservation);
     }
 
     fn signalShutdown(self: *WorkQueue) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.shutdown = true;
-        self.not_empty.broadcast(self.io);
+        self.pool.signalShutdown();
     }
 };
 
