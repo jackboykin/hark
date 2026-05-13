@@ -1883,6 +1883,12 @@ pub const RecursiveResolver = struct {
         do_bit: bool,
         store_response: bool,
     ) !?dns.Message {
+        // Second upstream-touching entry alongside queryAuthoritativeServers.
+        // findClosestCachedDelegation → reproveDelegationSecurity → here
+        // reaches the UDP transport directly; without this guard the recv-
+        // thread fast path crashes on `transports.?.udp` when the cached
+        // delegation needs DS/DNSKEY re-prove.
+        if (self.cache_only) return error.CacheOnlyMiss;
         if (servers.len == 0) return null;
 
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
