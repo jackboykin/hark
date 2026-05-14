@@ -95,12 +95,23 @@ const ArmState = struct {
 
 const ArmMap = std.HashMap(ArmKey, ArmState, ArmKeyContext, std.hash_map.default_max_load_percentage);
 
-pub const NsSelector = struct {
+/// Sharded to bound mutex contention as resolution-threads scales. Each shard
+/// owns its own map and mutex; the per-shard cap is `ceil(max_arms / shard_count)`
+/// so total capacity remains bounded by `max_arms` (modulo per-shard rounding).
+const shard_count: u32 = 16;
+const shard_mask: u32 = shard_count - 1;
+
+const Shard = struct {
     arms: ArmMap,
     mutex: ?std.Io.Mutex,
+};
+
+pub const NsSelector = struct {
+    shards: [shard_count]Shard,
     io: std.Io,
     gamma: f32,
     max_arms: u32,
+    per_shard_cap: u32,
 
     pub const Config = struct {
         allocator: Allocator,
@@ -110,21 +121,37 @@ pub const NsSelector = struct {
     };
 
     pub fn init(cfg: Config) NsSelector {
-        return .{
+        var shards: [shard_count]Shard = undefined;
+        for (&shards) |*s| s.* = .{
             .arms = ArmMap.init(cfg.allocator),
             .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
+        };
+        return .{
+            .shards = shards,
             .io = cfg.io,
             .gamma = default_gamma,
             .max_arms = cfg.max_arms,
+            .per_shard_cap = (cfg.max_arms + shard_count - 1) / shard_count,
         };
     }
 
     pub fn deinit(self: *NsSelector) void {
-        self.arms.deinit();
+        for (&self.shards) |*s| s.arms.deinit();
     }
 
-    pub fn count(self: *const NsSelector) usize {
-        return self.arms.count();
+    pub fn count(self: *NsSelector) usize {
+        var total: usize = 0;
+        for (&self.shards) |*s| {
+            if (s.mutex) |*mtx| mtx.lockUncancelable(self.io);
+            defer if (s.mutex) |*mtx| mtx.unlock(self.io);
+            total += s.arms.count();
+        }
+        return total;
+    }
+
+    inline fn shardFor(self: *NsSelector, key: ArmKey) *Shard {
+        const h = ArmKeyContext.hash(.{}, key);
+        return &self.shards[@as(u32, @truncate(h)) & shard_mask];
     }
 
     /// Returned ordering: live servers (sorted by Thompson sample, descending)
@@ -147,19 +174,17 @@ pub const NsSelector = struct {
         rtt_cache: ?*RttCache,
         order_buf: *[max_order]usize,
     ) Selection {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
-
         const zh = zoneHash(zone);
-
-        // Discount all arms for this zone (lazy: only on selection).
-        self.discountZone(zh, servers);
 
         var live_count: usize = 0;
         var dead_count: usize = 0;
         var samples: [max_order]f32 = undefined;
         const now_ms = if (rtt_cache) |rc| rc.nowMs() else 0;
 
+        // Fuse discount + read into a single per-shard locked region.
+        // Per-zone locks were a single bottleneck; per-arm shard locks scale
+        // with thread count at the cost of N lock acquisitions per call,
+        // each uncontended in the common case.
         for (servers, 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
@@ -172,13 +197,13 @@ pub const NsSelector = struct {
             }
 
             const arm_key = ArmKey{ .zone_hash = zh, .addr_key = addr_key };
-            const state = self.arms.get(arm_key) orelse ArmState{};
+            const state = self.discountAndRead(arm_key);
 
             order_buf[live_count] = i;
             // Beta(1,1) is uniform: skip Marsaglia-Tsang Gamma machinery when
             // the arm is at the uninformed prior (no observations, or floored
             // back to it by discount). Dominant case on cold resolutions.
-            // Float == is bit-exact here because discountZone floors both
+            // Float == is bit-exact here because discountAndRead floors both
             // fields back to the prior via @max with the same constants.
             samples[live_count] = if (state.alpha == alpha_prior and state.beta == beta_prior)
                 rand.fastUniformFloat(self.io)
@@ -214,30 +239,32 @@ pub const NsSelector = struct {
         outcome: Outcome,
         elapsed_us: i64,
     ) void {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
-
         const arm_key = ArmKey{
             .zone_hash = zoneHash(zone),
             .addr_key = AddressKey.fromAddress(server),
         };
+        const shard = self.shardFor(arm_key);
+        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
+
         const r = reward(outcome, elapsed_us);
 
-        const gop = self.arms.getOrPut(arm_key) catch return;
+        const gop = shard.arms.getOrPut(arm_key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = ArmState{};
         gop.value_ptr.alpha += r;
         gop.value_ptr.beta += (1.0 - r);
 
-        if (self.arms.count() > self.max_arms) self.evictOne(arm_key);
+        if (shard.arms.count() > self.per_shard_cap) self.evictOneLocked(shard, arm_key);
     }
 
-    /// Evict one non-`protected` arm; a flood across many zones must not
-    /// erase healthy root/TLD posteriors all at once.
-    fn evictOne(self: *NsSelector, protected: ArmKey) void {
-        var it = self.arms.iterator();
+    /// Evict one non-`protected` arm from a shard the caller holds.
+    /// A flood across many zones must not erase healthy root/TLD posteriors
+    /// all at once — the cap is now per-shard so eviction is bounded too.
+    fn evictOneLocked(_: *NsSelector, shard: *Shard, protected: ArmKey) void {
+        var it = shard.arms.iterator();
         while (it.next()) |kv| {
             if (std.meta.eql(kv.key_ptr.*, protected)) continue;
-            self.arms.removeByPtr(kv.key_ptr);
+            shard.arms.removeByPtr(kv.key_ptr);
             return;
         }
     }
@@ -245,28 +272,33 @@ pub const NsSelector = struct {
     /// Return the confidence score (Beta mean) for a server in a zone.
     /// Returns null if no observations exist.
     pub fn confidence(self: *NsSelector, zone: dns.Name, server: na.Address) ?f32 {
-        if (self.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (self.mutex) |*mtx| mtx.unlock(self.io);
-
         const arm_key = ArmKey{
             .zone_hash = zoneHash(zone),
             .addr_key = AddressKey.fromAddress(server),
         };
-        const state = self.arms.get(arm_key) orelse return null;
+        const shard = self.shardFor(arm_key);
+        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
+
+        const state = shard.arms.get(arm_key) orelse return null;
         return state.alpha / (state.alpha + state.beta);
     }
 
     // ── Internal ─────────────────────────────────────────────────────
 
-    /// Apply discount γ to all arms matching this zone and server set.
-    fn discountZone(self: *NsSelector, zh: u64, servers: []const na.Address) void {
-        for (servers) |server| {
-            const arm_key = ArmKey{ .zone_hash = zh, .addr_key = AddressKey.fromAddress(server) };
-            if (self.arms.getPtr(arm_key)) |state| {
-                state.alpha = @max(alpha_prior, state.alpha * self.gamma);
-                state.beta = @max(beta_prior, state.beta * self.gamma);
-            }
+    /// Apply discount γ if the arm exists, then return its (possibly updated)
+    /// state. Single-shard lock; caller must not hold any other shard.
+    fn discountAndRead(self: *NsSelector, key: ArmKey) ArmState {
+        const shard = self.shardFor(key);
+        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
+        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
+
+        if (shard.arms.getPtr(key)) |state| {
+            state.alpha = @max(alpha_prior, state.alpha * self.gamma);
+            state.beta = @max(beta_prior, state.beta * self.gamma);
+            return state.*;
         }
+        return ArmState{};
     }
 };
 
