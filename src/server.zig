@@ -27,6 +27,7 @@ const dedup_mod = @import("dedup.zig");
 const InFlightTable = dedup_mod.InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
+const BumpGatedGroup = @import("bg_group.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
@@ -389,72 +390,14 @@ const max_listen_addrs = 8;
 
 // ── Background task bookkeeping ────────────────────────────────────────
 
-/// Cap concurrent background tasks (prefetch + CD=1 validation). Mirrors
-/// the pattern in encrypted_ns.EncryptedNsCache / tls_transport.probeInBackground:
-/// spawn detached threads with a CAS-loop cap, poll to drain on shutdown.
-/// Conservative cap — DNSSEC cold-cache bursts can otherwise deadlock on
-/// over-fanout.
+/// Cap concurrent background tasks (prefetch + CD=1 validation). Conservative
+/// — DNSSEC cold-cache bursts can otherwise deadlock on over-fanout.
 const max_bg_tasks: u32 = 16;
 
 /// Dedup flag value for background CD=1 revalidation tasks. Distinct
 /// from CD=0 (flag=0) and CD=1-client (flag=1) so a client-facing query
 /// and a background revalidation of the same (name, qtype) don't coalesce.
 const bg_revalidate_flag: u8 = 2;
-
-const BackgroundTasks = struct {
-    active: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Reserve a slot for a new background thread. Returns false when the
-    /// cap is hit or we're shutting down — caller must fall back (run inline
-    /// or drop), never block here.
-    fn tryClaim(self: *BackgroundTasks) bool {
-        if (self.shutting_down.load(.acquire)) return false;
-        while (true) {
-            const cur = self.active.load(.monotonic);
-            if (cur >= max_bg_tasks) return false;
-            // .acq_rel on success: the release publishes our bump so awaitAll's
-            // acquire-load sees it; the acquire pairs with the post-bump
-            // shutdown re-check below.
-            if (self.active.cmpxchgStrong(cur, cur + 1, .acq_rel, .monotonic) == null) {
-                // Re-check shutdown after the bump landed. Between our pre-check
-                // and CAS, awaitAll may have set shutting_down and observed
-                // inFlight==0 (because our bump hadn't published yet) and
-                // exited. If shutdown is now set, roll back so we don't spawn
-                // into torn-down server state.
-                if (self.shutting_down.load(.acquire)) {
-                    _ = self.active.fetchSub(1, .release);
-                    return false;
-                }
-                return true;
-            }
-        }
-    }
-
-    fn release(self: *BackgroundTasks) void {
-        _ = self.active.fetchSub(1, .release);
-    }
-
-    fn inFlight(self: *const BackgroundTasks) u32 {
-        return self.active.load(.acquire);
-    }
-
-    /// Block until all in-flight background threads finish. Called from
-    /// Server.deinit so caches/config outlive the threads that read them.
-    ///
-    /// The poll-sleep is load-bearing for `tryClaim`'s rollback contract: a
-    /// CAS bump can land after `shutting_down` is set, so the poll must
-    /// observe the transient bump and wait for the subsequent rollback
-    /// decrement that the post-CAS re-check performs. A single-shot wait
-    /// (e.g. condvar) would re-open the race.
-    fn awaitAll(self: *BackgroundTasks) void {
-        self.shutting_down.store(true, .release);
-        while (self.inFlight() > 0) {
-            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-            _ = std.os.linux.nanosleep(&ts, null); // 1ms
-        }
-    }
-};
 
 // ── Server ─────────────────────────────────────────────────────────────
 
@@ -501,7 +444,7 @@ pub const Server = struct {
     /// `. NS` recursive query so subsequent resolutions hit a warm cache
     /// with the live root NS RRset (not just the in-source root_hints).
     primed: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
-    bg_tasks: BackgroundTasks = .{},
+    bg_tasks: BumpGatedGroup = .init(max_bg_tasks),
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         if (cfg.allow_loopback_upstreams) {
@@ -615,7 +558,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         // awaitProbes MUST precede ca_bundle.deinit: each probe holds a
         // by-value TlsTransport whose ca_bundle slices alias this owner.
-        self.bg_tasks.awaitAll();
+        self.bg_tasks.awaitAll(self.io);
         if (self.encrypted_ns_cache) |*oc| {
             oc.awaitProbes();
             oc.deinit();
@@ -819,11 +762,10 @@ pub const Server = struct {
         // setresuid is per-thread on Linux without libc's SIGSETXID broadcast,
         // so every worker drops independently after the last peer binds.
         if (self.config.drop_gid != null or self.config.drop_uid != null) {
-            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
             while (self.bound_count.load(.acquire) < self.config.workers and
                 !self.shutdown.load(.acquire))
             {
-                _ = std.os.linux.nanosleep(&ts, null);
+                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
             if (self.shutdown.load(.acquire)) return;
             dropPrivileges(self.config.drop_gid, self.config.drop_uid) catch |err| {
@@ -903,16 +845,15 @@ pub const Server = struct {
 
         for (pool_threads[0..spawned]) |pt| pt.join();
 
-        // Drain detached DoT probe threads before the per-pool-thread
+        // Drain in-flight DoT probe tasks before the per-pool-thread
         // TlsTransport instances they captured go out of scope.
         if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
     }
 
-    /// Attempt to hand off a prefetch or CD=1 revalidation to a detached
-    /// background thread. Returns true if spawned; false means the caller
-    /// should fall back (run inline or drop — caller's choice). The bg
-    /// thread owns the heap-allocated context and releases the bg_tasks
-    /// slot on exit.
+    /// Attempt to hand off a prefetch or CD=1 revalidation to a background
+    /// task. Returns true if spawned; false means the caller should fall
+    /// back (run inline or drop — caller's choice). The task owns the
+    /// heap-allocated context and releases the bg_tasks slot on exit.
     fn trySpawnBgPrefetch(self: *Server, name: []const u8, qtype: dns.RType, kind: BgKind) bool {
         if (name.len == 0 or name.len > dns.max_name_len + 1) return false;
         if (!self.bg_tasks.tryClaim()) return false;
@@ -924,12 +865,11 @@ pub const Server = struct {
         ctx.* = .{ .server = self, .qtype = qtype, .kind = kind, .name_len = @intCast(name.len) };
         @memcpy(ctx.name_buf[0..name.len], name);
 
-        const thread = std.Thread.spawn(.{ .stack_size = 1 << 20 }, bgPrefetchThread, .{ctx}) catch {
+        self.bg_tasks.spawn(self.io, bgPrefetchThread, .{ctx}) catch {
             self.allocator.destroy(ctx);
             self.bg_tasks.release();
             return false;
         };
-        thread.detach();
         return true;
     }
 };
@@ -1299,7 +1239,7 @@ const WorkerState = struct {
                 return;
             }
         }
-        self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+        self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
     }
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
@@ -1362,7 +1302,7 @@ const WorkerState = struct {
         var resolver = recursive.RecursiveResolver.fromContext(
             self.resolverContext(),
             null,
-            .{ .cd = query_msg.header.cd, .cache_only = true },
+            .{ .cd = query_msg.header.flags.cd, .cache_only = true },
         );
         const result = resolver.resolve(alloc, name_str, question.qtype) catch |err| {
             // CacheOnlyMiss is the expected miss signal — anything else (OOM,
@@ -1378,7 +1318,7 @@ const WorkerState = struct {
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
         self.dispatchPrefetches(result, name_str, null);
-        if (query_msg.header.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
+        if (query_msg.header.flags.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
         return true;
     }
 
@@ -1435,7 +1375,7 @@ const WorkerState = struct {
             };
 
             if (validateQuery(query)) |fail| {
-                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.opcode, fail.rcode, fail.extended_rcode, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions) orelse return;
                 tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
@@ -1445,12 +1385,12 @@ const WorkerState = struct {
             const name_str = question.name.formatInto(&name_buf);
 
             const start_ns = monotonic.nowNs();
-            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.cd, transports) catch |err| {
+            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, transports) catch |err| {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 self.cache.cacheServfail(name_str, question.qtype);
-                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.opcode, .server_failure, 0, query.header.rd, query.questions) orelse return;
+                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
                 tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
                 continue;
@@ -1458,7 +1398,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
             var rcode_buf: [24]u8 = undefined;
-            log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf), elapsed_ms });
+            log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
 
             // RFC 7828: advertise our TCP idle timeout so the stub can
             // size its keepalive expectations. Units are 100 ms.
@@ -1470,7 +1410,7 @@ const WorkerState = struct {
             tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
 
             self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
-            if (query.header.cd) {
+            if (query.header.flags.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
         }
@@ -1583,7 +1523,7 @@ const WorkerState = struct {
                 // return — otherwise the .unchecked SERVFAIL written into
                 // the cache by the resolver (5 min ceiling) would shadow
                 // root NS lookups for the entire boot window.
-                if (result.message.header.rcode != .no_error) {
+                if (result.message.header.flags.rcode != .no_error) {
                     self.server.primed.store(false, .release);
                 }
             } else |_| {
@@ -1648,7 +1588,7 @@ const WorkerState = struct {
         };
 
         if (validateQuery(query_msg)) |fail| {
-            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, fail.rcode, fail.extended_rcode, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, fail.rcode, fail.extended_rcode, query_msg.header.flags.rd, query_msg.questions, client_addr);
             return;
         }
 
@@ -1659,24 +1599,24 @@ const WorkerState = struct {
         const start_ns = monotonic.nowNs();
         var peer_buf: [64]u8 = undefined;
         const peer_str = na.format(client_addr, &peer_buf);
-        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.cd, transports) catch |err| {
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.flags.cd, transports) catch |err| {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             self.cache.cacheServfail(name_str, question.qtype);
-            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.opcode, .server_failure, 0, query_msg.header.rd, query_msg.questions, client_addr);
+            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
-        log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.rcode, &rcode_buf2), elapsed_ms });
+        log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
 
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
         self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
 
-        if (query_msg.header.cd) {
+        if (query_msg.header.flags.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
         }
     }
@@ -2049,8 +1989,8 @@ test "createSocket UDP reuseport allows multiple binds" {
     defer sys.close(sock2);
 }
 
-test "BackgroundTasks.tryClaim caps concurrent tasks" {
-    var bg = BackgroundTasks{};
+test "bg_tasks.tryClaim caps concurrent tasks" {
+    var bg = BumpGatedGroup.init(max_bg_tasks);
     for (0..max_bg_tasks) |_| {
         try testing.expect(bg.tryClaim());
     }
@@ -2061,8 +2001,8 @@ test "BackgroundTasks.tryClaim caps concurrent tasks" {
     try testing.expectEqual(@as(u32, 0), bg.inFlight());
 }
 
-test "BackgroundTasks rejects tryClaim after shutdown" {
-    var bg = BackgroundTasks{};
+test "bg_tasks rejects tryClaim after shutdown" {
+    var bg = BumpGatedGroup.init(max_bg_tasks);
     bg.shutting_down.store(true, .release);
     // Even with empty slots, shutdown short-circuits tryClaim so bg threads
     // can drain to zero and awaitAll can return.
@@ -2089,7 +2029,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // set ad=true (because security_status was .unchecked at lookup time —
     // recursive.zig:182 computes `ad = h.security_status == .secure`).
     const response_unchecked = dns.Message{
-        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
         .questions = &.{},
     };
 
@@ -2107,13 +2047,13 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     }, response_unchecked, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(false, parsed.header.ad);
+    try testing.expectEqual(false, parsed.header.flags.ad);
 
     // Same message with validation-proven security_status=.secure would have
-    // response.header.ad == true upstream of buildResponseWire; confirm the
+    // response.header.flags.ad == true upstream of buildResponseWire; confirm the
     // path then emits AD=1.
     const response_secure = dns.Message{
-        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = true, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = true, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
         .questions = &.{},
     };
     var buf2: [dns.edns_udp_payload]u8 = undefined;
@@ -2129,7 +2069,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
         .max_udp_payload = dns.edns_udp_payload,
     }, response_secure, a).?;
     const parsed2 = try dns.parseMessage(a, wire2);
-    try testing.expectEqual(true, parsed2.header.ad);
+    try testing.expectEqual(true, parsed2.header.flags.ad);
 }
 
 test "hasValidatedPositive returns true only for non-.unchecked entries" {
@@ -2161,7 +2101,7 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
     const answers = try a.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
     const resp = dns.Message{
-        .header = .{ .id = 0, .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
         .questions = &.{},
         .answers = answers,
     };
@@ -2190,6 +2130,6 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     try testing.expect(!server.trySpawnBgPrefetch(&too_long, .a, .prefetch));
 
     // Drain: no thread should have been spawned for the rejected inputs.
-    server.bg_tasks.awaitAll();
+    server.bg_tasks.awaitAll(server.io);
     try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());
 }

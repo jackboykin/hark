@@ -7,16 +7,16 @@ pub fn printMessage(msg: dns.Message, writer: anytype) !void {
     var opcode_buf: [24]u8 = undefined;
     var rcode_buf: [24]u8 = undefined;
     try writer.print(";; ->>HEADER<<- opcode: {s}, status: {s}, id: {d}\n", .{
-        dns.safeTagName(dns.OpCode, hdr.opcode, &opcode_buf), dns.safeTagName(dns.RCode, hdr.rcode, &rcode_buf), hdr.id,
+        dns.safeTagName(dns.OpCode, hdr.flags.opcode, &opcode_buf), dns.safeTagName(dns.RCode, hdr.flags.rcode, &rcode_buf), hdr.id,
     });
     try writer.print(";; flags:", .{});
-    if (hdr.qr) try writer.print(" qr", .{});
-    if (hdr.aa) try writer.print(" aa", .{});
-    if (hdr.tc) try writer.print(" tc", .{});
-    if (hdr.rd) try writer.print(" rd", .{});
-    if (hdr.ra) try writer.print(" ra", .{});
-    if (hdr.ad) try writer.print(" ad", .{});
-    if (hdr.cd) try writer.print(" cd", .{});
+    if (hdr.flags.qr) try writer.print(" qr", .{});
+    if (hdr.flags.aa) try writer.print(" aa", .{});
+    if (hdr.flags.tc) try writer.print(" tc", .{});
+    if (hdr.flags.rd) try writer.print(" rd", .{});
+    if (hdr.flags.ra) try writer.print(" ra", .{});
+    if (hdr.flags.ad) try writer.print(" ad", .{});
+    if (hdr.flags.cd) try writer.print(" cd", .{});
     try writer.print("; QUERY: {d}, ANSWER: {d}, AUTHORITY: {d}, ADDITIONAL: {d}\n\n", .{
         hdr.qd_count, hdr.an_count, hdr.ns_count, hdr.ar_count,
     });

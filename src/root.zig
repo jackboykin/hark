@@ -17,6 +17,7 @@ pub const ns_selector = @import("ns_selector.zig");
 pub const dedup = @import("dedup.zig");
 pub const nsec_cache = @import("nsec_cache.zig");
 pub const counting_allocator = @import("counting_allocator.zig");
+pub const bg_group = @import("bg_group.zig");
 pub const blocking_transport = @import("blocking_transport.zig");
 pub const transport = @import("transport.zig");
 pub const rand = @import("rand.zig");
@@ -47,6 +48,7 @@ test {
     _ = dedup;
     _ = nsec_cache;
     _ = counting_allocator;
+    _ = bg_group;
     _ = blocking_transport;
     _ = transport;
     _ = rand;

@@ -805,7 +805,7 @@ pub const RRsetCache = struct {
     /// observe a partial-response cache state mid-store; DNS clients
     /// tolerate this as they would tolerate a not-yet-arrived response.
     pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
-        if (response.header.rcode != .no_error) return;
+        if (response.header.flags.rcode != .no_error) return;
 
         // RFC 4035 §3.1.3.4: capture the wildcard NSEC denial onto the answer
         // entry so cache hits ship the same proof live did.
@@ -1370,16 +1370,18 @@ fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
     return .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = true,
+                .tc = false,
+                .rd = false,
+                .ra = false,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = 0,
@@ -1701,16 +1703,18 @@ test "storeResponse captures wildcard NSEC proofs onto positive cache entry" {
     const response: dns.Message = .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = true,
+                .tc = false,
+                .rd = false,
+                .ra = false,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = @intCast(authorities.len),
@@ -1810,16 +1814,18 @@ test "storeResponse ignores orphan-RRSIG wildcard signal (forged-trigger defence
     const response: dns.Message = .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = true,
+                .tc = false,
+                .rd = false,
+                .ra = false,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = @intCast(authorities.len),
@@ -1968,16 +1974,18 @@ test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
     const msg = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = true,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 1,
             .an_count = records.len,
             .ns_count = 0,

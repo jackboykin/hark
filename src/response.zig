@@ -47,7 +47,7 @@ fn isValidationMaterial(rtype: dns.RType) bool {
 /// least one answer record). Drives the strip rules: positives shed
 /// delegation NS and glue; negatives retain SOA + proofs.
 fn isPositiveAnswer(response: dns.Message) bool {
-    return response.header.rcode == .no_error and response.answers.len > 0;
+    return response.header.flags.rcode == .no_error and response.answers.len > 0;
 }
 
 /// Result of shaping: section slices owned by the supplied allocator
@@ -267,14 +267,14 @@ pub const ResponseContext = struct {
         const client_do = query.opt != null and query.opt.?.do_bit;
         return .{
             .query_id = query.header.id,
-            .opcode = query.header.opcode,
-            .rd = query.header.rd,
-            .cd = query.header.cd,
+            .opcode = query.header.flags.opcode,
+            .rd = query.header.flags.rd,
+            .cd = query.header.flags.cd,
             .questions = query.questions,
             .client_edns = query.opt != null,
             .client_do = client_do,
             // RFC 6840 §5.8: set AD only if client signalled DO or AD
-            .client_wants_ad = client_do or query.header.ad,
+            .client_wants_ad = client_do or query.header.flags.ad,
             .max_udp_payload = max_udp_payload,
         };
     }
@@ -329,16 +329,18 @@ pub fn buildResponseWire(
     var msg = dns.Message{
         .header = .{
             .id = ctx.query_id,
-            .qr = true,
-            .opcode = ctx.opcode,
-            .aa = false,
-            .tc = false,
-            .rd = ctx.rd,
-            .ra = true,
-            .z = 0,
-            .ad = response.header.ad and ctx.client_wants_ad,
-            .cd = ctx.cd,
-            .rcode = response.header.rcode,
+            .flags = .{
+                .qr = true,
+                .opcode = ctx.opcode,
+                .aa = false,
+                .tc = false,
+                .rd = ctx.rd,
+                .ra = true,
+                .z = 0,
+                .ad = response.header.flags.ad and ctx.client_wants_ad,
+                .cd = ctx.cd,
+                .rcode = response.header.flags.rcode,
+            },
             .qd_count = @intCast(ctx.questions.len),
             .an_count = @intCast(answers.len),
             .ns_count = @intCast(authorities.len),
@@ -368,7 +370,7 @@ pub fn buildResponseWire(
     // when an authoritative section that the client may need (negative SOA,
     // referral NS) is omitted, the truncation flag MUST be set so the client
     // knows to retry over TCP.
-    msg.header.tc = true;
+    msg.header.flags.tc = true;
     msg.authorities = &.{};
     msg.header.ns_count = 0;
     if (dns.serializeMessage(wire_buf, msg)) |wire| {
@@ -404,19 +406,21 @@ pub fn serializeErrorResponse(
     const msg = dns.Message{
         .header = .{
             .id = query_id,
-            .qr = true,
-            // RFC 1035 §4.1.1: response OPCODE echoes the query's OPCODE.
-            // Hardcoding .query here would mislabel NOTIMP responses to
-            // OPCODE=4/5 (Notify/Update) as ordinary QUERY replies.
-            .opcode = opcode,
-            .aa = false,
-            .tc = false,
-            .rd = rd,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = rcode,
+            .flags = .{
+                .qr = true,
+                // RFC 1035 §4.1.1: response OPCODE echoes the query's OPCODE.
+                // Hardcoding .query here would mislabel NOTIMP responses to
+                // OPCODE=4/5 (Notify/Update) as ordinary QUERY replies.
+                .opcode = opcode,
+                .aa = false,
+                .tc = false,
+                .rd = rd,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = rcode,
+            },
             .qd_count = @intCast(questions.len),
             .an_count = 0,
             .ns_count = 0,
@@ -446,16 +450,18 @@ pub fn synthesizedMessage(
     return .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = authenticated,
-            .cd = false,
-            .rcode = rcode,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = authenticated,
+                .cd = false,
+                .rcode = rcode,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = @intCast(authorities.len),
@@ -478,8 +484,8 @@ pub fn validateQuery(query: dns.Message) ?ValidationFailure {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful
     // (UDP path drops silently before parse).
-    if (query.header.qr) return .{ .rcode = .format_error };
-    if (query.header.opcode != .query) return .{ .rcode = .not_implemented };
+    if (query.header.flags.qr) return .{ .rcode = .format_error };
+    if (query.header.flags.opcode != .query) return .{ .rcode = .not_implemented };
     if (query.questions.len != 1) return .{ .rcode = .format_error };
     if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
     // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
@@ -503,16 +509,18 @@ test "buildResponseWire sets correct header fields" {
     const response = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .server_failure,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .server_failure,
+            },
             .qd_count = 0,
             .an_count = 0,
             .ns_count = 0,
@@ -536,10 +544,10 @@ test "buildResponseWire sets correct header fields" {
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(true, parsed.header.qr);
-    try testing.expectEqual(true, parsed.header.rd);
-    try testing.expectEqual(true, parsed.header.ra);
-    try testing.expectEqual(dns.RCode.server_failure, parsed.header.rcode);
+    try testing.expectEqual(true, parsed.header.flags.qr);
+    try testing.expectEqual(true, parsed.header.flags.rd);
+    try testing.expectEqual(true, parsed.header.flags.ra);
+    try testing.expectEqual(dns.RCode.server_failure, parsed.header.flags.rcode);
     try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
 }
 
@@ -556,16 +564,18 @@ test "buildResponseWire with EDNS0" {
     const response = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = 0,
             .ns_count = 0,
@@ -622,16 +632,18 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
     const response = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = 0,
@@ -673,10 +685,10 @@ test "serializeErrorResponse produces valid DNS message" {
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
-    try testing.expectEqual(dns.RCode.refused, parsed.header.rcode);
-    try testing.expectEqual(true, parsed.header.rd);
-    try testing.expectEqual(true, parsed.header.ra);
-    try testing.expectEqual(true, parsed.header.qr);
+    try testing.expectEqual(dns.RCode.refused, parsed.header.flags.rcode);
+    try testing.expectEqual(true, parsed.header.flags.rd);
+    try testing.expectEqual(true, parsed.header.flags.ra);
+    try testing.expectEqual(true, parsed.header.flags.qr);
     try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
 }
 
@@ -689,7 +701,7 @@ test "serializeErrorResponse with no question (parse failure)" {
 
     const parsed = try dns.parseMessage(arena.allocator(), wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(dns.RCode.format_error, parsed.header.rcode);
+    try testing.expectEqual(dns.RCode.format_error, parsed.header.flags.rcode);
     try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
 }
 
@@ -697,7 +709,7 @@ test "validateQuery rejects QR=1 (response posing as query)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var spoofed = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
-    spoofed.header.qr = true;
+    spoofed.header.flags.qr = true;
 
     try testing.expectEqual(dns.RCode.format_error, validateQuery(spoofed).?.rcode);
 }
@@ -730,8 +742,8 @@ test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const parsed = try dns.parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u4, 5), @intFromEnum(parsed.header.opcode));
-    try testing.expectEqual(dns.RCode.not_implemented, parsed.header.rcode);
+    try testing.expectEqual(@as(u4, 5), @intFromEnum(parsed.header.flags.opcode));
+    try testing.expectEqual(dns.RCode.not_implemented, parsed.header.flags.rcode);
 }
 
 test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.2.1)" {
@@ -768,16 +780,18 @@ test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.
     const response = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = 1,
             .ns_count = ns_authorities.len,
@@ -806,7 +820,7 @@ test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.
     }, response, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(true, parsed.header.tc);
+    try testing.expectEqual(true, parsed.header.flags.tc);
     try testing.expectEqual(@as(u16, 0), parsed.header.ns_count);
     try testing.expectEqual(@as(u16, 1), parsed.header.an_count);
 }
@@ -820,7 +834,7 @@ test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {
 
     const parsed = try dns.parseMessage(arena.allocator(), wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(dns.RCode.no_error, parsed.header.rcode);
+    try testing.expectEqual(dns.RCode.no_error, parsed.header.flags.rcode);
     try testing.expect(parsed.opt != null);
     try testing.expectEqual(@as(u8, 1), parsed.opt.?.extended_rcode);
 }
@@ -906,16 +920,18 @@ fn shapePositiveMessage(
     return .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = @intCast(answers.len),
             .ns_count = @intCast(authorities.len),
@@ -932,16 +948,18 @@ fn shapeNxdomainMessage(authorities: []const dns.ResourceRecord) dns.Message {
     return .{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .name_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .name_error,
+            },
             .qd_count = 0,
             .an_count = 0,
             .ns_count = @intCast(authorities.len),

@@ -205,45 +205,43 @@ pub const TlsTransport = struct {
         return sock;
     }
 
-    /// Fire a background probe for a nameserver. Detached thread does blocking
-    /// TCP connect + TLS handshake. On success, the connection is pooled.
+    /// Fire a background probe for a nameserver. The spawned task does
+    /// blocking TCP connect + TLS handshake. On success, the connection
+    /// is pooled.
     pub fn probeInBackground(self: *TlsTransport, server: na.Address, enc_ns_cache: *EncryptedNsCache) void {
         const tls_server = toPort(server, TlsTransport.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
-        // Cap concurrent probe threads (CAS loop to avoid TOCTOU overcount)
-        while (true) {
-            const current = enc_ns_cache.active_probes.load(.seq_cst);
-            if (current >= encrypted_ns_mod.max_probes) {
-                enc_ns_cache.revertProbing(addr_key);
-                return;
-            }
-            if (enc_ns_cache.active_probes.cmpxchgStrong(current, current + 1, .seq_cst, .seq_cst) == null) break;
+        if (!enc_ns_cache.probes.tryClaim()) {
+            enc_ns_cache.revertProbing(addr_key);
+            return;
         }
-        // Pass TlsTransport by value: the probe thread is detached and
-        // outlives the spawning thread (pool / bg-prefetch) whose stack
-        // frame holds the original `*TlsTransport`. Copying snaps the
-        // small handle (allocator / config / ca_bundle / io / pool ptr)
-        // into the new thread's args before the spawning stack vanishes.
-        // The Certificate.Bundle copy aliases byte slices owned by the
-        // caller; they must outlive every detached probe. Hark's main
-        // bundle is process-lifetime, so this holds.
-        const thread = std.Thread.spawn(.{}, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
-            enc_ns_cache.setStatus(addr_key, .failed);
-            _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
+        // Pass TlsTransport by value: the probe outlives the spawning
+        // stack frame (pool / bg-prefetch) that holds the original
+        // `*TlsTransport`. Copying snaps the small handle (allocator /
+        // config / ca_bundle / io / pool ptr) into the spawned task's
+        // args. The Certificate.Bundle copy aliases byte slices owned by
+        // the caller; they must outlive every probe. Hark's main bundle
+        // is process-lifetime, so this holds.
+        enc_ns_cache.probes.spawn(self.io, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
+            // ConcurrencyUnavailable is transient (spawn pressure), not a
+            // protocol failure — revert the .probing claim so the next
+            // query can probe again instead of poisoning the entry with
+            // `.failed` and skipping DoT for the full damping window.
+            enc_ns_cache.revertProbing(addr_key);
+            enc_ns_cache.probes.release();
             return;
         };
-        thread.detach();
     }
 
     fn probeThread(transport: TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
-        defer _ = enc_ns_cache.active_probes.fetchSub(1, .seq_cst);
-        if (enc_ns_cache.shutting_down.load(.seq_cst)) {
+        defer enc_ns_cache.probes.release();
+        if (enc_ns_cache.probes.shutting_down.load(.acquire)) {
             enc_ns_cache.revertProbing(addr_key);
             return;
         }
 
-        var self = transport; // value copy owned by this thread
+        var self = transport; // value copy owned by this task
 
         // RFC 9539 §4.3: TCP connect failure is "soft" — could be a
         // transient network blip; retry sooner. TLS handshake failure is
@@ -374,8 +372,8 @@ test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
     defer arena.deinit();
     const response = try dns.parseMessage(arena.allocator(), response_data);
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
+    try testing.expect(response.header.flags.qr);
+    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
     try testing.expect(response.answers.len > 0);
 }
 
@@ -407,8 +405,8 @@ test "TlsTransport query Google DoT 8.8.8.8:853" {
     defer arena.deinit();
     const response = try dns.parseMessage(arena.allocator(), response_data);
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
+    try testing.expect(response.header.flags.qr);
+    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
     try testing.expect(response.answers.len > 0);
 }
 
@@ -440,8 +438,8 @@ test "TlsTransport queryOpportunistic against 1.1.1.1:853" {
     defer arena.deinit();
     const response = try dns.parseMessage(arena.allocator(), response_data);
 
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
+    try testing.expect(response.header.flags.qr);
+    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
     try testing.expect(response.answers.len > 0);
 }
 
@@ -489,8 +487,8 @@ test "TlsTransport connection pooling reuses connection" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const response = try dns.parseMessage(arena.allocator(), response_data);
-    try testing.expect(response.header.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.rcode);
+    try testing.expect(response.header.flags.qr);
+    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
     try testing.expect(response.answers.len > 0);
 }
 
@@ -627,8 +625,8 @@ test "probeInBackground reverts .probing when max_probes hit" {
     try testing.expect(enc_ns_cache.claimProbe(addr_key));
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.probing, enc_ns_cache.getStatus(addr_key));
 
-    // Saturate active_probes so the guard triggers
-    enc_ns_cache.active_probes.store(encrypted_ns_mod.max_probes, .seq_cst);
+    // Saturate the probe-cap counter so the guard triggers
+    enc_ns_cache.probes.active.store(encrypted_ns_mod.max_probes, .seq_cst);
 
     // probeInBackground should hit the max_probes guard and revert.
     var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
@@ -649,17 +647,14 @@ test "probeThread reverts .probing on shutdown" {
     // Claim the probe slot
     try testing.expect(enc_ns_cache.claimProbe(addr_key));
 
-    // Signal shutdown before spawning
-    enc_ns_cache.shutting_down.store(true, .seq_cst);
+    // Signal shutdown before spawning so tryClaim short-circuits
+    enc_ns_cache.probes.shutting_down.store(true, .release);
 
     var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
     tls_t.probeInBackground(server, &enc_ns_cache);
 
-    // Wait for the detached thread to finish
-    while (enc_ns_cache.active_probes.load(.seq_cst) > 0) {
-        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
+    // Wait for the spawned probe to finish via the Group's await.
+    enc_ns_cache.awaitProbes();
 
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
 }

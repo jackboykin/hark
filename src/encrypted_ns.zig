@@ -5,6 +5,7 @@ const testing = std.testing;
 const na = @import("net_address.zig");
 const posix = std.posix;
 const AddressKey = na.AddressKey;
+const BumpGatedGroup = @import("bg_group.zig");
 
 /// How long a hard-failed probe is damped (1 hour). Hard failures are
 /// definitive signals the server does not speak DoT — TLS handshake
@@ -56,8 +57,8 @@ pub const EncryptedNsCache = struct {
     entries: std.AutoHashMap(AddressKey, NsEntry),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     io: std.Io,
-    active_probes: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Caps + joins in-flight probes; see `BumpGatedGroup`.
+    probes: BumpGatedGroup = .init(max_probes),
     now_fn: *const fn () i64 = &monotonic.nowSec,
 
     pub fn init(allocator: Allocator, io: std.Io) EncryptedNsCache {
@@ -149,12 +150,9 @@ pub const EncryptedNsCache = struct {
     }
 
     /// Block until all background probes have completed (for shutdown).
+    /// Probes mid-flight observe `probes.shutting_down` and bail early.
     pub fn awaitProbes(self: *EncryptedNsCache) void {
-        self.shutting_down.store(true, .seq_cst);
-        while (self.active_probes.load(.seq_cst) > 0) {
-            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-            _ = std.os.linux.nanosleep(&ts, null); // 1ms
-        }
+        self.probes.awaitAll(self.io);
     }
 
     /// Evict the oldest entry when at capacity. Caller must hold mutex.

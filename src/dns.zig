@@ -21,8 +21,8 @@ pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
 /// which may fail with EndOfData on mid-record truncation (RFC 2181).
 pub fn hasTcBit(bytes: []const u8) bool {
     if (bytes.len < header_len) return false;
-    const flags = mem.readInt(u16, bytes[2..4], .big);
-    return (flags >> 9) & 1 == 1;
+    const flags: Header.Flags = @bitCast(mem.readInt(u16, bytes[2..4], .big));
+    return flags.tc;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -118,64 +118,42 @@ pub const Error = error{
 
 pub const Header = struct {
     id: u16,
-    qr: bool,
-    opcode: OpCode,
-    aa: bool,
-    tc: bool,
-    rd: bool,
-    ra: bool,
-    z: u1,
-    ad: bool,
-    cd: bool,
-    rcode: RCode,
+    flags: Flags,
     qd_count: u16,
     an_count: u16,
     ns_count: u16,
     ar_count: u16,
 
-    pub fn parse(bytes: *const [12]u8) Header {
-        const id = mem.readInt(u16, bytes[0..2], .big);
-        const flags = mem.readInt(u16, bytes[2..4], .big);
-        const qd_count = mem.readInt(u16, bytes[4..6], .big);
-        const an_count = mem.readInt(u16, bytes[6..8], .big);
-        const ns_count = mem.readInt(u16, bytes[8..10], .big);
-        const ar_count = mem.readInt(u16, bytes[10..12], .big);
+    /// Wire-format flag bits (RFC 1035 §4.1.1 + RFC 2535 §6.1 for AD/CD).
+    /// Packed LSB→MSB so a host-order u16 (post `mem.readInt(.big)`) bitcasts
+    /// directly to the wire bit layout: QR is the MSB, RCODE the low nibble.
+    pub const Flags = packed struct(u16) {
+        rcode: RCode,
+        cd: bool,
+        ad: bool,
+        z: u1,
+        ra: bool,
+        rd: bool,
+        tc: bool,
+        aa: bool,
+        opcode: OpCode,
+        qr: bool,
+    };
 
+    pub fn parse(bytes: *const [12]u8) Header {
         return .{
-            .id = id,
-            .qr = (flags >> 15) & 1 == 1,
-            .opcode = @enumFromInt(@as(u4, @truncate(flags >> 11))),
-            .aa = (flags >> 10) & 1 == 1,
-            .tc = (flags >> 9) & 1 == 1,
-            .rd = (flags >> 8) & 1 == 1,
-            .ra = (flags >> 7) & 1 == 1,
-            .z = @truncate(flags >> 6),
-            .ad = (flags >> 5) & 1 == 1,
-            .cd = (flags >> 4) & 1 == 1,
-            .rcode = @enumFromInt(@as(u4, @truncate(flags))),
-            .qd_count = qd_count,
-            .an_count = an_count,
-            .ns_count = ns_count,
-            .ar_count = ar_count,
+            .id = mem.readInt(u16, bytes[0..2], .big),
+            .flags = @bitCast(mem.readInt(u16, bytes[2..4], .big)),
+            .qd_count = mem.readInt(u16, bytes[4..6], .big),
+            .an_count = mem.readInt(u16, bytes[6..8], .big),
+            .ns_count = mem.readInt(u16, bytes[8..10], .big),
+            .ar_count = mem.readInt(u16, bytes[10..12], .big),
         };
     }
 
     pub fn serialize(self: Header, out: *[12]u8) void {
         mem.writeInt(u16, out[0..2], self.id, .big);
-
-        var flags: u16 = 0;
-        flags |= @as(u16, @intFromBool(self.qr)) << 15;
-        flags |= @as(u16, @intFromEnum(self.opcode)) << 11;
-        flags |= @as(u16, @intFromBool(self.aa)) << 10;
-        flags |= @as(u16, @intFromBool(self.tc)) << 9;
-        flags |= @as(u16, @intFromBool(self.rd)) << 8;
-        flags |= @as(u16, @intFromBool(self.ra)) << 7;
-        flags |= @as(u16, self.z) << 6;
-        flags |= @as(u16, @intFromBool(self.ad)) << 5;
-        flags |= @as(u16, @intFromBool(self.cd)) << 4;
-        flags |= @as(u16, @intFromEnum(self.rcode));
-        mem.writeInt(u16, out[2..4], flags, .big);
-
+        mem.writeInt(u16, out[2..4], @bitCast(self.flags), .big);
         mem.writeInt(u16, out[4..6], self.qd_count, .big);
         mem.writeInt(u16, out[6..8], self.an_count, .big);
         mem.writeInt(u16, out[8..10], self.ns_count, .big);
@@ -616,16 +594,18 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
     return .{
         .header = .{
             .id = id,
-            .qr = false,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = options.rd,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = false,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = options.rd,
+                .ra = false,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 1,
             .an_count = 0,
             .ns_count = 0,
@@ -725,8 +705,7 @@ pub const Parser = struct {
                 if (labels_len >= max_label_count) return error.TooManyLabels;
                 cursor += 1;
                 if (cursor + label_len > self.msg.len) return error.EndOfData;
-                const label_data = self.msg[cursor..][0..label_len];
-                labels_buf[labels_len] = label_data;
+                labels_buf[labels_len] = self.msg[cursor..][0..label_len];
                 labels_len += 1;
                 cursor += label_len;
                 total_len += label_len + 1; // +1 for the dot separator
@@ -1393,16 +1372,18 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 test "header roundtrip" {
     const original = Header{
         .id = 0xABCD,
-        .qr = true,
-        .opcode = .query,
-        .aa = true,
-        .tc = false,
-        .rd = true,
-        .ra = true,
-        .z = 0,
-        .ad = false,
-        .cd = false,
-        .rcode = .no_error,
+        .flags = .{
+            .qr = true,
+            .opcode = .query,
+            .aa = true,
+            .tc = false,
+            .rd = true,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+        },
         .qd_count = 1,
         .an_count = 2,
         .ns_count = 0,
@@ -1414,16 +1395,7 @@ test "header roundtrip" {
     const parsed = Header.parse(&buf);
 
     try testing.expectEqual(original.id, parsed.id);
-    try testing.expectEqual(original.qr, parsed.qr);
-    try testing.expectEqual(original.opcode, parsed.opcode);
-    try testing.expectEqual(original.aa, parsed.aa);
-    try testing.expectEqual(original.tc, parsed.tc);
-    try testing.expectEqual(original.rd, parsed.rd);
-    try testing.expectEqual(original.ra, parsed.ra);
-    try testing.expectEqual(original.z, parsed.z);
-    try testing.expectEqual(original.ad, parsed.ad);
-    try testing.expectEqual(original.cd, parsed.cd);
-    try testing.expectEqual(original.rcode, parsed.rcode);
+    try testing.expectEqual(original.flags, parsed.flags);
     try testing.expectEqual(original.qd_count, parsed.qd_count);
     try testing.expectEqual(original.an_count, parsed.an_count);
     try testing.expectEqual(original.ns_count, parsed.ns_count);
@@ -1448,12 +1420,12 @@ test "header parse known bytes" {
     };
     const hdr = Header.parse(&bytes);
     try testing.expectEqual(@as(u16, 0x1234), hdr.id);
-    try testing.expect(hdr.qr);
-    try testing.expectEqual(OpCode.query, hdr.opcode);
-    try testing.expect(!hdr.aa);
-    try testing.expect(!hdr.tc);
-    try testing.expect(hdr.rd);
-    try testing.expect(hdr.ra);
+    try testing.expect(hdr.flags.qr);
+    try testing.expectEqual(OpCode.query, hdr.flags.opcode);
+    try testing.expect(!hdr.flags.aa);
+    try testing.expect(!hdr.flags.tc);
+    try testing.expect(hdr.flags.rd);
+    try testing.expect(hdr.flags.ra);
     try testing.expectEqual(@as(u16, 1), hdr.qd_count);
     try testing.expectEqual(@as(u16, 2), hdr.an_count);
 }
@@ -1529,7 +1501,7 @@ test "full query packet parse" {
     const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
 
     try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
-    try testing.expect(msg.header.rd);
+    try testing.expect(msg.header.flags.rd);
     try testing.expectEqual(@as(usize, 1), msg.questions.len);
     try testing.expectEqualStrings("example", msg.questions[0].name.labels[0]);
     try testing.expectEqualStrings("com", msg.questions[0].name.labels[1]);
@@ -1776,7 +1748,7 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
 
     // Compare
     try testing.expectEqual(msg1.header.id, msg2.header.id);
-    try testing.expectEqual(msg1.header.rd, msg2.header.rd);
+    try testing.expectEqual(msg1.header.flags.rd, msg2.header.flags.rd);
     try testing.expectEqual(msg1.questions.len, msg2.questions.len);
     try testing.expectEqual(msg1.answers.len, msg2.answers.len);
     try testing.expect(msg1.questions[0].name.eql(msg2.questions[0].name));
@@ -2162,9 +2134,9 @@ pub fn validateQuestionMatch(response: Message, expected_name: Name, expected_ty
 /// may omit the question section. Reject NOERROR/NXDOMAIN with missing
 /// questions (suspicious — nothing legitimate to poison into cache).
 pub fn validateResponse(msg: Message, expected_name: Name, qtype: RType) error{FormatError}!void {
-    if (!msg.header.qr) return error.FormatError;
+    if (!msg.header.flags.qr) return error.FormatError;
     if (!validateQuestionMatch(msg, expected_name, qtype)) {
-        if (msg.header.rcode == .no_error or msg.header.rcode == .name_error) return error.FormatError;
+        if (msg.header.flags.rcode == .no_error or msg.header.flags.rcode == .name_error) return error.FormatError;
     }
 }
 
@@ -2323,8 +2295,8 @@ test "buildQuery roundtrip" {
     const msg = try buildQuery(arena.allocator(), 0x1234, "example.com", .a, .{});
 
     try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
-    try testing.expect(!msg.header.qr);
-    try testing.expect(msg.header.rd);
+    try testing.expect(!msg.header.flags.qr);
+    try testing.expect(msg.header.flags.rd);
     try testing.expectEqual(@as(u16, 1), msg.header.qd_count);
     try testing.expectEqual(@as(usize, 1), msg.questions.len);
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
@@ -2334,7 +2306,7 @@ test "buildQuery roundtrip" {
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
     try testing.expectEqual(msg.header.id, msg2.header.id);
-    try testing.expectEqual(msg.header.rd, msg2.header.rd);
+    try testing.expectEqual(msg.header.flags.rd, msg2.header.flags.rd);
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
     try testing.expectEqual(msg.questions[0].qtype, msg2.questions[0].qtype);
 }
@@ -2344,13 +2316,13 @@ test "buildQuery rd=false roundtrip" {
     defer arena.deinit();
     const msg = try buildQuery(arena.allocator(), 0x5678, "example.com", .a, .{ .rd = false });
 
-    try testing.expect(!msg.header.rd);
+    try testing.expect(!msg.header.flags.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
 
     var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
 
-    try testing.expect(!msg2.header.rd);
+    try testing.expect(!msg2.header.flags.rd);
     try testing.expectEqual(@as(u16, 0x5678), msg2.header.id);
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
 }
@@ -2904,16 +2876,18 @@ pub fn serializeOptOptionResponse(
     const msg: Message = .{
         .header = .{
             .id = 0x1234,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = true,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = true,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 1,
             .an_count = if (include_answer) 1 else 0,
             .ns_count = 0,

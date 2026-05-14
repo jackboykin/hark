@@ -382,7 +382,7 @@ pub const RecursiveResolver = struct {
         const data = response_buf[0..n];
         if (dns.hasTcBit(data)) return null;
         const response = (try tryParseMessage(allocator, data, aq.upstream)) orelse return null;
-        if (response.header.rcode.isServerError()) return null;
+        if (response.header.flags.rcode.isServerError()) return null;
         const expected = dns.parseDottedName(allocator, qname) catch return null;
         dns.validateResponse(response, expected, qtype) catch return null;
         return .{ .message = response, .responding_server = aq.upstream };
@@ -695,7 +695,7 @@ pub const RecursiveResolver = struct {
                 if (!is_final) {
                     // Check for referral — only from successful responses (error responses
                     // may contain NS records in authority that are not valid delegations)
-                    if (response.header.rcode == .no_error) {
+                    if (response.header.flags.rcode == .no_error) {
                         if (extractReferral(response, target_name, parent_zone, self.referralPolicy())) |referral| {
                             if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
@@ -704,7 +704,7 @@ pub const RecursiveResolver = struct {
                         }
                     }
 
-                    if (response.header.rcode == .name_error) {
+                    if (response.header.flags.rcode == .name_error) {
                         // RFC 9156 §4 + RFC 8020 interaction: an unsigned-zone
                         // probe NXDOMAIN from an RFC 8020 violator (e.g.,
                         // dynect.net returning NXDOMAIN at empty non-terminals
@@ -742,7 +742,7 @@ pub const RecursiveResolver = struct {
                         continue;
                     }
 
-                    if (response.header.rcode != .no_error and response.header.rcode != .name_error) {
+                    if (response.header.flags.rcode != .no_error and response.header.flags.rcode != .name_error) {
                         // Probe error (SERVFAIL, REFUSED, FORMERR, etc.) — stop minimizing, send full QNAME
                         minimize_label_count = target_name.labels.len;
                         continue;
@@ -759,7 +759,7 @@ pub const RecursiveResolver = struct {
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
                             .proceed => {
-                                if (response.header.aa) {
+                                if (response.header.flags.aa) {
                                     if (self.cache) |c| {
                                         c.storeResponse(response, parent_zone, .unchecked);
                                         c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
@@ -802,7 +802,7 @@ pub const RecursiveResolver = struct {
                 // real cut.
                 if (self.dnssec_enabled and security_state == .secure and
                     target_name.labels.len > parent_zone.labels.len and
-                    response.header.aa and !hasSignedRecords(response))
+                    response.header.flags.aa and !hasSignedRecords(response))
                 {
                     var probe_depth: usize = parent_zone.labels.len + 1;
                     while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
@@ -820,12 +820,12 @@ pub const RecursiveResolver = struct {
                 }
 
                 // Classify response
-                if (response.header.rcode != .no_error) {
-                    if (response.header.rcode == .name_error and response.header.aa) {
+                if (response.header.flags.rcode != .no_error) {
+                    if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers[0..server_count])) {
                             .proceed => {
                                 if (security_state == .secure) {
-                                    response.header.ad = true;
+                                    response.header.flags.ad = true;
                                     self.storeNsec(response.authorities, parent_zone);
                                 }
                                 if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
@@ -833,7 +833,7 @@ pub const RecursiveResolver = struct {
                             .skip_cache => {},
                             .bogus => return self.bogusServfail(current_name, qtype),
                         }
-                    } else if (response.header.rcode == .server_failure or response.header.rcode == .refused) {
+                    } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
                         // RFC 9520 §3: cache the resolution failure so the
                         // next stub retry doesn't re-walk the whole upstream
                         // chain. Pin against the original qname (`name`) —
@@ -1004,11 +1004,11 @@ pub const RecursiveResolver = struct {
                 // Check for referral (NS records in authority section)
                 const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse {
                     // NODATA: no answers, no referral. Cache only if authoritative.
-                    if (response.header.aa) {
+                    if (response.header.flags.aa) {
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
                             .proceed => {
                                 if (security_state == .secure) {
-                                    response.header.ad = true;
+                                    response.header.flags.ad = true;
                                     self.storeNsec(response.authorities, parent_zone);
                                 }
                                 if (self.cache) |c| {
@@ -1217,16 +1217,18 @@ pub const RecursiveResolver = struct {
             c.storeResponse(.{
                 .header = .{
                     .id = 0,
-                    .qr = true,
-                    .opcode = .query,
-                    .aa = true,
-                    .tc = false,
-                    .rd = false,
-                    .ra = false,
-                    .z = 0,
-                    .ad = false,
-                    .cd = false,
-                    .rcode = .no_error,
+                    .flags = .{
+                        .qr = true,
+                        .opcode = .query,
+                        .aa = true,
+                        .tc = false,
+                        .rd = false,
+                        .ra = false,
+                        .z = 0,
+                        .ad = false,
+                        .cd = false,
+                        .rcode = .no_error,
+                    },
                     .qd_count = 0,
                     .an_count = @intCast(wc_count),
                     .ns_count = 0,
@@ -1284,7 +1286,7 @@ pub const RecursiveResolver = struct {
         }
 
         const response = try tryParseMessage(allocator, response_data, server) orelse return null;
-        if (!response.header.qr) return null;
+        if (!response.header.flags.qr) return null;
         return response;
     }
 
@@ -1305,7 +1307,7 @@ pub const RecursiveResolver = struct {
             return null;
         };
         const response = try tryParseMessage(allocator, tcp_data, server) orelse return null;
-        if (!response.header.qr) return null;
+        if (!response.header.flags.qr) return null;
         return response;
     }
 
@@ -1457,7 +1459,7 @@ pub const RecursiveResolver = struct {
         // handles this via `last_server_failure`, but the race path returns
         // first-by-latency — so a fast-failing NS would propagate verbatim
         // without this check. Score and bail to sequential.
-        if (resp.header.rcode.isServerError()) {
+        if (resp.header.flags.rcode.isServerError()) {
             if (self.ns_selector) |ns|
                 ns.recordOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
             return null;
@@ -1574,11 +1576,11 @@ pub const RecursiveResolver = struct {
                                 const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
                                 if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
                                     if (try tryParseMessage(allocator, tls_data, server)) |tls_response| {
-                                        if (tls_response.header.qr and
-                                            tls_response.header.rcode != .format_error and
+                                        if (tls_response.header.flags.qr and
+                                            tls_response.header.flags.rcode != .format_error and
                                             dns.validateQuestionMatch(tls_response, query_msg.questions[0].name, query_type))
                                         {
-                                            if (tls_response.header.rcode.isServerError()) {
+                                            if (tls_response.header.flags.rcode.isServerError()) {
                                                 last_server_failure = tls_response;
                                                 continue :server_loop;
                                             }
@@ -1635,7 +1637,7 @@ pub const RecursiveResolver = struct {
 
                 // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
                 // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
-                if (response.header.rcode.isServerError()) {
+                if (response.header.flags.rcode.isServerError()) {
                     if (self.ns_selector) |ns|
                         ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
                     last_server_failure = response;
@@ -1934,7 +1936,7 @@ pub const RecursiveResolver = struct {
                     continue :retry;
                 }
 
-                if (response.header.rcode != .no_error) break :retry;
+                if (response.header.flags.rcode != .no_error) break :retry;
                 if (store_response) {
                     if (self.cache) |c| c.storeResponse(response, authority_zone, .unchecked);
                 }
@@ -2144,7 +2146,7 @@ pub const RecursiveResolver = struct {
         // Validate the answer RRsets
         return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32, &self.validation_budget)) {
             .secure => {
-                response.header.ad = true;
+                response.header.flags.ad = true;
                 return .valid;
             },
             .bogus => .bogus,
@@ -2384,6 +2386,13 @@ pub const RecursiveResolver = struct {
         // Spawn helpers for tasks [1..task_n]. Task 0 runs on the caller.
         // `threads[i] == null` after this loop means spawn failed — the task
         // is handled synchronously in the fallback loop below.
+        //
+        // Raw `Thread.spawn` rather than `Io.Group.concurrent`: with miss-path
+        // throughput in the 200k QPS range and up to 6 helpers per query, the
+        // pool's default `async_limit = cpu_count − 1` saturates and forces
+        // tasks inline, dropping miss/128 throughput by ~15%. The lifecycle
+        // pattern here (spawn-then-join in the same function) doesn't need
+        // structured shutdown — Group is the wrong primitive for this rate.
         for (1..task_n) |i| {
             const ni = i / rtypes_n;
             const ri = i % rtypes_n;
@@ -3013,16 +3022,18 @@ fn validateNegativeResponse(
 fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {
     return .{
         .id = 0x1234,
-        .qr = true,
-        .opcode = .query,
-        .aa = false,
-        .tc = false,
-        .rd = false,
-        .ra = false,
-        .z = 0,
-        .ad = false,
-        .cd = false,
-        .rcode = .no_error,
+        .flags = .{
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = false,
+            .ra = false,
+            .z = 0,
+            .ad = false,
+            .cd = false,
+            .rcode = .no_error,
+        },
         .qd_count = 0,
         .an_count = an_count,
         .ns_count = ns_count,
@@ -3590,16 +3601,18 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
     const terminal_response = dns.Message{
         .header = .{
             .id = 0,
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = false,
+                .tc = false,
+                .rd = false,
+                .ra = true,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
             .qd_count = 0,
             .an_count = 1,
             .ns_count = 0,
