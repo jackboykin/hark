@@ -773,7 +773,7 @@ pub const RRsetCache = struct {
         if (now < expires_at) {
             const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
             const remaining = original_ttl - elapsed;
-            const needs_prefetch = self.prefetch and (remaining * 10 <= original_ttl);
+            const needs_prefetch = self.prefetch and (remaining <= original_ttl / 10);
             _ = shard.hits.fetchAdd(1, .monotonic);
             if (needs_prefetch) _ = shard.prefetch_eligible.fetchAdd(1, .monotonic);
             return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false, .is_stale = false };
@@ -1221,6 +1221,9 @@ pub const RRsetCache = struct {
 
     /// Probe a bounded number of entries from the SIEVE hand, evicting the first
     /// expired one. Clears visited flags as it goes for gradual SIEVE decay.
+    /// Note: shares `shard.hand` with sieveEvict, so each call advances the SIEVE
+    /// cursor (1-8 positions) — visited-bit decay is coupled to write rate, not
+    /// access rate. Hand-wrap takes at least max_entries / (8 × calls_per_sec).
     fn sweepExpired(self: *RRsetCache, shard: *Shard, count: u32) void {
         if (count == 0) return;
         const now = self.now_fn();
@@ -1234,7 +1237,7 @@ pub const RRsetCache = struct {
             if (expired) {
                 removeAtIndex(shard, i);
                 _ = shard.evictions.fetchAdd(1, .monotonic);
-                shard.hand = if (i < shard.map.count()) @intCast(i) else 0;
+                shard.hand = if (i < shard.map.count()) i else 0;
                 return;
             }
         }
@@ -1260,6 +1263,7 @@ inline fn markVisited(shard: *Shard, i: usize) void {
 /// this only after a `map.put` that was a fresh insert (not an update),
 /// so the new entry sits at the tail of the ordered map.
 inline fn markLastVisited(shard: *Shard) void {
+    std.debug.assert(shard.map.count() > 0);
     markVisited(shard, shard.map.count() - 1);
 }
 
