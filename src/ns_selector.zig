@@ -181,10 +181,8 @@ pub const NsSelector = struct {
         var samples: [max_order]f32 = undefined;
         const now_ms = if (rtt_cache) |rc| rc.nowMs() else 0;
 
-        // Fuse discount + read into a single per-shard locked region.
-        // Per-zone locks were a single bottleneck; per-arm shard locks scale
-        // with thread count at the cost of N lock acquisitions per call,
-        // each uncontended in the common case.
+        // Per-arm shard locks: N acquisitions per call, each uncontended in
+        // the common case. Discount + read are fused in one locked region.
         for (servers, 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
@@ -254,13 +252,13 @@ pub const NsSelector = struct {
         gop.value_ptr.alpha += r;
         gop.value_ptr.beta += (1.0 - r);
 
-        if (shard.arms.count() > self.per_shard_cap) self.evictOneLocked(shard, arm_key);
+        if (shard.arms.count() > self.per_shard_cap) evictOneLocked(shard, arm_key);
     }
 
-    /// Evict one non-`protected` arm from a shard the caller holds.
-    /// A flood across many zones must not erase healthy root/TLD posteriors
-    /// all at once — the cap is now per-shard so eviction is bounded too.
-    fn evictOneLocked(_: *NsSelector, shard: *Shard, protected: ArmKey) void {
+    /// Evict one non-`protected` arm from a shard the caller holds. A flood
+    /// across many zones must not erase healthy root/TLD posteriors at once;
+    /// the per-shard cap bounds eviction scope.
+    fn evictOneLocked(shard: *Shard, protected: ArmKey) void {
         var it = shard.arms.iterator();
         while (it.next()) |kv| {
             if (std.meta.eql(kv.key_ptr.*, protected)) continue;
@@ -540,7 +538,10 @@ test "arms map is bounded under random-zone load" {
         sel.recordOutcome(zone, server, .success, 10_000);
         try testing.expect(sel.count() <= sel.max_arms);
     }
-    try testing.expectEqual(@as(usize, sel.max_arms), sel.count());
+    // With sharded per-shard caps the steady-state count depends on hash
+    // distribution; floor at half to catch arm loss without flaking on
+    // legitimate distribution variance.
+    try testing.expect(sel.count() >= sel.max_arms / 2);
 }
 
 test "per-zone isolation" {

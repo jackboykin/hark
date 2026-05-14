@@ -54,11 +54,8 @@ const DedupKeyContext = struct {
 
 pub const AcquireResult = enum { leader, follower };
 
-/// Sharded for mutex contention scaling. Each shard owns a private map +
-/// mutex + condvar, so a leader's broadcast still wakes only its 1/N share
-/// of followers (preserving the prior wake-amplification benefit) and unrelated
-/// keys don't serialize on a common mutex. Power of two so modulo compiles
-/// to a mask.
+/// One mutex + condvar per shard; broadcast wakes only that shard's
+/// followers. Power of two so modulo compiles to a mask.
 const shard_count = 64;
 const shard_mask: u64 = shard_count - 1;
 

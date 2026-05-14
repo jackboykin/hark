@@ -71,7 +71,6 @@ const work_queue_capacity = 256;
 const queue_instr_on = build_options.queue_instr;
 
 /// Log-spaced buckets: <1µs, <10µs, <100µs, <1ms, <10ms, <100ms, <1s, ≥1s.
-const QInstrBuckets = [8]u64;
 const q_bucket_labels = [_][]const u8{ "<1µs", "<10µs", "<100µs", "<1ms", "<10ms", "<100ms", "<1s", "≥1s" };
 
 inline fn qBucket(ns: u64) usize {
@@ -135,21 +134,35 @@ const QInstr = struct {
     }
 };
 
+/// Three timestamps: before lock, after lock-acquired, and start of the real
+/// critical section. For push/release the latter two coincide and `locked()`
+/// sets both; for `pop` they differ because `dequeueLocked` may sleep on the
+/// not-empty condvar (releasing the mutex), which would otherwise inflate
+/// wait_ns. `pop` calls `workBegun()` after `dequeueLocked` returns to record
+/// the critical-section start, so condvar idle isn't billed as either wait
+/// time or hold time.
 const QInstrTimer = struct {
     t_before_lock: if (queue_instr_on) i128 else void = if (queue_instr_on) 0 else {},
     t_after_lock: if (queue_instr_on) i128 else void = if (queue_instr_on) 0 else {},
+    t_work_begun: if (queue_instr_on) i128 else void = if (queue_instr_on) 0 else {},
 
     inline fn start(self: *QInstrTimer) void {
         if (queue_instr_on) self.t_before_lock = monotonic.nowNs();
     }
     inline fn locked(self: *QInstrTimer) void {
-        if (queue_instr_on) self.t_after_lock = monotonic.nowNs();
+        if (!queue_instr_on) return;
+        const t = monotonic.nowNs();
+        self.t_after_lock = t;
+        self.t_work_begun = t;
+    }
+    inline fn workBegun(self: *QInstrTimer) void {
+        if (queue_instr_on) self.t_work_begun = monotonic.nowNs();
     }
     inline fn finishInto(self: *QInstrTimer, stats: *QInstrOpStats) void {
         if (!queue_instr_on) return;
         const now = monotonic.nowNs();
         const wait_ns: u64 = @intCast(@max(0, self.t_after_lock - self.t_before_lock));
-        const hold_ns: u64 = @intCast(@max(0, now - self.t_after_lock));
+        const hold_ns: u64 = @intCast(@max(0, now - self.t_work_begun));
         stats.record(wait_ns, hold_ns);
     }
 };
@@ -309,10 +322,11 @@ const WorkQueue = struct {
         t.start();
         self.pool.lock();
         t.locked();
-        defer {
-            t.finishInto(&self.instr.push);
-            self.pool.unlock();
-        }
+        // LIFO defer order: unlock first, then record. Recording calls
+        // monotonic.nowNs() (clock_gettime); doing it under the lock would
+        // inflate hold_ns and block waiters by the syscall latency.
+        defer t.finishInto(&self.instr.push);
+        defer self.pool.unlock();
         const claimed = self.pool.claimLocked() orelse return false;
         @memcpy(claimed.slot.buf[0..data.len], data);
         claimed.slot.len = @intCast(data.len);
@@ -324,18 +338,15 @@ const WorkQueue = struct {
     }
 
     /// Returned payload borrows from the slot until `release(reservation)`.
-    /// Hold-time measurement starts AFTER `dequeueLocked` returns so condvar
-    /// waiting on an empty queue isn't billed as lock contention.
     fn pop(self: *WorkQueue) ?PopResult {
         var t: QInstrTimer = .{};
         t.start();
         self.pool.lock();
-        const taken_opt = self.pool.dequeueLocked();
         t.locked();
-        defer {
-            t.finishInto(&self.instr.pop);
-            self.pool.unlock();
-        }
+        defer t.finishInto(&self.instr.pop);
+        defer self.pool.unlock();
+        const taken_opt = self.pool.dequeueLocked();
+        t.workBegun();
         const taken = taken_opt orelse return null;
         return PopResult{
             .payload = taken.slot.buf[0..taken.slot.len],
@@ -351,10 +362,8 @@ const WorkQueue = struct {
         t.start();
         self.pool.lock();
         t.locked();
-        defer {
-            t.finishInto(&self.instr.release);
-            self.pool.unlock();
-        }
+        defer t.finishInto(&self.instr.release);
+        defer self.pool.unlock();
         self.pool.releaseLocked(reservation);
     }
 
