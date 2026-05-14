@@ -54,37 +54,58 @@ const DedupKeyContext = struct {
 
 pub const AcquireResult = enum { leader, follower };
 
-/// Followers sleep on `conditions[shard]` where shard = key-hash % this.
-/// A leader's broadcast wakes only the 1/N of followers whose keys hash
-/// to the same shard, vs. waking the whole table. Power of two so the
-/// modulo compiles to a mask.
+/// Sharded for mutex contention scaling. Each shard owns a private map +
+/// mutex + condvar, so a leader's broadcast still wakes only its 1/N share
+/// of followers (preserving the prior wake-amplification benefit) and unrelated
+/// keys don't serialize on a common mutex. Power of two so modulo compiles
+/// to a mask.
 const shard_count = 64;
+const shard_mask: u64 = shard_count - 1;
 
 /// Hard cap to bound the table under random-subdomain water-torture floods.
-/// 8192 × ~270 B per entry ≈ 2 MiB.
+/// 8192 × ~270 B per entry ≈ 2 MiB. Per-shard cap = max_entries / shard_count.
 pub const max_entries: u32 = 8192;
+const per_shard_cap: u32 = max_entries / shard_count;
+
+const Shard = struct {
+    map: std.HashMapUnmanaged(DedupKey, bool, DedupKeyContext, 80) = .empty,
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    condition: std.Io.Condition = std.Io.Condition.init,
+
+    fn deinit(self: *Shard, allocator: mem.Allocator) void {
+        self.map.deinit(allocator);
+    }
+};
 
 pub const InFlightTable = struct {
-    map: std.HashMapUnmanaged(DedupKey, bool, DedupKeyContext, 80),
-    mutex: std.Io.Mutex = std.Io.Mutex.init,
-    conditions: [shard_count]std.Io.Condition = @splat(std.Io.Condition.init),
+    shards: [shard_count]Shard,
     io: std.Io,
     allocator: mem.Allocator,
 
     pub fn init(allocator: mem.Allocator, io: std.Io) InFlightTable {
-        return .{
-            .map = .empty,
-            .io = io,
-            .allocator = allocator,
-        };
+        var shards: [shard_count]Shard = undefined;
+        for (&shards) |*s| s.* = .{};
+        return .{ .shards = shards, .io = io, .allocator = allocator };
     }
 
     pub fn deinit(self: *InFlightTable) void {
-        self.map.deinit(self.allocator);
+        for (&self.shards) |*s| s.deinit(self.allocator);
     }
 
-    fn shardOf(key: DedupKey) usize {
-        return @intCast(DedupKeyContext.hash(.{}, key) % shard_count);
+    /// Total entry count across shards. Locks each shard briefly; only used
+    /// in tests and not on the hot path.
+    pub fn count(self: *InFlightTable) u32 {
+        var total: u32 = 0;
+        for (&self.shards) |*s| {
+            s.mutex.lockUncancelable(self.io);
+            defer s.mutex.unlock(self.io);
+            total += s.map.count();
+        }
+        return total;
+    }
+
+    fn shardFor(self: *InFlightTable, key: DedupKey) *Shard {
+        return &self.shards[DedupKeyContext.hash(.{}, key) & shard_mask];
     }
 
     /// Try to become the leader for this (name, qtype) pair.
@@ -109,30 +130,29 @@ pub const InFlightTable = struct {
 
     fn acquireOrWaitImpl(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns_opt: ?i128) AcquireResult {
         const key = DedupKey.init(name, qtype, flags) orelse return .leader;
+        const shard = self.shardFor(key);
 
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
-        if (self.map.getPtr(key)) |_| {
-            // Another worker is resolving this — wait on this key's shard.
-            // A releaseLeader for any key in the same shard will wake us to
-            // recheck; releases for keys in other shards will not broadcast
-            // here at all.
+        if (shard.map.getPtr(key)) |_| {
+            // Another worker is resolving this — wait on this shard's condvar.
+            // releaseLeader for any key in the same shard wakes us to recheck;
+            // releases on other shards never reach us.
             const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + 2 * std.time.ns_per_s);
-            const shard = shardOf(key);
-            while (self.map.get(key)) |completed| {
+            while (shard.map.get(key)) |completed| {
                 if (completed) break;
                 if (monotonic.nowNs() >= deadline_ns) break;
-                self.conditions[shard].waitUncancelable(self.io, &self.mutex);
+                shard.condition.waitUncancelable(self.io, &shard.mutex);
             }
             return .follower;
         }
 
-        // At cap: degrade by returning `.leader` without inserting. Eviction
-        // under flood would wake real queries' followers and double upstream
-        // amplification; uncoordinated leaders is the lesser evil.
-        if (self.map.count() >= max_entries) return .leader;
-        self.map.put(self.allocator, key, false) catch return .leader;
+        // At per-shard cap: degrade by returning `.leader` without inserting.
+        // Eviction under flood would wake real queries' followers and double
+        // upstream amplification; uncoordinated leaders is the lesser evil.
+        if (shard.map.count() >= per_shard_cap) return .leader;
+        shard.map.put(self.allocator, key, false) catch return .leader;
         return .leader;
     }
 
@@ -142,28 +162,30 @@ pub const InFlightTable = struct {
     /// (prefetch, async validation).
     pub fn tryAcquireLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) bool {
         const key = DedupKey.init(name, qtype, flags) orelse return false;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.map.get(key)) |_| return false;
-        if (self.map.count() >= max_entries) return false;
-        self.map.put(self.allocator, key, false) catch return false;
+        const shard = self.shardFor(key);
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
+        if (shard.map.get(key)) |_| return false;
+        if (shard.map.count() >= per_shard_cap) return false;
+        shard.map.put(self.allocator, key, false) catch return false;
         return true;
     }
 
     /// Called by the leader when resolution is complete. Wakes all waiting followers
-    /// and removes the entry so subsequent requests start fresh.
+    /// in the key's shard and removes the entry so subsequent requests start fresh.
     pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) void {
         const key = DedupKey.init(name, qtype, flags) orelse return;
+        const shard = self.shardFor(key);
 
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
-        if (self.map.getPtr(key)) |completed| {
+        if (shard.map.getPtr(key)) |completed| {
             completed.* = true;
         }
-        self.conditions[shardOf(key)].broadcast(self.io);
+        shard.condition.broadcast(self.io);
         // Remove entry so followers see null and break out, and future requests start fresh.
-        _ = self.map.remove(key);
+        _ = shard.map.remove(key);
     }
 };
 
@@ -177,7 +199,7 @@ test "leader for new key" {
     try testing.expectEqual(.leader, result);
 
     table.releaseLeader("example.com", .a, 0);
-    try testing.expectEqual(@as(u32, 0), table.map.count());
+    try testing.expectEqual(@as(u32, 0), table.count());
 }
 
 test "different qtypes are independent" {
@@ -255,7 +277,7 @@ test "follower waits for leader" {
 
     try testing.expectEqual(true, follower_done.load(.acquire));
     try testing.expectEqual(@intFromEnum(AcquireResult.follower), follower_result.load(.acquire));
-    try testing.expectEqual(@as(u32, 0), table.map.count());
+    try testing.expectEqual(@as(u32, 0), table.count());
 }
 
 test "acquireOrWaitWithTimeout uses custom timeout" {
@@ -302,37 +324,44 @@ test "CD bit partitions dedup groups" {
 
     table.releaseLeader("example.com", .a, cd0);
     table.releaseLeader("example.com", .a, cd1);
-    try testing.expectEqual(@as(u32, 0), table.map.count());
+    try testing.expectEqual(@as(u32, 0), table.count());
 }
 
 test "table caps entries at max_entries" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
-    // Fill the table to its cap with unique names.
+    // Fill the table to saturation with unique names. With per-shard caps
+    // some shards saturate before others, so the precise stored count is
+    // ≤ max_entries — what we verify is the overall cap, not equality.
     var name_buf: [32]u8 = undefined;
     for (0..max_entries) |i| {
         const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
         try testing.expectEqual(.leader, table.acquireOrWait(name, .a, 0));
     }
-    try testing.expectEqual(@as(u32, max_entries), table.map.count());
+    const saturated = table.count();
+    try testing.expect(saturated <= max_entries);
+    // Uniform hashing should fill the majority of shards near cap; a sanity
+    // floor catches a future bug that loses entries instead of capping them.
+    try testing.expect(saturated >= max_entries / 2);
 
-    // One more unique query: still gets .leader, but isn't inserted — graceful
-    // degradation under cap pressure. Concurrent same-key callers also become
-    // uncoordinated leaders rather than dedup; this is the lesser evil vs.
-    // evicting a real in-flight entry whose followers would retry and double
-    // upstream load.
-    try testing.expectEqual(.leader, table.acquireOrWait("overflow.example.com", .a, 0));
-    try testing.expectEqual(@as(u32, max_entries), table.map.count());
+    // tryAcquireLeader still refuses on a shard that's at cap; pick a key whose
+    // shard is more likely to be saturated by sweeping a small fan.
+    var caps_observed: usize = 0;
+    for (0..32) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "overflow{d}.example.com", .{i}) catch unreachable;
+        if (!table.tryAcquireLeader(name, .a, 0)) caps_observed += 1;
+    }
+    try testing.expect(caps_observed > 0);
 
-    // tryAcquireLeader also refuses past the cap.
-    try testing.expect(!table.tryAcquireLeader("overflow2.example.com", .a, 0));
-    try testing.expectEqual(@as(u32, max_entries), table.map.count());
-
-    // Clean up — release everything we leadered so the test allocator
-    // doesn't see leaks.
+    // Clean up: release everything we leadered (including any overflow we just
+    // tryAcquireLeader'd successfully) so the test allocator doesn't see leaks.
     for (0..max_entries) |i| {
         const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
+        table.releaseLeader(name, .a, 0);
+    }
+    for (0..32) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "overflow{d}.example.com", .{i}) catch unreachable;
         table.releaseLeader(name, .a, 0);
     }
 }
@@ -371,7 +400,7 @@ test "leader fail; follower retry becomes new leader" {
     const second = table.acquireOrWait("example.com", .dnskey, 0);
     try testing.expectEqual(.leader, second);
     table.releaseLeader("example.com", .dnskey, 0);
-    try testing.expectEqual(@as(u32, 0), table.map.count());
+    try testing.expectEqual(@as(u32, 0), table.count());
 }
 
 test "tryAcquireLeader coalesces without enqueueing followers" {
@@ -382,7 +411,7 @@ test "tryAcquireLeader coalesces without enqueueing followers" {
     // Second attempt returns false immediately (no wait), does not add an entry.
     try testing.expect(!table.tryAcquireLeader("example.com", .dnskey, 0));
     table.releaseLeader("example.com", .dnskey, 0);
-    try testing.expectEqual(@as(u32, 0), table.map.count());
+    try testing.expectEqual(@as(u32, 0), table.count());
 
     // Freed — next claim succeeds again.
     try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
