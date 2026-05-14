@@ -1,0 +1,18 @@
+# resolution-threads sweep — miss workload — 2026-05-14
+# build=ReleaseFast workers=2 duration=30s inflight=256 latency_ms=0
+# Three trios show the contention rollback after sharding the two
+# single-mutex structures (NsSelector, dedup.InFlightTable) and adding the
+# RttCache.isDead lock-free death-gate.
+#
+# threads   pre-sharded   +NsSel+dedup   +RttCache fast-path
+#  4         242k          254k           252k
+#  8         231k          244k           236k
+# 16         177k          200k           224k
+# 32         167k          229k           218k
+#
+# Final shape (single trial, 30s @ inflight=256):
+threads      qps        lost       avg_us
+4            252662     0.00       910
+8            236502     0.00       981
+16           224311     0.00       1000
+32           217667     0.00       1020

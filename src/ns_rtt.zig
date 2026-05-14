@@ -66,6 +66,13 @@ const shard_mask: u32 = shard_count - 1;
 const Shard = struct {
     entries: EntryMap,
     rwlock: ?std.Io.RwLock,
+    /// High-water mark of any `dead_until_ms` ever written in this shard.
+    /// Monotonic: only moves forward, written under rwlock (exclusive), read
+    /// atomically without the lock. When `now_ms >= latest_dead_until_ms`,
+    /// no entry in this shard is currently dead and `isDead` can return false
+    /// without touching the rwlock's reader-count cache line. Drives the
+    /// fast path on the dominant case (no dead servers).
+    latest_dead_until_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 };
 
 pub const RttCache = struct {
@@ -90,6 +97,7 @@ pub const RttCache = struct {
         for (&shards) |*s| s.* = .{
             .entries = EntryMap.init(cfg.allocator),
             .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
+            .latest_dead_until_ms = std.atomic.Value(i64).init(0),
         };
         return .{
             .shards = shards,
@@ -198,7 +206,14 @@ pub const RttCache = struct {
                 gop.value_ptr.consecutive_timeouts += 1;
             }
             if (gop.value_ptr.consecutive_timeouts >= dead_threshold) {
-                gop.value_ptr.dead_until_ms = self.now_fn() + dead_duration_ms;
+                const new_deadline = self.now_fn() + dead_duration_ms;
+                gop.value_ptr.dead_until_ms = new_deadline;
+                // Bump the shard's lock-free death gate. Held under exclusive
+                // rwlock so no other writer can interleave; .release pairs with
+                // the .acquire in isDead so a fast-path reader that sees the
+                // new high-water also sees the dead_until_ms write above.
+                const cur = shard.latest_dead_until_ms.load(.monotonic);
+                if (new_deadline > cur) shard.latest_dead_until_ms.store(new_deadline, .release);
             }
         }
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
@@ -216,8 +231,16 @@ pub const RttCache = struct {
     }
 
     /// Check whether the server is currently marked dead.
+    ///
+    /// Fast path: every shard tracks the high-water mark of `dead_until_ms`
+    /// across its entries. If `now_ms` is past it, no entry can be dead and
+    /// we skip the rwlock entirely. Dominant case under healthy upstream:
+    /// `isDead` is the hottest call in `selectServers`, and the rwlock reader
+    /// count was a major cache-line bouncing source at high thread counts.
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardOf(key);
+        if (now_ms >= shard.latest_dead_until_ms.load(.acquire)) return false;
+
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
 
