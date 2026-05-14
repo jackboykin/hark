@@ -62,6 +62,98 @@ inline fn parseAdvanceClockQname(name: []const u8) ?i64 {
 
 const work_queue_capacity = 256;
 
+// ── Optional WorkQueue instrumentation ────────────────────────────────
+// Behind `-Dqueue_instr=true`. Off by default: every field is a
+// `void`-sized struct and every helper compiles to nothing. On:
+// per-op acquisition counts + log-bucketed histograms for lock-wait
+// and held-time, dumped on shutdown.
+
+const queue_instr_on = build_options.queue_instr;
+
+/// Log-spaced buckets: <1µs, <10µs, <100µs, <1ms, <10ms, <100ms, <1s, ≥1s.
+const QInstrBuckets = [8]u64;
+const q_bucket_labels = [_][]const u8{ "<1µs", "<10µs", "<100µs", "<1ms", "<10ms", "<100ms", "<1s", "≥1s" };
+
+inline fn qBucket(ns: u64) usize {
+    if (ns < 1_000) return 0;
+    if (ns < 10_000) return 1;
+    if (ns < 100_000) return 2;
+    if (ns < 1_000_000) return 3;
+    if (ns < 10_000_000) return 4;
+    if (ns < 100_000_000) return 5;
+    if (ns < 1_000_000_000) return 6;
+    return 7;
+}
+
+const QInstrOpStats = if (queue_instr_on) struct {
+    count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    wait_buckets: [8]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** 8,
+    hold_buckets: [8]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** 8,
+
+    fn record(self: *@This(), wait_ns: u64, hold_ns: u64) void {
+        _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.wait_buckets[qBucket(wait_ns)].fetchAdd(1, .monotonic);
+        _ = self.hold_buckets[qBucket(hold_ns)].fetchAdd(1, .monotonic);
+    }
+
+    fn dump(self: *const @This(), op: []const u8) void {
+        const total = self.count.load(.monotonic);
+        if (total == 0) {
+            log.info("queue.{s}: count=0", .{op});
+            return;
+        }
+        var wait_buf: [256]u8 = undefined;
+        var hold_buf: [256]u8 = undefined;
+        const wait_str = formatBuckets(&wait_buf, &self.wait_buckets);
+        const hold_str = formatBuckets(&hold_buf, &self.hold_buckets);
+        log.info("queue.{s}: count={d} wait[{s}] hold[{s}]", .{ op, total, wait_str, hold_str });
+    }
+
+    fn formatBuckets(buf: []u8, buckets: *const [8]std.atomic.Value(u64)) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        for (buckets, q_bucket_labels, 0..) |*b, label, i| {
+            if (i > 0) w.writeAll(" ") catch break;
+            w.print("{s}={d}", .{ label, b.load(.monotonic) }) catch break;
+        }
+        return w.buffered();
+    }
+} else struct {
+    inline fn record(_: *@This(), _: u64, _: u64) void {}
+    inline fn dump(_: *const @This(), _: []const u8) void {}
+};
+
+const QInstr = struct {
+    push: QInstrOpStats = .{},
+    pop: QInstrOpStats = .{},
+    release: QInstrOpStats = .{},
+
+    fn dumpAll(self: *const QInstr) void {
+        if (!queue_instr_on) return;
+        self.push.dump("push");
+        self.pop.dump("pop");
+        self.release.dump("release");
+    }
+};
+
+const QInstrTimer = struct {
+    t_before_lock: if (queue_instr_on) i128 else void = if (queue_instr_on) 0 else {},
+    t_after_lock: if (queue_instr_on) i128 else void = if (queue_instr_on) 0 else {},
+
+    inline fn start(self: *QInstrTimer) void {
+        if (queue_instr_on) self.t_before_lock = monotonic.nowNs();
+    }
+    inline fn locked(self: *QInstrTimer) void {
+        if (queue_instr_on) self.t_after_lock = monotonic.nowNs();
+    }
+    inline fn finishInto(self: *QInstrTimer, stats: *QInstrOpStats) void {
+        if (!queue_instr_on) return;
+        const now = monotonic.nowNs();
+        const wait_ns: u64 = @intCast(@max(0, self.t_after_lock - self.t_before_lock));
+        const hold_ns: u64 = @intCast(@max(0, now - self.t_after_lock));
+        stats.record(wait_ns, hold_ns);
+    }
+};
+
 // Per-thread query arena, owned by a pool thread and reused across queries
 // via reset(.retain_capacity). Layering: caller → CountingAllocator → arena.
 // The CountingAllocator sits in front so each query's allocations are bounded
@@ -204,15 +296,23 @@ const PopResult = struct {
 
 const WorkQueue = struct {
     pool: SlotPool(Slot, work_queue_capacity),
+    instr: QInstr = .{},
 
     fn init(self: *WorkQueue, io: Io) void {
         self.pool.init(io);
+        self.instr = .{};
     }
 
     fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: Protocol) bool {
         if (data.len > max_work_query_bytes) return false;
+        var t: QInstrTimer = .{};
+        t.start();
         self.pool.lock();
-        defer self.pool.unlock();
+        t.locked();
+        defer {
+            t.finishInto(&self.instr.push);
+            self.pool.unlock();
+        }
         const claimed = self.pool.claimLocked() orelse return false;
         @memcpy(claimed.slot.buf[0..data.len], data);
         claimed.slot.len = @intCast(data.len);
@@ -224,10 +324,19 @@ const WorkQueue = struct {
     }
 
     /// Returned payload borrows from the slot until `release(reservation)`.
+    /// Hold-time measurement starts AFTER `dequeueLocked` returns so condvar
+    /// waiting on an empty queue isn't billed as lock contention.
     fn pop(self: *WorkQueue) ?PopResult {
+        var t: QInstrTimer = .{};
+        t.start();
         self.pool.lock();
-        defer self.pool.unlock();
-        const taken = self.pool.dequeueLocked() orelse return null;
+        const taken_opt = self.pool.dequeueLocked();
+        t.locked();
+        defer {
+            t.finishInto(&self.instr.pop);
+            self.pool.unlock();
+        }
+        const taken = taken_opt orelse return null;
         return PopResult{
             .payload = taken.slot.buf[0..taken.slot.len],
             .reservation = taken.idx,
@@ -238,13 +347,23 @@ const WorkQueue = struct {
     }
 
     fn release(self: *WorkQueue, reservation: u16) void {
+        var t: QInstrTimer = .{};
+        t.start();
         self.pool.lock();
-        defer self.pool.unlock();
+        t.locked();
+        defer {
+            t.finishInto(&self.instr.release);
+            self.pool.unlock();
+        }
         self.pool.releaseLocked(reservation);
     }
 
     fn signalShutdown(self: *WorkQueue) void {
         self.pool.signalShutdown();
+    }
+
+    fn dumpInstr(self: *const WorkQueue) void {
+        self.instr.dumpAll();
     }
 };
 
@@ -503,6 +622,7 @@ pub const Server = struct {
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
+        self.work_queue.dumpInstr();
         self.allocator.destroy(self.work_queue);
         for (self.wake_fds) |fd| if (fd >= 0) sys.close(fd);
         self.allocator.free(self.wake_fds);
