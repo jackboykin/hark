@@ -83,12 +83,20 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// Allocate a PooledConnection wired to `sock`. Caller must free via
+    /// Allocate a PooledConnection wired to `stream`. Caller must free via
     /// `destroyBroken` / `closeAndDestroy` on any subsequent error.
-    fn newPooledConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
+    ///
+    /// `File.Reader`/`File.Writer` (not `Stream.Reader`/`Stream.Writer`)
+    /// drive the TLS layer because the File path's `fileReadStreamingPosix`
+    /// returns `error.WouldBlock` on `SO_RCVTIMEO`-induced `EAGAIN`, while
+    /// `netReadPosix` treats it as a programmer bug. Until stdlib grows
+    /// per-call read timeouts on `Stream.Reader`, the File wrapper is the
+    /// path that lets the existing kernel-side timeout shape keep working.
+    fn newPooledConnection(self: *TlsTransport, stream: Io.net.Stream) !*PooledConnection {
         const conn = try self.allocator.create(PooledConnection);
-        const file = File{ .handle = sock, .flags = .{ .nonblocking = false } };
-        conn.sock = sock;
+        const file = File{ .handle = stream.socket.handle, .flags = .{ .nonblocking = false } };
+        conn.stream = stream;
+        conn.io = self.io;
         conn.last_used = 0;
         conn.query_count = 0;
         conn.max_queries = 200;
@@ -110,11 +118,11 @@ pub const TlsTransport = struct {
         const server_name = self.config.server_name orelse return error.ServerNameRequired;
         if (server_name.len == 0) return error.ServerNameRequired;
 
-        const sock = try connectTcpBlocking(tls_server, connect_timeout_ms);
-        errdefer sys.close(sock);
-        sys.setSocketTimeouts(sock, response_timeout_ms);
+        const stream = try connectTcpBlocking(self.io, tls_server, connect_timeout_ms);
+        errdefer stream.close(self.io);
+        sys.setSocketTimeouts(stream.socket.handle, response_timeout_ms);
 
-        const conn = try self.newPooledConnection(sock);
+        const conn = try self.newPooledConnection(stream);
         errdefer self.allocator.destroy(conn);
 
         try self.handshake(conn, server_name, self.ca_bundle);
@@ -163,8 +171,8 @@ pub const TlsTransport = struct {
         const remaining_ns = deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return error.Timeout;
         const connect_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
-        const sock = try connectTcpBlocking(tls_server, connect_ms);
-        const conn = try self.initOpportunisticConnection(sock);
+        const stream = try connectTcpBlocking(self.io, tls_server, connect_ms);
+        const conn = try self.initOpportunisticConnection(stream);
 
         const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
             conn.destroyBroken(self.allocator);
@@ -181,12 +189,12 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// Allocate a PooledConnection from a connected socket and perform an
+    /// Allocate a PooledConnection from a connected stream and perform an
     /// opportunistic TLS handshake (ALPN "dot", no cert, no SNI).
-    /// Takes ownership of `sock`: closes it on any failure path.
-    fn initOpportunisticConnection(self: *TlsTransport, sock: posix.fd_t) !*PooledConnection {
-        errdefer sys.close(sock);
-        const conn = try self.newPooledConnection(sock);
+    /// Takes ownership of `stream`: closes it on any failure path.
+    fn initOpportunisticConnection(self: *TlsTransport, stream: Io.net.Stream) !*PooledConnection {
+        errdefer stream.close(self.io);
+        const conn = try self.newPooledConnection(stream);
         errdefer self.allocator.destroy(conn);
 
         // RFC 9539 §4.6.3.3/4: no SNI, accept any cert. host="" selects
@@ -195,14 +203,21 @@ pub const TlsTransport = struct {
         return conn;
     }
 
-    fn connectTcpBlocking(tls_server: na.Address, timeout_ms: u32) !posix.fd_t {
+    /// Open a connected TCP stream for TLS. Same connect-timeout workaround
+    /// as `blocking_transport.connectTcp`: open the fd via raw posix to
+    /// apply `SO_SNDTIMEO`, then wrap as `Io.net.Stream`. Leaves SNDTIMEO
+    /// set because the caller overwrites both directions with the
+    /// per-handshake / per-query deadline immediately after.
+    fn connectTcpBlocking(io: Io, tls_server: na.Address, timeout_ms: u32) !Io.net.Stream {
         const af: u32 = na.afU32(tls_server);
-        const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
-        errdefer sys.close(sock);
-        sys.setSocketTimeouts(sock, timeout_ms);
-        sys.setNoDelay(sock);
-        na.connectTo(sock, &tls_server) catch return error.ConnectFailed;
-        return sock;
+        const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
+        errdefer sys.close(sock_fd);
+        sys.setSocketTimeouts(sock_fd, timeout_ms);
+        sys.setNoDelay(sock_fd);
+        na.connectTo(sock_fd, &tls_server) catch return error.ConnectFailed;
+        const local = na.getSockName(sock_fd) catch tls_server; // .address informational.
+        _ = io;
+        return .{ .socket = .{ .handle = sock_fd, .address = local } };
     }
 
     /// Fire a background probe for a nameserver. The spawned task does
@@ -246,13 +261,13 @@ pub const TlsTransport = struct {
         // RFC 9539 §4.3: TCP connect failure is "soft" — could be a
         // transient network blip; retry sooner. TLS handshake failure is
         // "hard" — server reached us but rejected the protocol; damp longer.
-        const sock = connectTcpBlocking(tls_server, 4000) catch {
+        const stream = connectTcpBlocking(self.io, tls_server, 4000) catch {
             enc_ns_cache.setStatus(addr_key, .soft_failed);
             return;
         };
 
         // ── TLS handshake ──
-        const conn = self.initOpportunisticConnection(sock) catch {
+        const conn = self.initOpportunisticConnection(stream) catch {
             enc_ns_cache.setStatus(addr_key, .failed);
             return;
         };
@@ -295,10 +310,11 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     var staging: [2 + dns.edns_udp_payload]u8 = undefined;
     const framed = try dns.stageLengthPrefixed(&staging, wire_query);
 
-    try sys.updateTimeout(conn.sock, posix.SO.SNDTIMEO, deadline_ns);
+    const handle = conn.stream.socket.handle;
+    try sys.updateTimeout(handle, posix.SO.SNDTIMEO, deadline_ns);
     conn.tls.writeAll(framed) catch return error.TlsSendFailed;
 
-    try sys.updateTimeout(conn.sock, posix.SO.RCVTIMEO, deadline_ns);
+    try sys.updateTimeout(handle, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
     const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch return error.TlsRecvFailed;
     if (n_len < 2) return error.TlsRecvFailed;
@@ -309,7 +325,7 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     const n_body = conn.tls.readAtLeast(response_buf[0..resp_len], resp_len) catch return error.TlsRecvFailed;
     if (n_body < resp_len) return error.TlsRecvFailed;
 
-    sys.setQuickAck(conn.sock);
+    sys.setQuickAck(handle);
     return response_buf[0..resp_len];
 }
 

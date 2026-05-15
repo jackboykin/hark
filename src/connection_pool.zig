@@ -73,7 +73,11 @@ pub const TcpConnectionPool = ConnectionPool(TcpPooledConnection);
 // ── PooledConnection (TLS) ──────────────────────────────────────────
 
 pub const PooledConnection = struct {
-    sock: posix.fd_t,
+    stream: Io.net.Stream,
+    /// Carried per-connection for the same reason as `TcpPooledConnection.io`
+    /// — keeps `destroyBroken` matching the generic ConnectionPool shape
+    /// (allocator-only).
+    io: Io,
     net_reader: File.Reader,
     net_writer: File.Writer,
     tls: tls.Connection,
@@ -93,13 +97,13 @@ pub const PooledConnection = struct {
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
         self.tls.close() catch {};
-        sys.close(self.sock);
+        self.stream.close(self.io);
         allocator.destroy(self);
     }
 
     /// Close socket without TLS shutdown (for error paths).
     pub fn destroyBroken(self: *PooledConnection, allocator: Allocator) void {
-        sys.close(self.sock);
+        self.stream.close(self.io);
         allocator.destroy(self);
     }
 
@@ -501,7 +505,8 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
 
     const conn = try allocator.create(PooledConnection);
     conn.* = .{
-        .sock = sock,
+        .stream = .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } },
+        .io = testing.io,
         .net_reader = undefined,
         .net_writer = undefined,
         .tls = undefined,
