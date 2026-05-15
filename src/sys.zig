@@ -209,6 +209,40 @@ pub fn setQuickAck(sock: posix.fd_t) void {
     posix.setsockopt(sock, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&one)) catch {};
 }
 
+/// `io.vtable.netRead` adapter for a single buffer. Wraps the slice in the
+/// one-element iovec the vtable expects.
+pub fn netRead(io: std.Io, handle: posix.fd_t, buf: []u8) std.Io.net.Stream.Reader.Error!usize {
+    var iovec = [_][]u8{buf};
+    return io.vtable.netRead(io.userdata, handle, &iovec);
+}
+
+/// `io.vtable.netWrite` adapter for a single contiguous buffer. The vtable's
+/// scatter-gather shape requires a non-empty `data` slice — the empty-string
+/// sentinel with `splat=0` elides into a header-only iovec.
+pub fn netWrite(io: std.Io, handle: posix.fd_t, buf: []const u8) std.Io.net.Stream.Writer.Error!usize {
+    return io.vtable.netWrite(io.userdata, handle, buf, &[_][]const u8{""}, 0);
+}
+
+/// Wait up to `deadline_ns` for `handle` to be ready for `events`
+/// (`posix.POLL.IN` / `posix.POLL.OUT`). Userspace timeout enforcement
+/// for transports whose read/write goes through `Io.net`'s vtable —
+/// `netReadPosix`/`netWritePosix` treat `EAGAIN` as a programmer bug,
+/// so `SO_RCVTIMEO`/`SO_SNDTIMEO` can't be used to bound those calls.
+/// Polling first puts the deadline in userspace where it belongs.
+pub fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, PollFailed }!void {
+    const remaining_ns = deadline_ns - monotonic.nowNs();
+    if (remaining_ns <= 0) return error.Timeout;
+    const wait_ms: i32 = @intCast(@min(@divFloor(remaining_ns, 1_000_000), std.math.maxInt(i32)));
+    var pfd = [_]posix.pollfd{.{ .fd = handle, .events = events, .revents = 0 }};
+    const n = posix.poll(&pfd, wait_ms) catch return error.PollFailed;
+    if (n == 0) return error.Timeout;
+    // POLLNVAL means the fd is invalid (closed elsewhere mid-poll). The
+    // subsequent read/write would hit EBADF and panic via errnoBug, so
+    // catch it here. POLLERR/POLLHUP can fire alongside the requested
+    // event; let the read/write surface the kernel's specific error.
+    if (pfd[0].revents & posix.POLL.NVAL != 0) return error.PollFailed;
+}
+
 /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
 /// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
 pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {

@@ -349,7 +349,15 @@ pub const BlockingTcpTransport = struct {
     /// data ops don't surface EAGAIN through netRead/netWrite, which
     /// `netReadPosix`/`netWritePosix` treat as a programmer bug. Once the
     /// stdlib grows working connect timeouts, this collapses to one line.
-    fn connectTcp(self: *BlockingTcpTransport, server: na.Address) !Io.net.Stream {
+    ///
+    /// `.address` is intentionally zero (not populated via getsockname).
+    /// CONTRACT: no caller reads `Stream.socket.address` on a client-side
+    /// stream. Audit on zig bumps — verified for 0.16 that close/read/
+    /// write paths only touch `.handle`. The family-tag may not match
+    /// the peer's family (zero is ip4 here, even on ip6 connects); a
+    /// future `Stream.peerAddress()` or address-formatting code would
+    /// silently lie. Populate via `na.getSockName` if that ever matters.
+    fn connectTcp(_: *BlockingTcpTransport, server: na.Address) !Io.net.Stream {
         const af: u32 = na.afU32(server);
         const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
         errdefer sys.close(sock_fd);
@@ -357,9 +365,7 @@ pub const BlockingTcpTransport = struct {
         sys.setNoDelay(sock_fd);
         na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
         sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, 0);
-        const local = na.getSockName(sock_fd) catch server; // .address is informational; fallback is harmless.
-        _ = self;
-        return .{ .socket = .{ .handle = sock_fd, .address = local } };
+        return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
     }
 
     /// Length-prefixed DNS query/response on a connected TCP stream. Each
@@ -378,7 +384,7 @@ pub const BlockingTcpTransport = struct {
         var bytes_sent: usize = 0;
         while (bytes_sent < framed.len) {
             try waitReady(handle, posix.POLL.OUT, deadline_ns);
-            const n = io.vtable.netWrite(io.userdata, handle, framed[bytes_sent..], &[_][]const u8{""}, 0) catch return error.SendFailed;
+            const n = sys.netWrite(io, handle, framed[bytes_sent..]) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
         }
@@ -388,8 +394,7 @@ pub const BlockingTcpTransport = struct {
         var len_filled: usize = 0;
         while (len_filled < 2) {
             try waitReady(handle, posix.POLL.IN, deadline_ns);
-            var iovec = [_][]u8{len_buf[len_filled..]};
-            const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return error.ConnectionClosed;
+            const n = sys.netRead(io, handle, len_buf[len_filled..]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             len_filled += n;
         }
@@ -400,8 +405,7 @@ pub const BlockingTcpTransport = struct {
         var body_filled: usize = 0;
         while (body_filled < body_len) {
             try waitReady(handle, posix.POLL.IN, deadline_ns);
-            var iovec = [_][]u8{response_buf[body_filled..body_len]};
-            const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return error.ConnectionClosed;
+            const n = sys.netRead(io, handle, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             body_filled += n;
         }
@@ -411,23 +415,16 @@ pub const BlockingTcpTransport = struct {
     }
 };
 
-/// Wait up to `deadline_ns` for `handle` to be ready for `events`
-/// (POLL.IN / POLL.OUT). Returns error.Timeout if the deadline elapses
-/// without readiness, error.SendFailed / error.ConnectionClosed on poll
-/// errors — chosen so the caller's catch translates the right way for the
-/// surrounding read or write loop.
+/// Wait for `handle` readiness with `events` (POLL.IN / POLL.OUT) up to
+/// `deadline_ns`. Wraps `sys.pollReady` with the read/write-flavored error
+/// mapping the surrounding loops want — Timeout passes through, poll
+/// failures become SendFailed on the write side, ConnectionClosed on the
+/// read side.
 fn waitReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, ConnectionClosed, SendFailed }!void {
-    const remaining_ns = deadline_ns - monotonic.nowNs();
-    if (remaining_ns <= 0) return error.Timeout;
-    const wait_ms: i32 = @intCast(@min(@divFloor(remaining_ns, 1_000_000), std.math.maxInt(i32)));
-
-    var pfd = [_]posix.pollfd{.{ .fd = handle, .events = events, .revents = 0 }};
-    const n = posix.poll(&pfd, wait_ms) catch {
-        return if (events == posix.POLL.OUT) error.SendFailed else error.ConnectionClosed;
+    sys.pollReady(handle, events, deadline_ns) catch |err| switch (err) {
+        error.Timeout => return error.Timeout,
+        error.PollFailed => return if (events == posix.POLL.OUT) error.SendFailed else error.ConnectionClosed,
     };
-    if (n == 0) return error.Timeout;
-    // POLLERR/POLLHUP can fire alongside the requested event; let the
-    // subsequent read/write surface the kernel's specific error.
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -567,8 +564,7 @@ fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
     var len_buf: [2]u8 = undefined;
     var len_filled: usize = 0;
     while (len_filled < 2) {
-        var iovec = [_][]u8{len_buf[len_filled..]};
-        const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return;
+        const n = sys.netRead(io, handle, len_buf[len_filled..]) catch return;
         if (n == 0) return;
         len_filled += n;
     }
@@ -578,8 +574,7 @@ fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
     var body_buf: [dns.edns_udp_payload]u8 = undefined;
     var body_filled: usize = 0;
     while (body_filled < body_len) {
-        var iovec = [_][]u8{body_buf[body_filled..body_len]};
-        const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return;
+        const n = sys.netRead(io, handle, body_buf[body_filled..body_len]) catch return;
         if (n == 0) return;
         body_filled += n;
     }
@@ -591,7 +586,7 @@ fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
 
     var sent: usize = 0;
     while (sent < 2 + body_len) {
-        const n = io.vtable.netWrite(io.userdata, handle, resp[sent .. 2 + body_len], &[_][]const u8{""}, 0) catch return;
+        const n = sys.netWrite(io, handle, resp[sent .. 2 + body_len]) catch return;
         if (n == 0) return;
         sent += n;
     }

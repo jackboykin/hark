@@ -207,17 +207,19 @@ pub const TlsTransport = struct {
     /// as `blocking_transport.connectTcp`: open the fd via raw posix to
     /// apply `SO_SNDTIMEO`, then wrap as `Io.net.Stream`. Leaves SNDTIMEO
     /// set because the caller overwrites both directions with the
-    /// per-handshake / per-query deadline immediately after.
+    /// per-handshake / per-query deadline immediately after. `.address`
+    /// follows the same CONTRACT as `BlockingTcpTransport.connectTcp`:
+    /// zero-init, do not read on client-side streams. `io` is reserved
+    /// for the eventual `IpAddress.connect` collapse.
     fn connectTcpBlocking(io: Io, tls_server: na.Address, timeout_ms: u32) !Io.net.Stream {
+        _ = io;
         const af: u32 = na.afU32(tls_server);
         const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
         errdefer sys.close(sock_fd);
         sys.setSocketTimeouts(sock_fd, timeout_ms);
         sys.setNoDelay(sock_fd);
         na.connectTo(sock_fd, &tls_server) catch return error.ConnectFailed;
-        const local = na.getSockName(sock_fd) catch tls_server; // .address informational.
-        _ = io;
-        return .{ .socket = .{ .handle = sock_fd, .address = local } };
+        return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
     }
 
     /// Fire a background probe for a nameserver. The spawned task does

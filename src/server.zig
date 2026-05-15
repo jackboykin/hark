@@ -1331,7 +1331,12 @@ const WorkerState = struct {
     ) void {
         defer sys.close(client_fd);
 
-        // Switch accepted fd to blocking mode with idle timeout.
+        // Switch accepted fd to blocking mode. Load-bearing for the
+        // poll-before-netRead path: with NONBLOCK + no SO_*TIMEO, netRead
+        // would return EAGAIN, which netReadPosix treats as errnoBug
+        // (panic in debug). Clearing NONBLOCK is what makes pollReady's
+        // "no other reader on this fd" + "poll guarantees readability"
+        // story actually preclude EAGAIN reaching netRead.
         const flags = sys.fcntl(client_fd, posix.F.GETFL, 0) catch return;
         const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
         _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
@@ -1351,12 +1356,12 @@ const WorkerState = struct {
             tcp_queries += 1;
             const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             var len_buf: [2]u8 = undefined;
-            tcpReadExactBlocking(client_fd, &len_buf, read_deadline_ns) orelse return;
+            tcpReadExactBlocking(self.io, client_fd, &len_buf, read_deadline_ns) orelse return;
             const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
             var query_buf: [dns.max_message_len]u8 = undefined;
-            tcpReadExactBlocking(client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
+            tcpReadExactBlocking(self.io, client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
             sys.setQuickAck(client_fd);
 
             const alloc = query_pta.reset();
@@ -1368,7 +1373,7 @@ const WorkerState = struct {
                     const id = mem.readInt(u16, data[0..2], .big);
                     const op_bits: u4 = @truncate(data[2] >> 3);
                     const w = serializeErrorResponse(&response_wire, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}) orelse return;
-                    tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
+                    tcpWriteMessage(self.io, client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
                 return;
@@ -1376,7 +1381,7 @@ const WorkerState = struct {
 
             if (validateQuery(query)) |fail| {
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions) orelse return;
-                tcpWriteMessage(client_fd, w, read_deadline_ns) orelse return;
+                tcpWriteMessage(self.io, client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
 
@@ -1392,7 +1397,7 @@ const WorkerState = struct {
                 self.cache.cacheServfail(name_str, question.qtype);
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-                tcpWriteMessage(client_fd, w, write_deadline_ns) orelse return;
+                tcpWriteMessage(self.io, client_fd, w, write_deadline_ns) orelse return;
                 continue;
             };
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1407,7 +1412,7 @@ const WorkerState = struct {
             ctx.minimal_responses = self.config.minimal_responses;
             const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-            tcpWriteMessage(client_fd, wire, write_deadline_ns) orelse return;
+            tcpWriteMessage(self.io, client_fd, wire, write_deadline_ns) orelse return;
 
             self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
             if (query.header.flags.cd) {
@@ -1696,31 +1701,51 @@ const WorkerState = struct {
 };
 
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
+//
+// Userspace deadline via sys.pollReady — same pattern as
+// BlockingTcpTransport.sendAndReceiveTcp (see comments there).
+//
+// All errors collapse to `null` ("drop client, move on") because per-client
+// recovery has no useful shape — but log at debug for operational visibility
+// so a future shotgun-style outage doesn't have to be diagnosed blind.
 
-fn tcpReadExactBlocking(fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
+fn tcpReadExactBlocking(io: Io, fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
     var total: usize = 0;
     while (total < buf.len) {
-        sys.updateTimeout(fd, posix.SO.RCVTIMEO, deadline_ns) catch return null;
-        const n = sys.read(fd, buf[total..]) catch return null;
-        if (n == 0) return null; // connection closed
+        sys.pollReady(fd, posix.POLL.IN, deadline_ns) catch |err| {
+            log.debug("tcp client read poll: {s}", .{@errorName(err)});
+            return null;
+        };
+        const n = sys.netRead(io, fd, buf[total..]) catch |err| {
+            log.debug("tcp client read: {s}", .{@errorName(err)});
+            return null;
+        };
+        if (n == 0) return null; // connection closed (FIN)
         total += n;
     }
 }
 
-fn tcpWriteAllBlocking(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
+fn tcpWriteAllBlocking(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     var total: usize = 0;
     while (total < data.len) {
-        sys.updateTimeout(fd, posix.SO.SNDTIMEO, deadline_ns) catch return null;
-        const n = sys.write(fd, data[total..]) catch return null;
+        sys.pollReady(fd, posix.POLL.OUT, deadline_ns) catch |err| {
+            log.debug("tcp client write poll: {s}", .{@errorName(err)});
+            return null;
+        };
+        const n = sys.netWrite(io, fd, data[total..]) catch |err| {
+            log.debug("tcp client write: {s}", .{@errorName(err)});
+            return null;
+        };
+        if (n == 0) return null;
         total += n;
     }
 }
 
-fn tcpWriteMessage(fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
+fn tcpWriteMessage(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     var len_prefix: [2]u8 = undefined;
     mem.writeInt(u16, &len_prefix, @intCast(data.len), .big);
-    tcpWriteAllBlocking(fd, &len_prefix, deadline_ns) orelse return null;
-    tcpWriteAllBlocking(fd, data, deadline_ns) orelse return null;
+    tcpWriteAllBlocking(io, fd, &len_prefix, deadline_ns) orelse return null;
+    tcpWriteAllBlocking(io, fd, data, deadline_ns) orelse return null;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
