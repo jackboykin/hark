@@ -12,9 +12,12 @@ const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 
-// UDP path goes through std.Io.net.Socket; TCP/TLS below still uses raw
-// posix via sys.zig. queryStaggered drops to posix.poll on socket.handle
-// rather than Io.select over receive futures — see comment there.
+// UDP and TCP both flow through std.Io.net (Socket/Stream + io.vtable.netRead/
+// netWrite for the data path). Connect-side TCP still opens the fd via raw
+// posix for SO_SNDTIMEO — Zig 0.16's `netConnectIp` accepts a timeout option
+// but its Io.Threaded backend panics on it. queryStaggered and the TCP loops
+// drop to posix.poll on socket.handle rather than Io.select over receive
+// futures — see comments at each call site.
 
 pub const Config = struct {
     timeout_ms: u32 = 5000,
@@ -280,13 +283,15 @@ pub const BlockingUdpTransport = struct {
 
 /// TCP transport using blocking sockets for thread-pool resolution.
 /// Tracks total deadline to mitigate slow-trickle attacks where an
-/// attacker sends one byte at a time to reset per-recv SO_RCVTIMEO.
+/// attacker sends one byte at a time — every iteration of the data
+/// loop polls with the remaining deadline before issuing a read/write.
 pub const BlockingTcpTransport = struct {
+    io: Io,
     const connect_timeout_ms: u32 = 5000;
     const response_timeout_ms: u32 = 10000;
 
-    pub fn init() BlockingTcpTransport {
-        return .{};
+    pub fn init(io: Io) BlockingTcpTransport {
+        return .{ .io = io };
     }
 
     /// Send a DNS query over TCP. With pool != null, tries an idle pooled
@@ -304,7 +309,7 @@ pub const BlockingTcpTransport = struct {
         if (pool) |p| {
             const key = AddressKey.fromAddress(server);
             if (p.acquire(key)) |conn| {
-                if (sendAndReceiveTcp(conn.sock, wire_query, response_buf, deadline_ns)) |data| {
+                if (sendAndReceiveTcp(conn.stream, self.io, wire_query, response_buf, deadline_ns)) |data| {
                     pool_mod.applyKeepaliveHint(conn, data);
                     p.release(key, conn, true);
                     return data;
@@ -314,45 +319,57 @@ pub const BlockingTcpTransport = struct {
             }
         }
 
-        const sock = try self.connectTcp(server);
-        const data = sendAndReceiveTcp(sock, wire_query, response_buf, deadline_ns) catch |err| {
-            sys.close(sock);
+        const stream = try self.connectTcp(server);
+        const data = sendAndReceiveTcp(stream, self.io, wire_query, response_buf, deadline_ns) catch |err| {
+            stream.close(self.io);
             return err;
         };
 
         if (pool) |p| {
             const key = AddressKey.fromAddress(server);
             const new_conn = p.allocator.create(TcpPooledConnection) catch {
-                // Pool out of memory — close the socket since no one will own it.
-                sys.close(sock);
+                // Pool out of memory — close the stream since no one will own it.
+                stream.close(self.io);
                 return data;
             };
-            new_conn.* = .{ .sock = sock, .last_used = undefined, .query_count = undefined };
+            new_conn.* = .{ .stream = stream, .io = self.io, .last_used = undefined, .query_count = undefined };
             pool_mod.applyKeepaliveHint(new_conn, data);
             p.store(key, new_conn);
             return data;
         }
 
-        sys.close(sock);
+        stream.close(self.io);
         return data;
     }
 
-    fn connectTcp(_: *BlockingTcpTransport, server: na.Address) !posix.fd_t {
+    /// Open a connected TCP stream. The fd is opened via raw posix so we can
+    /// apply SO_SNDTIMEO for the connect itself — Zig 0.16's
+    /// `IpAddress.connect` accepts a timeout option but its Io.Threaded
+    /// backend panics on it. Clear SNDTIMEO before returning so subsequent
+    /// data ops don't surface EAGAIN through netRead/netWrite, which
+    /// `netReadPosix`/`netWritePosix` treat as a programmer bug. Once the
+    /// stdlib grows working connect timeouts, this collapses to one line.
+    fn connectTcp(self: *BlockingTcpTransport, server: na.Address) !Io.net.Stream {
         const af: u32 = na.afU32(server);
-        const sock = try sys.socket(af, posix.SOCK.STREAM, 0);
-        errdefer sys.close(sock);
-        sys.setSocketTimeout(sock, posix.SO.SNDTIMEO, connect_timeout_ms);
-        sys.setNoDelay(sock);
-        na.connectTo(sock, &server) catch return error.ConnectFailed;
-        return sock;
+        const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
+        errdefer sys.close(sock_fd);
+        sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, connect_timeout_ms);
+        sys.setNoDelay(sock_fd);
+        na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
+        sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, 0);
+        const local = na.getSockName(sock_fd) catch server; // .address is informational; fallback is harmless.
+        _ = self;
+        return .{ .socket = .{ .handle = sock_fd, .address = local } };
     }
 
-    /// Length-prefixed DNS query/response on a connected TCP socket. The
-    /// per-syscall SO_*TIMEO is the remaining deadline; the userspace check
-    /// before each read/write enforces the total deadline (slow-trickle).
-    fn sendAndReceiveTcp(sock: posix.fd_t, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
-        try sys.updateTimeout(sock, posix.SO.SNDTIMEO, deadline_ns);
-        try sys.updateTimeout(sock, posix.SO.RCVTIMEO, deadline_ns);
+    /// Length-prefixed DNS query/response on a connected TCP stream. Each
+    /// loop iteration polls with the remaining deadline before issuing a
+    /// netRead/netWrite — the kernel-side SO_*TIMEO mechanism can't be used
+    /// because Io.Threaded's netRead/netWrite treat EAGAIN as a bug.
+    /// Userspace deadline enforcement covers the slow-trickle case where
+    /// the peer drips bytes to reset any per-syscall timer.
+    fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+        const handle = stream.socket.handle;
 
         // ── Send length-prefixed query ──
         var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
@@ -360,8 +377,8 @@ pub const BlockingTcpTransport = struct {
 
         var bytes_sent: usize = 0;
         while (bytes_sent < framed.len) {
-            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
-            const n = sys.write(sock, framed[bytes_sent..]) catch return error.SendFailed;
+            try waitReady(handle, posix.POLL.OUT, deadline_ns);
+            const n = io.vtable.netWrite(io.userdata, handle, framed[bytes_sent..], &[_][]const u8{""}, 0) catch return error.SendFailed;
             if (n == 0) return error.SendFailed;
             bytes_sent += n;
         }
@@ -369,10 +386,10 @@ pub const BlockingTcpTransport = struct {
         // ── Receive length-prefixed response ──
         var len_buf: [2]u8 = undefined;
         var len_filled: usize = 0;
-
         while (len_filled < 2) {
-            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
-            const n = sys.read(sock, len_buf[len_filled..]) catch return error.ConnectionClosed;
+            try waitReady(handle, posix.POLL.IN, deadline_ns);
+            var iovec = [_][]u8{len_buf[len_filled..]};
+            const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             len_filled += n;
         }
@@ -382,16 +399,36 @@ pub const BlockingTcpTransport = struct {
 
         var body_filled: usize = 0;
         while (body_filled < body_len) {
-            if (monotonic.nowNs() >= deadline_ns) return error.Timeout;
-            const n = sys.read(sock, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
+            try waitReady(handle, posix.POLL.IN, deadline_ns);
+            var iovec = [_][]u8{response_buf[body_filled..body_len]};
+            const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return error.ConnectionClosed;
             if (n == 0) return error.ConnectionClosed;
             body_filled += n;
         }
 
-        sys.setQuickAck(sock);
+        sys.setQuickAck(handle);
         return response_buf[0..body_len];
     }
 };
+
+/// Wait up to `deadline_ns` for `handle` to be ready for `events`
+/// (POLL.IN / POLL.OUT). Returns error.Timeout if the deadline elapses
+/// without readiness, error.SendFailed / error.ConnectionClosed on poll
+/// errors — chosen so the caller's catch translates the right way for the
+/// surrounding read or write loop.
+fn waitReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, ConnectionClosed, SendFailed }!void {
+    const remaining_ns = deadline_ns - monotonic.nowNs();
+    if (remaining_ns <= 0) return error.Timeout;
+    const wait_ms: i32 = @intCast(@min(@divFloor(remaining_ns, 1_000_000), std.math.maxInt(i32)));
+
+    var pfd = [_]posix.pollfd{.{ .fd = handle, .events = events, .revents = 0 }};
+    const n = posix.poll(&pfd, wait_ms) catch {
+        return if (events == posix.POLL.OUT) error.SendFailed else error.ConnectionClosed;
+    };
+    if (n == 0) return error.Timeout;
+    // POLLERR/POLLHUP can fire alongside the requested event; let the
+    // subsequent read/write surface the kernel's specific error.
+}
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
@@ -518,4 +555,71 @@ pub fn bindLoopbackUdpSock(io: Io) !struct { sock: Io.net.Socket, addr: na.Addre
     const bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
     const sock = try bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
     return .{ .sock = sock, .addr = sock.address };
+}
+
+/// Mock TCP echo server for tests: accepts one connection, reads one
+/// length-prefixed DNS query, echoes it back with the QR bit set, closes.
+fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    const handle = stream.socket.handle;
+
+    var len_buf: [2]u8 = undefined;
+    var len_filled: usize = 0;
+    while (len_filled < 2) {
+        var iovec = [_][]u8{len_buf[len_filled..]};
+        const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return;
+        if (n == 0) return;
+        len_filled += n;
+    }
+    const body_len = mem.readInt(u16, &len_buf, .big);
+    if (body_len < 12 or body_len > dns.edns_udp_payload) return;
+
+    var body_buf: [dns.edns_udp_payload]u8 = undefined;
+    var body_filled: usize = 0;
+    while (body_filled < body_len) {
+        var iovec = [_][]u8{body_buf[body_filled..body_len]};
+        const n = io.vtable.netRead(io.userdata, handle, &iovec) catch return;
+        if (n == 0) return;
+        body_filled += n;
+    }
+    body_buf[2] |= 0x80; // QR bit
+
+    var resp: [2 + dns.edns_udp_payload]u8 = undefined;
+    mem.writeInt(u16, resp[0..2], body_len, .big);
+    @memcpy(resp[2 .. 2 + body_len], body_buf[0..body_len]);
+
+    var sent: usize = 0;
+    while (sent < 2 + body_len) {
+        const n = io.vtable.netWrite(io.userdata, handle, resp[sent .. 2 + body_len], &[_][]const u8{""}, 0) catch return;
+        if (n == 0) return;
+        sent += n;
+    }
+}
+
+test "BlockingTcpTransport loopback query" {
+    try skipIfNotLinux();
+    const io = testing.io;
+
+    const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer server.deinit(io);
+    const server_addr = server.socket.address;
+
+    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a, .{});
+    defer dns.freeMessage(testing.allocator, msg);
+    var wire_buf: [dns.max_udp_payload]u8 = undefined;
+    const wire_query = try dns.serializeMessage(&wire_buf, msg);
+
+    const thread = try std.Thread.spawn(.{}, tcpEchoServerThread, .{ &server, io });
+
+    var transport = BlockingTcpTransport.init(io);
+    var response_buf: [dns.edns_udp_payload]u8 = undefined;
+    const response = try transport.query(wire_query, server_addr, &response_buf, null);
+    thread.join();
+
+    try testing.expect(response.len >= 12);
+    const resp_id = mem.readInt(u16, response[0..2], .big);
+    try testing.expectEqual(@as(u16, 0x1234), resp_id);
+    try testing.expect(response[2] & 0x80 != 0);
 }

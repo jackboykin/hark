@@ -232,7 +232,7 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     var t = BlockingUdpTransport.init(.{}, io);
     defer t.deinit();
-    var tcp_t = BlockingTcpTransport.init();
+    var tcp_t = BlockingTcpTransport.init(io);
 
     if (dot_strict and dot_host == null) {
         log.err("--dot-strict requires --dot-host for hostname verification", .{});

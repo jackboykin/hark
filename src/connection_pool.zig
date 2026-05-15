@@ -36,7 +36,12 @@ pub fn applyKeepaliveHint(conn: anytype, response: []const u8) void {
 // ── TcpPooledConnection ─────────────────────────────────────────────
 
 pub const TcpPooledConnection = struct {
-    sock: posix.fd_t,
+    stream: Io.net.Stream,
+    /// Io is carried per-connection so `destroyBroken` matches the generic
+    /// `ConnectionPool` shape (allocator-only). The cost is one interface
+    /// pointer per conn; the alternative — threading io through every
+    /// pool callsite — touches both TCP and TLS for no semantic gain.
+    io: Io,
     last_used: i64,
     query_count: u16,
     max_queries: u16 = 200,
@@ -46,7 +51,7 @@ pub const TcpPooledConnection = struct {
     idle_timeout_sec: ?i64 = null,
 
     pub fn destroyBroken(self: *TcpPooledConnection, allocator: Allocator) void {
-        sys.close(self.sock);
+        self.stream.close(self.io);
         allocator.destroy(self);
     }
 
@@ -514,7 +519,8 @@ fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
 
     const conn = try allocator.create(TcpPooledConnection);
     conn.* = .{
-        .sock = sock,
+        .stream = .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } },
+        .io = testing.io,
         .last_used = 0,
         .query_count = 0,
     };
@@ -633,7 +639,13 @@ test "TlsPool max queries eviction (RFC 7766 §6.2.1)" {
 test "applyKeepaliveHint clamps weaponized values" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var conn = TcpPooledConnection{ .sock = -1, .last_used = 0, .query_count = 0 };
+    // .stream is unused by applyKeepaliveHint (it only touches idle_timeout_sec).
+    var conn = TcpPooledConnection{
+        .stream = .{ .socket = .{ .handle = -1, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } },
+        .io = testing.io,
+        .last_used = 0,
+        .query_count = 0,
+    };
     var buf: [256]u8 = undefined;
 
     const buildKeepalive = struct {

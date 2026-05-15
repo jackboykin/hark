@@ -2472,7 +2472,7 @@ pub const RecursiveResolver = struct {
         fn run(ctx: *NsTaskCtx) void {
             var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
             defer udp_t.deinit();
-            var tcp_t = BlockingTcpTransport.init();
+            var tcp_t = BlockingTcpTransport.init(ctx.parent.io);
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp = &tcp_t,
