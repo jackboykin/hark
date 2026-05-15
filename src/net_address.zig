@@ -29,6 +29,15 @@ pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope } } };
 }
 
+/// Wildcard `0.0.0.0:0` / `[::]:0` of the same family as `peer`. The kernel
+/// fills in a random ephemeral source port (RFC 5452 §9.1) when this binds.
+pub fn wildcardFor(peer: Address) Address {
+    return switch (peer) {
+        .ip4 => initIp4(.{ 0, 0, 0, 0 }, 0),
+        .ip6 => initIp6(.{0} ** 16, 0, 0, 0),
+    };
+}
+
 /// Hashable, equality-comparable address-with-port. Used as a key in caches
 /// (RTT, NS-selector, encrypted_ns, connection pools).
 pub const AddressKey = struct {

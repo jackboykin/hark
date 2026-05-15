@@ -175,7 +175,7 @@ pub const RecursiveResolver = struct {
     anticipated_query: ?AnticipatedQuery = null,
 
     const AnticipatedQuery = struct {
-        sock: posix.fd_t,
+        sock: std.Io.net.Socket,
         query_id: u16,
         upstream: na.Address,
         qname_buf: [dns.max_name_len + 1]u8,
@@ -279,7 +279,7 @@ pub const RecursiveResolver = struct {
     /// slot is armed.
     fn dropAnticipated(self: *RecursiveResolver) void {
         if (self.anticipated_query) |aq| {
-            sys.close(aq.sock);
+            aq.sock.close(self.io);
             self.anticipated_query = null;
         }
     }
@@ -309,8 +309,10 @@ pub const RecursiveResolver = struct {
         const a = fba.allocator();
         // No 0x20 randomization on the anticipated path — `consumeAnticipated`
         // matches the case-insensitive echo policy of the non-0x20 send path.
-        // The connected UDP socket gives kernel 4-tuple validation that
-        // narrows the off-path forgery window 0x20 was designed to widen.
+        // The (peer IP, peer port) filter that narrows the off-path forgery
+        // window is enforced in userspace by consumeAnticipated's
+        // `recv.from.eql(&aq.upstream)` check; that check is load-bearing for
+        // the 0x20-omission justification — do not remove it.
         const msg = dns.buildQuery(a, 0, qname, qtype, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
@@ -320,16 +322,13 @@ pub const RecursiveResolver = struct {
         const query_id = rand.queryId(self.io);
         dns.patchQueryId(wire_buf[0..wire.len], query_id);
 
-        const af: u32 = na.afU32(upstream);
-        const sock = sys.socket(af, posix.SOCK.DGRAM, 0) catch return;
+        // Unconnected socket; consumeAnticipated does the source check in
+        // userspace, matching queryWithTimeout's RFC 5452 §9.2 policy.
+        const sock = na.wildcardFor(upstream).bind(self.io, .{ .mode = .dgram, .protocol = .udp }) catch return;
         // No `errdefer` — the function returns void, so `catch return` would
-        // leak the fd. Hand-roll the close on every fallible path.
-        na.connectTo(sock, &upstream) catch {
-            sys.close(sock);
-            return;
-        };
-        _ = sys.send(sock, wire, 0) catch {
-            sys.close(sock);
+        // leak the socket. Hand-roll the close on every fallible path.
+        sock.send(self.io, &upstream, wire) catch {
+            sock.close(self.io);
             return;
         };
 
@@ -371,15 +370,22 @@ pub const RecursiveResolver = struct {
         const remaining_ns = aq.deadline_ns - monotonic.nowNs();
         if (remaining_ns <= 0) return null;
         const remain_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
-        sys.setSocketTimeout(aq.sock, posix.SO.RCVTIMEO, @max(1, remain_ms));
 
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const n = sys.recv(aq.sock, response_buf, 0) catch return null;
-        if (n < dns.header_len) return null;
-        const resp_id = mem.readInt(u16, response_buf[0..2], .big);
+        const recv = aq.sock.receiveTimeout(
+            self.io,
+            response_buf,
+            .{ .duration = .{ .raw = .fromMilliseconds(@max(1, remain_ms)), .clock = .awake } },
+        ) catch return null;
+        if (recv.data.len < dns.header_len) return null;
+        // Load-bearing: this (peer IP, peer port) check replaces the kernel
+        // 4-tuple filter the old connected-UDP socket provided, and is what
+        // makes prepareAnticipated's 0x20 omission safe (RFC 5452 §9.2).
+        if (!recv.from.eql(&aq.upstream)) return null;
+        const resp_id = mem.readInt(u16, recv.data[0..2], .big);
         if (resp_id != aq.query_id) return null;
 
-        const data = response_buf[0..n];
+        const data = recv.data;
         if (dns.hasTcBit(data)) return null;
         const response = (try tryParseMessage(allocator, data, aq.upstream)) orelse return null;
         if (response.header.flags.rcode.isServerError()) return null;
@@ -3638,8 +3644,8 @@ const blocking_transport = @import("blocking_transport.zig");
 test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    const server = try blocking_transport.bindLoopbackUdpSock();
-    defer sys.close(server.sock);
+    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer server.sock.close(testing.io);
 
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, testing.io);
     defer udp_t.deinit();
@@ -3649,7 +3655,7 @@ test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
     };
     defer resolver.dropAnticipated();
 
-    const thread = try std.Thread.spawn(.{}, blocking_transport.echoServerThread, .{server.sock});
+    const thread = try std.Thread.spawn(.{}, blocking_transport.echoServerThread, .{ server.sock, testing.io });
 
     resolver.prepareAnticipated("example.com", .a, server.addr, 2000);
     try testing.expect(resolver.anticipated_query != null);
@@ -3671,8 +3677,8 @@ test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
 test "consumeAnticipated returns null but preserves slot on qname/qtype mismatch" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    const server = try blocking_transport.bindLoopbackUdpSock();
-    defer sys.close(server.sock);
+    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer server.sock.close(testing.io);
 
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
@@ -3702,8 +3708,8 @@ test "consumeAnticipated returns null but preserves slot on qname/qtype mismatch
 test "consumeAnticipated returns null but preserves slot when server not in list" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    const server = try blocking_transport.bindLoopbackUdpSock();
-    defer sys.close(server.sock);
+    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer server.sock.close(testing.io);
 
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
@@ -3727,10 +3733,10 @@ test "consumeAnticipated returns null but preserves slot when server not in list
 test "prepareAnticipated does not clobber a live outer slot" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 
-    const server_a = try blocking_transport.bindLoopbackUdpSock();
-    defer sys.close(server_a.sock);
-    const server_b = try blocking_transport.bindLoopbackUdpSock();
-    defer sys.close(server_b.sock);
+    const server_a = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer server_a.sock.close(testing.io);
+    const server_b = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer server_b.sock.close(testing.io);
 
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
@@ -3741,13 +3747,13 @@ test "prepareAnticipated does not clobber a live outer slot" {
     defer resolver.dropAnticipated();
 
     resolver.prepareAnticipated("outer.example.com", .a, server_a.addr, 30_000);
-    const outer_sock = resolver.anticipated_query.?.sock;
+    const outer_handle = resolver.anticipated_query.?.sock.handle;
 
     // Simulate a nested resolveImpl trying to arm its own anticipated query;
     // the outer's still-fresh slot must survive.
     resolver.prepareAnticipated("inner.example.com", .aaaa, server_b.addr, 30_000);
     try testing.expect(resolver.anticipated_query != null);
-    try testing.expectEqual(outer_sock, resolver.anticipated_query.?.sock);
+    try testing.expectEqual(outer_handle, resolver.anticipated_query.?.sock.handle);
     try testing.expectEqual(dns.RType.a, resolver.anticipated_query.?.qtype);
 }
 

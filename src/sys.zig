@@ -2,8 +2,12 @@
 /// Replaces the removed std.posix socket functions in Zig 0.16.
 /// Matches the old posix.* signatures for mechanical migration.
 ///
-/// sendto/recvfrom/write/read retry on EINTR internally. SIGINT/SIGTERM are
-/// blocked and delivered via signalfd, but other unblocked signals (SIGPIPE,
+/// Used by the TCP/TLS path and the inbound server/event-loop sockets.
+/// Outbound UDP uses std.Io.net.Socket directly; do not add new callers
+/// here for paths that have an Io alternative.
+///
+/// sendto/write/read retry on EINTR internally. SIGINT/SIGTERM are blocked
+/// and delivered via signalfd, but other unblocked signals (SIGPIPE,
 /// profilers, etc.) can still interrupt blocking syscalls; looping avoids
 /// dropping in-flight queries. connect/accept surface Interrupted because
 /// retry semantics are context-dependent.
@@ -72,14 +76,6 @@ pub fn listen(fd: posix.fd_t, backlog: u31) !void {
     };
 }
 
-pub fn send(fd: posix.fd_t, buf: []const u8, flags: u32) !usize {
-    return sendto(fd, buf, flags, null, 0);
-}
-
-pub fn recv(fd: posix.fd_t, buf: []u8, flags: u32) !usize {
-    return recvfrom(fd, buf, flags, null, null);
-}
-
 pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, len: posix.socklen_t) !usize {
     while (true) {
         const rc = linux.sendto(fd, buf.ptr, buf.len, flags, addr, len);
@@ -92,22 +88,6 @@ pub fn sendto(fd: posix.fd_t, buf: []const u8, flags: u32, addr: ?*const posix.s
             .MSGSIZE => error.MessageTooBig,
             .PIPE => error.BrokenPipe,
             .NOBUFS, .NOMEM => error.SystemResources,
-            else => |e| posix.unexpectedErrno(e),
-        };
-    }
-}
-
-pub fn recvfrom(fd: posix.fd_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) !usize {
-    while (true) {
-        const rc = linux.recvfrom(fd, buf.ptr, buf.len, flags, addr, len);
-        return switch (linux.errno(rc)) {
-            .SUCCESS => rc,
-            .AGAIN => error.WouldBlock,
-            .BADF, .NOTSOCK => unreachable,
-            .CONNREFUSED => error.ConnectionRefused,
-            .INTR => continue,
-            .NOMEM => error.SystemResources,
-            .CONNRESET => error.ConnectionResetByPeer,
             else => |e| posix.unexpectedErrno(e),
         };
     }

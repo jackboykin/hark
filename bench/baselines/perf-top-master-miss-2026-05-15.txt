@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 5K of event 'cpu/cycles/Pu'
+# Event count (approx.): 120877890057
+#
+# Overhead       Samples  Command  Shared Object     Symbol                                                                                                                      
+# ........  ............  .......  ................  ............................................................................................................................
+#
+     9.53%           433  hark     hark              [.] Io.RwLock.unlockShared
+     8.81%           426  hark     hark              [.] ns_rtt.RttCache.isDead
+     7.33%           384  hark     hark              [.] recursive.RecursiveResolver.queryAuthoritativeServers
+     6.46%           339  hark     hark              [.] heap.ArenaAllocator.alloc
+     4.70%           245  hark     hark              [.] compiler_rt.memcpy.memcpyFast
+     3.68%           223  hark     hark              [.] cache.RRsetCache.lookup
+     3.52%           164  hark     hark              [.] hash.wyhash.Wyhash.final
+     3.51%           186  hark     hark              [.] array_hash_map.Custom(cache.CacheKey,cache.CacheEntry,cache.CacheKeyContext,true).getIndexAdapted__anon_38035
+     3.14%           145  hark     hark              [.] hash.wyhash.Wyhash.update
+     2.59%           102  hark     hark              [.] cache.removeAtIndex
+     2.53%           133  hark     hark              [.] hash_map.HashMapUnmanaged(net_address.AddressKey,ns_rtt.RttState,net_address.AddressKey.HashCtx,80).getIndex__anon_48837
+     2.47%           145  hark     hark              [.] counting_allocator.CountingAllocator.countingAlloc
+     2.26%           116  hark     hark              [.] cache.RRsetCache.storeRRsetsExcept
+     2.03%           122  hark     hark              [.] dns.parseMessage
+     1.99%           178  hark     hark              [.] server.WorkerState.poolThread
+     1.71%           142  hark     hark              [.] Io.RwLock.lockUncancelable
+     1.68%            81  hark     hark              [.] ns_selector.NsSelector.recordOutcome
+     1.60%            87  hark     hark              [.] recursive.RecursiveResolver.resolveImpl
+     1.57%            72  hark     hark              [.] Random.init__anon_49911.gen.fill
+     1.55%           262  hark     [vdso]            [.] __vdso_clock_gettime
+     1.54%            81  hark     hark              [.] heap.SmpAllocator.free
+     1.54%           199  hark     hark              [.] ns_rtt.RttCache.recordSuccess
+     1.21%           126  hark     hark              [.] server.Server.runWorker
+     1.16%            61  hark     hark              [.] dedup.InFlightTable.acquireOrWaitImpl
+     1.13%            62  hark     hark              [.] ns_selector.gammaSample
+     1.06%            46  hark     hark              [.] hash_map.HashMapUnmanaged(dedup.DedupKey,bool,dedup.DedupKeyContext,80).getIndex__anon_38361
+     0.91%            54  hark     hark              [.] recursive.RecursiveResolver.findClosestCachedDelegation
+     0.88%            40  hark     hark              [.] heap.SmpAllocator.alloc
+     0.86%            42  hark     hark              [.] dns.Serializer.writeRecordFields
+     0.83%            47  hark     hark              [.] server.WorkQueue.push
+     0.79%            40  hark     hark              [.] Io.Threaded.randomMainThread
+     0.78%            39  hark     hark              [.] mem.findScalarPos__anon_16430
+     0.77%            41  hark     hark              [.] dns.serializeMessage
+     0.73%            33  hark     hark              [.] dedup.InFlightTable.releaseLeader
+     0.68%            28  hark     hark              [.] response.buildResponseWire
+     0.67%            32  hark     hark              [.] server.WorkerState.resolveQueryWith
+     0.64%            38  hark     hark              [.] counting_allocator.CountingAllocator.countingRemap
+     0.63%            24  hark     hark              [.] counting_allocator.CountingAllocator.countingFree
+     0.55%            31  hark     hark              [.] cache.RRsetCache.prepareSlot
+     0.54%            40  hark     [unknown]         [k] 0xffffffff8d20008f
+     0.52%            16  hark     hark              [.] server.WorkerState.resolveWithDedupUsing
+     0.52%            38  hark     hark              [.] heap.ArenaAllocator.reset
+     0.45%            22  hark     hark              [.] array_list.Aligned(dns.Question,null).toOwnedSlice
+     0.38%            26  hark     hark              [.] dns.parseDottedName
+     0.38%            19  hark     hark              [.] recursive.RecursiveResolver.serverTimeout
+     0.36%             8  hark     [unknown]         [k] 0xffffffff8d200084
+     0.35%            23  hark     hark              [.] array_list.Aligned(dns.ResourceRecord,null).toOwnedSlice
+     0.35%            27  hark     [unknown]         [k] 0xffffffff8d304104
+     0.34%            15  hark     hark              [.] array_list.Aligned(dns.ResourceRecord,null).ensureTotalCapacity

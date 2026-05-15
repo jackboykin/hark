@@ -2,8 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
 const testing = std.testing;
+const Io = std.Io;
 const dns = @import("dns.zig");
-const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
 const pool_mod = @import("connection_pool.zig");
 const TcpConnectionPool = pool_mod.TcpConnectionPool;
@@ -12,60 +12,46 @@ const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 
+// UDP path goes through std.Io.net.Socket; TCP/TLS below still uses raw
+// posix via sys.zig. queryStaggered drops to posix.poll on socket.handle
+// rather than Io.select over receive futures — see comment there.
+
 pub const Config = struct {
     timeout_ms: u32 = 5000,
     retransmit_count: u32 = 2,
 };
 
-/// Map a UDP-send syscall error to a transport-level error. WouldBlock from
-/// SO_SNDTIMEO means the kernel send buffer stayed jammed past the deadline;
-/// kernel-async ICMP unreachable surfaces here too. MessageTooBig means our
+/// Map a UDP-send error to a transport-level error. Kernel-async ICMP
+/// unreachable surfaces as ConnectionRefused. MessageOversize means our
 /// serialized query exceeded path MTU — should not happen under normal EDNS
 /// limits, so a distinct variant lets it stand out in logs.
-fn mapUdpSendErr(err: anyerror) error{ Timeout, PeerUnreachable, MessageTooBig, SendFailed } {
+fn mapUdpSendErr(err: anyerror) error{ PeerUnreachable, MessageTooBig, SendFailed } {
     return switch (err) {
-        error.WouldBlock => error.Timeout,
-        error.ConnectionRefused => error.PeerUnreachable,
-        error.MessageTooBig => error.MessageTooBig,
+        error.ConnectionRefused, error.HostUnreachable, error.NetworkUnreachable => error.PeerUnreachable,
+        error.MessageOversize => error.MessageTooBig,
         else => error.SendFailed,
     };
 }
 
-/// Create a UDP socket bound to a random ephemeral port (RFC 5452).
-fn openUdpSocket(dest: na.Address, io: std.Io) !posix.fd_t {
-    const af: u32 = na.afU32(dest);
-    const sock = try sys.socket(af, posix.SOCK.DGRAM, 0);
-    errdefer sys.close(sock);
-
-    for (0..64) |_| {
-        const port = rand.ephemeralPort(io);
-        const addr = if (af == posix.AF.INET6)
-            na.initIp6(.{0} ** 16, port, 0, 0)
-        else
-            na.initIp4(.{ 0, 0, 0, 0 }, port);
-        na.bindTo(sock, &addr) catch |err| switch (err) {
-            error.AddressInUse => continue,
-            else => return err,
-        };
-        return sock;
-    }
-    return error.AddressInUse;
+/// Create a UDP socket bound to a random ephemeral port (RFC 5452 §9.1).
+/// Source-port randomization is the kernel's job — `bind` with port 0
+/// returns an Io.net.Socket with `address` populated to the resolved port.
+fn openUdpSocket(dest: na.Address, io: Io) !Io.net.Socket {
+    const bind_addr = na.wildcardFor(dest);
+    return bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
 }
 
 /// Blocking UDP transport. Per-thread persistent unconnected sockets per
 /// address family, rebound every `rebind_after_queries` to refresh source-port
-/// randomness (RFC 5452 §9.1). The staggered path uses short-lived connected
-/// sockets per leg.
+/// randomness (RFC 5452 §9.1). The staggered path uses short-lived
+/// per-leg sockets.
 pub const BlockingUdpTransport = struct {
     config: Config,
-    io: std.Io,
-    sock_v4: ?posix.fd_t = null,
-    sock_v6: ?posix.fd_t = null,
+    io: Io,
+    sock_v4: ?Io.net.Socket = null,
+    sock_v6: ?Io.net.Socket = null,
     v4_queries: u32 = 0,
     v6_queries: u32 = 0,
-    // 0 means "unknown" — forces the next setsockopt through.
-    last_rcvtimeo_v4_ms: u32 = 0,
-    last_rcvtimeo_v6_ms: u32 = 0,
 
     /// Rotate the persistent socket every N queries for defense-in-depth:
     /// rebinding picks a fresh random source port, re-randomizing the
@@ -73,47 +59,32 @@ pub const BlockingUdpTransport = struct {
     /// source-port+query-id has a narrow window per binding.
     const rebind_after_queries: u32 = 4096;
 
-    pub fn init(config: Config, io: std.Io) BlockingUdpTransport {
+    pub fn init(config: Config, io: Io) BlockingUdpTransport {
         return .{ .config = config, .io = io };
     }
 
     pub fn deinit(self: *BlockingUdpTransport) void {
-        if (self.sock_v4) |fd| sys.close(fd);
-        if (self.sock_v6) |fd| sys.close(fd);
+        if (self.sock_v4) |s| s.close(self.io);
+        if (self.sock_v6) |s| s.close(self.io);
         self.sock_v4 = null;
         self.sock_v6 = null;
-        self.last_rcvtimeo_v4_ms = 0;
-        self.last_rcvtimeo_v6_ms = 0;
     }
 
-    const PersistentSocket = struct {
-        fd: posix.fd_t,
-        last_rcvtimeo_ms: *u32,
-    };
-
-    fn persistentSocket(self: *BlockingUdpTransport, dest: na.Address) !PersistentSocket {
-        const sock_ref, const counter_ref, const timeo_ref = switch (dest) {
-            .ip4 => .{ &self.sock_v4, &self.v4_queries, &self.last_rcvtimeo_v4_ms },
-            .ip6 => .{ &self.sock_v6, &self.v6_queries, &self.last_rcvtimeo_v6_ms },
+    fn persistentSocket(self: *BlockingUdpTransport, dest: na.Address) !Io.net.Socket {
+        const sock_ref, const counter_ref = switch (dest) {
+            .ip4 => .{ &self.sock_v4, &self.v4_queries },
+            .ip6 => .{ &self.sock_v6, &self.v6_queries },
         };
         if (sock_ref.* != null and counter_ref.* >= rebind_after_queries) {
-            sys.close(sock_ref.*.?);
+            sock_ref.*.?.close(self.io);
             sock_ref.* = null;
             counter_ref.* = 0;
-            timeo_ref.* = 0;
         }
         if (sock_ref.* == null) {
             sock_ref.* = try openUdpSocket(dest, self.io);
-            timeo_ref.* = 0;
         }
         counter_ref.* += 1;
-        return .{ .fd = sock_ref.*.?, .last_rcvtimeo_ms = timeo_ref };
-    }
-
-    fn setRcvTimeoIfChanged(sock: PersistentSocket, ms: u32) void {
-        if (sock.last_rcvtimeo_ms.* == ms) return;
-        sys.setSocketTimeout(sock.fd, posix.SO.RCVTIMEO, ms);
-        sock.last_rcvtimeo_ms.* = ms;
+        return sock_ref.*.?;
     }
 
     pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, response_buf: []u8) ![]const u8 {
@@ -128,14 +99,9 @@ pub const BlockingUdpTransport = struct {
     pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32, response_buf: []u8) ![]const u8 {
         const sock = try self.persistentSocket(upstream);
 
-        // Retransmit interval: 1/3 of overall timeout, at least 50ms
         const retransmit_ms = @max(50, timeout_ms / 3);
-        setRcvTimeoIfChanged(sock, retransmit_ms);
 
-        var upstream_sa: na.PosixAddress = undefined;
-        const upstream_sa_len = na.toSockaddr(&upstream, &upstream_sa);
-
-        _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch |err| return mapUdpSendErr(err);
+        sock.send(self.io, &upstream, wire_query) catch |err| return mapUdpSendErr(err);
 
         const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
         var retransmits_left: u32 = self.config.retransmit_count;
@@ -144,28 +110,28 @@ pub const BlockingUdpTransport = struct {
             const remaining_ns = deadline_ns - monotonic.nowNs();
             if (remaining_ns <= 0) return error.Timeout;
 
-            var src_sa: na.PosixAddress = undefined;
-            var src_sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-            const n = sys.recvfrom(sock.fd, response_buf, 0, @ptrCast(&src_sa), &src_sa_len) catch |err| switch (err) {
-                error.WouldBlock => {
-                    // Timeout on recv — retransmit or fail.
+            const remain_ms: u32 = @intCast(@min(
+                @divFloor(remaining_ns, 1_000_000),
+                retransmit_ms,
+            ));
+            if (remain_ms == 0) return error.Timeout;
+
+            const msg = sock.receiveTimeout(
+                self.io,
+                response_buf,
+                .{ .duration = .{ .raw = .fromMilliseconds(remain_ms), .clock = .awake } },
+            ) catch |err| switch (err) {
+                error.Timeout => {
                     if (retransmits_left == 0) return error.Timeout;
                     retransmits_left -= 1;
-                    _ = sys.sendto(sock.fd, wire_query, 0, &upstream_sa.any, upstream_sa_len) catch |e| return mapUdpSendErr(e);
-
-                    const remain_ms = @as(u32, @intCast(@min(
-                        @divFloor(remaining_ns, 1_000_000),
-                        retransmit_ms,
-                    )));
-                    if (remain_ms == 0) return error.Timeout;
-                    setRcvTimeoIfChanged(sock, remain_ms);
+                    sock.send(self.io, &upstream, wire_query) catch |e| return mapUdpSendErr(e);
                     continue;
                 },
-                error.ConnectionRefused => return error.PeerUnreachable,
+                error.PortUnreachable => return error.PeerUnreachable,
                 else => return error.RecvFailed,
             };
 
-            if (n < 2) continue;
+            if (msg.data.len < 2) continue;
 
             // Userspace source check: the persistent socket is unconnected so
             // it can receive responses addressed to any peer. Require full
@@ -173,12 +139,11 @@ pub const BlockingUdpTransport = struct {
             // socket would get from the kernel — off-path attackers spoofing
             // the upstream IP with a random source port are otherwise
             // accepted at this layer (RFC 5452 §9.2 assumes 5-tuple).
-            const src_addr = na.fromSockaddr(&src_sa);
-            if (!src_addr.eql(&upstream)) continue;
+            if (!msg.from.eql(&upstream)) continue;
 
-            const resp_id = mem.readInt(u16, response_buf[0..2], .big);
+            const resp_id = mem.readInt(u16, msg.data[0..2], .big);
             if (resp_id == query_id) {
-                return response_buf[0..n];
+                return msg.data;
             }
             // Wrong ID — keep waiting.
         }
@@ -194,14 +159,23 @@ pub const BlockingUdpTransport = struct {
     pub const max_staggered_legs = 4;
 
     /// Race up to `max_staggered_legs` nameservers; return the first valid
-    /// response. Each leg gets a connected UDP socket with a unique random
-    /// source port (RFC 5452 §9.1). Callers must pass distinct destination IPs
-    /// — racing the same IP would not increase birthday entropy.
+    /// response. Each leg gets an unconnected UDP socket with a unique
+    /// kernel-assigned ephemeral port (RFC 5452 §9.1). Callers must pass
+    /// distinct destination IPs — racing the same IP would not increase
+    /// birthday entropy.
+    ///
+    /// Per-leg source filtering is done in userspace by `tryRecv` via
+    /// `msg.from.eql(expected_server)` — the legs are unconnected so the
+    /// kernel cannot enforce a 4-tuple filter for us.
     ///
     /// `wire_queries`, `query_ids`, `servers` must be parallel arrays of length
     /// 2..`max_staggered_legs`. Leg `i` launches at `query_start + i*stagger_ms`
     /// unless an earlier leg responds first. `response_buf` lifetime: see
     /// queryWithTimeout.
+    ///
+    /// Multi-socket wait still uses `posix.poll` over `socket.handle` because
+    /// `Io.select` over `receiveTimeout` futures is heavier than it's worth
+    /// at this scale; revisit when `Io.Evented` networking lands.
     pub fn queryStaggered(
         self: *BlockingUdpTransport,
         wire_queries: []const []const u8,
@@ -215,20 +189,19 @@ pub const BlockingUdpTransport = struct {
         std.debug.assert(leg_n >= 2 and leg_n <= max_staggered_legs);
         std.debug.assert(leg_n == wire_queries.len and leg_n == query_ids.len);
 
-        var socks: [max_staggered_legs]posix.fd_t = undefined;
+        var socks: [max_staggered_legs]Io.net.Socket = undefined;
         var sock_count: usize = 0;
-        defer for (socks[0..sock_count]) |fd| sys.close(fd);
+        defer for (socks[0..sock_count]) |s| s.close(self.io);
 
         const deadline_ns = monotonic.nowNs() + @as(i128, overall_timeout_ms) * 1_000_000;
         const stagger_ns: i128 = @as(i128, stagger_ms) * 1_000_000;
 
-        // Launch leg 0 synchronously so the caller sees connect/send errors
+        // Launch leg 0 synchronously so the caller sees send errors
         // immediately rather than spinning in the poll loop.
         const s0 = try openUdpSocket(servers[0], self.io);
         socks[0] = s0;
         sock_count = 1;
-        na.connectTo(s0, &servers[0]) catch return error.SendFailed;
-        _ = sys.send(s0, wire_queries[0], 0) catch |err| return mapUdpSendErr(err);
+        s0.send(self.io, &servers[0], wire_queries[0]) catch |err| return mapUdpSendErr(err);
         var next_launch_ns: i128 = monotonic.nowNs() + stagger_ns;
 
         while (true) {
@@ -238,19 +211,15 @@ pub const BlockingUdpTransport = struct {
             // Fire any legs whose stagger interval has elapsed.
             while (sock_count < leg_n and now_ns >= next_launch_ns) {
                 const idx = sock_count;
-                const fd = openUdpSocket(servers[idx], self.io) catch {
+                const s = openUdpSocket(servers[idx], self.io) catch {
                     // Out of ephemeral ports / fd budget: stop trying to fan
                     // out, keep polling the legs already in flight.
                     next_launch_ns = deadline_ns;
                     break;
                 };
-                socks[idx] = fd;
+                socks[idx] = s;
                 sock_count += 1;
-                na.connectTo(fd, &servers[idx]) catch {
-                    next_launch_ns = deadline_ns;
-                    break;
-                };
-                _ = sys.send(fd, wire_queries[idx], 0) catch {
+                s.send(self.io, &servers[idx], wire_queries[idx]) catch {
                     next_launch_ns = deadline_ns;
                     break;
                 };
@@ -269,15 +238,15 @@ pub const BlockingUdpTransport = struct {
 
             var polls: [max_staggered_legs]posix.pollfd = undefined;
             for (0..sock_count) |i| {
-                polls[i] = .{ .fd = socks[i], .events = posix.POLL.IN, .revents = 0 };
+                polls[i] = .{ .fd = socks[i].handle, .events = posix.POLL.IN, .revents = 0 };
             }
             const n = posix.poll(polls[0..sock_count], wait_ms) catch 0;
             if (n == 0) continue; // next launch fires, or overall deadline expires
 
             for (0..sock_count) |i| {
                 if (polls[i].revents & posix.POLL.IN != 0) {
-                    if (tryRecv(socks[i], query_ids[i], response_buf)) |len| {
-                        return .{ .response_data = response_buf[0..len], .responding_idx = @intCast(i) };
+                    if (tryRecv(socks[i], self.io, &servers[i], query_ids[i], response_buf)) |data| {
+                        return .{ .response_data = data, .responding_idx = @intCast(i) };
                     }
                 }
             }
@@ -285,13 +254,27 @@ pub const BlockingUdpTransport = struct {
         }
     }
 
-    /// Try to receive a valid DNS response. Returns byte count or null.
-    fn tryRecv(sock: posix.fd_t, expected_id: u16, response_buf: []u8) ?usize {
-        const n = sys.recv(sock, response_buf, posix.MSG.DONTWAIT) catch return null;
-        if (n < 2) return null;
-        const resp_id = mem.readInt(u16, response_buf[0..2], .big);
+    /// Drain one datagram from a readable socket and validate it as a DNS
+    /// response from the expected server with the expected query ID.
+    /// Returns the response slice (into `response_buf`) or null on any
+    /// mismatch / receive error.
+    fn tryRecv(
+        sock: Io.net.Socket,
+        io: Io,
+        expected_server: *const na.Address,
+        expected_id: u16,
+        response_buf: []u8,
+    ) ?[]const u8 {
+        // poll(2) said readable; zero-timeout recv pulls one datagram or
+        // returns error.Timeout if the queue is already drained (rare
+        // post-poll kernel race — treat as "nothing here").
+        const msg = sock.receiveTimeout(io, response_buf, .{ .duration = .{ .raw = .zero, .clock = .awake } }) catch return null;
+        if (msg.data.len < 2) return null;
+        // Source check mirrors queryWithTimeout's RFC 5452 §9.2 enforcement.
+        if (!msg.from.eql(expected_server)) return null;
+        const resp_id = mem.readInt(u16, msg.data[0..2], .big);
         if (resp_id != expected_id) return null;
-        return n;
+        return msg.data;
     }
 };
 
@@ -416,30 +399,41 @@ fn skipIfNotLinux() !void {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 }
 
+test "mapUdpSendErr classifies the Socket.SendError surface" {
+    // PeerUnreachable bucket: any "this peer can't be reached" signal so the
+    // resolver can fail over to a sibling NS without spending the timeout.
+    try testing.expectEqual(error.PeerUnreachable, mapUdpSendErr(error.ConnectionRefused));
+    try testing.expectEqual(error.PeerUnreachable, mapUdpSendErr(error.HostUnreachable));
+    try testing.expectEqual(error.PeerUnreachable, mapUdpSendErr(error.NetworkUnreachable));
+
+    // MessageTooBig: distinct because it indicates a serialization bug, not a
+    // network problem — retrying or failing over won't help.
+    try testing.expectEqual(error.MessageTooBig, mapUdpSendErr(error.MessageOversize));
+
+    // Everything else collapses to SendFailed.
+    try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.NetworkDown));
+    try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.SystemResources));
+    try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.SocketUnconnected));
+    try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.AccessDenied));
+}
+
 test "BlockingUdpTransport loopback query" {
     try skipIfNotLinux();
     const io = testing.io;
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    // Create a mock "server" socket
-    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-    defer sys.close(server_sock);
     const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_storage: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
-    try sys.bind(server_sock, &bind_storage.any, bind_len);
+    const server_sock = try server_bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_sock.close(io);
+    const server_addr = server_sock.address;
 
-    // Get server address
-    const server_addr = try na.getSockName(server_sock);
-
-    // Build a DNS query
     const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
+    const thread = try std.Thread.spawn(.{}, echoServerThread, .{ server_sock, io });
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
     const response = try transport.query(wire_query, 0x1234, server_addr, &response_buf);
@@ -457,15 +451,11 @@ test "BlockingUdpTransport timeout" {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 100, .retransmit_count = 0 }, io);
 
-    // Create a server socket that never responds (black hole)
-    const server_sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-    defer sys.close(server_sock);
+    // Black-hole server: bind a socket and never read from it.
     const server_bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_storage: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
-    try sys.bind(server_sock, &bind_storage.any, bind_len);
-
-    const server_addr = try na.getSockName(server_sock);
+    const server_sock = try server_bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_sock.close(io);
+    const server_addr = server_sock.address;
 
     const msg = try dns.buildQuery(testing.allocator, 0x5678, "timeout.test", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
@@ -483,17 +473,14 @@ test "BlockingUdpTransport IPv6 loopback query" {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    const server_sock = sys.socket(posix.AF.INET6, posix.SOCK.DGRAM, 0) catch |err| switch (err) {
-        error.AddressFamilyNotSupported => return error.SkipZigTest,
+    const server_bind = na.initIp6(.{0} ** 16, 0, 0, 0);
+    const server_sock = server_bind.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| switch (err) {
+        error.AddressFamilyUnsupported => return error.SkipZigTest,
         else => return err,
     };
-    defer sys.close(server_sock);
-    const server_bind = na.initIp6(.{0} ** 16, 0, 0, 0);
-    var bind_storage: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&server_bind, &bind_storage);
-    try sys.bind(server_sock, &bind_storage.any, bind_len);
+    defer server_sock.close(io);
 
-    const port = (try na.getSockName(server_sock)).getPort();
+    const port = server_sock.address.getPort();
     const server_addr = na.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
 
     const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .aaaa, .{});
@@ -501,7 +488,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const thread = try std.Thread.spawn(.{}, echoServerThread, .{server_sock});
+    const thread = try std.Thread.spawn(.{}, echoServerThread, .{ server_sock, io });
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
     const response = try transport.query(wire_query, 0xABCD, server_addr, &response_buf);
@@ -514,31 +501,21 @@ test "BlockingUdpTransport IPv6 loopback query" {
 }
 
 /// Mock UDP echo server for tests: reads one query, echoes it back with QR bit set.
-pub fn echoServerThread(sock: posix.fd_t) void {
-    var polls = [1]posix.pollfd{.{ .fd = sock, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&polls, 2000) catch return;
-    if (poll_result == 0) return;
-
+pub fn echoServerThread(sock: Io.net.Socket, io: Io) void {
     var recv_buf: [dns.max_udp_payload]u8 = undefined;
-    var client_addr: na.PosixAddress = std.mem.zeroes(na.PosixAddress);
-    var client_addr_len: posix.socklen_t = @sizeOf(na.PosixAddress);
-    const n = sys.recvfrom(sock, &recv_buf, 0, @ptrCast(&client_addr), &client_addr_len) catch return;
-    if (n < 2) return;
+    const msg = sock.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } }) catch return;
+    if (msg.data.len < 2) return;
 
     var resp: [dns.max_udp_payload]u8 = undefined;
-    @memcpy(resp[0..n], recv_buf[0..n]);
+    @memcpy(resp[0..msg.data.len], msg.data);
     resp[2] |= 0x80;
-    _ = sys.sendto(sock, resp[0..n], 0, @ptrCast(&client_addr), client_addr_len) catch return;
+    sock.send(io, &msg.from, resp[0..msg.data.len]) catch return;
 }
 
 /// Ephemeral-port UDP loopback socket for tests. Pair with `echoServerThread`
-/// or any mock that wants a `(sock, addr)` it can recv/sendto from.
-pub fn bindLoopbackUdpSock() !struct { sock: posix.fd_t, addr: na.Address } {
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-    errdefer sys.close(sock);
+/// or any mock that wants a `(sock, addr)` it can send/receive on.
+pub fn bindLoopbackUdpSock(io: Io) !struct { sock: Io.net.Socket, addr: na.Address } {
     const bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_storage: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind, &bind_storage);
-    try sys.bind(sock, &bind_storage.any, bind_len);
-    return .{ .sock = sock, .addr = try na.getSockName(sock) };
+    const sock = try bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    return .{ .sock = sock, .addr = sock.address };
 }
