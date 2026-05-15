@@ -36,14 +36,14 @@ Resolve a name recursively (the default):
 
 ```
 hark query example.com AAAA
-hark query --dnssec example.com
-hark query --opportunistic example.com
+hark query example.com --dnssec
+hark query example.com --opportunistic
 ```
 
 Forward to an upstream resolver instead:
 
 ```
-hark query --forward example.com
+hark query example.com --forward
 ```
 
 Run as a server (UDP + TCP, TOML config):
