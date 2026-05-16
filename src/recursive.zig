@@ -582,101 +582,25 @@ pub const RecursiveResolver = struct {
                                 .prefetch_name = prefetch_name,
                                 .prefetch_qtype = qtype,
                             },
-                            .negative => |n| {
-                                const authorities = try buildNegativeAuthority(allocator, n.soa, n.nsec_proofs);
-                                return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, n.rcode, n.security_status == .secure)),
-                                    .prefetch_name = prefetch_name,
-                                    .prefetch_qtype = qtype,
-                                };
-                            },
+                            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_name, qtype, cname_chain.items, cname_auth_aggregate.items),
                         }
                     }
                 }
             }
 
-            // RFC 8020: NXDOMAIN means there is nothing underneath. If any
-            // unsigned ancestor has a cached NXDOMAIN, this child does not
-            // exist either — short-circuit. Signed-zone NXDOMAIN cuts go
-            // through the NSEC aggressive-use path below.
-            if (!self.bypass_cache) {
-                if (self.cache) |c| {
-                    if (c.lookupNxdomainAncestor(allocator, current_name, qtype, .in)) |result| {
-                        switch (result) {
-                            .negative => |n| {
-                                // Ancestor NXDOMAIN (RFC 8020) is always served
-                                // as AD=0: the cached entry proves the ancestor
-                                // doesn't exist, not the descendant qname.
-                                // n.nsec_proofs flows through anyway so a CD=1
-                                // client can chase the proof itself.
-                                const authorities = try buildNegativeAuthority(allocator, n.soa, n.nsec_proofs);
-                                return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authorities, .name_error, false)),
-                                    .prefetch_name = null,
-                                    .prefetch_qtype = qtype,
-                                };
-                            },
-                            .hit => {},
-                        }
-                    }
-                }
-            }
+            if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
             var target_name = try dns.parseDottedName(allocator, current_name);
 
-            // NSEC CACHE: synthesize negative responses from cached NSEC proofs (RFC 8198).
-            // Skip if CD bit set (Appendix A) or cache bypassed.
-            if (!self.bypass_cache and self.dnssec_enabled) {
-                if (self.nsec_cache) |nc| {
-                    if (nc.lookupSuffixes(allocator, target_name, qtype, current_name)) |synth| {
-                        switch (synth.rcode) {
-                            .nxdomain, .nodata => |rc| {
-                                const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
-                                const authority = try buildNegativeAuthority(allocator, synth.soa, synth.proofs);
-                                return .{
-                                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(&.{}, authority, rcode, true)),
-                                    .prefetch_name = prefetch_name,
-                                    .prefetch_qtype = qtype,
-                                };
-                            },
-                            .wildcard_match => {
-                                // RFC 8198 §5.3: synthesize answer from cached wildcard RRset.
-                                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| {
-                                    return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
-                                }
-                                // Wildcard RRset not in cache — fall through to upstream (RFC 8198 §5.3 MUST)
-                            },
-                        }
-                    }
-                }
-            }
+            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, prefetch_name, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
             var servers: [max_servers_per_level]na.Address = undefined;
-            const hints = self.root_hints;
-            std.debug.assert(hints.len <= max_servers_per_level);
-            var server_count: usize = hints.len;
-            @memcpy(servers[0..hints.len], hints);
+            var server_count: usize = undefined;
+            var parent_zone: dns.Name = undefined;
+            try self.seedServersForQuery(allocator, current_name, &servers, &server_count, &parent_zone, &security_state);
 
             var seen_zones: [max_delegations]dns.Name = undefined;
             var seen_zone_count: usize = 0;
-
-            // Parent zone tracks the zone the current servers are authoritative for.
-            // Starts as root (empty labels = ".") since we begin at root hints.
-            var parent_zone = dns.Name{ .labels = &.{} };
-
-            // CACHE CHECK 2: Find closest cached delegation to skip root/TLD queries.
-            if (try self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
-                server_count = deleg.count;
-                @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
-                parent_zone = deleg.zone;
-
-                // DNSSEC: when skipping referrals via cache, we miss classifyDelegation
-                // calls. Check for a cached negative DS to detect insecure delegations.
-                if (security_state == .secure and self.dnssec_enabled) {
-                    if (hasCachedInsecureDelegation(self.keyCache(), allocator, deleg.zone))
-                        security_state = .insecure;
-                }
-            }
 
             // QNAME minimization (RFC 9156): start probing one label past the
             // current zone cut and advance toward the full target name.
@@ -835,29 +759,7 @@ pub const RecursiveResolver = struct {
 
                 // ── Final query response handling ──
 
-                // DNSSEC: a server authoritative for both parent and child
-                // can answer directly without a referral, so
-                // classifyDelegation never ran. Probe DS at every depth
-                // from parent+1 to the leaf — one of those names is the
-                // real cut.
-                if (self.dnssec_enabled and security_state == .secure and
-                    target_name.labels.len > parent_zone.labels.len and
-                    response.header.flags.aa and !hasSignedRecords(response))
-                {
-                    var probe_depth: usize = parent_zone.labels.len + 1;
-                    while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
-                        const cut_labels = target_name.labels[target_name.labels.len - probe_depth ..];
-                        const candidate_cut = dns.Name{ .labels = cut_labels };
-                        var cut_buf: [dns.max_name_len + 1]u8 = undefined;
-                        const cut_name = candidate_cut.formatInto(&cut_buf);
-                        if (self.reproveDelegationSecurity(allocator, cut_name, servers[0..server_count]) == null and
-                            hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
-                        {
-                            security_state = .insecure;
-                            break;
-                        }
-                    }
-                }
+                self.probeParentChildCut(allocator, target_name, parent_zone, &response, servers[0..server_count], &security_state);
 
                 // Classify response
                 if (response.header.flags.rcode != .no_error) {
@@ -934,65 +836,21 @@ pub const RecursiveResolver = struct {
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
 
-                                // Compute the same-zone next-hop name + pre-fire the
-                                // UDP query before NSEC aggregation, so its RTT
-                                // overlaps with `verifyAuthoritySigs` (warm DNSKEY
-                                // path) and the storeResponse already completed.
-                                // Best-effort: any failure (alloc, socket, send,
-                                // outer slot already armed) silently falls through
-                                // to the normal per-hop send on the next iteration.
-                                var next_qname: ?[]const u8 = null;
-                                var next_target: ?dns.Name = null;
-                                if (is_same_zone) {
-                                    next_qname = try nameToDotted(allocator, cname_rr.rdata.cname);
-                                    next_target = try dns.parseDottedName(allocator, next_qname.?);
-                                    if (responding_server) |srv| {
-                                        // QMIN would probe a shorter qname when the
-                                        // target is deeper than parent+1, so our
-                                        // pre-armed query wouldn't match. Skip the
-                                        // pre-fire in that case rather than waste it.
-                                        const skip = self.qname_minimization and
-                                            next_target.?.labels.len > parent_zone.labels.len + 1;
-                                        if (!skip) {
-                                            const timeout = self.serverTimeout(AddressKey.fromAddress(srv), false);
-                                            self.prepareAnticipated(next_qname.?, qtype, srv, timeout);
-                                        }
-                                    }
-                                }
+                                const next: ?CnameNextHop = if (is_same_zone)
+                                    try self.prefireSameZoneCname(allocator, cname_rr.rdata.cname, qtype, parent_zone, responding_server)
+                                else
+                                    null;
 
-                                // Aggregate wildcard-expansion NSEC/NSEC3 proofs
-                                // from this hop's authority before moving past it.
-                                // Three gates: secure CNAME (DNSKEY warm), proof-
-                                // material pre-scan with cheap bailiwick to skip
-                                // the DNSKEY fetch on the common no-proof case,
-                                // then `verifyAuthoritySigs` for crypto truth.
-                                // An unverified scoop here is an injection path —
-                                // attacker stuffs forged NSEC into a `.secure`
-                                // chain and AD-trusting downstream believes it.
-                                if (cname_status == .secure and response.authorities.len > 0) {
-                                    var has_proof = false;
-                                    for (response.authorities) |auth_rr| {
-                                        if (dns.isNsecProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
-                                            has_proof = true;
-                                            break;
-                                        }
-                                    }
-                                    if (has_proof and self.verifyAuthoritySigs(allocator, response.authorities, servers[0..server_count]) == .secure) {
-                                        for (response.authorities) |auth_rr| {
-                                            if (dns.isNsecProofMaterial(auth_rr))
-                                                try cname_auth_aggregate.append(allocator, auth_rr);
-                                        }
-                                    }
-                                }
+                                try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_auth_aggregate);
 
                                 // Same-zone CNAME: keep current auth servers, delegation,
                                 // and security_state. The DNSSEC chain of trust is
                                 // unchanged within a zone, so re-walking from root would
                                 // only redo cache lookups. Skip back to the inner
                                 // referral loop with the new target.
-                                if (is_same_zone) {
-                                    current_name = next_qname.?;
-                                    target_name = next_target.?;
+                                if (next) |n| {
+                                    current_name = n.qname;
+                                    target_name = n.target;
                                     minimize_label_count = if (self.qname_minimization)
                                         parent_zone.labels.len + 1
                                     else
@@ -1078,6 +936,205 @@ pub const RecursiveResolver = struct {
             }
 
             unreachable; // while(true) only exits via inner returns / continue :cname_loop
+        }
+    }
+
+    // ── Initial server seeding ──────────────────────────────────────────
+
+    /// Seed the per-query authority server set from the closest cached
+    /// delegation, or root hints if none. Starts `parent_zone` at root
+    /// (empty labels = `.`). Demotes `security_state` to `.insecure`
+    /// when the cached delegation has a known negative DS — the live
+    /// referral path would have caught this via `classifyDelegation`,
+    /// but a cache shortcut skips that call, so `hasCachedInsecureDelegation`
+    /// stands in.
+    fn seedServersForQuery(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        current_name: []const u8,
+        servers: *[max_servers_per_level]na.Address,
+        server_count: *usize,
+        parent_zone: *dns.Name,
+        security_state: *dnssec.SecurityStatus,
+    ) !void {
+        parent_zone.* = dns.Name{ .labels = &.{} };
+
+        if (try self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
+            server_count.* = deleg.count;
+            @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
+            parent_zone.* = deleg.zone;
+
+            if (security_state.* == .secure and self.dnssec_enabled) {
+                if (hasCachedInsecureDelegation(self.keyCache(), allocator, deleg.zone))
+                    security_state.* = .insecure;
+            }
+            return;
+        }
+
+        const hints = self.root_hints;
+        std.debug.assert(hints.len <= max_servers_per_level);
+        server_count.* = hints.len;
+        @memcpy(servers[0..hints.len], hints);
+    }
+
+    // ── Cache-served short-circuits ─────────────────────────────────────
+
+    /// RFC 8198 aggressive NSEC use: synthesize negative or wildcard
+    /// responses from cached NSEC proofs without an upstream round-trip.
+    /// Returns null when no usable proof is cached, when a wildcard
+    /// match's target RRset isn't cached (caller falls through to
+    /// upstream per RFC 8198 §5.3 MUST), or when the cache is bypassed
+    /// / DNSSEC is disabled.
+    fn tryServeFromAggressiveNsec(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        target_name: dns.Name,
+        current_name: []const u8,
+        qtype: dns.RType,
+        prefetch_name: ?[]const u8,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !?ResolveResult {
+        if (self.bypass_cache or !self.dnssec_enabled) return null;
+        const nc = self.nsec_cache orelse return null;
+        const synth = nc.lookupSuffixes(allocator, target_name, qtype, current_name) orelse return null;
+        switch (synth.rcode) {
+            .nxdomain, .nodata => |rc| {
+                const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
+                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, prefetch_name, qtype, cname_chain_items, cname_auth_items);
+            },
+            .wildcard_match => {
+                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, cname_chain_items, cname_auth_items)) |result| {
+                    return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
+                }
+                return null;
+            },
+        }
+    }
+
+    /// RFC 8020: NXDOMAIN means there is nothing underneath. If any
+    /// unsigned ancestor has a cached NXDOMAIN, this child does not
+    /// exist either — short-circuit. Signed-zone NXDOMAIN cuts go
+    /// through the NSEC aggressive-use path in `resolveImpl`.
+    ///
+    /// Always served as AD=0: the cached entry proves the ancestor
+    /// doesn't exist, not the descendant qname. `n.nsec_proofs` flows
+    /// through anyway so a CD=1 client can chase the proof itself.
+    fn tryServeFromNxdomainAncestor(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        current_name: []const u8,
+        qtype: dns.RType,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !?ResolveResult {
+        if (self.bypass_cache) return null;
+        const c = self.cache orelse return null;
+        const result = c.lookupNxdomainAncestor(allocator, current_name, qtype, .in) orelse return null;
+        switch (result) {
+            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, .name_error, false, null, qtype, cname_chain_items, cname_auth_items),
+            .hit => return null, // ancestor exists positively — no RFC 8020 cut applies
+        }
+    }
+
+    /// DNSSEC: a server authoritative for both parent and child can
+    /// answer directly without a referral, so `classifyDelegation` never
+    /// ran. Probe DS at every depth from parent+1 to the leaf — one of
+    /// those names is the real cut. Demotes `security_state` to
+    /// `.insecure` on the first cached insecure-DS hit.
+    fn probeParentChildCut(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        target_name: dns.Name,
+        parent_zone: dns.Name,
+        response: *const dns.Message,
+        servers: []const na.Address,
+        security_state: *dnssec.SecurityStatus,
+    ) void {
+        if (!self.dnssec_enabled or security_state.* != .secure) return;
+        if (target_name.labels.len <= parent_zone.labels.len) return;
+        if (!response.header.flags.aa or hasSignedRecords(response.*)) return;
+
+        var probe_depth: usize = parent_zone.labels.len + 1;
+        while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
+            const cut_labels = target_name.labels[target_name.labels.len - probe_depth ..];
+            const candidate_cut = dns.Name{ .labels = cut_labels };
+            var cut_buf: [dns.max_name_len + 1]u8 = undefined;
+            const cut_name = candidate_cut.formatInto(&cut_buf);
+            if (self.reproveDelegationSecurity(allocator, cut_name, servers) == null and
+                hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
+            {
+                security_state.* = .insecure;
+                break;
+            }
+        }
+    }
+
+    // ── CNAME chase helpers ─────────────────────────────────────────────
+
+    const CnameNextHop = struct { qname: []const u8, target: dns.Name };
+
+    /// Same-zone CNAME pre-fire: compute the next-hop name and arm the
+    /// UDP query before NSEC aggregation so its RTT overlaps with
+    /// `verifyAuthoritySigs` (warm DNSKEY path) and the `storeResponse`
+    /// already completed. Caller guards on `is_same_zone`; the returned
+    /// (qname, target) feeds the same-zone branch directly. Best-effort:
+    /// any pre-fire failure (alloc, socket, send, outer slot already
+    /// armed) silently falls through to the normal per-hop send on the
+    /// next iteration.
+    fn prefireSameZoneCname(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        cname_target: dns.Name,
+        qtype: dns.RType,
+        parent_zone: dns.Name,
+        responding_server: ?na.Address,
+    ) !CnameNextHop {
+        const next_qname = try nameToDotted(allocator, cname_target);
+        const next_target = try dns.cloneName(allocator, cname_target);
+        if (responding_server) |srv| {
+            // QMIN would probe a shorter qname when the target is deeper
+            // than parent+1, so our pre-armed query wouldn't match. Skip
+            // the pre-fire in that case rather than waste it.
+            const skip = self.qname_minimization and
+                next_target.labels.len > parent_zone.labels.len + 1;
+            if (!skip) {
+                const timeout = self.serverTimeout(AddressKey.fromAddress(srv), false);
+                self.prepareAnticipated(next_qname, qtype, srv, timeout);
+            }
+        }
+        return .{ .qname = next_qname, .target = next_target };
+    }
+
+    /// Aggregate wildcard-expansion NSEC/NSEC3 proofs from this hop's
+    /// authority before moving past it. Three gates: secure CNAME
+    /// (DNSKEY warm), proof-material pre-scan with cheap bailiwick to
+    /// skip the DNSKEY fetch on the common no-proof case, then
+    /// `verifyAuthoritySigs` for crypto truth. An unverified scoop here
+    /// is an injection path — attacker stuffs forged NSEC into a
+    /// `.secure` chain and AD-trusting downstream believes it.
+    fn aggregateCnameWildcardProofs(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        cname_status: cache_mod.SecurityStatus,
+        authorities: []const dns.ResourceRecord,
+        parent_zone: dns.Name,
+        servers: []const na.Address,
+        cname_auth_aggregate: *std.ArrayListUnmanaged(dns.ResourceRecord),
+    ) !void {
+        if (cname_status != .secure or authorities.len == 0) return;
+        var has_proof = false;
+        for (authorities) |auth_rr| {
+            if (dns.isNsecProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
+                has_proof = true;
+                break;
+            }
+        }
+        if (!has_proof) return;
+        if (self.verifyAuthoritySigs(allocator, authorities, servers) != .secure) return;
+        for (authorities) |auth_rr| {
+            if (dns.isNsecProofMaterial(auth_rr))
+                try cname_auth_aggregate.append(allocator, auth_rr);
         }
     }
 
@@ -2907,6 +2964,29 @@ fn withCnameChain(
         msg.header.ns_count = @intCast(new_auths.len);
     }
     return msg;
+}
+
+/// Assemble a `ResolveResult` for a negative response: SOA + NSEC
+/// proofs in the authority section, empty answer section, threaded
+/// through any active CNAME chain. Used by all cache-served negative
+/// paths.
+fn negativeResolveResult(
+    allocator: mem.Allocator,
+    soa: ?dns.ResourceRecord,
+    proofs: []const dns.ResourceRecord,
+    rcode: dns.RCode,
+    ad: bool,
+    prefetch_name: ?[]const u8,
+    qtype: dns.RType,
+    cname_chain_items: []const dns.ResourceRecord,
+    cname_auth_items: []const dns.ResourceRecord,
+) !RecursiveResolver.ResolveResult {
+    const authority = try buildNegativeAuthority(allocator, soa, proofs);
+    return .{
+        .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(&.{}, authority, rcode, ad)),
+        .prefetch_name = prefetch_name,
+        .prefetch_qtype = qtype,
+    };
 }
 
 // ── Referral extraction ────────────────────────────────────────────────
