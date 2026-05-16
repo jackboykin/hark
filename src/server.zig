@@ -429,6 +429,13 @@ pub const Server = struct {
     /// returns anything other than `CacheOnlyMiss`. Slow path re-runs the
     /// resolve, so the work is duplicated when this happens.
     fast_path_errors: std.atomic.Value(u64) align(std.atomic.cache_line),
+    /// Bumped each time `consumeAnticipated` drains a datagram that fails
+    /// the source / id / length check on the unconnected pre-fired socket
+    /// (the userspace stand-in for the kernel 4-tuple filter the old
+    /// connected-UDP path had). Should stay at zero on a clean host; a
+    /// nonzero value means spurious UDP packets are colliding with the
+    /// ephemeral port of in-flight anticipated queries.
+    anticipated_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
@@ -530,6 +537,7 @@ pub const Server = struct {
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
             .fast_path_errors = std.atomic.Value(u64).init(0),
+            .anticipated_drops = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
             .wake_fds = try createWakeFds(allocator, cfg.workers),
         };
@@ -552,6 +560,7 @@ pub const Server = struct {
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .key_cache = if (self.key_cache) |*kc| kc else null,
             .tcp_pool = null,
+            .anticipated_drops = &self.anticipated_drops,
         };
     }
 
@@ -693,14 +702,9 @@ pub const Server = struct {
         if (udp_drops > 0 or tcp_drops > 0) {
             log.info("work queue drops: {d} UDP, {d} TCP", .{ udp_drops, tcp_drops });
         }
-        const udp_send_drops = self.udp_send_drops.load(.monotonic);
-        if (udp_send_drops > 0) {
-            log.info("UDP send-buffer drops: {d}", .{udp_send_drops});
-        }
-        const fast_path_errors = self.fast_path_errors.load(.monotonic);
-        if (fast_path_errors > 0) {
-            log.info("fast-path resolver errors (fell through to slow path): {d}", .{fast_path_errors});
-        }
+        logCounterIfNonzero("UDP send-buffer drops", self.udp_send_drops.load(.monotonic));
+        logCounterIfNonzero("fast-path resolver errors (fell through to slow path)", self.fast_path_errors.load(.monotonic));
+        logCounterIfNonzero("anticipated-query drops (spurious UDP on ephemeral port)", self.anticipated_drops.load(.monotonic));
     }
 
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, wake_fd: posix.fd_t, reuseport: bool) void {
@@ -811,6 +815,7 @@ pub const Server = struct {
             .udp_queue_drops = &self.udp_queue_drops,
             .tcp_queue_drops = &self.tcp_queue_drops,
             .udp_send_drops = &self.udp_send_drops,
+            .anticipated_drops = &self.anticipated_drops,
             .ca_bundle = self.ca_bundle,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
@@ -971,6 +976,7 @@ const WorkerState = struct {
     udp_queue_drops: *std.atomic.Value(u64),
     tcp_queue_drops: *std.atomic.Value(u64),
     udp_send_drops: *std.atomic.Value(u64),
+    anticipated_drops: *std.atomic.Value(u64),
     ca_bundle: Certificate.Bundle,
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -993,6 +999,7 @@ const WorkerState = struct {
             .nsec_cache = self.nsec_cache,
             .key_cache = self.key_cache,
             .tcp_pool = self.tcp_pool,
+            .anticipated_drops = self.anticipated_drops,
         };
     }
 
@@ -1755,6 +1762,10 @@ fn ctxIndex(ctxs: *const [max_listen_addrs]Ctx, n: usize, target: *const Ctx) ?u
         if (&ctxs[i] == target) return i;
     }
     return null;
+}
+
+fn logCounterIfNonzero(name: []const u8, value: u64) void {
+    if (value > 0) log.info("{s}: {d}", .{ name, value });
 }
 
 fn isNonLoopback(a: na.Address) bool {

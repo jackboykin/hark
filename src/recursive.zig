@@ -174,6 +174,10 @@ pub const RecursiveResolver = struct {
     /// (DS fetch) overwrite by closing the old socket first.
     anticipated_query: ?AnticipatedQuery = null,
 
+    /// Optional metrics sink for `consumeAnticipated`; see
+    /// `Server.anticipated_drops`. Null in tests and the cache-only path.
+    anticipated_drops: ?*std.atomic.Value(u64) = null,
+
     const AnticipatedQuery = struct {
         sock: std.Io.net.Socket,
         query_id: u16,
@@ -204,6 +208,7 @@ pub const RecursiveResolver = struct {
         nsec_cache: ?*NsecCache,
         key_cache: ?*RRsetCache,
         tcp_pool: ?*TcpConnectionPool,
+        anticipated_drops: ?*std.atomic.Value(u64) = null,
     };
 
     /// Per-query knobs that vary across calls within the same Context.
@@ -246,6 +251,7 @@ pub const RecursiveResolver = struct {
             .query_memory_limit = ctx.config.query_memory_limit,
             .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
             .key_cache = if (ctx.config.dnssec) ctx.key_cache else null,
+            .anticipated_drops = ctx.anticipated_drops,
         };
     }
 
@@ -350,6 +356,15 @@ pub const RecursiveResolver = struct {
     /// returns null. Mismatch on qname/qtype/server LEAVES the slot armed —
     /// a nested resolveImpl that doesn't match must not close the outer's
     /// pre-fired socket.
+    ///
+    /// The socket is unconnected (see prepareAnticipated), so the kernel
+    /// queues any datagram landing on the ephemeral port — not just ones
+    /// from `aq.upstream`. Drain spurious arrivals in a loop instead of
+    /// dropping the slot on the first mismatch; otherwise a single
+    /// unrelated packet would cost us the anticipated response (still
+    /// queued behind it) and force a full upstream round-trip for that
+    /// resolution. Loop is bounded by the slot's deadline; `max_drains`
+    /// caps the per-call retry count for defensive sanity.
     fn consumeAnticipated(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -367,31 +382,50 @@ pub const RecursiveResolver = struct {
 
         defer self.dropAnticipated();
 
-        const remaining_ns = aq.deadline_ns - monotonic.nowNs();
-        if (remaining_ns <= 0) return null;
-        const remain_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
-
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const recv = aq.sock.receiveTimeout(
-            self.io,
-            response_buf,
-            .{ .duration = .{ .raw = .fromMilliseconds(@max(1, remain_ms)), .clock = .awake } },
-        ) catch return null;
-        if (recv.data.len < dns.header_len) return null;
-        // Load-bearing: this (peer IP, peer port) check replaces the kernel
-        // 4-tuple filter the old connected-UDP socket provided, and is what
-        // makes prepareAnticipated's 0x20 omission safe (RFC 5452 §9.2).
-        if (!recv.from.eql(&aq.upstream)) return null;
-        const resp_id = mem.readInt(u16, recv.data[0..2], .big);
-        if (resp_id != aq.query_id) return null;
+        const max_drains: u8 = 16;
+        var drain_attempts: u8 = 0;
+        while (drain_attempts < max_drains) : (drain_attempts += 1) {
+            const remaining_ns = aq.deadline_ns - monotonic.nowNs();
+            if (remaining_ns <= 0) return null;
+            const remain_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
 
-        const data = recv.data;
-        if (dns.hasTcBit(data)) return null;
-        const response = (try tryParseMessage(allocator, data, aq.upstream)) orelse return null;
-        if (response.header.flags.rcode.isServerError()) return null;
-        const expected = dns.parseDottedName(allocator, qname) catch return null;
-        dns.validateResponse(response, expected, qtype) catch return null;
-        return .{ .message = response, .responding_server = aq.upstream };
+            const recv = aq.sock.receiveTimeout(
+                self.io,
+                response_buf,
+                .{ .duration = .{ .raw = .fromMilliseconds(@max(1, remain_ms)), .clock = .awake } },
+            ) catch return null;
+            if (recv.data.len < dns.header_len) {
+                self.bumpAnticipatedDrop();
+                continue;
+            }
+            // Load-bearing: this (peer IP, peer port) check replaces the
+            // kernel 4-tuple filter the old connected-UDP socket provided,
+            // and is what makes prepareAnticipated's 0x20 omission safe
+            // (RFC 5452 §9.2).
+            if (!recv.from.eql(&aq.upstream)) {
+                self.bumpAnticipatedDrop();
+                continue;
+            }
+            const resp_id = mem.readInt(u16, recv.data[0..2], .big);
+            if (resp_id != aq.query_id) {
+                self.bumpAnticipatedDrop();
+                continue;
+            }
+
+            const data = recv.data;
+            if (dns.hasTcBit(data)) return null;
+            const response = (try tryParseMessage(allocator, data, aq.upstream)) orelse return null;
+            if (response.header.flags.rcode.isServerError()) return null;
+            const expected = dns.parseDottedName(allocator, qname) catch return null;
+            dns.validateResponse(response, expected, qtype) catch return null;
+            return .{ .message = response, .responding_server = aq.upstream };
+        }
+        return null;
+    }
+
+    fn bumpAnticipatedDrop(self: *RecursiveResolver) void {
+        if (self.anticipated_drops) |c| _ = c.fetchAdd(1, .monotonic);
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -3671,6 +3705,62 @@ test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
 
     try testing.expectEqual(dns.RType.a, result.message.questions[0].qtype);
     try testing.expect(result.responding_server != null);
+    try testing.expect(resolver.anticipated_query == null);
+}
+
+test "consumeAnticipated drains spurious datagrams and returns the real response" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const real_server = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer real_server.sock.close(testing.io);
+    const spurious = try blocking_transport.bindLoopbackUdpSock(testing.io);
+    defer spurious.sock.close(testing.io);
+
+    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, testing.io);
+    defer udp_t.deinit();
+    var drops = std.atomic.Value(u64).init(0);
+    var resolver: RecursiveResolver = .{
+        .transports = .{ .udp = &udp_t, .tcp = null },
+        .io = testing.io,
+        .anticipated_drops = &drops,
+    };
+    defer resolver.dropAnticipated();
+
+    // Arm slot — sends the query to real_server synchronously.
+    resolver.prepareAnticipated("example.com", .a, real_server.addr, 2000);
+    try testing.expect(resolver.anticipated_query != null);
+
+    // Drive the responder by hand so the FIFO order is deterministic: drain
+    // the query at real_server, then enqueue the spurious into the
+    // anticipated socket BEFORE the real echo. consumeAnticipated has to
+    // skip past the spurious and return the real response, bumping the
+    // counter exactly once.
+    var query_buf: [dns.max_udp_payload]u8 = undefined;
+    const q = try real_server.sock.receiveTimeout(
+        testing.io,
+        &query_buf,
+        .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } },
+    );
+
+    const aq_port = resolver.anticipated_query.?.sock.address.ip4.port;
+    const aq_loopback = na.initIp4(.{ 127, 0, 0, 1 }, aq_port);
+    var spurious_payload: [16]u8 = undefined;
+    @memset(&spurious_payload, 0);
+    try spurious.sock.send(testing.io, &aq_loopback, &spurious_payload);
+
+    var echo: [dns.max_udp_payload]u8 = undefined;
+    @memcpy(echo[0..q.data.len], q.data);
+    echo[2] |= 0x80; // QR
+    try real_server.sock.send(testing.io, &q.from, echo[0..q.data.len]);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const servers = [_]na.Address{real_server.addr};
+    const result = (try resolver.consumeAnticipated(arena.allocator(), "example.com", .a, &servers)) orelse
+        return error.TestUnexpectedResult;
+
+    try testing.expectEqual(dns.RType.a, result.message.questions[0].qtype);
+    try testing.expectEqual(@as(u64, 1), drops.load(.monotonic));
     try testing.expect(resolver.anticipated_query == null);
 }
 
