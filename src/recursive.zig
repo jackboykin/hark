@@ -499,7 +499,6 @@ pub const RecursiveResolver = struct {
         // under a heap allocator.
         var cname_auth_aggregate: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
         defer cname_auth_aggregate.deinit(allocator);
-        var prefetch_name: ?[]const u8 = null;
 
         // DNSSEC chain of trust state — starts as secure at root
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
@@ -532,67 +531,13 @@ pub const RecursiveResolver = struct {
             }
 
             // CACHE CHECK 1: Do we already have a cached answer?
-            if (!self.bypass_cache) {
-                if (self.cache) |c| {
-                    if (c.lookup(allocator, current_name, qtype, .in)) |result| {
-                        const needs_prefetch = switch (result) {
-                            .hit => |h| h.needs_prefetch,
-                            .negative => |n| n.needs_prefetch,
-                        };
-                        const is_stale = switch (result) {
-                            .hit => |h| h.is_stale,
-                            .negative => |n| n.is_stale,
-                        };
-                        if (needs_prefetch and cname_count == 0) {
-                            prefetch_name = name;
-                        }
-
-                        // RFC 8767 §6: a stale cache entry must not be the
-                        // first answer when fresh resolution is achievable.
-                        // Try fresh once with bypass_cache; on success serve
-                        // it, on any failure fall back to the stale answer.
-                        // Restricted to the top of a CNAME chain — re-entry
-                        // mid-chain would re-walk preceding labels.
-                        if (is_stale and cname_count == 0) {
-                            // Save/restore so a future caller that arrives
-                            // here with bypass_cache already set doesn't
-                            // get its flag silently flipped to false.
-                            const prev_bypass = self.bypass_cache;
-                            self.bypass_cache = true;
-                            defer self.bypass_cache = prev_bypass;
-                            if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
-                                return fresh;
-                            } else |_| {
-                                // Fresh attempt failed; fall through to the
-                                // stale return below.
-                            }
-                        }
-
-                        switch (result) {
-                            .hit => |h| return .{
-                                // RFC 4035 §5.3.1: RRSIGs travel in the same
-                                // section as their covered RRset. Concatenate
-                                // sigs onto the answer-section records so a
-                                // DO=1 / CD=1 cache-served client can validate;
-                                // the wire shaper strips them for DO=0.
-                                // For wildcard-expanded answers, h.nsec_proofs
-                                // carries the §3.1.3.4 "no closer match" NSEC
-                                // proofs from the original response.
-                                .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
-                                .prefetch_name = prefetch_name,
-                                .prefetch_qtype = qtype,
-                            },
-                            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_name, qtype, cname_chain.items, cname_auth_aggregate.items),
-                        }
-                    }
-                }
-            }
+            if (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
             if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
             var target_name = try dns.parseDottedName(allocator, current_name);
 
-            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, prefetch_name, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
+            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
             var servers: [max_servers_per_level]na.Address = undefined;
             var server_count: usize = undefined;
@@ -762,39 +707,8 @@ pub const RecursiveResolver = struct {
                 self.probeParentChildCut(allocator, target_name, parent_zone, &response, servers[0..server_count], &security_state);
 
                 // Classify response
-                if (response.header.flags.rcode != .no_error) {
-                    if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers[0..server_count])) {
-                            .proceed => {
-                                if (security_state == .secure) {
-                                    response.header.flags.ad = true;
-                                    self.storeNsec(response.authorities, parent_zone);
-                                }
-                                if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
-                            },
-                            .skip_cache => {},
-                            .bogus => return self.bogusServfail(current_name, qtype),
-                        }
-                    } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
-                        // RFC 9520 §3: cache the resolution failure so the
-                        // next stub retry doesn't re-walk the whole upstream
-                        // chain. Pin against the original qname (`name`) —
-                        // mid-CNAME failures should still short-circuit the
-                        // stub's retry of the outer query. 5 s TTL is
-                        // enforced by storeNegativeBare.
-                        //
-                        // Only at the user-facing query (depth == 0). At
-                        // sub-recursion depths the caller is the resolver
-                        // itself (NS A/AAAA fanout, internal DS probes); a
-                        // cached failure there collapses sibling fanout and
-                        // turns one transient blip into a 5 s outage for
-                        // every name whose delegation NSes overlap with the
-                        // failed lookup — which is exactly the NoGlueRecords
-                        // path on out-of-bailiwick NS like dynect.net.
-                        if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
-                    }
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
-                }
+                if (response.header.flags.rcode != .no_error)
+                    return self.handleErrorResponse(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], cname_chain.items, cname_auth_aggregate.items);
 
                 if (response.answers.len > 0) {
                     // Follow CNAME if the answer doesn't contain the queried type
@@ -871,64 +785,12 @@ pub const RecursiveResolver = struct {
                         }
                     }
 
-                    // Validate answer RRsets if in secure zone
-                    var answer_status: cache_mod.SecurityStatus = .unchecked;
-                    if (self.dnssec_enabled) {
-                        switch (try self.validateAnswer(allocator, &response, qtype, security_state, servers[0..server_count])) {
-                            .bogus => {
-                                if (self.ns_selector) |ns| if (responding_server) |srv|
-                                    ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
-                                return self.bogusServfail(current_name, qtype);
-                            },
-                            .valid => {
-                                answer_status = .secure;
-                            },
-                            .skip => {},
-                        }
-                    }
-                    // Don't cache ANY responses: RFC 8482 makes them server-
-                    // policy, so unauthenticated constituents would become a
-                    // poisoning channel for later per-type lookups.
-                    if (self.cache) |c| if (qtype != .any) {
-                        c.storeResponse(response, parent_zone, answer_status);
-                        if (answer_status == .secure and self.nsec_cache != null) {
-                            self.storeWildcardRRsets(response.answers, qtype);
-                        }
-                    };
-
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
+                    return self.finalizeAnswer(allocator, &response, current_name, qtype, security_state, parent_zone, servers[0..server_count], responding_server, cname_chain.items, cname_auth_aggregate.items);
                 }
 
                 // Check for referral (NS records in authority section)
-                const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse {
-                    // NODATA: no answers, no referral. Cache only if authoritative.
-                    if (response.header.flags.aa) {
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers[0..server_count])) {
-                            .proceed => {
-                                if (security_state == .secure) {
-                                    response.header.flags.ad = true;
-                                    self.storeNsec(response.authorities, parent_zone);
-                                }
-                                if (self.cache) |c| {
-                                    c.storeResponse(response, parent_zone, .unchecked);
-                                    c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
-                                }
-                            },
-                            .skip_cache => {},
-                            .bogus => return self.bogusServfail(current_name, qtype),
-                        }
-                    } else {
-                        // Non-authoritative server returned no answer and no
-                        // referral — we can't continue resolution. RFC 9520 §3
-                        // calls this a resolution failure; cache against the
-                        // original qname so the stub's retry short-circuits.
-                        // depth == 0 only — see the SERVFAIL/REFUSED branch
-                        // above for why sub-recursion must not poison the
-                        // user-facing failure cache.
-                        if (depth == 0) if (self.cache) |c| c.cacheServfail(name, qtype);
-                    }
-                    return .{ .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, response) };
-                };
+                const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse
+                    return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], cname_chain.items, cname_auth_aggregate.items);
 
                 if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
@@ -979,6 +841,71 @@ pub const RecursiveResolver = struct {
 
     // ── Cache-served short-circuits ─────────────────────────────────────
 
+    /// Cache check 1: positive or negative hit on the main RRset cache.
+    /// Returns null on miss. RFC 8767 §6 requires trying fresh once
+    /// before serving a stale entry; the `bypass_cache` save/restore
+    /// lives inside this helper so the recursive call doesn't leak the
+    /// flag to other callers. Both stale recursion and prefetch-window
+    /// signalling are gated to the head of the CNAME chain
+    /// (cname_count == 0) — mid-chain re-entry would re-walk preceding
+    /// labels.
+    fn tryServeFromCache(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        name: []const u8,
+        current_name: []const u8,
+        qtype: dns.RType,
+        depth: usize,
+        cname_count: usize,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !?ResolveResult {
+        if (self.bypass_cache) return null;
+        const c = self.cache orelse return null;
+        const result = c.lookup(allocator, current_name, qtype, .in) orelse return null;
+
+        const meta = switch (result) {
+            inline .hit, .negative => |entry| .{
+                .needs_prefetch = entry.needs_prefetch,
+                .is_stale = entry.is_stale,
+            },
+        };
+        const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and cname_count == 0) name else null;
+
+        // RFC 8767 §6: a stale cache entry must not be the first answer
+        // when fresh resolution is achievable. Try fresh once with
+        // bypass_cache; on any failure fall back to the stale answer.
+        if (meta.is_stale and cname_count == 0) {
+            // Save/restore so a future caller that arrives here with
+            // bypass_cache already set doesn't get its flag silently
+            // flipped to false.
+            const prev_bypass = self.bypass_cache;
+            self.bypass_cache = true;
+            defer self.bypass_cache = prev_bypass;
+            if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
+                return fresh;
+            } else |_| {
+                // Fresh attempt failed; fall through to the stale return below.
+            }
+        }
+
+        switch (result) {
+            .hit => |h| return .{
+                // RFC 4035 §5.3.1: RRSIGs travel in the same section as
+                // their covered RRset. Concatenate sigs onto the answer-
+                // section records so a DO=1 / CD=1 cache-served client
+                // can validate; the wire shaper strips them for DO=0.
+                // For wildcard-expanded answers, h.nsec_proofs carries
+                // the §3.1.3.4 "no closer match" NSEC proofs from the
+                // original response.
+                .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
+                .prefetch_name = prefetch_out,
+                .prefetch_qtype = qtype,
+            },
+            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, cname_chain_items, cname_auth_items),
+        }
+    }
+
     /// RFC 8198 aggressive NSEC use: synthesize negative or wildcard
     /// responses from cached NSEC proofs without an upstream round-trip.
     /// Returns null when no usable proof is cached, when a wildcard
@@ -991,7 +918,6 @@ pub const RecursiveResolver = struct {
         target_name: dns.Name,
         current_name: []const u8,
         qtype: dns.RType,
-        prefetch_name: ?[]const u8,
         cname_chain_items: []const dns.ResourceRecord,
         cname_auth_items: []const dns.ResourceRecord,
     ) !?ResolveResult {
@@ -1001,11 +927,11 @@ pub const RecursiveResolver = struct {
         switch (synth.rcode) {
             .nxdomain, .nodata => |rc| {
                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
-                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, prefetch_name, qtype, cname_chain_items, cname_auth_items);
+                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, cname_chain_items, cname_auth_items);
             },
             .wildcard_match => {
                 if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, cname_chain_items, cname_auth_items)) |result| {
-                    return .{ .message = result, .prefetch_name = prefetch_name, .prefetch_qtype = qtype };
+                    return .{ .message = result, .prefetch_name = null, .prefetch_qtype = qtype };
                 }
                 return null;
             },
@@ -1187,6 +1113,146 @@ pub const RecursiveResolver = struct {
         parent_zone.* = zone_cut;
         server_count.* = addrs.count;
         @memcpy(servers.*[0..addrs.count], addrs.addrs[0..addrs.count]);
+    }
+
+    // ── Final response handling ─────────────────────────────────────────
+
+    /// RFC 9520 §3: cache a resolution failure so the next stub retry
+    /// doesn't re-walk the whole upstream chain. Pinned against the
+    /// original qname (`name`) so mid-CNAME failures still short-circuit
+    /// the stub's retry of the outer query. 5 s TTL enforced by
+    /// `storeNegativeBare`.
+    ///
+    /// Only at the user-facing query (depth == 0). At sub-recursion
+    /// depths the caller is the resolver itself (NS A/AAAA fanout,
+    /// internal DS probes); a cached failure there collapses sibling
+    /// fanout and turns one transient blip into a 5 s outage for every
+    /// name whose delegation NSes overlap with the failed lookup —
+    /// which is exactly the NoGlueRecords path on out-of-bailiwick NS
+    /// like dynect.net.
+    fn cacheResolutionFailure(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, depth: usize) void {
+        if (depth != 0) return;
+        if (self.cache) |c| c.cacheServfail(name, qtype);
+    }
+
+    /// Final-query response with `rcode != no_error`. AA-NXDOMAIN runs
+    /// the verified-negative dance and caches the proven negative;
+    /// SERVFAIL/REFUSED routes through `cacheResolutionFailure`. Other
+    /// rcodes (FORMERR, NOTIMP, …) fall through uncached — caller
+    /// receives the raw response.
+    fn handleErrorResponse(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        response: *dns.Message,
+        current_name: []const u8,
+        name: []const u8,
+        qtype: dns.RType,
+        depth: usize,
+        security_state: dnssec.SecurityStatus,
+        target_name: dns.Name,
+        parent_zone: dns.Name,
+        servers: []const na.Address,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !ResolveResult {
+        if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers)) {
+                .proceed => {
+                    if (security_state == .secure) {
+                        response.header.flags.ad = true;
+                        self.storeNsec(response.authorities, parent_zone);
+                    }
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                },
+                .skip_cache => {},
+                .bogus => return self.bogusServfail(current_name, qtype),
+            }
+        } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
+            self.cacheResolutionFailure(name, qtype, depth);
+        }
+        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
+    }
+
+    /// Validate the final answer RRsets (DNSSEC) and cache them, then
+    /// return through the active CNAME chain. ANY responses are not
+    /// cached — RFC 8482 makes them server-policy, so unauthenticated
+    /// constituents would become a poisoning channel for later per-type
+    /// lookups.
+    fn finalizeAnswer(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        response: *dns.Message,
+        current_name: []const u8,
+        qtype: dns.RType,
+        security_state: dnssec.SecurityStatus,
+        parent_zone: dns.Name,
+        servers: []const na.Address,
+        responding_server: ?na.Address,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !ResolveResult {
+        var answer_status: cache_mod.SecurityStatus = .unchecked;
+        if (self.dnssec_enabled) {
+            switch (try self.validateAnswer(allocator, response, qtype, security_state, servers)) {
+                .bogus => {
+                    if (self.ns_selector) |ns| if (responding_server) |srv|
+                        ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                    return self.bogusServfail(current_name, qtype);
+                },
+                .valid => {
+                    answer_status = .secure;
+                },
+                .skip => {},
+            }
+        }
+        if (self.cache) |c| if (qtype != .any) {
+            c.storeResponse(response.*, parent_zone, answer_status);
+            if (answer_status == .secure and self.nsec_cache != null) {
+                self.storeWildcardRRsets(response.answers, qtype);
+            }
+        };
+        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
+    }
+
+    /// NODATA terminal (no answers, no referral). AA responses run the
+    /// verified-negative dance and cache the proven negative. Non-AA
+    /// responses route through `cacheResolutionFailure` — a
+    /// non-authoritative server returning empty without a referral can't
+    /// advance resolution.
+    fn finalizeNodata(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        response: *dns.Message,
+        current_name: []const u8,
+        name: []const u8,
+        qtype: dns.RType,
+        depth: usize,
+        security_state: dnssec.SecurityStatus,
+        target_name: dns.Name,
+        parent_zone: dns.Name,
+        servers: []const na.Address,
+        cname_chain_items: []const dns.ResourceRecord,
+        cname_auth_items: []const dns.ResourceRecord,
+    ) !ResolveResult {
+        if (response.header.flags.aa) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers)) {
+                .proceed => {
+                    if (security_state == .secure) {
+                        response.header.flags.ad = true;
+                        self.storeNsec(response.authorities, parent_zone);
+                    }
+                    if (self.cache) |c| {
+                        c.storeResponse(response.*, parent_zone, .unchecked);
+                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                    }
+                },
+                .skip_cache => {},
+                .bogus => return self.bogusServfail(current_name, qtype),
+            }
+        } else {
+            self.cacheResolutionFailure(name, qtype, depth);
+        }
+        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
     }
 
     // ── Delegation security ────────────────────────────────────────────
