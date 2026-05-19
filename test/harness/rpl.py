@@ -162,6 +162,16 @@ class Scenario:
     # trust anchors at root only, so the first declared zone must be the
     # root in the scripted setup (typically ".").
     dnssec_zones: list[str] = dataclasses.field(default_factory=list)
+    # DNS rebinding protection. `None` means harness default (off — test
+    # scenarios deliberately use TEST-NET / RFC 1918 addresses for their
+    # scripted authoritatives, and production-side rebinding scrubbing
+    # would empty those answers). Rebinding-focused scenarios opt in via
+    # `; hark: rebinding-enabled = yes` and use the per-list directives
+    # below to configure the allowlist / DNSBL escape hatch.
+    rebinding_enabled: bool | None = None
+    rebinding_allow_zones: list[str] = dataclasses.field(default_factory=list)
+    rebinding_extra_block: list[str] = dataclasses.field(default_factory=list)
+    rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -221,6 +231,14 @@ class _Parser:
             self.scenario.qname_minimization = val.strip().lower() in {"yes", "true", "on", "1"}
         elif key == "minimal-responses":
             self.scenario.minimal_responses = val.strip().lower() in {"yes", "true", "on", "1"}
+        elif key == "rebinding-enabled":
+            self.scenario.rebinding_enabled = val.strip().lower() in {"yes", "true", "on", "1"}
+        elif key == "rebinding-allow-zone":
+            self.scenario.rebinding_allow_zones.append(val.strip())
+        elif key == "rebinding-extra-block":
+            self.scenario.rebinding_extra_block.append(val.strip())
+        elif key == "rebinding-extra-allow":
+            self.scenario.rebinding_extra_allow.append(val.strip())
         elif key == "dnssec-zone":
             # Canonicalize: lowercase, ensure trailing dot. Multiple
             # directives accumulate; same value collapses (idempotent).

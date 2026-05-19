@@ -1241,6 +1241,7 @@ const WorkerState = struct {
         if (wire_buf) |buf| {
             var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
             ctx.minimal_responses = self.config.minimal_responses;
+            ctx.rebinding = &self.config.rebinding;
             if (buildResponseWire(buf, ctx, result_msg, alloc)) |wire| {
                 self.sendUdpResponse(sock, wire, client_addr);
                 return;
@@ -1417,6 +1418,7 @@ const WorkerState = struct {
             var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
             ctx.tcp_keepalive = @intCast(self.config.tcp_idle_timeout_ms / 100);
             ctx.minimal_responses = self.config.minimal_responses;
+            ctx.rebinding = &self.config.rebinding;
             const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(self.io, client_fd, wire, write_deadline_ns) orelse return;

@@ -23,16 +23,19 @@ pub const Cidr = struct {
     family: Family,
 
     pub fn matches(self: Cidr, addr: na.Address) bool {
-        switch (addr) {
-            .ip4 => |v4| {
-                if (self.family != .v4) return false;
-                return prefixMatch(&v4.bytes, self.bytes[0..4], self.prefix);
-            },
-            .ip6 => |v6| {
-                if (self.family != .v6) return false;
-                return prefixMatch(&v6.bytes, self.bytes[0..16], self.prefix);
-            },
-        }
+        return switch (addr) {
+            .ip4 => |v4| self.matchesBytes(&v4.bytes),
+            .ip6 => |v6| self.matchesBytes(&v6.bytes),
+        };
+    }
+
+    /// Match against raw network-byte-order address bytes (4 for v4, 16 for
+    /// v6). Returns false on length / family mismatch — public API guard.
+    pub fn matchesBytes(self: Cidr, bytes: []const u8) bool {
+        return switch (self.family) {
+            .v4 => bytes.len == 4 and prefixMatch(bytes, self.bytes[0..4], self.prefix),
+            .v6 => bytes.len == 16 and prefixMatch(bytes, self.bytes[0..16], self.prefix),
+        };
     }
 };
 
@@ -154,6 +157,21 @@ test "matches v6 single host" {
 test "matches family mismatch fails" {
     const v4 = parse("0.0.0.0/0") orelse return error.ParseFailed;
     try testing.expect(!v4.matches(na.initIp6(.{0} ** 16, 0, 0, 0)));
+}
+
+test "matchesBytes accepts bare rdata bytes" {
+    const v4 = parse("10.0.0.0/8") orelse return error.ParseFailed;
+    try testing.expect(v4.matchesBytes(&[_]u8{ 10, 1, 2, 3 }));
+    try testing.expect(!v4.matchesBytes(&[_]u8{ 11, 1, 2, 3 }));
+    // Length mismatch — v4 cidr against 16 bytes
+    try testing.expect(!v4.matchesBytes(&([_]u8{0} ** 16)));
+
+    const v6 = parse("fc00::/7") orelse return error.ParseFailed;
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfc} ++ [_]u8{0} ** 15)));
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ [_]u8{0} ** 15)));
+    try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ [_]u8{0} ** 15)));
+    // Length mismatch — v6 cidr against 4 bytes
+    try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
 }
 
 test "allow with empty entries permits all" {

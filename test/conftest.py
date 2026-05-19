@@ -122,6 +122,14 @@ def run_scenario(path: Path, lift: bool = False) -> None:
         cfg.qname_minimization = scenario.qname_minimization
     if scenario.minimal_responses is not None:
         cfg.minimal_responses = scenario.minimal_responses
+    if scenario.rebinding_enabled is not None:
+        cfg.rebinding_enabled = scenario.rebinding_enabled
+    if scenario.rebinding_allow_zones:
+        cfg.rebinding_allow_zones = list(scenario.rebinding_allow_zones)
+    if scenario.rebinding_extra_block:
+        cfg.rebinding_extra_block = list(scenario.rebinding_extra_block)
+    if scenario.rebinding_extra_allow:
+        cfg.rebinding_extra_allow = list(scenario.rebinding_extra_allow)
 
     # DNSSEC harness: generate a key per declared zone, publish the root's
     # DS as hark's trust anchor, and hand the keys to the responder for

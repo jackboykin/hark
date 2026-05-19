@@ -1,0 +1,82 @@
+; hark: root-hints = 127.0.10.1
+; hark: rebinding-enabled = yes
+; hark: rebinding-allow-zone = homelab.lan
+
+SCENARIO_BEGIN allow-zone bypass preserves private A for split-horizon zone
+
+; Split-horizon / homelab deployments legitimately resolve internal names
+; into RFC 1918 space. The `allow_zones` knob declares which suffixes are
+; allowed to carry private addresses; matching is owner-name-based (so
+; CNAME chases into the allowed zone work too — the terminal A's owner
+; is the CNAME target, which lives under the allowlist).
+;
+; This scenario asserts the bypass: the same private address that gets
+; scrubbed in 001 (192.168.1.1) flows through unmolested when the owner
+; (router.homelab.lan.) is under an allow-zone entry (homelab.lan).
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      lan. IN A
+    SECTION AUTHORITY
+      lan. 86400 IN NS a.lan-tld.fake.
+    SECTION ADDITIONAL
+      a.lan-tld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .lan authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      homelab.lan. IN A
+    SECTION AUTHORITY
+      homelab.lan. 86400 IN NS ns.homelab.lan.
+    SECTION ADDITIONAL
+      ns.homelab.lan. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake homelab.lan authority — legitimately serves RFC 1918 ──────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      router.homelab.lan. IN A
+    SECTION ANSWER
+      router.homelab.lan. 3600 IN A 192.168.1.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    router.homelab.lan. IN A
+ENTRY_END
+
+; Expected: full answer preserved. allow_zones[homelab.lan] matches the
+; owner-name (router.homelab.lan.), so the scrub skips this rrset.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    router.homelab.lan. IN A
+  SECTION ANSWER
+    router.homelab.lan. 3600 IN A 192.168.1.1
+ENTRY_END
+
+SCENARIO_END

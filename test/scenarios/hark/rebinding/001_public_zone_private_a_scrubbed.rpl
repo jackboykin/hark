@@ -1,0 +1,87 @@
+; hark: root-hints = 127.0.10.1
+; hark: rebinding-enabled = yes
+
+SCENARIO_BEGIN public zone returning RFC 1918 address has its A scrubbed
+
+; The headline rebinding attack: an attacker controls attacker.com on the
+; public DNS. They set an A record pointing at 192.168.1.1 (or 127.0.0.1).
+; The victim's browser fetches https://attacker.com/, and because the IP
+; is local, the fetch reaches the victim's LAN router (or localhost) with
+; the attacker's chosen Host header — same-origin from the browser's
+; perspective, so CORS does not apply.
+;
+; A recursive resolver with rebinding protection scrubs the private A
+; from the public-zone answer. The browser sees NOERROR / NODATA, and
+; the fetch fails before crossing the trust boundary.
+;
+; This scenario asserts the scrub fires: the answer reaches the resolver,
+; the address (192.168.1.1) is in the default-block set, the rrset owner
+; (attacker.com.) is not in `allow_zones`, so the A is dropped. The
+; CNAME chain would survive if present; here it's a direct answer.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      attacker.com. IN A
+    SECTION AUTHORITY
+      attacker.com. 86400 IN NS ns.attacker.com.
+    SECTION ADDITIONAL
+      ns.attacker.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake attacker.com authority — returns RFC 1918 address ─────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      attacker.com. IN A
+    SECTION ANSWER
+      attacker.com. 3600 IN A 192.168.1.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    attacker.com. IN A
+ENTRY_END
+
+; Expected: NOERROR with empty answer section. The name exists (and the
+; CNAME chain, if any, would survive); only the private-IP A is dropped.
+; Empty-authority NODATA per RFC 2308 — no SOA synthesised, stub re-tries
+; on next config change instead of negative-caching a stale block.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    attacker.com. IN A
+ENTRY_END
+
+SCENARIO_END

@@ -7,6 +7,7 @@ const net_addr = @import("net_address.zig");
 const Address = net_addr.Address;
 const acl = @import("acl.zig");
 const dns = @import("dns.zig");
+const rebinding = @import("rebinding.zig");
 const build_options = @import("build_options");
 
 // ── ServerConfig ───────────────────────────────────────────────────────
@@ -85,6 +86,13 @@ pub const ServerConfig = struct {
     /// `[resolver] trust-anchors` config key.
     trust_anchors: []dns.DsData,
 
+    /// DNS rebinding protection. Default-on; localhost (127/8) is the
+    /// primary attack vector and excluding it would defeat the headline
+    /// use case. DNSBL operators opt out via `extra_allow = ["127.0.0.0/8"]`.
+    /// See `src/rebinding.zig` for the policy semantics and the built-in
+    /// CIDR set.
+    rebinding: rebinding.Config,
+
     allocator: Allocator,
 
     pub const Mode = enum { recursive, forward };
@@ -96,6 +104,13 @@ pub const ServerConfig = struct {
         self.allocator.free(self.allow_from);
         for (self.trust_anchors) |ta| self.allocator.free(ta.digest);
         self.allocator.free(self.trust_anchors);
+        for (self.rebinding.allow_zones) |zone| {
+            for (zone.labels) |label| self.allocator.free(label);
+            self.allocator.free(zone.labels);
+        }
+        self.allocator.free(self.rebinding.allow_zones);
+        self.allocator.free(self.rebinding.extra_block);
+        self.allocator.free(self.rebinding.extra_allow);
     }
 
     /// Effective root-hints slice for the recursor: config-supplied if any,
@@ -145,6 +160,9 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     const empty_root_hints = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
     const empty_trust_anchors = allocator.alloc(dns.DsData, 0) catch return error.OutOfMemory;
+    const empty_zones = allocator.alloc(dns.Name, 0) catch return error.OutOfMemory;
+    const empty_extra_block = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
+    const empty_extra_allow = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
 
     return .{
         .listen = listen,
@@ -183,6 +201,12 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .tcp_queries_per_conn = 128,
         .upstream_tcp_idle_sec = 30,
         .trust_anchors = empty_trust_anchors,
+        .rebinding = .{
+            .enabled = true,
+            .allow_zones = empty_zones,
+            .extra_block = empty_extra_block,
+            .extra_allow = empty_extra_allow,
+        },
         .allocator = allocator,
     };
 }
@@ -305,6 +329,27 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (logging.getBool("queries")) |q| cfg.log_queries = q;
     }
 
+    // [rebinding] section
+    if (parsed.table.getTable("rebinding")) |reb| {
+        if (reb.getBool("enabled")) |b| cfg.rebinding.enabled = b;
+        if (reb.getStringArray("allow-zones")) |entries| {
+            for (cfg.rebinding.allow_zones) |zone| {
+                for (zone.labels) |label| allocator.free(label);
+                allocator.free(zone.labels);
+            }
+            allocator.free(cfg.rebinding.allow_zones);
+            cfg.rebinding.allow_zones = try parseZoneList(allocator, entries);
+        }
+        if (reb.getStringArray("extra-block")) |entries| {
+            allocator.free(cfg.rebinding.extra_block);
+            cfg.rebinding.extra_block = try parseCidrList(allocator, entries);
+        }
+        if (reb.getStringArray("extra-allow")) |entries| {
+            allocator.free(cfg.rebinding.extra_allow);
+            cfg.rebinding.extra_allow = try parseCidrList(allocator, entries);
+        }
+    }
+
     // Validation
     if (cfg.mode == .forward and cfg.upstreams.len == 0) {
         return error.ForwardingRequiresUpstreams;
@@ -409,6 +454,33 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
         .digest_type = digest_type,
         .digest = digest,
     };
+}
+
+fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
+    const list = allocator.alloc(dns.Name, strs.len) catch return error.OutOfMemory;
+    var i: usize = 0;
+    errdefer {
+        for (list[0..i]) |zone| {
+            for (zone.labels) |label| allocator.free(label);
+            allocator.free(zone.labels);
+        }
+        allocator.free(list);
+    }
+    while (i < strs.len) : (i += 1) {
+        // Reject empty and root zone: `parseDottedName` accepts both as the
+        // zero-label name, and `isSubdomainOf` treats the zero-label parent
+        // as matching every RR — so a typo like `allow-zones = [""]` would
+        // silently disable rebinding protection entirely. Fail loudly.
+        if (strs[i].len == 0 or mem.eql(u8, strs[i], ".")) return error.InvalidValue;
+        list[i] = dns.parseDottedName(allocator, strs[i]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Any other dns parse error (invalid label, name too long, …)
+            // surfaces as InvalidValue — operators editing TOML need a clear
+            // signal, not a dns-internal error variant.
+            else => return error.InvalidValue,
+        };
+    }
+    return list;
 }
 
 fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
@@ -636,6 +708,30 @@ test "prefetch-cousin defaults off and parses" {
     );
     defer cfg2.deinit();
     try testing.expectEqual(true, cfg2.prefetch_cousin);
+}
+
+test "rebinding defaults are safe (enabled, empty extras)" {
+    var cfg = try parseConfig(testing.allocator, "");
+    defer cfg.deinit();
+    try testing.expectEqual(true, cfg.rebinding.enabled);
+    try testing.expectEqual(@as(usize, 0), cfg.rebinding.allow_zones.len);
+    try testing.expectEqual(@as(usize, 0), cfg.rebinding.extra_block.len);
+    try testing.expectEqual(@as(usize, 0), cfg.rebinding.extra_allow.len);
+}
+
+test "rebinding rejects empty / root zone in allow_zones (would silently disable scrub)" {
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[rebinding]
+        \\allow-zones = [""]
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[rebinding]
+        \\allow-zones = ["."]
+    ));
+    try testing.expectError(error.InvalidAclEntry, parseConfig(testing.allocator,
+        \\[rebinding]
+        \\extra-block = ["not-a-cidr"]
+    ));
 }
 
 test "logging config" {

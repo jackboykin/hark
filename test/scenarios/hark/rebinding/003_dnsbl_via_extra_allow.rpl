@@ -1,0 +1,83 @@
+; hark: root-hints = 127.0.10.1
+; hark: rebinding-enabled = yes
+; hark: rebinding-extra-allow = 127.0.0.0/8
+
+SCENARIO_BEGIN extra_allow carves out 127/8 so RFC 5782 DNSBL lookups survive
+
+; RFC 5782 DNSBL queries (Spamhaus, Spamcop, …) encode the answer in the
+; A record by returning a 127.0.0.x address — 127.0.0.2 = "listed",
+; 127.0.0.4 = "listed for policy reasons", etc. A blanket 127/8 block
+; (Knot's stance, hardcoded) would silently turn every DNSBL query into
+; a NODATA, making the antispam pipeline misclassify everything as clean.
+;
+; The escape hatch is `extra_allow`: addresses matched by an `extra_allow`
+; CIDR survive even if they'd otherwise be dropped by the default block
+; set. Operators running DNSBL set `extra-allow = ["127.0.0.0/8"]` and
+; everything else (10/8, 192.168/16, fe80::/10, …) still scrubs.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS a.example-tld.fake.
+    SECTION ADDITIONAL
+      a.example-tld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake example. authority ────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      bl.example. IN A
+    SECTION AUTHORITY
+      bl.example. 86400 IN NS ns.bl.example.
+    SECTION ADDITIONAL
+      ns.bl.example. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake DNSBL authority — RFC 5782 listed response ────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      2.0.0.10.bl.example. IN A
+    SECTION ANSWER
+      2.0.0.10.bl.example. 3600 IN A 127.0.0.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    2.0.0.10.bl.example. IN A
+ENTRY_END
+
+; Expected: 127.0.0.2 preserved. extra_allow overrides the default 127/8
+; block; the DNSBL answer reaches the spam pipeline intact.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    2.0.0.10.bl.example. IN A
+  SECTION ANSWER
+    2.0.0.10.bl.example. 3600 IN A 127.0.0.2
+ENTRY_END
+
+SCENARIO_END

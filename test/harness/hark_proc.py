@@ -32,6 +32,14 @@ class HarkConfig:
     # hark's test-only `[resolver] trust-anchors = [...]` knob. Implies
     # `dnssec = true`; conftest enforces that pairing.
     trust_anchors: list[str] = dataclasses.field(default_factory=list)
+    # Rebinding scrub. Harness default is *off* — scripted authoritatives
+    # routinely answer with TEST-NET (RFC 5737) and RFC 1918 addresses
+    # which production-side rebinding scrubbing would empty. Rebinding-
+    # focused scenarios re-enable via `; hark: rebinding-enabled = yes`.
+    rebinding_enabled: bool = False
+    rebinding_allow_zones: list[str] = dataclasses.field(default_factory=list)
+    rebinding_extra_block: list[str] = dataclasses.field(default_factory=list)
+    rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
     # Pass `--verbose` so per-query debug lines reach the test log.
     # Cheap; failing-scenario triage is impossible without them.
     verbose: bool = True
@@ -66,6 +74,20 @@ class HarkConfig:
             lines.append(f"trust-anchors = [{anchors}]")
         if self.cache_min_ttl:
             lines += ["", "[cache]", f"min-ttl = {self.cache_min_ttl}"]
+        lines += [
+            "",
+            "[rebinding]",
+            f"enabled = {str(self.rebinding_enabled).lower()}",
+        ]
+        if self.rebinding_allow_zones:
+            zones = ", ".join(f'"{z}"' for z in self.rebinding_allow_zones)
+            lines.append(f"allow-zones = [{zones}]")
+        if self.rebinding_extra_block:
+            cidrs = ", ".join(f'"{c}"' for c in self.rebinding_extra_block)
+            lines.append(f"extra-block = [{cidrs}]")
+        if self.rebinding_extra_allow:
+            cidrs = ", ".join(f'"{c}"' for c in self.rebinding_extra_allow)
+            lines.append(f"extra-allow = [{cidrs}]")
         return "\n".join(lines) + "\n"
 
 
