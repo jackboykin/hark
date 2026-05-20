@@ -4023,3 +4023,29 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, &servers, 1, parent_zone);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
+
+fn concatRRsOomProbe(allocator: mem.Allocator, _: void) !void {
+    // Two non-empty inputs force `concatRRs` onto its allocating branch
+    // (both empty / one empty paths return the input unchanged). The
+    // function's only heap allocation is the combined output slice — a
+    // single failure point — so this exercises that lone alloc.
+    const blank: dns.ResourceRecord = .{
+        .name = .{ .labels = &.{} },
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 0,
+        .rdata = .{ .a = .{ 0, 0, 0, 0 } },
+    };
+    const a = [_]dns.ResourceRecord{ blank, blank };
+    const b = [_]dns.ResourceRecord{ blank, blank, blank };
+    const out = try concatRRs(allocator, &a, &b);
+    // concatRRs returns the alloc'd buffer on the allocating branch and
+    // an input alias on the fast path. Free only when it allocated.
+    if (out.ptr != @as([*]const dns.ResourceRecord, &a) and out.ptr != @as([*]const dns.ResourceRecord, &b)) {
+        allocator.free(out);
+    }
+}
+
+test "concatRRs handles OOM without leaking" {
+    try testing.checkAllAllocationFailures(testing.allocator, concatRRsOomProbe, .{{}});
+}

@@ -2594,3 +2594,54 @@ test "eviction stays within shard" {
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), victim, .a, .in) != null);
 }
+
+fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
+    // Cache uses `failing_alloc` as its backing — every shard alloc routes
+    // through it so injected failures hit prepareSlot's dupe, the
+    // CachedRecord array, per-record wire/name/rdata clones, and the
+    // shard's map.put resize.
+    test_time = 1000;
+    var cache = RRsetCache.init(.{
+        .backing = failing_alloc,
+        .max_bytes = 1024 * 1024,
+        .max_entries = 64,
+        .io = testing.io,
+    });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Build an A RRset (2 records) on a side arena so the input lifetime
+    // is independent of the failing allocator. Cache copies what it stores.
+    var input_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer input_arena.deinit();
+    const ia = input_arena.allocator();
+
+    const name1 = try makeTestName(ia, &.{ "example", "com" });
+    const name2 = try makeTestName(ia, &.{ "example", "com" });
+    const answers = try ia.alloc(dns.ResourceRecord, 2);
+    answers[0] = .{ .name = name1, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    answers[1] = .{ .name = name2, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
+
+    const response = makeTestResponse(answers);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+}
+
+test "storeOneRRset handles backing-allocator OOM without leaking" {
+    // `storeResponse` is best-effort and swallows OOM (degraded caching is
+    // preferred over a failed query path), so `checkAllAllocationFailures`'
+    // SwallowedOutOfMemoryError discipline doesn't fit. Drive the sweep
+    // ourselves and assert allocated==freed at each fail_index — the leak
+    // signal is what we actually care about.
+    var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
+    try runStoreOneRRsetUnderFailing(counter.allocator());
+    const total = counter.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total) : (idx += 1) {
+        var f = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        runStoreOneRRsetUnderFailing(f.allocator()) catch |err| {
+            if (err != error.OutOfMemory) return err;
+        };
+        try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
+    }
+}
