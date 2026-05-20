@@ -323,7 +323,7 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.R
     const records: []RR = records_ptr[0..cached.len];
     const wire_area = buf[records_bytes..];
 
-    const shared_name = try dns.cloneNameFlat(alloc, cached[0].name);
+    const shared_name = (try dns.cloneNameFlat(alloc, cached[0].name)).toUnownedName();
 
     var offset: usize = 0;
     for (cached, 0..) |cr, i| {

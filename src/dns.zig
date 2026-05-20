@@ -2161,12 +2161,29 @@ pub fn cloneName(allocator: Allocator, name: Name) !Name {
     return .{ .labels = labels };
 }
 
-/// Single-allocation variant of cloneName: the returned Name's labels slice
-/// and every label byte live in one contiguous buffer. Use only with arena
-/// allocators — the result must NOT be passed to `freeName` (which frees
-/// each label individually). Designed for the cache read path where the
-/// caller's arena owns lifetime.
-pub fn cloneNameFlat(allocator: Allocator, name: Name) !Name {
+/// Arena-only DNS name: labels slice and every label byte share one
+/// contiguous buffer. Distinct from `Name` by type so the compiler
+/// rejects `freeName(NameFlat)` — that call would invoke `allocator.free`
+/// on each mid-buffer label pointer (UAF). Produced by `cloneNameFlat`,
+/// consumed by `.toUnownedName()` when handing off to a `ResourceRecord`
+/// (whose surrounding arena owns the lifetime).
+pub const NameFlat = struct {
+    labels: []const []const u8,
+
+    /// Reinterpret as a plain `Name` for placement in fields whose source
+    /// is mixed (e.g. `ResourceRecord.name`). The caller asserts the
+    /// surrounding arena will outlive every consumer — `freeName` MUST
+    /// NOT be called on the result.
+    pub fn toUnownedName(self: NameFlat) Name {
+        return .{ .labels = self.labels };
+    }
+};
+
+/// Single-allocation variant of cloneName: the returned `NameFlat`'s
+/// labels slice and every label byte live in one contiguous buffer. Use
+/// only with arena allocators. Designed for the cache read path where
+/// the caller's arena owns lifetime.
+pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
     const n = name.labels.len;
     if (n == 0) return .{ .labels = &.{} };
     const slice_bytes = @sizeOf([]const u8) * n;
@@ -2333,6 +2350,26 @@ pub fn freeMessage(allocator: Allocator, msg: Message) void {
     freeResourceRecords(allocator, msg.authorities);
     freeResourceRecords(allocator, msg.additionals);
     if (msg.opt) |opt| freeOpt(allocator, opt);
+}
+
+test "cloneNameFlat returns NameFlat; freeName(NameFlat) does not compile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src = Name{ .labels = &.{ "example", "com" } };
+    const flat: NameFlat = try cloneNameFlat(alloc, src);
+    try testing.expectEqual(@as(usize, 2), flat.labels.len);
+    try testing.expectEqualStrings("example", flat.labels[0]);
+    try testing.expectEqualStrings("com", flat.labels[1]);
+
+    // Compile-error proof (uncomment to verify): `freeName` takes `Name`,
+    // not `NameFlat`, so the next line fails to compile.
+    //   freeName(alloc, flat);
+
+    // The intentional bridge: explicit conversion when the surrounding
+    // arena owns lifetime. Result is a plain `Name` — must NOT be freed.
+    const as_name = flat.toUnownedName();
+    try testing.expect(as_name.eql(src));
 }
 
 test "parseDottedName basic" {
