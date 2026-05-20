@@ -66,19 +66,8 @@ const shard_mask: u64 = shard_count - 1;
 pub const max_entries: u32 = 8192;
 const per_shard_cap: u32 = 2 * max_entries / shard_count;
 
-/// TTL after which a leader's slot is presumed stranded (panicked leader,
-/// missed releaseLeader). 10× the longest legitimate dedup hold (DNSKEY
-/// chain ≈ 6s); live resolutions can't be reaped in flight.
-const stale_ttl_ms: i64 = 60 * std.time.ms_per_s;
-
-/// Reap fires only on inserts into a near-saturated shard. Bounded victims
-/// per pass; successive inserts amortize the rest.
-const reap_watermark: u32 = (per_shard_cap * 3) / 4;
-const max_victims_per_reap: usize = 64;
-
 const Shard = struct {
-    /// Value is the monotonic-ms insert stamp; drives the TTL reap.
-    map: std.HashMapUnmanaged(DedupKey, i64, DedupKeyContext, 80) = .empty,
+    map: std.HashMapUnmanaged(DedupKey, void, DedupKeyContext, 80) = .empty,
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     condition: std.Io.Condition = std.Io.Condition.init,
 
@@ -86,42 +75,6 @@ const Shard = struct {
         self.map.deinit(allocator);
     }
 };
-
-/// Drop up to `max_victims_per_reap` entries past their TTL. Caller holds
-/// `shard.mutex`. Two-pass because the stdlib HashMap iterator is
-/// invalidated by in-place removal. Broadcasts on eviction in case any
-/// follower is parked on a victim — safe even if a future TTL change
-/// brings it below the max follower deadline.
-fn reapStaleLocked(shard: *Shard, io: std.Io, now_ms: i64) void {
-    var victims: [max_victims_per_reap]DedupKey = undefined;
-    var n: usize = 0;
-    var it = shard.map.iterator();
-    while (it.next()) |e| {
-        if (n >= max_victims_per_reap) break;
-        if (now_ms - e.value_ptr.* > stale_ttl_ms) {
-            victims[n] = e.key_ptr.*;
-            n += 1;
-        }
-    }
-    for (victims[0..n]) |k| _ = shard.map.remove(k);
-    if (n > 0) shard.condition.broadcast(io);
-}
-
-/// Insert `key` as a new leader if the shard has room. Reaps inline when
-/// near saturation so stranded slots don't permanently consume capacity.
-/// Caller holds `shard.mutex`. Returns false at cap (after reap).
-///
-/// Open edge: a leader that holds for longer than `stale_ttl_ms` can be
-/// reaped and replaced by a successor; the original's eventual
-/// `releaseLeader` removes the successor's entry, waking that cohort to
-/// retry. Bounded fanout, narrow window — accepted rather than threading
-/// a generation token through the public API.
-fn tryInsertLeaderLocked(shard: *Shard, io: std.Io, allocator: mem.Allocator, key: DedupKey, now_ms: i64) bool {
-    if (shard.map.count() >= reap_watermark) reapStaleLocked(shard, io, now_ms);
-    if (shard.map.count() >= per_shard_cap) return false;
-    shard.map.put(allocator, key, now_ms) catch return false;
-    return true;
-}
 
 pub const InFlightTable = struct {
     shards: [shard_count]Shard,
@@ -181,11 +134,11 @@ pub const InFlightTable = struct {
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
 
-        if (shard.map.getPtr(key)) |_| {
+        if (shard.map.contains(key)) {
             // Wait on this shard's condvar. Any same-shard release wakes us;
             // we exit when our entry is gone or the deadline expires.
             const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + 2 * std.time.ns_per_s);
-            while (shard.map.get(key)) |_| {
+            while (shard.map.contains(key)) {
                 if (monotonic.nowNs() >= deadline_ns) break;
                 shard.condition.waitUncancelable(self.io, &shard.mutex);
             }
@@ -195,7 +148,8 @@ pub const InFlightTable = struct {
         // Cap-hit returns .leader uncoordinated (no insert, no bookkeeping).
         // Eviction-on-cap would wake real queries' followers and double
         // upstream amplification — uncoordinated is the lesser evil.
-        _ = tryInsertLeaderLocked(shard, self.io, self.allocator, key, monotonic.nowMs());
+        if (shard.map.count() >= per_shard_cap) return .leader;
+        shard.map.put(self.allocator, key, {}) catch return .leader;
         return .leader;
     }
 
@@ -208,8 +162,10 @@ pub const InFlightTable = struct {
         const shard = self.shardFor(key);
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
-        if (shard.map.get(key)) |_| return false;
-        return tryInsertLeaderLocked(shard, self.io, self.allocator, key, monotonic.nowMs());
+        if (shard.map.contains(key)) return false;
+        if (shard.map.count() >= per_shard_cap) return false;
+        shard.map.put(self.allocator, key, {}) catch return false;
+        return true;
     }
 
     /// Called by the leader when resolution is complete. Wakes all waiting followers
@@ -446,70 +402,4 @@ test "tryAcquireLeader coalesces without enqueueing followers" {
     // Freed — next claim succeeds again.
     try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
     table.releaseLeader("example.com", .dnskey, 0);
-}
-
-test "reapStaleLocked drops entries past the TTL, leaves fresh ones intact" {
-    var shard = Shard{};
-    defer shard.deinit(testing.allocator);
-
-    const now_ms = monotonic.nowMs();
-    const stale_ms = now_ms - stale_ttl_ms - 1;
-
-    const stale_key = DedupKey.init("stale.example.com", .a, 0).?;
-    const fresh_key = DedupKey.init("fresh.example.com", .a, 0).?;
-    try shard.map.put(testing.allocator, stale_key, stale_ms);
-    try shard.map.put(testing.allocator, fresh_key, now_ms);
-
-    reapStaleLocked(&shard, testing.io, now_ms);
-
-    try testing.expect(shard.map.get(stale_key) == null);
-    try testing.expect(shard.map.get(fresh_key) != null);
-}
-
-test "reapStaleLocked is bounded by max_victims_per_reap per pass" {
-    var shard = Shard{};
-    defer shard.deinit(testing.allocator);
-
-    const now_ms = monotonic.nowMs();
-    const stale_ms = now_ms - stale_ttl_ms - 1;
-
-    // Bounded victims per pass; successive passes finish the job.
-    const total = max_victims_per_reap + 5;
-    var name_buf: [32]u8 = undefined;
-    for (0..total) |i| {
-        const name = std.fmt.bufPrint(&name_buf, "n{d}", .{i}) catch unreachable;
-        const k = DedupKey.init(name, .a, 0).?;
-        try shard.map.put(testing.allocator, k, stale_ms);
-    }
-    try testing.expectEqual(@as(u32, @intCast(total)), shard.map.count());
-
-    reapStaleLocked(&shard, testing.io, now_ms);
-    try testing.expectEqual(@as(u32, 5), shard.map.count());
-
-    reapStaleLocked(&shard, testing.io, now_ms);
-    try testing.expectEqual(@as(u32, 0), shard.map.count());
-}
-
-test "tryInsertLeaderLocked reaps a stranded slot when shard hits watermark" {
-    var shard = Shard{};
-    defer shard.deinit(testing.allocator);
-
-    const fresh_ms = monotonic.nowMs();
-    const stale_ms = fresh_ms - stale_ttl_ms - 1;
-
-    const victim_key = DedupKey.init("victim.example.com", .a, 0).?;
-    try shard.map.put(testing.allocator, victim_key, stale_ms);
-
-    var name_buf: [32]u8 = undefined;
-    var i: u32 = 0;
-    while (shard.map.count() < reap_watermark) : (i += 1) {
-        const name = std.fmt.bufPrint(&name_buf, "f{d}", .{i}) catch unreachable;
-        const k = DedupKey.init(name, .a, 0).?;
-        try shard.map.put(testing.allocator, k, fresh_ms);
-    }
-
-    const newcomer = DedupKey.init("newcomer.example.com", .a, 0).?;
-    try testing.expect(tryInsertLeaderLocked(&shard, testing.io, testing.allocator, newcomer, fresh_ms));
-    try testing.expect(shard.map.get(victim_key) == null);
-    try testing.expect(shard.map.get(newcomer) != null);
 }
