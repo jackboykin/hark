@@ -1,0 +1,64 @@
+# cache write-amplification baseline (commit pre-pack)
+# build=ReleaseFast, single thread, M=1000 stores per combo
+# Backing allocator wrapped by AllocCounter; cache CountingAllocator
+# forwards every alloc call, so calls/store is exact for the cache path
+# (slot key dup + records array + per-record buildCachedRecord +
+# cached_sigs/cached_proofs slots + best-effort sig clones).
+#
+# Read path baseline (cache_hit): 2 allocs / lookup regardless of N.
+#
+# Asymmetry vs read path (calls/store):
+#   N=1     7-18    (3.5-9× read)
+#   N=4    22-63    (11-31× read)
+#   N=8    42-123   (21-61× read)
+#
+# DNSKEY+RRSIG carries N keys + N RRSIGs (2N records total). bytes/store
+# climbs faster than calls/store because each DNSKEY public_key and RRSIG
+# signature is a 256-byte owned buffer.
+#
+# rtype          N=1                       N=4                       N=8
+# ────────────  ────────────────────────  ────────────────────────  ──────────────────────────
+# a              p50=15.7us 7.1 calls       p50=49.5us 22.1 calls     p50=94.6us 42.1 calls
+# aaaa           p50=15.7us 7.1 calls       p50=49.5us 22.1 calls     p50=91.7us 42.1 calls
+# cname          p50=23.1us 11.1 calls      p50=77.0us 38.1 calls     p50=148us  74.1 calls
+# mx             p50=23.1us 11.1 calls      p50=76.7us 38.1 calls     p50=147us  74.1 calls
+# nsec           p50=25.4us 12.1 calls      p50=85.1us 42.1 calls     p50=164us  82.1 calls
+# dnskey+rrsig   p50=37.5us 18.1 calls      p50=129us  63.1 calls     p50=246us 123.1 calls
+#
+# raw run:
+[cache_write/a/N=1] p50=15670ns p99=31481ns mean=17622ns min=14799ns max=50389ns n=1000 allocs=7 bytes=900
+  rtype=a N=1 ops/s=56745 calls/store=7.1 bytes/store=900
+[cache_write/a/N=4] p50=49466ns p99=69755ns mean=51706ns min=45980ns max=302378ns n=1000 allocs=22 bytes=1511
+  rtype=a N=4 ops/s=19340 calls/store=22.1 bytes/store=1511
+[cache_write/a/N=8] p50=94614ns p99=128951ns mean=96831ns min=89744ns max=361604ns n=1000 allocs=42 bytes=2327
+  rtype=a N=8 ops/s=10327 calls/store=42.1 bytes/store=2327
+[cache_write/aaaa/N=1] p50=15731ns p99=32282ns mean=17665ns min=14608ns max=150573ns n=1000 allocs=7 bytes=855
+  rtype=aaaa N=1 ops/s=56606 calls/store=7.1 bytes/store=855
+[cache_write/aaaa/N=4] p50=49496ns p99=71158ns mean=51792ns min=45889ns max=317728ns n=1000 allocs=22 bytes=1503
+  rtype=aaaa N=4 ops/s=19307 calls/store=22.1 bytes/store=1503
+[cache_write/aaaa/N=8] p50=91668ns p99=121737ns mean=92955ns min=80728ns max=268473ns n=1000 allocs=42 bytes=2366
+  rtype=aaaa N=8 ops/s=10757 calls/store=42.1 bytes/store=2366
+[cache_write/cname/N=1] p50=23065ns p99=37613ns mean=24593ns min=20720ns max=253664ns n=1000 allocs=11 bytes=910
+  rtype=cname N=1 ops/s=40661 calls/store=11.1 bytes/store=910
+[cache_write/cname/N=4] p50=76970ns p99=99844ns mean=79148ns min=73212ns max=334592ns n=1000 allocs=38 bytes=1792
+  rtype=cname N=4 ops/s=12634 calls/store=38.1 bytes/store=1792
+[cache_write/cname/N=8] p50=148148ns p99=197124ns mean=152045ns min=141285ns max=571312ns n=1000 allocs=74 bytes=2967
+  rtype=cname N=8 ops/s=6576 calls/store=74.1 bytes/store=2967
+[cache_write/mx/N=1] p50=23135ns p99=38885ns mean=24750ns min=20781ns max=234396ns n=1000 allocs=11 bytes=907
+  rtype=mx N=1 ops/s=40403 calls/store=11.1 bytes/store=907
+[cache_write/mx/N=4] p50=76719ns p99=105284ns mean=79505ns min=73202ns max=412754ns n=1000 allocs=38 bytes=1771
+  rtype=mx N=4 ops/s=12577 calls/store=38.1 bytes/store=1771
+[cache_write/mx/N=8] p50=147397ns p99=192495ns mean=152005ns min=142648ns max=565801ns n=1000 allocs=74 bytes=2922
+  rtype=mx N=8 ops/s=6578 calls/store=74.1 bytes/store=2922
+[cache_write/nsec/N=1] p50=25399ns p99=40569ns mean=27058ns min=22764ns max=395269ns n=1000 allocs=12 bytes=919
+  rtype=nsec N=1 ops/s=36957 calls/store=12.1 bytes/store=919
+[cache_write/nsec/N=4] p50=85096ns p99=114313ns mean=87577ns min=80737ns max=352266ns n=1000 allocs=42 bytes=1824
+  rtype=nsec N=4 ops/s=11418 calls/store=42.1 bytes/store=1824
+[cache_write/nsec/N=8] p50=164190ns p99=211491ns mean=167837ns min=156865ns max=304933ns n=1000 allocs=82 bytes=3032
+  rtype=nsec N=8 ops/s=5958 calls/store=82.1 bytes/store=3032
+[cache_write/dnskey/N=1] p50=37483ns p99=48855ns mean=38421ns min=34257ns max=234967ns n=1000 allocs=18 bytes=2137
+  rtype=dnskey+rrsig N=1 ops/s=26027 calls/store=18.1 bytes/store=2137
+[cache_write/dnskey/N=4] p50=128701ns p99=172576ns mean=131304ns min=122137ns max=387764ns n=1000 allocs=63 bytes=6640
+  rtype=dnskey+rrsig N=4 ops/s=7615 calls/store=63.1 bytes/store=6640
+[cache_write/dnskey/N=8] p50=245668ns p99=333820ns mean=251169ns min=237442ns max=579097ns n=1000 allocs=123 bytes=12643
+  rtype=dnskey+rrsig N=8 ops/s=3981 calls/store=123.1 bytes/store=12643

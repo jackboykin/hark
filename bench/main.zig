@@ -23,6 +23,7 @@ const dedup = @import("bench_dedup.zig");
 const upstream = @import("bench_upstream.zig");
 const delegation = @import("bench_delegation.zig");
 const cache_contention = @import("bench_cache_contention.zig");
+const cache_write = @import("bench_cache_write.zig");
 
 const benchmarks = [_]Benchmark{
     .{ .name = "self_test", .run = self_test.run },
@@ -36,7 +37,7 @@ const benchmarks = [_]Benchmark{
     .{ .name = "upstream_perquery", .run = upstream.runPerQuery },
     .{ .name = "upstream_persistent", .run = upstream.runPersistent },
     .{ .name = "delegation", .run = delegation.run },
-} ++ cache_contention.benchmarks;
+} ++ cache_contention.benchmarks ++ cache_write.benchmarks;
 
 fn percentile(sorted: []const i64, p: f64) i64 {
     const idx_f = @as(f64, @floatFromInt(sorted.len)) * p;
