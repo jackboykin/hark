@@ -189,7 +189,6 @@ const QInstrTimer = struct {
 const PerThreadArena = struct {
     arena: std.heap.ArenaAllocator,
     cap: CountingAllocator,
-    peak_bytes: usize = 0,
     low_streak: u32 = 0,
 
     /// After this many consecutive low-usage resets, shrink the retained
@@ -207,25 +206,21 @@ const PerThreadArena = struct {
             self.arena.allocator(),
             if (max_bytes > 0) max_bytes else std.math.maxInt(usize),
         );
-        self.peak_bytes = 0;
         self.low_streak = 0;
     }
 
     fn reset(self: *PerThreadArena) mem.Allocator {
         const sample = self.cap.current_bytes.load(.monotonic);
         const low_threshold = self.cap.max_bytes / 4;
+        self.cap.current_bytes.store(0, .monotonic);
         if (sample > low_threshold) {
-            if (sample > self.peak_bytes) self.peak_bytes = sample;
             self.low_streak = 0;
-            self.cap.current_bytes.store(0, .monotonic);
             _ = self.arena.reset(.retain_capacity);
         } else {
             self.low_streak +%= 1;
-            self.cap.current_bytes.store(0, .monotonic);
             if (self.low_streak >= LOW_STREAK_THRESHOLD) {
                 _ = self.arena.reset(.{ .retain_with_limit = SHRINK_LIMIT_BYTES });
                 self.low_streak = 0;
-                self.peak_bytes = 0;
             } else {
                 _ = self.arena.reset(.retain_capacity);
             }
@@ -2225,19 +2220,18 @@ test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
 
     // Spike first so subsequent resets have a high-water mark to shrink from.
     {
-        const a = pta.reset(); // samples 0 → low_streak = 1, peak = 0
+        const a = pta.reset(); // samples 0 → low_streak = 1
         const big = try a.alloc(u8, spike_bytes);
         std.mem.doNotOptimizeAway(big.ptr);
     }
 
-    // Next reset samples the spike → low_streak resets, peak recorded.
+    // Next reset samples the spike → low_streak resets.
     {
         const a = pta.reset();
         const buf = try a.alloc(u8, low_alloc_bytes);
         std.mem.doNotOptimizeAway(buf.ptr);
     }
     try testing.expectEqual(@as(u32, 0), pta.low_streak);
-    try testing.expect(pta.peak_bytes >= spike_bytes);
     try testing.expect(pta.arena.queryCapacity() >= spike_bytes);
 
     // Now K consecutive low queries. Each reset samples the prior query's
@@ -2246,9 +2240,8 @@ test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
     const k = PerThreadArena.LOW_STREAK_THRESHOLD;
     var fired_at: ?u32 = null;
     var capacity_after_fire: usize = 0;
-    var pre_capacity: usize = pta.arena.queryCapacity();
     for (0..k + 8) |i| {
-        pre_capacity = pta.arena.queryCapacity();
+        const pre_capacity = pta.arena.queryCapacity();
         const a = pta.reset();
         if (fired_at == null and pta.low_streak == 0 and pre_capacity > PerThreadArena.SHRINK_LIMIT_BYTES * 2) {
             fired_at = @intCast(i);
@@ -2265,5 +2258,4 @@ test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
     try testing.expectEqual(@as(u32, k - 1), fired_at.?);
     const slack: usize = 64 * 1024;
     try testing.expect(capacity_after_fire <= PerThreadArena.SHRINK_LIMIT_BYTES + slack);
-    try testing.expectEqual(@as(usize, 0), pta.peak_bytes);
 }

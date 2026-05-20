@@ -3160,10 +3160,7 @@ fn buildOomTestWire(buf: []u8) usize {
     s.writeU16(@intFromEnum(RType.ns)) catch unreachable;
     s.writeU16(@intFromEnum(RClass.in)) catch unreachable;
     s.writeU32(3600) catch unreachable;
-    s.writeU16(17) catch unreachable; // rdlength: 2(ns) + 7(example) + 3(com) + 3 length bytes + 1 terminator + 1 = 17? recompute
-    // ns name: \x02 n s \x07 example \x03 com \x00 = 2+1 + 7+1 + 3+1 + 1 = 16. Fix rdlength.
-    // Backtrack: 2 bytes earlier — overwrite the rdlength we just wrote.
-    s.pos -= 2;
+    // rdlength: \x02"ns"(3) + \x07"example"(8) + \x03"com"(4) + \x00(1) = 16
     s.writeU16(16) catch unreachable;
     s.writeU8(2) catch unreachable;
     s.writeSlice("ns") catch unreachable;
