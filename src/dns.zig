@@ -3095,93 +3095,6 @@ test "keepaliveToSeconds rounds up" {
     try testing.expectEqual(@as(i64, 10), keepaliveToSeconds(100)); // 10s
 }
 
-/// Multi-record wire used by the OOM-injection test below. Question +
-/// two A answers + one NS authority + one OPT additional (one option) —
-/// exercises per-record `parseName` allocs, `parseEdnsOptions`, and the
-/// four section ArrayList spines.
-fn buildOomTestWire(buf: []u8) usize {
-    // Header: id=0x4242, flags=QR|AA, qd=1 an=2 ns=1 ar=1
-    var s = Serializer.init(buf);
-    const hdr: Header = .{
-        .id = 0x4242,
-        .flags = .{
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-        },
-        .qd_count = 1,
-        .an_count = 2,
-        .ns_count = 1,
-        .ar_count = 1,
-    };
-    s.writeHeader(hdr) catch unreachable;
-
-    // Helper: write owner name "example.com" as literal labels (no compression)
-    const write_example_com = struct {
-        fn f(ser: *Serializer) void {
-            ser.writeU8(7) catch unreachable;
-            ser.writeSlice("example") catch unreachable;
-            ser.writeU8(3) catch unreachable;
-            ser.writeSlice("com") catch unreachable;
-            ser.writeU8(0) catch unreachable;
-        }
-    }.f;
-
-    // Question: example.com IN A
-    write_example_com(&s);
-    s.writeU16(@intFromEnum(RType.a)) catch unreachable;
-    s.writeU16(@intFromEnum(RClass.in)) catch unreachable;
-
-    // Answer 1: example.com IN A 192.0.2.1 (TTL=60)
-    write_example_com(&s);
-    s.writeU16(@intFromEnum(RType.a)) catch unreachable;
-    s.writeU16(@intFromEnum(RClass.in)) catch unreachable;
-    s.writeU32(60) catch unreachable;
-    s.writeU16(4) catch unreachable;
-    s.writeSlice(&[_]u8{ 192, 0, 2, 1 }) catch unreachable;
-
-    // Answer 2: example.com IN A 192.0.2.2 (TTL=60)
-    write_example_com(&s);
-    s.writeU16(@intFromEnum(RType.a)) catch unreachable;
-    s.writeU16(@intFromEnum(RClass.in)) catch unreachable;
-    s.writeU32(60) catch unreachable;
-    s.writeU16(4) catch unreachable;
-    s.writeSlice(&[_]u8{ 192, 0, 2, 2 }) catch unreachable;
-
-    // Authority: example.com IN NS ns.example.com
-    write_example_com(&s);
-    s.writeU16(@intFromEnum(RType.ns)) catch unreachable;
-    s.writeU16(@intFromEnum(RClass.in)) catch unreachable;
-    s.writeU32(3600) catch unreachable;
-    // rdlength: \x02"ns"(3) + \x07"example"(8) + \x03"com"(4) + \x00(1) = 16
-    s.writeU16(16) catch unreachable;
-    s.writeU8(2) catch unreachable;
-    s.writeSlice("ns") catch unreachable;
-    s.writeU8(7) catch unreachable;
-    s.writeSlice("example") catch unreachable;
-    s.writeU8(3) catch unreachable;
-    s.writeSlice("com") catch unreachable;
-    s.writeU8(0) catch unreachable;
-
-    // Additional: OPT (root, udp_payload=1232, one option: NSID empty)
-    s.writeU8(0) catch unreachable; // root owner
-    s.writeU16(@intFromEnum(RType.opt)) catch unreachable;
-    s.writeU16(1232) catch unreachable; // class = UDP payload size
-    s.writeU32(0) catch unreachable; // ttl = extended rcode/version/flags
-    s.writeU16(4) catch unreachable; // rdlength = one option (code+len, len=0)
-    s.writeU16(3) catch unreachable; // option code NSID
-    s.writeU16(0) catch unreachable; // option length 0
-
-    return s.pos;
-}
-
 fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {
     const msg = try parseMessage(allocator, wire);
     // Wire-safe teardown: parseMessage's lifetime contract says inner labels
@@ -3200,9 +3113,53 @@ fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {
 }
 
 test "parseMessage handles OOM at every allocation without leaking" {
+    // Question + two A answers + one NS authority + OPT — exercises per-record
+    // parseName, parseRData branches, parseEdnsOptions, and the four section
+    // ArrayList spines.
+    const example_com = Name{ .labels = &.{ "example", "com" } };
+    const ns_target = Name{ .labels = &.{ "ns", "example", "com" } };
+    const msg: Message = .{
+        .header = .{
+            .id = 0x4242,
+            .flags = .{
+                .qr = true,
+                .opcode = .query,
+                .aa = true,
+                .tc = false,
+                .rd = false,
+                .ra = false,
+                .z = 0,
+                .ad = false,
+                .cd = false,
+                .rcode = .no_error,
+            },
+            .qd_count = 1,
+            .an_count = 2,
+            .ns_count = 1,
+            .ar_count = 0, // serializeMessage adds 1 for the OPT below
+        },
+        .questions = &.{
+            .{ .name = example_com, .qtype = .a, .qclass = .in },
+        },
+        .answers = &.{
+            .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
+            .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } },
+        },
+        .authorities = &.{
+            .{ .name = example_com, .rtype = .ns, .rclass = .in, .ttl = 3600, .rdata = .{ .ns = ns_target } },
+        },
+        .additionals = &.{},
+        .opt = .{
+            .udp_payload_size = 1232,
+            .extended_rcode = 0,
+            .version = 0,
+            .do_bit = false,
+            .options = &.{.{ .code = 3, .data = &.{} }}, // NSID, empty data
+        },
+    };
+
     var wire_buf: [max_udp_payload]u8 = undefined;
-    const wire_len = buildOomTestWire(&wire_buf);
-    const wire = wire_buf[0..wire_len];
+    const wire = try serializeMessage(&wire_buf, msg);
 
     // Sanity: the wire parses successfully under an arena.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
