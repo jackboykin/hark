@@ -26,31 +26,6 @@ const rebinding = @import("rebinding.zig");
 // `shapeResponse` is the single choke point for this policy. All
 // client-bound responses flow through it via `buildResponseWire`.
 
-/// Returns true for the qtype carve-out where authority/additional are
-/// load-bearing answer material. RFC 8109 priming: `dig NS .` returns NS
-/// records in answer and their addresses in additional; stripping either
-/// breaks any client that doesn't already have root hints. Mirrors
-/// Unbound's `positive_answer()` carve-out (msgencode.c:660).
-fn qtypeNeedsFullAuthority(qtype: dns.RType) bool {
-    return qtype == .ns;
-}
-
-/// Returns true if the record is DNSSEC proof material — must be kept
-/// for any DO=1 / CD=1 client running its own validation.
-fn isValidationMaterial(rtype: dns.RType) bool {
-    return switch (rtype) {
-        .nsec, .nsec3 => true,
-        else => false,
-    };
-}
-
-/// Returns true if the response is a positive answer (NOERROR with at
-/// least one answer record). Drives the strip rules: positives shed
-/// delegation NS and glue; negatives retain SOA + proofs.
-fn isPositiveAnswer(response: dns.Message) bool {
-    return response.header.flags.rcode == .no_error and response.answers.len > 0;
-}
-
 /// Result of shaping: section slices owned by the supplied allocator
 /// (or borrowed from `response` when no allocation was needed).
 const ShapedSections = struct {
@@ -81,15 +56,16 @@ fn shapeResponse(
     // DO=1-equivalent regardless of the DO bit.
     const keep_dnssec = do_bit or cd_bit;
 
-    // qtype=NS suppresses the minimal-responses strip — for priming
-    // queries the NS records *are* the answer and their glue is
-    // load-bearing.
-    const apply_minimal = minimal_responses and !qtypeNeedsFullAuthority(qtype);
-    const positive = isPositiveAnswer(response);
+    // qtype=NS suppresses the minimal-responses strip — for RFC 8109 root
+    // priming, the NS records *are* the answer and their glue is load-
+    // bearing. Mirrors Unbound's positive_answer() carve-out (msgencode.c:660).
+    const apply_minimal = minimal_responses and qtype != .ns;
+    // Positives shed delegation NS + glue; negatives retain SOA + proofs.
+    const positive = response.header.flags.rcode == .no_error and response.answers.len > 0;
 
     const answers = try shapeAnswers(alloc, response.answers, qtype, keep_dnssec, rebind_cfg);
-    const authorities = try shapeAuthority(alloc, response.authorities, qtype, keep_dnssec, apply_minimal, positive);
-    const additionals = try shapeAdditional(alloc, response.additionals, authorities, qtype, keep_dnssec, apply_minimal, positive);
+    const authorities = try shapeAuthority(alloc, response.authorities, keep_dnssec, apply_minimal, positive);
+    const additionals = try shapeAdditional(alloc, response.additionals, keep_dnssec, apply_minimal, positive);
 
     return .{
         .answers = answers,
@@ -135,12 +111,10 @@ fn shapeAnswers(
 fn shapeAuthority(
     alloc: mem.Allocator,
     authorities: []const dns.ResourceRecord,
-    qtype: dns.RType,
     keep_dnssec: bool,
     apply_minimal: bool,
     positive: bool,
 ) mem.Allocator.Error![]const dns.ResourceRecord {
-    _ = qtype;
     return filterRecords(alloc, authorities, struct {
         keep_dnssec: bool,
         apply_minimal: bool,
@@ -183,14 +157,10 @@ fn shapeAuthority(
 fn shapeAdditional(
     alloc: mem.Allocator,
     additionals: []const dns.ResourceRecord,
-    kept_authorities: []const dns.ResourceRecord,
-    qtype: dns.RType,
     keep_dnssec: bool,
     apply_minimal: bool,
     positive: bool,
 ) mem.Allocator.Error![]const dns.ResourceRecord {
-    _ = qtype;
-    _ = kept_authorities;
     return filterRecords(alloc, additionals, struct {
         keep_dnssec: bool,
         apply_minimal: bool,

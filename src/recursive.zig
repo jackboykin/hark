@@ -375,10 +375,9 @@ pub const RecursiveResolver = struct {
         const aq = self.anticipated_query orelse return null;
         if (qtype != aq.qtype or !std.ascii.eqlIgnoreCase(qname, aq.qname())) return null;
         const aq_key = AddressKey.fromAddress(aq.upstream);
-        const server_present = blk: for (servers) |s| {
-            if (AddressKey.fromAddress(s).eql(aq_key)) break :blk true;
-        } else false;
-        if (!server_present) return null;
+        for (servers) |s| {
+            if (AddressKey.fromAddress(s).eql(aq_key)) break;
+        } else return null;
 
         defer self.dropAnticipated();
 
@@ -448,13 +447,6 @@ pub const RecursiveResolver = struct {
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
         const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.udp().config.timeout_ms;
         return if (is_last) base else @min(base, failover_timeout_cap);
-    }
-
-    /// Snapshot timestamp for a server-skip loop. 0 when no rtt_cache —
-    /// `RttCache.isDead` returns false for any key against now=0, which
-    /// is the right "always live" fallback.
-    fn rttNowMs(self: *const RecursiveResolver) i64 {
-        return if (self.rtt_cache) |rc| rc.nowMs() else 0;
     }
 
     pub const ResolveResult = struct {
@@ -2059,7 +2051,9 @@ pub const RecursiveResolver = struct {
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
         const try_count = @min(servers.len, max_servers);
-        const now_ms = self.rttNowMs();
+        // 0 when no rtt_cache — `RttCache.isDead` returns false against now=0,
+        // which is the right "always live" fallback.
+        const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
         for (servers[0..try_count], 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 

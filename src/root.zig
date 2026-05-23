@@ -29,34 +29,6 @@ pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
 
 test {
-    _ = dns;
-    _ = dns_print;
-    _ = @import("response.zig");
-    _ = event_loop;
-    _ = resolver;
-    _ = recursive;
-    _ = cache;
-    _ = dnssec;
-    _ = tls_transport;
-    _ = connection_pool;
-    _ = encrypted_ns;
-    _ = case_state;
-    _ = toml;
-    _ = config;
-    _ = server;
-    _ = ns_rtt;
-    _ = ns_selector;
-    _ = dedup;
-    _ = nsec_cache;
-    _ = counting_allocator;
-    _ = bg_group;
-    _ = blocking_transport;
-    _ = transport;
-    _ = rand;
-    _ = monotonic;
-    _ = sys;
-    _ = net_address;
-    _ = special_use;
-    _ = acl;
-    _ = rebinding;
+    @import("std").testing.refAllDecls(@This());
+    _ = @import("response.zig"); // explicit: response.zig isn't re-exported, so don't rely on transitive imports keeping its tests in the run set
 }

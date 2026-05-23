@@ -74,22 +74,17 @@ pub const EncryptedNsCache = struct {
         self.entries.deinit();
     }
 
-    /// Damping period a non-.unknown entry is "live" for.
-    fn dampingPeriod(status: ServerStatus) i64 {
-        return switch (status) {
+    /// Status for `entry` at `now`, decayed to `.unknown` once the damping
+    /// period elapses.
+    fn effectiveStatus(entry: NsEntry, now: i64) ServerStatus {
+        const damping: i64 = switch (entry.status) {
             .capable => persistence_sec,
             .probing => probe_timeout_sec,
             .failed => damping_sec,
             .soft_failed => soft_damping_sec,
-            .unknown => 0,
+            .unknown => return .unknown,
         };
-    }
-
-    /// Status for `entry` at `now`, decayed to `.unknown` once the damping
-    /// period elapses.
-    fn effectiveStatus(entry: NsEntry, now: i64) ServerStatus {
-        if (entry.status == .unknown) return .unknown;
-        if (now - entry.last_probe >= dampingPeriod(entry.status)) return .unknown;
+        if (now - entry.last_probe >= damping) return .unknown;
         return entry.status;
     }
 

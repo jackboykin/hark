@@ -23,14 +23,6 @@ pub fn hashSeed(io: Io) u64 {
     return mem.readInt(u64, &buf, .little);
 }
 
-/// Generate a random ephemeral port in [1024, 65535]. Uses the full
-/// unprivileged range rather than the narrower IANA dynamic range
-/// [49152, 65535] to maximise source port entropy (~16 bits vs ~14)
-/// for Kaminsky-attack resistance (RFC 5452 §9.1).
-pub fn ephemeralPort(io: Io) u16 {
-    return intRangeAtMost(u16, io, 1024, 65535);
-}
-
 // ── Fast tactical RNG ────────────────────────────────────────────────
 //
 // std.Io.random funnels every call to a global mutex when the calling
