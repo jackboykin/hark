@@ -2203,6 +2203,28 @@ pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
     return .{ .labels = labels };
 }
 
+/// Like `cloneNameFlat` but lowercases ASCII letters in-flight. Used to
+/// scrub 0x20-randomized case off upstream RR owner names.
+pub fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
+    const n = name.labels.len;
+    if (n == 0) return .{ .labels = &.{} };
+    const slice_bytes = @sizeOf([]const u8) * n;
+    var total_bytes: usize = 0;
+    for (name.labels) |label| total_bytes += label.len;
+
+    const alignment: std.mem.Alignment = comptime .fromByteUnits(@alignOf([]const u8));
+    const buf = try allocator.alignedAlloc(u8, alignment, slice_bytes + total_bytes);
+    const labels_ptr: [*]([]const u8) = @ptrCast(buf.ptr);
+    const labels: [][]const u8 = labels_ptr[0..n];
+    var offset: usize = slice_bytes;
+    for (name.labels, 0..) |label, i| {
+        for (label, 0..) |b, j| buf[offset + j] = std.ascii.toLower(b);
+        labels[i] = buf[offset..][0..label.len];
+        offset += label.len;
+    }
+    return .{ .labels = labels };
+}
+
 /// Build a wildcard name (*.closest-encloser) from a closest encloser name
 /// into a caller-provided label buffer. Returns null if CE has too many labels.
 pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser: Name) ?Name {

@@ -87,7 +87,12 @@ pub fn synthesize(
     action: Action,
 ) !dns.Message {
     std.debug.assert(action != .none);
-    const qname = try dns.parseDottedName(allocator, name);
+    // Lowercase the client-typed name so synthesized owners match the
+    // `tryParseMessage` scrub policy.
+    var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+    if (name.len > lower_buf.len) return error.NameTooLong;
+    const lower = dns.lowerNameIntoBuf(&lower_buf, name);
+    const qname = try dns.parseDottedName(allocator, lower);
 
     var answers: []dns.ResourceRecord = &.{};
     var rcode: dns.RCode = .no_error;

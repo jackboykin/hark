@@ -87,8 +87,14 @@ const max_minimize_count = 10;
 /// errors to null so callers can skip malformed responses. Logs the
 /// server address and error name at debug level — warn would be a DoS
 /// amplifier for an attacker controlling an authoritative server.
+///
+/// After parse, lowercases the owner `name` on every answer/authority/
+/// additional RR so 0x20-randomized case from upstream cannot leak into
+/// client responses. Leaves the question section (eqlExact-compared
+/// against the outgoing query) and RData embedded names (DNSSEC
+/// lowercases those at canonical form per RFC 4035 §5.3.2) untouched.
 fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Address) error{OutOfMemory}!?dns.Message {
-    return dns.parseMessage(allocator, data) catch |err| switch (err) {
+    const msg = dns.parseMessage(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             var addr_buf: [64]u8 = undefined;
@@ -96,6 +102,16 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
             return null;
         },
     };
+
+    // `@constCast` is sound — parseMessage returns ArrayList-backed
+    // mutable storage typed `[]const`. The pre-scrub label bytes alias
+    // the upstream wire buffer; cloneNameFlatLower's arena allocation
+    // replaces them.
+    for (@constCast(msg.answers)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
+    for (@constCast(msg.authorities)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
+    for (@constCast(msg.additionals)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
+
+    return msg;
 }
 
 // ── RecursiveResolver ──────────────────────────────────────────────────
@@ -1301,12 +1317,24 @@ pub const RecursiveResolver = struct {
         switch (wc_result) {
             .hit => |h| {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
-                // target_name is arena-allocated and outlives the response —
-                // direct assignment. RFC 4035 §3.1.3.4: the RRSIG's labels
-                // field stays at the wildcard depth, so a DO=1 client
-                // reconstructs `*.CE` from qname and revalidates correctly.
-                for (h.records) |*rr| rr.name = target_name;
-                for (h.sigs) |*rr| rr.name = target_name;
+                // Lowercase via `cloneNameFlatLower` to keep client-typed
+                // case out of the synthesized owner. Clear `rr.wire` /
+                // `rr.wire_ttl_offset` so `writeResourceRecord`'s fast
+                // path does not memcpy the cached `*.CE` wire blob and
+                // overwrite our rewrite. RFC 4035 §3.1.3.4: the RRSIG's
+                // labels field stays at the wildcard depth so a DO=1
+                // client reconstructs `*.CE` from qname and revalidates.
+                const lc_target = (try dns.cloneNameFlatLower(allocator, target_name)).toUnownedName();
+                for (h.records) |*rr| {
+                    rr.name = lc_target;
+                    rr.wire = null;
+                    rr.wire_ttl_offset = 0;
+                }
+                for (h.sigs) |*rr| {
+                    rr.name = lc_target;
+                    rr.wire = null;
+                    rr.wire_ttl_offset = 0;
+                }
                 const answer = try concatRRs(allocator, h.records, h.sigs);
                 const authority = try buildNegativeAuthority(allocator, soa, nsec_proofs);
                 return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(answer, authority, .no_error, h.security_status == .secure));
@@ -2912,7 +2940,13 @@ const ttl_any_hinfo: u32 = 3789;
 /// Uses the RType=13 / RData.unknown path so we don't have to teach the
 /// rest of the parser/cache/printer about HINFO.
 fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
-    const qname = try dns.parseDottedName(allocator, name);
+    // Lowercase the client-typed name before parsing so the synthetic
+    // HINFO owner doesn't echo back mixed case (same scrub policy as the
+    // upstream-reply path in `tryParseMessage`).
+    var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+    if (name.len > lower_buf.len) return error.NameTooLong;
+    const lower = dns.lowerNameIntoBuf(&lower_buf, name);
+    const qname = try dns.parseDottedName(allocator, lower);
     // <len=7> R F C 8 4 8 2  <len=0>
     const rdata_bytes = try allocator.dupe(u8, &[_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 });
     const arr = try allocator.alloc(dns.ResourceRecord, 1);
@@ -4042,4 +4076,162 @@ fn concatRRsOomProbe(allocator: mem.Allocator, _: void) !void {
 
 test "concatRRs handles OOM without leaking" {
     try testing.checkAllAllocationFailures(testing.allocator, concatRRsOomProbe, .{{}});
+}
+
+// ── tryParseMessage 0x20-case scrub tests ──────────────────────────────
+//
+// These cover the bug where 0x20-randomized case in upstream replies
+// leaked into client responses via answer/authority/additional owner
+// names — visible as `PING x.cOm` for a `ping x.com` query. The scrub
+// in `tryParseMessage` lowercases every RR owner name; the question
+// section keeps its upstream-echoed case so the resolver's eqlExact
+// 0x20-echo verification still works.
+
+fn buildMixedCaseAnswerPacket(buf: *[64]u8) []const u8 {
+    // Header: id=0x1234, flags=0x8180 (QR=1, RA=1, RCODE=0), qd=1, an=1
+    mem.writeInt(u16, buf[0..2], 0x1234, .big);
+    mem.writeInt(u16, buf[2..4], 0x8180, .big);
+    mem.writeInt(u16, buf[4..6], 1, .big);
+    mem.writeInt(u16, buf[6..8], 1, .big);
+    mem.writeInt(u16, buf[8..10], 0, .big);
+    mem.writeInt(u16, buf[10..12], 0, .big);
+    // Question name `X.coM` at offset 12.
+    buf[12] = 1;
+    buf[13] = 'X';
+    buf[14] = 3;
+    buf[15] = 'c';
+    buf[16] = 'o';
+    buf[17] = 'M';
+    buf[18] = 0;
+    // Qtype=A(1), Qclass=IN(1).
+    mem.writeInt(u16, buf[19..21], 1, .big);
+    mem.writeInt(u16, buf[21..23], 1, .big);
+    // Answer name: compression pointer to offset 12 (the question name
+    // labels in `X.coM`). This is the worst case for the bug: the
+    // upstream-randomized question name's bytes are the *only* storage
+    // for the answer owner name labels.
+    buf[23] = 0xC0;
+    buf[24] = 12;
+    // Type=A, Class=IN, TTL=300, RDLENGTH=4, RDATA=192.0.2.1.
+    mem.writeInt(u16, buf[25..27], 1, .big);
+    mem.writeInt(u16, buf[27..29], 1, .big);
+    mem.writeInt(u32, buf[29..33], 300, .big);
+    mem.writeInt(u16, buf[33..35], 4, .big);
+    buf[35] = 192;
+    buf[36] = 0;
+    buf[37] = 2;
+    buf[38] = 1;
+    return buf[0..39];
+}
+
+test "tryParseMessage lowercases answer owner names but preserves question case" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    const wire = buildMixedCaseAnswerPacket(&buf);
+
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 53);
+    const msg = (try tryParseMessage(arena.allocator(), wire, server)) orelse return error.TestUnexpectedResult;
+
+    // Question must keep its upstream-echoed bytes — eqlExact compares
+    // it byte-for-byte against the outgoing randomized query name.
+    try testing.expectEqual(@as(usize, 1), msg.questions.len);
+    try testing.expectEqual(@as(usize, 2), msg.questions[0].name.labels.len);
+    try testing.expectEqualStrings("X", msg.questions[0].name.labels[0]);
+    try testing.expectEqualStrings("coM", msg.questions[0].name.labels[1]);
+
+    // Answer owner must be lowercase — this is the client-visible name
+    // that was leaking 0x20 randomization before the fix.
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    try testing.expectEqual(@as(usize, 2), msg.answers[0].name.labels.len);
+    try testing.expectEqualStrings("x", msg.answers[0].name.labels[0]);
+    try testing.expectEqualStrings("com", msg.answers[0].name.labels[1]);
+}
+
+test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
+    // The user-visible bug surface: cached wildcard RRset has owner
+    // `*.example.com` (lowercased on store), client queries
+    // `WhAtEvEr.example.com`. Pre-fix, `tryWildcardSynth` rewrote
+    // `rr.name = target_name` (mixed case) but left `rr.wire` set to
+    // the cached blob carrying `*.example.com`. `writeResourceRecord`'s
+    // fast path then memcpyd the blob and the client saw `*.example.com`
+    // in the answer (or, if target_name had been lowercased only, the
+    // wildcard literal). Assert both fixes: owner is lowercase AND
+    // wire is null so serialization picks up the rewritten name.
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Store a wildcard A RRset under `*.example.com`.
+    const star_labels = try aa.alloc([]const u8, 3);
+    star_labels[0] = try aa.dupe(u8, "*");
+    star_labels[1] = try aa.dupe(u8, "example");
+    star_labels[2] = try aa.dupe(u8, "com");
+    const wildcard_name = dns.Name{ .labels = star_labels };
+
+    const rrs = try aa.alloc(dns.ResourceRecord, 1);
+    rrs[0] = .{
+        .name = wildcard_name,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .a = .{ 192, 0, 2, 99 } },
+    };
+    const store_msg = dns.Message{
+        .header = .{
+            .id = 0,
+            .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error },
+            .qd_count = 0,
+            .an_count = 1,
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = rrs,
+    };
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+    cache.storeResponse(store_msg, dns.Name{ .labels = &.{} }, .unchecked);
+
+    // Build a target name with mixed case: `WhAtEvEr.example.com`.
+    const tgt_labels = try aa.alloc([]const u8, 3);
+    tgt_labels[0] = try aa.dupe(u8, "WhAtEvEr");
+    tgt_labels[1] = try aa.dupe(u8, "example");
+    tgt_labels[2] = try aa.dupe(u8, "com");
+    const target_name = dns.Name{ .labels = tgt_labels };
+
+    // Minimal SOA placeholder (synthesis returns it in authority section;
+    // not under test here, but tryWildcardSynth signature requires it).
+    const soa_mname = dns.Name{ .labels = &.{ "example", "com" } };
+    const soa_rname = dns.Name{ .labels = &.{ "hostmaster", "example", "com" } };
+    const soa_rr = dns.ResourceRecord{
+        .name = dns.Name{ .labels = &.{ "example", "com" } },
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .soa = .{ .mname = soa_mname, .rname = soa_rname, .serial = 1, .refresh = 3600, .retry = 600, .expire = 86400, .minimum = 3600 } },
+    };
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+    };
+
+    const synth = (try resolver.tryWildcardSynth(aa, 2, soa_rr, &.{}, target_name, .a, &.{}, &.{})) orelse return error.TestExpectedSynth;
+
+    try testing.expect(synth.answers.len >= 1);
+    const ans = synth.answers[0];
+    // Owner is lowercase — client-visible name, was `WhAtEvEr.example.com` pre-fix.
+    try testing.expectEqual(@as(usize, 3), ans.name.labels.len);
+    try testing.expectEqualStrings("whatever", ans.name.labels[0]);
+    try testing.expectEqualStrings("example", ans.name.labels[1]);
+    try testing.expectEqualStrings("com", ans.name.labels[2]);
+    // Wire blob was cleared so writeResourceRecord falls into the slow
+    // path and re-serializes from the rewritten name. Pre-fix the blob
+    // held `*.example.com`.
+    try testing.expect(ans.wire == null);
+    try testing.expectEqual(@as(u16, 0), ans.wire_ttl_offset);
 }

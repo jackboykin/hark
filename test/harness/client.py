@@ -107,14 +107,22 @@ def _assert_section_matches(label: str, actual: list, expected: list, compare_tt
 
 def _normalize_rrset(r: dns.rrset.RRset, compare_ttl: bool) -> tuple:
     ttl = r.ttl if compare_ttl else 0
-    # DNS names are case-insensitive (RFC 4343), and 0x20 randomization +
-    # wire-format compression leaks query-side randomized case into rdata
-    # for name-bearing types (CNAME, NS, MX, PTR, ...). Compare in canonical
-    # lowercase form. Non-name rdata (A, AAAA, TXT, etc.) are unaffected by
-    # lowercase at the surface form used here, except TXT — but scenarios
-    # that need case-preserved TXT can switch to `MATCH ttl` (deferred).
+    # Owner names are compared byte-exactly: hark scrubs 0x20-randomized
+    # case off every answer/authority/additional RR owner in
+    # `tryParseMessage`, so a mixed-case upstream reply cannot leak into
+    # the client-visible owner name. Scenarios that want to assert hark
+    # lowercased correctly need only spell the expected owner in the
+    # canonical form they expect.
+    #
+    # RData is still folded to lowercase. 0x20 randomization +
+    # wire-format compression leaks query-side randomized case into
+    # name-bearing rdata (CNAME, NS, MX, PTR, ...), and hark
+    # intentionally does NOT touch rdata names — DNSSEC canonical form
+    # lowercases them at sign/verify time (RFC 4035 §5.3.2), matching
+    # Unbound. Scenarios that need case-preserved TXT can switch to
+    # `MATCH ttl` (deferred).
     rdatas = tuple(sorted(rd.to_text().lower() for rd in r))
-    return (r.name.to_text().lower(), r.rdclass, r.rdtype, ttl, rdatas)
+    return (r.name.to_text(), r.rdclass, r.rdtype, ttl, rdatas)
 
 
 # ── Query-log assertions ─────────────────────────────────────────────────
