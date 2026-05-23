@@ -11,7 +11,6 @@ workers = 4
 resolution-threads = 16
 
 [resolver]
-mode = "recursive"
 dnssec = true
 qname-minimization = true
 case-randomization = true

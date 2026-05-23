@@ -1,7 +1,6 @@
 pub const dns = @import("dns.zig");
 pub const dns_print = @import("dns_print.zig");
 pub const event_loop = @import("event_loop.zig");
-pub const resolver = @import("resolver.zig");
 pub const recursive = @import("recursive.zig");
 pub const cache = @import("cache.zig");
 pub const dnssec = @import("dnssec.zig");

@@ -13,7 +13,6 @@ const OperationId = @import("event_loop.zig").OperationId;
 const recursive = @import("recursive.zig");
 const RecursiveResolver = recursive.RecursiveResolver;
 const acl = @import("acl.zig");
-const ForwardingResolver = @import("resolver.zig").ForwardingResolver;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
 const CaseState = @import("case_state.zig").CaseState;
@@ -549,7 +548,7 @@ pub const Server = struct {
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
             .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
-            .case_state = if (cfg.case_randomization and cfg.mode == .recursive) CaseState.init(allocator, io) else null,
+            .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
                 .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
@@ -659,7 +658,7 @@ pub const Server = struct {
         // (e.g. ["0.0.0.0/0", "::/0"] for fully-open). The kernel firewall
         // is the right place for most ACLs; this check just stops the
         // accidental amplifier-on-startup case.
-        if (self.config.mode == .recursive and self.config.allow_from.len == 0) {
+        if (self.config.allow_from.len == 0) {
             for (listen_addrs) |addr| {
                 if (isNonLoopback(addr)) {
                     var addr_buf: [64]u8 = undefined;
@@ -1329,8 +1328,6 @@ const WorkerState = struct {
     /// Recv-thread cache-hit fast path. Returns true when the query was
     /// fully handled inline; false to fall through to the slow-path queue.
     fn tryCacheHitReply(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) bool {
-        if (self.config.mode != .recursive) return false;
-
         const alloc = self.recv_pta.reset();
         const query_msg = dns.parseMessage(alloc, data) catch return false;
         if (validateQuery(query_msg)) |_| return false;
@@ -1484,40 +1481,17 @@ const WorkerState = struct {
                 };
             }
         }
-        switch (self.config.mode) {
-            .recursive => {
-                var resolver = recursive.RecursiveResolver.fromContext(
-                    self.resolverContext(),
-                    transports,
-                    .{ .cd = cd, .bypass_cache = bypass_cache },
-                );
-                var result = try resolver.resolve(alloc, name, qtype);
-                // Dupe into arena — points into stack-local resolver.pending_dnskey_buf
-                if (result.prefetch_dnskey_zone) |z| {
-                    result.prefetch_dnskey_zone = alloc.dupe(u8, z) catch null;
-                }
-                return result;
-            },
-            .forward => {
-                var resolver = ForwardingResolver{
-                    .transports = transports,
-                    .io = self.io,
-                };
-                const upstreams = if (self.config.upstreams.len > 0)
-                    self.config.upstreams
-                else
-                    &[_]na.Address{na.initIp4(.{ 8, 8, 8, 8 }, 53)};
-                var last_err: anyerror = error.Timeout;
-                for (upstreams) |upstream| {
-                    const msg = resolver.resolve(alloc, name, qtype, upstream) catch |err| {
-                        last_err = err;
-                        continue;
-                    };
-                    return .{ .message = msg };
-                }
-                return last_err;
-            },
+        var resolver = recursive.RecursiveResolver.fromContext(
+            self.resolverContext(),
+            transports,
+            .{ .cd = cd, .bypass_cache = bypass_cache },
+        );
+        var result = try resolver.resolve(alloc, name, qtype);
+        // Dupe into arena — points into stack-local resolver.pending_dnskey_buf
+        if (result.prefetch_dnskey_zone) |z| {
+            result.prefetch_dnskey_zone = alloc.dupe(u8, z) catch null;
         }
+        return result;
     }
 
     fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, transports: Transports, prefetch_pta: *PerThreadArena) void {

@@ -59,7 +59,6 @@ class HarkConfig:
             f"minimal-responses = {str(self.minimal_responses).lower()}",
             "",
             "[resolver]",
-            'mode = "recursive"',
             f"qname-minimization = {str(self.qname_minimization).lower()}",
             f"dnssec = {str(self.dnssec).lower()}",
             "opportunistic = false",

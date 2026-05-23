@@ -435,7 +435,7 @@ test "parse section tables" {
         \\workers = 4
         \\
         \\[resolver]
-        \\mode = "recursive"
+        \\qname-minimization = true
         \\dnssec = false
     );
     defer result.deinit();
@@ -446,7 +446,7 @@ test "parse section tables" {
     try testing.expectEqual(@as(usize, 1), arr.len);
 
     const resolver = result.table.getTable("resolver").?;
-    try testing.expectEqualStrings("recursive", resolver.getString("mode").?);
+    try testing.expectEqual(true, resolver.getBool("qname-minimization").?);
     try testing.expectEqual(false, resolver.getBool("dnssec").?);
 }
 
@@ -512,8 +512,6 @@ test "full config example" {
         \\workers = 4
         \\
         \\[resolver]
-        \\mode = "recursive"
-        \\upstreams = ["8.8.8.8", "1.1.1.1"]
         \\dnssec = false
         \\qname-minimization = true
         \\
@@ -527,7 +525,6 @@ test "full config example" {
     try testing.expectEqual(@as(i64, 4), server.getInteger("workers").?);
 
     const resolver = result.table.getTable("resolver").?;
-    try testing.expectEqualStrings("recursive", resolver.getString("mode").?);
     try testing.expectEqual(true, resolver.getBool("qname-minimization").?);
 
     const cache = result.table.getTable("cache").?;

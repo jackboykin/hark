@@ -17,7 +17,6 @@ Runs on Linux with io_uring.
 - **Query deduplication** across workers (singleflight)
 - **Multi-threaded server** with `SO_REUSEPORT`, per-query memory cap
 - UDP and TCP transport with EDNS0
-- Forwarding mode as an alternative to recursion
 
 ## Building
 
@@ -38,12 +37,6 @@ Resolve a name recursively (the default):
 hark query example.com AAAA
 hark query example.com --dnssec
 hark query example.com --opportunistic
-```
-
-Forward to an upstream resolver instead:
-
-```
-hark query example.com --forward
 ```
 
 Run as a server (UDP + TCP, TOML config):
@@ -68,7 +61,6 @@ resolution-threads = 4        # pool threads per worker (1..256)
 max-udp-payload = 1232        # advertised OPT + outbound clamp (512..65535)
 
 [resolver]
-mode = "recursive"            # or "forward"
 dnssec = false
 qname-minimization = true     # RFC 9156
 case-randomization = true     # 0x20 QNAME case (Vixie/Dagon)

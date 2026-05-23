@@ -58,7 +58,6 @@ workers = $WORKERS
 resolution-threads = $threads
 
 [resolver]
-mode = "recursive"
 dnssec = false
 qname-minimization = false
 case-randomization = false

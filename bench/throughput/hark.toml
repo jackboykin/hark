@@ -8,7 +8,6 @@ workers = 2
 resolution-threads = 4
 
 [resolver]
-mode = "recursive"
 dnssec = false
 qname-minimization = false
 case-randomization = false

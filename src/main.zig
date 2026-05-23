@@ -8,11 +8,9 @@ const BlockingTcpTransport = hark.blocking_transport.BlockingTcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
 const ConnectionPool = hark.connection_pool.ConnectionPool(hark.connection_pool.PooledConnection);
 const EncryptedNsCache = hark.encrypted_ns.EncryptedNsCache;
-const ForwardingResolver = hark.resolver.ForwardingResolver;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const RttCache = hark.ns_rtt.RttCache;
 const RRsetCache = hark.cache.RRsetCache;
-const Certificate = std.crypto.Certificate;
 const Io = std.Io;
 const Server = hark.server.Server;
 const ServerConfig = hark.config.ServerConfig;
@@ -107,15 +105,10 @@ fn printUsage() void {
         \\Commands:
         \\  dump                Read a raw DNS packet from stdin and print it
         \\  query <name> [type] [options]
-        \\                      Resolve a DNS query (recursive by default)
+        \\                      Resolve a DNS query recursively
         \\  serve [options]     Start DNS server
         \\
         \\Query options:
-        \\  --forward           Use forwarding mode instead of recursive resolution
-        \\  --upstream <addr>   Upstream server (IPv4, IPv6, or [IPv6]:port; default: 8.8.8.8; implies --forward)
-        \\  --dot               Use DNS-over-TLS (forwarding mode, port 853)
-        \\  --dot-host <name>   TLS server hostname for SNI/cert verification
-        \\  --dot-strict        Require hostname verification (RFC 7858 strict mode)
         \\  --opportunistic     Opportunistic encryption to authoritatives (RFC 9539)
         \\  --no-qmin           Disable QNAME minimization (RFC 9156)
         \\  --dnssec            Enable DNSSEC validation
@@ -126,7 +119,7 @@ fn printUsage() void {
         \\  --config <path>     Path to config file (default: /etc/hark/hark.toml)
         \\  --verbose, -v       Enable debug logging (per-query log lines)
         \\
-        \\Defaults: type=A, mode=recursive, QNAME minimization enabled, DNSSEC off
+        \\Defaults: type=A, QNAME minimization enabled, DNSSEC off
         \\
     , .{});
 }
@@ -174,11 +167,6 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     const name = args[0];
     var qtype: dns.RType = .a;
-    var upstream_addr = hark.net_address.initIp4(.{ 8, 8, 8, 8 }, 53);
-    var forward_mode = false;
-    var dot_mode = false;
-    var dot_host: ?[]const u8 = null;
-    var dot_strict = false;
     var no_qmin = false;
     var dnssec_enabled = false;
     var opportunistic = false;
@@ -187,22 +175,6 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
             log_verbose.store(true, .release);
-        } else if (std.mem.eql(u8, args[i], "--forward")) {
-            forward_mode = true;
-        } else if (std.mem.eql(u8, args[i], "--dot")) {
-            dot_mode = true;
-            forward_mode = true; // DoT implies forwarding
-        } else if (std.mem.eql(u8, args[i], "--dot-host")) {
-            i += 1;
-            if (i >= args.len) {
-                log.err("--dot-host requires a hostname", .{});
-                std.process.exit(1);
-            }
-            dot_host = args[i];
-        } else if (std.mem.eql(u8, args[i], "--dot-strict")) {
-            dot_strict = true;
-            dot_mode = true;
-            forward_mode = true;
         } else if (std.mem.eql(u8, args[i], "--opportunistic")) {
             opportunistic = true;
         } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
@@ -211,17 +183,6 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
             dnssec_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-dnssec")) {
             dnssec_enabled = false;
-        } else if (std.mem.eql(u8, args[i], "--upstream")) {
-            i += 1;
-            if (i >= args.len) {
-                log.err("--upstream requires an address", .{});
-                std.process.exit(1);
-            }
-            upstream_addr = hark.config.parseAddress(args[i], 53) orelse {
-                log.err("invalid address: {s}", .{args[i]});
-                std.process.exit(1);
-            };
-            forward_mode = true; // --upstream is meaningless in recursive mode
         } else {
             qtype = parseRType(args[i]) orelse {
                 log.err("unknown record type: {s}", .{args[i]});
@@ -234,28 +195,13 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     defer t.deinit();
     var tcp_t = BlockingTcpTransport.init(io);
 
-    if (dot_strict and dot_host == null) {
-        log.err("--dot-strict requires --dot-host for hostname verification", .{});
-        std.process.exit(1);
-    }
-
-    // Load CA bundle if DoT is enabled
-    var ca_bundle: Certificate.Bundle = .empty;
-    var ca_bundle_loaded = false;
-    if (dot_mode) {
-        ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch {
-            log.err("failed to load system CA certificates", .{});
-            std.process.exit(1);
-        };
-        ca_bundle_loaded = true;
-    }
-    defer if (ca_bundle_loaded) ca_bundle.deinit(allocator);
-
-    // TLS transport (only when --dot is set)
+    // Opportunistic DoT to authoritatives (RFC 9539) skips PKI verification by
+    // design; no CA bundle needed. The TlsTransport is wired regardless so the
+    // recursor can probe encrypted NSes when --opportunistic is set.
     var tls_t = TlsTransport.init(allocator, .{
-        .server_name = dot_host,
-        .strict = dot_strict,
-    }, ca_bundle, io);
+        .server_name = null,
+        .strict = false,
+    }, .empty, io);
 
     // Cache: 16MB cap, 10k max entries
     const cache_alloc = if (builtin.single_threaded)
@@ -270,53 +216,38 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const response = if (forward_mode) blk: {
-        var resolver = ForwardingResolver{
-            .transports = .{
-                .udp = &t,
-                .tcp = &tcp_t,
-                .tls = if (dot_mode) &tls_t else null,
-            },
-            .io = io,
-        };
-        break :blk resolver.resolve(arena.allocator(), name, qtype, upstream_addr) catch |err| {
-            log.err("query failed: {s}", .{@errorName(err)});
-            std.process.exit(1);
-        };
-    } else blk: {
-        var enc_ns = EncryptedNsCache.init(allocator, io);
-        var enc_pool = ConnectionPool.init(allocator, io);
-        defer {
-            enc_ns.awaitProbes();
-            enc_pool.deinit();
-            enc_ns.deinit();
-        }
+    var enc_ns = EncryptedNsCache.init(allocator, io);
+    var enc_pool = ConnectionPool.init(allocator, io);
+    defer {
+        enc_ns.awaitProbes();
+        enc_pool.deinit();
+        enc_ns.deinit();
+    }
 
-        if (opportunistic) tls_t.pool = &enc_pool;
+    if (opportunistic) tls_t.pool = &enc_pool;
 
-        var rtt_cache = RttCache.init(.{ .allocator = allocator, .io = io });
-        defer rtt_cache.deinit();
+    var rtt_cache = RttCache.init(.{ .allocator = allocator, .io = io });
+    defer rtt_cache.deinit();
 
-        var resolver = RecursiveResolver{
-            .transports = .{
-                .udp = &t,
-                .tcp = &tcp_t,
-                .tls = if (opportunistic) &tls_t else null,
-            },
-            .cache = &cache,
-            .qname_minimization = !no_qmin,
-            .dnssec_enabled = dnssec_enabled,
-            .dnssec_aware = dnssec_enabled,
-            .rtt_cache = &rtt_cache,
-            .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
-            .io = io,
-        };
-        const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
-            log.err("query failed: {s}", .{@errorName(err)});
-            std.process.exit(1);
-        };
-        break :blk result.message;
+    var resolver = RecursiveResolver{
+        .transports = .{
+            .udp = &t,
+            .tcp = &tcp_t,
+            .tls = if (opportunistic) &tls_t else null,
+        },
+        .cache = &cache,
+        .qname_minimization = !no_qmin,
+        .dnssec_enabled = dnssec_enabled,
+        .dnssec_aware = dnssec_enabled,
+        .rtt_cache = &rtt_cache,
+        .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
+        .io = io,
     };
+    const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
+        log.err("query failed: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const response = result.message;
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);

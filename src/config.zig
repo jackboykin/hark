@@ -14,8 +14,6 @@ const build_options = @import("build_options");
 
 pub const ServerConfig = struct {
     listen: []Address,
-    mode: Mode,
-    upstreams: []Address,
     /// Override IANA root hints. Empty means "use the compile-time
     /// defaults from recursive.root_hints_default". Tests redirect at
     /// scripted authoritatives via this; operators in split-horizon
@@ -95,11 +93,8 @@ pub const ServerConfig = struct {
 
     allocator: Allocator,
 
-    pub const Mode = enum { recursive, forward };
-
     pub fn deinit(self: *ServerConfig) void {
         self.allocator.free(self.listen);
-        self.allocator.free(self.upstreams);
         self.allocator.free(self.root_hints);
         self.allocator.free(self.allow_from);
         for (self.trust_anchors) |ta| self.allocator.free(ta.digest);
@@ -134,14 +129,11 @@ pub const ServerConfig = struct {
 
 pub const ConfigError = error{
     InvalidListenAddress,
-    InvalidUpstreamAddress,
     InvalidRootHintAddress,
-    InvalidMode,
     InvalidValue,
     InvalidWorkerCount,
     InvalidQueryMemoryLimit,
     InvalidAclEntry,
-    ForwardingRequiresUpstreams,
     /// Operator set a key gated behind `-Dtesting=true` in a production build.
     TestOnlyConfigKey,
     ConfigFileTooLarge,
@@ -156,7 +148,6 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
-    const empty_upstreams = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_root_hints = allocator.alloc(Address, 0) catch return error.OutOfMemory;
     const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
     const empty_trust_anchors = allocator.alloc(dns.DsData, 0) catch return error.OutOfMemory;
@@ -166,8 +157,6 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
 
     return .{
         .listen = listen,
-        .mode = .recursive,
-        .upstreams = empty_upstreams,
         .root_hints = empty_root_hints,
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
@@ -267,19 +256,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 
     // [resolver] section
     if (parsed.table.getTable("resolver")) |resolver| {
-        if (resolver.getString("mode")) |mode_str| {
-            if (mem.eql(u8, mode_str, "recursive")) {
-                cfg.mode = .recursive;
-            } else if (mem.eql(u8, mode_str, "forward")) {
-                cfg.mode = .forward;
-            } else {
-                return error.InvalidMode;
-            }
-        }
-        if (resolver.getStringArray("upstreams")) |addrs| {
-            allocator.free(cfg.upstreams);
-            cfg.upstreams = try parseAddressList(allocator, addrs, 53, error.InvalidUpstreamAddress);
-        }
         if (resolver.getStringArray("root-hints")) |addrs| {
             allocator.free(cfg.root_hints);
             cfg.root_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
@@ -348,11 +324,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.rebinding.extra_allow);
             cfg.rebinding.extra_allow = try parseCidrList(allocator, entries);
         }
-    }
-
-    // Validation
-    if (cfg.mode == .forward and cfg.upstreams.len == 0) {
-        return error.ForwardingRequiresUpstreams;
     }
 
     // Root hints in 127/8 / private space create a self-referencing or
@@ -556,8 +527,6 @@ test "default config" {
     defer cfg.deinit();
 
     try testing.expectEqual(@as(usize, 2), cfg.listen.len);
-    try testing.expectEqual(ServerConfig.Mode.recursive, cfg.mode);
-    try testing.expectEqual(@as(usize, 0), cfg.upstreams.len);
     try testing.expectEqual(@as(usize, 16 * 1024 * 1024), cfg.cache_size);
     try testing.expectEqual(@as(u32, 10_000), cfg.cache_entries);
     try testing.expectEqual(false, cfg.dnssec);
@@ -572,7 +541,6 @@ test "parse full config" {
         \\workers = 2
         \\
         \\[resolver]
-        \\mode = "recursive"
         \\dnssec = true
         \\qname-minimization = false
         \\
@@ -585,39 +553,10 @@ test "parse full config" {
     try testing.expectEqual(@as(usize, 1), cfg.listen.len);
     try testing.expectEqual(@as(u16, 8053), cfg.listen[0].getPort());
     try testing.expectEqual(@as(u16, 2), cfg.workers);
-    try testing.expectEqual(ServerConfig.Mode.recursive, cfg.mode);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(false, cfg.qname_minimization);
     try testing.expectEqual(@as(usize, 8388608), cfg.cache_size);
     try testing.expectEqual(@as(u32, 5000), cfg.cache_entries);
-}
-
-test "parse forwarding config" {
-    var cfg = try parseConfig(testing.allocator,
-        \\[resolver]
-        \\mode = "forward"
-        \\upstreams = ["8.8.8.8", "1.1.1.1"]
-    );
-    defer cfg.deinit();
-
-    try testing.expectEqual(ServerConfig.Mode.forward, cfg.mode);
-    try testing.expectEqual(@as(usize, 2), cfg.upstreams.len);
-}
-
-test "forwarding without upstreams is error" {
-    const result = parseConfig(testing.allocator,
-        \\[resolver]
-        \\mode = "forward"
-    );
-    try testing.expectError(error.ForwardingRequiresUpstreams, result);
-}
-
-test "invalid mode is error" {
-    const result = parseConfig(testing.allocator,
-        \\[resolver]
-        \\mode = "bogus"
-    );
-    try testing.expectError(error.InvalidMode, result);
 }
 
 test "empty config uses defaults" {
@@ -625,7 +564,6 @@ test "empty config uses defaults" {
     defer cfg.deinit();
 
     try testing.expectEqual(@as(usize, 2), cfg.listen.len);
-    try testing.expectEqual(ServerConfig.Mode.recursive, cfg.mode);
 }
 
 test "parse IPv6 listen address" {
