@@ -53,24 +53,3 @@ pub fn fastUniformFloat(io: Io) f32 {
 pub fn fastShuffle(comptime T: type, io: Io, items: []T) void {
     fastPrng(io).random().shuffle(T, items);
 }
-
-/// Random integer in [at_least, at_most] inclusive. Debiased modulo
-/// rejection sampling.
-fn intRangeAtMost(comptime T: type, io: Io, at_least: T, at_most: T) T {
-    const range: @TypeOf(@as(T, 0) +% 1) = at_most - at_least;
-    return at_least +| @as(T, @intCast(uintLessThan(@TypeOf(@as(T, 0) +% 1), io, range + 1)));
-}
-
-/// Random integer in [0, less_than). Rejection sampling.
-fn uintLessThan(comptime T: type, io: Io, less_than: T) T {
-    std.debug.assert(less_than > 0);
-    const bits = @bitSizeOf(T);
-    var buf: [bits / 8]u8 = undefined;
-    while (true) {
-        io.random(&buf);
-        const val = mem.readInt(T, &buf, .little);
-        // Debiased modulo reduction: reject values in the biased tail
-        const rem = val % less_than;
-        if (val -% rem <= (0 -% less_than)) return rem;
-    }
-}

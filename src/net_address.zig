@@ -18,7 +18,6 @@ pub fn randomizeHashSeed(io: std.Io) void {
 }
 
 pub const Address = std.Io.net.IpAddress;
-pub const Ip4 = std.Io.net.Ip4Address;
 pub const Ip6 = std.Io.net.Ip6Address;
 
 pub fn initIp4(bytes: [4]u8, port: u16) Address {
