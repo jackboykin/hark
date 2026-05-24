@@ -185,6 +185,9 @@ fn cloneEntry(
 ) !NsecEntry {
     const owner = try dns.cloneName(alloc, rr.name);
     errdefer dns.freeName(alloc, owner);
+    // `next` rides out to DO=1 clients verbatim via aggressive negative
+    // synthesis; relies on `tryParseMessage`'s RData scrub to lowercase
+    // upstream case first (else an attacker steers cached NSEC bytes).
     const next = try dns.cloneName(alloc, rr.rdata.nsec.next_domain_name);
     errdefer dns.freeName(alloc, next);
     const bitmaps = try alloc.dupe(u8, rr.rdata.nsec.type_bit_maps);

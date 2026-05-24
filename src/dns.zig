@@ -2208,6 +2208,11 @@ pub fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
     return .{ .labels = owned.name.labels };
 }
 
+/// `cloneNameFlatLower` + `toUnownedName` — for scrub sites that don't keep the owned form.
+pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
+    return (try cloneNameFlatLower(allocator, name)).toUnownedName();
+}
+
 fn cloneNameFlatImpl(allocator: Allocator, name: Name, comptime lower: bool) !OwnedFlatName {
     const n = name.labels.len;
     if (n == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
@@ -2346,6 +2351,26 @@ fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
         .txt => |t| allocator.free(t.strings),
         .rrsig => |r| freeWireParsedName(allocator, r.signer_name),
         .nsec => |n| freeWireParsedName(allocator, n.next_domain_name),
+    }
+}
+
+/// Lowercase every embedded `Name` in `rdata` in place. Mirrors the
+/// name-bearing variants of `freeWireParsedRData` (differs only on
+/// `.txt`, which has no names). Pre-scrub label bytes are abandoned,
+/// not freed; only safe under an arena.
+pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
+    switch (rdata.*) {
+        .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
+        .ns => |*n| n.* = try cloneNameLower(allocator, n.*),
+        .cname => |*n| n.* = try cloneNameLower(allocator, n.*),
+        .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
+        .mx => |*m| m.exchange = try cloneNameLower(allocator, m.exchange),
+        .soa => |*s| {
+            s.mname = try cloneNameLower(allocator, s.mname);
+            s.rname = try cloneNameLower(allocator, s.rname);
+        },
+        .rrsig => |*r| r.signer_name = try cloneNameLower(allocator, r.signer_name),
+        .nsec => |*n| n.next_domain_name = try cloneNameLower(allocator, n.next_domain_name),
     }
 }
 

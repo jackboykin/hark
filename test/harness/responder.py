@@ -248,12 +248,20 @@ class Responder:
         # case is mandatory (RFC 1035 §3.1) and load-bearing for hark's
         # 0x20 randomization (RFC 5452 §9.2); replacing it with entry.question
         # would force hark into a lowercase retry per upstream query.
+        # `ADJUST force_lower_qname` is the explicit opt-out, used by the
+        # case-mangling regression test.
         r = dns.message.make_response(query, recursion_available=False)
         # Overwriting `flags` rather than OR-ing means scenarios must
         # include QR explicitly; force it here so that's structural, not
         # convention.
         r.flags = entry.reply_flags | dns.flags.QR
         r.set_rcode(entry.reply_rcode)
+
+        if "force_lower_qname" in entry.adjust and r.question:
+            q = r.question[0]
+            r.question[0] = dns.rrset.RRset(
+                dns.name.from_text(q.name.to_text().lower()), q.rdclass, q.rdtype
+            )
 
         r.answer = list(entry.answer)
         r.authority = list(entry.authority)

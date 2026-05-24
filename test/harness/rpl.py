@@ -59,7 +59,10 @@ MATCH_VALID_FLAGS = frozenset({
 
 # ADJUST directive: dnspython's make_response already copies the ID, so
 # copy_id is a no-op; copy_query echoes the query's QUESTION section.
-ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query"})
+# `force_lower_qname` opts the response out of the verbatim-echo default
+# and forces the question name to lowercase — used to test hark's 0x20
+# echo verification (`eqlExact` mismatch → markCaseBroken + retry).
+ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query", "force_lower_qname"})
 
 # Section names → dnspython section indices via parse helper. QUERY_LOG is a
 # hark-only section used inside CHECK_QUERY_LOG entries; lines are
@@ -119,6 +122,8 @@ class Entry:
     # No-op on response-template entries (the responder always returns
     # whatever records the scenario declared).
     want_dnssec: bool = False
+    # Parsed ADJUST flags the responder acts on (most are documentation-only).
+    adjust: set[str] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -367,10 +372,12 @@ class _Parser:
                 self._validate_flags(flags, MATCH_VALID_FLAGS, "MATCH")
                 entry.match.update(flags)
             elif head == "ADJUST":
-                # Parsed for typo-rejection only — copy_id is implicit in
-                # `make_response`, copy_query is implicit since the responder
-                # echoes the query verbatim.
-                self._validate_flags(tokens[1:], ADJUST_VALID_FLAGS, "ADJUST")
+                # `copy_id` / `copy_query` are implicit in `make_response`
+                # + the verbatim-echo default; only `force_lower_qname` is
+                # acted on by the responder.
+                flags = [t.lower() for t in tokens[1:]]
+                self._validate_flags(flags, ADJUST_VALID_FLAGS, "ADJUST")
+                entry.adjust.update(flags)
             elif head == "REPLY":
                 self._parse_reply(entry, tokens[1:])
             elif head == "SECTION":

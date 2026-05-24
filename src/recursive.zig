@@ -92,11 +92,11 @@ const max_minimize_count = 10;
 /// server address and error name at debug level — warn would be a DoS
 /// amplifier for an attacker controlling an authoritative server.
 ///
-/// After parse, lowercases the owner `name` on every answer/authority/
-/// additional RR so 0x20-randomized case from upstream cannot leak into
-/// client responses. Leaves the question section (eqlExact-compared
-/// against the outgoing query) and RData embedded names (DNSSEC
-/// lowercases those at canonical form per RFC 4035 §5.3.2) untouched.
+/// After parse, lowercases the owner `name` and every embedded RData
+/// name so upstream-randomized case cannot leak into client responses
+/// or downstream queries (e.g. DNSKEY lookups built from RRSIG signer).
+/// Leaves the question section alone — `eqlExact` compares it byte-for-
+/// byte against the outgoing 0x20-echo query.
 fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Address) error{OutOfMemory}!?dns.Message {
     const msg = dns.parseMessage(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -111,9 +111,12 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
     // mutable storage typed `[]const`. The pre-scrub label bytes alias
     // the upstream wire buffer; cloneNameFlatLower's arena allocation
     // replaces them.
-    for (@constCast(msg.answers)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
-    for (@constCast(msg.authorities)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
-    for (@constCast(msg.additionals)) |*rr| rr.name = (try dns.cloneNameFlatLower(allocator, rr.name)).toUnownedName();
+    inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
+        for (@constCast(section)) |*rr| {
+            rr.name = try dns.cloneNameLower(allocator, rr.name);
+            try dns.lowercaseRDataNames(allocator, &rr.rdata);
+        }
+    }
 
     return msg;
 }
@@ -1321,14 +1324,14 @@ pub const RecursiveResolver = struct {
         switch (wc_result) {
             .hit => |h| {
                 // Rewrite owner names to the queried name (RFC 4592 §2.2).
-                // Lowercase via `cloneNameFlatLower` to keep client-typed
-                // case out of the synthesized owner. Clear `rr.wire` /
-                // `rr.wire_ttl_offset` so `writeResourceRecord`'s fast
-                // path does not memcpy the cached `*.CE` wire blob and
-                // overwrite our rewrite. RFC 4035 §3.1.3.4: the RRSIG's
-                // labels field stays at the wildcard depth so a DO=1
-                // client reconstructs `*.CE` from qname and revalidates.
-                const lc_target = (try dns.cloneNameFlatLower(allocator, target_name)).toUnownedName();
+                // Lowercase to keep client-typed case out of the
+                // synthesized owner. Clear `rr.wire` / `rr.wire_ttl_offset`
+                // so `writeResourceRecord`'s fast path does not memcpy the
+                // cached `*.CE` wire blob and overwrite our rewrite. RFC
+                // 4035 §3.1.3.4: the RRSIG's labels field stays at the
+                // wildcard depth so a DO=1 client reconstructs `*.CE`
+                // from qname and revalidates.
+                const lc_target = try dns.cloneNameLower(allocator, target_name);
                 for (h.records) |*rr| {
                     rr.name = lc_target;
                     rr.wire = null;
@@ -4020,40 +4023,13 @@ test "concatRRs handles OOM without leaking" {
 // 0x20-echo verification still works.
 
 fn buildMixedCaseAnswerPacket(buf: *[64]u8) []const u8 {
-    // Header: id=0x1234, flags=0x8180 (QR=1, RA=1, RCODE=0), qd=1, an=1
-    mem.writeInt(u16, buf[0..2], 0x1234, .big);
-    mem.writeInt(u16, buf[2..4], 0x8180, .big);
-    mem.writeInt(u16, buf[4..6], 1, .big);
-    mem.writeInt(u16, buf[6..8], 1, .big);
-    mem.writeInt(u16, buf[8..10], 0, .big);
-    mem.writeInt(u16, buf[10..12], 0, .big);
-    // Question name `X.coM` at offset 12.
-    buf[12] = 1;
-    buf[13] = 'X';
-    buf[14] = 3;
-    buf[15] = 'c';
-    buf[16] = 'o';
-    buf[17] = 'M';
-    buf[18] = 0;
-    // Qtype=A(1), Qclass=IN(1).
-    mem.writeInt(u16, buf[19..21], 1, .big);
-    mem.writeInt(u16, buf[21..23], 1, .big);
-    // Answer name: compression pointer to offset 12 (the question name
-    // labels in `X.coM`). This is the worst case for the bug: the
-    // upstream-randomized question name's bytes are the *only* storage
-    // for the answer owner name labels.
-    buf[23] = 0xC0;
-    buf[24] = 12;
-    // Type=A, Class=IN, TTL=300, RDLENGTH=4, RDATA=192.0.2.1.
-    mem.writeInt(u16, buf[25..27], 1, .big);
-    mem.writeInt(u16, buf[27..29], 1, .big);
-    mem.writeInt(u32, buf[29..33], 300, .big);
-    mem.writeInt(u16, buf[33..35], 4, .big);
-    buf[35] = 192;
-    buf[36] = 0;
-    buf[37] = 2;
-    buf[38] = 1;
-    return buf[0..39];
+    var pos = writeMixedCaseQuestion(buf, .a);
+    pos = writeAnswerHeader(buf, pos, .a, 4);
+    buf[pos] = 192;
+    buf[pos + 1] = 0;
+    buf[pos + 2] = 2;
+    buf[pos + 3] = 1;
+    return buf[0 .. pos + 4];
 }
 
 test "tryParseMessage lowercases answer owner names but preserves question case" {
@@ -4166,4 +4142,114 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
     // held `*.example.com`.
     try testing.expect(ans.wire == null);
     try testing.expectEqual(@as(u16, 0), ans.wire_ttl_offset);
+}
+
+// ── tryParseMessage 0x20 RDATA-name scrub tests ────────────────────────
+//
+// Worst case: a compression pointer in RDATA aliasing back to the
+// mixed-case question name, so the parser hands us label slices that
+// point straight at the upstream-chosen bytes.
+
+/// Header + mixed-case question name `X.coM` + qtype/qclass. Returns
+/// the offset where the answer RR starts.
+fn writeMixedCaseQuestion(buf: []u8, qtype: dns.RType) usize {
+    mem.writeInt(u16, buf[0..2], 0x1234, .big);
+    mem.writeInt(u16, buf[2..4], 0x8180, .big);
+    mem.writeInt(u16, buf[4..6], 1, .big); // qd
+    mem.writeInt(u16, buf[6..8], 1, .big); // an
+    mem.writeInt(u16, buf[8..10], 0, .big); // ns
+    mem.writeInt(u16, buf[10..12], 0, .big); // ar
+    @memcpy(buf[12..19], "\x01X\x03coM\x00");
+    mem.writeInt(u16, buf[19..21], @intFromEnum(qtype), .big);
+    mem.writeInt(u16, buf[21..23], 1, .big); // class IN
+    return 23;
+}
+
+/// Answer RR header: owner = pointer to qname at offset 12, then
+/// type/class/ttl/rdlength. Returns the RDATA write offset.
+fn writeAnswerHeader(buf: []u8, start: usize, rtype: dns.RType, rdlength: u16) usize {
+    buf[start] = 0xC0;
+    buf[start + 1] = 12;
+    mem.writeInt(u16, buf[start + 2 ..][0..2], @intFromEnum(rtype), .big);
+    mem.writeInt(u16, buf[start + 4 ..][0..2], 1, .big); // class IN
+    mem.writeInt(u32, buf[start + 6 ..][0..4], 300, .big); // ttl
+    mem.writeInt(u16, buf[start + 10 ..][0..2], rdlength, .big);
+    return start + 12;
+}
+
+test "tryParseMessage lowercases CNAME RDATA name via compression pointer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    var pos = writeMixedCaseQuestion(&buf, .cname);
+    pos = writeAnswerHeader(&buf, pos, .cname, 2);
+    buf[pos] = 0xC0;
+    buf[pos + 1] = 12;
+    pos += 2;
+
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 53);
+    const msg = (try tryParseMessage(arena.allocator(), buf[0..pos], server)) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    const cname = msg.answers[0].rdata.cname;
+    try testing.expectEqual(@as(usize, 2), cname.labels.len);
+    try testing.expectEqualStrings("x", cname.labels[0]);
+    try testing.expectEqualStrings("com", cname.labels[1]);
+}
+
+test "tryParseMessage lowercases SOA mname AND rname via compression pointers" {
+    // Dual-name arm — catches a fix that scrubs mname but forgets rname.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    var pos = writeMixedCaseQuestion(&buf, .soa);
+    pos = writeAnswerHeader(&buf, pos, .soa, 24);
+    // mname = ptr to qname, rname = ptr to qname, then 5 u32s.
+    buf[pos] = 0xC0;
+    buf[pos + 1] = 12;
+    buf[pos + 2] = 0xC0;
+    buf[pos + 3] = 12;
+    mem.writeInt(u32, buf[pos + 4 ..][0..4], 1, .big); // serial
+    mem.writeInt(u32, buf[pos + 8 ..][0..4], 3600, .big); // refresh
+    mem.writeInt(u32, buf[pos + 12 ..][0..4], 600, .big); // retry
+    mem.writeInt(u32, buf[pos + 16 ..][0..4], 86400, .big); // expire
+    mem.writeInt(u32, buf[pos + 20 ..][0..4], 3600, .big); // minimum
+    pos += 24;
+
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 53);
+    const msg = (try tryParseMessage(arena.allocator(), buf[0..pos], server)) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    const soa = msg.answers[0].rdata.soa;
+    try testing.expectEqualStrings("x", soa.mname.labels[0]);
+    try testing.expectEqualStrings("com", soa.mname.labels[1]);
+    try testing.expectEqualStrings("x", soa.rname.labels[0]);
+    try testing.expectEqualStrings("com", soa.rname.labels[1]);
+}
+
+test "tryParseMessage lowercases NSEC next_domain_name via compression pointer" {
+    // NSEC RDATA rides out of aggressive negative-synthesis answers
+    // verbatim via `nsecEntryToRecord` in nsec_cache.zig. Pre-fix,
+    // upstream-chosen case in next_domain_name leaked to DO=1 clients.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    var pos = writeMixedCaseQuestion(&buf, .nsec);
+    // rdlength = 2 (next_domain ptr) + 3 (bitmap: window=0, len=1, A-bit)
+    pos = writeAnswerHeader(&buf, pos, .nsec, 5);
+    buf[pos] = 0xC0;
+    buf[pos + 1] = 12;
+    buf[pos + 2] = 0; // window 0
+    buf[pos + 3] = 1; // bitmap length
+    buf[pos + 4] = 0x40; // A (rtype 1) bit
+    pos += 5;
+
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 53);
+    const msg = (try tryParseMessage(arena.allocator(), buf[0..pos], server)) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    const nsec = msg.answers[0].rdata.nsec;
+    try testing.expectEqual(@as(usize, 2), nsec.next_domain_name.labels.len);
+    try testing.expectEqualStrings("x", nsec.next_domain_name.labels[0]);
+    try testing.expectEqualStrings("com", nsec.next_domain_name.labels[1]);
 }

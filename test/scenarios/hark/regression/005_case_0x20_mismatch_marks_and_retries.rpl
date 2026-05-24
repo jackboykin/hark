@@ -1,0 +1,55 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN 0x20-case mismatch on echoed question marks server and retries lowercase
+
+; End-to-end wire-up test for the 0x20 echo-verify path: `eqlExact`
+; mismatch in src/recursive.zig must fire `markCaseBroken` and
+; `continue :retry`, producing a second (lowercase) query to the same
+; auth. Unit tests cover the predicate and CaseState in isolation;
+; only this scenario exercises the full loop.
+;
+; The qname has 36 0x20-eligible letters → probability the random case
+; happens to be all-lowercase (no mismatch, no retry) is 1/2^36 ≈ 10⁻¹¹.
+
+RANGE_BEGIN 0 100
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query force_lower_qname
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      abcdefghijklmnopqrstuvwxyz.example.com. IN A
+    SECTION ANSWER
+      abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    abcdefghijklmnopqrstuvwxyz.example.com. IN A
+ENTRY_END
+
+; Retry succeeded → client sees the real answer.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    abcdefghijklmnopqrstuvwxyz.example.com. IN A
+  SECTION ANSWER
+    abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+; Two queries to the same auth ⇒ the mismatch path fired
+; (0x20-randomized attempt + lowercase retry after markCaseBroken).
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    abcdefghijklmnopqrstuvwxyz.example.com. A 127.0.10.1
+    abcdefghijklmnopqrstuvwxyz.example.com. A 127.0.10.1
+ENTRY_END
+
+SCENARIO_END
