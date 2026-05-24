@@ -53,8 +53,6 @@ pub fn stageLengthPrefixed(buf: *[2 + edns_udp_payload]u8, wire_query: []const u
 
 pub const OpCode = enum(u4) {
     query = 0,
-    iquery = 1,
-    status = 2,
     _,
 };
 
