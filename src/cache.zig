@@ -118,6 +118,56 @@ fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
     };
 }
 
+/// Variant for the RRset main-records path: the owner name is borrowed
+/// from `CachedRRset.shared_name_backing`, not cloned per-record. The
+/// returned `CachedRecord.name` MUST NOT be freed via `dns.freeName`.
+fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_name: dns.Name) !CachedRecord {
+    var wire_stage: [rr_wire_stage_len]u8 = undefined;
+    const built = try dns.buildResourceRecordWire(&wire_stage, rr);
+    const wire_owned = try alloc.dupe(u8, built.bytes);
+    errdefer alloc.free(wire_owned);
+    const cloned_rdata = try cloneRData(alloc, rr.rdata);
+    return .{
+        .name = shared_name,
+        .rtype = rr.rtype,
+        .rclass = rr.rclass,
+        .rdata = cloned_rdata,
+        .wire = wire_owned,
+        .wire_ttl_offset = built.ttl_offset,
+    };
+}
+
+/// Free a CachedRecord whose `.name` is a borrowed view (e.g. one stored
+/// in `CachedRRset.records`). Skips `dns.freeName` — the name's backing
+/// is owned by the parent RRset and freed once via `shared_name_backing`.
+fn freeBorrowedRecord(alloc: Allocator, cr: CachedRecord) void {
+    dns.freeRData(alloc, cr.rdata);
+    alloc.free(cr.wire);
+}
+
+/// Build a single-allocation NameFlat-style backing for an RRset's shared
+/// owner name. Returns the backing slice and a `dns.Name` whose labels
+/// view into it. For root names (`labels.len == 0`) returns no allocation
+/// and the empty-labels sentinel. Free with `alloc.free(backing)` when
+/// the backing is non-empty.
+fn buildSharedNameBacking(alloc: Allocator, name: dns.Name) !struct { backing: []align(@alignOf([]const u8)) u8, name: dns.Name } {
+    if (name.labels.len == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
+    const slice_bytes = @sizeOf([]const u8) * name.labels.len;
+    var total_bytes: usize = 0;
+    for (name.labels) |label| total_bytes += label.len;
+    const alignment: std.mem.Alignment = comptime .fromByteUnits(@alignOf([]const u8));
+    const backing = try alloc.alignedAlloc(u8, alignment, slice_bytes + total_bytes);
+    const labels_ptr: [*]([]const u8) = @ptrCast(backing.ptr);
+    const labels: [][]const u8 = labels_ptr[0..name.labels.len];
+    var offset: usize = slice_bytes;
+    for (name.labels, 0..) |label, i| {
+        @memcpy(backing[offset..][0..label.len], label);
+        labels[i] = backing[offset..][0..label.len];
+        offset += label.len;
+    }
+    return .{ .backing = backing, .name = .{ .labels = labels } };
+}
+
 const CachedRRset = struct {
     records: []CachedRecord,
     /// RRSIGs covering `records` (same name, RRSIG.type_covered == records'
@@ -133,6 +183,15 @@ const CachedRRset = struct {
     /// served from cache would lack the "no closer match" denial and
     /// reject the response as bogus.
     nsec_proofs: []CachedRecord = &.{},
+    /// Single allocation backing the owner name shared by every entry in
+    /// `records`. Layout matches `dns.cloneNameFlat`: `[]const u8` slice
+    /// headers at offset 0, then label bytes packed contiguously. Empty
+    /// (`&.{}`) for root-name RRsets. Never call `dns.freeName` on a
+    /// `records[i].name` — those are views into this buffer. The
+    /// alignment annotation preserves the original `alignedAlloc` value
+    /// so `alloc.free` infers the right alignment; same slice footprint
+    /// as `[]u8` (alignment is a type-level property of the pointer).
+    shared_name_backing: []align(@alignOf([]const u8)) u8 = &.{},
     expires_at: i64,
     original_ttl: u32,
     stored_at: i64,
@@ -1180,15 +1239,27 @@ pub const RRsetCache = struct {
             slot.alloc.free(slot.key.name);
             return;
         };
+
+        // One shared owner-name backing for the whole RRset (mirrors the
+        // read path's cloneRRset). All records' `.name` views into this.
+        const shared = buildSharedNameBacking(slot.alloc, matches[0].name) catch {
+            slot.alloc.free(cached_records);
+            slot.alloc.free(slot.key.name);
+            return;
+        };
+        const shared_name_backing = shared.backing;
+        const shared_name = shared.name;
+
         var idx: usize = 0;
         for (matches) |other| {
-            cached_records[idx] = buildCachedRecord(slot.alloc, other) catch break;
+            cached_records[idx] = buildCachedRecordSharedName(slot.alloc, other, shared_name) catch break;
             idx += 1;
         }
         if (idx == 0 or idx < matches.len) {
             // Partial clone failure — don't cache an incomplete RRset.
-            for (cached_records[0..idx]) |cr| freeCachedRecord(slot.alloc, cr);
+            for (cached_records[0..idx]) |cr| freeBorrowedRecord(slot.alloc, cr);
             slot.alloc.free(cached_records);
+            if (shared_name_backing.len > 0) slot.alloc.free(shared_name_backing);
             slot.alloc.free(slot.key.name);
             return;
         }
@@ -1220,13 +1291,15 @@ pub const RRsetCache = struct {
             .records = cached_records,
             .sigs = cached_sigs,
             .nsec_proofs = cached_proofs,
+            .shared_name_backing = shared_name_backing,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
             .stored_at = now,
             .security_status = status,
         } }) catch {
-            for (cached_records) |cr| freeCachedRecord(slot.alloc, cr);
+            for (cached_records) |cr| freeBorrowedRecord(slot.alloc, cr);
             slot.alloc.free(cached_records);
+            if (shared_name_backing.len > 0) slot.alloc.free(shared_name_backing);
             for (cached_sigs) |cr| freeCachedRecord(slot.alloc, cr);
             if (cached_sigs.len > 0) slot.alloc.free(cached_sigs);
             for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
@@ -1366,8 +1439,11 @@ fn freeKey(alloc: Allocator, key: CacheKey) void {
 fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
     switch (entry) {
         .positive => |rrset| {
-            for (rrset.records) |cr| freeCachedRecord(alloc, cr);
+            // records[] borrow .name from shared_name_backing — free rdata
+            // and wire only, then the records slice, then the shared backing.
+            for (rrset.records) |cr| freeBorrowedRecord(alloc, cr);
             alloc.free(rrset.records);
+            if (rrset.shared_name_backing.len > 0) alloc.free(rrset.shared_name_backing);
             for (rrset.sigs) |cr| freeCachedRecord(alloc, cr);
             if (rrset.sigs.len > 0) alloc.free(rrset.sigs);
             for (rrset.nsec_proofs) |cr| freeCachedRecord(alloc, cr);
@@ -2835,6 +2911,42 @@ test "negative-store paths handle backing-allocator OOM without leaking" {
             if (err != error.OutOfMemory) return err;
         };
         try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
+    }
+}
+
+test "multi-record RRset round-trip preserves shared owner name" {
+    // Catches wrong-offset bugs in the shared-name backing: every record's
+    // owner name must compare equal to the original after store -> lookup.
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const labels = &[_][]const u8{ "multi", "example", "com" };
+    const n1 = try makeTestName(alloc, labels);
+    const n2 = try makeTestName(alloc, labels);
+    const n3 = try makeTestName(alloc, labels);
+    const answers = try alloc.alloc(dns.ResourceRecord, 3);
+    answers[0] = .{ .name = n1, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    answers[1] = .{ .name = n2, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
+    answers[2] = .{ .name = n3, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 9, 10, 11, 12 } } };
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const r = cache.lookup(arena.allocator(), "multi.example.com", .a, .in) orelse return error.TestExpectedHit;
+    switch (r) {
+        .hit => |h| {
+            try testing.expectEqual(@as(usize, 3), h.records.len);
+            // All three records' owner names must round-trip equal — a wrong
+            // offset in the shared-name builder would corrupt one or more.
+            const expected = try makeTestName(arena.allocator(), labels);
+            for (h.records) |rec| try testing.expect(rec.name.eql(expected));
+        },
+        .negative => return error.TestExpectedHit,
     }
 }
 
