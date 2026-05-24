@@ -2182,8 +2182,20 @@ pub const NameFlat = struct {
 /// only with arena allocators. Designed for the cache read path where
 /// the caller's arena owns lifetime.
 pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
+    const owned = try cloneNameFlatOwned(allocator, name);
+    return .{ .labels = owned.name.labels };
+}
+
+/// Like `cloneNameFlat` but also returns the raw backing slice so the
+/// caller can free it later. Used by callers that own the allocation
+/// across a non-arena boundary (e.g. the cache, which frees a single
+/// shared-owner buffer when evicting an RRset).
+pub fn cloneNameFlatOwned(allocator: Allocator, name: Name) !struct {
+    backing: []align(@alignOf([]const u8)) u8,
+    name: Name,
+} {
     const n = name.labels.len;
-    if (n == 0) return .{ .labels = &.{} };
+    if (n == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
     const slice_bytes = @sizeOf([]const u8) * n;
     var total_bytes: usize = 0;
     for (name.labels) |label| total_bytes += label.len;
@@ -2198,7 +2210,7 @@ pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
         labels[i] = buf[offset..][0..label.len];
         offset += label.len;
     }
-    return .{ .labels = labels };
+    return .{ .backing = buf, .name = .{ .labels = labels } };
 }
 
 /// Like `cloneNameFlat` but lowercases ASCII letters in-flight. Used to

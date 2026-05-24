@@ -145,29 +145,6 @@ fn freeBorrowedRecord(alloc: Allocator, cr: CachedRecord) void {
     alloc.free(cr.wire);
 }
 
-/// Build a single-allocation NameFlat-style backing for an RRset's shared
-/// owner name. Returns the backing slice and a `dns.Name` whose labels
-/// view into it. For root names (`labels.len == 0`) returns no allocation
-/// and the empty-labels sentinel. Free with `alloc.free(backing)` when
-/// the backing is non-empty.
-fn buildSharedNameBacking(alloc: Allocator, name: dns.Name) !struct { backing: []align(@alignOf([]const u8)) u8, name: dns.Name } {
-    if (name.labels.len == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
-    const slice_bytes = @sizeOf([]const u8) * name.labels.len;
-    var label_bytes: usize = 0;
-    for (name.labels) |label| label_bytes += label.len;
-    const alignment: std.mem.Alignment = comptime .fromByteUnits(@alignOf([]const u8));
-    const backing = try alloc.alignedAlloc(u8, alignment, slice_bytes + label_bytes);
-    const labels_ptr: [*]([]const u8) = @ptrCast(backing.ptr);
-    const labels: [][]const u8 = labels_ptr[0..name.labels.len];
-    var offset: usize = slice_bytes;
-    for (name.labels, 0..) |label, i| {
-        @memcpy(backing[offset..][0..label.len], label);
-        labels[i] = backing[offset..][0..label.len];
-        offset += label.len;
-    }
-    return .{ .backing = backing, .name = .{ .labels = labels } };
-}
-
 const CachedRRset = struct {
     records: []CachedRecord,
     /// RRSIGs covering `records` (same name, RRSIG.type_covered == records'
@@ -1225,7 +1202,7 @@ pub const RRsetCache = struct {
 
         // One shared owner-name backing for the whole RRset (mirrors the
         // read path's cloneRRset). All records' `.name` views into this.
-        const shared = buildSharedNameBacking(slot.alloc, matches[0].name) catch {
+        const shared = dns.cloneNameFlatOwned(slot.alloc, matches[0].name) catch {
             slot.alloc.free(cached_records);
             slot.alloc.free(slot.key.name);
             return;
