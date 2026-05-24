@@ -7,7 +7,12 @@ const special_use = @import("special_use.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const Transports = @import("transport.zig").Transports;
+
+pub const Transports = struct {
+    udp: *BlockingUdpTransport,
+    tcp_enabled: bool,
+    tls: ?*TlsTransport = null,
+};
 const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("net_address.zig").AddressKey;

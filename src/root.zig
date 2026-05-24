@@ -18,7 +18,6 @@ pub const nsec_cache = @import("nsec_cache.zig");
 pub const counting_allocator = @import("counting_allocator.zig");
 pub const bg_group = @import("bg_group.zig");
 pub const blocking_transport = @import("blocking_transport.zig");
-pub const transport = @import("transport.zig");
 pub const rand = @import("rand.zig");
 pub const monotonic = @import("monotonic.zig");
 pub const sys = @import("sys.zig");
