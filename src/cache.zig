@@ -150,9 +150,14 @@ const NegativeEntry = struct {
     security_status: SecurityStatus = .unchecked,
 };
 
+/// Positive is the common case (≥90% of real-workload entries) and stays
+/// inline. Negative is rare and boxed so the union is sized by CachedRRset
+/// (~72 B) instead of NegativeEntry (~152 B). Saves ~80 B per slot, ~720 KiB
+/// at 10k entries / 90% positive. Negative pointer lives on the same counting
+/// allocator as the rest of the entry, so it still counts against byte budget.
 const CacheEntry = union(enum) {
     positive: CachedRRset,
-    negative: NegativeEntry,
+    negative: *NegativeEntry,
 
     fn expiresAt(self: CacheEntry) i64 {
         return switch (self) {
@@ -900,7 +905,14 @@ pub const RRsetCache = struct {
         const now = self.now_fn();
         // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
         const capped_ttl = @min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl);
-        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
+        const neg = slot.alloc.create(NegativeEntry) catch {
+            freeCachedRecord(slot.alloc, cached_soa);
+            for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
+            if (cached_proofs.len > 0) slot.alloc.free(cached_proofs);
+            slot.alloc.free(slot.key.name);
+            return;
+        };
+        neg.* = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
@@ -908,7 +920,9 @@ pub const RRsetCache = struct {
             .soa = cached_soa,
             .nsec_proofs = cached_proofs,
             .security_status = security_status,
-        } }) catch {
+        };
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = neg }) catch {
+            slot.alloc.destroy(neg);
             freeCachedRecord(slot.alloc, cached_soa);
             for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
             if (cached_proofs.len > 0) slot.alloc.free(cached_proofs);
@@ -944,14 +958,20 @@ pub const RRsetCache = struct {
         // 5 minutes; NXDOMAIN/NODATA at RFC 2308 §5's 3h SHOULD ceiling.
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         const capped_ttl = @min(ttl, ceiling);
-        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
+        const neg = slot.alloc.create(NegativeEntry) catch {
+            slot.alloc.free(slot.key.name);
+            return;
+        };
+        neg.* = .{
             .rcode = rcode,
             .expires_at = now + @as(i64, capped_ttl),
             .original_ttl = capped_ttl,
             .stored_at = now,
             .soa = null,
             .security_status = security_status,
-        } }) catch {
+        };
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = neg }) catch {
+            slot.alloc.destroy(neg);
             slot.alloc.free(slot.key.name);
             return;
         };
@@ -1357,6 +1377,7 @@ fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
             if (neg.soa) |soa| freeCachedRecord(alloc, soa);
             for (neg.nsec_proofs) |cr| freeCachedRecord(alloc, cr);
             if (neg.nsec_proofs.len > 0) alloc.free(neg.nsec_proofs);
+            alloc.destroy(neg);
         },
     }
 }
@@ -2754,6 +2775,78 @@ test "byte-pressure check happens before key-name dupe" {
     }
     try testing.expect(landed);
     try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) >= 1);
+}
+
+fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
+    // Drive both negative-store paths so injected failures cover the
+    // alloc.create(NegativeEntry) failure + map.put rollback added in D6.
+    test_time = 1000;
+    var cache = RRsetCache.init(.{
+        .backing = failing_alloc,
+        .max_bytes = 1024 * 1024,
+        .max_entries = 64,
+        .io = testing.io,
+    });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Bare negative (no SOA, no proofs): exercises the simpler path.
+    cache.storeNegativeBare("missing.test", .a, .in, .name_error, 60, .unchecked);
+
+    // Negative with SOA + NSEC proofs: exercises the larger rollback path.
+    var input_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer input_arena.deinit();
+    const ia = input_arena.allocator();
+
+    const zone_name = try makeTestName(ia, &.{"test"});
+    const soa_name = try makeTestName(ia, &.{"test"});
+    const mname = try makeTestName(ia, &.{ "ns1", "test" });
+    const rname = try makeTestName(ia, &.{ "admin", "test" });
+    const auths = try ia.alloc(dns.ResourceRecord, 1);
+    auths[0] = .{
+        .name = soa_name,
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .soa = .{
+            .mname = mname,
+            .rname = rname,
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 600,
+            .expire = 86400,
+            .minimum = 300,
+        } },
+    };
+    cache.storeNegative("nodata.test", .a, .in, .no_error, auths, zone_name, .unchecked);
+}
+
+test "negative-store paths handle backing-allocator OOM without leaking" {
+    // Catches the D6 boxing rollbacks: alloc.create(NegativeEntry) failure
+    // and the map.put rollback that must alloc.destroy() the boxed pointer.
+    var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
+    try runStoreNegativeUnderFailing(counter.allocator());
+    const total = counter.alloc_index;
+
+    var idx: usize = 0;
+    while (idx < total) : (idx += 1) {
+        var f = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        runStoreNegativeUnderFailing(f.allocator()) catch |err| {
+            if (err != error.OutOfMemory) return err;
+        };
+        try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
+    }
+}
+
+test "CacheEntry size shrinks with boxed negative variant" {
+    // Sanity check that boxing actually saved bytes. CachedRRset is the
+    // expected payload size; the union should not balloon past that + tag.
+    const positive_size = @sizeOf(CachedRRset);
+    const entry_size = @sizeOf(CacheEntry);
+    // Negative pointer is 8B + tag + alignment; union body must equal
+    // sizeof(CachedRRset) since CachedRRset is the larger variant now.
+    try testing.expect(entry_size <= positive_size + @sizeOf(usize));
+    try testing.expect(@sizeOf(NegativeEntry) > positive_size); // sanity
 }
 
 test "storeOneRRset handles backing-allocator OOM without leaking" {
