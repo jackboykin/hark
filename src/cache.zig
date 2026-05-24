@@ -153,10 +153,10 @@ fn freeBorrowedRecord(alloc: Allocator, cr: CachedRecord) void {
 fn buildSharedNameBacking(alloc: Allocator, name: dns.Name) !struct { backing: []align(@alignOf([]const u8)) u8, name: dns.Name } {
     if (name.labels.len == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
     const slice_bytes = @sizeOf([]const u8) * name.labels.len;
-    var total_bytes: usize = 0;
-    for (name.labels) |label| total_bytes += label.len;
+    var label_bytes: usize = 0;
+    for (name.labels) |label| label_bytes += label.len;
     const alignment: std.mem.Alignment = comptime .fromByteUnits(@alignOf([]const u8));
-    const backing = try alloc.alignedAlloc(u8, alignment, slice_bytes + total_bytes);
+    const backing = try alloc.alignedAlloc(u8, alignment, slice_bytes + label_bytes);
     const labels_ptr: [*]([]const u8) = @ptrCast(backing.ptr);
     const labels: [][]const u8 = labels_ptr[0..name.labels.len];
     var offset: usize = slice_bytes;
@@ -184,13 +184,8 @@ const CachedRRset = struct {
     /// reject the response as bogus.
     nsec_proofs: []CachedRecord = &.{},
     /// Single allocation backing the owner name shared by every entry in
-    /// `records`. Layout matches `dns.cloneNameFlat`: `[]const u8` slice
-    /// headers at offset 0, then label bytes packed contiguously. Empty
-    /// (`&.{}`) for root-name RRsets. Never call `dns.freeName` on a
-    /// `records[i].name` — those are views into this buffer. The
-    /// alignment annotation preserves the original `alignedAlloc` value
-    /// so `alloc.free` infers the right alignment; same slice footprint
-    /// as `[]u8` (alignment is a type-level property of the pointer).
+    /// `records`. `records[i].name` labels view into this buffer — never
+    /// free them via `dns.freeName`. Empty for root-name RRsets.
     shared_name_backing: []align(@alignOf([]const u8)) u8 = &.{},
     expires_at: i64,
     original_ttl: u32,
@@ -2786,7 +2781,7 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
 
     cache.evictIfNeeded(shard0);
 
-    // Released synthetic bytes back so the deinit accounting checks out.
+    // Release synthetic bytes so deinit accounting checks out.
     _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
 
     try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) == 1);
@@ -2832,30 +2827,32 @@ test "byte-pressure check happens before key-name dupe" {
 
     // Find a different name that also hashes to shard 0.
     var newname_buf: [32]u8 = undefined;
-    var landed = false;
+    var newname: []const u8 = "";
     var j: u32 = 1000;
-    while (j < 1200 and !landed) : (j += 1) {
+    while (j < 1200) : (j += 1) {
         const name = std.fmt.bufPrint(&newname_buf, "new{d}.test", .{j}) catch unreachable;
         const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
         const shard, _ = cache.shardWithHash(probe);
         if (shard != shard0) continue;
-        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
-
-        // Pop the synthetic bump so lookup runs against real state.
-        _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
-
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        if (cache.lookup(arena.allocator(), name, .a, .in) != null) landed = true;
+        newname = name;
         break;
     }
-    try testing.expect(landed);
+    try testing.expect(newname.len > 0);
+
+    cache.storeNegativeBare(newname, .a, .in, .name_error, 60, .unchecked);
+
+    // Pop the synthetic bump so lookup runs against real state.
+    _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), newname, .a, .in) != null);
     try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) >= 1);
 }
 
 fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
     // Drive both negative-store paths so injected failures cover the
-    // alloc.create(NegativeEntry) failure + map.put rollback added in D6.
+    // alloc.create(NegativeEntry) failure + map.put rollback from boxing.
     test_time = 1000;
     var cache = RRsetCache.init(.{
         .backing = failing_alloc,
@@ -2898,7 +2895,7 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
 }
 
 test "negative-store paths handle backing-allocator OOM without leaking" {
-    // Catches the D6 boxing rollbacks: alloc.create(NegativeEntry) failure
+    // Catches the boxing rollbacks: alloc.create(NegativeEntry) failure
     // and the map.put rollback that must alloc.destroy() the boxed pointer.
     var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
     try runStoreNegativeUnderFailing(counter.allocator());
