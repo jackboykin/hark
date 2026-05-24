@@ -490,6 +490,8 @@ const Shard = struct {
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
     cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Subset of `evictions` triggered by byte-budget pressure rather than entry-count pressure.
+    byte_pressure_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
@@ -572,6 +574,8 @@ pub const RRsetCache = struct {
         evictions: u64,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
         cap_exhausted_evictions: u64,
+        /// Subset of `evictions` triggered by byte-budget pressure.
+        byte_pressure_evictions: u64,
         prefetch_eligible: u64,
         stale_hits: u64,
     };
@@ -587,6 +591,7 @@ pub const RRsetCache = struct {
             .negative_stores = 0,
             .evictions = 0,
             .cap_exhausted_evictions = 0,
+            .byte_pressure_evictions = 0,
             .prefetch_eligible = 0,
             .stale_hits = 0,
         };
@@ -602,6 +607,7 @@ pub const RRsetCache = struct {
             stats.negative_stores += shard.negative_stores.load(.monotonic);
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
+            stats.byte_pressure_evictions += shard.byte_pressure_evictions.load(.monotonic);
             stats.prefetch_eligible += shard.prefetch_eligible.load(.monotonic);
             stats.stale_hits += shard.stale_hits.load(.monotonic);
         }
@@ -1108,6 +1114,10 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockUncancelable(self.io);
+        // Evict before allocating: the key-name dupe itself counts against the
+        // byte budget, so byte-pressure eviction must run first or the dupe
+        // latches the shard at max_bytes.
+        self.evictIfNeeded(shard);
         const alloc = shard.counting.allocator();
         const key_name = alloc.dupe(u8, lower_name) catch {
             shard.rwlock.unlock(self.io);
@@ -1120,7 +1130,6 @@ pub const RRsetCache = struct {
             return null;
         }
         removeAndFree(shard, h, key);
-        self.evictIfNeeded(shard);
         return .{ .shard = shard, .alloc = alloc, .key = key };
     }
 
@@ -1211,12 +1220,20 @@ pub const RRsetCache = struct {
 
     fn evictIfNeeded(self: *RRsetCache, shard: *Shard) void {
         const count: u32 = @intCast(shard.map.count());
-        if (count < shard.max_entries) {
-            if (count < shard.max_entries / 4 * 3) return;
-            self.sweepExpired(shard, count);
+        // Byte pressure: the counting allocator silently refuses writes once the
+        // byte budget fills, latching the shard closed. Trigger SIEVE eviction
+        // pre-emptively at 87.5% so the next allocation has slack to land.
+        const bytes = shard.counting.current_bytes.load(.monotonic);
+        const byte_pressure = bytes > shard.counting.max_bytes / 8 * 7;
+
+        if (count >= shard.max_entries or byte_pressure) {
+            if (count == 0) return;
+            if (byte_pressure) _ = shard.byte_pressure_evictions.fetchAdd(1, .monotonic);
+            sieveEvict(shard, count);
             return;
         }
-        sieveEvict(shard, count);
+        if (count < shard.max_entries / 4 * 3) return;
+        self.sweepExpired(shard, count);
     }
 
     /// Probe a bounded number of entries from the SIEVE hand, evicting the first
@@ -2624,6 +2641,119 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
 
     const response = makeTestResponse(answers);
     cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+}
+
+test "evictIfNeeded triggers SIEVE on byte pressure" {
+    // Regression: previously evictIfNeeded only checked entry count. When the
+    // byte budget filled at fewer entries than max_entries, the key-name dupe
+    // in prepareSlot started failing and the shard latched closed — silent
+    // capacity loss with zero evictions recorded. The fix adds byte pressure
+    // (≥87.5% full) as an eviction trigger.
+    //
+    // Driven directly against the eviction primitive: integration-style fills
+    // are brittle because ArrayHashMap capacity-growth chunks can leap over
+    // the 87.5% threshold without ever crossing it at small test sizes.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Pre-populate shard 0 with a handful of entries so SIEVE has something
+    // to evict. The exact names don't matter — the test exercises the byte-
+    // pressure trigger directly below.
+    var name_buf: [32]u8 = undefined;
+    var stored: u32 = 0;
+    var i: u32 = 0;
+    while (stored < 4 and i < 100) : (i += 1) {
+        const name = std.fmt.bufPrint(&name_buf, "n{d}.test", .{i}) catch unreachable;
+        const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
+        const shard, _ = cache.shardWithHash(probe);
+        if (shard != &cache.shards[0]) continue;
+        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
+        stored += 1;
+    }
+    try testing.expect(stored == 4);
+    try testing.expect(cache.shards[0].map.count() == 4);
+
+    // Force byte pressure on shard 0: counter just above the 87.5% threshold.
+    const shard0 = &cache.shards[0];
+    const threshold = shard0.counting.max_bytes / 8 * 7;
+    const real_bytes = shard0.counting.current_bytes.load(.monotonic);
+    // Add synthetic bytes so total > threshold. We bump the counter directly
+    // (instead of via real allocations) so this works regardless of how the
+    // ArrayHashMap happens to be sized.
+    const bump: usize = if (real_bytes >= threshold) 1 else threshold - real_bytes + 1;
+    _ = shard0.counting.current_bytes.fetchAdd(bump, .monotonic);
+
+    cache.evictIfNeeded(shard0);
+
+    // Released synthetic bytes back so the deinit accounting checks out.
+    _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
+
+    try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) == 1);
+    try testing.expect(shard0.evictions.load(.monotonic) == 1);
+    try testing.expect(shard0.map.count() == 3);
+}
+
+test "byte-pressure check happens before key-name dupe" {
+    // Regression for the ordering fix: previously, prepareSlot duped the key
+    // name *before* calling evictIfNeeded. With the budget at max_bytes, the
+    // dupe itself was the allocation that latched the shard closed, never
+    // reaching the eviction code. The fix moves evictIfNeeded above the dupe.
+    //
+    // Verify by storing into a shard whose counter is at threshold: the
+    // pre-dupe eviction must free a slot, and the new entry must land.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Seed shard 0 with one entry.
+    var name_buf: [32]u8 = undefined;
+    var seeded: ?[]const u8 = null;
+    var i: u32 = 0;
+    while (seeded == null and i < 100) : (i += 1) {
+        const name = std.fmt.bufPrint(&name_buf, "seed{d}.test", .{i}) catch unreachable;
+        const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
+        const shard, _ = cache.shardWithHash(probe);
+        if (shard != &cache.shards[0]) continue;
+        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
+        seeded = name;
+    }
+    try testing.expect(seeded != null);
+
+    // Push shard 0 over the byte-pressure threshold.
+    const shard0 = &cache.shards[0];
+    const threshold = shard0.counting.max_bytes / 8 * 7;
+    const cur = shard0.counting.current_bytes.load(.monotonic);
+    const bump: usize = if (cur >= threshold) 1 else threshold - cur + 1;
+    _ = shard0.counting.current_bytes.fetchAdd(bump, .monotonic);
+
+    // Find a different name that also hashes to shard 0.
+    var newname_buf: [32]u8 = undefined;
+    var landed = false;
+    var j: u32 = 1000;
+    while (j < 1200 and !landed) : (j += 1) {
+        const name = std.fmt.bufPrint(&newname_buf, "new{d}.test", .{j}) catch unreachable;
+        const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
+        const shard, _ = cache.shardWithHash(probe);
+        if (shard != shard0) continue;
+        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
+
+        // Pop the synthetic bump so lookup runs against real state.
+        _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        if (cache.lookup(arena.allocator(), name, .a, .in) != null) landed = true;
+        break;
+    }
+    try testing.expect(landed);
+    try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) >= 1);
 }
 
 test "storeOneRRset handles backing-allocator OOM without leaking" {
