@@ -281,139 +281,133 @@ pub const BlockingUdpTransport = struct {
     }
 };
 
-/// TCP transport using blocking sockets for thread-pool resolution.
-/// Tracks total deadline to mitigate slow-trickle attacks where an
-/// attacker sends one byte at a time — every iteration of the data
-/// loop polls with the remaining deadline before issuing a read/write.
-pub const BlockingTcpTransport = struct {
+// TCP transport using blocking sockets for thread-pool resolution.
+// Tracks total deadline to mitigate slow-trickle attacks where an
+// attacker sends one byte at a time — every iteration of the data
+// loop polls with the remaining deadline before issuing a read/write.
+
+const tcp_connect_timeout_ms: u32 = 5000;
+const tcp_response_timeout_ms: u32 = 10000;
+
+/// Send a DNS query over TCP. With pool != null, tries an idle pooled
+/// connection first and stores a fresh one on success. Mirrors
+/// TlsTransport.query's optional-pool shape.
+pub fn queryTcp(
     io: Io,
-    const connect_timeout_ms: u32 = 5000;
-    const response_timeout_ms: u32 = 10000;
+    wire_query: []const u8,
+    server: na.Address,
+    response_buf: []u8,
+    pool: ?*TcpConnectionPool,
+) ![]const u8 {
+    const deadline_ns = monotonic.nowNs() + @as(i128, tcp_response_timeout_ms) * 1_000_000;
 
-    pub fn init(io: Io) BlockingTcpTransport {
-        return .{ .io = io };
-    }
-
-    /// Send a DNS query over TCP. With pool != null, tries an idle pooled
-    /// connection first and stores a fresh one on success. Mirrors
-    /// TlsTransport.query's optional-pool shape.
-    pub fn query(
-        self: *BlockingTcpTransport,
-        wire_query: []const u8,
-        server: na.Address,
-        response_buf: []u8,
-        pool: ?*TcpConnectionPool,
-    ) ![]const u8 {
-        const deadline_ns = monotonic.nowNs() + @as(i128, response_timeout_ms) * 1_000_000;
-
-        if (pool) |p| {
-            const key = AddressKey.fromAddress(server);
-            if (p.acquire(key)) |conn| {
-                if (sendAndReceiveTcp(conn.stream, self.io, wire_query, response_buf, deadline_ns)) |data| {
-                    pool_mod.applyKeepaliveHint(conn, data);
-                    p.release(key, conn, true);
-                    return data;
-                } else |_| {
-                    p.release(key, conn, false);
-                }
+    if (pool) |p| {
+        const key = AddressKey.fromAddress(server);
+        if (p.acquire(key)) |conn| {
+            if (sendAndReceiveTcp(conn.stream, io, wire_query, response_buf, deadline_ns)) |data| {
+                pool_mod.applyKeepaliveHint(conn, data);
+                p.release(key, conn, true);
+                return data;
+            } else |_| {
+                p.release(key, conn, false);
             }
         }
+    }
 
-        const stream = try self.connectTcp(server);
-        const data = sendAndReceiveTcp(stream, self.io, wire_query, response_buf, deadline_ns) catch |err| {
-            stream.close(self.io);
-            return err;
-        };
+    const stream = try connectTcp(server);
+    const data = sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns) catch |err| {
+        stream.close(io);
+        return err;
+    };
 
-        if (pool) |p| {
-            const key = AddressKey.fromAddress(server);
-            const new_conn = p.allocator.create(TcpPooledConnection) catch {
-                // Pool out of memory — close the stream since no one will own it.
-                stream.close(self.io);
-                return data;
-            };
-            new_conn.* = .{ .stream = stream, .io = self.io, .last_used = undefined, .query_count = undefined };
-            pool_mod.applyKeepaliveHint(new_conn, data);
-            p.store(key, new_conn);
+    if (pool) |p| {
+        const key = AddressKey.fromAddress(server);
+        const new_conn = p.allocator.create(TcpPooledConnection) catch {
+            // Pool out of memory — close the stream since no one will own it.
+            stream.close(io);
             return data;
-        }
-
-        stream.close(self.io);
+        };
+        new_conn.* = .{ .stream = stream, .io = io, .last_used = undefined, .query_count = undefined };
+        pool_mod.applyKeepaliveHint(new_conn, data);
+        p.store(key, new_conn);
         return data;
     }
 
-    /// Open a connected TCP stream. The fd is opened via raw posix so we can
-    /// apply SO_SNDTIMEO for the connect itself — Zig 0.16's
-    /// `IpAddress.connect` accepts a timeout option but its Io.Threaded
-    /// backend panics on it. Clear SNDTIMEO before returning so subsequent
-    /// data ops don't surface EAGAIN through netRead/netWrite, which
-    /// `netReadPosix`/`netWritePosix` treat as a programmer bug. Once the
-    /// stdlib grows working connect timeouts, this collapses to one line.
-    ///
-    /// `.address` is intentionally zero (not populated via getsockname).
-    /// CONTRACT: no caller reads `Stream.socket.address` on a client-side
-    /// stream. Audit on zig bumps — verified for 0.16 that close/read/
-    /// write paths only touch `.handle`. The family-tag may not match
-    /// the peer's family (zero is ip4 here, even on ip6 connects); a
-    /// future `Stream.peerAddress()` or address-formatting code would
-    /// silently lie. Populate via `na.getSockName` if that ever matters.
-    fn connectTcp(_: *BlockingTcpTransport, server: na.Address) !Io.net.Stream {
-        const af: u32 = na.afU32(server);
-        const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
-        errdefer sys.close(sock_fd);
-        sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, connect_timeout_ms);
-        sys.setNoDelay(sock_fd);
-        na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
-        sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, 0);
-        return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
+    stream.close(io);
+    return data;
+}
+
+/// Open a connected TCP stream. The fd is opened via raw posix so we can
+/// apply SO_SNDTIMEO for the connect itself — Zig 0.16's
+/// `IpAddress.connect` accepts a timeout option but its Io.Threaded
+/// backend panics on it. Clear SNDTIMEO before returning so subsequent
+/// data ops don't surface EAGAIN through netRead/netWrite, which
+/// `netReadPosix`/`netWritePosix` treat as a programmer bug. Once the
+/// stdlib grows working connect timeouts, this collapses to one line.
+///
+/// `.address` is intentionally zero (not populated via getsockname).
+/// CONTRACT: no caller reads `Stream.socket.address` on a client-side
+/// stream. Audit on zig bumps — verified for 0.16 that close/read/
+/// write paths only touch `.handle`. The family-tag may not match
+/// the peer's family (zero is ip4 here, even on ip6 connects); a
+/// future `Stream.peerAddress()` or address-formatting code would
+/// silently lie. Populate via `na.getSockName` if that ever matters.
+pub fn connectTcp(server: na.Address) !Io.net.Stream {
+    const af: u32 = na.afU32(server);
+    const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
+    errdefer sys.close(sock_fd);
+    sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, tcp_connect_timeout_ms);
+    sys.setNoDelay(sock_fd);
+    na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
+    sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, 0);
+    return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
+}
+
+/// Length-prefixed DNS query/response on a connected TCP stream. Each
+/// loop iteration polls with the remaining deadline before issuing a
+/// netRead/netWrite — the kernel-side SO_*TIMEO mechanism can't be used
+/// because Io.Threaded's netRead/netWrite treat EAGAIN as a bug.
+/// Userspace deadline enforcement covers the slow-trickle case where
+/// the peer drips bytes to reset any per-syscall timer.
+pub fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+    const handle = stream.socket.handle;
+
+    // ── Send length-prefixed query ──
+    var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
+    const framed = try dns.stageLengthPrefixed(&send_buf, wire_query);
+
+    var bytes_sent: usize = 0;
+    while (bytes_sent < framed.len) {
+        try waitReady(handle, posix.POLL.OUT, deadline_ns);
+        const n = sys.netWrite(io, handle, framed[bytes_sent..]) catch return error.SendFailed;
+        if (n == 0) return error.SendFailed;
+        bytes_sent += n;
     }
 
-    /// Length-prefixed DNS query/response on a connected TCP stream. Each
-    /// loop iteration polls with the remaining deadline before issuing a
-    /// netRead/netWrite — the kernel-side SO_*TIMEO mechanism can't be used
-    /// because Io.Threaded's netRead/netWrite treat EAGAIN as a bug.
-    /// Userspace deadline enforcement covers the slow-trickle case where
-    /// the peer drips bytes to reset any per-syscall timer.
-    fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
-        const handle = stream.socket.handle;
-
-        // ── Send length-prefixed query ──
-        var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
-        const framed = try dns.stageLengthPrefixed(&send_buf, wire_query);
-
-        var bytes_sent: usize = 0;
-        while (bytes_sent < framed.len) {
-            try waitReady(handle, posix.POLL.OUT, deadline_ns);
-            const n = sys.netWrite(io, handle, framed[bytes_sent..]) catch return error.SendFailed;
-            if (n == 0) return error.SendFailed;
-            bytes_sent += n;
-        }
-
-        // ── Receive length-prefixed response ──
-        var len_buf: [2]u8 = undefined;
-        var len_filled: usize = 0;
-        while (len_filled < 2) {
-            try waitReady(handle, posix.POLL.IN, deadline_ns);
-            const n = sys.netRead(io, handle, len_buf[len_filled..]) catch return error.ConnectionClosed;
-            if (n == 0) return error.ConnectionClosed;
-            len_filled += n;
-        }
-
-        const body_len = mem.readInt(u16, &len_buf, .big);
-        if (body_len == 0 or body_len > response_buf.len) return error.InvalidLength;
-
-        var body_filled: usize = 0;
-        while (body_filled < body_len) {
-            try waitReady(handle, posix.POLL.IN, deadline_ns);
-            const n = sys.netRead(io, handle, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
-            if (n == 0) return error.ConnectionClosed;
-            body_filled += n;
-        }
-
-        sys.setQuickAck(handle);
-        return response_buf[0..body_len];
+    // ── Receive length-prefixed response ──
+    var len_buf: [2]u8 = undefined;
+    var len_filled: usize = 0;
+    while (len_filled < 2) {
+        try waitReady(handle, posix.POLL.IN, deadline_ns);
+        const n = sys.netRead(io, handle, len_buf[len_filled..]) catch return error.ConnectionClosed;
+        if (n == 0) return error.ConnectionClosed;
+        len_filled += n;
     }
-};
+
+    const body_len = mem.readInt(u16, &len_buf, .big);
+    if (body_len == 0 or body_len > response_buf.len) return error.InvalidLength;
+
+    var body_filled: usize = 0;
+    while (body_filled < body_len) {
+        try waitReady(handle, posix.POLL.IN, deadline_ns);
+        const n = sys.netRead(io, handle, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
+        if (n == 0) return error.ConnectionClosed;
+        body_filled += n;
+    }
+
+    sys.setQuickAck(handle);
+    return response_buf[0..body_len];
+}
 
 /// Wait for `handle` readiness with `events` (POLL.IN / POLL.OUT) up to
 /// `deadline_ns`. Wraps `sys.pollReady` with the read/write-flavored error
@@ -592,7 +586,7 @@ fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
     }
 }
 
-test "BlockingTcpTransport loopback query" {
+test "queryTcp loopback query" {
     try skipIfNotLinux();
     const io = testing.io;
 
@@ -608,9 +602,8 @@ test "BlockingTcpTransport loopback query" {
 
     const thread = try std.Thread.spawn(.{}, tcpEchoServerThread, .{ &server, io });
 
-    var transport = BlockingTcpTransport.init(io);
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
-    const response = try transport.query(wire_query, server_addr, &response_buf, null);
+    const response = try queryTcp(io, wire_query, server_addr, &response_buf, null);
     thread.join();
 
     try testing.expect(response.len >= 12);

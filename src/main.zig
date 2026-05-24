@@ -4,7 +4,6 @@ const hark = @import("hark");
 const dns = hark.dns;
 const dns_print = hark.dns_print;
 const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
-const BlockingTcpTransport = hark.blocking_transport.BlockingTcpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
 const ConnectionPool = hark.connection_pool.ConnectionPool(hark.connection_pool.PooledConnection);
 const EncryptedNsCache = hark.encrypted_ns.EncryptedNsCache;
@@ -193,7 +192,6 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     var t = BlockingUdpTransport.init(.{}, io);
     defer t.deinit();
-    var tcp_t = BlockingTcpTransport.init(io);
 
     // Opportunistic DoT to authoritatives (RFC 9539) skips PKI verification by
     // design; no CA bundle needed. The TlsTransport is wired regardless so the
@@ -232,7 +230,7 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     var resolver = RecursiveResolver{
         .transports = .{
             .udp = &t,
-            .tcp = &tcp_t,
+            .tcp_enabled = true,
             .tls = if (opportunistic) &tls_t else null,
         },
         .cache = &cache,

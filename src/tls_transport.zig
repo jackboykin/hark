@@ -208,7 +208,7 @@ pub const TlsTransport = struct {
     /// apply `SO_SNDTIMEO`, then wrap as `Io.net.Stream`. Leaves SNDTIMEO
     /// set because the caller overwrites both directions with the
     /// per-handshake / per-query deadline immediately after. `.address`
-    /// follows the same CONTRACT as `BlockingTcpTransport.connectTcp`:
+    /// follows the same CONTRACT as `blocking_transport.connectTcp`:
     /// zero-init, do not read on client-side streams. `io` is reserved
     /// for the eventual `IpAddress.connect` collapse.
     fn connectTcpBlocking(io: Io, tls_server: na.Address, timeout_ms: u32) !Io.net.Stream {

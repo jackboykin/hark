@@ -29,7 +29,6 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const BumpGatedGroup = @import("bg_group.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
-const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const Transports = @import("transport.zig").Transports;
 const Certificate = std.crypto.Certificate;
@@ -938,7 +937,6 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     // refresh doesn't need amortized pooling.
     var udp_t = BlockingUdpTransport.init(.{}, server.io);
     defer udp_t.deinit();
-    var tcp_t = BlockingTcpTransport.init(server.io);
 
     var tls_t: ?TlsTransport = if (server.config.opportunistic) blk: {
         var t = TlsTransport.init(server.allocator, .{}, server.ca_bundle, server.io);
@@ -954,7 +952,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
 
     var resolver = recursive.RecursiveResolver.fromContext(
         server.resolverContext(),
-        .{ .udp = &udp_t, .tcp = &tcp_t, .tls = tls_ptr },
+        .{ .udp = &udp_t, .tcp_enabled = true, .tls = tls_ptr },
         .{ .bypass_cache = true },
     );
 
@@ -1485,7 +1483,6 @@ const WorkerState = struct {
     fn poolThread(self: *WorkerState) void {
         var udp_t = BlockingUdpTransport.init(.{}, self.io);
         defer udp_t.deinit();
-        var tcp_t = BlockingTcpTransport.init(self.io);
 
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
             var t = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
@@ -1495,7 +1492,7 @@ const WorkerState = struct {
 
         const transports: Transports = .{
             .udp = &udp_t,
-            .tcp = &tcp_t,
+            .tcp_enabled = true,
             .tls = if (tls_t) |*t| t else null,
         };
 
@@ -1700,7 +1697,7 @@ const WorkerState = struct {
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 //
 // Userspace deadline via sys.pollReady — same pattern as
-// BlockingTcpTransport.sendAndReceiveTcp (see comments there).
+// blocking_transport.sendAndReceiveTcp (see comments there).
 //
 // All errors collapse to `null` ("drop client, move on") because per-client
 // recovery has no useful shape — but log at debug for operational visibility

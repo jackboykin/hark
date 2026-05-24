@@ -6,7 +6,6 @@ const dnssec = @import("dnssec.zig");
 const special_use = @import("special_use.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
-const BlockingTcpTransport = @import("blocking_transport.zig").BlockingTcpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const Transports = @import("transport.zig").Transports;
 const encrypted_ns = @import("encrypted_ns.zig");
@@ -289,8 +288,8 @@ pub const RecursiveResolver = struct {
         return self.transports.?.udp;
     }
 
-    fn tcp(self: *const RecursiveResolver) ?*BlockingTcpTransport {
-        return self.transports.?.tcp;
+    fn tcpEnabled(self: *const RecursiveResolver) bool {
+        return self.transports.?.tcp_enabled;
     }
 
     fn tls(self: *const RecursiveResolver) ?*TlsTransport {
@@ -1482,9 +1481,9 @@ pub const RecursiveResolver = struct {
         wire_query: []const u8,
         server: na.Address,
     ) error{OutOfMemory}!?dns.Message {
-        const tcp_t = self.tcp() orelse return null;
+        if (!self.tcpEnabled()) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = tcp_t.query(wire_query, server, tcp_buf, self.tcp_pool) catch |err| {
+        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.tcp_pool) catch |err| {
             var addr_buf: [64]u8 = undefined;
             log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
@@ -2651,10 +2650,9 @@ pub const RecursiveResolver = struct {
         fn run(ctx: *NsTaskCtx) void {
             var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
             defer udp_t.deinit();
-            var tcp_t = BlockingTcpTransport.init(ctx.parent.io);
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
-                .tcp = &tcp_t,
+                .tcp_enabled = ctx.parent.tcpEnabled(),
                 .tls = ctx.parent.tls(),
             });
 
@@ -3787,7 +3785,7 @@ test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, testing.io);
     defer udp_t.deinit();
     var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp = null },
+        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
         .io = testing.io,
     };
     defer resolver.dropAnticipated();
@@ -3823,7 +3821,7 @@ test "consumeAnticipated drains spurious datagrams and returns the real response
     defer udp_t.deinit();
     var drops = std.atomic.Value(u64).init(0);
     var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp = null },
+        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
         .io = testing.io,
         .anticipated_drops = &drops,
     };
@@ -3876,7 +3874,7 @@ test "consumeAnticipated returns null but preserves slot on qname/qtype mismatch
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
     var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp = null },
+        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
         .io = testing.io,
     };
     defer resolver.dropAnticipated();
@@ -3907,7 +3905,7 @@ test "consumeAnticipated returns null but preserves slot when server not in list
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
     var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp = null },
+        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
         .io = testing.io,
     };
     defer resolver.dropAnticipated();
@@ -3934,7 +3932,7 @@ test "prepareAnticipated does not clobber a live outer slot" {
     var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
     defer udp_t.deinit();
     var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp = null },
+        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
         .io = testing.io,
     };
     defer resolver.dropAnticipated();
