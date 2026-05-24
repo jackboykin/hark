@@ -267,21 +267,6 @@ pub const NsSelector = struct {
         }
     }
 
-    /// Return the confidence score (Beta mean) for a server in a zone.
-    /// Returns null if no observations exist.
-    pub fn confidence(self: *NsSelector, zone: dns.Name, server: na.Address) ?f32 {
-        const arm_key = ArmKey{
-            .zone_hash = zoneHash(zone),
-            .addr_key = AddressKey.fromAddress(server),
-        };
-        const shard = self.shardFor(arm_key);
-        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
-
-        const state = shard.arms.get(arm_key) orelse return null;
-        return state.alpha / (state.alpha + state.beta);
-    }
-
     // ── Internal ─────────────────────────────────────────────────────
 
     /// Apply discount γ if the arm exists, then return its (possibly updated)
@@ -497,29 +482,6 @@ test "discount causes re-exploration" {
     try testing.expect(server0_first > 10);
 }
 
-test "recordOutcome updates state" {
-    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer sel.deinit();
-
-    const zone = dns.Name{ .labels = &.{ "example", "com" } };
-    const server = na.initIp4(.{ 10, 0, 0, 1 }, 53);
-
-    sel.recordOutcome(zone, server, .success, 50_000);
-    const c = sel.confidence(zone, server).?;
-    // After one success at 50ms (reward ≈ 0.975): alpha ≈ 1.975, beta ≈ 1.025
-    // confidence ≈ 0.66
-    try testing.expect(c > 0.5);
-}
-
-test "confidence returns null for unknown" {
-    var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer sel.deinit();
-
-    const zone = dns.Name{ .labels = &.{ "unknown", "com" } };
-    const server = na.initIp4(.{ 10, 0, 0, 99 }, 53);
-    try testing.expectEqual(@as(?f32, null), sel.confidence(zone, server));
-}
-
 test "arms map is bounded under random-zone load" {
     // Saturates AT the cap (single-entry eviction); does not oscillate to 0.
     var sel = NsSelector.init(.{
@@ -550,14 +512,30 @@ test "per-zone isolation" {
 
     const zone_a = dns.Name{ .labels = &.{ "a", "com" } };
     const zone_b = dns.Name{ .labels = &.{ "b", "com" } };
-    const server = na.initIp4(.{ 10, 0, 0, 1 }, 53);
+    const servers = [_]na.Address{
+        na.initIp4(.{ 10, 0, 0, 1 }, 53),
+        na.initIp4(.{ 10, 0, 0, 2 }, 53),
+    };
 
-    // Same server, different zones — independent state
-    for (0..20) |_| sel.recordOutcome(zone_a, server, .success, 10_000);
-    for (0..20) |_| sel.recordOutcome(zone_b, server, .timeout, 0);
+    // Server 0 is great in zone_a but terrible in zone_b; server 1 is the
+    // mirror image. Same arms, swapped reputations across zones — selection
+    // must track each zone's history independently.
+    for (0..50) |_| {
+        sel.recordOutcome(zone_a, servers[0], .success, 10_000);
+        sel.recordOutcome(zone_a, servers[1], .timeout, 0);
+        sel.recordOutcome(zone_b, servers[0], .timeout, 0);
+        sel.recordOutcome(zone_b, servers[1], .success, 10_000);
+    }
 
-    const ca = sel.confidence(zone_a, server).?;
-    const cb = sel.confidence(zone_b, server).?;
-    try testing.expect(ca > 0.8);
-    try testing.expect(cb < 0.2);
+    var order_buf: [max_order]usize = undefined;
+    var a0_first: usize = 0;
+    var b1_first: usize = 0;
+    for (0..100) |_| {
+        const oa = sel.selectServers(zone_a, &servers, null, &order_buf);
+        if (oa.order.len > 0 and oa.order[0] == 0) a0_first += 1;
+        const ob = sel.selectServers(zone_b, &servers, null, &order_buf);
+        if (ob.order.len > 0 and ob.order[0] == 1) b1_first += 1;
+    }
+    try testing.expect(a0_first > 90);
+    try testing.expect(b1_first > 90);
 }
