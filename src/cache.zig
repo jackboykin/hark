@@ -402,27 +402,11 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.R
 }
 
 /// Clone an optional CachedRecord into a ResourceRecord with a given TTL.
+/// Thin wrapper over `cloneCachedRecords` for the single-record SOA case.
 fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.ResourceRecord {
     const s = cached orelse return null;
-    const cloned_name = cloneName(alloc, s.name) catch return null;
-    const cloned_rdata = cloneRData(alloc, s.rdata) catch {
-        dns.freeName(alloc, cloned_name);
-        return null;
-    };
-    const cloned_wire = alloc.dupe(u8, s.wire) catch {
-        dns.freeName(alloc, cloned_name);
-        dns.freeRData(alloc, cloned_rdata);
-        return null;
-    };
-    return dns.ResourceRecord{
-        .name = cloned_name,
-        .rtype = s.rtype,
-        .rclass = s.rclass,
-        .ttl = ttl,
-        .rdata = cloned_rdata,
-        .wire = cloned_wire,
-        .wire_ttl_offset = s.wire_ttl_offset,
-    };
+    const out = cloneCachedRecords(alloc, &.{s}, ttl) catch return null;
+    return out[0];
 }
 
 /// Clone NSEC/NSEC3 proof records (and their covering RRSIGs) out of the
