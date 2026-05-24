@@ -16,12 +16,8 @@ const reprobe_sec: i64 = 3600;
 /// Bound on entries — same magnitude as encrypted_ns and ns_selector.
 const max_entries: usize = 4096;
 
-const Entry = struct {
-    last_marked: i64,
-};
-
 pub const CaseState = struct {
-    entries: std.AutoHashMap(AddressKey, Entry),
+    entries: std.AutoHashMap(AddressKey, i64),
     /// Lock-free fast path for the steady state (no servers ever marked).
     /// Increments after the first markBroken; never decrements.
     has_entries: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -31,7 +27,7 @@ pub const CaseState = struct {
 
     pub fn init(allocator: Allocator, io: std.Io) CaseState {
         return .{
-            .entries = std.AutoHashMap(AddressKey, Entry).init(allocator),
+            .entries = std.AutoHashMap(AddressKey, i64).init(allocator),
             .io = io,
         };
     }
@@ -48,8 +44,8 @@ pub const CaseState = struct {
         if (!self.has_entries.load(.acquire)) return true;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const entry = self.entries.get(key) orelse return true;
-        return self.now_fn() - entry.last_marked >= reprobe_sec;
+        const last_marked = self.entries.get(key) orelse return true;
+        return self.now_fn() - last_marked >= reprobe_sec;
     }
 
     /// Mark a server as case-mangling. Subsequent queries skip 0x20 for
@@ -60,7 +56,7 @@ pub const CaseState = struct {
         if (self.entries.count() >= max_entries and !self.entries.contains(key)) {
             self.evictOldest();
         }
-        self.entries.put(key, .{ .last_marked = self.now_fn() }) catch {};
+        self.entries.put(key, self.now_fn()) catch {};
         self.has_entries.store(true, .release);
     }
 
@@ -70,8 +66,8 @@ pub const CaseState = struct {
         var oldest_time: i64 = std.math.maxInt(i64);
         var iter = self.entries.iterator();
         while (iter.next()) |kv| {
-            if (kv.value_ptr.last_marked < oldest_time) {
-                oldest_time = kv.value_ptr.last_marked;
+            if (kv.value_ptr.* < oldest_time) {
+                oldest_time = kv.value_ptr.*;
                 oldest_key = kv.key_ptr.*;
             }
         }
