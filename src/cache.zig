@@ -1188,9 +1188,18 @@ pub const RRsetCache = struct {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockUncancelable(self.io);
-        // Evict before allocating: the key-name dupe itself counts against the
-        // byte budget, so byte-pressure eviction must run first or the dupe
-        // latches the shard at max_bytes.
+        // Anti-downgrade check must run before evictIfNeeded: SIEVE is
+        // security-blind, so an eviction here could silently drop the
+        // existing .secure entry we're about to refuse to overwrite (RFC
+        // 9520 §3.4). Probe key is fine — shouldBlockOverwrite only reads
+        // .name bytes for the hash-adapted lookup.
+        if (self.shouldBlockOverwrite(shard, h, probe, status)) {
+            shard.rwlock.unlock(self.io);
+            return null;
+        }
+        // Evict before allocating: the key-name dupe itself counts against
+        // the byte budget, so byte-pressure eviction must run first or the
+        // dupe latches the shard at max_bytes.
         self.evictIfNeeded(shard);
         const alloc = shard.counting.allocator();
         const key_name = alloc.dupe(u8, lower_name) catch {
@@ -1198,11 +1207,6 @@ pub const RRsetCache = struct {
             return null;
         };
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
-        if (self.shouldBlockOverwrite(shard, h, key, status)) {
-            alloc.free(key_name);
-            shard.rwlock.unlock(self.io);
-            return null;
-        }
         removeAndFree(shard, h, key);
         return .{ .shard = shard, .alloc = alloc, .key = key };
     }
@@ -2909,6 +2913,40 @@ test "negative-store paths handle backing-allocator OOM without leaking" {
         };
         try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
     }
+}
+
+test "anti-downgrade holds under byte pressure" {
+    // Regression: when evictIfNeeded ran before shouldBlockOverwrite,
+    // byte-pressure SIEVE (security-blind) could evict the existing .secure
+    // entry before the anti-downgrade check saw it — RFC 9520 §3.4 bypass.
+    // Fix runs shouldBlockOverwrite first against the stack probe key.
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Store a .secure positive for a name. expectCachedHitStatus probes by
+    // dotted string, so the labels must format back to that string.
+    try storeTestAWithStatus(&cache, alloc, &.{ "protected", "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
+
+    // Push the shard holding the entry over the 87.5% byte-pressure threshold.
+    const probe = CacheKey{ .name = "protected.example.com", .rtype = .a, .rclass = .in };
+    const shard, _ = cache.shardWithHash(probe);
+    const threshold = shard.counting.max_bytes / 8 * 7;
+    const cur = shard.counting.current_bytes.load(.monotonic);
+    const bump: usize = if (cur >= threshold) 1 else threshold - cur + 1;
+    _ = shard.counting.current_bytes.fetchAdd(bump, .monotonic);
+
+    // Attempt .unchecked downgrade of the same key. Must be refused.
+    try storeTestAWithStatus(&cache, alloc, &.{ "protected", "example", "com" }, 300, .{ 9, 9, 9, 9 }, .unchecked);
+
+    // Release synthetic bytes so the deinit accounting checks out.
+    _ = shard.counting.current_bytes.fetchSub(bump, .monotonic);
+
+    // Original .secure must survive.
+    try expectCachedHitStatus(alloc, &cache, "protected.example.com", .secure);
 }
 
 test "multi-record RRset round-trip preserves shared owner name" {
