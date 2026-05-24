@@ -709,8 +709,8 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions ({d} cap-exhausted), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
+            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
@@ -1048,8 +1048,8 @@ const WorkerState = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions", .{
-            stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions,
+        log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions ({d} cap-exhausted, {d} byte-pressure)", .{
+            stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions,
         });
     }
 
