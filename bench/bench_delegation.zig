@@ -75,7 +75,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     var transport = BlockingUdpTransport.init(.{}, io);
     var resolver = RecursiveResolver{
-        .transports = .{ .udp = &transport, .tcp = null },
+        .transports = .{ .udp = &transport, .tcp_enabled = false },
         .io = io,
         .cache = &cache,
     };
