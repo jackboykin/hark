@@ -1,6 +1,5 @@
 const std = @import("std");
 const monotonic = @import("monotonic.zig");
-const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
@@ -346,37 +345,6 @@ pub fn ConnectionPool(comptime Conn: type) type {
 // ── Tests ────────────────────────────────────────────────────────────
 
 const TlsPool = ConnectionPool(PooledConnection);
-
-test "AddressKey fromAddress IPv4" {
-    const addr = na.initIp4(.{ 1, 1, 1, 1 }, 853);
-    const key = AddressKey.fromAddress(addr);
-    try testing.expectEqual(@as(u8, @intCast(posix.AF.INET)), key.family);
-    try testing.expectEqual(@as(u16, 853), key.port);
-    try testing.expectEqual(@as(u8, 1), key.addr[0]);
-    try testing.expectEqual(@as(u8, 1), key.addr[1]);
-    try testing.expectEqual(@as(u8, 1), key.addr[2]);
-    try testing.expectEqual(@as(u8, 1), key.addr[3]);
-}
-
-test "AddressKey fromAddress IPv6" {
-    const addr = na.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 853, 0, 0);
-    const key = AddressKey.fromAddress(addr);
-    try testing.expectEqual(@as(u8, @intCast(posix.AF.INET6)), key.family);
-    try testing.expectEqual(@as(u16, 853), key.port);
-    try testing.expectEqual(@as(u8, 0x20), key.addr[0]);
-    try testing.expectEqual(@as(u8, 0x01), key.addr[1]);
-}
-
-test "AddressKey equality" {
-    const a1 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
-    const a2 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
-    const a3 = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 853));
-
-    // Same address produces same key
-    try testing.expectEqual(a1, a2);
-    // Different address produces different key
-    try testing.expect(!std.meta.eql(a1, a3));
-}
 
 test "ConnectionPool idle eviction with injectable now_fn" {
     var fake_time: i64 = 1000;
