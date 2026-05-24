@@ -235,9 +235,10 @@ const PerThreadArena = struct {
 // ── Slot pool ─────────────────────────────────────────────────────────
 // Bounded MPMC queue over a fixed slot array. Two rings: an order ring
 // holding queued indices (FIFO), and a free-list stack holding indices
-// available for claim. All primitives assume the caller holds `mutex`
-// — keeping push/pop atomic across claim+enqueue / dequeue+copy means
-// the wrapper does one lock acquisition per operation, not two.
+// available for claim. The `*Locked` primitives assume the caller holds
+// `mutex` — keeping push/pop atomic across claim+enqueue / dequeue+copy
+// means the wrapper does one lock acquisition per operation, not two.
+// `lock`/`unlock`/`signalShutdown` are self-locking entry points.
 
 fn SlotPool(comptime T: type, comptime cap: u16) type {
     return struct {

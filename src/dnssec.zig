@@ -1118,9 +1118,9 @@ fn validateNsec3NegativeProof(
 /// Validate answer RRsets against a DNSKEY set.
 /// Finds the RRSIG covering `qtype`, matches it to a DNSKEY by key_tag + algorithm,
 /// and verifies the signature. Per RFC 6840 §5.4, tries ALL matching DNSKEYs.
-/// Also validates CNAME RRSIG if the answer contains CNAMEs and qtype != .cname,
-/// but only when the CNAME RRSIG signer matches the main type's signer (same zone).
-/// Cross-zone CNAMEs (RFC 4035 §5.3.1) are skipped — they need their own zone's DNSKEYs.
+/// Also validates the CNAME RRset if the answer contains CNAMEs and qtype != .cname.
+/// Bailiwick scrubbing upstream guarantees all answer records share one zone, so the
+/// same DNSKEY set covers them — no signer-name check is needed here.
 pub fn validateAnswerRrset(
     answers: []const dns.ResourceRecord,
     qtype: dns.RType,

@@ -166,7 +166,7 @@ pub const RecursiveResolver = struct {
     stagger_ms: u32 = 0,
 
     /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon). null when
-    /// disabled or in forwarder mode.
+    /// disabled.
     case_state: ?*CaseState = null,
 
     /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
