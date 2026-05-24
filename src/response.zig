@@ -459,12 +459,7 @@ pub fn synthesizedMessage(
 
 // ── Query validation ───────────────────────────────────────────────────
 
-const ValidationFailure = struct {
-    rcode: dns.RCode,
-    extended_rcode: u8 = 0,
-};
-
-pub fn validateQuery(query: dns.Message) ?ValidationFailure {
+pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful
     // (UDP path drops silently before parse).
