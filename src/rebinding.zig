@@ -87,8 +87,8 @@ pub fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
         }
     }
     return switch (rr.rtype) {
-        .a => isPrivate(&rr.rdata.a, .v4, cfg),
-        .aaaa => isPrivate(&rr.rdata.aaaa, .v6, cfg),
+        .a => isPrivate(&rr.rdata.a, cfg),
+        .aaaa => isPrivate(&rr.rdata.aaaa, cfg),
         else => false,
     };
 }
@@ -183,8 +183,8 @@ fn logScrub(rr: dns.ResourceRecord) void {
 /// address for both extras — keeps `extra_allow = ["127.0.0.0/8"]` honest
 /// when an AAAA-flavoured DNSBL returns a mapped 127.0.0.x. Mirrors the
 /// recursion `matchesDefault` already does for the built-in v4 set.
-pub fn isPrivate(bytes: []const u8, family: acl.Family, cfg: Config) bool {
-    const mapped_v4: ?*const [4]u8 = if (family == .v6 and bytes.len == 16 and isIp4Mapped(bytes))
+pub fn isPrivate(bytes: []const u8, cfg: Config) bool {
+    const mapped_v4: ?*const [4]u8 = if (bytes.len == 16 and isIp4Mapped(bytes))
         bytes[12..16]
     else
         null;
@@ -193,7 +193,7 @@ pub fn isPrivate(bytes: []const u8, family: acl.Family, cfg: Config) bool {
         if (c.matchesBytes(bytes)) return false;
         if (mapped_v4) |v4| if (c.matchesBytes(v4)) return false;
     }
-    if (matchesDefault(bytes, family)) return true;
+    if (matchesDefault(bytes)) return true;
     for (cfg.extra_block) |c| {
         if (c.matchesBytes(bytes)) return true;
         if (mapped_v4) |v4| if (c.matchesBytes(v4)) return true;
@@ -205,10 +205,11 @@ fn isIp4Mapped(bytes: []const u8) bool {
     return mem.eql(u8, bytes[0..10], &([_]u8{0} ** 10)) and bytes[10] == 0xff and bytes[11] == 0xff;
 }
 
-fn matchesDefault(bytes: []const u8, family: acl.Family) bool {
-    return switch (family) {
-        .v4 => bytes.len == 4 and isPrivateIp4(bytes[0..4].*),
-        .v6 => bytes.len == 16 and isPrivateIp6(bytes[0..16].*),
+fn matchesDefault(bytes: []const u8) bool {
+    return switch (bytes.len) {
+        4 => isPrivateIp4(bytes[0..4].*),
+        16 => isPrivateIp6(bytes[0..16].*),
+        else => false,
     };
 }
 

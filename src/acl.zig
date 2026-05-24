@@ -13,14 +13,12 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const na = @import("net_address.zig");
 
-pub const Family = enum(u8) { v4, v6 };
-
 pub const Cidr = struct {
-    /// Network bytes, normalized so all bits past `prefix` are zero.
-    /// 4 bytes for v4, 16 for v6.
-    bytes: [16]u8,
+    /// Network address. Bytes are normalized so all bits past `prefix` are
+    /// zero. The address's union tag (`ip4` / `ip6`) carries family. Port
+    /// is always 0 — Cidr is a network mask, not an endpoint.
+    address: na.Address,
     prefix: u8,
-    family: Family,
 
     pub fn matches(self: Cidr, addr: na.Address) bool {
         return switch (addr) {
@@ -32,9 +30,9 @@ pub const Cidr = struct {
     /// Match against raw network-byte-order address bytes (4 for v4, 16 for
     /// v6). Returns false on length / family mismatch — public API guard.
     pub fn matchesBytes(self: Cidr, bytes: []const u8) bool {
-        return switch (self.family) {
-            .v4 => bytes.len == 4 and prefixMatch(bytes, self.bytes[0..4], self.prefix),
-            .v6 => bytes.len == 16 and prefixMatch(bytes, self.bytes[0..16], self.prefix),
+        return switch (self.address) {
+            .ip4 => |v4| bytes.len == 4 and prefixMatch(bytes, &v4.bytes, self.prefix),
+            .ip6 => |v6| bytes.len == 16 and prefixMatch(bytes, &v6.bytes, self.prefix),
         };
     }
 };
@@ -52,20 +50,18 @@ pub fn parse(s: []const u8) ?Cidr {
         const default_prefix: u8 = 128;
         const prefix = if (prefix_str) |p| std.fmt.parseInt(u8, p, 10) catch return null else default_prefix;
         if (prefix > 128) return null;
-        var c = Cidr{ .bytes = .{0} ** 16, .prefix = prefix, .family = .v6 };
-        @memcpy(&c.bytes, &ip6.bytes);
-        normalizeInPlace(c.bytes[0..16], prefix);
-        return c;
+        var bytes = ip6.bytes;
+        normalizeInPlace(&bytes, prefix);
+        return .{ .address = na.initIp6(bytes, 0, 0, 0), .prefix = prefix };
     }
 
     const ip4 = std.Io.net.Ip4Address.parse(addr_str, 0) catch return null;
     const default_prefix: u8 = 32;
     const prefix = if (prefix_str) |p| std.fmt.parseInt(u8, p, 10) catch return null else default_prefix;
     if (prefix > 32) return null;
-    var c = Cidr{ .bytes = .{0} ** 16, .prefix = prefix, .family = .v4 };
-    @memcpy(c.bytes[0..4], &ip4.bytes);
-    normalizeInPlace(c.bytes[0..4], prefix);
-    return c;
+    var bytes = ip4.bytes;
+    normalizeInPlace(&bytes, prefix);
+    return .{ .address = na.initIp4(bytes, 0), .prefix = prefix };
 }
 
 /// Returns true when `entries` is empty (back-compat: no ACL configured)
@@ -107,14 +103,13 @@ const testing = std.testing;
 
 test "parse v4 with prefix" {
     const c = parse("192.168.1.0/24") orelse return error.ParseFailed;
-    try testing.expectEqual(Family.v4, c.family);
     try testing.expectEqual(@as(u8, 24), c.prefix);
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, c.bytes[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, &c.address.ip4.bytes);
 }
 
 test "parse v4 normalizes host bits" {
     const c = parse("192.168.1.255/24") orelse return error.ParseFailed;
-    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, c.bytes[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, &c.address.ip4.bytes);
 }
 
 test "parse bare v4 address is /32" {
@@ -124,8 +119,8 @@ test "parse bare v4 address is /32" {
 
 test "parse v6 with prefix" {
     const c = parse("2001:db8::/32") orelse return error.ParseFailed;
-    try testing.expectEqual(Family.v6, c.family);
     try testing.expectEqual(@as(u8, 32), c.prefix);
+    try testing.expect(c.address == .ip6);
 }
 
 test "parse rejects invalid prefix" {
