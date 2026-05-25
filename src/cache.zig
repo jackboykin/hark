@@ -698,7 +698,6 @@ pub const RRsetCache = struct {
             _ = shard.misses.fetchAdd(1, .monotonic);
             return null;
         };
-        // SIEVE: mark as recently accessed (atomic store, safe under shared read lock)
         markVisited(shard, idx);
         const entry = shard.map.values()[idx];
 
@@ -1326,7 +1325,12 @@ fn removeAndFree(shard: *Shard, h: u32, key: CacheKey) void {
 }
 
 inline fn markVisited(shard: *Shard, i: usize) void {
-    if (shard.visited) |v| if (i < v.len) v[i].store(1, .monotonic);
+    // Load-first: an already-set hot bit skips the cache-line dirty write
+    // that every concurrent reader would otherwise pay coherence for.
+    // Monotonic u8 load/store compile to plain mov on x86_64/aarch64.
+    if (shard.visited) |v| if (i < v.len and v[i].load(.monotonic) == 0) {
+        v[i].store(1, .monotonic);
+    };
 }
 
 /// Mark the most recently inserted entry as visited. Callers MUST invoke
