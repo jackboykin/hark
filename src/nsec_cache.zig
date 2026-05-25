@@ -244,7 +244,8 @@ fn freeEntry(alloc: Allocator, e: *NsecEntry) void {
 /// An ancestor provably exists if an NSEC with that owner is in the zone.
 fn findClosestEncloser(list: *const ZoneNsecList, qname: dns.Name, now: i64) ?dns.Name {
     var label_count = qname.labels.len;
-    while (label_count > 1) {
+    // Include root (label_count 0) as a valid closest encloser.
+    while (label_count > 0) {
         label_count -= 1;
         const ancestor = dns.Name{ .labels = qname.labels[qname.labels.len - label_count ..] };
         if (list.findExact(ancestor, now) != null) return ancestor;
@@ -448,6 +449,11 @@ pub const NsecCache = struct {
             const zone_lower = name_lower[pos..];
             if (zone_lower.len == 0) break;
             if (self.tryZone(caller_alloc, zone_lower, qname, qtype, now)) |r| return r;
+        }
+
+        // Fall through to the root zone (keyed as "").
+        if (name_lower.len > 0) {
+            if (self.tryZone(caller_alloc, "", qname, qtype, now)) |r| return r;
         }
 
         _ = self.misses.fetchAdd(1, .monotonic);
@@ -1168,4 +1174,55 @@ test "zoneLabelsLen" {
     try testing.expectEqual(@as(usize, 1), zoneLabelsLen("com"));
     try testing.expectEqual(@as(usize, 2), zoneLabelsLen("example.com"));
     try testing.expectEqual(@as(usize, 3), zoneLabelsLen("sub.example.com"));
+}
+
+test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {
+    // Exercises both the root-zone suffix-walk fall-through in lookupSuffixes
+    // and the root-as-CE branch in findClosestEncloser. Either alone is
+    // insufficient — see scenario 007 for the end-to-end demonstration.
+    const alloc = testing.allocator;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // Bitmap signalling NSEC + RRSIG + DNSKEY + SOA + NS — the load-bearing
+    // bit for the wildcard-proof NSEC at root is just "isn't minimal and isn't
+    // a delegation NSEC", which this satisfies.
+    const bitmap_root = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_a = &[_]u8{ 0, 2, 0x40, 0x01 };
+
+    // Root SOA — owner is `.` (empty labels).
+    const root_soa = dns.ResourceRecord{
+        .name = dns.Name{ .labels = &.{} },
+        .rtype = .soa,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .soa = .{
+            .mname = try dns.parseDottedName(alloc, "root"),
+            .rname = try dns.parseDottedName(alloc, "admin"),
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 604800,
+            .minimum = 300,
+        } },
+    };
+    defer dns.freeName(alloc, root_soa.rdata.soa.mname);
+    defer dns.freeName(alloc, root_soa.rdata.soa.rname);
+
+    // NSEC chain: `. → a → c`. Covers `b` between `a` and `c` for NXDOMAIN,
+    // and covers `*` between `.` and `a` for the wildcard-non-existence proof.
+    const a_name = try dns.parseDottedName(alloc, "a");
+    const c_name = try dns.parseDottedName(alloc, "c");
+    defer dns.freeName(alloc, a_name);
+    defer dns.freeName(alloc, c_name);
+
+    nc.storeFromAuthority(&.{
+        root_soa,
+        .{ .name = dns.Name{ .labels = &.{} }, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = a_name, .type_bit_maps = bitmap_root } } },
+        .{ .name = a_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = c_name, .type_bit_maps = bitmap_a } } },
+    }, dns.Name{ .labels = &.{} });
+
+    const qname = try dns.parseDottedName(alloc, "b");
+    defer dns.freeName(alloc, qname);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .a, "b"), .nxdomain);
 }

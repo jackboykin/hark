@@ -1,0 +1,81 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN aggressive NSEC synthesises NXDOMAIN for sibling in cached range (RFC 8198)
+
+; End-to-end coverage for `src/nsec_cache.zig`. The module has 15 unit
+; tests but no scenario asserting the synthesis path fires on a real
+; recursive resolution.
+;
+; Zone layout (signed root, harness-generated key):
+;   `.`  — apex (SOA + NS + DNSKEY)
+;   `a.` — A record
+;   `c.` — A record
+;
+; Canonical owner ordering (RFC 4034 §6.1, octet-wise with absent < 0):
+;   . < a. < b. < b2. < c.
+;
+; Step 1 primes the cache with a live query for `b. A`. The responder
+; returns NXDOMAIN with two NSEC proofs:
+;   1. `a. NSEC c.` covers every name strictly between `a.` and `c.`,
+;      including both `b.` and `b2.`.
+;   2. `. NSEC a.` covers `*.` (0x2A `*` < 0x61 `a`), proving no
+;      wildcard would have matched.
+; Both get validated against the harness-signed DNSKEY for `.` and
+; stored in the aggressive NSEC cache.
+;
+; Step 3 queries `b2. A`. The scenario declares ONLY ONE upstream entry
+; (for `b.`). If hark goes upstream for `b2.`, the responder returns
+; REFUSED (responder.py:244, default for unmatched queries), hark
+; surfaces SERVFAIL, and step 4's `MATCH flags … AD NXDOMAIN` fails.
+;
+; The only path that produces NXDOMAIN with AD=1 for `b2.` without an
+; upstream query is RFC 8198 §5.3 synthesis from cached NSEC records.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b2. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b2. IN A
+ENTRY_END
+
+SCENARIO_END
