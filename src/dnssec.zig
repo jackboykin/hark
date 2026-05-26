@@ -562,8 +562,12 @@ fn serialAfter(s1: u32, s2: u32) bool {
     return s1 != s2 and (s1 -% s2) < 0x80000000;
 }
 
-/// 5 minutes — covers typical NTP drift; stricter than Unbound (1h floor).
-const clock_skew_tolerance: u32 = 300;
+// RFC 4035 §5.3.1 mandates zero grace; we deviate minimally and asymmetrically.
+// Inception grace forgives a signer with a slightly-ahead clock (misconfig, no
+// replay value). Expiration grace would widen an attacker's replay window for
+// a captured RRSIG, so it stays zero.
+const inception_skew_tolerance: u32 = 60;
+const expiration_skew_tolerance: u32 = 0;
 
 /// Verify an RRSIG, returning true on success, false on non-budget failure.
 /// Propagates ValidationBudgetExhausted so callers can bail out of loops.
@@ -603,9 +607,9 @@ pub fn verifyRrsig(
         if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
     }
 
-    // RFC 4035 §5.3.1 validity period, with clock-skew tolerance.
-    const skew_ahead = now_u32 +% clock_skew_tolerance;
-    const skew_behind = now_u32 -% clock_skew_tolerance;
+    // RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
+    const skew_ahead = now_u32 +% inception_skew_tolerance;
+    const skew_behind = now_u32 -% expiration_skew_tolerance;
     if (serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
     if (serialAfter(skew_behind, rrsig.sig_expiration)) return error.SignatureExpired;
 
@@ -2842,19 +2846,19 @@ const test_window_dnskey = dns.DnskeyData{
 const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
 
 test "verifyRrsig rejects expired signature" {
-    // now is past expiration by more than the clock-skew tolerance
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + clock_skew_tolerance + 1, null));
+    // Expiration tolerance is 0 — any time strictly past expiration rejects.
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + expiration_skew_tolerance + 1, null));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
-    // now is before inception by more than the clock-skew tolerance
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - clock_skew_tolerance - 1, null));
+    // now is before inception by more than the inception-skew tolerance
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, null));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
     inline for (.{
-        1700000000 + clock_skew_tolerance, // just past expiration, within tolerance
-        1699000000 - clock_skew_tolerance, // just before inception, within tolerance
+        1700000000 + expiration_skew_tolerance, // at expiration boundary
+        1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
         try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, null));
