@@ -914,24 +914,68 @@ pub fn validateNegativeProof(
     // Reject mixed NSEC/NSEC3
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
-    // Try NSEC proofs first. Track the NSEC that covered qname so we can derive
-    // the closest encloser and only test wildcard denial at the correct name.
-    // Invariant: `any_nsec` remains false when the proof is pure NSEC3, which
-    // lets control fall through to the NSEC3 path below.
+    // One scan for both shapes: matching_nsec (owner == qname) → direct NODATA;
+    // covering_nsec (range covers qname) → wildcard-NODATA (§3.1.3.4) or
+    // NXDOMAIN-shape-under-NOERROR (§5.4 — proof shape is signed, not rcode).
+    var matching_nsec: ?dns.ResourceRecord = null;
     var covering_nsec: ?dns.ResourceRecord = null;
     var any_nsec = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec) continue;
         any_nsec = true;
-        if (is_nxdomain) {
-            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) {
-                covering_nsec = rr;
-            }
-        } else {
-            // NODATA: NSEC owner matches qname, type not in bitmap
-            if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype)) {
+        if (matching_nsec == null and rr.name.eql(qname)) matching_nsec = rr;
+        if (covering_nsec == null and
+            nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname))
+        {
+            covering_nsec = rr;
+        }
+    }
+
+    // NODATA arm. Bitmap contradicting NODATA → .bogus (signed, hence forgery).
+    if (!is_nxdomain and any_nsec) {
+        if (matching_nsec) |rr| {
+            if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype))
                 return .secure;
+            return .bogus;
+        }
+
+        // Do NOT borrow the NXDOMAIN arm's strict CE-existence check (NSEC
+        // owner or next == CE): canonical wildcard NSECs have owner *.CE
+        // which sorts AFTER CE, so the strict check fails on the wire shape
+        // IANA and real signed zones actually emit. Owner-equality with
+        // *.CE plus a verified RRSIG is the binding here.
+        if (covering_nsec) |cov| {
+            if (qname.labels.len == 0) return .unchecked;
+            // Clamp commonSuffix to a proper ancestor: an apex-NSEC bound
+            // (e.g. ip6.arpa. → 3.0.0.1.0.0.2.ip6.arpa.) saturates at
+            // qname.labels.len when it contains qname as a strict suffix.
+            const ce_depth = @min(@max(
+                commonSuffixLabels(qname, cov.name),
+                commonSuffixLabels(qname, cov.rdata.nsec.next_domain_name),
+            ), qname.labels.len - 1);
+            const ce = dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
+
+            var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+            const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
+
+            for (authorities) |rr| {
+                if (rr.rtype != .nsec) continue;
+                if (rr.name.eql(wildcard)) {
+                    // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
+                    if (dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, qtype))
+                        return .bogus;
+                    if (qtype != .cname and
+                        dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .cname))
+                    {
+                        return .bogus;
+                    }
+                    return .secure;
+                }
+                // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
+                if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard))
+                    return .secure;
             }
+            return .unchecked;
         }
     }
 
@@ -940,12 +984,12 @@ pub fn validateNegativeProof(
     // also a suffix of the covering NSEC's owner or next_domain_name.
     if (is_nxdomain and any_nsec) {
         const covering = covering_nsec orelse return .unchecked;
-        const ce_depth = @max(
+        if (qname.labels.len == 0) return .unchecked;
+        // Clamp: see NODATA arm above.
+        const ce_depth = @min(@max(
             commonSuffixLabels(qname, covering.name),
             commonSuffixLabels(qname, covering.rdata.nsec.next_domain_name),
-        );
-        // CE must be a proper ancestor of qname (strictly fewer labels).
-        if (ce_depth >= qname.labels.len) return .bogus;
+        ), qname.labels.len - 1);
         const ce = dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
 
         // RFC 4035 §5.4: the CE must be *proven* to exist via an NSEC that
@@ -1032,36 +1076,42 @@ fn validateNsec3NegativeProof(
         return .unchecked;
     }
 
+    // hash(qname) is needed by both the NODATA direct-match check and the CE
+    // walk's label_offset==0 iteration; compute once.
+    const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch |e|
+        return budgetedHashStatus(e);
+
+    // Direct NODATA at hash(qname) (RFC 5155 §8.5). Bitmap contradicting
+    // NODATA → .bogus (mirrors NSEC arm).
     if (!is_nxdomain) {
-        // NODATA (RFC 5155 §8.5): NSEC3 owner matches hash(qname), qtype absent
-        const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch |e|
-            return budgetedHashStatus(e);
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
                 const nsec3 = rr.rdata.nsec3;
-                // Must not have qtype AND must not have CNAME (RFC 5155 §8.5)
-                if (!dns.typeBitmapContains(nsec3.type_bit_maps, qtype) and
-                    !dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
+                if (dns.typeBitmapContains(nsec3.type_bit_maps, qtype) or
+                    dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
                 {
-                    return .secure;
+                    return .bogus;
                 }
-                return .unchecked;
+                return .secure;
             }
         }
-        return .unchecked;
+        // No owner-match: fall through to CE proof. Handles wildcard-NODATA
+        // (§8.6) and NXDOMAIN-shape-under-NOERROR (§8.4).
     }
 
-    // NXDOMAIN (RFC 5155 §8.4): closest encloser proof
-    // Walk up from qname toward root to find closest encloser
-    var ce_idx: ?usize = null; // index into qname.labels where CE starts
+    // Closest-encloser proof (RFC 5155 §8.4 / §8.6). Shared by NXDOMAIN rcode
+    // and NODATA fallthrough; the wildcard step below distinguishes them.
+    var ce_idx: ?usize = null;
     var label_offset: usize = 0;
     while (label_offset < qname.labels.len) : (label_offset += 1) {
-        // Build ancestor name from qname.labels[label_offset..]
-        const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-        const ancestor_hash = budgetedNsec3Hash(ancestor, salt, iterations, budget) catch |e|
-            return budgetedHashStatus(e);
-
+        const ancestor_hash: [Sha1.digest_length]u8 = if (label_offset == 0)
+            qname_hash
+        else blk: {
+            const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
+            break :blk budgetedNsec3Hash(ancestor, salt, iterations, budget) catch |e|
+                return budgetedHashStatus(e);
+        };
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &ancestor_hash)) {
@@ -1073,24 +1123,25 @@ fn validateNsec3NegativeProof(
     }
     const ce_offset = ce_idx orelse return .unchecked;
 
-    // CE == qname itself contradicts NXDOMAIN
+    // CE == qname contradicts NXDOMAIN (and wildcard-expansion semantics).
     if (ce_offset == 0) return .bogus;
 
-    // Next closer name: CE + one label toward qname = qname.labels[ce_offset - 1..]
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
     const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch |e|
         return budgetedHashStatus(e);
 
-    // Wildcard at closest encloser: *.CE
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
     const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch |e|
         return budgetedHashStatus(e);
 
-    // Verify: some NSEC3 covers the next-closer hash
+    // Wildcard step: covered (denial, §8.4) OR owner-match with qtype + CNAME
+    // absent (§8.6). Owner-match with qtype/CNAME present → .bogus: the
+    // answer should have been wildcard expansion, not NXDOMAIN/NODATA.
     var nc_covered = false;
-    var wc_covered = false;
+    var wc_proven = false;
+    var wc_contradicted = false;
     for (authorities) |rr| {
         const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
         const nsec3 = rr.rdata.nsec3;
@@ -1098,18 +1149,23 @@ fn validateNsec3NegativeProof(
         if (!nc_covered and nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) {
             nc_covered = true;
         }
-        // Wildcard: covered (doesn't exist) OR exact match with no qtype (NODATA at wildcard)
-        if (!wc_covered) {
+        if (!wc_proven) {
             if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
-                wc_covered = true;
+                wc_proven = true;
             } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
-                // Wildcard exists but doesn't have the type — still proves NXDOMAIN
-                wc_covered = true;
+                if (dns.typeBitmapContains(nsec3.type_bit_maps, qtype) or
+                    dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
+                {
+                    wc_contradicted = true;
+                } else {
+                    wc_proven = true;
+                }
             }
         }
     }
 
-    if (nc_covered and wc_covered) return .secure;
+    if (nc_covered and wc_proven) return .secure;
+    if (wc_contradicted) return .bogus;
     return .unchecked;
 }
 
@@ -2131,6 +2187,122 @@ test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
+// Helper for NSEC tests with explicit bitmaps. nsecRr builds with empty bitmap.
+fn nsecRrWithBitmap(owner: dns.Name, next: dns.Name, bitmap: []const u8) dns.ResourceRecord {
+    return .{
+        .name = owner,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = bitmap } },
+    };
+}
+
+test "validateNegativeProof NSEC NXDOMAIN apex-NSEC shape (clamped CE)" {
+    // IANA ip6.arpa shape under NXDOMAIN rcode: next contains qname as a
+    // strict suffix → commonSuffix saturates → clamp must engage.
+    const apex = dns.Name{ .labels = &.{ "ip6", "arpa" } };
+    const next = dns.Name{ .labels = &.{ "3", "0", "0", "1", "0", "0", "2", "ip6", "arpa" } };
+    const qname = dns.Name{ .labels = &.{ "2", "ip6", "arpa" } };
+    const authorities = [_]dns.ResourceRecord{nsecRr(apex, next)};
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
+}
+
+test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" {
+    // go-vip.net shape: HTTPS on a wildcard-expanded name. Covering NSEC
+    // proves no closer match; *.CE NSEC has A+AAAA+RRSIG+NSEC, no HTTPS(65).
+    const lotus = dns.Name{ .labels = &.{ "lotus", "go-vip", "net" } };
+    const ns1 = dns.Name{ .labels = &.{ "ns1", "go-vip", "net" } };
+    const wildcard = dns.Name{ .labels = &.{ "*", "go-vip", "net" } };
+    const acme = dns.Name{ .labels = &.{ "_acme-challenge", "go-vip", "net" } };
+    const qname = dns.Name{ .labels = &.{ "nasa-tv", "go-vip", "net" } };
+
+    // A(1)+AAAA(28)+RRSIG(46)+NSEC(47); HTTPS(65) and CNAME(5) absent.
+    const wc_bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03 };
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(lotus, ns1),
+        nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
+    };
+
+    const https: dns.RType = @enumFromInt(65);
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
+}
+
+test "validateNegativeProof NSEC NODATA NXDOMAIN-shape under NOERROR (RFC 4035 §5.4)" {
+    // IANA ip6.arpa shape under NOERROR. Single apex NSEC covers qname AND
+    // *.CE (canonical: ip6.arpa < *.ip6.arpa < 2.ip6.arpa < 3.0.0.1.0.0.2.ip6.arpa).
+    const apex = dns.Name{ .labels = &.{ "ip6", "arpa" } };
+    const next = dns.Name{ .labels = &.{ "3", "0", "0", "1", "0", "0", "2", "ip6", "arpa" } };
+    const qname = dns.Name{ .labels = &.{ "2", "ip6", "arpa" } };
+    const authorities = [_]dns.ResourceRecord{nsecRr(apex, next)};
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+}
+
+test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
+    const lotus = dns.Name{ .labels = &.{ "lotus", "go-vip", "net" } };
+    const ns1 = dns.Name{ .labels = &.{ "ns1", "go-vip", "net" } };
+    const wildcard = dns.Name{ .labels = &.{ "*", "go-vip", "net" } };
+    const acme = dns.Name{ .labels = &.{ "_acme-challenge", "go-vip", "net" } };
+    const qname = dns.Name{ .labels = &.{ "nasa-tv", "go-vip", "net" } };
+
+    // Wildcard bitmap claims HTTPS(65) present — contradicts NODATA claim.
+    const wc_bitmap = [_]u8{ 0x00, 0x09, 0x40, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x40 };
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(lotus, ns1),
+        nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
+    };
+
+    const https: dns.RType = @enumFromInt(65);
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, https, false, &b));
+}
+
+test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
+    // RFC 6840 §4.3: *.CE with CNAME in bitmap means the answer should have
+    // chased the CNAME, not returned NODATA.
+    const lotus = dns.Name{ .labels = &.{ "lotus", "go-vip", "net" } };
+    const ns1 = dns.Name{ .labels = &.{ "ns1", "go-vip", "net" } };
+    const wildcard = dns.Name{ .labels = &.{ "*", "go-vip", "net" } };
+    const acme = dns.Name{ .labels = &.{ "_acme-challenge", "go-vip", "net" } };
+    const qname = dns.Name{ .labels = &.{ "nasa-tv", "go-vip", "net" } };
+
+    const wc_bitmap = [_]u8{ 0x00, 0x01, 0x04 }; // CNAME(5) only
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(lotus, ns1),
+        nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
+    };
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+}
+
+test "validateNegativeProof NSEC NODATA owner-match with qtype in bitmap is .bogus" {
+    const name = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "next", "com" } };
+    const bitmap = [_]u8{ 0x00, 0x04, 0x60, 0x00, 0x00, 0x08 }; // A+NS+AAAA
+    const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(name, next, &bitmap)};
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, name, .aaaa, false, &b));
+}
+
+test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unchecked" {
+    // Covering range starts at aaa.example.com, so *.example.com sorts before
+    // the range and isn't covered. No *.CE NSEC either.
+    const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
+    const zzz = dns.Name{ .labels = &.{ "zzz", "example", "com" } };
+    const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, &b));
+}
+
 // ── NSEC3 Helper Tests ───────────────────────────────────────────────
 
 /// Build an NSEC3 owner name by base32hex-encoding a hash and appending zone labels.
@@ -2303,8 +2475,8 @@ test "NSEC3 NODATA - secure" {
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
 }
 
-test "NSEC3 NODATA - CNAME in bitmap" {
-    // If CNAME is in bitmap, should NOT prove NODATA (RFC 5155 §8.5)
+test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
+    // Mirrors NSEC arm: owner-match with CNAME in bitmap contradicts NODATA.
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "alias"), @as([]const u8, "com") },
     };
@@ -2317,7 +2489,7 @@ test "NSEC3 NODATA - CNAME in bitmap" {
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x04 })};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
 }
 
 test "NSEC3 NXDOMAIN - closest encloser proof" {
@@ -2383,6 +2555,92 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
 
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, &b));
+}
+
+test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.6)" {
+    const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
+    const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
+    var bufs2: Nsec3OwnerBufs = .{};
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
+    // *.CE NSEC3 owner-match with bitmap = A(1) only; HTTPS(65) and CNAME(5) absent.
+    var bufs3: Nsec3OwnerBufs = .{};
+    const wc_owner = makeNsec3OwnerName(try nsec3Hash(wc_name, salt, 0), zone_labels, &bufs3.enc, &bufs3.labels);
+
+    const authorities = [_]dns.ResourceRecord{
+        makeNsec3Rr(ce_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+        nc_rr,
+        makeNsec3Rr(wc_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+    };
+
+    const https: dns.RType = @enumFromInt(65);
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
+}
+
+test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
+    // §8.4-shape proof (CE + next-closer + wildcard all covered) under NOERROR.
+    const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
+    const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
+    var bufs2: Nsec3OwnerBufs = .{};
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
+    var bufs3: Nsec3OwnerBufs = .{};
+    var wc_low: [20]u8 = undefined;
+    var wc_high: [20]u8 = undefined;
+    const wc_rr = makeCoveringNsec3(try nsec3Hash(wc_name, salt, 0), zone_labels, salt, &bufs3, &wc_low, &wc_high);
+
+    const authorities = [_]dns.ResourceRecord{
+        makeNsec3Rr(ce_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+        nc_rr,
+        wc_rr,
+    };
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+}
+
+test "NSEC3 NXDOMAIN wildcard-match with qtype present is .bogus" {
+    // Tightened from prior accept-any-wildcard-match: bitmap claiming the
+    // qtype is present at *.CE means the answer should have been wildcard
+    // expansion, not NXDOMAIN.
+    const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
+    const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
+    var bufs2: Nsec3OwnerBufs = .{};
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
+    var bufs3: Nsec3OwnerBufs = .{};
+    const wc_owner = makeNsec3OwnerName(try nsec3Hash(wc_name, salt, 0), zone_labels, &bufs3.enc, &bufs3.labels);
+
+    const authorities = [_]dns.ResourceRecord{
+        makeNsec3Rr(ce_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+        nc_rr,
+        makeNsec3Rr(wc_owner, salt, &([_]u8{0xFF} ** 20), &[_]u8{ 0x00, 0x01, 0x40 }),
+    };
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "classifyDelegation NSEC3 match" {
@@ -2527,10 +2785,10 @@ test "classifyDelegation salt-cache defeat exhausts NSEC3 budget" {
 }
 
 test "NSEC3 budget accumulates across negative-proof calls" {
-    // Per-resolution semantics: a single ValidationBudget is shared across the
-    // whole resolve(), so two validateNegativeProof invocations on the same
-    // budget must accumulate. Use the NODATA path (one hash per call); a budget
-    // of 1 admits the first call but exhausts the second.
+    // One ValidationBudget is shared across resolve(); two calls must
+    // accumulate. NODATA-with-no-owner-match hashes qname once, then ancestors
+    // in the CE walk; label_offset==0 reuses qname_hash, so a 2-label qname
+    // costs 2 hashes per call (qname + com).
     const qname = dns.Name{ .labels = &.{ "example", "com" } };
     const salt: []const u8 = &.{};
 
@@ -2539,7 +2797,7 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    var b: ValidationBudget = .{ .nsec3_hash_remaining = 1 };
+    var b: ValidationBudget = .{ .nsec3_hash_remaining = 2 };
     const first = validateNegativeProof(&authorities, qname, .a, false, &b);
     try testing.expectEqual(SecurityStatus.unchecked, first);
     try testing.expectEqual(@as(u16, 0), b.nsec3_hash_remaining);
