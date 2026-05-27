@@ -12,7 +12,7 @@ Runs on Linux with io_uring.
 - **DNS-over-TLS** — opportunistic encryption to authoritatives (RFC 9539) with background probing and connection pooling
 - **Full recursive resolution** from root hints with QNAME minimization
 - **TCP connection pooling** for upstream queries (RFC 7766)
-- **In-memory RRset cache** with SIEVE eviction, RFC 2308 negative caching, prefetch, serve-stale (RFC 8767)
+- **In-memory RRset cache** with SIEVE eviction, RFC 2308 negative caching, prefetch, A/AAAA cousin prefetch (RFC 8305), serve-stale (RFC 8767)
 - **Thompson Sampling** nameserver selection (per-zone, discounted)
 - **Query deduplication** across workers (singleflight)
 - **Multi-threaded server** with `SO_REUSEPORT`, per-query memory cap
@@ -74,7 +74,7 @@ entries = 10000               # answer cache, max entries
 key-cache-size = 4194304      # DNSKEY/DS cache, bytes
 key-cache-entries = 2000      # DNSKEY/DS cache, max entries
 prefetch = false              # refresh near-expiry entries
-prefetch-cousin = false       # also fetch the other A/AAAA on lookup
+prefetch-cousin = true        # also fetch the other A/AAAA on lookup
 serve-stale-ttl = 0           # serve expired up to N seconds (RFC 8767)
 min-ttl = 0                   # floor for aggressive CDN TTLs
 

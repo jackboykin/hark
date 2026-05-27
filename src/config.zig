@@ -165,7 +165,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .key_cache_size = 4 * 1024 * 1024,
         .key_cache_entries = 2_000,
         .prefetch = false,
-        .prefetch_cousin = false,
+        .prefetch_cousin = true,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
         .dnssec = false,
@@ -635,17 +635,17 @@ test "tcp idle/queries/upstream knobs parse and validate" {
     ));
 }
 
-test "prefetch-cousin defaults off and parses" {
+test "prefetch-cousin defaults on and parses" {
     var cfg1 = try parseConfig(testing.allocator, "");
     defer cfg1.deinit();
-    try testing.expectEqual(false, cfg1.prefetch_cousin);
+    try testing.expectEqual(true, cfg1.prefetch_cousin);
 
     var cfg2 = try parseConfig(testing.allocator,
         \\[cache]
-        \\prefetch-cousin = true
+        \\prefetch-cousin = false
     );
     defer cfg2.deinit();
-    try testing.expectEqual(true, cfg2.prefetch_cousin);
+    try testing.expectEqual(false, cfg2.prefetch_cousin);
 }
 
 test "rebinding defaults are safe (enabled, empty extras)" {
