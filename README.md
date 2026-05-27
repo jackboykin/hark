@@ -61,7 +61,7 @@ resolution-threads = 4        # pool threads per worker (1..256)
 max-udp-payload = 1232        # advertised OPT + outbound clamp (512..65535)
 
 [resolver]
-dnssec = false
+dnssec = true
 qname-minimization = true     # RFC 9156
 case-randomization = true     # 0x20 QNAME case (Vixie/Dagon)
 opportunistic = false         # RFC 9539 encrypted to authoritatives

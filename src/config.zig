@@ -168,7 +168,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .prefetch_cousin = true,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
-        .dnssec = false,
+        .dnssec = true,
         .qname_minimization = true,
         .case_randomization = true,
         .query_memory_limit = 2 * 1024 * 1024,
@@ -536,7 +536,7 @@ test "default config" {
     try testing.expectEqual(@as(usize, 2), cfg.listen.len);
     try testing.expectEqual(@as(usize, 16 * 1024 * 1024), cfg.cache_size);
     try testing.expectEqual(@as(u32, 10_000), cfg.cache_entries);
-    try testing.expectEqual(false, cfg.dnssec);
+    try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(true, cfg.qname_minimization);
     try testing.expect(cfg.workers >= 1);
 }
