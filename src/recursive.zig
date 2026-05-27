@@ -292,18 +292,6 @@ pub const RecursiveResolver = struct {
         return resolver;
     }
 
-    fn udp(self: *const RecursiveResolver) *BlockingUdpTransport {
-        return self.transports.?.udp;
-    }
-
-    fn tcpEnabled(self: *const RecursiveResolver) bool {
-        return self.transports.?.tcp_enabled;
-    }
-
-    fn tls(self: *const RecursiveResolver) ?*TlsTransport {
-        return self.transports.?.tls;
-    }
-
     /// Close and discard any pending anticipated query. Safe to call when no
     /// slot is armed.
     fn dropAnticipated(self: *RecursiveResolver) void {
@@ -468,7 +456,7 @@ pub const RecursiveResolver = struct {
     const failover_timeout_cap: u32 = 2000;
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.udp().config.timeout_ms;
+        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.?.udp.config.timeout_ms;
         return if (is_last) base else @min(base, failover_timeout_cap);
     }
 
@@ -1527,7 +1515,7 @@ pub const RecursiveResolver = struct {
         // output across loop iterations — each hop needs its own buffer so
         // those slices survive until the arena resets.
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const response_data = self.udp().queryWithTimeout(
+        const response_data = self.transports.?.udp.queryWithTimeout(
             wire_query,
             query_id,
             server,
@@ -1565,7 +1553,7 @@ pub const RecursiveResolver = struct {
         wire_query: []const u8,
         server: na.Address,
     ) error{OutOfMemory}!?dns.Message {
-        if (!self.tcpEnabled()) return null;
+        if (!self.transports.?.tcp_enabled) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
         const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.tcp_pool) catch |err| {
             var addr_buf: [64]u8 = undefined;
@@ -1640,7 +1628,7 @@ pub const RecursiveResolver = struct {
         else
             self.stagger_ms;
 
-        const overall_timeout = self.udp().config.timeout_ms;
+        const overall_timeout = self.transports.?.udp.config.timeout_ms;
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
         // per leg because each socket's send holds the wire bytes past the
@@ -1688,7 +1676,7 @@ pub const RecursiveResolver = struct {
 
         const query_start = monotonic.nowUs();
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const stag_result = self.udp().queryStaggered(
+        const stag_result = self.transports.?.udp.queryStaggered(
             wires[0..leg_count],
             qids[0..leg_count],
             leg_addrs[0..leg_count],
@@ -1826,7 +1814,7 @@ pub const RecursiveResolver = struct {
                 // ── RFC 9539: Opportunistic encrypted query ──
                 // TLS authenticates the channel, so 0x20 is redundant there;
                 // the TLS variant always uses lowercase QNAME.
-                if (self.tls()) |tls_t| {
+                if (self.transports.?.tls) |tls_t| {
                     if (self.encrypted_ns_cache) |oc| {
                         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
                         switch (oc.getStatus(tls_key)) {
@@ -1926,7 +1914,7 @@ pub const RecursiveResolver = struct {
 
     fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
         const oc = self.encrypted_ns_cache orelse return;
-        const tls_t = self.tls() orelse return;
+        const tls_t = self.transports.?.tls orelse return;
         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
         if (oc.claimProbe(tls_key)) {
             tls_t.probeInBackground(server, oc);
@@ -2736,8 +2724,8 @@ pub const RecursiveResolver = struct {
             defer udp_t.deinit();
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
-                .tcp_enabled = ctx.parent.tcpEnabled(),
-                .tls = ctx.parent.tls(),
+                .tcp_enabled = ctx.parent.transports.?.tcp_enabled,
+                .tls = ctx.parent.transports.?.tls,
             });
 
             var arena = std.heap.ArenaAllocator.init(ctx.shared_cap.allocator());
