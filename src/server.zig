@@ -508,6 +508,7 @@ pub const Server = struct {
         errdefer ns_selector.deinit();
 
         var ca_bundle: Certificate.Bundle = .empty;
+        errdefer ca_bundle.deinit(allocator);
         if (cfg.opportunistic) {
             ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch |err| {
                 log.err("failed to load CA certificates: {s}", .{@errorName(err)});
