@@ -546,7 +546,29 @@ pub const RecursiveResolver = struct {
             }
 
             // CACHE CHECK 1: Do we already have a cached answer?
-            if (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
+            switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, cname_chain.items, cname_auth_aggregate.items)) {
+                .none => {},
+                .served => |served| return served,
+                .follow_cname => |dispatch| {
+                    if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
+                    if (cnameTargetRevisitsChain(cname_chain.items, dispatch.cname_rr.rdata.cname)) {
+                        logCnameLoop(dispatch.cname_rr.rdata.cname, "cache-served");
+                        return self.bogusServfail(current_name, qtype);
+                    }
+                    cname_count += 1;
+                    try cname_chain.append(allocator, dispatch.cname_rr);
+                    try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_auth_aggregate);
+                    current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
+                    // Mirror the upstream branch (lines 794-796): re-resolve
+                    // the target with fresh security state, but preserve
+                    // .insecure so an unauthenticated cached CNAME can't
+                    // launder AD onto downstream answers.
+                    if (security_state != .insecure) {
+                        security_state = if (self.dnssec_enabled) .secure else .unchecked;
+                    }
+                    continue :cname_loop;
+                },
+            }
 
             if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
 
@@ -762,6 +784,10 @@ pub const RecursiveResolver = struct {
                                 // Store before following CNAME — won't reach final answer validation
                                 if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status);
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
+                                if (cnameTargetRevisitsChain(cname_chain.items, cname_rr.rdata.cname)) {
+                                    logCnameLoop(cname_rr.rdata.cname, "upstream-served");
+                                    return self.bogusServfail(current_name, qtype);
+                                }
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
 
@@ -856,14 +882,39 @@ pub const RecursiveResolver = struct {
 
     // ── Cache-served short-circuits ─────────────────────────────────────
 
+    /// Dispatch from `tryServeFromCache`: either a terminal answer, a
+    /// CNAME follow-up the outer loop drives, or no usable cache hit.
+    /// The `follow_cname` arm is the dual-stack win — when a downstream
+    /// AAAA query reuses the CNAME its sibling A query already cached.
+    const CacheDispatch = union(enum) {
+        none,
+        served: ResolveResult,
+        follow_cname: struct {
+            cname_rr: dns.ResourceRecord,
+            security_status: cache_mod.SecurityStatus,
+            /// Pre-validated wildcard-expansion proofs from the cache.
+            /// Trust-at-store; aggregated without re-verifying signatures.
+            nsec_proofs: []const dns.ResourceRecord,
+        },
+    };
+
     /// Cache check 1: positive or negative hit on the main RRset cache.
-    /// Returns null on miss. RFC 8767 §6 requires trying fresh once
+    /// Returns `.none` on miss. RFC 8767 §6 requires trying fresh once
     /// before serving a stale entry; the `bypass_cache` save/restore
     /// lives inside this helper so the recursive call doesn't leak the
     /// flag to other callers. Both stale recursion and prefetch-window
     /// signalling are gated to the head of the CNAME chain
     /// (cname_count == 0) — mid-chain re-entry would re-walk preceding
     /// labels.
+    ///
+    /// CNAME-follow fallback: when the direct `(current_name, qtype)`
+    /// lookup misses and qtype isn't .cname, probe for a cached CNAME.
+    /// A fresh hit returns `.follow_cname`; the outer loop pushes it
+    /// onto the chain and continues. Stale CNAMEs at the head of the
+    /// chain are skipped so the direct upstream path can run — the
+    /// stale-revalidate gate (cname_count == 0) protects against
+    /// silently serving a stale redirect when fresh resolution is on
+    /// the table.
     fn tryServeFromCache(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -874,50 +925,75 @@ pub const RecursiveResolver = struct {
         cname_count: usize,
         cname_chain_items: []const dns.ResourceRecord,
         cname_auth_items: []const dns.ResourceRecord,
-    ) !?ResolveResult {
-        if (self.bypass_cache) return null;
-        const c = self.cache orelse return null;
-        const result = c.lookup(allocator, current_name, qtype, .in) orelse return null;
+    ) !CacheDispatch {
+        if (self.bypass_cache) return .none;
+        const c = self.cache orelse return .none;
+        if (c.lookup(allocator, current_name, qtype, .in)) |result| {
+            const meta = switch (result) {
+                inline .hit, .negative => |entry| .{
+                    .needs_prefetch = entry.needs_prefetch,
+                    .is_stale = entry.is_stale,
+                },
+            };
+            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and cname_count == 0) name else null;
 
-        const meta = switch (result) {
-            inline .hit, .negative => |entry| .{
-                .needs_prefetch = entry.needs_prefetch,
-                .is_stale = entry.is_stale,
-            },
-        };
-        const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and cname_count == 0) name else null;
+            // RFC 8767 §6: a stale cache entry must not be the first answer
+            // when fresh resolution is achievable. Try fresh once with
+            // bypass_cache; on any failure fall back to the stale answer.
+            if (meta.is_stale and cname_count == 0) {
+                // Save/restore so a future caller that arrives here with
+                // bypass_cache already set doesn't get its flag silently
+                // flipped to false.
+                const prev_bypass = self.bypass_cache;
+                self.bypass_cache = true;
+                defer self.bypass_cache = prev_bypass;
+                if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
+                    return .{ .served = fresh };
+                } else |_| {
+                    // Fresh attempt failed; fall through to the stale return below.
+                }
+            }
 
-        // RFC 8767 §6: a stale cache entry must not be the first answer
-        // when fresh resolution is achievable. Try fresh once with
-        // bypass_cache; on any failure fall back to the stale answer.
-        if (meta.is_stale and cname_count == 0) {
-            // Save/restore so a future caller that arrives here with
-            // bypass_cache already set doesn't get its flag silently
-            // flipped to false.
-            const prev_bypass = self.bypass_cache;
-            self.bypass_cache = true;
-            defer self.bypass_cache = prev_bypass;
-            if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
-                return fresh;
-            } else |_| {
-                // Fresh attempt failed; fall through to the stale return below.
+            switch (result) {
+                .hit => |h| return .{
+                    .served = .{
+                        // RFC 4035 §5.3.1: RRSIGs travel in the same section as
+                        // their covered RRset. Concatenate sigs onto the answer-
+                        // section records so a DO=1 / CD=1 cache-served client
+                        // can validate; the wire shaper strips them for DO=0.
+                        // For wildcard-expanded answers, h.nsec_proofs carries
+                        // the §3.1.3.4 "no closer match" NSEC proofs from the
+                        // original response.
+                        .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
+                        .prefetch_name = prefetch_out,
+                        .prefetch_qtype = qtype,
+                    },
+                },
+                .negative => |n| return .{ .served = try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, cname_chain_items, cname_auth_items) },
             }
         }
 
-        switch (result) {
-            .hit => |h| return .{
-                // RFC 4035 §5.3.1: RRSIGs travel in the same section as
-                // their covered RRset. Concatenate sigs onto the answer-
-                // section records so a DO=1 / CD=1 cache-served client
-                // can validate; the wire shaper strips them for DO=0.
-                // For wildcard-expanded answers, h.nsec_proofs carries
-                // the §3.1.3.4 "no closer match" NSEC proofs from the
-                // original response.
-                .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
-                .prefetch_name = prefetch_out,
-                .prefetch_qtype = qtype,
+        // Direct miss. Probe (current_name, .cname): the dual-stack win.
+        // A prior A query may have cached the redirect; a subsequent AAAA
+        // can reuse it instead of re-walking from root. Unbound / BIND /
+        // PowerDNS / Knot all collapse this path.
+        if (qtype == .cname) return .none;
+        const cname_result = c.lookup(allocator, current_name, .cname, .in) orelse return .none;
+        switch (cname_result) {
+            .hit => |h| {
+                // Stale CNAME at the head of the chain: skip the follow
+                // and let the upstream path run. Mid-chain stale is
+                // already a degraded answer — the chain head was fresh
+                // when we entered — so following is acceptable there.
+                if (h.is_stale and cname_count == 0) return .none;
+                if (h.records.len == 0) return .none;
+                return .{ .follow_cname = .{
+                    .cname_rr = h.records[0],
+                    .security_status = h.security_status,
+                    .nsec_proofs = h.nsec_proofs,
+                } };
             },
-            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, cname_chain_items, cname_auth_items),
+            .negative => return .none, // cached NXDOMAIN/NODATA on .cname → upstream path handles it
         }
     }
 
@@ -3005,6 +3081,26 @@ fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord 
     return null;
 }
 
+/// True when `next_target` matches the owner of any CNAME already in the
+/// chain — a 2-name A→B→A cycle, or any longer revisit. Catches loops
+/// before they burn through `max_cname_chain`. Chain owners are
+/// lowercased at parse, so `Name.eql`'s case-insensitive compare is the
+/// right granularity here.
+fn cnameTargetRevisitsChain(chain: []const dns.ResourceRecord, next_target: dns.Name) bool {
+    for (chain) |rr| {
+        if (rr.name.eql(next_target)) return true;
+    }
+    return false;
+}
+
+/// Shared debug-log shape for the upstream-served and cache-served
+/// CNAME loop-detection branches. Single format string keeps both
+/// branches reading the same telemetry.
+fn logCnameLoop(target: dns.Name, where: []const u8) void {
+    var buf: [dns.max_name_len + 1]u8 = undefined;
+    log.debug("cname loop detected ({s}): target {s} already in chain", .{ where, target.formatInto(&buf) });
+}
+
 /// Concatenate two RR slices. Returns the input slice unchanged when one
 /// side is empty (zero-alloc fast path for the dominant non-DNSSEC case).
 fn concatRRs(allocator: mem.Allocator, a: []const dns.ResourceRecord, b: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
@@ -3064,6 +3160,27 @@ fn withCnameChain(
         msg.header.ns_count = @intCast(new_auths.len);
     }
     return msg;
+}
+
+/// Cache-served sibling of `aggregateCnameWildcardProofs`: append the
+/// pre-validated `nsec_proofs` from a CNAME cache entry to the running
+/// chain aggregate. Trust-at-store applies — the cache only retains
+/// `.secure` proofs for `.secure` entries, and `collectNsecProofs`
+/// already filtered to `isNsecProofMaterial`, so no signature re-verify
+/// is needed. Re-filtering on the way out is belt-and-suspenders against
+/// a future store-path that loosens its filter; cheap on the empty-proof
+/// common case.
+fn aggregateCachedCnameWildcardProofs(
+    allocator: mem.Allocator,
+    cname_status: cache_mod.SecurityStatus,
+    nsec_proofs: []const dns.ResourceRecord,
+    cname_auth_aggregate: *std.ArrayListUnmanaged(dns.ResourceRecord),
+) !void {
+    if (cname_status != .secure or nsec_proofs.len == 0) return;
+    for (nsec_proofs) |rr| {
+        if (dns.isNsecProofMaterial(rr))
+            try cname_auth_aggregate.append(allocator, rr);
+    }
 }
 
 /// Assemble a `ResolveResult` for a negative response: SOA + NSEC
@@ -3504,6 +3621,33 @@ test "findCnameRecord finds CNAME matching target" {
     try testing.expect(target.eql(result.?.name));
 }
 
+test "cnameTargetRevisitsChain detects 2-name A→B→A cycle in ≤2 hops" {
+    const alloc = testing.allocator;
+    const a_name = try makeName(alloc, &.{ "a", "example", "com" });
+    const b_name = try makeName(alloc, &.{ "b", "example", "com" });
+    defer dns.freeName(alloc, a_name);
+    defer dns.freeName(alloc, b_name);
+
+    // Hop 1: A → B
+    const cname_ab = dns.ResourceRecord{
+        .name = a_name,
+        .rtype = .cname,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .cname = b_name },
+    };
+    // Empty chain accepts anything.
+    try testing.expect(!cnameTargetRevisitsChain(&.{}, b_name));
+
+    // After hop 1, chain holds {A→B}. Hop 2 target = A revisits A.
+    const chain_one = [_]dns.ResourceRecord{cname_ab};
+    try testing.expect(cnameTargetRevisitsChain(&chain_one, a_name));
+    // Sanity: a non-revisiting third name is fine.
+    const c_name = try makeName(alloc, &.{ "c", "example", "com" });
+    defer dns.freeName(alloc, c_name);
+    try testing.expect(!cnameTargetRevisitsChain(&chain_one, c_name));
+}
+
 test "findCnameRecord returns null when no CNAME present" {
     const alloc = testing.allocator;
     const owner = try makeName(alloc, &.{ "example", "com" });
@@ -3514,6 +3658,148 @@ test "findCnameRecord returns null when no CNAME present" {
     defer dns.freeMessage(alloc, response);
 
     try testing.expect(findCnameRecord(response, dns.Name{ .labels = &.{ "example", "com" } }) == null);
+}
+
+test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAAA short-circuit upstream" {
+    const alloc = testing.allocator;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+
+    // Pre-warm the cache: (alias.example.com CNAME → target.example.com)
+    // and (target.example.com AAAA = ::1). Same shape a prior A query
+    // would have laid down on its way through this resolver.
+    {
+        const cname_owner = try makeName(alloc, &.{ "alias", "example", "com" });
+        const cname_target = try makeName(alloc, &.{ "target", "example", "com" });
+        const cname_rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = cname_target } };
+        const cname_msg = dns.Message{
+            .header = makeHeader(0, 0, 1),
+            .questions = &.{},
+            .answers = cname_rrs,
+        };
+        defer dns.freeMessage(alloc, cname_msg);
+        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked);
+    }
+    {
+        const aaaa_owner = try makeName(alloc, &.{ "target", "example", "com" });
+        const aaaa_rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        aaaa_rrs[0] = .{
+            .name = aaaa_owner,
+            .rtype = .aaaa,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+        };
+        const aaaa_msg = dns.Message{
+            .header = makeHeader(0, 0, 1),
+            .questions = &.{},
+            .answers = aaaa_rrs,
+        };
+        defer dns.freeMessage(alloc, aaaa_msg);
+        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked);
+    }
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true, // any upstream attempt → error.CacheOnlyMiss
+    };
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
+
+    // Two answers: synthesized CNAME from the chain + target AAAA.
+    try testing.expectEqual(@as(usize, 2), result.message.answers.len);
+    try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
+    try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
+}
+
+test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache-served path" {
+    const alloc = testing.allocator;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+
+    // Build a deliberately cyclic pair of CNAMEs in the cache: an
+    // attacker (or a really mangled zone) gives us a.example.com →
+    // b.example.com and b.example.com → a.example.com. The upstream
+    // path's loop check already catches this; the cache path must too.
+    inline for ([_]struct { owner: []const []const u8, target: []const []const u8 }{
+        .{ .owner = &.{ "a", "example", "com" }, .target = &.{ "b", "example", "com" } },
+        .{ .owner = &.{ "b", "example", "com" }, .target = &.{ "a", "example", "com" } },
+    }) |pair| {
+        const owner = try makeName(alloc, pair.owner);
+        const target = try makeName(alloc, pair.target);
+        const rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        rrs[0] = .{ .name = owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = target } };
+        const msg = dns.Message{
+            .header = makeHeader(0, 0, 1),
+            .questions = &.{},
+            .answers = rrs,
+        };
+        defer dns.freeMessage(alloc, msg);
+        cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked);
+    }
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try resolver.resolve(arena.allocator(), "a.example.com", .a);
+
+    // Cycle ⇒ SERVFAIL. Worth pinning: the upstream-blocked variant
+    // would otherwise pop CacheOnlyMiss instead.
+    try testing.expectEqual(dns.RCode.server_failure, result.message.header.flags.rcode);
+}
+
+test "aggregateCachedCnameWildcardProofs appends only when status is .secure" {
+    const alloc = testing.allocator;
+
+    const owner = try makeName(alloc, &.{ "x", "example", "com" });
+    const next = try makeName(alloc, &.{ "z", "example", "com" });
+    defer dns.freeName(alloc, owner);
+    defer dns.freeName(alloc, next);
+
+    const nsec_rr = dns.ResourceRecord{
+        .name = owner,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = &.{} } },
+    };
+
+    // .unchecked → no-op (an unauthenticated cached entry must never
+    // contribute AD-bearing material).
+    {
+        var agg: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        defer agg.deinit(alloc);
+        try aggregateCachedCnameWildcardProofs(alloc, .unchecked, &.{nsec_rr}, &agg);
+        try testing.expectEqual(@as(usize, 0), agg.items.len);
+    }
+    // .insecure → no-op.
+    {
+        var agg: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        defer agg.deinit(alloc);
+        try aggregateCachedCnameWildcardProofs(alloc, .insecure, &.{nsec_rr}, &agg);
+        try testing.expectEqual(@as(usize, 0), agg.items.len);
+    }
+    // .secure → proof material flows through.
+    {
+        var agg: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        defer agg.deinit(alloc);
+        try aggregateCachedCnameWildcardProofs(alloc, .secure, &.{nsec_rr}, &agg);
+        try testing.expectEqual(@as(usize, 1), agg.items.len);
+        try testing.expectEqual(dns.RType.nsec, agg.items[0].rtype);
+    }
 }
 
 // ── QNAME minimization tests ──────────────────────────────────────────
