@@ -218,8 +218,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // [server] section
     if (parsed.table.getTable("server")) |server| {
         if (server.getStringArray("listen")) |addrs| {
+            const new_listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
             allocator.free(cfg.listen);
-            cfg.listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
+            cfg.listen = new_listen;
         }
         if (server.getInteger("workers")) |w| {
             if (w < 1 or w > 65535) return error.InvalidWorkerCount;
@@ -237,8 +238,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (try nonNegativeClamped(u32, server, "user")) |u| cfg.drop_uid = u;
         if (try nonNegativeClamped(u32, server, "group")) |g| cfg.drop_gid = g;
         if (server.getStringArray("allow-from")) |entries| {
+            const new_allow = try parseCidrList(allocator, entries);
             allocator.free(cfg.allow_from);
-            cfg.allow_from = try parseCidrList(allocator, entries);
+            cfg.allow_from = new_allow;
         }
         if (try nonNegativeClamped(u32, server, "tcp-idle-timeout-ms")) |v| {
             // RFC 7828 §3.4 caps the wire TIMEOUT field (100-ms units) at u16.
@@ -257,8 +259,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // [resolver] section
     if (parsed.table.getTable("resolver")) |resolver| {
         if (resolver.getStringArray("root-hints")) |addrs| {
+            const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
             allocator.free(cfg.root_hints);
-            cfg.root_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
+            cfg.root_hints = new_hints;
         }
         // Test-only knobs. Each is gated by `build_options.testing_enabled`
         // so a production binary refuses the key — adding a new one means
@@ -274,8 +277,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (resolver.getStringArray("trust-anchors")) |entries| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
+            const new_anchors = try parseTrustAnchors(allocator, entries);
             allocator.free(cfg.trust_anchors);
-            cfg.trust_anchors = try parseTrustAnchors(allocator, entries);
+            cfg.trust_anchors = new_anchors;
         }
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
@@ -309,20 +313,23 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     if (parsed.table.getTable("rebinding")) |reb| {
         if (reb.getBool("enabled")) |b| cfg.rebinding.enabled = b;
         if (reb.getStringArray("allow-zones")) |entries| {
+            const new_zones = try parseZoneList(allocator, entries);
             for (cfg.rebinding.allow_zones) |zone| {
                 for (zone.labels) |label| allocator.free(label);
                 allocator.free(zone.labels);
             }
             allocator.free(cfg.rebinding.allow_zones);
-            cfg.rebinding.allow_zones = try parseZoneList(allocator, entries);
+            cfg.rebinding.allow_zones = new_zones;
         }
         if (reb.getStringArray("extra-block")) |entries| {
+            const new_block = try parseCidrList(allocator, entries);
             allocator.free(cfg.rebinding.extra_block);
-            cfg.rebinding.extra_block = try parseCidrList(allocator, entries);
+            cfg.rebinding.extra_block = new_block;
         }
         if (reb.getStringArray("extra-allow")) |entries| {
+            const new_allow = try parseCidrList(allocator, entries);
             allocator.free(cfg.rebinding.extra_allow);
-            cfg.rebinding.extra_allow = try parseCidrList(allocator, entries);
+            cfg.rebinding.extra_allow = new_allow;
         }
     }
 
@@ -593,6 +600,18 @@ test "invalid worker count" {
         \\workers = 0
     );
     try testing.expectError(error.InvalidWorkerCount, result);
+}
+
+// Regression: parseConfig used to free `cfg.listen` then `try parseAddressList`,
+// so a malformed address left a dangling slice that cfg.deinit double-freed.
+// `listen` is the only field with a non-empty default, so it's the only site
+// where testing.allocator actually trips on the bug — the sibling fields parse
+// into zero-length defaults whose double-free is a stdlib no-op.
+test "malformed listen does not double-free default" {
+    try testing.expectError(
+        error.InvalidListenAddress,
+        parseConfig(testing.allocator, "[server]\nlisten = [\"999.999.999.999:53\"]\n"),
+    );
 }
 
 test "cache prefetch and stale config" {
