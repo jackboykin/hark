@@ -481,6 +481,10 @@ pub const Server = struct {
             allocator
         else
             std.heap.smp_allocator;
+        // Pool threads, NS-fanout helpers, and bg-prefetch all share these
+        // caches via shallow-cloned resolver context. Gate on the same
+        // single_threaded build flag that picks the cache backing allocator.
+        const thread_safe = !builtin.single_threaded;
         var cache = RRsetCache.init(.{
             .backing = cache_alloc,
             .max_bytes = cfg.cache_size,
@@ -496,14 +500,14 @@ pub const Server = struct {
         var rtt_cache = RttCache.init(.{
             .allocator = allocator,
             .io = io,
-            .thread_safe = cfg.workers > 1,
+            .thread_safe = thread_safe,
         });
         errdefer rtt_cache.deinit();
 
         var ns_selector = NsSelector.init(.{
             .allocator = allocator,
             .io = io,
-            .thread_safe = cfg.workers > 1,
+            .thread_safe = thread_safe,
         });
         errdefer ns_selector.deinit();
 
@@ -536,7 +540,7 @@ pub const Server = struct {
                 .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
                 .max_bytes = NsecCache.default_max_bytes,
                 .io = io,
-                .thread_safe = cfg.workers > 1,
+                .thread_safe = thread_safe,
             }) else null,
             .key_cache = if (cfg.dnssec) RRsetCache.init(.{
                 .backing = cache_alloc,
