@@ -41,6 +41,15 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // ThinLTO in release modes: the cache-hit hot path crosses four module
+    // boundaries (server → recursive → cache → dns), and cross-module
+    // inlining of shardWithHash / Wyhash / lowerNameIntoBuf is exactly what
+    // ThinLTO recovers. Debug stays untouched so iteration speed doesn't
+    // degrade; ReleaseSmall stays untouched because LTO can grow binaries
+    // by enabling more inlining.
+    if (optimize == .ReleaseFast or optimize == .ReleaseSafe) {
+        exe.lto = .thin;
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
