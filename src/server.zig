@@ -1271,11 +1271,13 @@ const WorkerState = struct {
         const opcode_bits: u4 = @truncate(data[2] >> 3);
         const client_opcode: dns.OpCode = @enumFromInt(opcode_bits);
         if (opcode_bits != 0) { // Only QUERY (0) supported
+            @branchHint(.cold);
             self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, client_addr);
             return;
         }
         const qdcount = mem.readInt(u16, data[4..6], .big);
         if (qdcount != 1) {
+            @branchHint(.cold);
             self.sendErrorUdp(sock, id, .query, .format_error, 0, rd, &.{}, client_addr);
             return;
         }
@@ -1283,6 +1285,7 @@ const WorkerState = struct {
         if (self.tryCacheHitReply(sock, data, client_addr)) return;
 
         if (!self.queue.push(data, client_addr, sock, .udp)) {
+            @branchHint(.cold);
             // Silent drop on pool saturation (matches Unbound ip-ratelimit,
             // PowerDNS over-capacity, dnsdist default). A SERVFAIL here
             // would get pinned in every downstream cache for up to 5
@@ -1569,6 +1572,7 @@ const WorkerState = struct {
         const alloc = query_pta.reset();
 
         const query_msg = dns.parseMessage(alloc, data) catch {
+            @branchHint(.cold);
             if (data.len >= 3) {
                 const id = mem.readInt(u16, data[0..2], .big);
                 // Best-effort opcode echo from raw header even when parse failed.
@@ -1591,6 +1595,7 @@ const WorkerState = struct {
         var peer_buf: [64]u8 = undefined;
         const peer_str = na.format(client_addr, &peer_buf);
         const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.flags.cd, transports) catch |err| {
+            @branchHint(.cold);
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });

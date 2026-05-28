@@ -98,8 +98,12 @@ const max_minimize_count = 10;
 /// byte against the outgoing 0x20-echo query.
 fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Address) error{OutOfMemory}!?dns.Message {
     const msg = dns.parseMessage(allocator, data) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            @branchHint(.cold);
+            return error.OutOfMemory;
+        },
         else => {
+            @branchHint(.cold);
             var addr_buf: [64]u8 = undefined;
             log.debug("dropping malformed reply from {s}: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
@@ -992,6 +996,7 @@ pub const RecursiveResolver = struct {
     /// which is exactly the NoGlueRecords path on out-of-bailiwick NS
     /// like dynect.net.
     fn cacheResolutionFailure(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, depth: usize) void {
+        @branchHint(.cold);
         if (depth != 0) return;
         if (self.cache) |c| c.cacheServfail(name, qtype);
     }
@@ -1713,6 +1718,7 @@ pub const RecursiveResolver = struct {
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
+        @branchHint(.cold);
         if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked);
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
@@ -3098,6 +3104,7 @@ fn validateNegativeResponse(
         .insecure => .skip_cache,
         .bogus => .bogus,
         .unchecked => {
+            @branchHint(.cold);
             // Diagnostic for the fail-closed path: a real-world broken auth
             // (or a middlebox stripping NSEC) shows up here as SERVFAIL
             // where other resolvers may serve unauthenticated.
