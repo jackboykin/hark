@@ -5,7 +5,8 @@ const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const special_use = @import("special_use.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
-const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
+const blocking_transport = @import("blocking_transport.zig");
+const BlockingUdpTransport = blocking_transport.BlockingUdpTransport;
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 
 pub const Transports = struct {
@@ -189,32 +190,6 @@ pub const RecursiveResolver = struct {
     /// at every `resolve()` entry so it bounds work for one user-facing query.
     validation_budget: dnssec.ValidationBudget = .{},
 
-    /// Pre-fired UDP query for the predicted next same-zone CNAME hop. Sent at
-    /// the same-zone branch right before the inner loop continues; its RTT
-    /// overlaps with the current hop's cache-write + NSEC aggregation work.
-    /// Consumed at the next `queryAuthoritativeServers` entry when the
-    /// (qname, qtype, upstream) tuple matches. Single-slot; nested resolutions
-    /// (DS fetch) overwrite by closing the old socket first.
-    anticipated_query: ?AnticipatedQuery = null,
-
-    /// Optional metrics sink for `consumeAnticipated`; see
-    /// `Server.anticipated_drops`. Null in tests and the cache-only path.
-    anticipated_drops: ?*std.atomic.Value(u64) = null,
-
-    const AnticipatedQuery = struct {
-        sock: std.Io.net.Socket,
-        query_id: u16,
-        upstream: na.Address,
-        qname_buf: [dns.max_name_len + 1]u8,
-        qname_len: u16,
-        qtype: dns.RType,
-        deadline_ns: i128,
-
-        fn qname(self: *const AnticipatedQuery) []const u8 {
-            return self.qname_buf[0..self.qname_len];
-        }
-    };
-
     /// Stable inputs that come from the surrounding Server / WorkerState.
     /// Both server-side construction sites build one of these and call
     /// `fromContext` — the single source of truth for the field mapping.
@@ -231,7 +206,6 @@ pub const RecursiveResolver = struct {
         nsec_cache: ?*NsecCache,
         key_cache: ?*RRsetCache,
         tcp_pool: ?*TcpConnectionPool,
-        anticipated_drops: ?*std.atomic.Value(u64) = null,
     };
 
     /// Per-query knobs that vary across calls within the same Context.
@@ -274,7 +248,6 @@ pub const RecursiveResolver = struct {
             .query_memory_limit = ctx.config.query_memory_limit,
             .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
             .key_cache = if (ctx.config.dnssec) ctx.key_cache else null,
-            .anticipated_drops = ctx.anticipated_drops,
         };
     }
 
@@ -288,154 +261,7 @@ pub const RecursiveResolver = struct {
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
         resolver.validation_budget = .{};
-        resolver.anticipated_query = null;
         return resolver;
-    }
-
-    /// Close and discard any pending anticipated query. Safe to call when no
-    /// slot is armed.
-    fn dropAnticipated(self: *RecursiveResolver) void {
-        if (self.anticipated_query) |aq| {
-            aq.sock.close(self.io);
-            self.anticipated_query = null;
-        }
-    }
-
-    /// Pre-fire the next same-zone CNAME hop. Best-effort: any error path
-    /// (allocation, socket setup, send) silently falls back to the normal
-    /// per-hop send in the next loop iteration. Overwrites any prior slot.
-    fn prepareAnticipated(
-        self: *RecursiveResolver,
-        qname: []const u8,
-        qtype: dns.RType,
-        upstream: na.Address,
-        per_server_timeout_ms: u32,
-    ) void {
-        // Don't clobber a live slot from an outer same-zone branch — a nested
-        // resolveImpl (DNSKEY/DS fetch from verifyAuthoritySigs) sitting inside
-        // a same-zone CNAME chain would otherwise close the outer's pre-fired
-        // socket. If the existing slot is past its deadline, drop and rearm.
-        if (self.anticipated_query) |existing| {
-            if (existing.deadline_ns > monotonic.nowNs()) return;
-            self.dropAnticipated();
-        }
-        if (qname.len == 0 or qname.len > dns.max_name_len) return;
-
-        var stack_buf: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
-        const a = fba.allocator();
-        // No 0x20 randomization on the anticipated path — `consumeAnticipated`
-        // matches the case-insensitive echo policy of the non-0x20 send path.
-        // The (peer IP, peer port) filter that narrows the off-path forgery
-        // window is enforced in userspace by consumeAnticipated's
-        // `recv.from.eql(&aq.upstream)` check; that check is load-bearing for
-        // the 0x20-omission justification — do not remove it.
-        const msg = dns.buildQuery(a, 0, qname, qtype, .{
-            .rd = false,
-            .edns = .{ .do_bit = self.dnssec_aware },
-        }) catch return;
-        var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-        const wire = dns.serializeMessage(&wire_buf, msg) catch return;
-        const query_id = rand.queryId(self.io);
-        dns.patchQueryId(wire_buf[0..wire.len], query_id);
-
-        // Unconnected socket; consumeAnticipated does the source check in
-        // userspace, matching queryWithTimeout's RFC 5452 §9.2 policy.
-        const sock = na.wildcardFor(upstream).bind(self.io, .{ .mode = .dgram, .protocol = .udp }) catch return;
-        // No `errdefer` — the function returns void, so `catch return` would
-        // leak the socket. Hand-roll the close on every fallible path.
-        sock.send(self.io, &upstream, wire) catch {
-            sock.close(self.io);
-            return;
-        };
-
-        var aq: AnticipatedQuery = .{
-            .sock = sock,
-            .query_id = query_id,
-            .upstream = upstream,
-            .qname_buf = undefined,
-            .qname_len = @intCast(qname.len),
-            .qtype = qtype,
-            .deadline_ns = monotonic.nowNs() + @as(i128, per_server_timeout_ms) * std.time.ns_per_ms,
-        };
-        @memcpy(aq.qname_buf[0..qname.len], qname);
-        self.anticipated_query = aq;
-    }
-
-    /// Attempt to satisfy the current query from the pre-fired socket. Returns
-    /// the parsed response on a clean ID + question-echo match; otherwise
-    /// returns null. Mismatch on qname/qtype/server LEAVES the slot armed —
-    /// a nested resolveImpl that doesn't match must not close the outer's
-    /// pre-fired socket.
-    ///
-    /// The socket is unconnected (see prepareAnticipated), so the kernel
-    /// queues any datagram landing on the ephemeral port — not just ones
-    /// from `aq.upstream`. Drain spurious arrivals in a loop instead of
-    /// dropping the slot on the first mismatch; otherwise a single
-    /// unrelated packet would cost us the anticipated response (still
-    /// queued behind it) and force a full upstream round-trip for that
-    /// resolution. Loop is bounded by the slot's deadline; `max_drains`
-    /// caps the per-call retry count for defensive sanity.
-    fn consumeAnticipated(
-        self: *RecursiveResolver,
-        allocator: mem.Allocator,
-        qname: []const u8,
-        qtype: dns.RType,
-        servers: []const na.Address,
-    ) error{OutOfMemory}!?ServerQueryResult {
-        const aq = self.anticipated_query orelse return null;
-        if (qtype != aq.qtype or !std.ascii.eqlIgnoreCase(qname, aq.qname())) return null;
-        const aq_key = AddressKey.fromAddress(aq.upstream);
-        for (servers) |s| {
-            if (AddressKey.fromAddress(s).eql(aq_key)) break;
-        } else return null;
-
-        defer self.dropAnticipated();
-
-        const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
-        const max_drains: u8 = 16;
-        var drain_attempts: u8 = 0;
-        while (drain_attempts < max_drains) : (drain_attempts += 1) {
-            const remaining_ns = aq.deadline_ns - monotonic.nowNs();
-            if (remaining_ns <= 0) return null;
-            const remain_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
-
-            const recv = aq.sock.receiveTimeout(
-                self.io,
-                response_buf,
-                .{ .duration = .{ .raw = .fromMilliseconds(@max(1, remain_ms)), .clock = .awake } },
-            ) catch return null;
-            if (recv.data.len < dns.header_len) {
-                self.bumpAnticipatedDrop();
-                continue;
-            }
-            // Load-bearing: this (peer IP, peer port) check replaces the
-            // kernel 4-tuple filter the old connected-UDP socket provided,
-            // and is what makes prepareAnticipated's 0x20 omission safe
-            // (RFC 5452 §9.2).
-            if (!recv.from.eql(&aq.upstream)) {
-                self.bumpAnticipatedDrop();
-                continue;
-            }
-            const resp_id = mem.readInt(u16, recv.data[0..2], .big);
-            if (resp_id != aq.query_id) {
-                self.bumpAnticipatedDrop();
-                continue;
-            }
-
-            const data = recv.data;
-            if (dns.hasTcBit(data)) return null;
-            const response = (try tryParseMessage(allocator, data, aq.upstream)) orelse return null;
-            if (response.header.flags.rcode.isServerError()) return null;
-            const expected = dns.parseDottedName(allocator, qname) catch return null;
-            dns.validateResponse(response, expected, qtype) catch return null;
-            return .{ .message = response, .responding_server = aq.upstream };
-        }
-        return null;
-    }
-
-    fn bumpAnticipatedDrop(self: *RecursiveResolver) void {
-        if (self.anticipated_drops) |c| _ = c.fetchAdd(1, .monotonic);
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -472,7 +298,6 @@ pub const RecursiveResolver = struct {
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         self.validation_budget = .{};
-        defer self.dropAnticipated();
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
         result.cousin_prefetch_qtype = switch (qtype) {
@@ -779,11 +604,6 @@ pub const RecursiveResolver = struct {
                                 cname_count += 1;
                                 try cname_chain.append(allocator, cname_rr);
 
-                                const next: ?CnameNextHop = if (is_same_zone)
-                                    try self.prefireSameZoneCname(allocator, cname_rr.rdata.cname, qtype, parent_zone, responding_server)
-                                else
-                                    null;
-
                                 try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_auth_aggregate);
 
                                 // Same-zone CNAME: keep current auth servers, delegation,
@@ -791,9 +611,9 @@ pub const RecursiveResolver = struct {
                                 // unchanged within a zone, so re-walking from root would
                                 // only redo cache lookups. Skip back to the inner
                                 // referral loop with the new target.
-                                if (next) |n| {
-                                    current_name = n.qname;
-                                    target_name = n.target;
+                                if (is_same_zone) {
+                                    current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
+                                    target_name = try dns.cloneName(allocator, cname_rr.rdata.cname);
                                     minimize_label_count = if (self.qname_minimization)
                                         parent_zone.labels.len + 1
                                     else
@@ -1073,42 +893,6 @@ pub const RecursiveResolver = struct {
                 break;
             }
         }
-    }
-
-    // ── CNAME chase helpers ─────────────────────────────────────────────
-
-    const CnameNextHop = struct { qname: []const u8, target: dns.Name };
-
-    /// Same-zone CNAME pre-fire: compute the next-hop name and arm the
-    /// UDP query before NSEC aggregation so its RTT overlaps with
-    /// `verifyAuthoritySigs` (warm DNSKEY path) and the `storeResponse`
-    /// already completed. Caller guards on `is_same_zone`; the returned
-    /// (qname, target) feeds the same-zone branch directly. Best-effort:
-    /// any pre-fire failure (alloc, socket, send, outer slot already
-    /// armed) silently falls through to the normal per-hop send on the
-    /// next iteration.
-    fn prefireSameZoneCname(
-        self: *RecursiveResolver,
-        allocator: mem.Allocator,
-        cname_target: dns.Name,
-        qtype: dns.RType,
-        parent_zone: dns.Name,
-        responding_server: ?na.Address,
-    ) !CnameNextHop {
-        const next_qname = try nameToDotted(allocator, cname_target);
-        const next_target = try dns.cloneName(allocator, cname_target);
-        if (responding_server) |srv| {
-            // QMIN would probe a shorter qname when the target is deeper
-            // than parent+1, so our pre-armed query wouldn't match. Skip
-            // the pre-fire in that case rather than waste it.
-            const skip = self.qname_minimization and
-                next_target.labels.len > parent_zone.labels.len + 1;
-            if (!skip) {
-                const timeout = self.serverTimeout(AddressKey.fromAddress(srv), false);
-                self.prepareAnticipated(next_qname, qtype, srv, timeout);
-            }
-        }
-        return .{ .qname = next_qname, .target = next_target };
     }
 
     /// Aggregate wildcard-expansion NSEC/NSEC3 proofs from this hop's
@@ -1748,14 +1532,6 @@ pub const RecursiveResolver = struct {
         parent_zone: dns.Name,
     ) anyerror!ServerQueryResult {
         if (self.cache_only) return error.CacheOnlyMiss;
-
-        // Fast path: a same-zone CNAME chase may have pre-fired this exact
-        // query while the prior hop did cache-write + NSEC aggregation. Drain
-        // it before re-running NS selection / stagger / send.
-        if (try self.consumeAnticipated(allocator, query_name, query_type, servers[0..server_count])) |aq_result| {
-            self.fireOteProbe(aq_result.responding_server.?);
-            return aq_result;
-        }
 
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
         var order_buf: [max_servers_per_level]usize = undefined;
@@ -4052,182 +3828,6 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
     try testing.expectEqual(dns.RType.a, stitched.answers[1].rtype);
     try testing.expectEqual(@as(usize, 1), stitched.authorities.len); // NSEC aggregated
     try testing.expectEqual(dns.RType.nsec, stitched.authorities[0].rtype);
-}
-
-// ── Anticipated CNAME dispatch ──────────────────────────────────────────
-
-const blocking_transport = @import("blocking_transport.zig");
-
-test "prepareAnticipated + consumeAnticipated roundtrip over loopback UDP" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer server.sock.close(testing.io);
-
-    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, testing.io);
-    defer udp_t.deinit();
-    var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
-        .io = testing.io,
-    };
-    defer resolver.dropAnticipated();
-
-    const thread = try std.Thread.spawn(.{}, blocking_transport.echoServerThread, .{ server.sock, testing.io });
-
-    resolver.prepareAnticipated("example.com", .a, server.addr, 2000);
-    try testing.expect(resolver.anticipated_query != null);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const servers = [_]na.Address{server.addr};
-    const result = (try resolver.consumeAnticipated(arena.allocator(), "example.com", .a, &servers)) orelse {
-        thread.join();
-        return error.TestUnexpectedResult;
-    };
-    thread.join();
-
-    try testing.expectEqual(dns.RType.a, result.message.questions[0].qtype);
-    try testing.expect(result.responding_server != null);
-    try testing.expect(resolver.anticipated_query == null);
-}
-
-test "consumeAnticipated drains spurious datagrams and returns the real response" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const real_server = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer real_server.sock.close(testing.io);
-    const spurious = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer spurious.sock.close(testing.io);
-
-    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, testing.io);
-    defer udp_t.deinit();
-    var drops = std.atomic.Value(u64).init(0);
-    var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
-        .io = testing.io,
-        .anticipated_drops = &drops,
-    };
-    defer resolver.dropAnticipated();
-
-    // Arm slot — sends the query to real_server synchronously.
-    resolver.prepareAnticipated("example.com", .a, real_server.addr, 2000);
-    try testing.expect(resolver.anticipated_query != null);
-
-    // Drive the responder by hand so the FIFO order is deterministic: drain
-    // the query at real_server, then enqueue the spurious into the
-    // anticipated socket BEFORE the real echo. consumeAnticipated has to
-    // skip past the spurious and return the real response, bumping the
-    // counter exactly once.
-    var query_buf: [dns.max_udp_payload]u8 = undefined;
-    const q = try real_server.sock.receiveTimeout(
-        testing.io,
-        &query_buf,
-        .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } },
-    );
-
-    const aq_port = resolver.anticipated_query.?.sock.address.ip4.port;
-    const aq_loopback = na.initIp4(.{ 127, 0, 0, 1 }, aq_port);
-    var spurious_payload: [16]u8 = undefined;
-    @memset(&spurious_payload, 0);
-    try spurious.sock.send(testing.io, &aq_loopback, &spurious_payload);
-
-    var echo: [dns.max_udp_payload]u8 = undefined;
-    @memcpy(echo[0..q.data.len], q.data);
-    echo[2] |= 0x80; // QR
-    try real_server.sock.send(testing.io, &q.from, echo[0..q.data.len]);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const servers = [_]na.Address{real_server.addr};
-    const result = (try resolver.consumeAnticipated(arena.allocator(), "example.com", .a, &servers)) orelse
-        return error.TestUnexpectedResult;
-
-    try testing.expectEqual(dns.RType.a, result.message.questions[0].qtype);
-    try testing.expectEqual(@as(u64, 1), drops.load(.monotonic));
-    try testing.expect(resolver.anticipated_query == null);
-}
-
-test "consumeAnticipated returns null but preserves slot on qname/qtype mismatch" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer server.sock.close(testing.io);
-
-    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
-    defer udp_t.deinit();
-    var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
-        .io = testing.io,
-    };
-    defer resolver.dropAnticipated();
-
-    resolver.prepareAnticipated("example.com", .a, server.addr, 1000);
-    try testing.expect(resolver.anticipated_query != null);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const servers = [_]na.Address{server.addr};
-
-    // Nested resolveImpl (DS / DNSKEY fetch) would pass an unrelated qname/qtype
-    // here. Surrendering the slot on mismatch would close the outer's pre-fired
-    // socket; the regression guard is "still armed."
-    try testing.expect((try resolver.consumeAnticipated(arena.allocator(), "example.com", .aaaa, &servers)) == null);
-    try testing.expect(resolver.anticipated_query != null);
-
-    try testing.expect((try resolver.consumeAnticipated(arena.allocator(), "other.example.com", .a, &servers)) == null);
-    try testing.expect(resolver.anticipated_query != null);
-}
-
-test "consumeAnticipated returns null but preserves slot when server not in list" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const server = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer server.sock.close(testing.io);
-
-    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
-    defer udp_t.deinit();
-    var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
-        .io = testing.io,
-    };
-    defer resolver.dropAnticipated();
-
-    resolver.prepareAnticipated("example.com", .a, server.addr, 1000);
-    try testing.expect(resolver.anticipated_query != null);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const other_server = na.initIp4(.{ 192, 0, 2, 99 }, 53);
-    const servers = [_]na.Address{other_server};
-    try testing.expect((try resolver.consumeAnticipated(arena.allocator(), "example.com", .a, &servers)) == null);
-    try testing.expect(resolver.anticipated_query != null);
-}
-
-test "prepareAnticipated does not clobber a live outer slot" {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const server_a = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer server_a.sock.close(testing.io);
-    const server_b = try blocking_transport.bindLoopbackUdpSock(testing.io);
-    defer server_b.sock.close(testing.io);
-
-    var udp_t = BlockingUdpTransport.init(.{ .timeout_ms = 1000 }, testing.io);
-    defer udp_t.deinit();
-    var resolver: RecursiveResolver = .{
-        .transports = .{ .udp = &udp_t, .tcp_enabled = false },
-        .io = testing.io,
-    };
-    defer resolver.dropAnticipated();
-
-    resolver.prepareAnticipated("outer.example.com", .a, server_a.addr, 30_000);
-    const outer_handle = resolver.anticipated_query.?.sock.handle;
-
-    // Simulate a nested resolveImpl trying to arm its own anticipated query;
-    // the outer's still-fresh slot must survive.
-    resolver.prepareAnticipated("inner.example.com", .aaaa, server_b.addr, 30_000);
-    try testing.expect(resolver.anticipated_query != null);
-    try testing.expectEqual(outer_handle, resolver.anticipated_query.?.sock.handle);
-    try testing.expectEqual(dns.RType.a, resolver.anticipated_query.?.qtype);
 }
 
 // ── cache_only guard tests ────────────────────────────────────────────
