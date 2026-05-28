@@ -513,12 +513,60 @@ fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
 
 // ── RRsetCache ────────────────────────────────────────────────────────
 
-/// Number of cache shards. Power-of-2 so shard selection is `& mask`.
-/// 16 = 2^4 sits in the industry sweet spot (Unbound auto-sets *-slabs to
-/// a power of 2 close to thread count; dnsdist defaults to 20 packet-cache
-/// shards). Matches dev-host physical core count.
-const shard_count: u32 = 16;
-const shard_mask: u32 = shard_count - 1;
+/// Cache shards: each is an independent rwlock + map, so lookups on different
+/// names run concurrently. The active count is derived per cache from
+/// reader_concurrency (Unbound/BIND model: slabs/buckets ~ thread count) and
+/// capped by the per-shard entry budget — the read-contention knee tracks the
+/// reader count, so a hardcoded value is wrong. Powers of two so selection is
+/// `& mask`; `max_shards` is the inline array size (raise for >64-core hosts).
+const max_shards: u32 = 64;
+const min_shards: u32 = 16;
+/// Keep per-shard entries above this so the SIEVE second-chance ring (scan cap
+/// 64) and byte budget stay meaningful; this caps shard count on small caches.
+const min_entries_per_shard: u32 = 128;
+
+/// Active shard count: a power of two in [min_shards, max_shards], rounded up
+/// toward `reader_concurrency` but capped by the per-shard entry budget.
+fn deriveShardCount(reader_concurrency: u32, max_entries: u32) u32 {
+    const by_concurrency = std.math.ceilPowerOfTwo(u32, @max(reader_concurrency, 1)) catch max_shards;
+    const by_budget = std.math.floorPowerOfTwo(u32, @max(max_entries / min_entries_per_shard, 1));
+    return std.math.clamp(@min(by_concurrency, by_budget), min_shards, max_shards);
+}
+
+/// Read-path stat counters (hits/misses/prefetch_eligible/stale_hits) are
+/// bumped on every cache hit/miss; as per-shard atomics they contended one
+/// line across all readers of a hot shard. Stripe by thread into cache-line
+/// slots so each reader bumps its own line; getStats sums. Advisory: a slot is
+/// claimed once per thread and never reclaimed, so once more than
+/// `counter_slots` distinct threads have *ever* touched the cache (e.g. bg-
+/// prefetch churn) some share a slot — mild re-contention, never a torn or lost
+/// count. Persistent hot readers (workers + pool) claim distinct slots at
+/// startup, so steady-state striping holds.
+const counter_slots: u32 = 128;
+const counter_slot_mask: u32 = counter_slots - 1;
+const no_counter_slot: u32 = std.math.maxInt(u32);
+
+const ReadCounters = struct {
+    // hits is cache-line aligned so @sizeOf(ReadCounters) rounds to a full
+    // line and array elements never false-share. One thread owns a slot, so
+    // the four counters sharing that line is intended, not contention.
+    hits: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
+    misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+/// Thread's stripe index, assigned once on first cache touch and stable for
+/// the thread's life. Shared across RRsetCache instances (each indexes its own
+/// read_counters array) — the index is only a stripe selector.
+var counter_slot_next: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+threadlocal var counter_slot_tl: u32 = no_counter_slot;
+
+fn threadCounterSlot() u32 {
+    if (counter_slot_tl == no_counter_slot)
+        counter_slot_tl = counter_slot_next.fetchAdd(1, .monotonic) & counter_slot_mask;
+    return counter_slot_tl;
+}
 
 /// Per-shard state: lock, map, allocator, eviction state, stat counters.
 /// The shards array is cache-line aligned so shard 0 starts on a boundary.
@@ -532,8 +580,9 @@ const Shard = struct {
     visited: ?[]std.atomic.Value(u8) = null,
     hand: u32 = 0,
     max_entries: u32,
-    hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Read-path counters are striped per-thread in RRsetCache.read_counters
+    // (they were contending one line per shard); write-path counters below run
+    // under the exclusive lock and are rare.
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     negative_stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -541,12 +590,15 @@ const Shard = struct {
     cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` triggered by byte-budget pressure rather than entry-count pressure.
     byte_pressure_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const RRsetCache = struct {
-    shards: [shard_count]Shard align(std.atomic.cache_line),
+    shards: [max_shards]Shard align(std.atomic.cache_line),
+    /// Active shard count (<= max_shards) and its mask, chosen at init.
+    shard_count: u32 = max_shards,
+    shard_mask: u32 = max_shards - 1,
+    /// Per-thread striped read-path counters (see ReadCounters). Default-zeroed.
+    read_counters: [counter_slots]ReadCounters align(std.atomic.cache_line) = [_]ReadCounters{.{}} ** counter_slots,
     io: std.Io,
     now_fn: *const fn () i64,
     serve_stale_ttl: u32 = 0,
@@ -568,11 +620,22 @@ pub const RRsetCache = struct {
         min_ttl: u32 = 0,
         /// Skip .dnskey and .ds records in storeRRsetsExcept (routed to key cache).
         skip_key_types: bool = false,
+        /// Expected concurrent cache-reader threads (recv workers + their pool
+        /// threads). Drives the shard count; see deriveShardCount.
+        reader_concurrency: u32 = 1,
+        /// Explicit shard-count override (power of 2, <= max_shards). The
+        /// contention bench pins this for a fixed-config regression gate; null
+        /// derives from reader_concurrency + the entry budget.
+        shards: ?u32 = null,
     };
 
     pub fn init(cfg: Config) RRsetCache {
+        const sc = cfg.shards orelse deriveShardCount(cfg.reader_concurrency, cfg.max_entries);
+        std.debug.assert(sc >= 1 and sc <= max_shards and std.math.isPowerOfTwo(sc));
         var cache: RRsetCache = .{
             .shards = undefined,
+            .shard_count = sc,
+            .shard_mask = sc - 1,
             .io = cfg.io,
             .now_fn = &monotonic.nowSec,
             .serve_stale_ttl = cfg.serve_stale_ttl,
@@ -581,10 +644,10 @@ pub const RRsetCache = struct {
             .skip_key_types = cfg.skip_key_types,
         };
 
-        const per_shard_bytes = @max(cfg.max_bytes / shard_count, 4096);
-        const per_shard_entries: u32 = @max(cfg.max_entries / shard_count, 1);
+        const per_shard_bytes = @max(cfg.max_bytes / sc, 4096);
+        const per_shard_entries: u32 = @max(cfg.max_entries / sc, 1);
 
-        for (&cache.shards) |*shard| {
+        for (cache.shards[0..sc]) |*shard| {
             // SIEVE visited flags allocated from backing allocator (not counted against cache budget).
             const visited: ?[]std.atomic.Value(u8) = if (cfg.backing.alloc(std.atomic.Value(u8), per_shard_entries)) |v| blk: {
                 for (v) |*slot| slot.* = std.atomic.Value(u8).init(0);
@@ -604,8 +667,7 @@ pub const RRsetCache = struct {
     /// `getIndexAdapted` to avoid recomputing it inside the map.
     fn shardWithHash(self: *RRsetCache, key: CacheKey) struct { *Shard, u32 } {
         const h = CacheKeyContext.hash(.{}, key);
-        const idx = if (comptime shard_count == 1) 0 else h & shard_mask;
-        return .{ &self.shards[idx], h };
+        return .{ &self.shards[h & self.shard_mask], h };
     }
 
     /// Aggregated across shards. Not a consistent snapshot — a put racing
@@ -644,27 +706,30 @@ pub const RRsetCache = struct {
             .prefetch_eligible = 0,
             .stale_hits = 0,
         };
-        for (&self.shards) |*shard| {
+        for (self.shards[0..self.shard_count]) |*shard| {
             shard.rwlock.lockSharedUncancelable(self.io);
             stats.entries += @intCast(shard.map.count());
             shard.rwlock.unlockShared(self.io);
             stats.memory_bytes += shard.counting.current_bytes.load(.monotonic);
             stats.max_bytes += shard.counting.max_bytes;
-            stats.hits += shard.hits.load(.monotonic);
-            stats.misses += shard.misses.load(.monotonic);
             stats.stores += shard.stores.load(.monotonic);
             stats.negative_stores += shard.negative_stores.load(.monotonic);
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
             stats.byte_pressure_evictions += shard.byte_pressure_evictions.load(.monotonic);
-            stats.prefetch_eligible += shard.prefetch_eligible.load(.monotonic);
-            stats.stale_hits += shard.stale_hits.load(.monotonic);
+        }
+        // Read-path counters are striped per-thread (see ReadCounters); sum them.
+        for (&self.read_counters) |*rc| {
+            stats.hits += rc.hits.load(.monotonic);
+            stats.misses += rc.misses.load(.monotonic);
+            stats.prefetch_eligible += rc.prefetch_eligible.load(.monotonic);
+            stats.stale_hits += rc.stale_hits.load(.monotonic);
         }
         return stats;
     }
 
     pub fn deinit(self: *RRsetCache) void {
-        for (&self.shards) |*shard| {
+        for (self.shards[0..self.shard_count]) |*shard| {
             const alloc = shard.counting.allocator();
             const keys = shard.map.keys();
             const vals = shard.map.values();
@@ -724,7 +789,7 @@ pub const RRsetCache = struct {
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse {
-            _ = shard.misses.fetchAdd(1, .monotonic);
+            _ = self.read_counters[threadCounterSlot()].misses.fetchAdd(1, .monotonic);
             return null;
         };
         markVisited(shard, idx);
@@ -734,7 +799,7 @@ pub const RRsetCache = struct {
 
         switch (entry) {
             .positive => |rrset| {
-                const hit = self.evalFreshness(shard, rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
+                const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
                 const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
                 // Read path: degrade sigs/proofs to empty on OOM rather than
                 // drop the answer. The stored entry was already proven complete
@@ -756,7 +821,7 @@ pub const RRsetCache = struct {
                 // SERVFAIL never serves stale: short TTL (e.g. 1s for DNSSEC bogus)
                 // is intentional; extending it would prolong failure beyond design.
                 const disable_stale = neg.rcode == .server_failure;
-                const hit = self.evalFreshness(shard, neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
+                const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
                 const soa = cloneCachedRecord(caller_alloc, neg.soa, hit.remaining_ttl);
                 const nsec_proofs: []dns.ResourceRecord = if (neg.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, neg.nsec_proofs, hit.remaining_ttl) catch &.{};
                 return .{ .negative = .{
@@ -820,7 +885,6 @@ pub const RRsetCache = struct {
     /// RFC 8767). On fresh hit, force_unchecked=false.
     fn evalFreshness(
         self: *RRsetCache,
-        shard: *Shard,
         expires_at: i64,
         stored_at: i64,
         original_ttl: u32,
@@ -831,19 +895,21 @@ pub const RRsetCache = struct {
             const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
             const remaining = original_ttl - elapsed;
             const needs_prefetch = self.prefetch and (remaining <= original_ttl / 10);
-            _ = shard.hits.fetchAdd(1, .monotonic);
-            if (needs_prefetch) _ = shard.prefetch_eligible.fetchAdd(1, .monotonic);
+            const cs = &self.read_counters[threadCounterSlot()];
+            _ = cs.hits.fetchAdd(1, .monotonic);
+            if (needs_prefetch) _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
             return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false, .is_stale = false };
         }
         if (disable_stale or self.serve_stale_ttl == 0 or (now - expires_at) >= self.serve_stale_ttl) {
             // Deferred eviction: under shared read lock we cannot mutate the map;
             // expired entries linger until the next write path calls evictIfNeeded.
-            _ = shard.misses.fetchAdd(1, .monotonic);
+            _ = self.read_counters[threadCounterSlot()].misses.fetchAdd(1, .monotonic);
             return null;
         }
-        _ = shard.hits.fetchAdd(1, .monotonic);
-        _ = shard.stale_hits.fetchAdd(1, .monotonic);
-        _ = shard.prefetch_eligible.fetchAdd(1, .monotonic);
+        const cs = &self.read_counters[threadCounterSlot()];
+        _ = cs.hits.fetchAdd(1, .monotonic);
+        _ = cs.stale_hits.fetchAdd(1, .monotonic);
+        _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
         // is_stale is computed from now/expires_at directly (not derived from
         // force_unchecked) so a future change that flips force_unchecked for
         // a non-stale reason can't silently lie to the resolver's RFC 8767
@@ -2106,7 +2172,7 @@ test "cache eviction when full" {
 
     // Configure cap so each shard floors at 1 entry; storing cap+1 names
     // forces eviction in at least one shard regardless of N.
-    const cap = shard_count;
+    const cap: u32 = min_shards;
     var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = cap, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
@@ -2594,7 +2660,6 @@ test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
 }
 
 test "shard distribution is reasonable for random names" {
-    if (shard_count == 1) return; // degenerate; nothing to distribute
     const alloc = testing.allocator;
     test_time = 1000;
 
@@ -2618,28 +2683,39 @@ test "shard distribution is reasonable for random names" {
     // Pigeonhole: expected mean = n_keys / shard_count. Allow up to 3× mean
     // before flagging as a hash regression. (3× is loose; Wyhash usually
     // stays within 1.5× even for adversarial inputs.)
-    const mean_per_shard: usize = n_keys / shard_count;
+    const mean_per_shard: usize = n_keys / cache.shard_count;
     const max_allowed: usize = mean_per_shard * 3;
-    for (&cache.shards) |*shard| {
+    for (cache.shards[0..cache.shard_count]) |*shard| {
         try testing.expect(shard.map.count() <= max_allowed);
     }
 }
 
+test "deriveShardCount tracks concurrency, floored and budget-capped" {
+    // Floor: low concurrency / tiny cache still gets min_shards.
+    try testing.expectEqual(min_shards, deriveShardCount(1, 100));
+    // Default server concurrency: workers=2 * (1 + resolution_threads=4) = 10 -> 16.
+    try testing.expectEqual(@as(u32, 16), deriveShardCount(10, 10_000));
+    // High concurrency on a healthy cache scales up, capped at max_shards.
+    try testing.expectEqual(max_shards, deriveShardCount(160, 10_000));
+    try testing.expectEqual(max_shards, deriveShardCount(1000, 1_000_000));
+    // Budget cap: a tight cache (2000/128=15 -> 8) is lifted back to the floor.
+    try testing.expectEqual(min_shards, deriveShardCount(160, 2000));
+}
+
 test "eviction stays within shard" {
-    if (shard_count == 1) return;
     const alloc = testing.allocator;
     test_time = 1000;
 
     // 1 entry per shard. Hammer one specific shard with many stores
     // (forces eviction there); a victim entry on a different shard must
     // survive — eviction must not cross shard boundaries.
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = shard_count, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = min_shards, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
     const victim = "victim.test";
-    const victim_shard = CacheKeyContext.hash(.{}, .{ .name = victim, .rtype = .a, .rclass = .in }) & shard_mask;
-    const target_shard = (victim_shard +% 1) & shard_mask;
+    const victim_shard = CacheKeyContext.hash(.{}, .{ .name = victim, .rtype = .a, .rclass = .in }) & cache.shard_mask;
+    const target_shard = (victim_shard +% 1) & cache.shard_mask;
 
     try storeTestA(&cache, alloc, &.{ "victim", "test" }, 300, .{ 1, 2, 3, 4 });
 
@@ -2648,7 +2724,7 @@ test "eviction stays within shard" {
     while (stored < 4) : (probe += 1) {
         var nb: [16]u8 = undefined;
         const dotted = try std.fmt.bufPrint(&nb, "x{d}.com", .{probe});
-        const sh = CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }) & shard_mask;
+        const sh = CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }) & cache.shard_mask;
         if (sh != target_shard) continue;
         const parsed = try dns.parseDottedName(alloc, dotted);
         const answers = try alloc.alloc(dns.ResourceRecord, 1);

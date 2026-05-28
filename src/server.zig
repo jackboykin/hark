@@ -478,6 +478,9 @@ pub const Server = struct {
         // caches via shallow-cloned resolver context. Gate on the same
         // single_threaded build flag that picks the cache backing allocator.
         const thread_safe = !builtin.single_threaded;
+        // Cache readers = recv workers + their resolution-thread pools; both
+        // caches size their shards from this.
+        const reader_concurrency: u32 = @as(u32, cfg.workers) * (1 + @as(u32, cfg.resolution_threads));
         var cache = RRsetCache.init(.{
             .backing = cache_alloc,
             .max_bytes = cfg.cache_size,
@@ -487,6 +490,7 @@ pub const Server = struct {
             .serve_stale_ttl = cfg.serve_stale_ttl,
             .min_ttl = cfg.min_ttl,
             .skip_key_types = cfg.dnssec,
+            .reader_concurrency = reader_concurrency,
         });
         errdefer cache.deinit();
 
@@ -540,6 +544,7 @@ pub const Server = struct {
                 .max_bytes = cfg.key_cache_size,
                 .max_entries = cfg.key_cache_entries,
                 .io = io,
+                .reader_concurrency = reader_concurrency,
             }) else null,
             .shutdown = std.atomic.Value(bool).init(false),
             .worker_errors = std.atomic.Value(u32).init(0),
