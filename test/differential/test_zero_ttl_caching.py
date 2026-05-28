@@ -32,6 +32,7 @@ from pathlib import Path
 import dns.message
 import dns.query
 
+from conftest import HARK_LISTEN as RESOLVER_LISTEN, RESP_PORT
 from differential import unbound_proc
 from harness import hark_proc, responder, rpl
 
@@ -60,8 +61,6 @@ RANGE_END
 SCENARIO_END
 """
 
-RESP_PORT = 5353
-RESOLVER_LISTEN = ("127.0.0.1", 5354)
 QNAME = "example.com."
 QTYPE = "A"
 
