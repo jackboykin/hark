@@ -25,8 +25,9 @@ Requires Zig 0.16 and Linux 6.1+ (io_uring buffer rings + DEFER_TASKRUN).
 ```
 zig build
 zig build test
-zig build bench              # microbenchmarks; ReleaseFast
-zig build bench -- cache_hit # filter to matching names
+zig build bench                                # microbenchmarks; ReleaseFast
+zig build bench -- cache_hit                   # filter to matching names
+zig build -Doptimize=ReleaseSafe -Dcpu=native  # host-tuned release
 ```
 
 ## Usage
