@@ -253,6 +253,19 @@ fn closestEncloserFromCover(qname: dns.Name, cover: *const NsecEntry) ?dns.Name 
     return dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
 }
 
+/// RFC 6840 §4.1: a parent-side NSEC at a delegation cut (NS+!SOA) is
+/// authoritative for the cut, not the subtree below. Fires only when
+/// `target` is at-or-below `nsec.owner` — the shape where misuse would
+/// launder parent authority into a child zone. DS is the named exception
+/// (RFC 4035 §5.2). Mirrors Knot's `kr_nsec_children_in_zone_check` and
+/// Unbound's `val_nsec_proves_name_error` / `nsec_proves_nodata`.
+fn isParentSideNsec(nsec: *const NsecEntry, target: dns.Name, qtype: dns.RType) bool {
+    if (qtype == .ds) return false;
+    if (!dns.typeBitmapContains(nsec.type_bit_maps, .ns)) return false;
+    if (dns.typeBitmapContains(nsec.type_bit_maps, .soa)) return false;
+    return dnssec.commonSuffixLabels(target, nsec.owner) == nsec.owner.labels.len;
+}
+
 // ── NsecCache ─────────────────────────────────────────────────────────
 
 /// Result of an aggressive NSEC lookup (RFC 8198).
@@ -353,10 +366,6 @@ pub const NsecCache = struct {
             if (rr.rtype != .nsec) continue;
             if (rr.ttl == 0) continue;
             if (!rr.name.isSubdomainOf(zone)) continue;
-            // Skip delegation NSECs (NS present, SOA absent) — these are parent-zone
-            // proofs that a delegation exists, not proofs names don't exist (GL #3402).
-            if (dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .ns) and
-                !dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .soa)) continue;
             // Skip minimal/black-lies NSEC ranges (next = owner + \000) — these cover
             // only the queried name and waste cache space (Knot Resolver approach).
             if (isMinimalNsec(rr.name, rr.rdata.nsec.next_domain_name)) continue;
@@ -508,6 +517,7 @@ pub const NsecCache = struct {
             },
             .unknown => nodata: {
                 const nsec = list.findExact(qname, now) orelse return null;
+                if (isParentSideNsec(nsec, qname, qtype)) return null;
                 // Don't synthesize NODATA if CNAME exists — query must follow the
                 // CNAME chain (RFC 1034 §3.6.2, RFC 4035 §2.5).
                 if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
@@ -621,6 +631,7 @@ const NameNonExistence = union(enum) {
 fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RType, now: i64) NameNonExistence {
     // (a) Find NSEC covering qname
     const qname_cover = list.findCovering(qname, now) orelse return .unknown;
+    if (isParentSideNsec(qname_cover, qname, qtype)) return .unknown;
 
     // (b) Derive closest encloser from cover, then check wildcard
     const ce = closestEncloserFromCover(qname, qname_cover) orelse return .unknown;
@@ -630,6 +641,7 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
 
     // Check if wildcard exists
     if (list.findExact(wildcard_name, now)) |wc_nsec| {
+        if (isParentSideNsec(wc_nsec, wildcard_name, qtype)) return .unknown;
         // Wildcard exists — check type bitmap for synthesis
         // CNAME at wildcard: must follow CNAME upstream, can't synthesize here
         if (qtype != .cname and dns.typeBitmapContains(wc_nsec.type_bit_maps, .cname))
@@ -642,6 +654,7 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
 
     // Prove wildcard name is covered by an NSEC (doesn't exist)
     const wildcard_cover = list.findCovering(wildcard_name, now) orelse return .unknown;
+    if (isParentSideNsec(wildcard_cover, wildcard_name, qtype)) return .unknown;
     return .{ .nxdomain = .{ .qname_cover = qname_cover, .wildcard_cover = wildcard_cover } };
 }
 
@@ -799,6 +812,119 @@ test "NSEC cache: NXDOMAIN synthesis without apex NSEC (nlnetlabs.nl shape)" {
     const apex_q = try dns.parseDottedName(alloc, "example.com");
     defer dns.freeName(alloc, apex_q);
     try testing.expect(nc.lookupSuffixes(alloc, apex_q, .a, "example.com") == null);
+}
+
+// Bitmap for a parent-side delegation NSEC: NS RRSIG NSEC, no SOA.
+// NS=2 → byte 0 bit 5 (mask 0x20); RRSIG=46 → byte 5 bit 1 (mask 0x02);
+// NSEC=47 → byte 5 bit 0 (mask 0x01).
+const bitmap_delegation = &[_]u8{ 0, 6, 0x20, 0x00, 0x00, 0x00, 0x00, 0x03 };
+
+test "NSEC cache: parent-side qname-cover usable when qname NOT at-or-below owner" {
+    // TLD-style: every non-apex NSEC is parent-side (NS+!SOA). The store-time
+    // filter used to drop them all; the predicate only blocks at-or-below, so
+    // sibling NXDOMAINs synthesise from the same proof material the on-wire
+    // validator already accepts.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const bitmap_apex = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+
+    // Apex NSEC (NS+SOA — covers *.example.com) + parent-side sibling cover.
+    const apex_owner = try dns.parseDottedName(alloc, "example.com");
+    const apex_next = try dns.parseDottedName(alloc, "sub.example.com");
+    const cover_owner = try dns.parseDottedName(alloc, "nonex.example.com");
+    const cover_next = try dns.parseDottedName(alloc, "nonexpired.example.com");
+    defer dns.freeName(alloc, apex_owner);
+    defer dns.freeName(alloc, apex_next);
+    defer dns.freeName(alloc, cover_owner);
+    defer dns.freeName(alloc, cover_next);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex_next, .type_bit_maps = bitmap_apex } } },
+        .{ .name = cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = cover_next, .type_bit_maps = bitmap_delegation } } },
+    }, example_zone);
+
+    // commonSuffix(qname, cover_owner) == 2 < owner.labels.len == 3 → predicate
+    // doesn't fire → parent-side cover IS the right proof material.
+    const qname = try dns.parseDottedName(alloc, "nonexistent.example.com");
+    defer dns.freeName(alloc, qname);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .a, "nonexistent.example.com"), .nxdomain);
+}
+
+test "NSEC cache: rejects parent-side cover when qname is at-or-below owner (RFC 6840 §4.1)" {
+    // Scenario C: cover.owner == `bar.example.com` with NS+!SOA. A query for
+    // `foo.bar.example.com` could be tricked into synthesising NXDOMAIN from
+    // this parent-side NSEC if the predicate didn't fire — but
+    // `bar.example.com`'s child zone is the real authority for that name.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+
+    // Delegation NSEC at the would-be CE, covering the target qname's range.
+    const bar_owner = try dns.parseDottedName(alloc, "bar.example.com");
+    const qux_next = try dns.parseDottedName(alloc, "qux.example.com");
+    // Forged wildcard cover (also parent-side, owner is *.bar's ancestor).
+    const wc_cover_owner = try dns.parseDottedName(alloc, "!.bar.example.com");
+    const wc_cover_next = try dns.parseDottedName(alloc, "6only.bar.example.com");
+    defer dns.freeName(alloc, bar_owner);
+    defer dns.freeName(alloc, qux_next);
+    defer dns.freeName(alloc, wc_cover_owner);
+    defer dns.freeName(alloc, wc_cover_next);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = bar_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = qux_next, .type_bit_maps = bitmap_delegation } } },
+        .{ .name = wc_cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_cover_next, .type_bit_maps = bitmap_delegation } } },
+    }, example_zone);
+
+    // foo.bar.example.com: commonSuffix(qname, bar.example.com) == 3 ==
+    // owner.labels.len → predicate fires → cover rejected → no synthesis.
+    const qname = try dns.parseDottedName(alloc, "foo.bar.example.com");
+    defer dns.freeName(alloc, qname);
+    try testing.expect(nc.lookupSuffixes(alloc, qname, .a, "foo.bar.example.com") == null);
+}
+
+test "NSEC cache: rejects parent-side NODATA at child apex; DS exemption synthesises" {
+    // `.unknown` NODATA path: findExact at qname returns a parent-side NSEC.
+    // For non-DS qtypes the bitmap reflects only what the parent knows (NS,
+    // RRSIG, NSEC) — using it as NODATA proof leaks parent authority into
+    // the child apex. For DS qtype the parent IS authoritative (RFC 4035 §5.2).
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+
+    // Parent-side NSEC at `child.example.com` (a delegated SLD in example.com).
+    const child_owner = try dns.parseDottedName(alloc, "child.example.com");
+    const next_owner = try dns.parseDottedName(alloc, "sister.example.com");
+    defer dns.freeName(alloc, child_owner);
+    defer dns.freeName(alloc, next_owner);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = child_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = next_owner, .type_bit_maps = bitmap_delegation } } },
+    }, example_zone);
+
+    const qname = try dns.parseDottedName(alloc, "child.example.com");
+    defer dns.freeName(alloc, qname);
+
+    // A query: bitmap has no A; predicate fires for non-DS, NODATA refused.
+    try testing.expect(nc.lookupSuffixes(alloc, qname, .a, "child.example.com") == null);
+
+    // DS query: predicate exempts DS; bitmap has no DS; NODATA synthesises.
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .ds, "child.example.com"), .nodata);
 }
 
 test "NSEC cache: empty cache returns null" {
