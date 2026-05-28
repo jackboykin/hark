@@ -726,7 +726,7 @@ pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
 
 /// Number of trailing labels shared between two names (case-insensitive).
 /// Used to derive the closest encloser from an NSEC that covers qname.
-fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
+pub fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
     const min_labels = @min(a.labels.len, b.labels.len);
     for (0..min_labels) |i| {
         const al = a.labels[a.labels.len - 1 - i];

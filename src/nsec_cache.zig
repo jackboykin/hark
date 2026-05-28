@@ -240,17 +240,17 @@ fn freeEntry(alloc: Allocator, e: *NsecEntry) void {
     if (e.sigs.len > 0) alloc.free(e.sigs);
 }
 
-/// Determine closest encloser: walk up qname labels from left to right.
-/// An ancestor provably exists if an NSEC with that owner is in the zone.
-fn findClosestEncloser(list: *const ZoneNsecList, qname: dns.Name, now: i64) ?dns.Name {
-    var label_count = qname.labels.len;
-    // Include root (label_count 0) as a valid closest encloser.
-    while (label_count > 0) {
-        label_count -= 1;
-        const ancestor = dns.Name{ .labels = qname.labels[qname.labels.len - label_count ..] };
-        if (list.findExact(ancestor, now) != null) return ancestor;
-    }
-    return null;
+/// Closest encloser derived from the cover NSEC's endpoints (RFC 8198 §5.3,
+/// matches validateNegativeProof). CE is a label-suffix of qname by the
+/// slice expression below; the clamp keeps apex-wrap NSECs (next == apex,
+/// a suffix of qname) from saturating CE to qname itself.
+fn closestEncloserFromCover(qname: dns.Name, cover: *const NsecEntry) ?dns.Name {
+    if (qname.labels.len == 0) return null;
+    const ce_depth = @min(@max(
+        dnssec.commonSuffixLabels(qname, cover.owner),
+        dnssec.commonSuffixLabels(qname, cover.next_domain),
+    ), qname.labels.len - 1);
+    return dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
 }
 
 // ── NsecCache ─────────────────────────────────────────────────────────
@@ -622,8 +622,8 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
     // (a) Find NSEC covering qname
     const qname_cover = list.findCovering(qname, now) orelse return .unknown;
 
-    // (b) Determine closest encloser, then check wildcard
-    const ce = findClosestEncloser(list, qname, now) orelse return .unknown;
+    // (b) Derive closest encloser from cover, then check wildcard
+    const ce = closestEncloserFromCover(qname, qname_cover) orelse return .unknown;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const wildcard_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unknown;
@@ -755,6 +755,50 @@ test "NSEC cache: NXDOMAIN synthesis" {
     const exists = try dns.parseDottedName(alloc, "alpha.example.com");
     defer dns.freeName(alloc, exists);
     try testing.expect(nc.lookupSuffixes(alloc, exists, .a, "alpha.example.com") == null);
+}
+
+test "NSEC cache: NXDOMAIN synthesis without apex NSEC (nlnetlabs.nl shape)" {
+    // .nl-style signers omit the apex NSEC; CE must come from the cover.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const bitmap = &[_]u8{ 0, 2, 0x40, 0x01 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+
+    // zuul-aws → example.com (apex-wrap qname cover);
+    // !. → 6only (covers *.example.com: '!' < '*' < '6').
+    const cover_owner = try dns.parseDottedName(alloc, "zuul-aws.example.com");
+    const apex = try dns.parseDottedName(alloc, "example.com");
+    const wc_cover_owner = try dns.parseDottedName(alloc, "!.example.com");
+    const wc_cover_next = try dns.parseDottedName(alloc, "6only.example.com");
+    defer dns.freeName(alloc, cover_owner);
+    defer dns.freeName(alloc, apex);
+    defer dns.freeName(alloc, wc_cover_owner);
+    defer dns.freeName(alloc, wc_cover_next);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex, .type_bit_maps = bitmap } } },
+        .{ .name = wc_cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_cover_next, .type_bit_maps = bitmap } } },
+    }, example_zone);
+
+    const qname = try dns.parseDottedName(alloc, "zzz-aggt.example.com");
+    defer dns.freeName(alloc, qname);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .a, "zzz-aggt.example.com"), .nxdomain);
+
+    // Depth guard: direct-child ancestor outside the cover range, no synth.
+    const guarded = try dns.parseDottedName(alloc, "sub.aaa.example.com");
+    defer dns.freeName(alloc, guarded);
+    try testing.expect(nc.lookupSuffixes(alloc, guarded, .a, "sub.aaa.example.com") == null);
+
+    // Apex query against apex-wrap cover: apex itself isn't covered (next
+    // is exclusive), no findExact match — no synth.
+    const apex_q = try dns.parseDottedName(alloc, "example.com");
+    defer dns.freeName(alloc, apex_q);
+    try testing.expect(nc.lookupSuffixes(alloc, apex_q, .a, "example.com") == null);
 }
 
 test "NSEC cache: empty cache returns null" {
@@ -1177,9 +1221,9 @@ test "zoneLabelsLen" {
 }
 
 test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {
-    // Exercises both the root-zone suffix-walk fall-through in lookupSuffixes
-    // and the root-as-CE branch in findClosestEncloser. Either alone is
-    // insufficient — see scenario 007 for the end-to-end demonstration.
+    // Exercises the root-zone suffix-walk fall-through in lookupSuffixes plus
+    // CE derivation from the cover NSEC's endpoints — see scenario 007 for
+    // the end-to-end demonstration.
     const alloc = testing.allocator;
     var nc = testCache(alloc);
     defer nc.deinit();
