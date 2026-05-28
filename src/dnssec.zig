@@ -8,10 +8,13 @@ const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
-const rsa = std.crypto.Certificate.rsa;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+
+// See verifyRsa for why we drive std.crypto.ff directly.
+const RsaModulus = std.crypto.ff.Modulus(4096);
+const RsaFe = RsaModulus.Fe;
 
 const VerifyError = error{
     InvalidSignature,
@@ -644,39 +647,84 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
         offset = 3;
     }
 
+    if (exp_len == 0) return error.InvalidKey;
     if (offset + exp_len > key_data.len) return error.InvalidKey;
-    const exponent = key_data[offset..][0..exp_len];
+    var exponent = key_data[offset..][0..exp_len];
     const modulus = key_data[offset + exp_len ..];
 
-    // Reject degenerate exponents: empty, 0, 1, or even
-    if (exp_len == 0) return error.InvalidKey;
-    if (exponent[exp_len - 1] & 1 == 0) return error.InvalidKey; // reject even
-    if (exp_len == 1 and exponent[0] <= 1) return error.InvalidKey; // reject 0, 1
+    // Strip leading zeros: `[00 00 00 01]` would read as e=1 and forge sig=EM.
+    while (exponent.len > 1 and exponent[0] == 0) exponent = exponent[1..];
+    if (exponent[exponent.len - 1] & 1 == 0) return error.InvalidKey; // even
+    if (exponent.len == 1 and exponent[0] <= 1) return error.InvalidKey; // 0, 1
 
-    // Require 1024-bit minimum modulus (128 bytes). Many zones (including TLDs
-    // like .org) still use 1024-bit RSA ZSKs. Validators must accept them even
-    // though 2048-bit is recommended for signing (RFC 6781).
-    if (modulus.len < 128 or modulus.len > 512) return error.InvalidKey;
+    // Require 1024-bit minimum modulus, 8-byte step (1024/2048/3072/4096 are
+    // the only sizes generated in practice). RFC 6781 recommends 2048 but
+    // 1024-bit ZSKs are still common, including in TLDs like .org.
+    if (modulus.len < 128 or modulus.len > 512 or modulus.len % 8 != 0) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
-    const pub_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.InvalidKey;
+    // ff.Modulus is what Certificate.rsa wraps; calling it directly sidesteps
+    // the 4-byte exponent cap (Windows-CryptoAPI parity) that would lock out
+    // zones like xelerance.com (e = 2^32 + 1).
+    const n = RsaModulus.fromBytes(modulus, .big) catch return error.InvalidKey;
+    if (n.bits() < 1024) return error.InvalidKey;
+    const e = RsaFe.fromBytes(n, exponent, .big) catch return error.InvalidKey;
+    const sig_fe = RsaFe.fromBytes(n, signature, .big) catch return error.InvalidSignature;
+    const decoded_fe = n.powPublic(sig_fe, e) catch return error.InvalidSignature;
 
-    // Dispatch on modulus length at comptime. Zig's RSA implementation needs
-    // the modulus size as a comptime parameter. Cover every 8-byte-aligned
-    // size from 128 to 512 — RSA keys are always a multiple of 64 bits.
+    // Comptime dispatch sizes the two stack buffers for the EM comparison.
     inline for (comptime blk: {
         var sizes: [(512 - 128) / 8 + 1]usize = undefined;
         for (0..sizes.len) |i| sizes[i] = 128 + i * 8;
         break :blk sizes;
     }) |mod_len| {
         if (modulus.len == mod_len) {
-            const sig_array = signature[0..mod_len].*;
-            rsa.PKCS1v1_5Signature.verify(mod_len, sig_array, msg, pub_key, Hash) catch
+            var em_dec: [mod_len]u8 = undefined;
+            decoded_fe.toBytes(&em_dec, .big) catch return error.InvalidSignature;
+            const em_expected = pkcs1v15Encode(mod_len, Hash, msg);
+            if (!std.crypto.timing_safe.eql([mod_len]u8, em_dec, em_expected))
                 return error.InvalidSignature;
             return;
         }
     }
-    return error.InvalidKey;
+    unreachable; // 8-byte-aligned 128..512 covered above
+}
+
+/// EMSA-PKCS1-v1_5 (RFC 8017 §9.2). Inlined because the stdlib's equivalent
+/// in Certificate.rsa is private and we no longer route through it.
+fn pkcs1v15Encode(comptime emLen: usize, comptime Hash: type, msg: []const u8) [emLen]u8 {
+    const hash_der: []const u8 = &switch (Hash) {
+        Sha1 => .{
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+            0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+        },
+        Sha256 => .{
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+            0x00, 0x04, 0x20,
+        },
+        Sha512 => .{
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+            0x00, 0x04, 0x40,
+        },
+        else => @compileError("unsupported hash for PKCS#1 v1.5"),
+    };
+    // RFC 8017 §9.2 step 3: PS ≥ 8 octets, else @memset wraps.
+    comptime std.debug.assert(emLen >= hash_der.len + Hash.digest_length + 11);
+
+    var em: [emLen]u8 = undefined;
+    var idx: usize = emLen;
+    idx -= Hash.digest_length;
+    Hash.hash(msg, em[idx..][0..Hash.digest_length], .{});
+    idx -= hash_der.len;
+    @memcpy(em[idx..][0..hash_der.len], hash_der);
+    idx -= 1;
+    em[idx] = 0x00;
+    @memset(em[2..idx], 0xff);
+    em[1] = 0x01;
+    em[0] = 0x00;
+    return em;
 }
 
 /// Verify an ECDSA signature (P-256 or P-384) given raw x||y key and r||s signature.
@@ -1698,6 +1746,102 @@ test "invalid key sizes are rejected" {
     try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48, &sig96, msg, &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, msg, &.{ 0x01, 0x02 }));
+}
+
+test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
+    // KSK 26346 uses e = 2^32 + 1 (5 bytes). RFC 3110: 1-byte exp_len || exp || mod.
+    // Synthetic 1024-bit modulus: any odd number with high bit set, so n.bits() == 1024.
+    var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ [_]u8{0x55} ** 128;
+    key_data[6] = 0x80;
+    const signature = [_]u8{0xaa} ** 128;
+    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, "x", &key_data, Sha1));
+    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, "x", &key_data, Sha256));
+}
+
+test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
+    // Without the strip, [00 00 00 01] reads as e=1 and any sig == EM verifies.
+    var k1 = [_]u8{ 4, 0x00, 0x00, 0x00, 0x01 } ++ [_]u8{0x55} ** 128;
+    k1[5] = 0x80;
+    const sig = [_]u8{0} ** 128;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "x", &k1, Sha256));
+
+    // 2-byte exp_len encoding with 8-byte padded exponent.
+    var k2 = [_]u8{ 0, 0, 8 } ++ [_]u8{0} ** 7 ++ [_]u8{0x01} ++ [_]u8{0x55} ** 128;
+    k2[11] = 0x80;
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "x", &k2, Sha256));
+}
+
+test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
+    // EM = 00 || 01 || PS (0xff..) || 00 || T (DER) || H. Pinning the bytes
+    // per hash defends the OID-typo class — a bad byte in a DER prefix would
+    // silently SERVFAIL every zone signed with that algorithm.
+    const Case = struct {
+        Hash: type,
+        digest_len: usize,
+        der: []const u8,
+        hash_abc: []const u8,
+    };
+    inline for ([_]Case{
+        .{
+            .Hash = Sha1,
+            .digest_len = 20,
+            .der = &.{
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+                0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+            },
+            // SHA-1("abc") — RFC 3174 Appendix A.
+            .hash_abc = &.{
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a,
+                0xba, 0x3e, 0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c,
+                0x9c, 0xd0, 0xd8, 0x9d,
+            },
+        },
+        .{
+            .Hash = Sha256,
+            .digest_len = 32,
+            .der = &.{
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+                0x00, 0x04, 0x20,
+            },
+            // NIST SHA-256("abc").
+            .hash_abc = &.{
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+                0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+                0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+                0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+            },
+        },
+        .{
+            .Hash = Sha512,
+            .digest_len = 64,
+            .der = &.{
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+                0x00, 0x04, 0x40,
+            },
+            // NIST SHA-512("abc").
+            .hash_abc = &.{
+                0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba,
+                0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31,
+                0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9, 0x7e, 0xa2,
+                0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a,
+                0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8,
+                0x36, 0xba, 0x3c, 0x23, 0xa3, 0xfe, 0xeb, 0xbd,
+                0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e,
+                0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f,
+            },
+        },
+    }) |c| {
+        const em = pkcs1v15Encode(128, c.Hash, "abc");
+        try testing.expectEqual(@as(u8, 0x00), em[0]);
+        try testing.expectEqual(@as(u8, 0x01), em[1]);
+        const sep = 128 - c.digest_len - c.der.len - 1;
+        for (em[2..sep]) |b| try testing.expectEqual(@as(u8, 0xff), b);
+        try testing.expectEqual(@as(u8, 0x00), em[sep]);
+        try testing.expectEqualSlices(u8, c.der, em[sep + 1 .. sep + 1 + c.der.len]);
+        try testing.expectEqualSlices(u8, c.hash_abc, em[128 - c.digest_len ..]);
+    }
 }
 
 test "classifyDelegation with DS present" {
