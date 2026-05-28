@@ -413,24 +413,53 @@ fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) 
 }
 
 /// Build a `[]CachedRecord` from caller-side records, allocating into the
-/// shard. Best-effort: returns `&.{}` on any allocation failure so the
-/// caller can keep storing the primary rrset. Used for the auxiliary
-/// material (sigs, NSEC proofs) where a transient OOM degrades a DO=1
-/// client's revalidation experience but doesn't lose the answer itself.
-fn cloneRecordsBestEffort(alloc: Allocator, records: []const dns.ResourceRecord) []CachedRecord {
+/// shard. Empty input yields an empty slice; a mid-clone OOM yields
+/// error.OutOfMemory so callers refuse the store rather than silently cache a
+/// truncated set — these carry DNSSEC material (sigs, NSEC proofs) that, when
+/// present, must travel with the RRset they cover (RFC 4035 §3.2.3).
+fn cloneRecords(alloc: Allocator, records: []const dns.ResourceRecord) ![]CachedRecord {
     if (records.len == 0) return &.{};
-    const arr = alloc.alloc(CachedRecord, records.len) catch return &.{};
+    const arr = try alloc.alloc(CachedRecord, records.len);
     var idx: usize = 0;
-    for (records) |rr| {
-        arr[idx] = buildCachedRecord(alloc, rr) catch break;
-        idx += 1;
-    }
-    if (idx < records.len) {
+    errdefer {
         for (arr[0..idx]) |cr| freeCachedRecord(alloc, cr);
         alloc.free(arr);
-        return &.{};
+    }
+    for (records) |rr| {
+        arr[idx] = try buildCachedRecord(alloc, rr);
+        idx += 1;
     }
     return arr;
+}
+
+/// Free a positive RRset staged for insertion but not yet handed to the map.
+/// `records` are borrowed (share the flat name backing); sigs/proofs own their
+/// names. Empty slices free as no-ops, so partial stages pass `&.{}`.
+fn freeStagedPositive(
+    alloc: Allocator,
+    records: []CachedRecord,
+    sigs: []CachedRecord,
+    proofs: []CachedRecord,
+    shared_name_backing: []align(@alignOf([]const u8)) u8,
+    key_name: []const u8,
+) void {
+    for (records) |cr| freeBorrowedRecord(alloc, cr);
+    alloc.free(records);
+    alloc.free(shared_name_backing);
+    for (sigs) |cr| freeCachedRecord(alloc, cr);
+    alloc.free(sigs);
+    for (proofs) |cr| freeCachedRecord(alloc, cr);
+    alloc.free(proofs);
+    alloc.free(key_name);
+}
+
+/// Free a negative entry's components staged before (or rolled back after) map
+/// insertion. The boxed NegativeEntry itself is the caller's to destroy.
+fn freeStagedNegative(alloc: Allocator, soa: CachedRecord, proofs: []CachedRecord, key_name: []const u8) void {
+    freeCachedRecord(alloc, soa);
+    for (proofs) |cr| freeCachedRecord(alloc, cr);
+    alloc.free(proofs);
+    alloc.free(key_name);
 }
 
 /// Collect NSEC/NSEC3 + covering RRSIGs from `records`, bailiwick-filtered.
@@ -707,7 +736,10 @@ pub const RRsetCache = struct {
             .positive => |rrset| {
                 const hit = self.evalFreshness(shard, rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
                 const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
-                // Best-effort sigs / proofs clone — OOM degrades to empty (see storeOneRRset).
+                // Read path: degrade sigs/proofs to empty on OOM rather than
+                // drop the answer. The stored entry was already proven complete
+                // at store time (storeOneRRset refuses truncated stores), so a
+                // transient clone failure here only costs a DO client its proofs.
                 const sigs: []dns.ResourceRecord = if (rrset.sigs.len == 0) &.{} else cloneRRset(caller_alloc, rrset.sigs, hit.remaining_ttl) catch &.{};
                 const nsec_proofs: []dns.ResourceRecord = if (rrset.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, rrset.nsec_proofs, hit.remaining_ttl) catch &.{};
                 return .{ .hit = .{
@@ -914,16 +946,18 @@ pub const RRsetCache = struct {
             return;
         };
 
-        const cached_proofs = cloneRecordsBestEffort(slot.alloc, proofs);
+        // Refuse rather than cache a negative whose NSEC proofs were truncated
+        // under OOM — a denial a DO client couldn't validate (RFC 4035 §3.1.3.2/.3).
+        const cached_proofs = cloneRecords(slot.alloc, proofs) catch {
+            freeStagedNegative(slot.alloc, cached_soa, &.{}, slot.key.name);
+            return;
+        };
 
         const now = self.now_fn();
         // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
         const capped_ttl = @min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl);
         const neg = slot.alloc.create(NegativeEntry) catch {
-            freeCachedRecord(slot.alloc, cached_soa);
-            for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
-            if (cached_proofs.len > 0) slot.alloc.free(cached_proofs);
-            slot.alloc.free(slot.key.name);
+            freeStagedNegative(slot.alloc, cached_soa, cached_proofs, slot.key.name);
             return;
         };
         neg.* = .{
@@ -937,10 +971,7 @@ pub const RRsetCache = struct {
         };
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = neg }) catch {
             slot.alloc.destroy(neg);
-            freeCachedRecord(slot.alloc, cached_soa);
-            for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
-            if (cached_proofs.len > 0) slot.alloc.free(cached_proofs);
-            slot.alloc.free(slot.key.name);
+            freeStagedNegative(slot.alloc, cached_soa, cached_proofs, slot.key.name);
             return;
         };
         markLastVisited(slot.shard);
@@ -1223,8 +1254,17 @@ pub const RRsetCache = struct {
             return;
         }
 
-        const cached_sigs = cloneRecordsBestEffort(slot.alloc, sigs);
-        const cached_proofs = cloneRecordsBestEffort(slot.alloc, nsec_proofs);
+        // Refuse the store if a clone fails — a .secure entry stripped of its
+        // signatures is unprovable to a DO client. See cloneRecords; mirrors
+        // the records partial-clone guard above.
+        const cached_sigs = cloneRecords(slot.alloc, sigs) catch {
+            freeStagedPositive(slot.alloc, cached_records, &.{}, &.{}, shared_name_backing, slot.key.name);
+            return;
+        };
+        const cached_proofs = cloneRecords(slot.alloc, nsec_proofs) catch {
+            freeStagedPositive(slot.alloc, cached_records, cached_sigs, &.{}, shared_name_backing, slot.key.name);
+            return;
+        };
 
         // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
         // facing heterogeneous TTLs MUST treat the RRset as having a single
@@ -1256,14 +1296,7 @@ pub const RRsetCache = struct {
             .stored_at = now,
             .security_status = status,
         } }) catch {
-            for (cached_records) |cr| freeBorrowedRecord(slot.alloc, cr);
-            slot.alloc.free(cached_records);
-            if (shared_name_backing.len > 0) slot.alloc.free(shared_name_backing);
-            for (cached_sigs) |cr| freeCachedRecord(slot.alloc, cr);
-            if (cached_sigs.len > 0) slot.alloc.free(cached_sigs);
-            for (cached_proofs) |cr| freeCachedRecord(slot.alloc, cr);
-            if (cached_proofs.len > 0) slot.alloc.free(cached_proofs);
-            slot.alloc.free(slot.key.name);
+            freeStagedPositive(slot.alloc, cached_records, cached_sigs, cached_proofs, shared_name_backing, slot.key.name);
             return;
         };
         markLastVisited(slot.shard);
@@ -1468,6 +1501,30 @@ fn makeTestResponse(answers: []const dns.ResourceRecord) dns.Message {
         .questions = &.{},
         .answers = answers,
     };
+}
+
+// Test RRSIG with the fields the cache cares about (owner, covered type,
+// labels, signer, ttl); the rest are fixed placeholders — signatures aren't
+// verified here. original_ttl tracks ttl, matching real RRSIGs.
+fn makeTestRrsig(owner: dns.Name, covered: dns.RType, labels: u8, signer: dns.Name, ttl: u32) dns.ResourceRecord {
+    return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
+        .type_covered = covered,
+        .algorithm = .ecdsap256sha256,
+        .labels = labels,
+        .original_ttl = ttl,
+        .sig_expiration = 0,
+        .sig_inception = 0,
+        .key_tag = 0,
+        .signer_name = signer,
+        .signature = "",
+    } } };
+}
+
+fn makeTestNsec(owner: dns.Name, next: dns.Name, ttl: u32) dns.ResourceRecord {
+    return .{ .name = owner, .rtype = .nsec, .rclass = .in, .ttl = ttl, .rdata = .{ .nsec = .{
+        .next_domain_name = next,
+        .type_bit_maps = &.{},
+    } } };
 }
 
 fn storeTestA(cache: *RRsetCache, alloc: Allocator, comptime labels: []const []const u8, ttl: u32, ip: [4]u8) !void {
@@ -1740,43 +1797,13 @@ test "storeResponse captures wildcard NSEC proofs onto positive cache entry" {
     const answers = try alloc.alloc(dns.ResourceRecord, 2);
     defer alloc.free(answers);
     answers[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    answers[1] = .{
-        .name = owner,
-        .rtype = .rrsig,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{
-            .rrsig = .{
-                .type_covered = .a,
-                .algorithm = .ecdsap256sha256,
-                .labels = 2, // ← wildcard signal: owner has 3 labels but RRSIG says 2 (covers *.example.com).
-                .original_ttl = 300,
-                .sig_expiration = 0,
-                .sig_inception = 0,
-                .key_tag = 0,
-                .signer_name = rrsig_a_signer,
-                .signature = "",
-            },
-        },
-    };
+    // labels 2 < owner's 3 → wildcard signal (covers *.example.com).
+    answers[1] = makeTestRrsig(owner, .a, 2, rrsig_a_signer, 300);
 
     const authorities = try alloc.alloc(dns.ResourceRecord, 2);
     defer alloc.free(authorities);
-    authorities[0] = .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{
-        .next_domain_name = nsec_next,
-        .type_bit_maps = &.{},
-    } } };
-    authorities[1] = .{ .name = nsec_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
-        .type_covered = .nsec,
-        .algorithm = .ecdsap256sha256,
-        .labels = 3,
-        .original_ttl = 300,
-        .sig_expiration = 0,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = rrsig_nsec_signer,
-        .signature = "",
-    } } };
+    authorities[0] = makeTestNsec(nsec_owner, nsec_next, 300);
+    authorities[1] = makeTestRrsig(nsec_owner, .nsec, 3, rrsig_nsec_signer, 300);
 
     const response: dns.Message = .{
         .header = .{
@@ -1858,36 +1885,13 @@ test "storeResponse ignores orphan-RRSIG wildcard signal (forged-trigger defence
     defer alloc.free(answers);
     answers[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
     // Genuine RRSIG over A (non-wildcard: labels == owner.labels.len).
-    answers[1] = .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
-        .type_covered = .a,
-        .algorithm = .ecdsap256sha256,
-        .labels = 3,
-        .original_ttl = 300,
-        .sig_expiration = 0,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = rrsig_signer,
-        .signature = "",
-    } } };
+    answers[1] = makeTestRrsig(owner, .a, 3, rrsig_signer, 300);
     // Forged orphan RRSIG: claims to cover TXT (no TXT in answers), labels=1.
-    answers[2] = .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
-        .type_covered = .txt,
-        .algorithm = .ecdsap256sha256,
-        .labels = 1,
-        .original_ttl = 300,
-        .sig_expiration = 0,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = forged_signer,
-        .signature = "",
-    } } };
+    answers[2] = makeTestRrsig(owner, .txt, 1, forged_signer, 300);
 
     const authorities = try alloc.alloc(dns.ResourceRecord, 1);
     defer alloc.free(authorities);
-    authorities[0] = .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{
-        .next_domain_name = nsec_next,
-        .type_bit_maps = &.{},
-    } } };
+    authorities[0] = makeTestNsec(nsec_owner, nsec_next, 300);
 
     const response: dns.Message = .{
         .header = .{
@@ -1965,21 +1969,8 @@ test "storeNegative captures NSEC proofs onto negative cache entry" {
         .expire = 604800,
         .minimum = 600,
     } } };
-    authorities[1] = .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 600, .rdata = .{ .nsec = .{
-        .next_domain_name = nsec_next,
-        .type_bit_maps = &.{},
-    } } };
-    authorities[2] = .{ .name = nsec_owner, .rtype = .rrsig, .rclass = .in, .ttl = 600, .rdata = .{ .rrsig = .{
-        .type_covered = .nsec,
-        .algorithm = .ecdsap256sha256,
-        .labels = 3,
-        .original_ttl = 600,
-        .sig_expiration = 0,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = sig_signer,
-        .signature = "",
-    } } };
+    authorities[1] = makeTestNsec(nsec_owner, nsec_next, 600);
+    authorities[2] = makeTestRrsig(nsec_owner, .nsec, 3, sig_signer, 600);
 
     cache.storeNegative("b.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .secure);
 
@@ -2694,14 +2685,26 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
     defer input_arena.deinit();
     const ia = input_arena.allocator();
 
-    const name1 = try makeTestName(ia, &.{ "example", "com" });
-    const name2 = try makeTestName(ia, &.{ "example", "com" });
-    const answers = try ia.alloc(dns.ResourceRecord, 2);
-    answers[0] = .{ .name = name1, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    answers[1] = .{ .name = name2, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
+    // Wildcard-expanded A + RRSIG(A) (rrsig.labels < owner.labels) so
+    // storeResponse captures the authority NSEC + RRSIG(NSEC) as proofs. The
+    // A rrset then reaches storeOneRRset with BOTH non-empty sigs and
+    // nsec_proofs, so the fail-index sweep drives both clone-failure bails.
+    const owner = try makeTestName(ia, &.{ "foo", "example", "com" });
+    const signer = try makeTestName(ia, &.{ "example", "com" });
+    const nsec_owner = try makeTestName(ia, &.{ "bar", "example", "com" });
+    const nsec_next = try makeTestName(ia, &.{ "zzz", "example", "com" });
 
-    const response = makeTestResponse(answers);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+    const answers = try ia.alloc(dns.ResourceRecord, 2);
+    answers[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    answers[1] = makeTestRrsig(owner, .a, 2, signer, 300); // labels 2 < owner's 3 → wildcard signal
+
+    const authorities = try ia.alloc(dns.ResourceRecord, 2);
+    authorities[0] = makeTestNsec(nsec_owner, nsec_next, 300);
+    authorities[1] = makeTestRrsig(nsec_owner, .nsec, 3, signer, 300);
+
+    var response = makeTestResponse(answers);
+    response.authorities = authorities;
+    cache.storeResponse(response, signer, .secure);
 }
 
 test "evictIfNeeded triggers SIEVE on byte pressure" {
@@ -2844,7 +2847,9 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
     const soa_name = try makeTestName(ia, &.{"test"});
     const mname = try makeTestName(ia, &.{ "ns1", "test" });
     const rname = try makeTestName(ia, &.{ "admin", "test" });
-    const auths = try ia.alloc(dns.ResourceRecord, 1);
+    const nsec_owner = try makeTestName(ia, &.{ "sub", "test" });
+    const nsec_next = try makeTestName(ia, &.{ "zzz", "test" });
+    const auths = try ia.alloc(dns.ResourceRecord, 3);
     auths[0] = .{
         .name = soa_name,
         .rtype = .soa,
@@ -2860,6 +2865,10 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
             .minimum = 300,
         } },
     };
+    // NSEC + RRSIG(NSEC) so collectNsecProofs yields non-empty proofs and the
+    // negative proofs-clone bail path is leak-swept.
+    auths[1] = makeTestNsec(nsec_owner, nsec_next, 300);
+    auths[2] = makeTestRrsig(nsec_owner, .nsec, 2, zone_name, 300);
     cache.storeNegative("nodata.test", .a, .in, .no_error, auths, zone_name, .unchecked);
 }
 
