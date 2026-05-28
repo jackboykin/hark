@@ -30,7 +30,7 @@ const writer_period: u32 = 100;
 const arena_warmup: u32 = 256;
 const max_threads: usize = 64;
 
-const Mode = enum { ro, rw };
+const Mode = enum { ro, rw, hot };
 
 fn readerWorker(
     cache: *RRsetCache,
@@ -40,6 +40,7 @@ fn readerWorker(
     samples: []i64,
     thread_idx: u32,
     n_threads: u32,
+    mode: Mode,
 ) void {
     const backing = std.heap.page_allocator;
     var arena = std.heap.ArenaAllocator.init(backing);
@@ -49,18 +50,22 @@ fn readerWorker(
 
     for (0..arena_warmup) |i| {
         _ = arena.reset(.retain_capacity);
-        const name = names[(thread_idx +% @as(u32, @intCast(i))) % len_u32];
+        const name = if (mode == .hot) names[0] else names[(thread_idx +% @as(u32, @intCast(i))) % len_u32];
         if (cache.lookup(arena.allocator(), name, .a, .in)) |r| std.mem.doNotOptimizeAway(r);
     }
 
     _ = ready.fetchAdd(1, .release);
     while (!start_flag.load(.acquire)) {}
 
+    // hot mode: every reader hammers names[0] -> one shard -> maximal
+    // reader-reader contention on a single rwlock state word. The delta vs
+    // ro (same clone/probe cost, reads spread across shards) isolates the
+    // per-shard shared-lock CAS contention.
     const stride: u32 = len_u32 / n_threads;
     const base: u32 = thread_idx * stride;
     for (samples, 0..) |*s, i| {
         _ = arena.reset(.retain_capacity);
-        const name = names[(base + @as(u32, @intCast(i))) % len_u32];
+        const name = if (mode == .hot) names[0] else names[(base + @as(u32, @intCast(i))) % len_u32];
         const t0 = monotonic.nowNs();
         const r = cache.lookup(arena.allocator(), name, .a, .in);
         const t1 = monotonic.nowNs();
@@ -77,9 +82,11 @@ fn writerWorker(
     samples: []i64,
     thread_idx: u32,
     n_threads: u32,
+    mode: Mode,
 ) void {
     _ = thread_idx;
     _ = n_threads;
+    _ = mode;
     const backing = std.heap.page_allocator;
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
@@ -127,6 +134,10 @@ fn runSweep(
         .max_bytes = 64 * 1024 * 1024,
         .max_entries = n_entries * 2,
         .io = io,
+        // Pin the max shard count: this bench is the fixed-config regression
+        // gate, not a per-deployment derivation (which the server does from
+        // worker count). Stresses the most-sharded path; keeps baselines stable.
+        .shards = 64,
     });
     defer cache.deinit();
 
@@ -158,7 +169,7 @@ fn runSweep(
     }
 
     for (0..n_threads) |i| {
-        const args = .{ &cache, lookup_names, &ready, &start_flag, thread_samples[i], @as(u32, @intCast(i)), n_threads };
+        const args = .{ &cache, lookup_names, &ready, &start_flag, thread_samples[i], @as(u32, @intCast(i)), n_threads, mode };
         threads[i] = if (has_writer and i == 0)
             std.Thread.spawn(.{}, writerWorker, args) catch @panic("thread spawn failed")
         else
@@ -211,9 +222,10 @@ fn makeRun(
 
 const ro_counts = [_]u32{ 1, 2, 4, 8, 16, 32, 64 };
 const rw_counts = [_]u32{ 2, 4, 8, 16, 32, 64 };
+const hot_counts = [_]u32{ 1, 2, 4, 8, 16, 32, 64 };
 
 pub const benchmarks = blk: {
-    var list: [ro_counts.len + rw_counts.len]Benchmark = undefined;
+    var list: [ro_counts.len + rw_counts.len + hot_counts.len]Benchmark = undefined;
     var i: usize = 0;
     for (ro_counts) |n| {
         list[i] = .{ .name = std.fmt.comptimePrint("cache_contention_ro/t={d}", .{n}), .run = makeRun(n, .ro) };
@@ -221,6 +233,10 @@ pub const benchmarks = blk: {
     }
     for (rw_counts) |n| {
         list[i] = .{ .name = std.fmt.comptimePrint("cache_contention_rw/t={d}", .{n}), .run = makeRun(n, .rw) };
+        i += 1;
+    }
+    for (hot_counts) |n| {
+        list[i] = .{ .name = std.fmt.comptimePrint("cache_contention_hot/t={d}", .{n}), .run = makeRun(n, .hot) };
         i += 1;
     }
     break :blk list;
