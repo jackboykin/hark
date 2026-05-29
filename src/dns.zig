@@ -166,6 +166,9 @@ pub const Name = struct {
 
     /// Format `self` into `buf` as a dotted string. Returns the written slice so
     /// callers don't need to re-scan for the null terminator.
+    ///
+    /// Display-lossy (non-printables render as `?`); for logging only, not
+    /// byte-exact comparison — use `eqlExact` for that.
     pub fn formatInto(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
         var pos: usize = 0;
         for (self.labels) |label| {
@@ -507,7 +510,7 @@ pub const Message = struct {
 pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     // Handle root zone
     if (dotted.len == 0 or (dotted.len == 1 and dotted[0] == '.')) {
-        const labels = allocator.alloc([]const u8, 0) catch return error.OutOfMemory;
+        const labels = try allocator.alloc([]const u8, 0);
         return .{ .labels = labels };
     }
 
@@ -528,12 +531,14 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
         }
     }
 
-    // Allocate and populate
-    const labels = allocator.alloc([]const u8, label_count) catch return error.OutOfMemory;
+    // Allocate and populate. errdefer unwinds a partial fill on dupe-OOM.
+    const labels = try allocator.alloc([]const u8, label_count);
+    errdefer allocator.free(labels);
     var i: usize = 0;
+    errdefer for (labels[0..i]) |l| allocator.free(l);
     var iter = mem.splitScalar(u8, name_str, '.');
     while (iter.next()) |label| {
-        labels[i] = allocator.dupe(u8, label) catch return error.OutOfMemory;
+        labels[i] = try allocator.dupe(u8, label);
         i += 1;
     }
 
@@ -586,7 +591,7 @@ const QueryOptions = struct {
 pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
     const name = try parseDottedName(allocator, name_str);
     if (options.case_rng) |io| applyCase0x20(io, name);
-    const questions = allocator.alloc(Question, 1) catch return error.OutOfMemory;
+    const questions = try allocator.alloc(Question, 1);
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
 
     return .{
@@ -716,7 +721,7 @@ pub const Parser = struct {
 
         if (saved_pos) |sp| self.pos = sp;
 
-        const labels = allocator.dupe([]const u8, labels_buf[0..labels_len]) catch return error.OutOfMemory;
+        const labels = try allocator.dupe([]const u8, labels_buf[0..labels_len]);
         return .{ .labels = labels };
     }
 
@@ -806,10 +811,10 @@ pub const Parser = struct {
                     const str_len: usize = try self.readU8();
                     if (self.pos + str_len > rdata_end) return error.FormatError;
                     const str_data = try self.readSlice(str_len);
-                    strings.append(allocator, str_data) catch return error.OutOfMemory;
+                    try strings.append(allocator, str_data);
                 }
                 return .{ .txt = .{
-                    .strings = strings.toOwnedSlice(allocator) catch return error.OutOfMemory,
+                    .strings = try strings.toOwnedSlice(allocator),
                 } };
             },
             .rrsig => {
@@ -1032,11 +1037,11 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
         pos += 4;
         if (pos + length > rdata.len) return error.FormatError;
         const data = rdata[pos..][0..length];
-        options.append(allocator, .{ .code = code, .data = data }) catch return error.OutOfMemory;
+        try options.append(allocator, .{ .code = code, .data = data });
         pos += length;
     }
     if (pos != rdata.len) return error.FormatError;
-    return options.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return try options.toOwnedSlice(allocator);
 }
 
 // ── Top-level parse ────────────────────────────────────────────────────
@@ -1070,7 +1075,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const max_rrs = payload / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
 
     var questions: ArrayList(Question) = .empty;
-    questions.ensureTotalCapacity(allocator, @min(hdr.qd_count, max_questions)) catch return error.OutOfMemory;
+    try questions.ensureTotalCapacity(allocator, @min(hdr.qd_count, max_questions));
     errdefer {
         for (questions.items) |q| freeWireParsedName(allocator, q.name);
         questions.deinit(allocator);
@@ -1084,7 +1089,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     }
 
     var answers: ArrayList(ResourceRecord) = .empty;
-    answers.ensureTotalCapacity(allocator, @min(hdr.an_count, max_rrs)) catch return error.OutOfMemory;
+    try answers.ensureTotalCapacity(allocator, @min(hdr.an_count, max_rrs));
     errdefer {
         for (answers.items) |rr| freeWireParsedRR(allocator, rr);
         answers.deinit(allocator);
@@ -1098,7 +1103,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     }
 
     var authorities: ArrayList(ResourceRecord) = .empty;
-    authorities.ensureTotalCapacity(allocator, @min(hdr.ns_count, max_rrs)) catch return error.OutOfMemory;
+    try authorities.ensureTotalCapacity(allocator, @min(hdr.ns_count, max_rrs));
     errdefer {
         for (authorities.items) |rr| freeWireParsedRR(allocator, rr);
         authorities.deinit(allocator);
@@ -1112,7 +1117,7 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     }
 
     var additionals: ArrayList(ResourceRecord) = .empty;
-    additionals.ensureTotalCapacity(allocator, @min(hdr.ar_count, max_rrs)) catch return error.OutOfMemory;
+    try additionals.ensureTotalCapacity(allocator, @min(hdr.ar_count, max_rrs));
     errdefer {
         for (additionals.items) |rr| freeWireParsedRR(allocator, rr);
         additionals.deinit(allocator);
@@ -1164,22 +1169,22 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     // see an empty list. Materialise all four, then take each list's outer
     // backing in turn — on any failure the surviving lists' errdefers fire
     // with their items intact.
-    const questions_slice = questions.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const questions_slice = try questions.toOwnedSlice(allocator);
     errdefer {
         for (questions_slice) |q| freeWireParsedName(allocator, q.name);
         allocator.free(questions_slice);
     }
-    const answers_slice = answers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const answers_slice = try answers.toOwnedSlice(allocator);
     errdefer {
         for (answers_slice) |rr| freeWireParsedRR(allocator, rr);
         allocator.free(answers_slice);
     }
-    const authorities_slice = authorities.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const authorities_slice = try authorities.toOwnedSlice(allocator);
     errdefer {
         for (authorities_slice) |rr| freeWireParsedRR(allocator, rr);
         allocator.free(authorities_slice);
     }
-    const additionals_slice = additionals.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const additionals_slice = try additionals.toOwnedSlice(allocator);
 
     return .{
         .header = hdr,
@@ -2266,6 +2271,25 @@ pub fn validateResponse(msg: Message, expected_name: Name, qtype: RType) error{F
     }
 }
 
+test "validateResponse accepts a question-less error reply but rejects question-less NOERROR" {
+    // RFC 9619: error rcodes may omit the question; NOERROR may not. An error
+    // reply with QDCOUNT=0 thus passes here with empty questions — recursive.zig's
+    // 0x20-echo checks must gate on questions.len==1 before indexing questions[0].
+    const qname = Name{ .labels = &.{ "example", "com" } };
+    const base_flags = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .refused };
+
+    const refused_no_question = Message{
+        .header = .{ .id = 0, .flags = base_flags, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .questions = &.{},
+    };
+    try validateResponse(refused_no_question, qname, .a);
+    try std.testing.expectEqual(@as(usize, 0), refused_no_question.questions.len);
+
+    var noerror_no_question = refused_no_question;
+    noerror_no_question.header.flags.rcode = .no_error;
+    try std.testing.expectError(error.FormatError, validateResponse(noerror_no_question, qname, .a));
+}
+
 pub fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);
@@ -2317,6 +2341,104 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
         .nsec3param => |nsec3p| freeIfOwned(allocator, nsec3p.salt),
         .unknown => |data| allocator.free(data),
     }
+}
+
+/// Deep-copy an `RData`, allocating owned copies of every heap-backed field.
+/// The clone counterpart to `freeRData`.
+pub fn cloneRData(allocator: Allocator, rdata: RData) !RData {
+    return switch (rdata) {
+        .a => |v| .{ .a = v },
+        .aaaa => |v| .{ .aaaa = v },
+        .ns => |name| .{ .ns = try cloneName(allocator, name) },
+        .cname => |name| .{ .cname = try cloneName(allocator, name) },
+        .ptr => |name| .{ .ptr = try cloneName(allocator, name) },
+        .mx => |mx| .{ .mx = .{
+            .preference = mx.preference,
+            .exchange = try cloneName(allocator, mx.exchange),
+        } },
+        .soa => |soa| blk: {
+            const mname = try cloneName(allocator, soa.mname);
+            errdefer freeName(allocator, mname);
+            const rname = try cloneName(allocator, soa.rname);
+            break :blk .{ .soa = .{
+                .mname = mname,
+                .rname = rname,
+                .serial = soa.serial,
+                .refresh = soa.refresh,
+                .retry = soa.retry,
+                .expire = soa.expire,
+                .minimum = soa.minimum,
+            } };
+        },
+        .txt => |txt| blk: {
+            const strings = try allocator.alloc([]const u8, txt.strings.len);
+            errdefer allocator.free(strings);
+            var init_count: usize = 0;
+            errdefer for (strings[0..init_count]) |s| allocator.free(s);
+            for (txt.strings, 0..) |s, i| {
+                strings[i] = try allocator.dupe(u8, s);
+                init_count += 1;
+            }
+            break :blk .{ .txt = .{ .strings = strings } };
+        },
+        .rrsig => |rrsig| blk: {
+            const signer = try cloneName(allocator, rrsig.signer_name);
+            errdefer freeName(allocator, signer);
+            const sig = try allocator.dupe(u8, rrsig.signature);
+            break :blk .{ .rrsig = .{
+                .type_covered = rrsig.type_covered,
+                .algorithm = rrsig.algorithm,
+                .labels = rrsig.labels,
+                .original_ttl = rrsig.original_ttl,
+                .sig_expiration = rrsig.sig_expiration,
+                .sig_inception = rrsig.sig_inception,
+                .key_tag = rrsig.key_tag,
+                .signer_name = signer,
+                .signature = sig,
+            } };
+        },
+        .dnskey => |dnskey| .{ .dnskey = .{
+            .flags = dnskey.flags,
+            .protocol = dnskey.protocol,
+            .algorithm = dnskey.algorithm,
+            .public_key = try allocator.dupe(u8, dnskey.public_key),
+        } },
+        .ds => |ds_data| .{ .ds = .{
+            .key_tag = ds_data.key_tag,
+            .algorithm = ds_data.algorithm,
+            .digest_type = ds_data.digest_type,
+            .digest = try allocator.dupe(u8, ds_data.digest),
+        } },
+        .nsec => |nsec_data| blk: {
+            const next_name = try cloneName(allocator, nsec_data.next_domain_name);
+            errdefer freeName(allocator, next_name);
+            break :blk .{ .nsec = .{
+                .next_domain_name = next_name,
+                .type_bit_maps = try dupeOrEmpty(allocator, nsec_data.type_bit_maps),
+            } };
+        },
+        .nsec3 => |nsec3| blk: {
+            const salt = try dupeOrEmpty(allocator, nsec3.salt);
+            errdefer freeIfOwned(allocator, salt);
+            const next_hash = try dupeOrEmpty(allocator, nsec3.next_hashed_owner);
+            errdefer freeIfOwned(allocator, next_hash);
+            break :blk .{ .nsec3 = .{
+                .hash_algorithm = nsec3.hash_algorithm,
+                .flags = nsec3.flags,
+                .iterations = nsec3.iterations,
+                .salt = salt,
+                .next_hashed_owner = next_hash,
+                .type_bit_maps = try dupeOrEmpty(allocator, nsec3.type_bit_maps),
+            } };
+        },
+        .nsec3param => |nsec3p| .{ .nsec3param = .{
+            .hash_algorithm = nsec3p.hash_algorithm,
+            .flags = nsec3p.flags,
+            .iterations = nsec3p.iterations,
+            .salt = try dupeOrEmpty(allocator, nsec3p.salt),
+        } },
+        .unknown => |data| .{ .unknown = try allocator.dupe(u8, data) },
+    };
 }
 
 fn freeOpt(allocator: Allocator, opt: OptRecord) void {

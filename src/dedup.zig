@@ -139,6 +139,9 @@ pub const InFlightTable = struct {
             // we exit when our entry is gone or the deadline expires.
             const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + 2 * std.time.ns_per_s);
             while (shard.map.contains(key)) {
+                // Deadline hit, leader still in-flight: return .follower anyway;
+                // the caller re-resolves on its own. A rare duplicate upstream
+                // query beats blocking past the client budget.
                 if (monotonic.nowNs() >= deadline_ns) break;
                 shard.condition.waitUncancelable(self.io, &shard.mutex);
             }

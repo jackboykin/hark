@@ -4,6 +4,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
+const log = std.log.scoped(.event_loop);
 
 pub const max_operations = 64;
 const recv_buf_size = 4096;
@@ -168,7 +169,7 @@ pub const EventLoop = struct {
             linux.IORING_SETUP_DEFER_TASKRUN;
         params.cq_entries = max_operations * 4;
         self.ring = linux.IoUring.init_params(max_operations, &params) catch |err| {
-            std.log.scoped(.event_loop).err(
+            log.err(
                 "failed to create io_uring ({s}); hark requires Linux 6.1+",
                 .{@errorName(err)},
             );
@@ -182,7 +183,7 @@ pub const EventLoop = struct {
             self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
         }
         self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch |err| {
-            std.log.scoped(.event_loop).err(
+            log.err(
                 "failed to register io_uring buffer ring ({s}); hark requires Linux 6.1+",
                 .{@errorName(err)},
             );

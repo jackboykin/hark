@@ -69,9 +69,9 @@ const ArmKey = struct {
 };
 
 /// Compose AddressKey's hash with the precomputed `zone_hash` so we skip
-/// rehashing 32 bytes through Wyhash on every `discountZone` /
-/// `recordOutcome` lookup, while still picking up the randomized seed
-/// AddressKey.HashCtx already applies.
+/// re-running AddressKey.HashCtx (FNV-1a + Murmur3 fmix64) over the whole
+/// key on every `discountAndRead` / `recordOutcome` lookup, while still
+/// picking up the randomized seed AddressKey.HashCtx already applies.
 const ArmKeyContext = struct {
     pub fn hash(_: @This(), key: ArmKey) u64 {
         var h = AddressKey.HashCtx.hash(.{}, key.addr_key);
@@ -150,6 +150,9 @@ pub const NsSelector = struct {
     }
 
     inline fn shardFor(self: *NsSelector, key: ArmKey) *Shard {
+        // Low bits are safe: ArmKeyContext.hash composes an already
+        // fmix64-finalized AddressKey hash. (ns_rtt.shardFor must use high
+        // bits off the raw FNV-1a chain instead.)
         const h = ArmKeyContext.hash(.{}, key);
         return &self.shards[@as(u32, @truncate(h)) & shard_mask];
     }

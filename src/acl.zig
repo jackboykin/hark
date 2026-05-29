@@ -10,7 +10,6 @@
 /// CIDR list to deserve service.
 const std = @import("std");
 const mem = std.mem;
-const Allocator = mem.Allocator;
 const na = @import("net_address.zig");
 
 pub const Cidr = struct {

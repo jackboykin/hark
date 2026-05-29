@@ -94,6 +94,22 @@ const max_servers_per_level = 26;
 // 8-hop CDN chain (Akamai/edgesuite stacks); matches PowerDNS post-fix
 // and Hickory.
 const max_cname_chain = 16;
+
+/// CNAME records collected over one resolveImpl chain walk, plus the
+/// wildcard-expansion proofs authenticating them. Always paired and
+/// same-lifetime, so they travel as one struct.
+const CnameChain = struct {
+    records: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty,
+    /// RFC 4035 §3.1.3.4 wildcard-expansion proofs from each CNAME hop's
+    /// authority (cf. Unbound `iter_add_prepend_auth`). Members borrow the
+    /// per-query arena's parse buffers — would dangle under a heap allocator.
+    wildcard_proofs: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty,
+
+    fn deinit(self: *CnameChain, allocator: mem.Allocator) void {
+        self.records.deinit(allocator);
+        self.wildcard_proofs.deinit(allocator);
+    }
+};
 const max_minimize_count = 10;
 
 /// Parse a DNS message, propagating OOM and converting other parse
@@ -387,16 +403,8 @@ pub const RecursiveResolver = struct {
         // bounds QMIN iterations (including cache-hit advances).
         var upstream_queries: usize = 0;
         var total_probes: usize = 0;
-        var cname_chain: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+        var cname_chain: CnameChain = .{};
         defer cname_chain.deinit(allocator);
-        // RFC 4035 §3.1.3.4 wildcard-expansion proofs accumulated from each
-        // intermediate CNAME hop's authority. Mirrors Unbound's
-        // `iter_add_prepend_auth` (iterator.c:500). Members borrow from
-        // the parse-response arena buffers — safe because the per-query
-        // arena outlives every parse buffer it produces; would dangle
-        // under a heap allocator.
-        var cname_auth_aggregate: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
-        defer cname_auth_aggregate.deinit(allocator);
 
         // DNSSEC chain of trust state — starts as secure at root
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
@@ -409,7 +417,7 @@ pub const RecursiveResolver = struct {
             if (action != .none) {
                 const synth = try special_use.synthesize(allocator, current_name, action);
                 return .{
-                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synth),
+                    .message = try withCnameChain(allocator, &cname_chain, synth),
                     .prefetch_name = null,
                     .prefetch_qtype = qtype,
                 };
@@ -422,25 +430,25 @@ pub const RecursiveResolver = struct {
             if (qtype == .any) {
                 const synth = try synthesizeAnyHinfo(allocator, current_name);
                 return .{
-                    .message = try withCnameChain(allocator, cname_chain.items, cname_auth_aggregate.items, synth),
+                    .message = try withCnameChain(allocator, &cname_chain, synth),
                     .prefetch_name = null,
                     .prefetch_qtype = qtype,
                 };
             }
 
             // CACHE CHECK 1: Do we already have a cached answer?
-            switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, cname_chain.items, cname_auth_aggregate.items)) {
+            switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, &cname_chain)) {
                 .none => {},
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
                     if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
-                    if (cnameTargetRevisitsChain(cname_chain.items, dispatch.cname_rr.rdata.cname)) {
+                    if (cnameTargetRevisitsChain(cname_chain.records.items, dispatch.cname_rr.rdata.cname)) {
                         logCnameLoop(dispatch.cname_rr.rdata.cname, "cache-served");
                         return self.bogusServfail(current_name, qtype);
                     }
                     cname_count += 1;
-                    try cname_chain.append(allocator, dispatch.cname_rr);
-                    try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_auth_aggregate);
+                    try cname_chain.records.append(allocator, dispatch.cname_rr);
+                    try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
                     // Mirror the upstream branch (lines 794-796): re-resolve
                     // the target with fresh security state, but preserve
@@ -453,11 +461,11 @@ pub const RecursiveResolver = struct {
                 },
             }
 
-            if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
+            if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, &cname_chain)) |result| return result;
 
             var target_name = try dns.parseDottedName(allocator, current_name);
 
-            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, cname_chain.items, cname_auth_aggregate.items)) |result| return result;
+            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, &cname_chain)) |result| return result;
 
             var servers: [max_servers_per_level]na.Address = undefined;
             var server_count: usize = undefined;
@@ -633,7 +641,7 @@ pub const RecursiveResolver = struct {
 
                 // Classify response
                 if (response.header.flags.rcode != .no_error)
-                    return self.handleErrorResponse(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], cname_chain.items, cname_auth_aggregate.items);
+                    return self.handleErrorResponse(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
 
                 if (response.answers.len > 0) {
                     // Follow CNAME if the answer doesn't contain the queried type
@@ -672,14 +680,14 @@ pub const RecursiveResolver = struct {
                                 // Store before following CNAME — won't reach final answer validation
                                 if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status);
                                 if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
-                                if (cnameTargetRevisitsChain(cname_chain.items, cname_rr.rdata.cname)) {
+                                if (cnameTargetRevisitsChain(cname_chain.records.items, cname_rr.rdata.cname)) {
                                     logCnameLoop(cname_rr.rdata.cname, "upstream-served");
                                     return self.bogusServfail(current_name, qtype);
                                 }
                                 cname_count += 1;
-                                try cname_chain.append(allocator, cname_rr);
+                                try cname_chain.records.append(allocator, cname_rr);
 
-                                try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_auth_aggregate);
+                                try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_chain.wildcard_proofs);
 
                                 // Same-zone CNAME: keep current auth servers, delegation,
                                 // and security_state. The DNSSEC chain of trust is
@@ -709,12 +717,12 @@ pub const RecursiveResolver = struct {
                         }
                     }
 
-                    return self.finalizeAnswer(allocator, &response, current_name, qtype, security_state, parent_zone, servers[0..server_count], responding_server, cname_chain.items, cname_auth_aggregate.items);
+                    return self.finalizeAnswer(allocator, &response, current_name, qtype, security_state, parent_zone, servers[0..server_count], responding_server, &cname_chain);
                 }
 
                 // Check for referral (NS records in authority section)
                 const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse
-                    return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], cname_chain.items, cname_auth_aggregate.items);
+                    return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
 
                 if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
@@ -808,8 +816,7 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         depth: usize,
         cname_count: usize,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !CacheDispatch {
         if (self.bypass_cache) return .none;
         const c = self.cache orelse return .none;
@@ -849,12 +856,12 @@ pub const RecursiveResolver = struct {
                         // For wildcard-expanded answers, h.nsec_proofs carries
                         // the §3.1.3.4 "no closer match" NSEC proofs from the
                         // original response.
-                        .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
+                        .message = try withCnameChain(allocator, chain, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
                         .prefetch_name = prefetch_out,
                         .prefetch_qtype = qtype,
                     },
                 },
-                .negative => |n| return .{ .served = try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, cname_chain_items, cname_auth_items) },
+                .negative => |n| return .{ .served = try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, chain) },
             }
         }
 
@@ -894,8 +901,7 @@ pub const RecursiveResolver = struct {
         target_name: dns.Name,
         current_name: []const u8,
         qtype: dns.RType,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !?ResolveResult {
         if (self.bypass_cache or !self.dnssec_enabled) return null;
         const nc = self.nsec_cache orelse return null;
@@ -903,10 +909,10 @@ pub const RecursiveResolver = struct {
         switch (synth.rcode) {
             .nxdomain, .nodata => |rc| {
                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
-                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, cname_chain_items, cname_auth_items);
+                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, chain);
             },
             .wildcard_match => {
-                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, cname_chain_items, cname_auth_items)) |result| {
+                if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, chain)) |result| {
                     return .{ .message = result, .prefetch_name = null, .prefetch_qtype = qtype };
                 }
                 return null;
@@ -927,14 +933,13 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         current_name: []const u8,
         qtype: dns.RType,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !?ResolveResult {
         if (self.bypass_cache) return null;
         const c = self.cache orelse return null;
         const result = c.lookupNxdomainAncestor(allocator, current_name, qtype, .in) orelse return null;
         switch (result) {
-            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, .name_error, false, null, qtype, cname_chain_items, cname_auth_items),
+            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, .name_error, false, null, qtype, chain),
             .hit => return null, // ancestor exists positively — no RFC 8020 cut applies
         }
     }
@@ -1093,8 +1098,7 @@ pub const RecursiveResolver = struct {
         target_name: dns.Name,
         parent_zone: dns.Name,
         servers: []const na.Address,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers)) {
@@ -1111,7 +1115,7 @@ pub const RecursiveResolver = struct {
         } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
             self.cacheResolutionFailure(name, qtype, depth);
         }
-        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
+        return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
 
     /// Validate the final answer RRsets (DNSSEC) and cache them, then
@@ -1129,8 +1133,7 @@ pub const RecursiveResolver = struct {
         parent_zone: dns.Name,
         servers: []const na.Address,
         responding_server: ?na.Address,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !ResolveResult {
         var answer_status: cache_mod.SecurityStatus = .unchecked;
         if (self.dnssec_enabled) {
@@ -1152,7 +1155,7 @@ pub const RecursiveResolver = struct {
                 self.storeWildcardRRsets(response.answers, qtype);
             }
         };
-        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
+        return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
 
     /// NODATA terminal (no answers, no referral). AA responses run the
@@ -1172,8 +1175,7 @@ pub const RecursiveResolver = struct {
         target_name: dns.Name,
         parent_zone: dns.Name,
         servers: []const na.Address,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.aa) {
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers)) {
@@ -1193,7 +1195,7 @@ pub const RecursiveResolver = struct {
         } else {
             self.cacheResolutionFailure(name, qtype, depth);
         }
-        return .{ .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, response.*) };
+        return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
 
     // ── Delegation security ────────────────────────────────────────────
@@ -1234,8 +1236,7 @@ pub const RecursiveResolver = struct {
         nsec_proofs: []const dns.ResourceRecord,
         target_name: dns.Name,
         qtype: dns.RType,
-        cname_chain_items: []const dns.ResourceRecord,
-        cname_auth_items: []const dns.ResourceRecord,
+        chain: *const CnameChain,
     ) !?dns.Message {
         if (ce_label_count == 0 or target_name.labels.len < ce_label_count) return null;
         // Build *.CE from qname labels and format as dotted string for cache lookup
@@ -1270,7 +1271,7 @@ pub const RecursiveResolver = struct {
                 }
                 const answer = try concatRRs(allocator, h.records, h.sigs);
                 const authority = try buildNegativeAuthority(allocator, soa, nsec_proofs);
-                return try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(answer, authority, .no_error, h.security_status == .secure));
+                return try withCnameChain(allocator, chain, synthesizedMessage(answer, authority, .no_error, h.security_status == .secure));
             },
             .negative => return null,
         }
@@ -1566,7 +1567,7 @@ pub const RecursiveResolver = struct {
 
         // 0x20 echo verify. Mark and bail to sequential, which will rebuild
         // lowercase against the same server and retry properly.
-        if (case_rng != null and !msg0.questions[0].name.eqlExact(resp.questions[0].name)) {
+        if (case_rng != null and resp.questions.len == 1 and !msg0.questions[0].name.eqlExact(resp.questions[0].name)) {
             self.markCaseBroken(responding_addr);
             return null;
         }
@@ -1737,7 +1738,7 @@ pub const RecursiveResolver = struct {
                 // distinguish middlebox-vs-server with a TCP probe — the
                 // 1-hour reprobe TTL on the marker recovers automatically if
                 // the middlebox is later removed.
-                if (case_rng != null and !query_msg.questions[0].name.eqlExact(response.questions[0].name)) {
+                if (case_rng != null and response.questions.len == 1 and !query_msg.questions[0].name.eqlExact(response.questions[0].name)) {
                     self.markCaseBroken(server);
                     case_rng = null;
                     continue :retry;
@@ -2986,10 +2987,11 @@ fn buildNegativeAuthority(
 /// `iter_add_prepend_auth`. Section trimming is the shaper's job.
 fn withCnameChain(
     allocator: mem.Allocator,
-    chain: []const dns.ResourceRecord,
-    auth_aggregate: []const dns.ResourceRecord,
+    cc: *const CnameChain,
     response: dns.Message,
 ) !dns.Message {
+    const chain = cc.records.items;
+    const auth_aggregate = cc.wildcard_proofs.items;
     if (chain.len == 0 and auth_aggregate.len == 0) return response;
     var msg = response;
     if (chain.len > 0) {
@@ -3042,12 +3044,11 @@ fn negativeResolveResult(
     ad: bool,
     prefetch_name: ?[]const u8,
     qtype: dns.RType,
-    cname_chain_items: []const dns.ResourceRecord,
-    cname_auth_items: []const dns.ResourceRecord,
+    chain: *const CnameChain,
 ) !RecursiveResolver.ResolveResult {
     const authority = try buildNegativeAuthority(allocator, soa, proofs);
     return .{
-        .message = try withCnameChain(allocator, cname_chain_items, cname_auth_items, synthesizedMessage(&.{}, authority, rcode, ad)),
+        .message = try withCnameChain(allocator, chain, synthesizedMessage(&.{}, authority, rcode, ad)),
         .prefetch_name = prefetch_name,
         .prefetch_qtype = qtype,
     };
@@ -3905,7 +3906,11 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
         .answers = &.{a_rr},
     };
 
-    const stitched = try withCnameChain(a, &.{cname_rr}, &.{nsec_rr}, terminal_response);
+    var cc: CnameChain = .{};
+    defer cc.deinit(a);
+    try cc.records.append(a, cname_rr);
+    try cc.wildcard_proofs.append(a, nsec_rr);
+    const stitched = try withCnameChain(a, &cc, terminal_response);
 
     try testing.expectEqual(@as(usize, 2), stitched.answers.len); // CNAME + A
     try testing.expectEqual(dns.RType.cname, stitched.answers[0].rtype);
@@ -4141,7 +4146,8 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
         .cache = &cache,
     };
 
-    const synth = (try resolver.tryWildcardSynth(aa, 2, soa_rr, &.{}, target_name, .a, &.{}, &.{})) orelse return error.TestExpectedSynth;
+    const empty_chain: CnameChain = .{};
+    const synth = (try resolver.tryWildcardSynth(aa, 2, soa_rr, &.{}, target_name, .a, &empty_chain)) orelse return error.TestExpectedSynth;
 
     try testing.expect(synth.answers.len >= 1);
     const ans = synth.answers[0];

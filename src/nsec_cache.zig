@@ -4,7 +4,6 @@ const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
-const cache_mod = @import("cache.zig");
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 
 /// Maximum effective TTL for synthesized responses (RFC 9077 §3).
@@ -30,7 +29,7 @@ const NsecEntry = struct {
 fn cloneRecord(alloc: Allocator, rr: dns.ResourceRecord) !dns.ResourceRecord {
     const name = try dns.cloneName(alloc, rr.name);
     errdefer dns.freeName(alloc, name);
-    const rdata = try cache_mod.cloneRData(alloc, rr.rdata);
+    const rdata = try dns.cloneRData(alloc, rr.rdata);
     return .{ .name = name, .rtype = rr.rtype, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = rdata };
 }
 

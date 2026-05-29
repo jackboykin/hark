@@ -540,14 +540,6 @@ pub fn echoServerThread(sock: Io.net.Socket, io: Io) void {
     sock.send(io, &msg.from, resp[0..msg.data.len]) catch return;
 }
 
-/// Ephemeral-port UDP loopback socket for tests. Pair with `echoServerThread`
-/// or any mock that wants a `(sock, addr)` it can send/receive on.
-pub fn bindLoopbackUdpSock(io: Io) !struct { sock: Io.net.Socket, addr: na.Address } {
-    const bind = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const sock = try bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
-    return .{ .sock = sock, .addr = sock.address };
-}
-
 /// Mock TCP echo server for tests: accepts one connection, reads one
 /// length-prefixed DNS query, echoes it back with the QR bit set, closes.
 fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {

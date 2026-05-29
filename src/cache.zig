@@ -107,7 +107,7 @@ fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
     errdefer alloc.free(wire_owned);
     const cloned_name = try cloneName(alloc, rr.name);
     errdefer dns.freeName(alloc, cloned_name);
-    const cloned_rdata = try cloneRData(alloc, rr.rdata);
+    const cloned_rdata = try dns.cloneRData(alloc, rr.rdata);
     return .{
         .name = cloned_name,
         .rtype = rr.rtype,
@@ -126,7 +126,7 @@ fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_
     const built = try dns.buildResourceRecordWire(&wire_stage, rr);
     const wire_owned = try alloc.dupe(u8, built.bytes);
     errdefer alloc.free(wire_owned);
-    const cloned_rdata = try cloneRData(alloc, rr.rdata);
+    const cloned_rdata = try dns.cloneRData(alloc, rr.rdata);
     return .{
         .name = shared_name,
         .rtype = rr.rtype,
@@ -234,102 +234,6 @@ pub const CacheLookupResult = union(enum) {
 
 const cloneName = dns.cloneName;
 
-pub fn cloneRData(alloc: Allocator, rdata: dns.RData) !dns.RData {
-    return switch (rdata) {
-        .a => |v| .{ .a = v },
-        .aaaa => |v| .{ .aaaa = v },
-        .ns => |name| .{ .ns = try cloneName(alloc, name) },
-        .cname => |name| .{ .cname = try cloneName(alloc, name) },
-        .ptr => |name| .{ .ptr = try cloneName(alloc, name) },
-        .mx => |mx| .{ .mx = .{
-            .preference = mx.preference,
-            .exchange = try cloneName(alloc, mx.exchange),
-        } },
-        .soa => |soa| blk: {
-            const mname = try cloneName(alloc, soa.mname);
-            errdefer dns.freeName(alloc, mname);
-            const rname = try cloneName(alloc, soa.rname);
-            break :blk .{ .soa = .{
-                .mname = mname,
-                .rname = rname,
-                .serial = soa.serial,
-                .refresh = soa.refresh,
-                .retry = soa.retry,
-                .expire = soa.expire,
-                .minimum = soa.minimum,
-            } };
-        },
-        .txt => |txt| blk: {
-            const strings = try alloc.alloc([]const u8, txt.strings.len);
-            errdefer alloc.free(strings);
-            var init_count: usize = 0;
-            errdefer for (strings[0..init_count]) |s| alloc.free(s);
-            for (txt.strings, 0..) |s, i| {
-                strings[i] = try alloc.dupe(u8, s);
-                init_count += 1;
-            }
-            break :blk .{ .txt = .{ .strings = strings } };
-        },
-        .rrsig => |rrsig| blk: {
-            const signer = try cloneName(alloc, rrsig.signer_name);
-            errdefer dns.freeName(alloc, signer);
-            const sig = try alloc.dupe(u8, rrsig.signature);
-            break :blk .{ .rrsig = .{
-                .type_covered = rrsig.type_covered,
-                .algorithm = rrsig.algorithm,
-                .labels = rrsig.labels,
-                .original_ttl = rrsig.original_ttl,
-                .sig_expiration = rrsig.sig_expiration,
-                .sig_inception = rrsig.sig_inception,
-                .key_tag = rrsig.key_tag,
-                .signer_name = signer,
-                .signature = sig,
-            } };
-        },
-        .dnskey => |dnskey| .{ .dnskey = .{
-            .flags = dnskey.flags,
-            .protocol = dnskey.protocol,
-            .algorithm = dnskey.algorithm,
-            .public_key = try alloc.dupe(u8, dnskey.public_key),
-        } },
-        .ds => |ds_data| .{ .ds = .{
-            .key_tag = ds_data.key_tag,
-            .algorithm = ds_data.algorithm,
-            .digest_type = ds_data.digest_type,
-            .digest = try alloc.dupe(u8, ds_data.digest),
-        } },
-        .nsec => |nsec_data| blk: {
-            const next_name = try cloneName(alloc, nsec_data.next_domain_name);
-            errdefer dns.freeName(alloc, next_name);
-            break :blk .{ .nsec = .{
-                .next_domain_name = next_name,
-                .type_bit_maps = try dns.dupeOrEmpty(alloc, nsec_data.type_bit_maps),
-            } };
-        },
-        .nsec3 => |nsec3| blk: {
-            const salt = try dns.dupeOrEmpty(alloc, nsec3.salt);
-            errdefer dns.freeIfOwned(alloc, salt);
-            const next_hash = try dns.dupeOrEmpty(alloc, nsec3.next_hashed_owner);
-            errdefer dns.freeIfOwned(alloc, next_hash);
-            break :blk .{ .nsec3 = .{
-                .hash_algorithm = nsec3.hash_algorithm,
-                .flags = nsec3.flags,
-                .iterations = nsec3.iterations,
-                .salt = salt,
-                .next_hashed_owner = next_hash,
-                .type_bit_maps = try dns.dupeOrEmpty(alloc, nsec3.type_bit_maps),
-            } };
-        },
-        .nsec3param => |nsec3p| .{ .nsec3param = .{
-            .hash_algorithm = nsec3p.hash_algorithm,
-            .flags = nsec3p.flags,
-            .iterations = nsec3p.iterations,
-            .salt = try dns.dupeOrEmpty(alloc, nsec3p.salt),
-        } },
-        .unknown => |data| .{ .unknown = try alloc.dupe(u8, data) },
-    };
-}
-
 /// Apply min-TTL floor and max-TTL cap.
 fn clampTtl(min_ttl: u32, ttl: u32) u32 {
     const effective = if (min_ttl > 0) @max(ttl, min_ttl) else ttl;
@@ -369,7 +273,7 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.R
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
-            .rdata = try cloneRData(alloc, cr.rdata),
+            .rdata = try dns.cloneRData(alloc, cr.rdata),
             .wire = wire_area[offset..][0..cr.wire.len],
             .wire_ttl_offset = cr.wire_ttl_offset,
         };
@@ -397,7 +301,7 @@ fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) 
     const out = try alloc.alloc(dns.ResourceRecord, cached.len);
     for (cached, 0..) |cr, i| {
         const name = try cloneName(alloc, cr.name);
-        const rdata = try cloneRData(alloc, cr.rdata);
+        const rdata = try dns.cloneRData(alloc, cr.rdata);
         const wire = try alloc.dupe(u8, cr.wire);
         out[i] = .{
             .name = name,

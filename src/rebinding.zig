@@ -362,3 +362,34 @@ test "scrub drops RRSIG when its rrset is partially scrubbed (sig invalidated by
     try testing.expectEqual(@as(usize, 1), scrubbed.len);
     try testing.expectEqual(dns.RType.a, scrubbed[0].rtype);
 }
+
+test "scrub heap path: >128-RR section drops private A and the orphaned RRSIG" {
+    // answers.len > max_inline_marks forces the heap marks bitmap + orphan-RRSIG
+    // sweep that the small-section tests above never reach.
+    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+
+    const public_count = 100;
+    const private_count = 100;
+    var answers: [public_count + private_count + 1]dns.ResourceRecord = undefined;
+    var idx: usize = 0;
+    for (0..public_count) |i| {
+        answers[idx] = rrA(public_name, .{ 8, 8, @intCast(i >> 8), @intCast(i & 0xff) });
+        idx += 1;
+    }
+    for (0..private_count) |i| {
+        answers[idx] = rrA(public_name, .{ 192, 168, @intCast(i >> 8), @intCast(i & 0xff) });
+        idx += 1;
+    }
+    answers[idx] = rrsigOver(.a); // orphaned once any member of its rrset is scrubbed
+
+    try testing.expect(answers.len > max_inline_marks); // guards the heap branch
+
+    const scrubbed = try scrub(testing.allocator, &answers, cfg);
+    defer testing.allocator.free(scrubbed);
+
+    try testing.expectEqual(@as(usize, public_count), scrubbed.len);
+    for (scrubbed) |rr| {
+        try testing.expectEqual(dns.RType.a, rr.rtype); // RRSIG dropped, no private survived
+        try testing.expect(!isPrivateIp4(rr.rdata.a));
+    }
+}

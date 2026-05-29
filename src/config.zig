@@ -143,17 +143,17 @@ pub const ConfigError = error{
 // ── Defaults ───────────────────────────────────────────────────────────
 
 fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
-    const listen = allocator.alloc(Address, 2) catch return error.OutOfMemory;
+    const listen = try allocator.alloc(Address, 2);
     errdefer allocator.free(listen);
     listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
-    const empty_root_hints = allocator.alloc(Address, 0) catch return error.OutOfMemory;
-    const empty_acl = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
-    const empty_trust_anchors = allocator.alloc(dns.DsData, 0) catch return error.OutOfMemory;
-    const empty_zones = allocator.alloc(dns.Name, 0) catch return error.OutOfMemory;
-    const empty_extra_block = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
-    const empty_extra_allow = allocator.alloc(acl.Cidr, 0) catch return error.OutOfMemory;
+    const empty_root_hints = try allocator.alloc(Address, 0);
+    const empty_acl = try allocator.alloc(acl.Cidr, 0);
+    const empty_trust_anchors = try allocator.alloc(dns.DsData, 0);
+    const empty_zones = try allocator.alloc(dns.Name, 0);
+    const empty_extra_block = try allocator.alloc(acl.Cidr, 0);
+    const empty_extra_allow = try allocator.alloc(acl.Cidr, 0);
 
     return .{
         .listen = listen,
@@ -364,7 +364,7 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
     while (true) {
         const n = try sys.read(fd, &read_buf);
         if (n == 0) break;
-        contents.appendSlice(allocator, read_buf[0..n]) catch return error.OutOfMemory;
+        try contents.appendSlice(allocator, read_buf[0..n]);
         if (contents.items.len > 1024 * 1024) return error.ConfigFileTooLarge;
     }
 
@@ -377,7 +377,7 @@ pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
 /// numbers (e.g. `8` = RSA/SHA-256, `2` = SHA-256). Owner name is implicit
 /// root — the override targets the same anchor slot as `dnssec.root_ds_records`.
 fn parseTrustAnchors(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
-    const list = allocator.alloc(dns.DsData, strs.len) catch return error.OutOfMemory;
+    const list = try allocator.alloc(dns.DsData, strs.len);
     var i: usize = 0;
     errdefer {
         for (list[0..i]) |ta| allocator.free(ta.digest);
@@ -422,7 +422,7 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     };
     if (digest_len != expected_len) return error.InvalidValue;
 
-    const digest = allocator.alloc(u8, digest_len) catch return error.OutOfMemory;
+    const digest = try allocator.alloc(u8, digest_len);
     errdefer allocator.free(digest);
     _ = std.fmt.hexToBytes(digest, digest_str) catch return error.InvalidValue;
 
@@ -435,7 +435,7 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
 }
 
 fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
-    const list = allocator.alloc(dns.Name, strs.len) catch return error.OutOfMemory;
+    const list = try allocator.alloc(dns.Name, strs.len);
     var i: usize = 0;
     errdefer {
         for (list[0..i]) |zone| {
@@ -462,7 +462,7 @@ fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]d
 }
 
 fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
-    const list = allocator.alloc(acl.Cidr, strs.len) catch return error.OutOfMemory;
+    const list = try allocator.alloc(acl.Cidr, strs.len);
     errdefer allocator.free(list);
     for (strs, 0..) |s, i| {
         list[i] = acl.parse(s) orelse return error.InvalidAclEntry;
@@ -471,7 +471,7 @@ fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]a
 }
 
 fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]Address {
-    const addrs = allocator.alloc(Address, strs.len) catch return error.OutOfMemory;
+    const addrs = try allocator.alloc(Address, strs.len);
     errdefer allocator.free(addrs);
 
     for (strs, 0..) |s, i| {

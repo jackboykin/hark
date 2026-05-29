@@ -89,7 +89,9 @@ pub const PooledConnection = struct {
     /// seconds. null falls back to the pool's `max_idle_sec`.
     idle_timeout_sec: ?i64 = null,
 
-    // Inline buffers — stable addresses since struct is heap-allocated.
+    // Inline buffers; net_reader/net_writer and (later) `tls` alias them by
+    // pointer, so a live connection MUST NOT be moved or copied by value — it
+    // is heap-allocated and held only via *PooledConnection, else those dangle.
     net_read_buf: [tls.input_buffer_len]u8,
     net_write_buf: [tls.output_buffer_len]u8,
 
@@ -346,18 +348,17 @@ pub fn ConnectionPool(comptime Conn: type) type {
 
 const TlsPool = ConnectionPool(PooledConnection);
 
+// Injectable test clock; each test resets it at entry (cf. cache.zig testNowSeconds).
+var cp_test_now: i64 = 1000;
+fn cpTestNow() i64 {
+    return cp_test_now;
+}
+
 test "ConnectionPool idle eviction with injectable now_fn" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     pool.max_idle_sec = 10;
     defer pool.deinit();
 
@@ -371,7 +372,7 @@ test "ConnectionPool idle eviction with injectable now_fn" {
     try testing.expect(pool.entries.count() == 1);
 
     // Advance time past idle threshold
-    fake_time = 1020; // 20 seconds later, past max_idle_sec=10
+    cp_test_now = 1020; // 20 seconds later, past max_idle_sec=10
 
     // acquire should evict the stale entry
     const result = pool.acquire(key);
@@ -380,17 +381,10 @@ test "ConnectionPool idle eviction with injectable now_fn" {
 }
 
 test "ConnectionPool store and acquire" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
@@ -399,7 +393,7 @@ test "ConnectionPool store and acquire" {
     pool.store(key, conn);
 
     // Advance time slightly (within idle window)
-    fake_time = 1005;
+    cp_test_now = 1005;
     const acquired = pool.acquire(key);
     try testing.expect(acquired != null);
     try testing.expect(pool.entries.count() == 0); // removed from pool on acquire
@@ -422,17 +416,10 @@ test "ConnectionPool release not alive frees connection" {
 }
 
 test "ConnectionPool max entries eviction" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     pool.max_entries = 2;
     defer pool.deinit();
 
@@ -441,7 +428,7 @@ test "ConnectionPool max entries eviction" {
     const key1 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
     pool.store(key1, conn1);
 
-    fake_time = 1001;
+    cp_test_now = 1001;
     const conn2 = try createTestConnection(testing.allocator);
     const key2 = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 853));
     pool.store(key2, conn2);
@@ -449,7 +436,7 @@ test "ConnectionPool max entries eviction" {
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
 
     // Store a 3rd — should evict the oldest (conn1)
-    fake_time = 1002;
+    cp_test_now = 1002;
     const conn3 = try createTestConnection(testing.allocator);
     const key3 = AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 853));
     pool.store(key3, conn3);
@@ -501,27 +488,20 @@ fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
 }
 
 test "ConnectionPool multi-entry per key (LIFO)" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
     const c1 = try createTestConnection(testing.allocator);
     pool.store(key, c1);
-    fake_time = 1001;
+    cp_test_now = 1001;
     const c2 = try createTestConnection(testing.allocator);
     pool.store(key, c2);
-    fake_time = 1002;
+    cp_test_now = 1002;
     const c3 = try createTestConnection(testing.allocator);
     pool.store(key, c3);
 
@@ -545,17 +525,10 @@ test "ConnectionPool multi-entry per key (LIFO)" {
 }
 
 test "ConnectionPool per-key cap evicts oldest within key" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
@@ -564,7 +537,7 @@ test "ConnectionPool per-key cap evicts oldest within key" {
     for (0..per_key_cap) |_| {
         const c = try createTestConnection(testing.allocator);
         pool.store(key, c);
-        fake_time += 1;
+        cp_test_now += 1;
     }
     try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
 
@@ -580,17 +553,10 @@ test "ConnectionPool per-key cap evicts oldest within key" {
 }
 
 test "TlsPool max queries eviction (RFC 7766 §6.2.1)" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
@@ -643,17 +609,10 @@ test "applyKeepaliveHint clamps weaponized values" {
 }
 
 test "TcpConnectionPool per-connection idle_timeout_sec overrides pool default" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TcpConnectionPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     pool.max_idle_sec = 60; // pool default would keep this alive at t+20
     defer pool.deinit();
 
@@ -662,23 +621,16 @@ test "TcpConnectionPool per-connection idle_timeout_sec overrides pool default" 
     conn.idle_timeout_sec = 5; // RFC 7828 advertised: 5s
     pool.store(key, conn);
 
-    fake_time = 1010; // 10s later: past per-conn limit, under pool default
+    cp_test_now = 1010; // 10s later: past per-conn limit, under pool default
     try testing.expect(pool.acquire(key) == null);
     try testing.expect(pool.entries.count() == 0);
 }
 
 test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLocked" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TcpConnectionPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     pool.max_idle_sec = 120;
     pool.max_entries = 4;
     defer pool.deinit();
@@ -696,7 +648,7 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
     try testing.expectEqual(@as(usize, 2), pool.total_conns);
 
     // Trigger idle sweep via acquire on a third key past the half-cap heuristic.
-    fake_time = 1010; // short_conn expired, long_conn still fine
+    cp_test_now = 1010; // short_conn expired, long_conn still fine
     // Fill above max_entries/2 to ensure evictIdleLocked actually runs.
     const filler_conn = try createTestTcpConnection(testing.allocator);
     pool.store(key_long, filler_conn);
@@ -712,17 +664,10 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
 }
 
 test "TcpConnectionPool max queries eviction" {
-    var fake_time: i64 = 1000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    cp_test_now = 1000;
 
     var pool = TcpConnectionPool.init(testing.allocator, undefined);
-    pool.now_fn = &now_fn.now;
+    pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));

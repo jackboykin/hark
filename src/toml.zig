@@ -129,11 +129,11 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             if (root.map.get(section_name)) |_| return error.DuplicateSection;
 
             // Create section table
-            const duped_name = allocator.dupe(u8, section_name) catch return error.OutOfMemory;
+            const duped_name = try allocator.dupe(u8, section_name);
             errdefer allocator.free(duped_name);
 
             const empty_table = Value{ .table = .{ .map = .empty } };
-            root.map.put(allocator, duped_name, empty_table) catch return error.OutOfMemory;
+            try root.map.put(allocator, duped_name, empty_table);
             current_section = duped_name;
         } else {
             // Key = value
@@ -151,7 +151,7 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
                 freeValue(allocator, &v);
             }
 
-            const duped_key = allocator.dupe(u8, raw_key) catch return error.OutOfMemory;
+            const duped_key = try allocator.dupe(u8, raw_key);
             errdefer allocator.free(duped_key);
 
             // Insert into current section or root
@@ -161,7 +161,7 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             } else &root.map;
 
             if (target.get(duped_key) != null) return error.DuplicateKey;
-            target.put(allocator, duped_key, value) catch return error.OutOfMemory;
+            try target.put(allocator, duped_key, value);
         }
     }
 
@@ -230,20 +230,20 @@ fn parseString(allocator: Allocator, raw: []const u8) ParseError![]const u8 {
             // Found closing quote — check nothing follows
             const after = mem.trim(u8, raw[i + 1 ..], &std.ascii.whitespace);
             if (after.len > 0) return error.InvalidSyntax;
-            return allocator.dupe(u8, result.items) catch return error.OutOfMemory;
+            return try allocator.dupe(u8, result.items);
         }
         if (c == '\\') {
             i += 1;
             if (i >= raw.len) return error.InvalidEscape;
             switch (raw[i]) {
-                '\\' => result.append(allocator, '\\') catch return error.OutOfMemory,
-                '"' => result.append(allocator, '"') catch return error.OutOfMemory,
-                'n' => result.append(allocator, '\n') catch return error.OutOfMemory,
-                't' => result.append(allocator, '\t') catch return error.OutOfMemory,
+                '\\' => try result.append(allocator, '\\'),
+                '"' => try result.append(allocator, '"'),
+                'n' => try result.append(allocator, '\n'),
+                't' => try result.append(allocator, '\t'),
                 else => return error.InvalidEscape,
             }
         } else {
-            result.append(allocator, c) catch return error.OutOfMemory;
+            try result.append(allocator, c);
         }
         i += 1;
     }
@@ -290,7 +290,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
 
     if (inner.len == 0) {
         // Empty array
-        const empty = allocator.alloc([]const u8, 0) catch return error.OutOfMemory;
+        const empty = try allocator.alloc([]const u8, 0);
         return .{ .string_array = empty };
     }
 
@@ -323,7 +323,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
                 end += 1;
             }
             const str = try parseString(allocator, inner[pos..end]);
-            items.append(allocator, str) catch return error.OutOfMemory;
+            try items.append(allocator, str);
             pos = end;
         } else {
             return error.InvalidSyntax; // Only string arrays supported
@@ -334,7 +334,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
         if (pos < inner.len and inner[pos] == ',') pos += 1;
     }
 
-    const result = allocator.dupe([]const u8, items.items) catch return error.OutOfMemory;
+    const result = try allocator.dupe([]const u8, items.items);
     // Clear items without freeing strings (ownership transferred)
     items.items.len = 0;
     return .{ .string_array = result };

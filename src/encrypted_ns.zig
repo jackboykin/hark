@@ -3,7 +3,6 @@ const monotonic = @import("monotonic.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const na = @import("net_address.zig");
-const posix = std.posix;
 const AddressKey = na.AddressKey;
 const BumpGatedGroup = @import("bg_group.zig");
 
@@ -184,60 +183,52 @@ test "EncryptedNsCache setStatus capable, getStatus" {
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 }
 
+// Injectable test clock; each test resets it at entry (cf. cache.zig testNowSeconds).
+var en_test_now: i64 = 100_000;
+fn enTestNow() i64 {
+    return en_test_now;
+}
+
 test "EncryptedNsCache failed with damping" {
-    var fake_time: i64 = 100_000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    en_test_now = 100_000;
 
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    cache.now_fn = &now_fn.now;
+    cache.now_fn = &enTestNow;
     defer cache.deinit();
 
     const key = makeKey(.{ 8, 8, 8, 8 });
     cache.setStatus(key, .failed);
 
     // Within damping window — should be failed
-    fake_time = 100_000 + damping_sec - 1;
+    en_test_now = 100_000 + damping_sec - 1;
     try testing.expectEqual(ServerStatus.failed, cache.getStatus(key));
 
     // Past damping window — should revert to unknown
-    fake_time = 100_000 + damping_sec;
+    en_test_now = 100_000 + damping_sec;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
 test "EncryptedNsCache soft_failed uses shorter damping" {
-    var fake_time: i64 = 100_000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    en_test_now = 100_000;
 
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    cache.now_fn = &now_fn.now;
+    cache.now_fn = &enTestNow;
     defer cache.deinit();
 
     const key = makeKey(.{ 8, 8, 4, 4 });
     cache.setStatus(key, .soft_failed);
 
     // Within soft-damping window — should report soft_failed.
-    fake_time = 100_000 + soft_damping_sec - 1;
+    en_test_now = 100_000 + soft_damping_sec - 1;
     try testing.expectEqual(ServerStatus.soft_failed, cache.getStatus(key));
 
     // Past soft-damping window — reverts to unknown so a retry can fire.
-    fake_time = 100_000 + soft_damping_sec;
+    en_test_now = 100_000 + soft_damping_sec;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 
     // Crucially, the soft window is much shorter than the hard one — a
     // soft-failed entry must not still be damped at the hard threshold.
-    fake_time = 100_000 + damping_sec - 1;
+    en_test_now = 100_000 + damping_sec - 1;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
@@ -256,28 +247,21 @@ test "EncryptedNsCache claimProbe dedup" {
 }
 
 test "EncryptedNsCache claimProbe respects damping" {
-    var fake_time: i64 = 100_000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    en_test_now = 100_000;
 
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    cache.now_fn = &now_fn.now;
+    cache.now_fn = &enTestNow;
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 0, 0, 1 });
     cache.setStatus(key, .failed);
 
     // Within damping — claim should fail
-    fake_time = 100_000 + damping_sec - 1;
+    en_test_now = 100_000 + damping_sec - 1;
     try testing.expect(!cache.claimProbe(key));
 
     // Past damping — claim should succeed
-    fake_time = 100_000 + damping_sec;
+    en_test_now = 100_000 + damping_sec;
     try testing.expect(cache.claimProbe(key));
 }
 
@@ -304,31 +288,24 @@ test "EncryptedNsCache capable after failed" {
 }
 
 test "EncryptedNsCache capable expires after persistence_sec" {
-    var fake_time: i64 = 100_000;
-    const now_fn = struct {
-        var time_ptr: *i64 = undefined;
-        fn now() i64 {
-            return time_ptr.*;
-        }
-    };
-    now_fn.time_ptr = &fake_time;
+    en_test_now = 100_000;
 
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
-    cache.now_fn = &now_fn.now;
+    cache.now_fn = &enTestNow;
     defer cache.deinit();
 
     const key = makeKey(.{ 1, 1, 1, 1 });
     cache.setStatus(key, .capable);
 
     // Within persistence window — should be capable
-    fake_time = 100_000 + persistence_sec - 1;
+    en_test_now = 100_000 + persistence_sec - 1;
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 
     // Should not re-probe within window
     try testing.expect(!cache.claimProbe(key));
 
     // Past persistence window — should revert to unknown
-    fake_time = 100_000 + persistence_sec;
+    en_test_now = 100_000 + persistence_sec;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 
     // Should allow re-probing

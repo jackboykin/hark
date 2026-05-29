@@ -1,7 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
-const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 
 const Sha1 = std.crypto.hash.Sha1;
@@ -188,7 +187,9 @@ pub fn validateDnskeyRrset(
         }
         if (findMatchingDnskey(ds, dnskey_records, zone_name, tags)) |ksk_match| {
             const ksk = ksk_match.dnskey;
-            const ksk_tag = tags[ksk_match.index];
+            // findMatchingDnskey indexes the unfiltered dnskey_records, which may
+            // be longer than the 64-entry tag cache; recompute past the window.
+            const ksk_tag = if (ksk_match.index < tags.len) tags[ksk_match.index] else keyTag(ksk);
             // Try every RRSIG covering DNSKEY
             for (dnskey_records) |rrsig_rr| {
                 if (rrsig_rr.rtype != .rrsig) continue;
@@ -232,8 +233,13 @@ fn isInsecureDelegationProof(type_bit_maps: []const u8) bool {
         !dns.typeBitmapContains(type_bit_maps, .soa);
 }
 
-/// Check if a referral has DS records proving the child is signed,
-/// or NSEC/NSEC3 records proving DS absence (insecure delegation).
+/// Classify a child-zone delegation from the parent's authority section:
+/// DS present, or NSEC/NSEC3 proving no DS (insecure), or neither.
+///
+/// `.secure` here does NOT mean "validated": it means "treat as signed,
+/// proceed to DNSKEY/DS validation" — and an unsigned-but-unproven delegation
+/// also returns `.secure`, so the validator (recursive.zig) fails closed to
+/// SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation.
 pub fn classifyDelegation(
     authorities: []const dns.ResourceRecord,
     child_zone: dns.Name,
@@ -384,27 +390,23 @@ pub fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) Ve
 
     const data = wire_buf[0..pos];
 
-    switch (ds.digest_type) {
-        .sha1 => {
-            if (ds.digest.len != Sha1.digest_length) return error.InvalidSignature;
-            var hash: [Sha1.digest_length]u8 = undefined;
-            Sha1.hash(data, &hash, .{});
-            if (!mem.eql(u8, &hash, ds.digest)) return error.InvalidSignature;
-        },
-        .sha256 => {
-            if (ds.digest.len != Sha256.digest_length) return error.InvalidSignature;
-            var hash: [Sha256.digest_length]u8 = undefined;
-            Sha256.hash(data, &hash, .{});
-            if (!mem.eql(u8, &hash, ds.digest)) return error.InvalidSignature;
-        },
-        .sha384 => {
-            if (ds.digest.len != Sha384.digest_length) return error.InvalidSignature;
-            var hash: [Sha384.digest_length]u8 = undefined;
-            Sha384.hash(data, &hash, .{});
-            if (!mem.eql(u8, &hash, ds.digest)) return error.InvalidSignature;
-        },
+    const ok = switch (ds.digest_type) {
+        .sha1 => verifyDigest(Sha1, data, ds.digest),
+        .sha256 => verifyDigest(Sha256, data, ds.digest),
+        .sha384 => verifyDigest(Sha384, data, ds.digest),
         _ => return error.UnsupportedAlgorithm,
-    }
+    };
+    if (!ok) return error.InvalidSignature;
+}
+
+/// Fixed-shape digest check: the expected length must match the hash and the
+/// hash of `data` must equal `expected`. Either mismatch yields false — the
+/// caller maps that to InvalidSignature, preserving verifyDs's semantics.
+fn verifyDigest(comptime Hash: type, data: []const u8, expected: []const u8) bool {
+    if (expected.len != Hash.digest_length) return false;
+    var hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(data, &hash, .{});
+    return mem.eql(u8, &hash, expected);
 }
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
@@ -513,6 +515,10 @@ pub fn buildSignedData(
 /// Write canonical RDATA per RFC 4034 §6.2.
 /// For types with embedded names (NS, CNAME, SOA, PTR, MX, RRSIG, NSEC),
 /// the names are lowercased. Other types are written as-is.
+///
+/// Separate from `dns.Serializer.writeRData` (canonical/lowercased, not wire).
+/// Any new name-bearing RData arm MUST add a lowercasing arm here, or the
+/// fallback mis-canonicalizes its embedded name and DNSSEC validation breaks.
 fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize {
     switch (rdata) {
         .ns => |name| return writeCanonicalNameWire(buf, name),
@@ -1279,6 +1285,36 @@ fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     };
 }
 
+/// Try every DNSKEY whose tag and algorithm match `rrsig`; true if any verifies
+/// `rrset`. Shared by the answer-side and authority-side validators so the
+/// key-matching rule has one home.
+fn rrsetVerifiesWithAnyKey(
+    rrsig: dns.RrsigData,
+    dnskey_records: []const dns.ResourceRecord,
+    rrset: []const dns.ResourceRecord,
+    now_u32: u32,
+    budget: ?*ValidationBudget,
+) error{ValidationBudgetExhausted}!bool {
+    for (dnskey_records) |dk_rr| {
+        if (dk_rr.rtype != .dnskey) continue;
+        const dk = dk_rr.rdata.dnskey;
+        if (!isValidZoneKey(dk)) continue;
+        if (keyTag(dk) != rrsig.key_tag) continue;
+        if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+        if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
+    }
+    return false;
+}
+
+/// RFC 6840 §5.11 anti-downgrade verdict when no signature verified: only
+/// all-unsupported-algos is .insecure; a failed supported attempt (or nothing
+/// attempted) is .bogus, so an injected unsupported RRSIG can't launder a
+/// failure to .insecure. Shared by both validators so the rule can't drift.
+fn launderingVerdict(attempted_supported: bool, had_unsupported_algo: bool) SecurityStatus {
+    if (attempted_supported) return .bogus;
+    return if (had_unsupported_algo) .insecure else .bogus;
+}
+
 /// Validate a single RRset type within the answers against DNSKEYs.
 /// Iterates ALL RRSIGs covering the target type per RFC 6840 §5.11.
 fn validateRrsetForType(
@@ -1316,20 +1352,9 @@ fn validateRrsetForType(
         if (count == 0) continue;
 
         // Try ALL matching DNSKEYs (key_tag + algorithm)
-        for (dnskey_records) |dk_rr| {
-            if (dk_rr.rtype != .dnskey) continue;
-            const dk = dk_rr.rdata.dnskey;
-            if (!isValidZoneKey(dk)) continue;
-            if (keyTag(dk) != rrsig.key_tag) continue;
-            if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
-            if (tryVerifyRrsig(rrsig, dk, filtered[0..count], now_u32, budget) catch return .bogus) return .secure;
-        }
+        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return .bogus) return .secure;
     }
-    // RFC 6840 §5.11: all-unsupported → .insecure. But a supported-algo
-    // attempt that failed must yield .bogus, not .insecure, or attackers
-    // launder failures via injected unsupported-algo RRSIGs.
-    if (attempted_supported) return .bogus;
-    return if (had_unsupported_algo) .insecure else .bogus;
+    return launderingVerdict(attempted_supported, had_unsupported_algo);
 }
 
 // ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
@@ -1377,26 +1402,20 @@ pub fn verifyAuthorityNsecSigs(
 
             attempted_supported = true;
 
-            for (dnskey_records) |dk_rr| {
-                if (dk_rr.rtype != .dnskey) continue;
-                const dk = dk_rr.rdata.dnskey;
-                if (!isValidZoneKey(dk)) continue;
-                if (keyTag(dk) != rrsig.key_tag) continue;
-                if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
-                if (tryVerifyRrsig(rrsig, dk, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
-                    sig_verified = true;
-                    break;
-                }
+            if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
+                sig_verified = true;
+                break;
             }
-            if (sig_verified) break;
         }
         if (!sig_verified) {
-            // RFC 4035 §5.3: every NSEC owner must verify. .insecure only
-            // when every supported-algo path was unavailable; otherwise
-            // bogus. See validateRrsetForType for the laundering rationale.
-            if (attempted_supported) return .bogus;
-            if (!had_unsupported_algo) return .bogus;
-            any_unsupported = true;
+            // RFC 4035 §5.3: every NSEC owner must verify; fall back to the
+            // shared §5.11 anti-downgrade verdict (.bogus aborts the whole
+            // proof, .insecure means this owner had only unsupported algos).
+            switch (launderingVerdict(attempted_supported, had_unsupported_algo)) {
+                .bogus => return .bogus,
+                .insecure => any_unsupported = true,
+                else => unreachable,
+            }
         }
     }
 
@@ -1484,6 +1503,10 @@ test "canonical name wire format" {
 
 /// Compute SHA-256 DS digest for a DNSKEY: SHA-256(canonical_owner_wire || DNSKEY_RDATA).
 fn testDsDigest(owner: dns.Name, dnskey: dns.DnskeyData) ![Sha256.digest_length]u8 {
+    return testDsDigestWith(Sha256, owner, dnskey);
+}
+
+fn testDsDigestWith(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) ![Hash.digest_length]u8 {
     var wire_buf: [1024]u8 = undefined;
     const name_len = try writeCanonicalNameWire(&wire_buf, owner);
     var pos = name_len;
@@ -1495,8 +1518,8 @@ fn testDsDigest(owner: dns.Name, dnskey: dns.DnskeyData) ![Sha256.digest_length]
     pos += 1;
     @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
     pos += dnskey.public_key.len;
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(wire_buf[0..pos], &digest, .{});
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(wire_buf[0..pos], &digest, .{});
     return digest;
 }
 
@@ -1527,6 +1550,26 @@ test "DS hash verification - synthetic" {
     try verifyDs(ds, test_dnskey, test_owner);
 }
 
+test "DS hash verification - sha1 and sha384 digest types" {
+    // verifyDs's three digest arms collapse to one comptime helper; exercise
+    // the sha1 and sha384 instantiations (only sha256 was covered above).
+    const d1 = try testDsDigestWith(Sha1, test_owner, test_dnskey);
+    try verifyDs(.{
+        .key_tag = keyTag(test_dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha1,
+        .digest = &d1,
+    }, test_dnskey, test_owner);
+
+    const d384 = try testDsDigestWith(Sha384, test_owner, test_dnskey);
+    try verifyDs(.{
+        .key_tag = keyTag(test_dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha384,
+        .digest = &d384,
+    }, test_dnskey, test_owner);
+}
+
 test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     // RFC 4035 §5.2: stripped RRSIG on DNSKEY must not bypass validation.
     var digest = try testDsDigest(test_owner, test_dnskey);
@@ -1550,6 +1593,39 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     try testing.expectError(
         error.InvalidSignature,
         validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, null),
+    );
+}
+
+test "validateDnskeyRrset tolerates a DS match past the 64-key tag window" {
+    // A hostile zone can serve >64 DNSKEYs over TCP. findMatchingDnskey indexes
+    // the unfiltered record slice, so the matched key can sit past the clamped
+    // 64-entry tag cache — the index must not read tags[] out of bounds.
+    var digest = try testDsDigest(test_owner, test_dnskey);
+    const ds = dns.DsData{
+        .key_tag = keyTag(test_dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha256,
+        .digest = &digest,
+    };
+
+    // Distinct-tag filler keys occupy the whole tag window; the DS-matching key
+    // lands at index 64, exactly one past it.
+    const filler = dns.DnskeyData{
+        .flags = 257,
+        .protocol = 3,
+        .algorithm = .rsasha256,
+        .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44 },
+    };
+    try testing.expect(keyTag(filler) != ds.key_tag);
+
+    var records: [65]dns.ResourceRecord = undefined;
+    for (records[0..64]) |*r| r.* = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = filler } };
+    records[64] = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
+
+    // No RRSIG present, so validation must reject cleanly rather than panic.
+    try testing.expectError(
+        error.InvalidSignature,
+        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, null),
     );
 }
 
