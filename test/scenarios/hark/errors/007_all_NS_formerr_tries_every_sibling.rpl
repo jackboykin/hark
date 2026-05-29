@@ -1,0 +1,117 @@
+; hark: root-hints = 127.0.10.1
+; hark: stagger-ms = 0
+
+SCENARIO_BEGIN FORMERR from every NS is tried before surfacing (RFC 1034 §4.3.5)
+
+; Both authoritative servers for example.com FORMERR the leaf. Hark must try
+; BOTH (the FORMERR sibling-fallthrough path, recursive.zig server_loop) before
+; surfacing FORMERR to the stub. On code that does NOT treat FORMERR as a
+; fallthrough signal, only the first-picked NS is queried — so the second
+; QUERY_LOG row below is absent and STEP 3 fails. That is the deterministic
+; teeth this scenario provides (006 covers the happy-path recovery; cold NS
+; selection is randomized, so a two-NS *recovery* test has order-dependent
+; teeth — this all-fail variant queries both NSes regardless of order).
+;
+; `stagger-ms = 0` forces the sequential server loop so exactly one NS is tried
+; per FORMERR hop, making the query-log count deterministic. Companion to 003
+; (sole NS) and 006; see multi_NS_fallthrough.divergence.md.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority: delegates example.com to TWO NSes ─────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns1.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+    SECTION ADDITIONAL
+      ns1.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── ns1.example.com: NOERROR on the QMIN probe, FORMERR on the leaf ─
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ── ns2.example.com: same — NOERROR probe, FORMERR leaf ────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Both NSes FORMERR, so hark exhausts and surfaces the last FORMERR.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA FORMERR
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Teeth: the leaf must have been queried at BOTH NSes (presence-only, so
+; order-independent). Code that doesn't fall through on FORMERR queries only
+; the first-picked NS, leaving one row absent.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    www.example.com. A 127.0.10.3
+    www.example.com. A 127.0.10.4
+ENTRY_END
+
+SCENARIO_END

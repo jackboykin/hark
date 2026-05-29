@@ -1,0 +1,104 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN FORMERR from one of two NSes falls through to the second (RFC 1034 §4.3.5)
+
+; Two authoritative servers for example.com: ns1 returns FORMERR on the leaf
+; (the EDNS-hostile-auth / COOKIE-mangling-middlebox case), ns2 answers. Hark
+; must iterate to ns2 rather than propagate ns1's FORMERR to the stub. This is
+; the multi-NS companion to 003 (sole-NS FORMERR surfaces) and mirrors the
+; SERVFAIL/REFUSED fallthrough in 004/005.
+;
+; Companion divergence note: multi_NS_fallthrough.divergence.md
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority: delegates example.com to TWO NSes ─────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns1.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+    SECTION ADDITIONAL
+      ns1.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── ns1.example.com: FORMERRs the leaf ─────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ── ns2.example.com: answers the leaf ──────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END

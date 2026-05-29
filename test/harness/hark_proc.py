@@ -28,6 +28,9 @@ class HarkConfig:
     dnssec: bool = False
     cache_min_ttl: int = 0
     minimal_responses: bool = True
+    # NS-racing stagger in ms; None = hark default (150). 0 disables the
+    # staggered race, forcing the deterministic sequential server loop.
+    stagger_ms: int | None = None
     # Each entry is a `"<key-tag> <alg> <dtype> <hex>"` string fed to
     # hark's test-only `[resolver] trust-anchors = [...]` knob. Implies
     # `dnssec = true`; conftest enforces that pairing.
@@ -65,6 +68,8 @@ class HarkConfig:
             f"upstream-port = {self.upstream_port}",
             "allow-loopback-upstreams = true",
         ]
+        if self.stagger_ms is not None:
+            lines.append(f"stagger-ms = {self.stagger_ms}")
         if self.root_hints:
             hints = ", ".join(f'"{h}"' for h in self.root_hints)
             lines.append(f"root-hints = [{hints}]")

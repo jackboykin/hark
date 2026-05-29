@@ -122,6 +122,8 @@ def run_scenario(path: Path, lift: bool = False) -> None:
         cfg.qname_minimization = scenario.qname_minimization
     if scenario.minimal_responses is not None:
         cfg.minimal_responses = scenario.minimal_responses
+    if scenario.stagger_ms is not None:
+        cfg.stagger_ms = scenario.stagger_ms
     if scenario.rebinding_enabled is not None:
         cfg.rebinding_enabled = scenario.rebinding_enabled
     if scenario.rebinding_allow_zones:

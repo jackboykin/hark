@@ -1575,8 +1575,9 @@ pub const RecursiveResolver = struct {
         // RFC 1034 §4.3.5 lame-NS fallthrough. The sequential server_loop
         // handles this via `last_server_failure`, but the race path returns
         // first-by-latency — so a fast-failing NS would propagate verbatim
-        // without this check. Score and bail to sequential.
-        if (resp.header.flags.rcode.isServerError()) {
+        // without this check. Score and bail to sequential. FORMERR counts
+        // (an EDNS-hostile auth shouldn't condemn the zone — try a sibling).
+        if (resp.header.flags.rcode.shouldTrySiblingNs()) {
             if (self.ns_selector) |ns|
                 ns.recordOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
             return null;
@@ -1745,8 +1746,10 @@ pub const RecursiveResolver = struct {
                 }
 
                 // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
+                // FORMERR too (RFC 1034 §4.3.5): one parse-hostile NS must not
+                // condemn a zone its siblings can still serve.
                 // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
-                if (response.header.flags.rcode.isServerError()) {
+                if (response.header.flags.rcode.shouldTrySiblingNs()) {
                     if (self.ns_selector) |ns|
                         ns.recordOutcome(parent_zone, server, .server_error, do53_elapsed);
                     last_server_failure = response;

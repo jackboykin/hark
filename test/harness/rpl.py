@@ -180,6 +180,10 @@ class Scenario:
     rebinding_allow_zones: list[str] = dataclasses.field(default_factory=list)
     rebinding_extra_block: list[str] = dataclasses.field(default_factory=list)
     rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
+    # NS-racing stagger override (ms). `; hark: stagger-ms = 0` forces the
+    # deterministic sequential server loop so a fallthrough scenario can pin a
+    # specific NS-failure order. None = harness/hark default.
+    stagger_ms: int | None = None
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -247,6 +251,8 @@ class _Parser:
             self.scenario.rebinding_extra_block.append(val.strip())
         elif key == "rebinding-extra-allow":
             self.scenario.rebinding_extra_allow.append(val.strip())
+        elif key == "stagger-ms":
+            self.scenario.stagger_ms = int(val.strip())
         elif key == "dnssec-zone":
             # Canonicalize: lowercase, ensure trailing dot. Multiple
             # directives accumulate; same value collapses (idempotent).
