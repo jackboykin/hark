@@ -68,13 +68,23 @@ pub const root_hints_default: [26]na.Address = .{
 };
 
 // Per-resolveImpl-call ceiling on calls to queryAuthoritativeServers.
-// The single network-touching counter — same-zone CNAME continuations,
+// Resets on every sub-resolution and CNAME hop — it bounds a single name's
+// resolution, NOT the whole tree (that is `max_global_queries`, below).
+// Analogous to BIND's `max-recursion-queries`. Same-zone CNAME continuations,
 // QMIN cache-hit advances, and other zero-I/O loop iterations cost zero
-// against this. Bounded by `max_resolve_depth` × this value across the
-// full call tree (sub-recursions for NS A/AAAA + DNSKEY get their own
-// budget). Picked to clear an 8-hop CDN chain (`ba.dn.nexoncdn.co.kr`)
+// against this. Picked to clear an 8-hop CDN chain (`ba.dn.nexoncdn.co.kr`)
 // observed at ~9 queries with comfortable headroom for DNSSEC retries.
 const max_upstream_queries = 32;
+// Tree-wide ceiling on upstream queries for one client-facing resolution,
+// shared by pointer across every sub-resolution (glueless NS-address fetches,
+// DNSKEY/DS chases) and never reset on CNAME — the counter `max_upstream_queries`
+// is not. Without it, NXNSAttack (CVE-2020-12667) glueless-NS fan-out hands
+// each depth+1 sub-resolution a fresh `max_upstream_queries` budget, amplifying
+// one client query into hundreds of upstream queries. Mirrors Unbound's
+// `max-global-quota` (200) and BIND's `max-query-count` (200); set tighter
+// because hark already caps delegation depth at 3 and NS fan-out at 3/2/1,
+// so a legitimate cold-cache DNSSEC + QMIN resolution stays well under this.
+const max_global_queries = 100;
 // Sizes `seen_zones` and bounds the per-cross-zone-walk delegation count.
 // Real DNS depth tops out around 5; 16 covers QMIN-with-referrals stacks
 // without giving up loop-detection.
@@ -125,6 +135,32 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 }
 
 // ── RecursiveResolver ──────────────────────────────────────────────────
+
+/// Tree-wide outbound-query budget for one client-facing resolution.
+///
+/// Lives on the stack of `resolve()` and is shared *by pointer* across the
+/// entire resolution tree — `cloneForThread` copies the pointer (it does NOT
+/// reset it the way it resets `validation_budget`), so the concurrent
+/// NS-address fan-out helpers all draw from the same counter. The atomic makes
+/// that race-free.
+///
+/// This is the structural defense against NXNSAttack (CVE-2020-12667): the
+/// per-call `max_upstream_queries` counter resets on every `resolveImpl`
+/// sub-call, so glueless-NS fan-out would otherwise grant unbounded total
+/// work. Mirrors Unbound's refcounted `target_count[GLOBAL_QUOTA]` and BIND's
+/// `max-query-count`. Never reset mid-resolution (BIND's bug #4741 was a
+/// per-name counter that reset on CNAME — useless against a redirect chain).
+pub const QueryBudget = struct {
+    spent: std.atomic.Value(u32) = .init(0),
+    max: u32 = max_global_queries,
+
+    /// Reserve one upstream query. Returns the error once the ceiling is hit;
+    /// callers propagate it and the server maps it to SERVFAIL.
+    fn consume(self: *QueryBudget) error{GlobalQueryBudgetExhausted}!void {
+        if (self.spent.fetchAdd(1, .monotonic) >= self.max)
+            return error.GlobalQueryBudgetExhausted;
+    }
+};
 
 pub const RecursiveResolver = struct {
     /// `null` IFF `cache_only` — the type-level invariant lets the resolver
@@ -191,6 +227,12 @@ pub const RecursiveResolver = struct {
     /// Per-resolution DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes). Reset
     /// at every `resolve()` entry so it bounds work for one user-facing query.
     validation_budget: dnssec.ValidationBudget = .{},
+
+    /// Tree-wide upstream-query budget for the in-flight client query. Points
+    /// at a `QueryBudget` on `resolve()`'s stack; shared (not reset) across
+    /// `cloneForThread` so fan-out helpers draw from the same ceiling. null
+    /// outside an active `resolve()` (e.g. cache-only unit tests).
+    query_budget: ?*QueryBudget = null,
 
     /// Stable inputs that come from the surrounding Server / WorkerState.
     /// Both server-side construction sites build one of these and call
@@ -263,7 +305,16 @@ pub const RecursiveResolver = struct {
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
         resolver.validation_budget = .{};
+        // query_budget is intentionally NOT reset: fan-out helpers must share
+        // the parent's tree-wide ceiling, or NXNS amplification reappears one
+        // clone at a time. The counter is atomic, so concurrent draws are safe.
         return resolver;
+    }
+
+    /// Charge one upstream query against the tree-wide budget. No-op when
+    /// unset (cache-only paths and unit tests run without a budget).
+    fn consumeQuery(self: *RecursiveResolver) error{GlobalQueryBudgetExhausted}!void {
+        if (self.query_budget) |qb| try qb.consume();
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -300,6 +351,12 @@ pub const RecursiveResolver = struct {
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         self.validation_budget = .{};
+        // One budget per client query, shared by pointer through the whole
+        // resolution tree (incl. fan-out clones). Stack-scoped: every helper
+        // thread is joined before this frame returns, so the pointer stays live.
+        var query_budget: QueryBudget = .{};
+        self.query_budget = &query_budget;
+        defer self.query_budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
         result.cousin_prefetch_qtype = switch (qtype) {
@@ -447,6 +504,7 @@ pub const RecursiveResolver = struct {
                 }
 
                 if (upstream_queries >= max_upstream_queries) return error.MaxQueriesExceeded;
+                try self.consumeQuery();
                 upstream_queries += 1;
                 const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, &servers, server_count, parent_zone);
                 var response = sqr.message;
@@ -1939,6 +1997,10 @@ pub const RecursiveResolver = struct {
             if (self.rtt_cache) |rc| {
                 if (rc.isDead(addr_key, now_ms) and i + 1 < try_count) continue;
             }
+
+            // DS/DNSKEY fetches are upstream packets too; draw from the same
+            // tree-wide budget so a signed-zone variant can't sidestep it.
+            try self.consumeQuery();
 
             var case_rng = self.caseRng(addr_key);
             retry: while (true) {
@@ -3864,6 +3926,20 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     const parent_zone = dns.Name{ .labels = &.{} };
     const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, &servers, 1, parent_zone);
     try testing.expectError(error.CacheOnlyMiss, result);
+}
+
+// ── QueryBudget: tree-wide NXNS guard ─────────────────────────────────
+
+test "QueryBudget.consume permits exactly max draws then refuses" {
+    var budget: QueryBudget = .{ .max = 5 };
+    for (0..5) |_| try budget.consume();
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consume());
+    // Stays refused once exhausted — the counter never resets mid-resolution
+    // (the property that makes it NXNS-proof; cf. BIND #4741). The shared-by-
+    // pointer-across-cloneForThread invariant is guarded end-to-end by
+    // test/harness/test_nxns_amplification.py, not here — a unit test can only
+    // restate Zig's value-copy semantics, which is not the thing that breaks.
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consume());
 }
 
 fn concatRRsOomProbe(allocator: mem.Allocator, _: void) !void {

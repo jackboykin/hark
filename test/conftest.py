@@ -205,6 +205,16 @@ def _run_steps(
                 client.assert_query_log_matches(resp.query_log, step.entry)
             except AssertionError as e:
                 raise _step_failure(path, step.n, str(e), resp, proc) from None
+        elif step.kind == "CHECK_MAX_QUERIES":
+            assert step.max_queries is not None
+            sent = len(resp.query_log)
+            if sent > step.max_queries:
+                raise _step_failure(
+                    path, step.n,
+                    f"CHECK_MAX_QUERIES: resolver sent {sent} upstream queries, "
+                    f"bound is {step.max_queries} (NXNSAttack amplification?)",
+                    resp, proc,
+                )
         elif step.kind == "CHECK_OUT_QUERY":
             # Strictly positional, distinct from CHECK_QUERY_LOG's set-style check.
             assert step.entry is not None

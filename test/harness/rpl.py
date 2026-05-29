@@ -9,7 +9,7 @@ Reference: https://github.com/NLnetLabs/unbound/blob/master/testcode/testbound.c
 Step kinds split into *actions* (do something to the system under test) and
 *assertions* (CHECK_* — observe and verify):
   actions     — QUERY, TIME_PASSES, TIMEOUT
-  assertions  — CHECK_ANSWER, CHECK_QUERY_LOG, CHECK_OUT_QUERY
+  assertions  — CHECK_ANSWER, CHECK_QUERY_LOG, CHECK_OUT_QUERY, CHECK_MAX_QUERIES
 
 `TIMEOUT` is a responder-side directive disguised as a step: it pre-positions
 a "drop the next incoming query" on the responder before the QUERY fires.
@@ -20,6 +20,7 @@ Hark-only extensions:
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
   - STEP n CHECK_OUT_QUERY                  positional upstream-query check
+  - STEP n CHECK_MAX_QUERIES <N>            assert <= N total upstream queries
   - SECTION QUERY_LOG                       `<qname> <qtype> [<dest>]` rows
   - MATCH UDP / MATCH TCP                   per-transport entry discrimination
 """
@@ -142,6 +143,8 @@ class Step:
     kind: str          # "QUERY" | "CHECK_ANSWER" | "CHECK_QUERY_LOG" | "TIME_PASSES"
     entry: Entry | None = None
     time_seconds: int = 0
+    # CHECK_MAX_QUERIES: upper bound on total upstream queries logged so far.
+    max_queries: int | None = None
 
 
 @dataclasses.dataclass
@@ -346,6 +349,17 @@ class _Parser:
             # outgoing upstream query as if the auth had silently timed out.
             # No ENTRY block.
             return Step(n=n, kind=kind)
+
+        if kind == "CHECK_MAX_QUERIES":
+            # `STEP n CHECK_MAX_QUERIES <N>` — assert the resolver has emitted
+            # at most N upstream queries so far. The NXNSAttack regression
+            # guard. No ENTRY block.
+            if len(parts) != 4:
+                raise self.err("CHECK_MAX_QUERIES takes a single integer bound")
+            try:
+                return Step(n=n, kind=kind, max_queries=int(parts[3]))
+            except ValueError as e:
+                raise self.err(f"CHECK_MAX_QUERIES bound: {e}")
 
         # All remaining kinds wrap an ENTRY block.
         if self._next_line() != "ENTRY_BEGIN":

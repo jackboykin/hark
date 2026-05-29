@@ -1,0 +1,143 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN glueless NS fan-out resolves within the tree-wide query budget
+;
+; NXNSAttack (CVE-2020-12667) regression. A delegation listing several glueless
+; NS names forces the resolver to sub-resolve each NS address before it can ask
+; the child zone anything. The defense is `QueryBudget`
+; (src/recursive.zig:max_global_queries): one counter shared by pointer across
+; the whole resolution tree — including the concurrent NS-address fan-out
+; clones — and never reset on sub-resolution or CNAME.
+;
+; Before that counter, each `resolveImpl(depth+1)` got a fresh
+; `max_upstream_queries` budget, so glueless fan-out amplified one client query
+; into hundreds of upstream queries.
+;
+; This scenario is the *economy* guard: a benign glueless two-NS delegation
+; resolves in a handful of upstream queries (measured 15), and
+; CHECK_MAX_QUERIES pins that. It catches gross over-querying — broken per-depth
+; NS-fetch caps, lost dedup, a re-resolution loop. It does NOT by itself reach
+; the amplification scale that exercises the budget cap (that needs a deep tree
+; of unique glueless names — see test/harness/test_nxns_amplification.py, which
+; drives one client query into a ~500-node fan-out and asserts it stays
+; bounded). The two together cover the path end to end.
+;
+; Topology (avoids RFC 6761 special-use TLDs like .test/.example)
+;   root  127.0.10.1  delegates com. (-> .2) and org. (-> .3)
+;   com   127.0.10.2  refers svc.demo.com to TWO glueless NS under .org
+;   org   127.0.10.3  resolves the glueless NS addresses (-> .4)
+;   auth  127.0.10.4  authoritative for demo.com; serves the leaf answer
+
+; ── Root ───────────────────────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+
+  ; Glueless NS sub-resolutions (ns1.a.org, ns2.b.org) start at root.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.orgtld.fake.
+    SECTION ADDITIONAL
+      a.orgtld.fake. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── .com auth: glueless referral with two NS names (the NXNS shape) ─────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      svc.demo.com. IN A
+    SECTION AUTHORITY
+      svc.demo.com. 86400 IN NS ns1.a.org.
+      svc.demo.com. 86400 IN NS ns2.b.org.
+  ENTRY_END
+RANGE_END
+
+; ── .org auth: resolves both glueless NS names to the demo.com auth ─────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns1.a.org. IN A
+    SECTION ANSWER
+      ns1.a.org. 3600 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns2.b.org. IN A
+    SECTION ANSWER
+      ns2.b.org. 3600 IN A 127.0.10.4
+  ENTRY_END
+  ; AAAA probes for the NS names: authoritative NODATA so hark doesn't stall.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.org. IN AAAA
+    SECTION AUTHORITY
+      org. 3600 IN SOA a.orgtld.fake. hostmaster.org. 1 7200 3600 86400 300
+  ENTRY_END
+RANGE_END
+
+; ── demo.com auth: the leaf answer, once an NS address is in hand ──────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      svc.demo.com. IN A
+    SECTION ANSWER
+      svc.demo.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    svc.demo.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    svc.demo.com. IN A
+  SECTION ANSWER
+    svc.demo.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+; Measured 15 with QMIN on; 25 leaves headroom for probe-interleaving variance
+; while staying an order of magnitude below any fan-out blow-up.
+STEP 3 CHECK_MAX_QUERIES 25
+
+SCENARIO_END
