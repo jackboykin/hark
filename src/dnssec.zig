@@ -33,26 +33,31 @@ const VerifyError = error{
 /// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per query. Sized for a
 /// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
 /// zones SERVFAIL during rollover windows.
-const max_sig_verify_per_resolution: u16 = 96;
+const max_sig_verify_per_resolution: u32 = 96;
 
-/// NSEC3 hash cap per query (CVE-2023-50868 plus salt-cache-defeat in
-/// `classifyDelegation`). Exhaustion fails open to `.insecure`. Each
-/// invocation is bounded to `max_nsec3_iterations` SHA-1 ops.
-const max_nsec3_hashes_per_resolution: u16 = 96;
+/// NSEC3 hash cap per query (CVE-2023-50868). Whole-query exhaustion fails
+/// CLOSED to `.bogus`; the per-record `max_nsec3_iterations` cap fails OPEN.
+const max_nsec3_hashes_per_resolution: u32 = 96;
 
-/// Per-resolution CPU counters; reset at the top of each `resolve()`.
+/// Per-query DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes), shared tree-wide
+/// by pointer across `cloneForThread` like `recursive.QueryBudget`. Atomic
+/// spent-up against a fixed ceiling: exactly `max` draws succeed then refuse
+/// forever — never re-arms (a `fetchSub` down-counter would wrap u32 and silently
+/// re-grant). Two separate counters so sig and NSEC3-hash exhaustion are independent.
 pub const ValidationBudget = struct {
-    sig_verify_remaining: u16 = max_sig_verify_per_resolution,
-    nsec3_hash_remaining: u16 = max_nsec3_hashes_per_resolution,
+    sig_verify_spent: std.atomic.Value(u32) = .init(0),
+    max_sig_verify: u32 = max_sig_verify_per_resolution,
+    nsec3_hash_spent: std.atomic.Value(u32) = .init(0),
+    max_nsec3_hash: u32 = max_nsec3_hashes_per_resolution,
 
     pub fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.sig_verify_remaining == 0) return error.ValidationBudgetExhausted;
-        self.sig_verify_remaining -= 1;
+        if (self.sig_verify_spent.fetchAdd(1, .monotonic) >= self.max_sig_verify)
+            return error.ValidationBudgetExhausted;
     }
 
     pub fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.nsec3_hash_remaining == 0) return error.ValidationBudgetExhausted;
-        self.nsec3_hash_remaining -= 1;
+        if (self.nsec3_hash_spent.fetchAdd(1, .monotonic) >= self.max_nsec3_hash)
+            return error.ValidationBudgetExhausted;
     }
 };
 
@@ -245,6 +250,8 @@ pub fn classifyDelegation(
 
     if (has_ds) return .secure;
 
+    if (nsec3Flood(authorities)) return .bogus;
+
     // No DS — check for NSEC/NSEC3 proof of DS absence.
     // All NSEC3 records in a response share the same salt/iterations (RFC 9276),
     // so the child zone hash can be computed once and reused across all records.
@@ -281,7 +288,7 @@ pub fn classifyDelegation(
                         break :blk h;
                 }
                 const new_hash = budgetedNsec3Hash(child_zone, nsec3.salt, nsec3.iterations, budget) catch |e| switch (e) {
-                    error.ValidationBudgetExhausted => return .insecure,
+                    error.ValidationBudgetExhausted => return .bogus,
                     error.HashFailed => continue,
                 };
                 cached_hash = new_hash;
@@ -845,11 +852,25 @@ pub fn nsecProvesTypeNonexistence(
 
 // ── NSEC3 Hashing (RFC 5155) ─────────────────────────────────────────
 
-/// Maximum allowed NSEC3 iterations. RFC 9276 §3.2 recommends treating any
-/// iteration count as a configuration smell; 100 is the modern BIND/Unbound
-/// soft ceiling above which proofs are downgraded to .insecure rather than
-/// burning hash budget.
-const max_nsec3_iterations: u16 = 100;
+/// Max NSEC3 iterations per record. >50 → .insecure (fail-open) rather than
+/// burning hash budget — the post-CVE-2023-50868 consensus (Knot/BIND/PowerDNS);
+/// RFC 9276 recommends 0. Honest signers use 0–20.
+const max_nsec3_iterations: u16 = 50;
+
+/// Per-proof NSEC3 record ceiling (Knot Resolver 5.7.1). An honest proof needs
+/// ≤3 (closest-encloser + next-closer + wildcard); more is the CVE-2023-50868
+/// flood shape, refused CLOSED to `.bogus` before any hashing.
+const max_nsec3_records_per_proof: usize = 8;
+
+/// True when an authority section holds more NSEC3 records than any honest proof
+/// needs — the flood shape. NSEC3-only count, so NSEC proofs are unaffected.
+fn nsec3Flood(authorities: []const dns.ResourceRecord) bool {
+    var n: usize = 0;
+    for (authorities) |rr| {
+        if (rr.rtype == .nsec3) n += 1;
+    }
+    return n > max_nsec3_records_per_proof;
+}
 
 /// Compute NSEC3 hash: iterated SHA-1 over canonical_name_wire || salt.
 /// Returns the raw hash bytes (20 bytes for SHA-1).
@@ -918,9 +939,8 @@ fn supportedNsec3OwnerHash(rr: dns.ResourceRecord) ?[Sha1.digest_length]u8 {
 
 const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
 
-/// Compute NSEC3 hash with per-resolution budget tracking. Callers map
-/// ValidationBudgetExhausted to .insecure (CVE-2023-50868 + salt-cache-defeat
-/// in `classifyDelegation`) and HashFailed to .bogus.
+/// Compute NSEC3 hash, charging the per-query budget. Callers map both
+/// ValidationBudgetExhausted (CVE-2023-50868, fail-closed) and HashFailed to .bogus.
 pub fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
@@ -929,13 +949,6 @@ pub fn budgetedNsec3Hash(
 ) BudgetedHashError![Sha1.digest_length]u8 {
     try budget.consumeNsec3Hash();
     return nsec3Hash(name, salt, iterations) catch return error.HashFailed;
-}
-
-fn budgetedHashStatus(e: BudgetedHashError) SecurityStatus {
-    return switch (e) {
-        error.ValidationBudgetExhausted => .insecure,
-        error.HashFailed => .bogus,
-    };
 }
 
 // ── Mixed NSEC/NSEC3 Detection ───────────────────────────────────────
@@ -1098,6 +1111,8 @@ fn validateNsec3NegativeProof(
     is_nxdomain: bool,
     budget: *ValidationBudget,
 ) SecurityStatus {
+    if (nsec3Flood(authorities)) return .bogus;
+
     // Extract NSEC3 parameters from first NSEC3 record
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
@@ -1130,8 +1145,7 @@ fn validateNsec3NegativeProof(
 
     // hash(qname) is needed by both the NODATA direct-match check and the CE
     // walk's label_offset==0 iteration; compute once.
-    const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch |e|
-        return budgetedHashStatus(e);
+    const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch return .bogus;
 
     // Direct NODATA at hash(qname) (RFC 5155 §8.5). Bitmap contradicting
     // NODATA → .bogus (mirrors NSEC arm).
@@ -1161,8 +1175,7 @@ fn validateNsec3NegativeProof(
             qname_hash
         else blk: {
             const ancestor = dns.Name{ .labels = qname.labels[label_offset..] };
-            break :blk budgetedNsec3Hash(ancestor, salt, iterations, budget) catch |e|
-                return budgetedHashStatus(e);
+            break :blk budgetedNsec3Hash(ancestor, salt, iterations, budget) catch return .bogus;
         };
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
@@ -1179,14 +1192,12 @@ fn validateNsec3NegativeProof(
     if (ce_offset == 0) return .bogus;
 
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch |e|
-        return budgetedHashStatus(e);
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
-    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch |e|
-        return budgetedHashStatus(e);
+    const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch return .bogus;
 
     // Wildcard step: covered (denial, §8.4) OR owner-match with qtype + CNAME
     // absent (§8.6). Owner-match with qtype/CNAME present → .bogus: the
@@ -2832,7 +2843,8 @@ test "classifyDelegation NSEC3 non-match" {
 
 test "NSEC3 hash budget exhaustion" {
     // CVE-2023-50868: a deep ancestor walk under a tight budget exhausts before
-    // the CE is found; the proof fails open to .insecure rather than burning CPU.
+    // the CE is found. Exhausting the whole-query budget is an attack signal, so
+    // the proof fails CLOSED to .bogus rather than degrading to insecure.
     const deep_labels: []const []const u8 = &.{
         "l00", "l01",     "l02", "l03", "l04", "l05", "l06", "l07",
         "l08", "l09",     "l10", "l11", "l12", "l13", "l14", "l15",
@@ -2850,12 +2862,12 @@ test "NSEC3 hash budget exhaustion" {
 
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    var b: ValidationBudget = .{ .nsec3_hash_remaining = 32 };
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, &b));
+    var b: ValidationBudget = .{ .max_nsec3_hash = 32 };
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
-    // Iterations > 150 → .insecure: validator opts out of expensive proof rather
+    // Iterations > 50 → .insecure: validator opts out of expensive proof rather
     // than burning CPU. classifyDelegation and validateNegativeProof both apply
     // this policy uniformly.
     const qname = dns.Name{
@@ -2866,7 +2878,7 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
     const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
     const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
 
-    // NSEC3 with iterations=200 (exceeds max_nsec3_iterations=150)
+    // NSEC3 with iterations=200 (exceeds max_nsec3_iterations=50)
     const authorities = [_]dns.ResourceRecord{.{
         .name = owner_name,
         .rtype = .nsec3,
@@ -2893,12 +2905,11 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
 }
 
 test "classifyDelegation salt-cache defeat exhausts NSEC3 budget" {
-    // Adversarial: stuff the authority section with NSEC3 records that all use
-    // unique salts. Each record forces a fresh nsec3Hash because the single-slot
-    // salt cache misses on every transition. Without the per-resolution budget
-    // this is unmetered CPU; with the budget the resolution returns .insecure
-    // once the cap is hit.
-    const N: usize = 32;
+    // Adversarial, within the per-proof record cap (≤8): NSEC3 records with
+    // unique salts each force a fresh nsec3Hash because the single-slot salt
+    // cache misses on every transition. With the per-resolution budget,
+    // exhausting it fails CLOSED to .bogus once the cap is hit.
+    const N: usize = 6;
     const child_zone = dns.Name{ .labels = &.{ "victim", "example", "com" } };
     const zone_labels: []const []const u8 = &.{ "example", "com" };
 
@@ -2927,9 +2938,33 @@ test "classifyDelegation salt-cache defeat exhausts NSEC3 budget" {
         };
     }
 
-    var b: ValidationBudget = .{ .nsec3_hash_remaining = 8 };
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&rrs, child_zone, &b));
-    try testing.expectEqual(@as(u16, 0), b.nsec3_hash_remaining);
+    var b: ValidationBudget = .{ .max_nsec3_hash = 4 };
+    try testing.expectEqual(SecurityStatus.bogus, classifyDelegation(&rrs, child_zone, &b));
+    try testing.expect(b.nsec3_hash_spent.load(.monotonic) >= 4);
+}
+
+test "refuses NSEC3 floods before hashing (Knot >8-record cap)" {
+    // >8 NSEC3 records is the flood shape: refused .bogus before any hashing, on
+    // both paths, so the hash budget is untouched (spent == 0).
+    const N: usize = max_nsec3_records_per_proof + 1;
+    const zone_labels: []const []const u8 = &.{ "example", "com" };
+    const salt: []const u8 = &.{};
+    const next_owner = [_]u8{0xFF} ** 20;
+
+    var bufs: [N]Nsec3OwnerBufs = undefined;
+    var rrs: [N]dns.ResourceRecord = undefined;
+    for (0..N) |i| {
+        bufs[i] = .{};
+        const owner = makeNsec3OwnerName([_]u8{@as(u8, @intCast(i ^ 0xA5))} ** 20, zone_labels, &bufs[i].enc, &bufs[i].labels);
+        rrs[i] = makeNsec3Rr(owner, salt, &next_owner, &.{});
+    }
+
+    var b: ValidationBudget = .{};
+    const child_zone = dns.Name{ .labels = &.{ "victim", "example", "com" } };
+    try testing.expectEqual(SecurityStatus.bogus, classifyDelegation(&rrs, child_zone, &b));
+    const qname = dns.Name{ .labels = &.{ "absent", "example", "com" } };
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&rrs, qname, .a, true, &b));
+    try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent.load(.monotonic));
 }
 
 test "NSEC3 budget accumulates across negative-proof calls" {
@@ -2945,12 +2980,12 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     const owner_name = makeNsec3OwnerName([_]u8{0x42} ** 20, zone_labels, &bufs.enc, &bufs.labels);
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &([_]u8{0x43} ** 20), &.{})};
 
-    var b: ValidationBudget = .{ .nsec3_hash_remaining = 2 };
+    var b: ValidationBudget = .{ .max_nsec3_hash = 2 };
     const first = validateNegativeProof(&authorities, qname, .a, false, &b);
     try testing.expectEqual(SecurityStatus.unchecked, first);
-    try testing.expectEqual(@as(u16, 0), b.nsec3_hash_remaining);
+    try testing.expectEqual(@as(u32, 2), b.nsec3_hash_spent.load(.monotonic));
     const second = validateNegativeProof(&authorities, qname, .a, false, &b);
-    try testing.expectEqual(SecurityStatus.insecure, second);
+    try testing.expectEqual(SecurityStatus.bogus, second);
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────
@@ -3034,7 +3069,7 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
 }
 
 test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
-    var budget: ValidationBudget = .{ .sig_verify_remaining = 2 };
+    var budget: ValidationBudget = .{ .max_sig_verify = 2 };
     // Each call charges one unit, even when later checks would reject (empty
     // key here trips InvalidKey). Two attempts deplete the budget.
     inline for (0..2) |_| {
@@ -3046,7 +3081,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
             &budget,
         ));
     }
-    try testing.expectEqual(@as(u16, 0), budget.sig_verify_remaining);
+    try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent.load(.monotonic));
     try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
         test_window_rrsig,
         test_window_dnskey,
@@ -3085,7 +3120,7 @@ test "validateRrsetForType propagates budget exhaustion as bogus" {
     const dnskeys = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
     };
-    var budget: ValidationBudget = .{ .sig_verify_remaining = 0 };
+    var budget: ValidationBudget = .{ .max_sig_verify = 0 };
     const status = validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget);
     try testing.expectEqual(SecurityStatus.bogus, status);
 }

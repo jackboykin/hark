@@ -139,8 +139,8 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 /// Tree-wide outbound-query budget for one client-facing resolution.
 ///
 /// Lives on the stack of `resolve()` and is shared *by pointer* across the
-/// entire resolution tree — `cloneForThread` copies the pointer (it does NOT
-/// reset it the way it resets `validation_budget`), so the concurrent
+/// entire resolution tree — `cloneForThread` copies the pointer and never
+/// resets it (exactly as it now treats `validation_budget`), so the concurrent
 /// NS-address fan-out helpers all draw from the same counter. The atomic makes
 /// that race-free.
 ///
@@ -224,9 +224,11 @@ pub const RecursiveResolver = struct {
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
-    /// Per-resolution DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes). Reset
-    /// at every `resolve()` entry so it bounds work for one user-facing query.
-    validation_budget: dnssec.ValidationBudget = .{},
+    /// Tree-wide DNSSEC CPU budget for the in-flight query — a `dnssec.ValidationBudget`
+    /// on `resolve()`'s stack, shared (not reset) across `cloneForThread` so the fan-out
+    /// can't multiply the KeyTrap/NSEC3 ceilings. null outside `resolve()` (cache-only +
+    /// unit tests, both crypto-free). Mirrors `query_budget`.
+    validation_budget: ?*dnssec.ValidationBudget = null,
 
     /// Tree-wide upstream-query budget for the in-flight client query. Points
     /// at a `QueryBudget` on `resolve()`'s stack; shared (not reset) across
@@ -304,10 +306,9 @@ pub const RecursiveResolver = struct {
         resolver.gpa = null;
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
-        resolver.validation_budget = .{};
-        // query_budget is intentionally NOT reset: fan-out helpers must share
-        // the parent's tree-wide ceiling, or NXNS amplification reappears one
-        // clone at a time. The counter is atomic, so concurrent draws are safe.
+        // Neither budget is reset: `self.*` copies the pointers, so clones share the
+        // parent's counters. Resetting either re-opens fan-out amplification (NXNS /
+        // KeyTrap). Both are atomic, so concurrent draws are safe.
         return resolver;
     }
 
@@ -315,6 +316,14 @@ pub const RecursiveResolver = struct {
     /// unset (cache-only paths and unit tests run without a budget).
     fn consumeQuery(self: *RecursiveResolver) error{GlobalQueryBudgetExhausted}!void {
         if (self.query_budget) |qb| try qb.consume();
+    }
+
+    /// The in-flight query's DNSSEC CPU budget. Non-null wherever crypto runs
+    /// (every validation site is downstream of an upstream response, impossible
+    /// under cache-only); the assert guards that invariant.
+    fn validationBudget(self: *RecursiveResolver) ?*dnssec.ValidationBudget {
+        std.debug.assert(self.validation_budget != null or self.cache_only);
+        return self.validation_budget;
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -350,13 +359,15 @@ pub const RecursiveResolver = struct {
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
-        self.validation_budget = .{};
-        // One budget per client query, shared by pointer through the whole
-        // resolution tree (incl. fan-out clones). Stack-scoped: every helper
-        // thread is joined before this frame returns, so the pointer stays live.
+        // Both per-query budgets are stack locals here, shared by pointer through
+        // the whole tree (incl. clones). Helpers join before this frame returns, so
+        // the pointers stay live.
         var query_budget: QueryBudget = .{};
         self.query_budget = &query_budget;
         defer self.query_budget = null;
+        var validation_budget: dnssec.ValidationBudget = .{};
+        self.validation_budget = &validation_budget;
+        defer self.validation_budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
         result.cousin_prefetch_qtype = switch (qtype) {
@@ -518,6 +529,10 @@ pub const RecursiveResolver = struct {
                         if (extractReferral(response, target_name, parent_zone, self.referralPolicy())) |referral| {
                             if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
+                            // Flood/exhaustion classifies the delegation .bogus; fail
+                            // closed here — a later CNAME hop would re-elevate it to
+                            // .secure and serve unsigned.
+                            if (security_state == .bogus) return self.bogusServfail(current_name, qtype);
                             minimize_label_count = parent_zone.labels.len + 1;
                             continue;
                         }
@@ -703,6 +718,8 @@ pub const RecursiveResolver = struct {
 
                 if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
+                // Flood/exhaustion → .bogus delegation; fail closed (see above).
+                if (security_state == .bogus) return self.bogusServfail(current_name, qtype);
                 minimize_label_count = parent_zone.labels.len + 1;
             }
 
@@ -1194,7 +1211,7 @@ pub const RecursiveResolver = struct {
         if (authorities.len > 0) {
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
             if (auth_status == .secure) {
-                const status = dnssec.classifyDelegation(authorities, zone_cut, &self.validation_budget);
+                const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget().?);
                 cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities);
                 return status;
             }
@@ -1922,10 +1939,10 @@ pub const RecursiveResolver = struct {
                     .hit => |h| {
                         if (h.security_status != .secure) {
                             if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
-                                validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, &self.validation_budget) catch return null;
+                                validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, self.validationBudget()) catch return null;
                             } else return null;
                         } else {
-                            validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null;
+                            validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, self.validationBudget()) catch return null;
                         }
                     },
                     // Proven-insecure delegation: no signed DNSKEYs to anchor.
@@ -1941,19 +1958,19 @@ pub const RecursiveResolver = struct {
                 // NSEC TTL, not the suppressed DS TTL) still distinguishes
                 // insecure delegations from outright failures.
                 if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
-                    validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, &self.validation_budget) catch return null;
+                    validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, self.validationBudget()) catch return null;
                 } else if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
                     switch (result) {
                         // Insecure delegation proven during fetch — see above.
                         .negative => return null,
-                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, &self.validation_budget) catch return null,
+                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, self.validationBudget()) catch return null,
                     }
                 } else return null;
             } else {
                 // Root zone: validate against the configured trust anchors
                 // (default IANA; test harness overrides via ServerConfig).
                 const now_u32 = epochNowU32();
-                dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, &self.validation_budget) catch return null;
+                dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, self.validationBudget()) catch return null;
             }
         }
 
@@ -2161,7 +2178,7 @@ pub const RecursiveResolver = struct {
                 .ds,
                 parent_dnskeys,
                 epochNowU32(),
-                &self.validation_budget,
+                self.validationBudget(),
             );
             if (ds_status != .secure) return null;
 
@@ -2200,7 +2217,7 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(response.authorities, zone, &self.validation_budget);
+            const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget().?);
             if (status == .insecure) {
                 cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
             }
@@ -2242,7 +2259,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (try self.fetchDnskey(allocator, signer_dotted, servers)) orelse return .bogus;
 
         // Validate the answer RRsets
-        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32, &self.validation_budget)) {
+        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32, self.validationBudget())) {
             .secure => {
                 response.header.flags.ad = true;
                 return .valid;
@@ -2281,7 +2298,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
         const now_u32 = epochNowU32();
-        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, &self.validation_budget);
+        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, self.validationBudget());
     }
 
     /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.
@@ -2301,7 +2318,7 @@ pub const RecursiveResolver = struct {
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 
-        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, &self.validation_budget);
+        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, self.validationBudget().?);
     }
 
     fn resolveNsAddresses(
@@ -3940,6 +3957,47 @@ test "QueryBudget.consume permits exactly max draws then refuses" {
     // test/harness/test_nxns_amplification.py, not here — a unit test can only
     // restate Zig's value-copy semantics, which is not the thing that breaks.
     try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consume());
+}
+
+test "validation budget stays tree-wide across cloneForThread under concurrent fan-out" {
+    // Real helper threads each clone the parent (production cloneForThread) and
+    // charge the shared budget until refused. Shared-by-pointer ⇒ exactly `ceiling`
+    // draws succeed across ALL clones, not per-clone — the reset-on-clone guard a
+    // struct test can't give. Teeth: re-add a per-clone reset to cloneForThread and
+    // the total jumps to K*ceiling, turning this RED.
+    const K = 6;
+    const ceiling: u32 = 40;
+    var shared: dnssec.ValidationBudget = .{ .max_sig_verify = ceiling };
+    var parent: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .validation_budget = &shared,
+    };
+
+    const Worker = struct {
+        parent: *RecursiveResolver,
+        granted: u32 = 0,
+        fn run(w: *@This()) void {
+            var udp_t = BlockingUdpTransport.init(.{}, w.parent.io);
+            defer udp_t.deinit();
+            var clone = w.parent.cloneForThread(.{ .udp = &udp_t, .tcp_enabled = false, .tls = null });
+            const vb = clone.validationBudget().?;
+            while (true) {
+                vb.consumeVerify() catch break;
+                w.granted += 1;
+            }
+        }
+    };
+
+    var workers: [K]Worker = undefined;
+    for (&workers) |*w| w.* = .{ .parent = &parent };
+    var threads: [K]std.Thread = undefined;
+    for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    for (&threads) |t| t.join();
+
+    var total: u32 = 0;
+    for (workers) |w| total += w.granted;
+    try testing.expectEqual(ceiling, total);
 }
 
 fn concatRRsOomProbe(allocator: mem.Allocator, _: void) !void {
