@@ -1,28 +1,29 @@
 # hark
 
-A validating, recursive, caching DNS resolver built from scratch in Zig.
-Runs on Linux with io_uring.
+[![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-333)
 
-## Features
+hark is a validating, recursive, caching DNS resolver written in Zig.
+The core is small and Linux-first: io_uring drives client I/O while a per-worker
+thread pool fans out upstream queries on blocking sockets, behind a multi-threaded
+`SO_REUSEPORT` server.
 
-- **Concurrent resolution** — per-worker thread pool with blocking sockets; main thread stays on io_uring for client I/O
-- **Staggered NS racing** — query two nameservers with adaptive delay, take first response (RFC 5452 safe)
-- **DNSSEC validation** — RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519; validate-then-store; dedicated key cache
-- **Aggressive NSEC negative caching** — synthesize NXDOMAIN/NODATA from cached NSEC records with wildcard synthesis (RFC 8198)
-- **DNS-over-TLS** — opportunistic encryption to authoritatives (RFC 9539) with background probing and connection pooling
-- **Full recursive resolution** from root hints with QNAME minimization
-- **TCP connection pooling** for upstream queries (RFC 7766)
-- **In-memory RRset cache** with SIEVE eviction, RFC 2308 negative caching, prefetch, A/AAAA cousin prefetch (RFC 8305), serve-stale (RFC 8767)
-- **Thompson Sampling** nameserver selection (per-zone, discounted)
-- **Query deduplication** across workers (singleflight)
-- **Multi-threaded server** with `SO_REUSEPORT`, per-query memory cap
-- UDP and TCP transport with EDNS0
+Queries use QNAME minimization and 0x20 case randomization. DNSSEC answers are
+validated before they reach the cache, and queries to authoritative servers can
+be encrypted opportunistically via DNS-over-TLS with pooled connections. Answers
+from public zones are scrubbed of private, loopback, and link-local addresses —
+DNS rebinding protection, on by default.
+
+The cache does aggressive NSEC negative caching, prefetch, and serve-stale.
+Nameserver selection races candidates and learns per-zone with Thompson sampling,
+and identical in-flight queries are deduplicated across workers.
 
 ## Building
 
 Requires Zig 0.16 and Linux 6.1+ (io_uring buffer rings + DEFER_TASKRUN).
 
-```
+```console
 zig build
 zig build test
 zig build bench                                # microbenchmarks; ReleaseFast
@@ -30,66 +31,83 @@ zig build bench -- cache_hit                   # filter to matching names
 zig build -Doptimize=ReleaseSafe -Dcpu=native  # host-tuned release
 ```
 
-## Usage
+The binary is written to `zig-out/bin/hark`. `zig build test` covers the Zig
+unit and fuzz tests. The Python integration
+harness (scripted responder, RPL replay) lives under `test/`; a provided
+`shell.nix` supplies the toolchain: `cd test && nix-shell --run pytest`.
 
-Resolve a name recursively (the default):
+## Running
 
+hark runs as a server over UDP and TCP. With no config it listens on
+`127.0.0.1:53` and `[::1]:53`; pass `--config` to change ports, cache sizes, or
+anything else (see [Configuration](#configuration)):
+
+```console
+sudo hark serve                            # built-in defaults
+hark serve --config /etc/hark/hark.toml    # custom config
 ```
-hark query example.com AAAA
-hark query example.com --dnssec
-hark query example.com --opportunistic
-```
 
-Run as a server (UDP + TCP, TOML config):
+Point a stub resolver at it with `nameserver 127.0.0.1` in `/etc/resolv.conf`.
 
-```
-hark serve --config /etc/hark/hark.toml
-```
+Binding a non-loopback address requires an explicit `allow-from` allowlist — hark
+refuses to start as an open resolver otherwise (BCP 140) — and can drop to a
+configured `user`/`group` (numeric uid/gid) after binding privileged ports.
 
-Dump a raw DNS packet from stdin:
+For debugging, `hark query` resolves a single name from the command line and
+`hark dump` decodes a raw packet on stdin:
 
-```
+```console
+hark query example.com AAAA --dnssec
 hark dump < packet.bin
 ```
 
 ## Configuration
 
+Every key is optional, and every value shown *is* its default, so this snippet
+is a no-op — set only what you want to change.
+
 ```toml
 [server]
 listen = ["127.0.0.1:53", "[::1]:53"]
-workers = 2                   # range 1..65535; raise for high-QPS
-resolution-threads = 4        # pool threads per worker (1..256)
-max-udp-payload = 1232        # advertised OPT + outbound clamp (512..65535)
+allow-from = []               # client CIDR allowlist; empty = allow all
+workers = 2                   # raise for high QPS
+resolution-threads = 4        # upstream query threads per worker
+max-udp-payload = 1232        # advertised EDNS0 buffer size
+minimal-responses = true      # strip non-load-bearing authority/additional RRs
 
 [resolver]
 dnssec = true
-qname-minimization = true     # RFC 9156
-case-randomization = true     # 0x20 QNAME case (Vixie/Dagon)
-opportunistic = false         # RFC 9539 encrypted to authoritatives
-stagger-ms = 150              # NS racing delay; 0 disables, max 1000
-query-memory-limit = 2097152  # per-query arena cap, bytes (0 disables; min 65536)
+qname-minimization = true
+case-randomization = true     # 0x20 query-name casing
+opportunistic = false         # encrypt to authoritatives when possible
+stagger-ms = 150              # nameserver racing delay; 0 disables
+query-memory-limit = 2097152  # per-query memory cap, bytes
+
+[rebinding]
+enabled = true                # scrub private addresses from public-zone answers
+allow-zones = []              # owner names exempt from scrubbing (split-horizon)
+extra-block = []              # additional CIDRs to scrub
+extra-allow = []              # CIDRs to exempt from scrubbing
 
 [cache]
 size = 16777216               # answer cache, bytes
 entries = 10000               # answer cache, max entries
-key-cache-size = 4194304      # DNSKEY/DS cache, bytes
-key-cache-entries = 2000      # DNSKEY/DS cache, max entries
-prefetch = false              # refresh near-expiry entries
-prefetch-cousin = true        # also fetch the other A/AAAA on lookup
-serve-stale-ttl = 0           # serve expired up to N seconds (RFC 8767)
-min-ttl = 0                   # floor for aggressive CDN TTLs
+key-cache-size = 4194304      # DNSSEC key cache, bytes
+key-cache-entries = 2000      # DNSSEC key cache, max entries
+prefetch = false              # refresh entries before they expire
+prefetch-cousin = true        # fetch the matching A/AAAA alongside
+serve-stale-ttl = 0           # serve expired answers for N seconds
+min-ttl = 0                   # floor for very short TTLs
 
 [logging]
-queries = false               # per-query log lines
+queries = false               # log every query
 ```
-
-Every value shown is the default — copying the snippet verbatim is a no-op. Omit a key to get the same default.
 
 ## Design
 
-- **Linux-first** — io_uring for client I/O, blocking sockets for upstream queries. Portability is not a goal.
+- **Linux-first** — io_uring for client I/O, blocking sockets for upstream queries. Bad portability.
 - **Vendor-minimal** — stdlib first; one vendored Zig library for DoT (see [Credits](#credits)). No package manager, no fetched deps, no vendored C.
-- **Tested** — fuzzed parsers, integration tests against live DNS, leak detection via `std.testing.allocator`.
+- **Tested** — a fuzzed message parser, a hermetic integration harness (scripted responder, RPL scenario replay over Unbound's iterator corpus with every divergence documented), and leak detection via `std.testing.allocator`.
 
 ## Credits
 
