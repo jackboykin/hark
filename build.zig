@@ -56,9 +56,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
@@ -81,7 +79,7 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run microbenchmarks (optional filter: zig build bench -- <name_substring>)");
     const bench_run = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&bench_run.step);
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
 
     const synth_pellet_exe = b.addExecutable(.{
         .name = "synth-pellet",

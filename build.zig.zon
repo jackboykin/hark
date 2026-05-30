@@ -2,7 +2,7 @@
     .name = .hark,
     .version = "0.1.0",
     .fingerprint = 0x51aa02434620a6c6, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0-dev", // any 0.17 nightly or later; "0.17.0" would reject all -dev builds (pre-release sorts below release)
+    .minimum_zig_version = "0.17.0-dev.607", // build.zig needs addPassthruArgs (build-runner split, ziglang/zig#35428); earlier -dev builds lack it. 0.17.0 stable satisfies this too (release > pre-release).
     .dependencies = .{},
     .paths = .{
         "build.zig",
