@@ -528,7 +528,7 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, &payloads });
 
     var completions: [max_operations]Completion = undefined;
-    var seen = [_]bool{false} ** payloads.len;
+    var seen: [payloads.len]bool = @splat(false);
     var received: usize = 0;
     var still_armed_seen = false;
 

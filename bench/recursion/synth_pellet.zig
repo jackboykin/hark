@@ -204,7 +204,7 @@ fn addU16Slice(start: u32, bytes: []const u8) u32 {
 
 // fd00::<client_index> — RFC 4193 ULA, won't escape if accidentally routed.
 fn clientAddress(idx: u32) [16]u8 {
-    var a: [16]u8 = .{0} ** 16;
+    var a: [16]u8 = @splat(0);
     a[0] = 0xfd;
     a[1] = 0x00;
     std.mem.writeInt(u32, a[12..16], idx + 1, .big);

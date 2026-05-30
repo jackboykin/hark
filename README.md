@@ -1,6 +1,6 @@
 # hark
 
-[![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.17_nightly-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-333)
 
@@ -21,7 +21,7 @@ and identical in-flight queries are deduplicated across workers.
 
 ## Building
 
-Requires Zig 0.16 and Linux 6.1+ (io_uring buffer rings + DEFER_TASKRUN).
+Requires a Zig 0.17 nightly and Linux 6.1+ (io_uring buffer rings + DEFER_TASKRUN).
 
 ```console
 zig build

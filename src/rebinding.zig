@@ -202,7 +202,7 @@ pub fn isPrivate(bytes: []const u8, cfg: Config) bool {
 }
 
 fn isIp4Mapped(bytes: []const u8) bool {
-    return mem.eql(u8, bytes[0..10], &([_]u8{0} ** 10)) and bytes[10] == 0xff and bytes[11] == 0xff;
+    return mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and bytes[10] == 0xff and bytes[11] == 0xff;
 }
 
 fn matchesDefault(bytes: []const u8) bool {
@@ -243,7 +243,7 @@ fn isPrivateIp4(b: [4]u8) bool {
 /// symmetry with IPv4 multicast.
 fn isPrivateIp6(b: [16]u8) bool {
     // ::/128 and ::1/128
-    if (mem.eql(u8, b[0..15], &([_]u8{0} ** 15))) return b[15] <= 1;
+    if (mem.eql(u8, b[0..15], &@as([15]u8, @splat(0)))) return b[15] <= 1;
     // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
     // doesn't slip through as a "v6 address" the v6 set has no opinion on.
     if (isIp4Mapped(&b)) return isPrivateIp4(b[12..16].*);
@@ -324,16 +324,16 @@ test "default IPv4 block set leaves routable space alone (incl. boundaries + mul
 }
 
 test "default IPv6 block set covers ::/::1, ULA, link-local, docs, mapped-v4" {
-    try testing.expect(isPrivateIp6([_]u8{0} ** 16)); // ::
-    try testing.expect(isPrivateIp6([_]u8{0} ** 15 ++ [_]u8{1})); // ::1
-    try testing.expect(isPrivateIp6([_]u8{0xfc} ++ [_]u8{0} ** 15)); // fc00::/7
-    try testing.expect(isPrivateIp6([_]u8{0xfd} ++ [_]u8{0} ** 15));
-    try testing.expect(isPrivateIp6([_]u8{ 0xfe, 0x80 } ++ [_]u8{0} ** 14)); // fe80::/10
-    try testing.expect(isPrivateIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12)); // 2001:db8::/32
-    try testing.expect(isPrivateIp6([_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 })); // mapped 127
-    try testing.expect(!isPrivateIp6([_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 })); // mapped public
-    try testing.expect(!isPrivateIp6([_]u8{ 0xff, 0x02 } ++ [_]u8{0} ** 14)); // multicast — not blocked
-    try testing.expect(!isPrivateIp6([_]u8{ 0x26, 0x06 } ++ [_]u8{0} ** 14)); // public
+    try testing.expect(isPrivateIp6(@as([16]u8, @splat(0)))); // ::
+    try testing.expect(isPrivateIp6(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
+    try testing.expect(isPrivateIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0)))); // fc00::/7
+    try testing.expect(isPrivateIp6([_]u8{0xfd} ++ @as([15]u8, @splat(0))));
+    try testing.expect(isPrivateIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)))); // fe80::/10
+    try testing.expect(isPrivateIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)))); // 2001:db8::/32
+    try testing.expect(isPrivateIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 })); // mapped 127
+    try testing.expect(!isPrivateIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 })); // mapped public
+    try testing.expect(!isPrivateIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)))); // multicast — not blocked
+    try testing.expect(!isPrivateIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)))); // public
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {
@@ -342,8 +342,8 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
     // or AAAA-DNSBL silently stops working when v4-DNSBL does not.
     const allow127 = acl.parse("127.0.0.0/8") orelse return error.ParseFailed;
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{allow127} };
-    const mapped_listed = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 2 };
-    const mapped_rfc1918 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
+    const mapped_listed = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 2 };
+    const mapped_rfc1918 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
     try testing.expect(!shouldDrop(rrAAAA(public_name, mapped_listed), cfg));
     try testing.expect(shouldDrop(rrAAAA(public_name, mapped_rfc1918), cfg));
 }

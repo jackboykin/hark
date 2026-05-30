@@ -114,7 +114,7 @@ pub fn synthesize(
         },
         .localhost_aaaa => {
             const arr = try allocator.alloc(dns.ResourceRecord, 1);
-            const aaaa = [_]u8{0} ** 15 ++ [_]u8{1};
+            const aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1};
             arr[0] = .{
                 .name = qname,
                 .rtype = .aaaa,

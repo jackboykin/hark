@@ -12,10 +12,11 @@ const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 
-// UDP and TCP both flow through std.Io.net (Socket/Stream + io.vtable.netRead/
-// netWrite for the data path). Connect-side TCP still opens the fd via raw
-// posix for SO_SNDTIMEO — Zig 0.16's `netConnectIp` accepts a timeout option
-// but its Io.Threaded backend panics on it. queryStaggered and the TCP loops
+// UDP and TCP both flow through std.Io.net (Socket/Stream — reads via
+// `std.Io.net.Stream.read`/`io.operate(.net_read)`, writes via `io.vtable.netWrite`).
+// Connect-side TCP still opens the fd via raw posix for SO_SNDTIMEO — Zig's
+// `netConnectIp` accepts a timeout option but its Io.Threaded backend panics on
+// it. queryStaggered and the TCP loops
 // drop to posix.poll on socket.handle rather than Io.select over receive
 // futures — see comments at each call site.
 
@@ -338,7 +339,7 @@ pub fn queryTcp(
 }
 
 /// Open a connected TCP stream. The fd is opened via raw posix so we can
-/// apply SO_SNDTIMEO for the connect itself — Zig 0.16's
+/// apply SO_SNDTIMEO for the connect itself — Zig's
 /// `IpAddress.connect` accepts a timeout option but its Io.Threaded
 /// backend panics on it. Clear SNDTIMEO before returning so subsequent
 /// data ops don't surface EAGAIN through netRead/netWrite, which
@@ -501,7 +502,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
 
-    const server_bind = na.initIp6(.{0} ** 16, 0, 0, 0);
+    const server_bind = na.initIp6(@splat(0), 0, 0, 0);
     const server_sock = server_bind.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| switch (err) {
         error.AddressFamilyUnsupported => return error.SkipZigTest,
         else => return err,

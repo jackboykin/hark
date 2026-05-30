@@ -209,11 +209,15 @@ pub fn setQuickAck(sock: posix.fd_t) void {
     posix.setsockopt(sock, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&one)) catch {};
 }
 
-/// `io.vtable.netRead` adapter for a single buffer. Wraps the slice in the
-/// one-element iovec the vtable expects.
+/// Read adapter for a single buffer. Wraps the slice in the one-element
+/// iovec `std.Io.net.Stream.read` expects, which dispatches the read through
+/// `io.operate(.net_read)` — the 0.17 replacement for the removed
+/// `io.vtable.netRead` method.
 pub fn netRead(io: std.Io, handle: posix.fd_t, buf: []u8) std.Io.net.Stream.Reader.Error!usize {
     var iovec = [_][]u8{buf};
-    return io.vtable.netRead(io.userdata, handle, &iovec);
+    // net_read only reads the handle; address is never touched on the read path.
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = handle, .address = undefined } };
+    return stream.read(io, &iovec);
 }
 
 /// `io.vtable.netWrite` adapter for a single contiguous buffer. The vtable's

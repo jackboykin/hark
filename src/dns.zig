@@ -1880,7 +1880,7 @@ test "writeResourceRecord fast-path matches field path with TTL patch" {
 
 test "edge case: empty message (too short)" {
     try testing.expectError(error.EndOfData, parseMessage(testing.allocator, ""));
-    try testing.expectError(error.EndOfData, parseMessage(testing.allocator, &[_]u8{0} ** 11));
+    try testing.expectError(error.EndOfData, parseMessage(testing.allocator, &@as([11]u8, @splat(0))));
 }
 
 test "edge case: truncated question" {
@@ -2589,8 +2589,8 @@ test "parseDottedName empty label" {
 }
 
 test "parseDottedName too-long label" {
-    const long_label = "a" ** 64 ++ ".com";
-    try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, long_label));
+    const long_label = @as([64]u8, @splat('a')) ++ ".com".*;
+    try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, &long_label));
 }
 
 test "isSubdomainOf equal names" {
@@ -3132,7 +3132,7 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
 
     const iterations: usize = 10_000;
     const letters = "abcdefghijklmnopqrstuvwxyz";
-    var upper_counts: [26]u32 = .{0} ** 26;
+    var upper_counts: [26]u32 = @splat(0);
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

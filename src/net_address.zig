@@ -33,7 +33,7 @@ pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
 pub fn wildcardFor(peer: Address) Address {
     return switch (peer) {
         .ip4 => initIp4(.{ 0, 0, 0, 0 }, 0),
-        .ip6 => initIp6(.{0} ** 16, 0, 0, 0),
+        .ip6 => initIp6(@splat(0), 0, 0, 0),
     };
 }
 
@@ -56,7 +56,7 @@ pub const AddressKey = struct {
     }
 
     pub fn fromAddress(address: Address) AddressKey {
-        var key = AddressKey{ .family = 0, .addr = .{0} ** 16, .port = 0 };
+        var key = AddressKey{ .family = 0, .addr = @splat(0), .port = 0 };
         switch (address) {
             .ip4 => |v4| {
                 key.family = @intCast(posix.AF.INET);
@@ -234,10 +234,10 @@ fn isNonRoutableIp6(b: [16]u8) bool {
 
 fn isNonRoutableIp6Zero(b: [16]u8) bool {
     // All addresses starting with 0x00: check for ::, ::1, and ::ffff:mapped
-    if (!mem.eql(u8, b[1..10], &([_]u8{0} ** 9))) return false;
+    if (!mem.eql(u8, b[1..10], &@as([9]u8, @splat(0)))) return false;
     if (b[10] == 0 and b[11] == 0) {
         // :: (unspecified) or ::1 (loopback)
-        return mem.eql(u8, b[12..15], &([_]u8{0} ** 3)) and b[15] <= 1;
+        return mem.eql(u8, b[12..15], &@as([3]u8, @splat(0))) and b[15] <= 1;
     }
     if (b[10] == 0xff and b[11] == 0xff) {
         // ::ffff:0:0/96 (IPv4-mapped) — check the mapped IPv4 address
@@ -256,7 +256,7 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     const b = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
     const c = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 5353));
     const d = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 5 }, 53));
-    const e = AddressKey.fromAddress(initIp6(.{ 1, 2, 3, 4 } ++ .{0} ** 12, 53, 0, 0));
+    const e = AddressKey.fromAddress(initIp6([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0)), 53, 0, 0));
 
     try testing.expect(ctx.eql(a, b));
     try testing.expectEqual(ctx.hash(a), ctx.hash(b));
@@ -275,7 +275,7 @@ test "AddressKey.HashCtx: 16-shard distribution on sequential IPv4 keys" {
     // Pin the floor so any future tweak that re-introduces that pathology
     // fails loudly.
     const ctx: AddressKey.HashCtx = .{};
-    var counts: [16]u32 = .{0} ** 16;
+    var counts: [16]u32 = @splat(0);
     var i: u32 = 0;
     while (i < 4096) : (i += 1) {
         const k = AddressKey.fromAddress(initIp4(.{
@@ -310,10 +310,10 @@ test "AddressKey.HashCtx: randomizeHashSeed shifts the hash space" {
 test "format produces ip:port and RFC 5952 IPv6" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("127.0.0.1:53", format(initIp4(.{ 127, 0, 0, 1 }, 53), &buf));
-    try testing.expectEqualStrings("[::1]:53884", format(initIp6(.{0} ** 15 ++ .{1}, 53884, 0, 0), &buf));
+    try testing.expectEqualStrings("[::1]:53884", format(initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53884, 0, 0), &buf));
     try testing.expectEqualStrings(
         "[2001:db8::1]:53",
-        format(initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ .{0} ** 11 ++ .{1}, 53, 0, 0), &buf),
+        format(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0), &buf),
     );
 }
 
@@ -347,27 +347,27 @@ test "isNonRoutableNs allows routable IPv4" {
 
 test "isNonRoutableNs blocks private/reserved IPv6" {
     // Loopback ::1
-    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 15 ++ .{1}, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
     // Unspecified ::
-    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 16, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6(@splat(0), 53, 0, 0)));
     // Unique local fc00::/7
-    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfc, 0 } ++ .{0} ** 14, 53, 0, 0)));
-    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfd, 0x12 } ++ .{0} ** 14, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfc, 0 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfd, 0x12 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // Link-local fe80::/10
-    try testing.expect(isNonRoutableNs(initIp6(.{ 0xfe, 0x80 } ++ .{0} ** 14, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // Multicast ff00::/8
-    try testing.expect(isNonRoutableNs(initIp6(.{ 0xff, 0x02 } ++ .{0} ** 14, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // IPv4-mapped ::ffff:127.0.0.1
-    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
     // IPv4-mapped ::ffff:10.0.0.1
-    try testing.expect(isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 10, 0, 0, 1 }, 53, 0, 0)));
+    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53, 0, 0)));
 }
 
 test "isNonRoutableNs allows routable IPv6" {
     // 2001:db8::1 (documentation, but routable from resolver perspective)
-    try testing.expect(!isNonRoutableNs(initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ .{0} ** 11 ++ .{1}, 53, 0, 0)));
+    try testing.expect(!isNonRoutableNs(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
     // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
-    try testing.expect(!isNonRoutableNs(initIp6(.{0} ** 10 ++ .{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
+    try testing.expect(!isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
 }
 
 /// Compare two addresses by IP only, ignoring port.

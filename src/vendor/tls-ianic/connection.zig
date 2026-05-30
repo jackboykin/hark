@@ -345,7 +345,7 @@ test "encrypt decrypt" {
     const rng_impl: std.Random.IoSource = .{ .io = testing.io };
     const rng = rng_impl.interface();
     var output_buf: [1024]u8 = undefined;
-    var stream_reader: Io.Reader = .fixed(&data12.server_pong ** 4);
+    var stream_reader: Io.Reader = .fixed(&(data12.server_pong ++ data12.server_pong ++ data12.server_pong ++ data12.server_pong));
     var stream_writer: Io.Writer = .fixed(&output_buf);
     var conn: Connection = .{
         .input = &stream_reader,

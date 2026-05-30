@@ -85,8 +85,8 @@ inline fn qBucket(ns: u64) usize {
 
 const QInstrOpStats = if (queue_instr_on) struct {
     count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    wait_buckets: [8]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** 8,
-    hold_buckets: [8]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** 8,
+    wait_buckets: [8]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    hold_buckets: [8]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
 
     fn record(self: *@This(), wait_ns: u64, hold_ns: u64) void {
         _ = self.count.fetchAdd(1, .monotonic);
@@ -262,7 +262,7 @@ const PopResult = struct {
 // means the wrapper does one lock acquisition per operation, not two.
 
 const WorkQueue = struct {
-    slots: [work_queue_capacity]Slot = [_]Slot{.{}} ** work_queue_capacity,
+    slots: [work_queue_capacity]Slot = @splat(.{}),
     order: [work_queue_capacity]u16 = undefined,
     head: u16 = 0,
     tail: u16 = 0,
@@ -736,8 +736,8 @@ pub const Server = struct {
         defer server_loop.destroy();
 
         // Per-thread server sockets — one UDP + one TCP per listen address
-        var udp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
-        var tcp_socks: [max_listen_addrs]posix.fd_t = .{-1} ** max_listen_addrs;
+        var udp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
+        var tcp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
 
         defer for (0..listen_addrs.len) |i| {
             if (udp_socks[i] >= 0) sys.close(udp_socks[i]);
@@ -1042,8 +1042,8 @@ const WorkerState = struct {
         var wake_ctx = Ctx{ .tag = .wake, .fd = wake_fd };
 
         // Op IDs indexed by listen address; null means inactive
-        var udp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
-        var tcp_ops: [max_listen_addrs]?OperationId = .{null} ** max_listen_addrs;
+        var udp_ops: [max_listen_addrs]?OperationId = @splat(null);
+        var tcp_ops: [max_listen_addrs]?OperationId = @splat(null);
 
         // Multishot recvmsg — one SQE per socket stays armed and produces
         // CQEs for every inbound packet until the kernel terminates it.

@@ -150,7 +150,7 @@ test "matches v6 single host" {
 
 test "matches family mismatch fails" {
     const v4 = parse("0.0.0.0/0") orelse return error.ParseFailed;
-    try testing.expect(!v4.matches(na.initIp6(.{0} ** 16, 0, 0, 0)));
+    try testing.expect(!v4.matches(na.initIp6(@splat(0), 0, 0, 0)));
 }
 
 test "matchesBytes accepts bare rdata bytes" {
@@ -158,19 +158,19 @@ test "matchesBytes accepts bare rdata bytes" {
     try testing.expect(v4.matchesBytes(&[_]u8{ 10, 1, 2, 3 }));
     try testing.expect(!v4.matchesBytes(&[_]u8{ 11, 1, 2, 3 }));
     // Length mismatch — v4 cidr against 16 bytes
-    try testing.expect(!v4.matchesBytes(&([_]u8{0} ** 16)));
+    try testing.expect(!v4.matchesBytes(&@as([16]u8, @splat(0))));
 
     const v6 = parse("fc00::/7") orelse return error.ParseFailed;
-    try testing.expect(v6.matchesBytes(&([_]u8{0xfc} ++ [_]u8{0} ** 15)));
-    try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ [_]u8{0} ** 15)));
-    try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ [_]u8{0} ** 15)));
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfc} ++ @as([15]u8, @splat(0)))));
+    try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ @as([15]u8, @splat(0)))));
+    try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ @as([15]u8, @splat(0)))));
     // Length mismatch — v6 cidr against 4 bytes
     try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
 }
 
 test "allow with empty entries permits all" {
     try testing.expect(allow(&.{}, na.initIp4(.{ 8, 8, 8, 8 }, 0)));
-    try testing.expect(allow(&.{}, na.initIp6(.{0} ** 16, 0, 0, 0)));
+    try testing.expect(allow(&.{}, na.initIp6(@splat(0), 0, 0, 0)));
 }
 
 test "allow returns false when no entry matches" {

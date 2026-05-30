@@ -3725,7 +3725,7 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
                 .flags = 0,
                 .iterations = 0,
                 .salt = &.{},
-                .next_hashed_owner = &(.{@as(u8, 0)} ** 20),
+                .next_hashed_owner = &@as([20]u8, @splat(0)),
                 .type_bit_maps = &.{},
             } },
         },

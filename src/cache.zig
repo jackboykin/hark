@@ -502,7 +502,7 @@ pub const RRsetCache = struct {
     shard_count: u32 = max_shards,
     shard_mask: u32 = max_shards - 1,
     /// Per-thread striped read-path counters (see ReadCounters). Default-zeroed.
-    read_counters: [counter_slots]ReadCounters align(std.atomic.cache_line) = [_]ReadCounters{.{}} ** counter_slots,
+    read_counters: [counter_slots]ReadCounters align(std.atomic.cache_line) = @splat(.{}),
     io: std.Io,
     now_fn: *const fn () i64,
     serve_stale_ttl: u32 = 0,
