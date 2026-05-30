@@ -1,7 +1,12 @@
 # Local patches against ianic/tls.zig
 
 Upstream: https://github.com/ianic/tls.zig
-Pinned commit: `561cd3e5a88ec430d2021e2da19b6bee667e020d`
+Pinned commit: `5452bafc98d23e304209cb24d81fd2d19434e52d`
+
+The SNI guard below is the **only** local delta against this pin — confirm with
+`diff -ru <upstream-src> src/vendor/tls-ianic` after a refresh. Zig 0.17
+compatibility (`**`→`@splat`) is upstream-native as of this pin, so no local
+0.17 port is carried.
 
 ## SNI: skip extension when host is empty
 
@@ -32,10 +37,10 @@ cp /tmp/tls-ianic/LICENSE src/vendor/tls-ianic/LICENSE.tls-ianic
 zig build test
 ```
 
-Note: `testdata/` is included even though it only feeds upstream's own test
-blocks. Zig 0.16 eagerly resolves top-level `@import` declarations regardless
-of whether they're referenced, so dropping the directory breaks compilation.
-At ~60 KB it isn't worth patching out.
+Note: `testdata/` (and `rsa/testdata/`) is included even though it only feeds
+upstream's own test blocks. Zig eagerly resolves top-level `@import`
+declarations regardless of whether they're referenced, so dropping the
+directory breaks compilation. At ~60 KB it isn't worth patching out.
 
 ## Refresh checklist (security properties hark relies on)
 

@@ -314,9 +314,23 @@ pub const Connection = struct {
             // Last element of `data` is repeated as necessary so that it is
             // written `splat` number of times, which may be zero.
             const pattern = data[data.len - 1];
-            for (0..splat) |_| {
-                try self.writeAll(pattern);
-                n += pattern.len;
+            switch (pattern.len) {
+                0 => {},
+                1 => {
+                    var buffer: [cipher.max_cleartext_len]u8 = undefined;
+                    @memset(&buffer, pattern[0]);
+                    var remaining = splat;
+                    while (remaining > 0) {
+                        const chunk_len = @min(remaining, buffer.len);
+                        try self.writeAll(buffer[0..chunk_len]);
+                        remaining -= chunk_len;
+                    }
+                    n += splat;
+                },
+                else => for (0..splat) |_| {
+                    try self.writeAll(pattern);
+                    n += pattern.len;
+                },
             }
 
             // Number of bytes consumed from `data` is returned, excluding bytes

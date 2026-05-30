@@ -191,6 +191,8 @@ pub const Transcript = struct {
 };
 
 fn TranscriptT(comptime Hash: type) type {
+    const spaces: [64]u8 = @splat(0x20);
+
     return struct {
         const Hmac = crypto.auth.hmac.Hmac(Hash);
         const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
@@ -209,7 +211,7 @@ fn TranscriptT(comptime Hash: type) type {
         }
 
         fn serverCertificateVerify(self: *Self) []const u8 {
-            self.buffer = (@as([64]u8, @splat(0x20))) ++
+            self.buffer = spaces ++
                 "TLS 1.3, server CertificateVerify\x00".* ++
                 self.hash.peek();
             return &self.buffer;
@@ -217,7 +219,7 @@ fn TranscriptT(comptime Hash: type) type {
 
         // ref: https://www.rfc-editor.org/rfc/rfc8446#section-4.4.3
         fn clientCertificateVerify(self: *Self) []u8 {
-            self.buffer = (@as([64]u8, @splat(0x20))) ++
+            self.buffer = spaces ++
                 "TLS 1.3, client CertificateVerify\x00".* ++
                 self.hash.peek();
             return &self.buffer;
