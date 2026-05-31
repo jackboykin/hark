@@ -58,12 +58,13 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
 
+    // main.zig has no test blocks and imports only the hark module, so a
+    // second exe-rooted test binary would recompile the same graph mod_tests
+    // already covers for zero added coverage. Test the module only.
     const mod_tests = b.addTest(.{ .root_module = mod });
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
-    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",

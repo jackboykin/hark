@@ -26,7 +26,37 @@ pub const special_use = @import("special_use.zig");
 pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
 
+// Explicit per-file imports drive test discovery by reachability, so tests run
+// regardless of pub-ness — unlike refAllDecls, which sees only pub decls (a
+// dropped `pub` silently drops a file's tests) and is on its way out of std.
+// Add a line here when you add a module file.
 test {
-    @import("std").testing.refAllDecls(@This());
-    _ = @import("response.zig"); // explicit: response.zig isn't re-exported, so don't rely on transitive imports keeping its tests in the run set
+    _ = @import("dns.zig");
+    _ = @import("dns_print.zig");
+    _ = @import("event_loop.zig");
+    _ = @import("recursive.zig");
+    _ = @import("cache.zig");
+    _ = @import("dnssec.zig");
+    _ = @import("tls_transport.zig");
+    _ = @import("connection_pool.zig");
+    _ = @import("encrypted_ns.zig");
+    _ = @import("case_state.zig");
+    _ = @import("toml.zig");
+    _ = @import("config.zig");
+    _ = @import("server.zig");
+    _ = @import("ns_rtt.zig");
+    _ = @import("ns_selector.zig");
+    _ = @import("dedup.zig");
+    _ = @import("nsec_cache.zig");
+    _ = @import("counting_allocator.zig");
+    _ = @import("bg_group.zig");
+    _ = @import("blocking_transport.zig");
+    _ = @import("rand.zig");
+    _ = @import("monotonic.zig");
+    _ = @import("sys.zig");
+    _ = @import("net_address.zig");
+    _ = @import("special_use.zig");
+    _ = @import("acl.zig");
+    _ = @import("rebinding.zig");
+    _ = @import("response.zig");
 }
