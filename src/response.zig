@@ -2,8 +2,9 @@
 /// truncation cascade, error responses, and per-RFC validation. Pure (no
 /// I/O); the I/O orchestrator lives in server.zig.
 ///
-/// Response shaping policy is captured in `shapeResponse`. The design
-/// matrix lives in `~/Documents/hark-notes/response-shaping-2026-05-11.md`.
+/// Response shaping policy is captured in `shapeResponse`: a per-section
+/// keep/strip matrix over (qtype, DO bit, rcode, answer-present). The cells
+/// are documented inline at each branch of `shapeResponse` below.
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -35,9 +36,9 @@ const ShapedSections = struct {
 };
 
 /// Pure shaper: applies the per-section keep/strip matrix to `response`
-/// and returns new slices. See `~/Documents/hark-notes/response-shaping-
-/// 2026-05-11.md` for the matrix; the implementation below is a direct
-/// transcription.
+/// and returns new slices. Each matrix cell is spelled out at the branch
+/// that implements it; the `shapeResponse` tests below exercise them
+/// one-to-one.
 ///
 /// On OOM returns the error so the caller can surface SERVFAIL —
 /// silently returning a partially-shaped response would leak records
@@ -821,7 +822,7 @@ test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {
 // ── shapeResponse tests ────────────────────────────────────────────────
 //
 // Each test exercises one (or a tightly-coupled pair) of cells in the
-// shaping matrix at `~/Documents/hark-notes/response-shaping-2026-05-11.md`.
+// keep/strip matrix implemented by `shapeResponse` above.
 // The shaper is a pure function on `dns.Message`; we build messages
 // directly and inspect the shaped sections without going through wire
 // encode/decode (the wire layer is tested elsewhere).

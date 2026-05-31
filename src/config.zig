@@ -64,8 +64,8 @@ pub const ServerConfig = struct {
     /// / CD=1). When false, the wire shaper passes the upstream's authority
     /// and additional sections through unchanged except for the RFC 4035
     /// §3.2.3 DO=0 strip (which remains mandatory). Mirrors Unbound's
-    /// `minimal-responses` knob (default-on since 1.7.x). See
-    /// `~/Documents/hark-notes/response-shaping-2026-05-11.md` for the matrix.
+    /// `minimal-responses` knob (default-on since 1.7.x). The full keep/strip
+    /// matrix is implemented and documented in `response.zig:shapeResponse`.
     minimal_responses: bool,
 
     /// RFC 7766 §6.2.1: TCP idle timeout. Hark closes a TCP client

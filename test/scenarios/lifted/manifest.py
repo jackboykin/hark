@@ -43,9 +43,10 @@ Previously blocked, now in the manifest:
     control DNS query `_advance-clock.<N>.testharness.invalid.` on
     `STEP n TIME_PASSES`.
 
-The cross-cutting picture of divergences is in
-`~/.claude/projects/.../memory/cname-divergence-from-unbound.md` and
-`iterative-dispatch-gaps.md`.
+The cross-cutting picture — the handful of underlying reasons behind the
+per-entry `xfail_reason` strings below, and whether each is a deliberate
+choice, an unimplemented feature, or a harness limit — is in `DIVERGENCES.md`
+alongside this file.
 """
 
 from __future__ import annotations
