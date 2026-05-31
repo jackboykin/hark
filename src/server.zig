@@ -681,8 +681,15 @@ pub const Server = struct {
             for (threads) |t| t.join();
         }
 
-        // Check for worker failures
+        // Check for worker failures. Every worker increments worker_errors at
+        // most once on its single fatal path, so failed >= worker_count means
+        // nothing is listening — fail loud rather than exit 0 on a dead server.
         const failed = self.worker_errors.load(.monotonic);
+        const worker_count = @max(workers, 1);
+        if (failed >= worker_count) {
+            log.err("all {d} worker(s) failed to initialize; nothing was served", .{worker_count});
+            return error.AllWorkersFailed;
+        }
         if (failed > 0) {
             log.warn("{d} worker(s) failed to initialize; running with degraded capacity", .{failed});
         }
