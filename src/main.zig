@@ -228,7 +228,14 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         log.err("query failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    const response = result.message;
+    var response = result.message;
+
+    var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+    var questions: [1]dns.Question = undefined;
+    if (dns.parseDottedName(arena.allocator(), dns.lowerNameIntoBuf(&lower_buf, name))) |qname| {
+        questions[0] = .{ .name = qname, .qtype = qtype, .qclass = .in };
+        response.questions = &questions;
+    } else |_| {}
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
