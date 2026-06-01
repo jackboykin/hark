@@ -1,18 +1,12 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const hark = @import("hark");
 const dns = hark.dns;
 const dns_print = hark.dns_print;
 const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
 const TlsTransport = hark.tls_transport.TlsTransport;
-const ConnectionPool = hark.connection_pool.ConnectionPool(hark.connection_pool.PooledConnection);
-const EncryptedNsCache = hark.encrypted_ns.EncryptedNsCache;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
-const RttCache = hark.ns_rtt.RttCache;
-const RRsetCache = hark.cache.RRsetCache;
 const Io = std.Io;
 const Server = hark.server.Server;
-const ServerConfig = hark.config.ServerConfig;
 
 var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -190,57 +184,46 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     }
 
+    // Reuse Server.init so the one-shot resolver is wired exactly like
+    // `serve`: caches, NS selector, DNSSEC/opportunistic state, staggered NS
+    // racing, and the parallel-fanout allocator all flow from the same config
+    // path through `fromContext` — the single source of truth for field
+    // mapping. This keeps `query` a faithful mirror of production resolution
+    // instead of a hand-rolled subset that silently drifts. Sockets are bound
+    // only by `run()`, never by `init`.
+    var cfg = hark.config.parseConfig(allocator, "") catch |err| {
+        log.err("building default config: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    cfg.qname_minimization = !no_qmin;
+    cfg.dnssec = dnssec_enabled;
+    cfg.opportunistic = opportunistic;
+    defer cfg.deinit();
+
+    var server = Server.init(allocator, cfg, io) catch |err| {
+        log.err("initializing resolver: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer server.deinit();
+
+    // Fresh transports for this single resolve (mirrors the bg-prefetch path).
     var t = BlockingUdpTransport.init(.{}, io);
     defer t.deinit();
+    var tls_t: ?TlsTransport = if (opportunistic) blk: {
+        var tt = TlsTransport.init(allocator, .{}, server.ca_bundle, io);
+        if (server.enc_pool) |*pool| tt.pool = pool;
+        break :blk tt;
+    } else null;
+    const tls_ptr: ?*TlsTransport = if (tls_t) |*tt| tt else null;
 
-    // Opportunistic DoT to authoritatives (RFC 9539) skips PKI verification by
-    // design; no CA bundle needed. The TlsTransport is wired regardless so the
-    // recursor can probe encrypted NSes when --opportunistic is set.
-    var tls_t = TlsTransport.init(allocator, .{
-        .server_name = null,
-        .strict = false,
-    }, .empty, io);
-
-    // Cache: 16MB cap, 10k max entries
-    const cache_alloc = if (builtin.single_threaded)
-        allocator
-    else
-        std.heap.smp_allocator;
-    hark.cache.randomizeHashSeed(io);
-    var cache = RRsetCache.init(.{ .backing = cache_alloc, .max_bytes = 16 * 1024 * 1024, .max_entries = 10_000, .io = io });
-    defer cache.deinit();
-
-    // DNS message data uses arena
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var enc_ns = EncryptedNsCache.init(allocator, io);
-    var enc_pool = ConnectionPool.init(allocator, io);
-    defer {
-        enc_ns.awaitProbes();
-        enc_pool.deinit();
-        enc_ns.deinit();
-    }
-
-    if (opportunistic) tls_t.pool = &enc_pool;
-
-    var rtt_cache = RttCache.init(.{ .allocator = allocator, .io = io });
-    defer rtt_cache.deinit();
-
-    var resolver = RecursiveResolver{
-        .transports = .{
-            .udp = &t,
-            .tcp_enabled = true,
-            .tls = if (opportunistic) &tls_t else null,
-        },
-        .cache = &cache,
-        .qname_minimization = !no_qmin,
-        .dnssec_enabled = dnssec_enabled,
-        .dnssec_aware = dnssec_enabled,
-        .rtt_cache = &rtt_cache,
-        .encrypted_ns_cache = if (opportunistic) &enc_ns else null,
-        .io = io,
-    };
+    var resolver = RecursiveResolver.fromContext(
+        server.resolverContext(),
+        .{ .udp = &t, .tcp_enabled = true, .tls = tls_ptr },
+        .{},
+    );
     const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
         log.err("query failed: {s}", .{@errorName(err)});
         std.process.exit(1);
