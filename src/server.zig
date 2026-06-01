@@ -44,6 +44,20 @@ const build_options = @import("build_options");
 
 const log = std.log.scoped(.server);
 
+/// Bytes as binary kibibytes, for human-readable cache logging.
+fn asKiB(bytes: usize) u64 {
+    return @as(u64, bytes) / 1024;
+}
+
+/// Response rcode as a leading-space-prefixed tag, or "" when NOERROR — the
+/// common case, kept off the per-query log line so it isn't repeated endlessly.
+fn rcodeSuffix(rcode: dns.RCode, buf: []u8) []const u8 {
+    if (rcode == .no_error) return "";
+    var tmp: [24]u8 = undefined;
+    const tag = dns.safeTagName(dns.RCode, rcode, &tmp);
+    return std.fmt.bufPrint(buf, " {s}", .{tag}) catch tag;
+}
+
 /// Parse the test-harness clock-advance control qname. Returns the number
 /// of seconds to advance, or null if the qname doesn't match. Format:
 /// `_advance-clock.<seconds>.testharness.invalid` (server layer strips the
@@ -698,8 +712,8 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, stats.memory_bytes, stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats: {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
+            stats.entries, asKiB(stats.memory_bytes), stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
@@ -1032,8 +1046,8 @@ const WorkerState = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache: {d} entries, {d}/{d} bytes, {d}% hit rate, {d} evictions ({d} cap-exhausted, {d} byte-pressure)", .{
-            stats.entries, stats.memory_bytes, stats.max_bytes, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions,
+        log.info("cache: {d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
+            stats.entries, asKiB(stats.memory_bytes), asKiB(stats.max_bytes), hit_pct, stats.evictions,
         });
     }
 
@@ -1092,12 +1106,17 @@ const WorkerState = struct {
         var last_stats_ns: i128 = monotonic.nowNs();
         const stats_interval_ns: i128 = 60 * std.time.ns_per_s;
 
+        // The cache is shared per-process, so every worker would log identical
+        // stats. Only the main worker (the one holding the signalfd) emits the
+        // periodic line, keeping it to one entry per interval.
+        const log_stats = sig_fd >= 0;
+
         while (!self.shutdown.load(.acquire)) {
             const results = self.loop.tick(&completions) catch break;
 
             // Periodic cache stats logging
             const now_ns = monotonic.nowNs();
-            if (now_ns - last_stats_ns >= stats_interval_ns) {
+            if (log_stats and now_ns - last_stats_ns >= stats_interval_ns) {
                 self.logCacheStats();
                 last_stats_ns = now_ns;
             }
@@ -1427,7 +1446,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
             var rcode_buf: [24]u8 = undefined;
-            log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), dns.safeTagName(dns.RCode, result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
+            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
 
             // RFC 7828: advertise our TCP idle timeout so the stub can
             // size its keepalive expectations. Units are 100 ms.
@@ -1618,7 +1637,7 @@ const WorkerState = struct {
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
-        log.debug("client={s} id=0x{x:0>4} {s} {s} {s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), dns.safeTagName(dns.RCode, result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
+        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
 
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
