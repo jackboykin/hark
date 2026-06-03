@@ -80,3 +80,50 @@ pub const CountingAllocator = struct {
         self.backing.rawFree(buf, alignment, ret_addr);
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "CountingAllocator: exact boundary, clean refusal, exact release" {
+    var ca = CountingAllocator.init(testing.allocator, 1024);
+    const a = ca.allocator();
+
+    const buf = try a.alloc(u8, 1024);
+    try testing.expectEqual(@as(usize, 1024), ca.current_bytes.load(.monotonic));
+
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    try testing.expectEqual(@as(usize, 1024), ca.current_bytes.load(.monotonic));
+
+    a.free(buf);
+    try testing.expectEqual(@as(usize, 0), ca.current_bytes.load(.monotonic));
+
+    const buf2 = try a.alloc(u8, 1024);
+    a.free(buf2);
+    try testing.expectEqual(@as(usize, 0), ca.current_bytes.load(.monotonic));
+}
+
+test "CountingAllocator: resize honors the cap and adjusts the counter both ways" {
+    // FBA backing makes an in-place grow of the last allocation deterministic.
+    var storage: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&storage);
+    var ca = CountingAllocator.init(fba.allocator(), 1024);
+    const a = ca.allocator();
+
+    var buf = try a.alloc(u8, 256);
+    try testing.expectEqual(@as(usize, 256), ca.current_bytes.load(.monotonic));
+
+    try testing.expect(a.resize(buf, 768));
+    buf.len = 768;
+    try testing.expectEqual(@as(usize, 768), ca.current_bytes.load(.monotonic));
+
+    try testing.expect(!a.resize(buf, 2048));
+    try testing.expectEqual(@as(usize, 768), ca.current_bytes.load(.monotonic));
+
+    try testing.expect(a.resize(buf, 128));
+    buf.len = 128;
+    try testing.expectEqual(@as(usize, 128), ca.current_bytes.load(.monotonic));
+
+    a.free(buf);
+    try testing.expectEqual(@as(usize, 0), ca.current_bytes.load(.monotonic));
+}

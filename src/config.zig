@@ -171,7 +171,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .dnssec = true,
         .qname_minimization = true,
         .case_randomization = true,
-        .query_memory_limit = 2 * 1024 * 1024,
+        .query_memory_limit = 256 * 1024,
         .opportunistic = false,
         // 2 workers is enough for most deployments. Each worker is one
         // io_uring ring; per-worker resolution-threads handle upstream

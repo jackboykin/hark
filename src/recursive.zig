@@ -223,7 +223,7 @@ pub const RecursiveResolver = struct {
     /// Persistent allocator for helper thread arenas (parallel NS resolution).
     gpa: ?mem.Allocator = null,
     /// Per-query memory cap in bytes (for helper thread arenas).
-    query_memory_limit: usize = 2 * 1024 * 1024,
+    query_memory_limit: usize = 256 * 1024,
     /// Staggered NS racing interval in ms (0 = disabled).
     stagger_ms: u32 = 0,
 
