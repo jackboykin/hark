@@ -10,8 +10,8 @@ const ArrayList = std.ArrayList;
 /// Returns the field name for known values, or the numeric string for unknown ones.
 pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
     const info = @typeInfo(E).@"enum";
-    inline for (info.fields) |field| {
-        if (@intFromEnum(val) == field.value) return field.name;
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (@intFromEnum(val) == value) return name;
     }
     return std.fmt.bufPrint(buf, "{d}", .{@intFromEnum(val)}) catch "?";
 }
