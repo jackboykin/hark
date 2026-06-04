@@ -222,8 +222,11 @@ pub const RecursiveResolver = struct {
     tcp_pool: ?*TcpConnectionPool = null,
     /// Persistent allocator for helper thread arenas (parallel NS resolution).
     gpa: ?mem.Allocator = null,
-    /// Per-query memory cap in bytes (for helper thread arenas).
-    query_memory_limit: usize = 256 * 1024,
+    /// Per-resolution memory cap: the main query arena and each NS-fanout
+    /// helper arena independently. Above legitimate signed traffic (~350 KiB),
+    /// below the 2 MiB wire ceiling (32 upstream × 64 KiB) — a stuffing
+    /// tripwire. Mirrors config.zig defaultConfig.
+    query_memory_limit: usize = 1024 * 1024,
     /// Staggered NS racing interval in ms (0 = disabled).
     stagger_ms: u32 = 0,
 
@@ -2494,11 +2497,10 @@ pub const RecursiveResolver = struct {
             dotted_names[ni] = try nameToDotted(allocator, ns_names[ni]);
         }
 
-        // One shared CountingAllocator caps the helpers' combined memory at
-        // query_memory_limit. Without sharing, each helper had its own cap and
-        // a single user query could allocate task_n × limit.
-        var helpers_cap = CountingAllocator.init(self.gpa.?, self.query_memory_limit);
-
+        // Each helper builds its OWN per-resolution cap in run() (gpa+mem_limit).
+        // A shared cap split query_memory_limit across the concurrent helpers,
+        // starving each to limit/task_n and SERVFAIL'ing ordinary signed domains.
+        // Caps are transient — each freed at its thread's join.
         var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
         var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
 
@@ -2520,7 +2522,8 @@ pub const RecursiveResolver = struct {
                 .ns_dotted = dotted_names[ni],
                 .rtype = address_rtypes[ri],
                 .depth = depth,
-                .shared_cap = &helpers_cap,
+                .gpa = self.gpa.?,
+                .mem_limit = self.query_memory_limit,
             };
             threads[i] = std.Thread.spawn(.{ .stack_size = 1 << 20 }, NsTaskCtx.run, .{&task_ctxs[i]}) catch null;
         }
@@ -2577,7 +2580,8 @@ pub const RecursiveResolver = struct {
         ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
-        shared_cap: *CountingAllocator,
+        gpa: mem.Allocator,
+        mem_limit: usize,
         addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
         oom: bool = false,
@@ -2591,7 +2595,8 @@ pub const RecursiveResolver = struct {
                 .tls = ctx.parent.transports.?.tls,
             });
 
-            var arena = std.heap.ArenaAllocator.init(ctx.shared_cap.allocator());
+            var cap = CountingAllocator.init(ctx.gpa, ctx.mem_limit);
+            var arena = std.heap.ArenaAllocator.init(cap.allocator());
             defer arena.deinit();
 
             resolver.resolveNsNameOne(

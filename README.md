@@ -81,7 +81,7 @@ qname-minimization = true
 case-randomization = true     # 0x20 query-name casing
 opportunistic = false         # encrypt to authoritatives when possible
 stagger-ms = 150              # nameserver racing delay; 0 disables
-query-memory-limit = 262144   # per-query memory cap, bytes
+query-memory-limit = 1048576  # per-resolution memory cap, bytes
 
 [rebinding]
 enabled = true                # scrub private addresses from public-zone answers

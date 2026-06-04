@@ -171,7 +171,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .dnssec = true,
         .qname_minimization = true,
         .case_randomization = true,
-        .query_memory_limit = 256 * 1024,
+        .query_memory_limit = 1024 * 1024,
         .opportunistic = false,
         // 2 workers is enough for most deployments. Each worker is one
         // io_uring ring; per-worker resolution-threads handle upstream
@@ -287,7 +287,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
         if (try nonNegativeClamped(usize, resolver, "query-memory-limit")) |val| {
             if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
-            cfg.query_memory_limit = val;
+            // 0 = unlimited. Resolve the sentinel here so every cap site (worker
+            // arena, NS-fanout helpers, bg-prefetch) honors it uniformly.
+            cfg.query_memory_limit = if (val == 0) std.math.maxInt(usize) else val;
         }
         if (try nonNegativeClamped(u32, resolver, "stagger-ms")) |v| cfg.stagger_ms = @min(v, 1000);
     }
