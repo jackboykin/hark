@@ -140,7 +140,7 @@ pub const TlsTransport = struct {
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
         conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
             .rng = rng_impl.interface(),
-            .now = Io.Timestamp.now(self.io, .real),
+            .now = monotonic.wallclockTimestamp(self.io),
             .host = host,
             .root_ca = root_ca,
             .insecure_skip_verify = host.len == 0,
@@ -341,7 +341,7 @@ fn skipIfNotLinux() !void {
 /// test if the host has none. Caller owns the returned bundle.
 fn loadSystemCaBundleOrSkip(io: Io) !Certificate.Bundle {
     var ca_bundle: Certificate.Bundle = .empty;
-    ca_bundle.rescan(testing.allocator, io, Io.Timestamp.now(io, .real)) catch return error.SkipZigTest;
+    ca_bundle.rescan(testing.allocator, io, monotonic.wallclockTimestamp(io)) catch return error.SkipZigTest;
     return ca_bundle;
 }
 
@@ -352,7 +352,7 @@ fn captureClientHello(io: Io, host: []const u8, out: []u8) !usize {
     var sc_buf: [tls.max_ciphertext_record_len]u8 = undefined;
     var cli = tls.nonblock.Client.init(.{
         .rng = rng_impl.interface(),
-        .now = Io.Timestamp.now(io, .real),
+        .now = monotonic.wallclockTimestamp(io),
         .root_ca = .empty,
         .host = host,
         .insecure_skip_verify = true,

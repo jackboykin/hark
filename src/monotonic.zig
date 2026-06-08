@@ -55,3 +55,10 @@ pub fn wallclockSec() i64 {
     const base: i64 = if (linux.errno(linux.clock_gettime(.REALTIME, &ts)) == .SUCCESS) ts.sec else 0;
     return base + testOffsetSec();
 }
+
+/// Wall-clock `Io.Timestamp`, offset by the synthetic test clock so DoT
+/// cert-validity / CA-bundle expiry advance under `STEP n TIME_PASSES`. Use
+/// this, not a raw `Io.Timestamp.now`, for scenario-advanceable reads.
+pub fn wallclockTimestamp(io: std.Io) std.Io.Timestamp {
+    return std.Io.Timestamp.now(io, .real).addDuration(.fromSeconds(testOffsetSec()));
+}

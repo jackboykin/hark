@@ -525,7 +525,7 @@ pub const Server = struct {
         var ca_bundle: Certificate.Bundle = .empty;
         errdefer ca_bundle.deinit(allocator);
         if (cfg.opportunistic) {
-            ca_bundle.rescan(allocator, io, Io.Timestamp.now(io, .real)) catch |err| {
+            ca_bundle.rescan(allocator, io, monotonic.wallclockTimestamp(io)) catch |err| {
                 log.err("failed to load CA certificates: {s}", .{@errorName(err)});
                 return err;
             };
