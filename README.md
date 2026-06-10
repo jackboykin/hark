@@ -63,45 +63,10 @@ hark dump < packet.bin
 
 ## Configuration
 
-Every key is optional, and every value shown *is* its default, so this snippet
-is a no-op — set only what you want to change.
-
-```toml
-[server]
-listen = ["127.0.0.1:53", "[::1]:53"]
-allow-from = []               # client CIDR allowlist; empty = allow all
-workers = 2                   # raise for high QPS
-resolution-threads = 4        # upstream query threads per worker
-max-udp-payload = 1232        # advertised EDNS0 buffer size
-minimal-responses = true      # strip non-load-bearing authority/additional RRs
-
-[resolver]
-dnssec = true
-qname-minimization = true
-case-randomization = true     # 0x20 query-name casing
-opportunistic = false         # encrypt to authoritatives when possible
-stagger-ms = 150              # nameserver racing delay; 0 disables
-query-memory-limit = 1048576  # per-resolution memory cap, bytes
-
-[rebinding]
-enabled = true                # scrub private addresses from public-zone answers
-allow-zones = []              # owner names exempt from scrubbing (split-horizon)
-extra-block = []              # additional CIDRs to scrub
-extra-allow = []              # CIDRs to exempt from scrubbing
-
-[cache]
-size = 16777216               # answer cache, bytes
-entries = 10000               # answer cache, max entries
-key-cache-size = 4194304      # DNSSEC key cache, bytes
-key-cache-entries = 2000      # DNSSEC key cache, max entries
-prefetch = false              # refresh entries before they expire
-prefetch-cousin = true        # fetch the matching A/AAAA alongside
-serve-stale-ttl = 0           # serve expired answers for N seconds
-min-ttl = 0                   # floor for very short TTLs
-
-[logging]
-queries = false               # log every query
-```
+Every key is optional and the defaults hold for most deployments. The full
+annotated reference — every key at its default — ships as
+[`hark.toml.example`](hark.toml.example). Unknown keys and wrong-typed values
+are rejected at startup.
 
 ## Design
 

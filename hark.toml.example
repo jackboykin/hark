@@ -1,0 +1,49 @@
+# hark configuration — install as /etc/hark/hark.toml
+#
+# Every key is optional and every value shown is its default, so this file
+# as-is is a no-op: set only what you want to change. Unknown keys and
+# wrong-typed values are rejected at startup — hark refuses to run on a
+# config it only half-understood.
+
+[server]
+listen = ["127.0.0.1:53", "[::1]:53"]
+allow-from = []               # client CIDR allowlist; empty = allow all.
+                              # Required when binding non-loopback (BCP 140).
+workers = 2                   # io_uring rings; raise for high QPS
+resolution-threads = 4        # upstream query threads per worker
+max-udp-payload = 1232        # advertised EDNS0 buffer size
+minimal-responses = true      # strip non-load-bearing authority/additional RRs
+tcp-idle-timeout-ms = 5000    # close idle TCP clients (RFC 7766 §6.2.1)
+tcp-queries-per-conn = 128    # queries per TCP connection before close
+upstream-tcp-idle-sec = 30    # idle timeout for pooled upstream TCP/DoT conns
+# user = 65534                # numeric uid to drop to after binding :53
+# group = 65534               # numeric gid; names need NSS — pass resolved ids
+
+[resolver]
+dnssec = true
+qname-minimization = true     # RFC 9156
+case-randomization = true     # 0x20 query-name casing
+opportunistic = false         # encrypted transport to authoritatives (RFC 9539)
+stagger-ms = 150              # nameserver racing delay; 0 disables
+query-memory-limit = 1048576  # per-resolution memory cap, bytes; 0 = unlimited
+root-hints = []               # override IANA roots ("ip" or "ip:port");
+                              # empty = compiled-in defaults
+
+[cache]
+size = 16777216               # answer cache, bytes
+entries = 10000               # answer cache, max entries
+key-cache-size = 4194304      # DNSSEC key cache, bytes
+key-cache-entries = 2000      # DNSSEC key cache, max entries
+prefetch = false              # refresh popular entries before they expire
+prefetch-cousin = true        # fetch the matching A/AAAA alongside
+serve-stale-ttl = 0           # serve expired answers for N seconds
+min-ttl = 0                   # floor for very short TTLs
+
+[rebinding]
+enabled = true                # scrub private addresses from public-zone answers
+allow-zones = []              # owner names exempt from scrubbing (split-horizon)
+extra-block = []              # additional CIDRs to scrub
+extra-allow = []              # CIDRs to exempt (e.g. ["127.0.0.0/8"] for DNSBLs)
+
+[logging]
+queries = false               # log every query
