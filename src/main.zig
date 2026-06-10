@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const hark = @import("hark");
 const dns = hark.dns;
 const dns_print = hark.dns_print;
@@ -78,6 +79,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
         return;
+    } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-V")) {
+        var stdout_buf: [64]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+        stdout_writer.interface.print("hark {s}\n", .{build_options.version}) catch std.process.exit(1);
+        stdout_writer.interface.flush() catch std.process.exit(1);
+        return;
     } else if (std.mem.eql(u8, command, "dump")) {
         return runDump(allocator, io);
     } else if (std.mem.eql(u8, command, "query")) {
@@ -100,6 +107,7 @@ fn printUsage() void {
         \\  query <name> [type] [options]
         \\                      Resolve a DNS query recursively
         \\  serve [options]     Start DNS server
+        \\  version             Print version
         \\
         \\Query options:
         \\  --opportunistic     Opportunistic encryption to authoritatives (RFC 9539)

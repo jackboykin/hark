@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "testing_enabled", testing_enabled);
     build_opts.addOption(bool, "queue_instr", queue_instr);
+    build_opts.addOption([]const u8, "version", zon.version);
     const build_options_mod = build_opts.createModule();
 
     const tls_mod = b.addModule("tls", .{
@@ -38,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "hark", .module = mod },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
     });
