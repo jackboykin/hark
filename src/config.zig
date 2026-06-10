@@ -10,6 +10,14 @@ const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const build_options = @import("build_options");
 
+/// Error variants can't carry the offending key name, so log it at rejection
+/// time. Silent under test: the schema tests trigger these intentionally and
+/// the test runner fails on error-level logs.
+fn errLog(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    std.log.err(fmt, args);
+}
+
 // ── ServerConfig ───────────────────────────────────────────────────────
 
 pub const ServerConfig = struct {
@@ -136,6 +144,9 @@ pub const ConfigError = error{
     InvalidAclEntry,
     /// Operator set a key gated behind `-Dtesting=true` in a production build.
     TestOnlyConfigKey,
+    /// Key or section not in the schema — almost always a typo. Fail loud
+    /// rather than silently serve with the default.
+    UnknownConfigKey,
     ConfigFileTooLarge,
     OutOfMemory,
 };
@@ -200,6 +211,98 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     };
 }
 
+// ── Schema ─────────────────────────────────────────────────────────────
+// Every key the parser reads, with its expected TOML type — validated before
+// parsing so a typo'd key or wrong-typed value (`dnssec = "true"`) errors
+// instead of silently keeping the default. Test-only keys are listed too;
+// their `-Dtesting` gate stays in the parser for the distinct error.
+
+const KeySpec = struct { name: []const u8, kind: std.meta.Tag(toml.Value) };
+const SectionSpec = struct { name: []const u8, keys: []const KeySpec };
+
+const config_schema = [_]SectionSpec{
+    .{ .name = "server", .keys = &.{
+        .{ .name = "listen", .kind = .string_array },
+        .{ .name = "workers", .kind = .integer },
+        .{ .name = "resolution-threads", .kind = .integer },
+        .{ .name = "max-udp-payload", .kind = .integer },
+        .{ .name = "user", .kind = .integer },
+        .{ .name = "group", .kind = .integer },
+        .{ .name = "allow-from", .kind = .string_array },
+        .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
+        .{ .name = "tcp-queries-per-conn", .kind = .integer },
+        .{ .name = "upstream-tcp-idle-sec", .kind = .integer },
+        .{ .name = "minimal-responses", .kind = .boolean },
+    } },
+    .{ .name = "resolver", .keys = &.{
+        .{ .name = "root-hints", .kind = .string_array },
+        .{ .name = "upstream-port", .kind = .integer },
+        .{ .name = "allow-loopback-upstreams", .kind = .boolean },
+        .{ .name = "trust-anchors", .kind = .string_array },
+        .{ .name = "dnssec", .kind = .boolean },
+        .{ .name = "qname-minimization", .kind = .boolean },
+        .{ .name = "case-randomization", .kind = .boolean },
+        .{ .name = "opportunistic", .kind = .boolean },
+        .{ .name = "query-memory-limit", .kind = .integer },
+        .{ .name = "stagger-ms", .kind = .integer },
+    } },
+    .{ .name = "cache", .keys = &.{
+        .{ .name = "size", .kind = .integer },
+        .{ .name = "entries", .kind = .integer },
+        .{ .name = "key-cache-size", .kind = .integer },
+        .{ .name = "key-cache-entries", .kind = .integer },
+        .{ .name = "prefetch", .kind = .boolean },
+        .{ .name = "prefetch-cousin", .kind = .boolean },
+        .{ .name = "serve-stale-ttl", .kind = .integer },
+        .{ .name = "min-ttl", .kind = .integer },
+    } },
+    .{ .name = "logging", .keys = &.{
+        .{ .name = "queries", .kind = .boolean },
+    } },
+    .{ .name = "rebinding", .keys = &.{
+        .{ .name = "enabled", .kind = .boolean },
+        .{ .name = "allow-zones", .kind = .string_array },
+        .{ .name = "extra-block", .kind = .string_array },
+        .{ .name = "extra-allow", .kind = .string_array },
+    } },
+};
+
+fn validateSchema(root: toml.Table) ConfigError!void {
+    var sections = root.map.iterator();
+    while (sections.next()) |entry| {
+        const section_name = entry.key_ptr.*;
+        const spec = for (config_schema) |s| {
+            if (mem.eql(u8, s.name, section_name)) break s;
+        } else {
+            errLog("config: unknown section [{s}]", .{section_name});
+            return error.UnknownConfigKey;
+        };
+        const table = switch (entry.value_ptr.*) {
+            .table => |t| t,
+            else => {
+                errLog("config: top-level key '{s}' — every setting lives under a [section]", .{section_name});
+                return error.UnknownConfigKey;
+            },
+        };
+        var keys = table.map.iterator();
+        while (keys.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const kspec = for (spec.keys) |k| {
+                if (mem.eql(u8, k.name, key)) break k;
+            } else {
+                errLog("config: unknown key '{s}' in [{s}]", .{ key, section_name });
+                return error.UnknownConfigKey;
+            };
+            if (kv.value_ptr.* != kspec.kind) {
+                errLog("config: [{s}] {s} expects {s}, got {s}", .{
+                    section_name, key, @tagName(kspec.kind), @tagName(kv.value_ptr.*),
+                });
+                return error.InvalidValue;
+            }
+        }
+    }
+}
+
 // ── Parser ─────────────────────────────────────────────────────────────
 
 fn nonNegativeClamped(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
@@ -211,6 +314,8 @@ fn nonNegativeClamped(comptime T: type, table: toml.Table, key: []const u8) Conf
 pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
     var parsed = try toml.parse(allocator, contents);
     defer parsed.deinit();
+
+    try validateSchema(parsed.table);
 
     var cfg = try defaultConfig(allocator);
     errdefer cfg.deinit();
@@ -690,6 +795,41 @@ test "rebinding rejects empty / root zone in allow_zones (would silently disable
     try testing.expectError(error.InvalidAclEntry, parseConfig(testing.allocator,
         \\[rebinding]
         \\extra-block = ["not-a-cidr"]
+    ));
+}
+
+test "unknown key rejected, not silently ignored" {
+    try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
+        \\[server]
+        \\worker = 4
+    ));
+    try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
+        \\[resolvers]
+        \\dnssec = true
+    ));
+    // Underscore instead of dash — the most likely real-world typo.
+    try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
+        \\[resolver]
+        \\qname_minimization = false
+    ));
+    // Top-level key outside any section.
+    try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
+        \\dnssec = true
+    ));
+}
+
+test "wrong-typed key rejected, default must not silently win" {
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\dnssec = "true"
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[rebinding]
+        \\allow-zones = "homelab.lan"
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\workers = "2"
     ));
 }
 
