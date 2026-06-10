@@ -645,7 +645,7 @@ pub const Server = struct {
         for (listen_addrs) |addr| {
             var addr_buf: [64]u8 = undefined;
             const addr_str = na.format(addr, &addr_buf);
-            log.info("listening on {s} (UDP+TCP)", .{addr_str});
+            log.info("binding {s} (UDP+TCP)", .{addr_str});
         }
 
         // Fail closed: a non-loopback recursive bind without an explicit ACL
