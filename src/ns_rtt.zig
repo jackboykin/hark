@@ -149,7 +149,7 @@ pub const RttCache = struct {
             };
         } else {
             // RFC 6298 EWMA update
-            const delta = @as(i64, @intCast(@abs(gop.value_ptr.srtt_us - rtt_us)));
+            const delta: i64 = @intCast(@abs(gop.value_ptr.srtt_us - rtt_us));
             gop.value_ptr.rttvar_us = 3 * @divTrunc(gop.value_ptr.rttvar_us, 4) + @divTrunc(delta, 4);
             gop.value_ptr.srtt_us = 7 * @divTrunc(gop.value_ptr.srtt_us, 8) + @divTrunc(rtt_us, 8);
             gop.value_ptr.consecutive_timeouts = 0;

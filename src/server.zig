@@ -11,7 +11,6 @@ const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const OperationId = @import("event_loop.zig").OperationId;
 const recursive = @import("recursive.zig");
-const RecursiveResolver = recursive.RecursiveResolver;
 const acl = @import("acl.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
 const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
@@ -1850,7 +1849,7 @@ fn classifySignalRead(result: anytype) SignalAction {
 
 fn makeWakeEventFd() !posix.fd_t {
     const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
-    const sr = @as(isize, @bitCast(rc));
+    const sr: isize = @bitCast(rc);
     if (sr < 0) return error.EventFdFailed;
     return @intCast(sr);
 }

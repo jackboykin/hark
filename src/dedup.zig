@@ -82,9 +82,7 @@ pub const InFlightTable = struct {
     allocator: mem.Allocator,
 
     pub fn init(allocator: mem.Allocator, io: std.Io) InFlightTable {
-        var shards: [shard_count]Shard = undefined;
-        for (&shards) |*s| s.* = .{};
-        return .{ .shards = shards, .io = io, .allocator = allocator };
+        return .{ .shards = @splat(.{}), .io = io, .allocator = allocator };
     }
 
     pub fn deinit(self: *InFlightTable) void {
