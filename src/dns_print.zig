@@ -85,9 +85,7 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
                 try writer.print("{x:0>2}{x:0>2}", .{ addr[i * 2], addr[i * 2 + 1] });
             }
         },
-        .ns => |name| try printName(name, writer),
-        .cname => |name| try printName(name, writer),
-        .ptr => |name| try printName(name, writer),
+        .ns, .cname, .ptr => |name| try printName(name, writer),
         .mx => |mx| {
             try writer.print("{d} ", .{mx.preference});
             try printName(mx.exchange, writer);

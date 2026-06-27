@@ -691,7 +691,6 @@ pub const Server = struct {
             // Main thread runs a worker too, with signalfd for shutdown
             self.runWorker(listen_addrs, sig_fd, self.wake_fds[workers - 1], true);
 
-            // Join all worker threads
             for (threads) |t| t.join();
         }
 
@@ -1834,11 +1833,9 @@ fn setupSignalFd() !posix.fd_t {
     linux.sigaddset(&mask, linux.SIG.USR1);
 
     // Block signals so they arrive via signalfd
-    // SIG_BLOCK = 0 on Linux x86_64
-    _ = linux.sigprocmask(0, &mask, null);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
 
-    const SFD_NONBLOCK: u32 = 0o4000;
-    return posix.signalfd(-1, &mask, SFD_NONBLOCK);
+    return posix.signalfd(-1, &mask, linux.SFD.NONBLOCK);
 }
 
 const SignalAction = enum { stats, shutdown };
@@ -1867,10 +1864,8 @@ fn classifySignalRead(result: anytype) SignalAction {
     return if (saw_stats) .stats else .shutdown;
 }
 
-const EFD_NONBLOCK: u32 = 0o4000;
-
 fn makeWakeEventFd() !posix.fd_t {
-    const rc = linux.eventfd(0, EFD_NONBLOCK);
+    const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
     const sr = @as(isize, @bitCast(rc));
     if (sr < 0) return error.EventFdFailed;
     return @intCast(sr);
@@ -1932,8 +1927,7 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 fn isLinuxIoUringAvailable() bool {
-    if (comptime @import("builtin").os.tag != .linux) return false;
-    return true;
+    return builtin.os.tag == .linux;
 }
 
 test "server init and deinit" {
@@ -2078,7 +2072,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
 
     // Simulate a cached-and-returned message where the resolver did NOT
     // set ad=true (because security_status was .unchecked at lookup time —
-    // recursive.zig:182 computes `ad = h.security_status == .secure`).
+    // recursive.zig sets `ad = security_status == .secure`).
     const response_unchecked = dns.Message{
         .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
         .questions = &.{},

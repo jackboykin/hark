@@ -236,8 +236,7 @@ const cloneName = dns.cloneName;
 
 /// Apply min-TTL floor and max-TTL cap.
 fn clampTtl(min_ttl: u32, ttl: u32) u32 {
-    const effective = if (min_ttl > 0) @max(ttl, min_ttl) else ttl;
-    return @min(effective, max_cache_ttl);
+    return @min(@max(ttl, min_ttl), max_cache_ttl);
 }
 
 /// Clone cached records into caller-owned ResourceRecords with a given TTL.
@@ -795,11 +794,11 @@ pub const RRsetCache = struct {
         now: i64,
         disable_stale: bool,
     ) ?struct { remaining_ttl: u32, needs_prefetch: bool, force_unchecked: bool, is_stale: bool } {
+        const cs = &self.read_counters[threadCounterSlot()];
         if (now < expires_at) {
             const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
             const remaining = original_ttl - elapsed;
             const needs_prefetch = self.prefetch and (remaining <= original_ttl / 10);
-            const cs = &self.read_counters[threadCounterSlot()];
             _ = cs.hits.fetchAdd(1, .monotonic);
             if (needs_prefetch) _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
             return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false, .is_stale = false };
@@ -807,10 +806,9 @@ pub const RRsetCache = struct {
         if (disable_stale or self.serve_stale_ttl == 0 or (now - expires_at) >= self.serve_stale_ttl) {
             // Deferred eviction: under shared read lock we cannot mutate the map;
             // expired entries linger until the next write path calls evictIfNeeded.
-            _ = self.read_counters[threadCounterSlot()].misses.fetchAdd(1, .monotonic);
+            _ = cs.misses.fetchAdd(1, .monotonic);
             return null;
         }
-        const cs = &self.read_counters[threadCounterSlot()];
         _ = cs.hits.fetchAdd(1, .monotonic);
         _ = cs.stale_hits.fetchAdd(1, .monotonic);
         _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
@@ -2534,7 +2532,7 @@ test ".unchecked store does not downgrade fresh .secure positive" {
 
 test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
     // A previously .secure entry must not be dropped by a subsequent
-    // SERVFAIL store — hasProtectedPositive guards against downgrade by
+    // SERVFAIL store — shouldBlockOverwrite guards against downgrade by
     // a stale/injected negative. This is the counterpart invariant to
     // the preceding test: the bg-validation invalidation path only wins
     // against .unchecked, never against already-validated data.

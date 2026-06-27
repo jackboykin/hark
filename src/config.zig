@@ -508,10 +508,8 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     const alg_int = std.fmt.parseInt(u8, alg_str, 10) catch return error.InvalidValue;
     const dtype_int = std.fmt.parseInt(u8, dtype_str, 10) catch return error.InvalidValue;
     // Reject unknown algorithm/digest-type at parse time. Both enums are
-    // open (`_` trailing) so a typo in test configs would otherwise reach
-    // the validator and surface as a cryptic SERVFAIL instead of a clear
-    // config error.
-    // Both enums are open (`_` trailing) so @enumFromInt accepts any u8;
+    // open (`_` trailing) so @enumFromInt accepts any u8; an unchecked typo
+    // would surface as a cryptic SERVFAIL instead of a clear config error.
     // tagName returns null for values that don't match a named variant —
     // the cheapest known-variant check for this shape.
     const algorithm: dns.DnssecAlgorithm = @enumFromInt(alg_int);
@@ -587,7 +585,7 @@ fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port
     return addrs;
 }
 
-pub fn parseAddress(s: []const u8, default_port: u16) ?Address {
+fn parseAddress(s: []const u8, default_port: u16) ?Address {
     // IPv6 with brackets: [::1]:53 or [::1]
     if (s.len > 0 and s[0] == '[') {
         const close = mem.indexOfScalar(u8, s, ']') orelse return null;

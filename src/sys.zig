@@ -147,7 +147,6 @@ pub fn read(fd: posix.fd_t, buf: []u8) !usize {
 }
 
 pub fn open(path: [*:0]const u8, flags: std.posix.O, mode: std.posix.mode_t) !posix.fd_t {
-    // Use openat with AT.FDCWD
     const rc = linux.openat(@bitCast(@as(i32, linux.AT.FDCWD)), path, flags, mode);
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),

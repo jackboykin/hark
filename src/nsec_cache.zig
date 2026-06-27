@@ -41,9 +41,6 @@ fn freeRecord(alloc: Allocator, rr: *dns.ResourceRecord) void {
 // ── Zone NSEC list ────────────────────────────────────────────────────
 // Sorted by canonical name order for binary search.
 
-const cloneSoaRecord = cloneRecord;
-const freeSoaRecord = freeRecord;
-
 const ZoneNsecList = struct {
     entries: []NsecEntry,
     len: usize,
@@ -57,7 +54,7 @@ const ZoneNsecList = struct {
     fn deinit(self: *ZoneNsecList, alloc: Allocator) void {
         for (self.entries[0..self.len]) |*e| freeEntry(alloc, e);
         alloc.free(self.entries);
-        if (self.soa) |*s| freeSoaRecord(alloc, s);
+        if (self.soa) |*s| freeRecord(alloc, s);
     }
 
     /// Insert maintaining sorted order. Replaces existing entry with same owner.
@@ -376,7 +373,7 @@ pub const NsecCache = struct {
         if (clone_count == 0) return;
 
         // Clone SOA outside lock for synthesized responses (RFC 2308 §3)
-        var cached_soa: ?dns.ResourceRecord = if (soa_rr) |sr| cloneSoaRecord(alloc, sr) catch null else null;
+        var cached_soa: ?dns.ResourceRecord = if (soa_rr) |sr| cloneRecord(alloc, sr) catch null else null;
 
         // Take write lock only for zone lookup + sorted insert
         if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
@@ -384,11 +381,11 @@ pub const NsecCache = struct {
 
         const list = self.getOrCreateZone(alloc, zone_lower) orelse {
             for (cloned[0..clone_count]) |*e| freeEntry(alloc, e);
-            if (cached_soa) |*s| freeSoaRecord(alloc, s);
+            if (cached_soa) |*s| freeRecord(alloc, s);
             return;
         };
         if (cached_soa) |soa| {
-            if (list.soa) |*old| freeSoaRecord(alloc, old);
+            if (list.soa) |*old| freeRecord(alloc, old);
             list.soa = soa;
             cached_soa = null; // ownership transferred
         }
@@ -530,7 +527,7 @@ pub const NsecCache = struct {
                 return null;
             },
         };
-        const soa = cloneSoaRecord(caller_alloc, cached_soa.*) catch return null;
+        const soa = cloneRecord(caller_alloc, cached_soa.*) catch return null;
         const proofs = cloneProofs(caller_alloc, proof_refs[0..proof_ref_count], now);
         _ = self.hits.fetchAdd(1, .monotonic);
         return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len, .proofs = proofs };
@@ -697,7 +694,7 @@ fn testCache(alloc: Allocator) NsecCache {
 }
 
 fn freeSynth(alloc: Allocator, r: *SynthResult) void {
-    freeSoaRecord(alloc, &r.soa);
+    freeRecord(alloc, &r.soa);
     for (r.proofs) |*p| freeRecord(alloc, p);
     if (r.proofs.len > 0) alloc.free(r.proofs);
 }
@@ -1196,7 +1193,7 @@ test "NSEC cache: wildcard NODATA synthesis" {
     // Zone has: example.com NSEC *.example.com, *.example.com NSEC z.example.com
     // Wildcard exists with A and MX but NOT TXT
     const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A, NS
+    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A, MX
     const soa_rr = try testSoa(alloc);
     defer freeSoa(alloc, soa_rr);
     const apex_owner = try dns.parseDottedName(alloc, "example.com");
@@ -1226,7 +1223,7 @@ test "NSEC cache: wildcard match returns wildcard_match" {
 
     // Wildcard has A (bitmap includes type 1)
     const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A=1, NS=2 present
+    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A=1, MX=15 present
     const soa_rr = try testSoa(alloc);
     defer freeSoa(alloc, soa_rr);
     const apex_owner = try dns.parseDottedName(alloc, "example.com");

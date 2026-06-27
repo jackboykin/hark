@@ -38,7 +38,9 @@ const hedge_multiplier: u32 = 3;
 /// track upward on route changes that move the path's true floor.
 const hedge_decay_ms: i64 = 30_000;
 
+/// Cold-start hedge stagger used when no min_rtt sample exists yet.
 const hedge_cold_default_ms: u32 = initial_timeout_ms / 4;
+/// Absolute ceiling on the hedge stagger.
 const max_hedge_stagger_ms: u32 = 300;
 
 // ── RttState ─────────────────────────────────────────────────────────

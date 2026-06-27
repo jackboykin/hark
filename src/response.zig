@@ -591,7 +591,7 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
     // Build an answer section that includes RRSIG — would need stripping for
-    // a non-DO client, which forces stripDnssecRRs to allocate.
+    // a non-DO client, which forces filterRecords to allocate.
     const a_rdata = dns.RData{ .a = .{ 192, 0, 2, 1 } };
     const rrsig_rdata = dns.RData{ .rrsig = .{
         .type_covered = .a,
@@ -633,7 +633,7 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
         .answers = answers,
     };
 
-    // FailingAllocator with budget 0 fails every allocation; stripDnssecRRs
+    // FailingAllocator with budget 0 fails every allocation; filterRecords
     // must surface OOM as a null response, not return the unfiltered slice.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var buf: [dns.max_udp_payload]u8 = undefined;

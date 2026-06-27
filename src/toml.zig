@@ -113,7 +113,6 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
         if (line.len == 0) continue;
 
         if (line[0] == '[') {
-            // Section header
             const close = mem.indexOfScalar(u8, line, ']') orelse return error.InvalidSyntax;
             if (close == 1) return error.InvalidBareKey; // empty section name
             const section_name = mem.trim(u8, line[1..close], &std.ascii.whitespace);
@@ -136,7 +135,6 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             try root.map.put(allocator, duped_name, empty_table);
             current_section = duped_name;
         } else {
-            // Key = value
             const eq_pos = mem.indexOfScalar(u8, line, '=') orelse return error.InvalidSyntax;
             const raw_key = mem.trim(u8, line[0..eq_pos], &std.ascii.whitespace);
             const raw_val = mem.trim(u8, line[eq_pos + 1 ..], &std.ascii.whitespace);
@@ -219,7 +217,6 @@ fn parseValue(allocator: Allocator, raw: []const u8) ParseError!Value {
 fn parseString(allocator: Allocator, raw: []const u8) ParseError![]const u8 {
     if (raw.len < 2 or raw[0] != '"') return error.InvalidSyntax;
 
-    // Find closing quote
     var result = std.ArrayList(u8).empty;
     defer result.deinit(allocator);
 

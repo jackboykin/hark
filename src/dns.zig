@@ -28,7 +28,7 @@ pub fn hasTcBit(bytes: []const u8) bool {
 // ── Constants ──────────────────────────────────────────────────────────
 
 pub const max_label_len = 63;
-pub const max_label_count = 127; // max_name_len / (1 label byte + 1 char) = 127
+pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
@@ -1300,9 +1300,7 @@ pub const Serializer = struct {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
-            .ns => |name| try self.writeName(name),
-            .cname => |name| try self.writeName(name),
-            .ptr => |name| try self.writeName(name),
+            .ns, .cname, .ptr => |name| try self.writeName(name),
             .mx => |mx| {
                 try self.writeU16(mx.preference);
                 try self.writeName(mx.exchange);
@@ -2321,9 +2319,7 @@ pub fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
 pub fn freeRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa => {},
-        .ns => |name| freeName(allocator, name),
-        .cname => |name| freeName(allocator, name),
-        .ptr => |name| freeName(allocator, name),
+        .ns, .cname, .ptr => |name| freeName(allocator, name),
         .mx => |mx| freeName(allocator, mx.exchange),
         .soa => |soa| {
             freeName(allocator, soa.mname);
@@ -2493,9 +2489,7 @@ fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
 pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
     switch (rdata.*) {
         .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
-        .ns => |*n| n.* = try cloneNameLower(allocator, n.*),
-        .cname => |*n| n.* = try cloneNameLower(allocator, n.*),
-        .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
+        .ns, .cname, .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
         .mx => |*m| m.exchange = try cloneNameLower(allocator, m.exchange),
         .soa => |*s| {
             s.mname = try cloneNameLower(allocator, s.mname);

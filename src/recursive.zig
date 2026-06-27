@@ -138,7 +138,7 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 
     // `@constCast` is sound — parseMessage returns ArrayList-backed
     // mutable storage typed `[]const`. The pre-scrub label bytes alias
-    // the upstream wire buffer; cloneNameFlatLower's arena allocation
+    // the upstream wire buffer; cloneNameLower's arena allocation
     // replaces them.
     inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
         for (@constCast(section)) |*rr| {
@@ -453,8 +453,8 @@ pub const RecursiveResolver = struct {
                     try cname_chain.records.append(allocator, dispatch.cname_rr);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
-                    // Mirror the upstream branch (lines 794-796): re-resolve
-                    // the target with fresh security state, but preserve
+                    // Mirror the upstream CNAME branch: re-resolve the
+                    // target with fresh security state, but preserve
                     // .insecure so an unauthenticated cached CNAME can't
                     // launder AD onto downstream answers.
                     if (security_state != .insecure) {
@@ -2695,12 +2695,12 @@ pub const RecursiveResolver = struct {
         const cache = self.cache orelse return null;
 
         // Split into labels
-        var parts: [128][]const u8 = undefined;
+        var parts: [dns.max_label_count + 1][]const u8 = undefined;
         var part_count: usize = 0;
         var iter = mem.splitScalar(u8, target_name, '.');
         while (iter.next()) |part| {
             if (part.len == 0) continue;
-            if (part_count >= 128) break;
+            if (part_count >= dns.max_label_count + 1) break;
             parts[part_count] = part;
             part_count += 1;
         }

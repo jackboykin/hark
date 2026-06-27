@@ -7,8 +7,8 @@ const mem = std.mem;
 const sys = @import("sys.zig");
 const rand = @import("rand.zig");
 
-/// Hash seed randomized at startup so an authoritative serving crafted glue
-/// addresses can't engineer bucket collisions against `RttCache` /
+/// Hash seed randomized at startup so an authoritative server serving crafted
+/// glue addresses can't engineer bucket collisions against `RttCache` /
 /// `NsSelector`. Stays 0 in tests (deterministic); production calls
 /// `randomizeHashSeed`.
 var hash_seed: u64 = 0;

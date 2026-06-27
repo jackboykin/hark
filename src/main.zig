@@ -48,11 +48,9 @@ fn logFn(
     @memcpy(buf[pos..][0..level_prefix.len], level_prefix);
     pos += level_prefix.len;
 
-    // Message
     const msg = std.fmt.bufPrint(buf[pos..], format ++ "\n", args) catch return;
     pos += msg.len;
 
-    // Write to stderr
     std.debug.print("{s}", .{buf[0..pos]});
 }
 
@@ -192,13 +190,10 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         }
     }
 
-    // Reuse Server.init so the one-shot resolver is wired exactly like
-    // `serve`: caches, NS selector, DNSSEC/opportunistic state, staggered NS
-    // racing, and the parallel-fanout allocator all flow from the same config
-    // path through `fromContext` — the single source of truth for field
-    // mapping. This keeps `query` a faithful mirror of production resolution
-    // instead of a hand-rolled subset that silently drifts. Sockets are bound
-    // only by `run()`, never by `init`.
+    // Reuse Server.init/fromContext so one-shot `query` is wired exactly like
+    // `serve` (caches, NS selector, DNSSEC, opportunistic, fanout) from the
+    // same config path, instead of a hand-rolled subset that silently drifts.
+    // init never binds sockets; only run() does.
     var cfg = hark.config.parseConfig(allocator, "") catch |err| {
         log.err("building default config: {s}", .{@errorName(err)});
         std.process.exit(1);

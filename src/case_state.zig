@@ -19,7 +19,7 @@ const max_entries: usize = 4096;
 pub const CaseState = struct {
     entries: std.AutoHashMap(AddressKey, i64),
     /// Lock-free fast path for the steady state (no servers ever marked).
-    /// Increments after the first markBroken; never decrements.
+    /// Set true on the first markBroken; never cleared.
     has_entries: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     io: std.Io,

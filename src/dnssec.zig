@@ -114,7 +114,7 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
 /// Find a DNSKEY in a set that matches a DS record.
 /// Returns the matching DNSKEY and its index, or null.
 /// Uses pre-computed key tags to avoid redundant keyTag() calls.
-pub fn findMatchingDnskey(
+fn findMatchingDnskey(
     ds: dns.DsData,
     dnskeys: []const dns.ResourceRecord,
     owner_name: dns.Name,
@@ -325,7 +325,7 @@ pub fn classifyDelegation(
 
 /// Compute the key tag for a DNSKEY record per RFC 4034 Appendix B.
 /// The key tag is a checksum over the DNSKEY RDATA wire format.
-pub fn keyTag(dnskey: dns.DnskeyData) u16 {
+fn keyTag(dnskey: dns.DnskeyData) u16 {
     var ac: u32 = 0;
 
     // DNSKEY RDATA wire: flags(2) + protocol(1) + algorithm(1) + public_key
@@ -350,7 +350,7 @@ pub fn keyTag(dnskey: dns.DnskeyData) u16 {
 
 /// Write a name in canonical (lowercase, uncompressed) wire format.
 /// Returns the number of bytes written.
-pub fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
+fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
     var pos: usize = 0;
     for (name.labels) |label| {
         if (pos + 1 + label.len > buf.len) return error.BufferTooSmall;
@@ -371,7 +371,7 @@ pub fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!u
 
 /// Verify a DS record against a DNSKEY record.
 /// Computes hash(canonical_owner_wire || DNSKEY_RDATA) and compares to DS digest.
-pub fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) VerifyError!void {
+fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) VerifyError!void {
     // Build: canonical_owner_wire || DNSKEY_RDATA
     var wire_buf: [1024]u8 = undefined;
     const name_len = writeCanonicalNameWire(&wire_buf, owner_name) catch return error.BufferTooSmall;
@@ -429,7 +429,7 @@ fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!u
 
 /// Build the signed data for RRSIG verification.
 /// Returns a slice of the buffer containing: RRSIG_RDATA(sans signature) || sorted_canonical_RRset
-pub fn buildSignedData(
+fn buildSignedData(
     buf: []u8,
     rrsig: dns.RrsigData,
     rrset: []const dns.ResourceRecord,
@@ -602,7 +602,7 @@ fn tryVerifyRrsig(
 }
 
 /// Verify an RRSIG signature against a DNSKEY and RRset.
-pub fn verifyRrsig(
+fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
     rrset: []const dns.ResourceRecord,
@@ -655,7 +655,6 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     var exp_len: usize = key_data[0];
     var offset: usize = 1;
     if (exp_len == 0) {
-        if (key_data.len < 3) return error.InvalidKey;
         exp_len = @as(usize, key_data[1]) << 8 | key_data[2];
         offset = 3;
     }
@@ -844,7 +843,7 @@ pub fn nsecProvesNameNonexistence(
 /// have followed it. (When qtype itself is CNAME, only that absence
 /// matters; the dual check would be self-redundant.) Mirrors the NSEC3
 /// NODATA path in validateNegativeProofNsec3.
-pub fn nsecProvesTypeNonexistence(
+fn nsecProvesTypeNonexistence(
     nsec_owner: dns.Name,
     nsec: dns.NsecData,
     qname: dns.Name,
@@ -880,7 +879,7 @@ fn nsec3Flood(authorities: []const dns.ResourceRecord) bool {
 
 /// Compute NSEC3 hash: iterated SHA-1 over canonical_name_wire || salt.
 /// Returns the raw hash bytes (20 bytes for SHA-1).
-pub fn nsec3Hash(
+fn nsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
@@ -908,7 +907,7 @@ pub fn nsec3Hash(
 }
 
 /// Check if hash falls within the NSEC3 range (owner_hash, next_hashed_owner).
-pub fn nsec3HashInRange(
+fn nsec3HashInRange(
     owner_hash: []const u8,
     next_hash: []const u8,
     target_hash: []const u8,
@@ -924,7 +923,7 @@ pub fn nsec3HashInRange(
 
 /// Extract the raw hash from an NSEC3 owner name by base32hex-decoding its first label.
 /// Returns null if the label length is wrong or contains invalid characters.
-pub fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
+fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     if (name.labels.len == 0) return null;
     const label = name.labels[0];
     if (label.len != 32) return null; // SHA-1 = 20 bytes = 32 base32hex chars
@@ -961,7 +960,7 @@ pub fn budgetedNsec3Hash(
 
 /// Check if a response mixes NSEC and NSEC3 from the same zone.
 /// Returns true if mixed (should reject the proof).
-pub fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
+fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
     var has_nsec = false;
     var has_nsec3 = false;
     for (authorities) |rr| {

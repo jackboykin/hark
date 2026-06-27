@@ -66,7 +66,6 @@ const Slot = struct {
 
     // Multishot recvmsg owns msghdr (kernel reads namelen/iovlen at
     // submit time). accept/read own addr and recv_buf respectively.
-    iov: [1]posix.iovec,
     addr: na.PosixAddress,
     addr_len: posix.socklen_t,
     msghdr: posix.msghdr,
@@ -77,7 +76,6 @@ const Slot = struct {
             .kind = .recv_multi,
             .context = undefined,
             .active = false,
-            .iov = undefined,
             .addr = undefined,
             .addr_len = 0,
             .msghdr = undefined,

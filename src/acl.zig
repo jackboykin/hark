@@ -71,6 +71,12 @@ pub fn allow(entries: []const Cidr, addr: na.Address) bool {
     return false;
 }
 
+/// Network-mask byte for a partial-byte prefix: the top `rem` bits set
+/// (`rem` in 1..7). Used to compare/zero a CIDR's boundary byte.
+fn netmaskByte(rem: u3) u8 {
+    return ~(@as(u8, 0xFF) >> rem);
+}
+
 fn prefixMatch(addr: []const u8, network: []const u8, prefix: u8) bool {
     std.debug.assert(addr.len == network.len);
     const full = prefix / 8;
@@ -78,8 +84,7 @@ fn prefixMatch(addr: []const u8, network: []const u8, prefix: u8) bool {
     if (!mem.eql(u8, addr[0..full], network[0..full])) return false;
     const rem: u3 = @intCast(prefix % 8);
     if (rem == 0) return true;
-    const shift: u4 = @as(u4, 8) - @as(u4, rem);
-    const mask: u8 = @truncate(@as(u16, 0xFF) << shift);
+    const mask = netmaskByte(rem);
     return (addr[full] & mask) == (network[full] & mask);
 }
 
@@ -90,9 +95,7 @@ fn normalizeInPlace(buf: []u8, prefix: u8) void {
         if (rem == 0) {
             for (buf[full..]) |*b| b.* = 0;
         } else {
-            const shift: u4 = @as(u4, 8) - @as(u4, rem);
-            const mask: u8 = @truncate(@as(u16, 0xFF) << shift);
-            buf[full] &= mask;
+            buf[full] &= netmaskByte(rem);
             for (buf[full + 1 ..]) |*b| b.* = 0;
         }
     }

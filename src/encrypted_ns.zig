@@ -8,7 +8,7 @@ const BumpGatedGroup = @import("bg_group.zig");
 
 /// How long a hard-failed probe is damped (1 hour). Hard failures are
 /// definitive signals the server does not speak DoT — TLS handshake
-/// rejection, ALPN mismatch, cert validation in strict mode.
+/// rejection or ALPN mismatch.
 const damping_sec: i64 = 3600;
 
 /// How long a soft-failed probe is damped (60 s). Soft failures are
@@ -24,7 +24,6 @@ const persistence_sec: i64 = 3 * 24 * 3600;
 /// How long a .probing entry is valid before expiring to .unknown (RFC 9539 §4.2).
 const probe_timeout_sec: i64 = 30;
 
-/// Maximum number of cached entries.
 const max_entries: usize = 256;
 
 /// Maximum concurrent background probe threads.

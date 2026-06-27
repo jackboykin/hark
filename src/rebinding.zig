@@ -77,7 +77,7 @@ pub const Config = struct {
 
 /// Returns true if this RR should be dropped from the answer section.
 /// Inspects only A and AAAA; every other rtype passes through.
-pub fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
+fn shouldDrop(rr: dns.ResourceRecord, cfg: Config) bool {
     if (!cfg.enabled) return false;
     // Allowlist walk is per-RR; skip when no zones configured (the
     // default deployment) so the hot path stays one branch + a switch.
@@ -183,7 +183,7 @@ fn logScrub(rr: dns.ResourceRecord) void {
 /// address for both extras — keeps `extra_allow = ["127.0.0.0/8"]` honest
 /// when an AAAA-flavoured DNSBL returns a mapped 127.0.0.x. Mirrors the
 /// recursion `matchesDefault` already does for the built-in v4 set.
-pub fn isPrivate(bytes: []const u8, cfg: Config) bool {
+fn isPrivate(bytes: []const u8, cfg: Config) bool {
     const mapped_v4: ?*const [4]u8 = if (bytes.len == 16 and isIp4Mapped(bytes))
         bytes[12..16]
     else

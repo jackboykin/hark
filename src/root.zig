@@ -25,6 +25,7 @@ pub const net_address = @import("net_address.zig");
 pub const special_use = @import("special_use.zig");
 pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
+pub const response = @import("response.zig");
 
 // Explicit per-file imports drive test discovery by reachability, so tests run
 // regardless of pub-ness — unlike refAllDecls, which sees only pub decls (a
