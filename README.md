@@ -28,7 +28,7 @@ zig build
 zig build test
 zig build bench                                # microbenchmarks; ReleaseFast
 zig build bench -- cache_hit                   # filter to matching names
-zig build -Doptimize=ReleaseSafe -Dcpu=native  # host-tuned release
+zig build -Doptimize=ReleaseSafe               # release
 ```
 
 The binary is written to `zig-out/bin/hark`. `zig build test` covers the Zig
