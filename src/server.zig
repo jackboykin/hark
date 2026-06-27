@@ -31,7 +31,6 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const Transports = recursive.Transports;
-const Certificate = std.crypto.Certificate;
 const na = @import("net_address.zig");
 const response = @import("response.zig");
 const ResponseContext = response.ResponseContext;
@@ -435,7 +434,6 @@ pub const Server = struct {
     rtt_cache: RttCache,
     ns_selector: NsSelector,
     dedup: ?InFlightTable,
-    ca_bundle: Certificate.Bundle,
     encrypted_ns_cache: ?EncryptedNsCache,
     case_state: ?CaseState,
     enc_pool: ?ConnectionPool,
@@ -522,15 +520,6 @@ pub const Server = struct {
         });
         errdefer ns_selector.deinit();
 
-        var ca_bundle: Certificate.Bundle = .empty;
-        errdefer ca_bundle.deinit(allocator);
-        if (cfg.opportunistic) {
-            ca_bundle.rescan(allocator, io, monotonic.wallclockTimestamp(io)) catch |err| {
-                log.err("failed to load CA certificates: {s}", .{@errorName(err)});
-                return err;
-            };
-        }
-
         const work_queue = try allocator.create(WorkQueue);
         errdefer allocator.destroy(work_queue);
         work_queue.init(io);
@@ -543,7 +532,6 @@ pub const Server = struct {
             .rtt_cache = rtt_cache,
             .ns_selector = ns_selector,
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
-            .ca_bundle = ca_bundle,
             .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
             .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
@@ -592,8 +580,9 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        // awaitProbes MUST precede ca_bundle.deinit: each probe holds a
-        // by-value TlsTransport whose ca_bundle slices alias this owner.
+        // awaitProbes/awaitAll MUST precede pool + cache teardown: each probe
+        // holds a by-value TlsTransport that stores into self.enc_pool and the
+        // encrypted-NS cache.
         self.bg_tasks.awaitAll(self.io);
         if (self.encrypted_ns_cache) |*oc| {
             oc.awaitProbes();
@@ -601,9 +590,6 @@ pub const Server = struct {
         }
         if (self.case_state) |*cs| cs.deinit();
         if (self.enc_pool) |*pool| pool.deinit();
-        if (self.config.opportunistic) {
-            self.ca_bundle.deinit(self.allocator);
-        }
         if (self.dedup) |*d| d.deinit();
         if (self.nsec_cache) |*nc| nc.deinit();
         if (self.key_cache) |*kc| kc.deinit();
@@ -847,7 +833,6 @@ pub const Server = struct {
             .udp_queue_drops = &self.udp_queue_drops,
             .tcp_queue_drops = &self.tcp_queue_drops,
             .udp_send_drops = &self.udp_send_drops,
-            .ca_bundle = self.ca_bundle,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
         };
@@ -958,7 +943,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     defer udp_t.deinit();
 
     var tls_t: ?TlsTransport = if (server.config.opportunistic) blk: {
-        var t = TlsTransport.init(server.allocator, .{}, server.ca_bundle, server.io);
+        var t = TlsTransport.init(server.allocator, server.io);
         if (server.enc_pool) |*pool| t.pool = pool;
         break :blk t;
     } else null;
@@ -1006,7 +991,6 @@ const WorkerState = struct {
     udp_queue_drops: *std.atomic.Value(u64),
     tcp_queue_drops: *std.atomic.Value(u64),
     udp_send_drops: *std.atomic.Value(u64),
-    ca_bundle: Certificate.Bundle,
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     max_tcp_clients: u32 = 0,
@@ -1510,7 +1494,7 @@ const WorkerState = struct {
         defer udp_t.deinit();
 
         var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
-            var t = TlsTransport.init(self.allocator, .{}, self.ca_bundle, self.io);
+            var t = TlsTransport.init(self.allocator, self.io);
             t.pool = self.enc_pool;
             break :blk t;
         } else null;

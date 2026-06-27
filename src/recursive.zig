@@ -1687,7 +1687,7 @@ pub const RecursiveResolver = struct {
 
                                 const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
                                 const ote_deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
-                                if (tls_t.queryOpportunistic(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
+                                if (tls_t.query(padded_query, server, tls_response_buf, ote_deadline_ns)) |tls_data| {
                                     if (try tryParseMessage(allocator, tls_data, server)) |tls_response| {
                                         if (tls_response.header.flags.qr and
                                             tls_response.header.flags.rcode != .format_error and

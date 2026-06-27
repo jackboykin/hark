@@ -213,7 +213,7 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     var t = BlockingUdpTransport.init(.{}, io);
     defer t.deinit();
     var tls_t: ?TlsTransport = if (opportunistic) blk: {
-        var tt = TlsTransport.init(allocator, .{}, server.ca_bundle, io);
+        var tt = TlsTransport.init(allocator, io);
         if (server.enc_pool) |*pool| tt.pool = pool;
         break :blk tt;
     } else null;

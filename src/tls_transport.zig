@@ -3,7 +3,6 @@ const posix = std.posix;
 const mem = std.mem;
 const Io = std.Io;
 const File = Io.File;
-const Certificate = std.crypto.Certificate;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("dns.zig");
@@ -22,25 +21,19 @@ const log = std.log.scoped(.tls_transport);
 /// RFC 9539 §4.4: DoT ALPN identifier ("dot").
 const alpn_dot = "dot";
 
-pub const TlsConfig = struct {
-    server_name: ?[]const u8 = null,
-    /// RFC 7858 strict mode: require hostname verification (server_name must be set).
-    strict: bool = false,
-};
-
+/// RFC 9539 opportunistic DoT transport: encrypts queries to authoritative
+/// servers over TLS (ALPN "dot", no SNI, no certificate verification),
+/// falling back to Do53 on any failure. Opportunistic is the only mode, so
+/// the query methods carry no qualifier.
 pub const TlsTransport = struct {
     pub const port: u16 = 853;
-    const connect_timeout_ms: u32 = 5000;
-    const response_timeout_ms: u32 = 10000;
 
     allocator: Allocator,
-    config: TlsConfig,
-    ca_bundle: Certificate.Bundle,
     io: Io,
     pool: ?*ConnectionPool = null,
 
-    pub fn init(allocator: Allocator, config: TlsConfig, ca_bundle: Certificate.Bundle, io: Io) TlsTransport {
-        return .{ .allocator = allocator, .config = config, .ca_bundle = ca_bundle, .io = io };
+    pub fn init(allocator: Allocator, io: Io) TlsTransport {
+        return .{ .allocator = allocator, .io = io };
     }
 
     /// Try a query on a pooled connection for `key`. Returns null if no pool,
@@ -56,31 +49,6 @@ pub const TlsTransport = struct {
             pool.release(key, conn, false);
             return null;
         }
-    }
-
-    pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8) ![]const u8 {
-        const tls_server = toPort(server, TlsTransport.port);
-        const key = AddressKey.fromAddress(tls_server);
-        const deadline_ns = monotonic.nowNs() + @as(i128, response_timeout_ms) * std.time.ns_per_ms;
-
-        if (self.tryPooledQuery(key, wire_query, response_buf, deadline_ns)) |data| return data;
-
-        // ── Establish new connection ──
-        const conn = try self.connectAndHandshake(tls_server);
-
-        const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
-            conn.destroyBroken(self.allocator);
-            return err;
-        };
-
-        if (self.pool) |pool| {
-            pool_mod.applyKeepaliveHint(conn, data);
-            pool.store(key, conn);
-        } else {
-            conn.closeAndDestroy(self.allocator);
-        }
-
-        return data;
     }
 
     /// Allocate a PooledConnection wired to `stream`. Caller must free via
@@ -106,62 +74,37 @@ pub const TlsTransport = struct {
         return conn;
     }
 
-    /// Establish a blocking TCP connection, perform TLS handshake,
-    /// and return a heap-allocated PooledConnection.
-    fn connectAndHandshake(self: *TlsTransport, tls_server: na.Address) !*PooledConnection {
-        // Config validation before any side effects. server_name must be a
-        // non-empty hostname: ianic skips hostname verification when host="",
-        // so a blank name would silently accept any cert from a trusted CA.
-        if (self.config.strict and self.config.server_name == null) {
-            return error.StrictModeRequiresHostname;
-        }
-        const server_name = self.config.server_name orelse return error.ServerNameRequired;
-        if (server_name.len == 0) return error.ServerNameRequired;
-
-        const stream = try connectTcpBlocking(self.io, tls_server, connect_timeout_ms);
-        errdefer stream.close(self.io);
-        sys.setSocketTimeouts(stream.socket.handle, response_timeout_ms);
-
-        const conn = try self.newPooledConnection(stream);
-        errdefer self.allocator.destroy(conn);
-
-        try self.handshake(conn, server_name, self.ca_bundle);
-        return conn;
-    }
-
-    /// Run the TLS handshake on `conn`. `host=""` selects opportunistic mode:
-    /// no SNI (vendored ianic patch elides the extension), no cert verification.
-    /// Otherwise authenticated mode: SNI sent, full chain + hostname verify.
-    /// ALPN advertises "dot" per RFC 9539 §4.4. The peer omitting the echo is
-    /// tolerated (Cloudflare / Google do this in violation of RFC 7301 §3.2);
-    /// a non-"dot" echo is rejected as a handshake failure — sending a
-    /// length-prefixed DNS frame to e.g. an h2 endpoint would corrupt state.
-    fn handshake(self: *TlsTransport, conn: *PooledConnection, host: []const u8, root_ca: Certificate.Bundle) !void {
+    /// Run the TLS handshake on `conn` (RFC 9539): no SNI (the
+    /// vendored ianic patch elides the extension for host=""), no cert
+    /// verification. ALPN advertises "dot" per §4.4. A peer omitting the echo
+    /// is tolerated (Cloudflare / Google do this in violation of RFC 7301
+    /// §3.2); a non-"dot" echo is rejected — sending a length-prefixed DNS
+    /// frame to e.g. an h2 endpoint would corrupt state.
+    fn handshake(self: *TlsTransport, conn: *PooledConnection) !void {
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
         conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
             .rng = rng_impl.interface(),
             .now = monotonic.wallclockTimestamp(self.io),
-            .host = host,
-            .root_ca = root_ca,
-            .insecure_skip_verify = host.len == 0,
+            .host = "",
+            .root_ca = .empty,
+            .insecure_skip_verify = true,
             .alpn_protocols = &.{alpn_dot},
         }) catch |err| {
-            log.debug("TLS handshake failed against {s}: {s}", .{ host, @errorName(err) });
+            log.debug("TLS handshake failed: {s}", .{@errorName(err)});
             return error.TlsHandshakeFailed;
         };
         if (conn.tls.alpn_protocol) |proto| {
             if (!std.mem.eql(u8, proto, alpn_dot)) {
-                log.warn("TLS ALPN mismatch against {s}: peer echoed {s}", .{ host, proto });
+                log.warn("TLS ALPN mismatch: peer echoed {s}", .{proto});
                 return error.TlsHandshakeFailed;
             }
         }
     }
 
-    /// RFC 9539 opportunistic encrypted query: ALPN "dot", no cert verification,
-    /// no SNI, immediate fallback on any failure. Tries pooled connection
-    /// first, pools new connections on success. `deadline_ns` is an absolute
-    /// monotonic deadline that bounds both connect and query.
-    pub fn queryOpportunistic(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+    /// Encrypted DoT query. Tries a pooled connection first, pools new
+    /// connections on success. `deadline_ns` is an absolute monotonic deadline
+    /// bounding both connect and query.
+    pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, deadline_ns: i128) ![]const u8 {
         const tls_server = toPort(server, TlsTransport.port);
         const addr_key = AddressKey.fromAddress(tls_server);
 
@@ -172,7 +115,7 @@ pub const TlsTransport = struct {
         if (remaining_ns <= 0) return error.Timeout;
         const connect_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
         const stream = try connectTcpBlocking(self.io, tls_server, connect_ms);
-        const conn = try self.initOpportunisticConnection(stream);
+        const conn = try self.initConnection(stream);
 
         const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
             conn.destroyBroken(self.allocator);
@@ -189,17 +132,15 @@ pub const TlsTransport = struct {
         return data;
     }
 
-    /// Allocate a PooledConnection from a connected stream and perform an
-    /// opportunistic TLS handshake (ALPN "dot", no cert, no SNI).
-    /// Takes ownership of `stream`: closes it on any failure path.
-    fn initOpportunisticConnection(self: *TlsTransport, stream: Io.net.Stream) !*PooledConnection {
+    /// Allocate a PooledConnection from a connected stream and perform the
+    /// TLS handshake. Takes ownership of `stream`: closes it on any failure.
+    fn initConnection(self: *TlsTransport, stream: Io.net.Stream) !*PooledConnection {
         errdefer stream.close(self.io);
         const conn = try self.newPooledConnection(stream);
         errdefer self.allocator.destroy(conn);
 
-        // RFC 9539 §4.6.3.3/4: no SNI, accept any cert. host="" selects
-        // opportunistic mode in handshake().
-        try self.handshake(conn, "", .empty);
+        // RFC 9539 §4.6.3.3/4: no SNI, accept any cert.
+        try self.handshake(conn);
         return conn;
     }
 
@@ -235,11 +176,8 @@ pub const TlsTransport = struct {
         }
         // Pass TlsTransport by value: the probe outlives the spawning
         // stack frame (pool / bg-prefetch) that holds the original
-        // `*TlsTransport`. Copying snaps the small handle (allocator /
-        // config / ca_bundle / io / pool ptr) into the spawned task's
-        // args. The Certificate.Bundle copy aliases byte slices owned by
-        // the caller; they must outlive every probe. Hark's main bundle
-        // is process-lifetime, so this holds.
+        // `*TlsTransport`. Copying snaps the small handle (allocator / io /
+        // pool ptr) into the spawned task's args.
         enc_ns_cache.probes.spawn(self.io, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
             // ConcurrencyUnavailable is transient (spawn pressure), not a
             // protocol failure — revert the .probing claim so the next
@@ -269,7 +207,7 @@ pub const TlsTransport = struct {
         };
 
         // ── TLS handshake ──
-        const conn = self.initOpportunisticConnection(stream) catch {
+        const conn = self.initConnection(stream) catch {
             enc_ns_cache.setStatus(addr_key, .failed);
             return;
         };
@@ -337,14 +275,6 @@ fn skipIfNotLinux() !void {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
 }
 
-/// Load the system CA bundle for an authenticated-mode test, or skip the
-/// test if the host has none. Caller owns the returned bundle.
-fn loadSystemCaBundleOrSkip(io: Io) !Certificate.Bundle {
-    var ca_bundle: Certificate.Bundle = .empty;
-    ca_bundle.rescan(testing.allocator, io, monotonic.wallclockTimestamp(io)) catch return error.SkipZigTest;
-    return ca_bundle;
-}
-
 /// Drive a single ClientHello from `tls.nonblock.Client` with the given host
 /// and return its raw bytes (writes into `out`). Used by the SNI patch tests.
 fn captureClientHello(io: Io, host: []const u8, out: []u8) !usize {
@@ -362,81 +292,11 @@ fn captureClientHello(io: Io, host: []const u8, out: []u8) !usize {
     return cr.send_pos;
 }
 
-test "TlsTransport query Cloudflare DoT 1.1.1.1:853" {
+test "TlsTransport query against 1.1.1.1:853" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    var ca_bundle = try loadSystemCaBundleOrSkip(io);
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .server_name = "one.one.one.one",
-    }, ca_bundle, io);
-
-    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a, .{});
-    defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [dns.max_udp_payload]u8 = undefined;
-    const wire_query = try dns.serializeMessage(&wire_buf, msg);
-
-    const server = na.initIp4(.{ 1, 1, 1, 1 }, 53); // port overridden to 853
-    var response_buf: [dns.max_message_len]u8 = undefined;
-
-    const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
-        else => return err,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const response = try dns.parseMessage(arena.allocator(), response_data);
-
-    try testing.expect(response.header.flags.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
-    try testing.expect(response.answers.len > 0);
-}
-
-test "TlsTransport query Google DoT 8.8.8.8:853" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var ca_bundle = try loadSystemCaBundleOrSkip(io);
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .server_name = "dns.google",
-    }, ca_bundle, io);
-
-    const msg = try dns.buildQuery(testing.allocator, 0x1234, "example.com", .a, .{});
-    defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [dns.max_udp_payload]u8 = undefined;
-    const wire_query = try dns.serializeMessage(&wire_buf, msg);
-
-    const server = na.initIp4(.{ 8, 8, 8, 8 }, 53);
-    var response_buf: [dns.max_message_len]u8 = undefined;
-
-    const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
-        else => return err,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const response = try dns.parseMessage(arena.allocator(), response_data);
-
-    try testing.expect(response.header.flags.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
-    try testing.expect(response.answers.len > 0);
-}
-
-test "TlsTransport queryOpportunistic against 1.1.1.1:853" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    // Opportunistic mode does not need a CA bundle (no cert verification).
-    var ca_bundle: Certificate.Bundle = .empty;
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{}, ca_bundle, io);
+    var tls_t = TlsTransport.init(testing.allocator, io);
 
     const msg = try dns.buildQuery(testing.allocator, 0xC0DE, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
@@ -447,7 +307,7 @@ test "TlsTransport queryOpportunistic against 1.1.1.1:853" {
     var response_buf: [dns.max_message_len]u8 = undefined;
     const deadline = monotonic.nowNs() + 10 * std.time.ns_per_s;
 
-    const response_data = tls_t.queryOpportunistic(wire_query, server, &response_buf, deadline) catch |err| switch (err) {
+    const response_data = tls_t.query(wire_query, server, &response_buf, deadline) catch |err| switch (err) {
         error.ConnectFailed, error.TlsHandshakeFailed, error.Timeout => return error.SkipZigTest,
         else => return err,
     };
@@ -465,15 +325,10 @@ test "TlsTransport connection pooling reuses connection" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    var ca_bundle = try loadSystemCaBundleOrSkip(io);
-    defer ca_bundle.deinit(testing.allocator);
-
     var pool = ConnectionPool.init(testing.allocator, io);
     defer pool.deinit();
 
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .server_name = "one.one.one.one",
-    }, ca_bundle, io);
+    var tls_t = TlsTransport.init(testing.allocator, io);
     tls_t.pool = &pool;
 
     const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a, .{});
@@ -485,8 +340,9 @@ test "TlsTransport connection pooling reuses connection" {
     var response_buf: [dns.max_message_len]u8 = undefined;
 
     // First query — establishes connection, stores in pool
-    _ = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed => return error.SkipZigTest,
+    const deadline1 = monotonic.nowNs() + 10 * std.time.ns_per_s;
+    _ = tls_t.query(wire_query, server, &response_buf, deadline1) catch |err| switch (err) {
+        error.ConnectFailed, error.TlsHandshakeFailed, error.Timeout => return error.SkipZigTest,
         else => return err,
     };
 
@@ -494,8 +350,9 @@ test "TlsTransport connection pooling reuses connection" {
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
 
     // Second query — should reuse pooled connection
-    const response_data = tls_t.query(wire_query, server, &response_buf) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed, error.TlsSendFailed, error.TlsRecvFailed => return error.SkipZigTest,
+    const deadline2 = monotonic.nowNs() + 10 * std.time.ns_per_s;
+    const response_data = tls_t.query(wire_query, server, &response_buf, deadline2) catch |err| switch (err) {
+        error.ConnectFailed, error.TlsHandshakeFailed, error.TlsSendFailed, error.TlsRecvFailed, error.Timeout => return error.SkipZigTest,
         else => return err,
     };
 
@@ -551,85 +408,6 @@ test "ianic SNI sanity: host=\"example.com\" includes server_name" {
     try testing.expect(clientHelloHasSni(buf[0..n]));
 }
 
-test "TlsTransport rejects empty server_name" {
-    const io = testing.io;
-    var ca_bundle: Certificate.Bundle = .empty;
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .server_name = "",
-    }, ca_bundle, io);
-
-    var wire_buf: [dns.edns_udp_payload]u8 = undefined;
-    var response_buf: [dns.max_message_len]u8 = undefined;
-    const server = na.initIp4(.{ 127, 0, 0, 1 }, 853);
-
-    try testing.expectError(error.ServerNameRequired, tls_t.query(&wire_buf, server, &response_buf));
-}
-
-test "TlsTransport strict mode without server_name fails fast" {
-    const io = testing.io;
-    var ca_bundle: Certificate.Bundle = .empty;
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .strict = true,
-        .server_name = null,
-    }, ca_bundle, io);
-
-    var wire_buf: [dns.max_udp_payload]u8 = undefined;
-    @memset(&wire_buf, 0);
-    var response_buf: [dns.max_message_len]u8 = undefined;
-
-    const server = na.initIp4(.{ 127, 0, 0, 1 }, 853);
-    try testing.expectError(error.StrictModeRequiresHostname, tls_t.query(&wire_buf, server, &response_buf));
-}
-
-// Real Cloudflare DoT, but advertise an SNI/verify name no public cert
-// could legitimately bear (.invalid is RFC 2606 reserved). Cloudflare's
-// chain validates fine; the hostname check inside cert verification must
-// reject it. Strict mode currently shares the cert-verify path, so the
-// strict variant is a documentation-of-intent assertion: it pins that
-// strict mode is at least as strict as default mode, ready to catch a
-// future divergence.
-fn runHostnameMismatchTest(strict: bool) !void {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var ca_bundle = try loadSystemCaBundleOrSkip(io);
-    defer ca_bundle.deinit(testing.allocator);
-
-    var tls_t = TlsTransport.init(testing.allocator, .{
-        .server_name = "definitely-not-cloudflare.invalid",
-        .strict = strict,
-    }, ca_bundle, io);
-
-    const msg = try dns.buildQuery(testing.allocator, 0xDEAD, "example.com", .a, .{});
-    defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [dns.max_udp_payload]u8 = undefined;
-    const wire_query = try dns.serializeMessage(&wire_buf, msg);
-
-    const server = na.initIp4(.{ 1, 1, 1, 1 }, 53);
-    var response_buf: [dns.max_message_len]u8 = undefined;
-
-    const result = tls_t.query(wire_query, server, &response_buf);
-    if (result) |_| {
-        return error.TestUnexpectedSuccess;
-    } else |err| switch (err) {
-        error.ConnectFailed => return error.SkipZigTest,
-        error.TlsHandshakeFailed => {}, // expected
-        else => return err,
-    }
-}
-
-test "TlsTransport authenticated mode rejects hostname mismatch" {
-    try runHostnameMismatchTest(false);
-}
-
-test "TlsTransport strict mode rejects hostname mismatch" {
-    try runHostnameMismatchTest(true);
-}
-
 test "probeInBackground reverts .probing when max_probes hit" {
     const io = testing.io;
     var enc_ns_cache = EncryptedNsCache.init(testing.allocator, io);
@@ -647,7 +425,7 @@ test "probeInBackground reverts .probing when max_probes hit" {
     enc_ns_cache.probes.active.store(encrypted_ns_mod.max_probes, .seq_cst);
 
     // probeInBackground should hit the max_probes guard and revert.
-    var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
+    var tls_t = TlsTransport.init(testing.allocator, testing.io);
     tls_t.probeInBackground(server, &enc_ns_cache);
 
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
@@ -668,7 +446,7 @@ test "probeThread reverts .probing on shutdown" {
     // Signal shutdown before spawning so tryClaim short-circuits
     enc_ns_cache.probes.shutting_down.store(true, .release);
 
-    var tls_t = TlsTransport.init(testing.allocator, .{}, .empty, testing.io);
+    var tls_t = TlsTransport.init(testing.allocator, testing.io);
     tls_t.probeInBackground(server, &enc_ns_cache);
 
     // Wait for the spawned probe to finish via the Group's await.
