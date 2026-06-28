@@ -1,9 +1,4 @@
 # hark configuration — install as /etc/hark/hark.toml
-#
-# Every key is optional and every value shown is its default, so this file
-# as-is is a no-op: set only what you want to change. Unknown keys and
-# wrong-typed values are rejected at startup — hark refuses to run on a
-# config it only half-understood.
 
 [server]
 listen = ["127.0.0.1:53", "[::1]:53"]

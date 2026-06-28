@@ -117,17 +117,13 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             if (close == 1) return error.InvalidBareKey; // empty section name
             const section_name = mem.trim(u8, line[1..close], &std.ascii.whitespace);
 
-            // Validate bare key chars
             if (!isValidBareKey(section_name)) return error.InvalidBareKey;
 
-            // Check for trailing garbage after ]
             const after_close = mem.trim(u8, line[close + 1 ..], &std.ascii.whitespace);
             if (after_close.len > 0) return error.InvalidSyntax;
 
-            // Check for duplicate section
             if (root.map.get(section_name)) |_| return error.DuplicateSection;
 
-            // Create section table
             const duped_name = try allocator.dupe(u8, section_name);
             errdefer allocator.free(duped_name);
 

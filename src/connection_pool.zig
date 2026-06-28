@@ -167,8 +167,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
 
             fn removeAt(self: *Slots, idx: u8) *Conn {
                 const evicted = self.items[idx];
-                var i: u8 = idx + 1;
-                while (i < self.len) : (i += 1) self.items[i - 1] = self.items[i];
+                for (idx + 1..self.len) |i| self.items[i - 1] = self.items[i];
                 self.len -= 1;
                 return evicted;
             }

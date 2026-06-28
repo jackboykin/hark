@@ -773,8 +773,7 @@ fn verifyEd25519(signature: []const u8, msg: []const u8, key_data: []const u8) V
 pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
     // Compare from the rightmost label
     const min_labels = @min(a.labels.len, b.labels.len);
-    var i: usize = 0;
-    while (i < min_labels) : (i += 1) {
+    for (0..min_labels) |i| {
         const a_idx = a.labels.len - 1 - i;
         const b_idx = b.labels.len - 1 - i;
         const cmp = cmpLabelsCI(a.labels[a_idx], b.labels[b_idx]);

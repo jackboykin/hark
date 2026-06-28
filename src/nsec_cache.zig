@@ -581,7 +581,6 @@ fn cloneProofs(alloc: Allocator, refs: []const *const NsecEntry, now: i64) []dns
     if (refs.len == 0) return &.{};
     var total: usize = 0;
     for (refs) |r| total += 1 + r.sigs.len;
-    if (total == 0) return &.{};
     const out = alloc.alloc(dns.ResourceRecord, total) catch return &.{};
     var pos: usize = 0;
     for (refs) |r| {

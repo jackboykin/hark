@@ -415,15 +415,13 @@ test "zone hash different zones differ" {
 
 test "beta sample in range" {
     // Draw many samples, all should be in (0, 1)
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
+    for (0..1000) |_| {
         const s = betaSample(testing.io, 1.0, 1.0);
         try testing.expect(s >= 0.0 and s <= 1.0);
     }
     // Skewed distribution: alpha >> beta → samples mostly near 1.0
     var sum: f32 = 0;
-    i = 0;
-    while (i < 1000) : (i += 1) {
+    for (0..1000) |_| {
         sum += betaSample(testing.io, 100.0, 1.0);
     }
     try testing.expect(sum / 1000.0 > 0.9);
