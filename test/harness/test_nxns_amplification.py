@@ -27,7 +27,15 @@ import dns.query
 import pytest
 
 from .hark_proc import HarkConfig, HarkProcess, find_hark_binary
-from .nxns_evil import ROOT_LABEL, EvilRoot
+from .nxns_evil import ROOT_LABEL, EvilRoot, decode
+
+
+def test_evil_decode_is_case_insensitive() -> None:
+    # hark 0x20-randomizes query case; a case-sensitive mock answers an
+    # uncounted authoritative NODATA that the resolver rightly caches,
+    # flaking the amplification test below (~20% of runs). See decode().
+    assert decode("N-0-3") == [0, 3]
+    assert decode("N") == []
 
 EVIL_IP = "127.0.0.1"
 EVIL_PORT = 18053

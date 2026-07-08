@@ -35,7 +35,17 @@ def child_label(path: list[int]) -> str:
 
 
 def decode(label: str) -> list[int] | None:
-    """Decode a zone label like 'n-0-3' -> [0, 3]; None if not ours."""
+    """Decode a zone label like 'n-0-3' -> [0, 3]; None if not ours.
+
+    Case-insensitive, like any real authoritative server (RFC 1034 §3.1):
+    hark 0x20-randomizes query names (draft-vixie-dnsext-dns0x20), so a
+    single-char label arrives as 'N' about half the time. A case-sensitive
+    compare would misclassify it as not-ours and answer an *uncounted*
+    authoritative NODATA — which the resolver rightly caches, zeroing
+    `total` and flaking the amplification test (~20% of runs, sticky
+    once cached).
+    """
+    label = label.lower()
     if label == ROOT_LABEL:
         return []
     if not label.startswith(ROOT_LABEL + "-"):
