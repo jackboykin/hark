@@ -7,7 +7,13 @@ const sys = @import("sys.zig");
 const log = std.log.scoped(.event_loop);
 
 pub const max_operations = 64;
-const recv_buf_size = 4096;
+
+/// Read ops serve only the signalfd and wake eventfd — the buffer needs
+/// room for a few packed signalfd_siginfo records (128 B each; signalfd
+/// coalesces per signo, and excess records stay queued in the fd until
+/// the op is re-armed), never packet data. UDP payloads ride the
+/// multishot buffer ring instead.
+const read_buf_size = 4 * @sizeOf(linux.signalfd_siginfo);
 
 /// Buffer group for multishot UDP recvmsg. 256 buffers × (header + name +
 /// payload) ≈ 1 MiB per worker. Sized to absorb short bursts without
@@ -51,35 +57,39 @@ pub const AcceptResult = struct {
 };
 
 pub const ReadResult = struct {
+    /// Aliases the op's slot buffer, which is recycled as soon as any new
+    /// op is armed: consume `data` before arming ops (arming can claim
+    /// this completion's freed slot even within the same batch).
     data: []const u8,
     err: ?anyerror,
 };
 
 // ── Operation slot ──────────────────────────────────────────────────────
 
-const OpKind = enum { recv_multi, accept, read };
-
 const Slot = struct {
-    kind: OpKind,
     context: *anyopaque,
     active: bool,
+    /// Kernel-visible per-kind storage: io_uring reads/writes through
+    /// pointers into the active variant while the op is in flight, so
+    /// the variant must stay untouched (and the slot unmoved) until its
+    /// CQE frees the slot.
+    state: State,
 
-    // Multishot recvmsg owns msghdr (kernel reads namelen/iovlen at
-    // submit time). accept/read own addr and recv_buf respectively.
-    addr: na.PosixAddress,
-    addr_len: posix.socklen_t,
-    msghdr: posix.msghdr,
-    recv_buf: [recv_buf_size]u8,
+    const State = union(enum) {
+        /// Multishot recvmsg owns msghdr (kernel reads namelen/iovlen at
+        /// submit time; payloads arrive via the buffer ring).
+        recv_multi: posix.msghdr,
+        /// accept owns the peer-address out-params the kernel fills.
+        accept: struct { addr: na.PosixAddress, addr_len: posix.socklen_t },
+        /// read owns a small buffer — signalfd/eventfd payloads only.
+        read: [read_buf_size]u8,
+    };
 
     fn init() Slot {
         return .{
-            .kind = .recv_multi,
             .context = undefined,
             .active = false,
-            .addr = undefined,
-            .addr_len = 0,
-            .msghdr = undefined,
-            .recv_buf = undefined,
+            .state = .{ .recv_multi = undefined },
         };
     }
 };
@@ -209,10 +219,10 @@ pub const EventLoop = struct {
         self.free_count += 1;
     }
 
-    fn initOp(self: *EventLoop, kind: OpKind, context: *anyopaque) !OperationId {
+    fn initOp(self: *EventLoop, state: Slot.State, context: *anyopaque) !OperationId {
         const id = self.allocSlot() orelse return error.TooManyOperations;
         const slot = &self.slots[id];
-        slot.kind = kind;
+        slot.state = state;
         slot.context = context;
         slot.active = true;
         return id;
@@ -223,28 +233,24 @@ pub const EventLoop = struct {
     /// Callers receive a `RecvResult` with `buf_id` set and MUST call
     /// `releaseBuf` after processing the payload.
     pub fn recvFromMulti(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.recv_multi, context);
-        errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-
         // msghdr configures the kernel's output layout. iov is ignored
         // (buffer selected from the ring). namelen/controllen tell the
         // kernel how many bytes to reserve for sender address / control
         // msgs; we reserve multishot_name_reserve (sockaddr_in6) and 0
         // control since DNS doesn't need CMSG.
-        slot.addr_len = multishot_name_reserve;
-        slot.msghdr = .{
+        const id = try self.initOp(.{ .recv_multi = .{
             .name = null,
-            .namelen = slot.addr_len,
+            .namelen = multishot_name_reserve,
             .iov = undefined,
             .iovlen = 0,
             .control = null,
             .controllen = 0,
             .flags = 0,
-        };
+        } }, context);
+        errdefer self.freeSlot(id);
 
         var sqe = try self.ring.get_sqe();
-        sqe.prep_recvmsg(fd, &slot.msghdr, 0);
+        sqe.prep_recvmsg(fd, &self.slots[id].state.recv_multi, 0);
         sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
         sqe.flags |= linux.IOSQE_BUFFER_SELECT;
         sqe.buf_index = self.udp_buf_ring.group_id;
@@ -265,27 +271,28 @@ pub const EventLoop = struct {
     pub fn stillArmed(self: *const EventLoop, op_id: ?OperationId) bool {
         const id = op_id orelse return false;
         const slot = &self.slots[id];
-        return slot.active and slot.kind == .recv_multi;
+        return slot.active and slot.state == .recv_multi;
     }
 
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.accept, context);
+        const id = try self.initOp(.{ .accept = .{
+            .addr = std.mem.zeroes(na.PosixAddress),
+            .addr_len = @sizeOf(na.PosixAddress),
+        } }, context);
         errdefer self.freeSlot(id);
-        const slot = &self.slots[id];
-        slot.addr = std.mem.zeroes(na.PosixAddress);
-        slot.addr_len = @sizeOf(na.PosixAddress);
+        const a = &self.slots[id].state.accept;
 
         var sqe = try self.ring.get_sqe();
-        sqe.prep_accept(listen_fd, @ptrCast(&slot.addr.any), &slot.addr_len, 0);
+        sqe.prep_accept(listen_fd, @ptrCast(&a.addr.any), &a.addr_len, 0);
         sqe.user_data = id;
         return id;
     }
 
     pub fn read(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.read, context);
+        const id = try self.initOp(.{ .read = undefined }, context);
         errdefer self.freeSlot(id);
         var sqe = try self.ring.get_sqe();
-        sqe.prep_read(fd, &self.slots[id].recv_buf, 0);
+        sqe.prep_read(fd, &self.slots[id].state.read, 0);
         sqe.user_data = id;
         return id;
     }
@@ -349,7 +356,7 @@ pub const EventLoop = struct {
             // the kernel will produce more CQEs for the same user_data.
             var free_after = true;
 
-            switch (slot.kind) {
+            switch (slot.state) {
                 .recv_multi => {
                     // When F_MORE is clear, the kernel has terminated the
                     // multishot (e.g. on ENOBUFS); the slot must be freed
@@ -378,11 +385,11 @@ pub const EventLoop = struct {
                         free_after = true;
                     }
                 },
-                .accept => {
+                .accept => |*a| {
                     if (cqe.res >= 0) {
                         completion.result = .{ .accept = .{
                             .fd = @intCast(cqe.res),
-                            .addr = na.fromSockaddr(&slot.addr),
+                            .addr = na.fromSockaddr(&a.addr),
                             .err = null,
                         } };
                     } else if (isCancelled(cqe)) {
@@ -399,11 +406,11 @@ pub const EventLoop = struct {
                         } };
                     }
                 },
-                .read => {
+                .read => |*rbuf| {
                     if (cqe.res > 0) {
                         const len: usize = @intCast(cqe.res);
                         completion.result = .{ .read = .{
-                            .data = slot.recv_buf[0..len],
+                            .data = rbuf[0..len],
                             .err = null,
                         } };
                     } else if (cqe.res == 0) {
@@ -487,6 +494,14 @@ fn createTestLoop() !*EventLoop {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
+}
+
+test "Slot stays lean — read ops must not drag packet-sized buffers back in" {
+    // The pre-union Slot carried a 4 KiB recv_buf in every slot whether
+    // the op needed it or not (~256 KiB/worker dead). Budget: the small
+    // read buffer plus header change. If this fires, some variant grew a
+    // packet-sized payload — packets belong in the multishot buffer ring.
+    try testing.expect(@sizeOf(Slot) <= read_buf_size + 64);
 }
 
 test "EventLoop create/destroy" {
