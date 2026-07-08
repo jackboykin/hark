@@ -2967,3 +2967,28 @@ test "storeOneRRset handles backing-allocator OOM without leaking" {
         try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
     }
 }
+
+test "cache key: read-side and write-side name lowering agree byte-for-byte" {
+    // Reads key the cache via lowerNameBuf over a formatInto-dotted string;
+    // writes key it via Name.formatLower over the label array
+    // (storeRRsetsExcept). One byte of disagreement lands stores under a
+    // key reads never hit — a silent cache miss, not a crash. Pin the
+    // agreement across the shapes that could plausibly diverge.
+    const names = [_]dns.Name{
+        .{ .labels = &.{ "ExAmPlE", "CoM" } }, // mixed case (0x20 echo)
+        .{ .labels = &.{ "WWW", "EXAMPLE", "COM" } },
+        .{ .labels = &.{ "xn--nxasmq6b", "example" } }, // punycode
+        .{ .labels = &.{ "_sip", "_tcp", "example", "com" } }, // SRV underscores
+        .{ .labels = &.{ "\x01\x7fBIN", "TeSt" } }, // non-printables -> '?'
+        .{ .labels = &.{} }, // root
+    };
+    for (names) |n| {
+        var fmt_buf: [dns.max_name_len + 1]u8 = undefined;
+        const dotted = n.formatInto(&fmt_buf);
+        var read_buf: [dns.max_name_len + 1]u8 = undefined;
+        const read_key = lowerNameBuf(&read_buf, dotted).?;
+        var write_buf: [dns.max_name_len + 1]u8 = undefined;
+        const write_key = n.formatLower(&write_buf);
+        try testing.expectEqualStrings(write_key, read_key);
+    }
+}
