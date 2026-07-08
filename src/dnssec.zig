@@ -111,25 +111,21 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
-/// Find a DNSKEY in a set that matches a DS record.
-/// Returns the matching DNSKEY and its index, or null.
-/// Uses pre-computed key tags to avoid redundant keyTag() calls.
+/// Find a DNSKEY in a set that matches a DS record, or null.
 fn findMatchingDnskey(
     ds: dns.DsData,
     dnskeys: []const dns.ResourceRecord,
     owner_name: dns.Name,
-    precomputed_tags: []const u16,
-) ?struct { dnskey: dns.DnskeyData, index: usize } {
-    for (dnskeys, 0..) |rr, i| {
+) ?dns.DnskeyData {
+    for (dnskeys) |rr| {
         if (rr.rtype != .dnskey) continue;
         const dk = rr.rdata.dnskey;
         if (!isValidZoneKey(dk)) continue;
-        const tag = if (i < precomputed_tags.len) precomputed_tags[i] else keyTag(dk);
-        if (tag != ds.key_tag) continue;
+        if (keyTag(dk) != ds.key_tag) continue;
         if (@intFromEnum(dk.algorithm) != @intFromEnum(ds.algorithm)) continue;
         // Verify DS hash matches
         verifyDs(ds, dk, owner_name) catch continue;
-        return .{ .dnskey = dk, .index = i };
+        return dk;
     }
     return null;
 }
@@ -169,14 +165,6 @@ pub fn validateDnskeyRrset(
     }
     const filtered = dnskey_only[0..dnskey_count];
 
-    // Pre-compute key tags to avoid redundant recomputation across nested loops.
-    var key_tags: [64]u16 = undefined;
-    for (dnskey_records, 0..) |rr, i| {
-        if (i >= key_tags.len) break;
-        key_tags[i] = if (rr.rtype == .dnskey) keyTag(rr.rdata.dnskey) else 0;
-    }
-    const tags = key_tags[0..@min(dnskey_records.len, key_tags.len)];
-
     // Try all DS records × all RRSIGs covering DNSKEY (RFC 6840 §5.11)
     outer: for (ds_records) |ds| {
         // RFC 6840 §5.2: if a SHA-256 DS covers the same key_tag, MUST NOT use SHA-1.
@@ -185,11 +173,8 @@ pub fn validateDnskeyRrset(
                 if (ds2.digest_type == .sha256 and ds2.key_tag == ds.key_tag) continue :outer;
             }
         }
-        if (findMatchingDnskey(ds, dnskey_records, zone_name, tags)) |ksk_match| {
-            const ksk = ksk_match.dnskey;
-            // findMatchingDnskey indexes the unfiltered dnskey_records, which may
-            // be longer than the 64-entry tag cache; recompute past the window.
-            const ksk_tag = if (ksk_match.index < tags.len) tags[ksk_match.index] else keyTag(ksk);
+        if (findMatchingDnskey(ds, dnskey_records, zone_name)) |ksk| {
+            const ksk_tag = keyTag(ksk);
             // Try every RRSIG covering DNSKEY
             for (dnskey_records) |rrsig_rr| {
                 if (rrsig_rr.rtype != .rrsig) continue;
@@ -203,12 +188,11 @@ pub fn validateDnskeyRrset(
                 }
 
                 // Fallback: signing key must be DS-authenticated (C2 fix)
-                for (dnskey_records, 0..) |rr, i| {
+                for (dnskey_records) |rr| {
                     if (rr.rtype != .dnskey) continue;
                     const dk = rr.rdata.dnskey;
                     if (!isValidZoneKey(dk)) continue;
-                    const dk_tag = if (i < tags.len) tags[i] else keyTag(dk);
-                    if (dk_tag != rrsig.key_tag) continue;
+                    if (keyTag(dk) != rrsig.key_tag) continue;
                     var ds_auth = false;
                     for (ds_records) |ds2| {
                         verifyDs(ds2, dk, zone_name) catch continue;
@@ -1595,10 +1579,10 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     );
 }
 
-test "validateDnskeyRrset tolerates a DS match past the 64-key tag window" {
-    // A hostile zone can serve >64 DNSKEYs over TCP. findMatchingDnskey indexes
-    // the unfiltered record slice, so the matched key can sit past the clamped
-    // 64-entry tag cache — the index must not read tags[] out of bounds.
+test "validateDnskeyRrset tolerates more DNSKEYs than the 64-key filter buffer" {
+    // A hostile zone can serve >64 DNSKEYs over TCP. The dnskey_only filter
+    // buffer clamps at 64 entries; the overflow key must be skipped cleanly,
+    // never written out of bounds.
     var digest = try testDsDigest(test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
@@ -1607,8 +1591,8 @@ test "validateDnskeyRrset tolerates a DS match past the 64-key tag window" {
         .digest = &digest,
     };
 
-    // Distinct-tag filler keys occupy the whole tag window; the DS-matching key
-    // lands at index 64, exactly one past it.
+    // Distinct-tag filler keys fill the buffer; the DS-matching key lands at
+    // index 64, exactly one past it.
     const filler = dns.DnskeyData{
         .flags = 257,
         .protocol = 3,
