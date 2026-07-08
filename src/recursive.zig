@@ -337,12 +337,12 @@ pub const RecursiveResolver = struct {
         if (self.query_budget) |qb| try qb.consume();
     }
 
-    /// The in-flight query's DNSSEC CPU budget. Non-null wherever crypto runs
+    /// The in-flight query's DNSSEC CPU budget. Set wherever crypto runs
     /// (every validation site is downstream of an upstream response, impossible
-    /// under cache-only); the assert guards that invariant.
-    fn validationBudget(self: *RecursiveResolver) ?*dnssec.ValidationBudget {
-        std.debug.assert(self.validation_budget != null or self.cache_only);
-        return self.validation_budget;
+    /// under cache-only); the unwrap enforces that invariant — dnssec verify
+    /// functions take a non-optional budget so no verify site can fail open.
+    fn validationBudget(self: *RecursiveResolver) *dnssec.ValidationBudget {
+        return self.validation_budget.?;
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -1216,7 +1216,7 @@ pub const RecursiveResolver = struct {
         if (authorities.len > 0) {
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
             if (auth_status == .secure) {
-                const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget().?);
+                const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget());
                 cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities);
                 return status;
             }
@@ -2224,7 +2224,7 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget().?);
+            const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget());
             if (status == .insecure) {
                 cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
             }
@@ -2325,7 +2325,7 @@ pub const RecursiveResolver = struct {
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 
-        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, self.validationBudget().?);
+        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, self.validationBudget());
     }
 
     fn resolveNsAddresses(
@@ -2835,7 +2835,7 @@ fn validateDnskeyAgainstDs(
     dnskey_answers: []const dns.ResourceRecord,
     ds_records_rr: []const dns.ResourceRecord,
     zone_parsed: dns.Name,
-    budget: ?*dnssec.ValidationBudget,
+    budget: *dnssec.ValidationBudget,
 ) !void {
     var ds_records: [16]dns.DsData = undefined;
     var ds_count: usize = 0;
@@ -3994,7 +3994,7 @@ test "validation budget stays tree-wide across cloneForThread under concurrent f
             var udp_t = BlockingUdpTransport.init(.{}, w.parent.io);
             defer udp_t.deinit();
             var clone = w.parent.cloneForThread(.{ .udp = &udp_t, .tcp_enabled = false, .tls = null });
-            const vb = clone.validationBudget().?;
+            const vb = clone.validationBudget();
             while (true) {
                 vb.consumeVerify() catch break;
                 w.granted += 1;

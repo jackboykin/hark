@@ -154,7 +154,7 @@ pub fn validateDnskeyRrset(
     ds_records: []const dns.DsData,
     zone_name: dns.Name,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) VerifyError!void {
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
@@ -592,7 +592,7 @@ fn tryVerifyRrsig(
     dnskey: dns.DnskeyData,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) error{ValidationBudgetExhausted}!bool {
     verifyRrsig(rrsig, dnskey, rrset, now_u32, budget) catch |e| switch (e) {
         error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
@@ -607,11 +607,11 @@ fn verifyRrsig(
     dnskey: dns.DnskeyData,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) VerifyError!void {
     // KeyTrap (CVE-2023-50387) mitigation: charge before any work so attempts
     // count even when the cheap pre-checks below would reject.
-    if (budget) |b| try b.consumeVerify();
+    try budget.consumeVerify();
 
     // RFC 4034 §3.1.3: signer name MUST be a (non-strict) ancestor of every
     // RRset owner, and `labels` MUST NOT exceed the owner's non-root label
@@ -1249,7 +1249,7 @@ pub fn validateAnswerRrset(
     qtype: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     // Validate the main answer type. Propagate .insecure (all-unsupported-algo
     // RRSIGs) instead of silently upgrading to .secure — otherwise the resolver
@@ -1291,7 +1291,7 @@ fn rrsetVerifiesWithAnyKey(
     dnskey_records: []const dns.ResourceRecord,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) error{ValidationBudgetExhausted}!bool {
     for (dnskey_records) |dk_rr| {
         if (dk_rr.rtype != .dnskey) continue;
@@ -1320,7 +1320,7 @@ fn validateRrsetForType(
     covered_type: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     var had_unsupported_algo = false;
     var attempted_supported = false;
@@ -1363,7 +1363,7 @@ pub fn verifyAuthorityNsecSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
-    budget: ?*ValidationBudget,
+    budget: *ValidationBudget,
 ) SecurityStatus {
     // Verify that every NSEC/NSEC3 record has a valid RRSIG.
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
@@ -1588,9 +1588,10 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
         .rdata = .{ .dnskey = test_dnskey },
     }};
 
+    var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, null),
+        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, &budget),
     );
 }
 
@@ -1621,9 +1622,10 @@ test "validateDnskeyRrset tolerates a DS match past the 64-key tag window" {
     records[64] = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
 
     // No RRSIG present, so validation must reject cleanly rather than panic.
+    var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, null),
+        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
     );
 }
 
@@ -3099,22 +3101,25 @@ const test_window_dnskey = dns.DnskeyData{
 const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
 
 test "verifyRrsig rejects expired signature" {
+    var budget: ValidationBudget = .{};
     // Expiration tolerance is 0 — any time strictly past expiration rejects.
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + expiration_skew_tolerance + 1, null));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + expiration_skew_tolerance + 1, &budget));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
+    var budget: ValidationBudget = .{};
     // now is before inception by more than the inception-skew tolerance
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, null));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, &budget));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
+    var budget: ValidationBudget = .{};
     inline for (.{
         1700000000 + expiration_skew_tolerance, // at expiration boundary
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
-        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, null));
+        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, &budget));
     }
 }
 
@@ -3136,9 +3141,10 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
     const rrset = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
     };
+    var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, null),
+        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, &budget),
     );
 }
 
@@ -3251,9 +3257,10 @@ test "verifyAuthorityNsecSigs: NSEC without RRSIG returns bogus" {
     const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
     const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
     // No DNSKEYs needed; iteration fails the find-RRSIG step.
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
     );
 }
 
@@ -3273,9 +3280,10 @@ test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
         nsecRr(owner2, next2),
         // no RRSIG for owner2 — bogus
     };
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
     );
 }
 
@@ -3290,9 +3298,10 @@ test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns insecure" {
         nsecRr(owner, next),
         nsecRrsigRr(owner, signer, .dsasha1), // unsupported — triggers had_unsupported_algo
     };
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.insecure,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, null),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
     );
 }
 
@@ -3309,9 +3318,10 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
         rrsigRr(owner, .nsec, .ecdsap256sha256, tag, signer), // supported, empty sig → fails
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(signer, test_ecdsa_dnskey)};
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, null),
+        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, &budget),
     );
 }
 
@@ -3327,9 +3337,10 @@ test "validateRrsetForType: owner-mismatch supported + matched unsupported retur
         rrsigRr(other_owner, .a, .ecdsap256sha256, tag, other_owner), // supported, unmatched owner
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, null),
+        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
     );
 }
 
@@ -3342,9 +3353,10 @@ test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus"
         rrsigRr(test_owner, .a, .ecdsap256sha256, tag, test_owner), // empty sig → fails
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, null),
+        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
     );
 }
 
@@ -3355,9 +3367,10 @@ test "validateAnswerRrset: insecure sub-result propagates (not laundered to secu
         .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
         rrsigRr(test_owner, .a, .dsasha1, 0, test_owner),
     };
+    var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.insecure,
-        validateAnswerRrset(&answers, .a, &.{}, 1699500000, null),
+        validateAnswerRrset(&answers, .a, &.{}, 1699500000, &budget),
     );
 }
 
