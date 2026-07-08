@@ -15,6 +15,7 @@ const EncryptedNsCache = encrypted_ns_mod.EncryptedNsCache;
 const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
+const blocking_transport = @import("blocking_transport.zig");
 const monotonic = @import("monotonic.zig");
 const log = std.log.scoped(.tls_transport);
 
@@ -144,23 +145,17 @@ pub const TlsTransport = struct {
         return conn;
     }
 
-    /// Open a connected TCP stream for TLS. Same connect-timeout workaround
-    /// as `blocking_transport.connectTcp`: open the fd via raw posix to
-    /// apply `SO_SNDTIMEO`, then wrap as `Io.net.Stream`. Leaves SNDTIMEO
-    /// set because the caller overwrites both directions with the
-    /// per-handshake / per-query deadline immediately after. `.address`
-    /// follows the same CONTRACT as `blocking_transport.connectTcp`:
-    /// zero-init, do not read on client-side streams. `io` is reserved
+    /// Open a connected TCP stream for TLS via the shared raw connect
+    /// kernel (`blocking_transport.connectTcpRaw` — see the `.address`
+    /// CONTRACT there). Kernel timeouts stay armed on both directions:
+    /// the TLS handshake reads right after this and relies on them;
+    /// `queryOnConnection` re-tightens per deadline. `io` is reserved
     /// for the eventual `IpAddress.connect` collapse.
     fn connectTcpBlocking(io: Io, tls_server: na.Address, timeout_ms: u32) !Io.net.Stream {
         _ = io;
-        const af: u32 = na.afU32(tls_server);
-        const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
-        errdefer sys.close(sock_fd);
-        sys.setSocketTimeouts(sock_fd, timeout_ms);
-        sys.setNoDelay(sock_fd);
-        na.connectTo(sock_fd, &tls_server) catch return error.ConnectFailed;
-        return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
+        const stream = try blocking_transport.connectTcpRaw(tls_server, timeout_ms);
+        sys.setSocketTimeout(stream.socket.handle, posix.SO.RCVTIMEO, timeout_ms);
+        return stream;
     }
 
     /// Fire a background probe for a nameserver. The spawned task does

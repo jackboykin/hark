@@ -338,13 +338,14 @@ pub fn queryTcp(
     return data;
 }
 
-/// Open a connected TCP stream. The fd is opened via raw posix so we can
-/// apply SO_SNDTIMEO for the connect itself — Zig's
-/// `IpAddress.connect` accepts a timeout option but its Io.Threaded
-/// backend panics on it. Clear SNDTIMEO before returning so subsequent
-/// data ops don't surface EAGAIN through netRead/netWrite, which
-/// `netReadPosix`/`netWritePosix` treat as a programmer bug. Once the
-/// stdlib grows working connect timeouts, this collapses to one line.
+/// Open a connected TCP stream — the raw connect kernel shared by Do53
+/// (`connectTcp`) and DoT (`tls_transport.connectTcpBlocking`). The fd is
+/// opened via raw posix so we can apply SO_SNDTIMEO for the connect
+/// itself — Zig's `IpAddress.connect` accepts a timeout option but its
+/// Io.Threaded backend panics on it. SNDTIMEO is left set to
+/// `connect_timeout_ms`; each caller resets or re-arms it for its data
+/// phase. Once the stdlib grows working connect timeouts, this collapses
+/// to one line.
 ///
 /// `.address` is intentionally zero (not populated via getsockname).
 /// CONTRACT: no caller reads `Stream.socket.address` on a client-side
@@ -353,73 +354,60 @@ pub fn queryTcp(
 /// the peer's family (zero is ip4 here, even on ip6 connects); a
 /// future `Stream.peerAddress()` or address-formatting code would
 /// silently lie. Populate via `na.getSockName` if that ever matters.
-pub fn connectTcp(server: na.Address) !Io.net.Stream {
+pub fn connectTcpRaw(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
     const af: u32 = na.afU32(server);
     const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
     errdefer sys.close(sock_fd);
-    sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, tcp_connect_timeout_ms);
+    sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, connect_timeout_ms);
     sys.setNoDelay(sock_fd);
     na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
-    sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, 0);
     return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
 }
 
-/// Length-prefixed DNS query/response on a connected TCP stream. Each
-/// loop iteration polls with the remaining deadline before issuing a
-/// netRead/netWrite — the kernel-side SO_*TIMEO mechanism can't be used
-/// because Io.Threaded's netRead/netWrite treat EAGAIN as a bug.
-/// Userspace deadline enforcement covers the slow-trickle case where
-/// the peer drips bytes to reset any per-syscall timer.
+/// Do53 connect: clear SNDTIMEO after connect so subsequent data ops
+/// don't surface EAGAIN through netRead/netWrite, which `netReadPosix`/
+/// `netWritePosix` treat as a programmer bug — deadlines here are
+/// enforced in userspace (`sendAndReceiveTcp`).
+pub fn connectTcp(server: na.Address) !Io.net.Stream {
+    const stream = try connectTcpRaw(server, tcp_connect_timeout_ms);
+    sys.setSocketTimeout(stream.socket.handle, posix.SO.SNDTIMEO, 0);
+    return stream;
+}
+
+/// Length-prefixed DNS query/response on a connected TCP stream, via the
+/// deadline-bounded exact-I/O kernels in sys.zig (userspace deadline
+/// enforcement — kernel-side SO_*TIMEO can't be used because Io.Threaded's
+/// netRead/netWrite treat EAGAIN as a bug). Timeout passes through;
+/// every other failure collapses to SendFailed on the write side,
+/// ConnectionClosed on the read side.
 pub fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
     const handle = stream.socket.handle;
 
     // ── Send length-prefixed query ──
     var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
     const framed = try dns.stageLengthPrefixed(&send_buf, wire_query);
-
-    var bytes_sent: usize = 0;
-    while (bytes_sent < framed.len) {
-        try waitReady(handle, posix.POLL.OUT, deadline_ns);
-        const n = sys.netWrite(io, handle, framed[bytes_sent..]) catch return error.SendFailed;
-        if (n == 0) return error.SendFailed;
-        bytes_sent += n;
-    }
+    sys.writeAllDeadline(io, handle, framed, deadline_ns) catch |err| switch (err) {
+        error.Timeout => return error.Timeout,
+        else => return error.SendFailed,
+    };
 
     // ── Receive length-prefixed response ──
     var len_buf: [2]u8 = undefined;
-    var len_filled: usize = 0;
-    while (len_filled < 2) {
-        try waitReady(handle, posix.POLL.IN, deadline_ns);
-        const n = sys.netRead(io, handle, len_buf[len_filled..]) catch return error.ConnectionClosed;
-        if (n == 0) return error.ConnectionClosed;
-        len_filled += n;
-    }
+    sys.readExactDeadline(io, handle, &len_buf, deadline_ns) catch |err| switch (err) {
+        error.Timeout => return error.Timeout,
+        else => return error.ConnectionClosed,
+    };
 
     const body_len = mem.readInt(u16, &len_buf, .big);
     if (body_len == 0 or body_len > response_buf.len) return error.InvalidLength;
 
-    var body_filled: usize = 0;
-    while (body_filled < body_len) {
-        try waitReady(handle, posix.POLL.IN, deadline_ns);
-        const n = sys.netRead(io, handle, response_buf[body_filled..body_len]) catch return error.ConnectionClosed;
-        if (n == 0) return error.ConnectionClosed;
-        body_filled += n;
-    }
+    sys.readExactDeadline(io, handle, response_buf[0..body_len], deadline_ns) catch |err| switch (err) {
+        error.Timeout => return error.Timeout,
+        else => return error.ConnectionClosed,
+    };
 
     sys.setQuickAck(handle);
     return response_buf[0..body_len];
-}
-
-/// Wait for `handle` readiness with `events` (POLL.IN / POLL.OUT) up to
-/// `deadline_ns`. Wraps `sys.pollReady` with the read/write-flavored error
-/// mapping the surrounding loops want — Timeout passes through, poll
-/// failures become SendFailed on the write side, ConnectionClosed on the
-/// read side.
-fn waitReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, ConnectionClosed, SendFailed }!void {
-    sys.pollReady(handle, events, deadline_ns) catch |err| switch (err) {
-        error.Timeout => return error.Timeout,
-        error.PollFailed => return if (events == posix.POLL.OUT) error.SendFailed else error.ConnectionClosed,
-    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

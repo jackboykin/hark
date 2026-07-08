@@ -558,6 +558,39 @@ pub const Server = struct {
         };
     }
 
+    /// The per-thread upstream transport pair: a fresh blocking UDP
+    /// transport plus (when `opportunistic`) a TLS transport wired to the
+    /// server's DoT pool. Lives by value on the owning thread's stack
+    /// frame; `transports()` hands out pointers into it, so don't move it
+    /// after that.
+    pub const UpstreamTransports = struct {
+        udp: BlockingUdpTransport,
+        tls: ?TlsTransport,
+
+        pub fn init(server: *Server) UpstreamTransports {
+            return .{
+                .udp = BlockingUdpTransport.init(.{}, server.io),
+                .tls = if (server.config.opportunistic) blk: {
+                    var t = TlsTransport.init(server.allocator, server.io);
+                    t.pool = if (server.enc_pool) |*pool| pool else null;
+                    break :blk t;
+                } else null,
+            };
+        }
+
+        pub fn deinit(self: *UpstreamTransports) void {
+            self.udp.deinit();
+        }
+
+        pub fn transports(self: *UpstreamTransports) Transports {
+            return .{
+                .udp = &self.udp,
+                .tcp_enabled = true,
+                .tls = if (self.tls) |*t| t else null,
+            };
+        }
+    };
+
     /// Build a resolver Context from the server-level (background) state.
     /// The bg-prefetch path always passes `tcp_pool = null` (it creates
     /// fresh transports per task; no shared pool semantics).
@@ -921,15 +954,8 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     // Fresh per-thread transports (mirrors the resolveNsAddressesFanout
     // pattern). BG threads never reuse per-worker TCP pools — a rare
     // refresh doesn't need amortized pooling.
-    var udp_t = BlockingUdpTransport.init(.{}, server.io);
-    defer udp_t.deinit();
-
-    var tls_t: ?TlsTransport = if (server.config.opportunistic) blk: {
-        var t = TlsTransport.init(server.allocator, server.io);
-        if (server.enc_pool) |*pool| t.pool = pool;
-        break :blk t;
-    } else null;
-    const tls_ptr: ?*TlsTransport = if (tls_t) |*t| t else null;
+    var upstream = Server.UpstreamTransports.init(server);
+    defer upstream.deinit();
 
     var cap = CountingAllocator.init(server.allocator, server.config.query_memory_limit);
     var arena = std.heap.ArenaAllocator.init(cap.allocator());
@@ -938,7 +964,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
 
     var resolver = recursive.RecursiveResolver.fromContext(
         server.resolverContext(),
-        .{ .udp = &udp_t, .tcp_enabled = true, .tls = tls_ptr },
+        upstream.transports(),
         .{ .bypass_cache = true },
     );
 
@@ -1445,20 +1471,9 @@ const WorkerState = struct {
 
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) void {
-        var udp_t = BlockingUdpTransport.init(.{}, self.server.io);
-        defer udp_t.deinit();
-
-        var tls_t: ?TlsTransport = if (self.server.config.opportunistic) blk: {
-            var t = TlsTransport.init(self.server.allocator, self.server.io);
-            t.pool = if (self.server.enc_pool) |*pool| pool else null;
-            break :blk t;
-        } else null;
-
-        const transports: Transports = .{
-            .udp = &udp_t,
-            .tcp_enabled = true,
-            .tls = if (tls_t) |*t| t else null,
-        };
+        var upstream = Server.UpstreamTransports.init(self.server);
+        defer upstream.deinit();
+        const transports = upstream.transports();
 
         var query_pta: PerThreadArena = undefined;
         query_pta.init(self.server.allocator, self.server.config.query_memory_limit);
@@ -1662,43 +1677,25 @@ const WorkerState = struct {
 
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
 //
-// Userspace deadline via sys.pollReady — same pattern as
-// blocking_transport.sendAndReceiveTcp (see comments there).
-//
-// All errors collapse to `null` ("drop client, move on") because per-client
-// recovery has no useful shape — but log at debug for operational visibility
-// so a future shotgun-style outage doesn't have to be diagnosed blind.
+// Thin wrappers over sys.readExactDeadline/writeAllDeadline (userspace
+// deadline enforcement — see comments there). All errors collapse to
+// `null` ("drop client, move on") because per-client recovery has no
+// useful shape; a clean FIN (`error.Closed`) is routine and stays
+// silent, everything else logs at debug for operational visibility so a
+// future shotgun-style outage doesn't have to be diagnosed blind.
 
 fn tcpReadExactBlocking(io: Io, fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        sys.pollReady(fd, posix.POLL.IN, deadline_ns) catch |err| {
-            log.debug("tcp client read poll: {s}", .{@errorName(err)});
-            return null;
-        };
-        const n = sys.netRead(io, fd, buf[total..]) catch |err| {
-            log.debug("tcp client read: {s}", .{@errorName(err)});
-            return null;
-        };
-        if (n == 0) return null; // connection closed (FIN)
-        total += n;
-    }
+    sys.readExactDeadline(io, fd, buf, deadline_ns) catch |err| {
+        if (err != error.Closed) log.debug("tcp client read: {s}", .{@errorName(err)});
+        return null;
+    };
 }
 
 fn tcpWriteAllBlocking(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
-    var total: usize = 0;
-    while (total < data.len) {
-        sys.pollReady(fd, posix.POLL.OUT, deadline_ns) catch |err| {
-            log.debug("tcp client write poll: {s}", .{@errorName(err)});
-            return null;
-        };
-        const n = sys.netWrite(io, fd, data[total..]) catch |err| {
-            log.debug("tcp client write: {s}", .{@errorName(err)});
-            return null;
-        };
-        if (n == 0) return null;
-        total += n;
-    }
+    sys.writeAllDeadline(io, fd, data, deadline_ns) catch |err| {
+        if (err != error.Closed) log.debug("tcp client write: {s}", .{@errorName(err)});
+        return null;
+    };
 }
 
 fn tcpWriteMessage(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {

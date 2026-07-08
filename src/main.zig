@@ -3,8 +3,6 @@ const build_options = @import("build_options");
 const hark = @import("hark");
 const dns = hark.dns;
 const dns_print = hark.dns_print;
-const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
-const TlsTransport = hark.tls_transport.TlsTransport;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const Io = std.Io;
 const Server = hark.server.Server;
@@ -209,22 +207,17 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     };
     defer server.deinit();
 
-    // Fresh transports for this single resolve (mirrors the bg-prefetch path).
-    var t = BlockingUdpTransport.init(.{}, io);
-    defer t.deinit();
-    var tls_t: ?TlsTransport = if (opportunistic) blk: {
-        var tt = TlsTransport.init(allocator, io);
-        if (server.enc_pool) |*pool| tt.pool = pool;
-        break :blk tt;
-    } else null;
-    const tls_ptr: ?*TlsTransport = if (tls_t) |*tt| tt else null;
+    // Fresh transports for this single resolve (mirrors the bg-prefetch
+    // path). `opportunistic` rides in via cfg, set above before init.
+    var upstream = Server.UpstreamTransports.init(&server);
+    defer upstream.deinit();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     var resolver = RecursiveResolver.fromContext(
         server.resolverContext(),
-        .{ .udp = &t, .tcp_enabled = true, .tls = tls_ptr },
+        upstream.transports(),
         .{},
     );
     const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {

@@ -180,11 +180,6 @@ pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
     };
 }
 
-pub fn setSocketTimeouts(sock: posix.fd_t, ms: u32) void {
-    setSocketTimeout(sock, posix.SO.RCVTIMEO, ms);
-    setSocketTimeout(sock, posix.SO.SNDTIMEO, ms);
-}
-
 pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
     const timeout = posix.timeval{
         .sec = @intCast(ms / 1000),
@@ -224,6 +219,37 @@ pub fn netRead(io: std.Io, handle: posix.fd_t, buf: []u8) std.Io.net.Stream.Read
 /// sentinel with `splat=0` elides into a header-only iovec.
 pub fn netWrite(io: std.Io, handle: posix.fd_t, buf: []const u8) std.Io.net.Stream.Writer.Error!usize {
     return io.vtable.netWrite(io.userdata, handle, buf, &[_][]const u8{""}, 0);
+}
+
+/// Errors from the deadline-bounded exact-I/O loops below. `Closed` is a
+/// clean peer FIN (`n == 0`) — routine on client connections; `IoFailed`
+/// wraps any read/write syscall error.
+pub const DeadlineIoError = error{ Timeout, PollFailed, IoFailed, Closed };
+
+/// Read exactly `buf.len` bytes from `handle` before `deadline_ns`. Every
+/// iteration polls with the remaining deadline before issuing a netRead —
+/// the slow-trickle mitigation: a peer dripping one byte per syscall
+/// can't reset a per-syscall timer that doesn't exist.
+pub fn readExactDeadline(io: std.Io, handle: posix.fd_t, buf: []u8, deadline_ns: i128) DeadlineIoError!void {
+    var total: usize = 0;
+    while (total < buf.len) {
+        try pollReady(handle, posix.POLL.IN, deadline_ns);
+        const n = netRead(io, handle, buf[total..]) catch return error.IoFailed;
+        if (n == 0) return error.Closed;
+        total += n;
+    }
+}
+
+/// Write all of `data` to `handle` before `deadline_ns`. Deadline
+/// semantics mirror `readExactDeadline`.
+pub fn writeAllDeadline(io: std.Io, handle: posix.fd_t, data: []const u8, deadline_ns: i128) DeadlineIoError!void {
+    var total: usize = 0;
+    while (total < data.len) {
+        try pollReady(handle, posix.POLL.OUT, deadline_ns);
+        const n = netWrite(io, handle, data[total..]) catch return error.IoFailed;
+        if (n == 0) return error.Closed;
+        total += n;
+    }
 }
 
 /// Wait up to `deadline_ns` for `handle` to be ready for `events`
