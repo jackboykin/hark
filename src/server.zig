@@ -814,24 +814,7 @@ pub const Server = struct {
         // Worker state
         var ws = WorkerState{
             .server = self,
-            .config = &self.config,
-            .allocator = self.allocator,
-            .io = self.io,
             .loop = server_loop,
-            .enc_pool = if (self.enc_pool) |*pool| pool else null,
-            .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
-            .case_state = if (self.case_state) |*cs| cs else null,
-            .cache = &self.cache,
-            .key_cache = if (self.key_cache) |*kc| kc else null,
-            .rtt_cache = &self.rtt_cache,
-            .ns_selector = &self.ns_selector,
-            .dedup = if (self.dedup) |*d| d else null,
-            .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
-            .shutdown = &self.shutdown,
-            .queue = self.work_queue,
-            .udp_queue_drops = &self.udp_queue_drops,
-            .tcp_queue_drops = &self.tcp_queue_drops,
-            .udp_send_drops = &self.udp_send_drops,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
         };
@@ -972,46 +955,19 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
 
 const WorkerState = struct {
     server: *Server,
-    config: *const ServerConfig,
-    allocator: mem.Allocator,
-    io: Io,
     loop: *EventLoop,
-    enc_pool: ?*ConnectionPool,
-    encrypted_ns_cache: ?*EncryptedNsCache,
-    case_state: ?*CaseState,
-    cache: *RRsetCache,
-    key_cache: ?*RRsetCache,
-    rtt_cache: *RttCache,
-    ns_selector: *NsSelector,
-    dedup: ?*InFlightTable,
-    nsec_cache: ?*NsecCache,
-    shutdown: *std.atomic.Value(bool),
-    queue: *WorkQueue,
-    udp_queue_drops: *std.atomic.Value(u64),
-    tcp_queue_drops: *std.atomic.Value(u64),
-    udp_send_drops: *std.atomic.Value(u64),
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     max_tcp_clients: u32 = 0,
     recv_pta: PerThreadArena = undefined,
 
-    /// Build a resolver Context from the per-worker pointer-style state.
-    /// Per-query knobs (cd, bypass_cache) go through RuntimeOpts, not here.
+    /// Build a resolver Context: the server-level one plus this worker's
+    /// Do53 TCP pool. Per-query knobs (cd, bypass_cache) go through
+    /// RuntimeOpts, not here.
     fn resolverContext(self: *WorkerState) recursive.RecursiveResolver.Context {
-        return .{
-            .config = self.config,
-            .io = self.io,
-            .gpa = self.allocator,
-            .cache = self.cache,
-            .rtt_cache = self.rtt_cache,
-            .ns_selector = self.ns_selector,
-            .encrypted_ns_cache = self.encrypted_ns_cache,
-            .case_state = self.case_state,
-            .dedup = self.dedup,
-            .nsec_cache = self.nsec_cache,
-            .key_cache = self.key_cache,
-            .tcp_pool = self.tcp_pool,
-        };
+        var ctx = self.server.resolverContext();
+        ctx.tcp_pool = self.tcp_pool;
+        return ctx;
     }
 
     /// Try to claim a TCP client slot. Returns true on success (caller
@@ -1025,7 +981,7 @@ const WorkerState = struct {
     }
 
     fn logCacheStats(self: *const WorkerState) void {
-        const stats = self.cache.getStats();
+        const stats = self.server.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
         log.info("cache: {d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
@@ -1036,7 +992,7 @@ const WorkerState = struct {
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t, wake_fd: posix.fd_t) void {
         const n = udp_socks.len;
 
-        self.recv_pta.init(self.allocator, self.config.query_memory_limit);
+        self.recv_pta.init(self.server.allocator, self.server.config.query_memory_limit);
         defer self.recv_pta.deinit();
 
         var udp_ctxs: [max_listen_addrs]Ctx = undefined;
@@ -1093,7 +1049,7 @@ const WorkerState = struct {
         // periodic line, keeping it to one entry per interval.
         const log_stats = sig_fd >= 0;
 
-        while (!self.shutdown.load(.acquire)) {
+        while (!self.server.shutdown.load(.acquire)) {
             const results = self.loop.tick(&completions) catch break;
 
             // Periodic cache stats logging
@@ -1121,7 +1077,7 @@ const WorkerState = struct {
                     },
                     .wake => {
                         // Counterpart wrote to wake_fd — shutdown is in flight.
-                        self.shutdown.store(true, .release);
+                        self.server.shutdown.store(true, .release);
                         break;
                     },
                     .udp_recv => {
@@ -1134,7 +1090,7 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        if (self.shutdown.load(.acquire)) continue;
+                        if (self.server.shutdown.load(.acquire)) continue;
                         const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
                         // Multishot stays armed across CQEs; re-arm only
                         // when the kernel terminated it.
@@ -1154,23 +1110,23 @@ const WorkerState = struct {
                                     // check is gated on a non-empty list to avoid
                                     // a getpeername syscall in the open-recursive
                                     // / loopback-only common case.
-                                    if (self.config.allow_from.len > 0) {
+                                    if (self.server.config.allow_from.len > 0) {
                                         const peer = na.getPeerName(acc.fd) catch {
                                             sys.close(acc.fd);
                                             continue;
                                         };
-                                        if (!acl.allow(self.config.allow_from, peer)) {
+                                        if (!acl.allow(self.server.config.allow_from, peer)) {
                                             sys.close(acc.fd);
                                             continue;
                                         }
                                     }
-                                    if (!self.queue.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), acc.fd, .tcp)) {
+                                    if (!self.server.work_queue.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), acc.fd, .tcp)) {
                                         // Drop silently (no SERVFAIL): we haven't read the
                                         // query yet so we don't have an ID, and reading it
                                         // would consume the pool capacity we're protecting.
                                         // Client sees TCP reset and should retry (typically
                                         // over UDP).
-                                        _ = self.tcp_queue_drops.fetchAdd(1, .monotonic);
+                                        _ = self.server.tcp_queue_drops.fetchAdd(1, .monotonic);
                                         log.warn("resolution queue full, dropping TCP client", .{});
                                         sys.close(acc.fd);
                                     }
@@ -1178,7 +1134,7 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        if (!self.shutdown.load(.acquire)) {
+                        if (!self.server.shutdown.load(.acquire)) {
                             const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
                             tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch |err| {
                                 log.err("failed to re-register TCP accept: {s}", .{@errorName(err)});
@@ -1227,7 +1183,7 @@ const WorkerState = struct {
         var storage: na.PosixAddress = undefined;
         const sa_len = na.toSockaddr(&dest, &storage);
         _ = sys.sendto(sock, data, posix.MSG.DONTWAIT, &storage.any, sa_len) catch {
-            _ = self.udp_send_drops.fetchAdd(1, .monotonic);
+            _ = self.server.udp_send_drops.fetchAdd(1, .monotonic);
         };
     }
 
@@ -1246,7 +1202,7 @@ const WorkerState = struct {
         // Floor at the bare-EDNS-0 minimum, ceiling at the operator cap.
         // Trusting an unbounded client claim is a reflection-amp surface.
         const client_payload = if (query_msg.opt) |opt| opt.udp_payload_size else dns.max_udp_payload;
-        const resolved_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.config.max_udp_payload);
+        const resolved_payload: u16 = @min(@max(client_payload, dns.max_udp_payload), self.server.config.max_udp_payload);
 
         var wire_stack: [4096]u8 = undefined;
         const wire_buf: ?[]u8 = if (resolved_payload <= wire_stack.len)
@@ -1256,8 +1212,8 @@ const WorkerState = struct {
 
         if (wire_buf) |buf| {
             var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
-            ctx.minimal_responses = self.config.minimal_responses;
-            ctx.rebinding = &self.config.rebinding;
+            ctx.minimal_responses = self.server.config.minimal_responses;
+            ctx.rebinding = &self.server.config.rebinding;
             if (buildResponseWire(buf, ctx, result_msg, alloc)) |wire| {
                 self.sendUdpResponse(sock, wire, client_addr);
                 return;
@@ -1272,7 +1228,7 @@ const WorkerState = struct {
         // with REFUSED would still amplify and confirm the resolver exists;
         // a drop is the only correct anti-reflection behavior. Empty list ==
         // no ACL == accept all (back-compat).
-        if (!acl.allow(self.config.allow_from, client_addr)) return;
+        if (!acl.allow(self.server.config.allow_from, client_addr)) return;
         // RFC 1035 §4.1.1: drop QR=1 silently. Treating a spoofed response
         // as a query would let an attacker reflect upstream resolutions
         // off this server.
@@ -1297,7 +1253,7 @@ const WorkerState = struct {
 
         if (self.tryCacheHitReply(sock, data, client_addr)) return;
 
-        if (!self.queue.push(data, client_addr, sock, .udp)) {
+        if (!self.server.work_queue.push(data, client_addr, sock, .udp)) {
             @branchHint(.cold);
             // Silent drop on pool saturation (matches Unbound ip-ratelimit,
             // PowerDNS over-capacity, dnsdist default). A SERVFAIL here
@@ -1308,7 +1264,7 @@ const WorkerState = struct {
             // Per-drop log stays at debug — under a UDP flood, a warn
             // here would itself become the DoS surface; the
             // `udp_queue_drops` atomic is the operator-facing signal.
-            _ = self.udp_queue_drops.fetchAdd(1, .monotonic);
+            _ = self.server.udp_queue_drops.fetchAdd(1, .monotonic);
             log.debug("resolution queue full, dropping query", .{});
         }
     }
@@ -1375,18 +1331,18 @@ const WorkerState = struct {
         else |_|
             "?";
 
-        const tcp_idle_timeout_ns: i128 = @as(i128, self.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
+        const tcp_idle_timeout_ns: i128 = @as(i128, self.server.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
         var tcp_queries: u32 = 0;
-        while (!self.shutdown.load(.acquire) and tcp_queries < self.config.tcp_queries_per_conn) {
+        while (!self.server.shutdown.load(.acquire) and tcp_queries < self.server.config.tcp_queries_per_conn) {
             tcp_queries += 1;
             const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             var len_buf: [2]u8 = undefined;
-            tcpReadExactBlocking(self.io, client_fd, &len_buf, read_deadline_ns) orelse return;
+            tcpReadExactBlocking(self.server.io, client_fd, &len_buf, read_deadline_ns) orelse return;
             const msg_len = mem.readInt(u16, &len_buf, .big);
             if (msg_len == 0) return;
 
             var query_buf: [dns.max_message_len]u8 = undefined;
-            tcpReadExactBlocking(self.io, client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
+            tcpReadExactBlocking(self.server.io, client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
             sys.setQuickAck(client_fd);
 
             const alloc = query_pta.reset();
@@ -1398,7 +1354,7 @@ const WorkerState = struct {
                     const id = mem.readInt(u16, data[0..2], .big);
                     const op_bits: u4 = @truncate(data[2] >> 3);
                     const w = serializeErrorResponse(&response_wire, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}) orelse return;
-                    tcpWriteMessage(self.io, client_fd, w, read_deadline_ns) orelse return;
+                    tcpWriteMessage(self.server.io, client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
                 return;
@@ -1406,7 +1362,7 @@ const WorkerState = struct {
 
             if (validateQuery(query)) |fail| {
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions) orelse return;
-                tcpWriteMessage(self.io, client_fd, w, read_deadline_ns) orelse return;
+                tcpWriteMessage(self.server.io, client_fd, w, read_deadline_ns) orelse return;
                 continue;
             }
 
@@ -1419,10 +1375,10 @@ const WorkerState = struct {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
-                self.cache.cacheServfail(name_str, question.qtype);
+                self.server.cache.cacheServfail(name_str, question.qtype);
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-                tcpWriteMessage(self.io, client_fd, w, write_deadline_ns) orelse return;
+                tcpWriteMessage(self.server.io, client_fd, w, write_deadline_ns) orelse return;
                 continue;
             };
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1433,12 +1389,12 @@ const WorkerState = struct {
             // RFC 7828: advertise our TCP idle timeout so the stub can
             // size its keepalive expectations. Units are 100 ms.
             var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
-            ctx.tcp_keepalive = @intCast(self.config.tcp_idle_timeout_ms / 100);
-            ctx.minimal_responses = self.config.minimal_responses;
-            ctx.rebinding = &self.config.rebinding;
+            ctx.tcp_keepalive = @intCast(self.server.config.tcp_idle_timeout_ms / 100);
+            ctx.minimal_responses = self.server.config.minimal_responses;
+            ctx.rebinding = &self.server.config.rebinding;
             const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-            tcpWriteMessage(self.io, client_fd, wire, write_deadline_ns) orelse return;
+            tcpWriteMessage(self.server.io, client_fd, wire, write_deadline_ns) orelse return;
 
             self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
             if (query.header.flags.cd) {
@@ -1489,12 +1445,12 @@ const WorkerState = struct {
 
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) void {
-        var udp_t = BlockingUdpTransport.init(.{}, self.io);
+        var udp_t = BlockingUdpTransport.init(.{}, self.server.io);
         defer udp_t.deinit();
 
-        var tls_t: ?TlsTransport = if (self.config.opportunistic) blk: {
-            var t = TlsTransport.init(self.allocator, self.io);
-            t.pool = self.enc_pool;
+        var tls_t: ?TlsTransport = if (self.server.config.opportunistic) blk: {
+            var t = TlsTransport.init(self.server.allocator, self.server.io);
+            t.pool = if (self.server.enc_pool) |*pool| pool else null;
             break :blk t;
         } else null;
 
@@ -1505,11 +1461,11 @@ const WorkerState = struct {
         };
 
         var query_pta: PerThreadArena = undefined;
-        query_pta.init(self.allocator, self.config.query_memory_limit);
+        query_pta.init(self.server.allocator, self.server.config.query_memory_limit);
         defer query_pta.deinit();
 
         var prefetch_pta: PerThreadArena = undefined;
-        prefetch_pta.init(self.allocator, self.config.query_memory_limit);
+        prefetch_pta.init(self.server.allocator, self.server.config.query_memory_limit);
         defer prefetch_pta.deinit();
 
         // RFC 8109: first pool thread anywhere on this Server primes the
@@ -1538,13 +1494,13 @@ const WorkerState = struct {
             }
         }
 
-        while (self.queue.pop()) |item| {
+        while (self.server.work_queue.pop()) |item| {
             switch (item.protocol) {
                 .udp => {
                     // item.payload borrows from the slot; parseMessage
                     // copies what it keeps into the per-thread arena, so
                     // releasing right after processUdpQuery is safe.
-                    defer self.queue.release(item.reservation);
+                    defer self.server.work_queue.release(item.reservation);
                     self.processUdpQuery(
                         item.sock_fd,
                         item.payload,
@@ -1559,7 +1515,7 @@ const WorkerState = struct {
                     // can live for seconds and the slot is just an fd
                     // courier — holding it ties up queue capacity for
                     // nothing.
-                    self.queue.release(item.reservation);
+                    self.server.work_queue.release(item.reservation);
                     if (self.claimTcpSlot()) {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
                         self.processTcpClient(item.sock_fd, transports, &query_pta, &prefetch_pta);
@@ -1612,7 +1568,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
-            self.cache.cacheServfail(name_str, question.qtype);
+            self.server.cache.cacheServfail(name_str, question.qtype);
             self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
             return;
         };
@@ -1645,8 +1601,8 @@ const WorkerState = struct {
 
         // RFC 8305 cousin co-prefetch: fire-and-forget, bg-only on both paths.
         const cousin_qtype = result.cousin_prefetch_qtype orelse return;
-        if (!self.config.prefetch_cousin) return;
-        if (self.cache.containsFresh(query_name, cousin_qtype, .in)) return;
+        if (!self.server.config.prefetch_cousin) return;
+        if (self.server.cache.containsFresh(query_name, cousin_qtype, .in)) return;
         _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .prefetch);
     }
 
@@ -1662,8 +1618,8 @@ const WorkerState = struct {
     /// invalidates on BOGUS. Silently drops on cap/spawn failure — the only
     /// loss is missed cache warming, never an incorrect response.
     fn scheduleCd1Revalidate(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
-        if (!self.config.dnssec) return;
-        if (self.cache.hasValidatedPositive(name, qtype, .in)) return;
+        if (!self.server.config.dnssec) return;
+        if (self.server.cache.hasValidatedPositive(name, qtype, .in)) return;
         _ = self.server.trySpawnBgPrefetch(name, qtype, .revalidate);
     }
 
@@ -1679,13 +1635,13 @@ const WorkerState = struct {
         // upstream I/O happens, so the InFlightTable mutex pair is pure
         // overhead; a shared-lock existence probe skips it. On miss we fall
         // through to the normal dedup + resolve path.
-        if (self.cache.containsFresh(name, qtype, .in)) {
+        if (self.server.cache.containsFresh(name, qtype, .in)) {
             return self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         }
 
         const cd_flag: u8 = @intFromBool(cd);
         var is_leader = true;
-        if (self.dedup) |dedup| {
+        if (self.server.dedup) |*dedup| {
             switch (dedup.acquireOrWait(name, qtype, cd_flag)) {
                 .leader => {},
                 .follower => {
@@ -1694,11 +1650,11 @@ const WorkerState = struct {
             }
         }
         errdefer if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
+            if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
         };
         const result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         if (is_leader) {
-            if (self.dedup) |dedup| dedup.releaseLeader(name, qtype, cd_flag);
+            if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
         }
         return result;
     }
