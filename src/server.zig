@@ -1762,6 +1762,11 @@ fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: 
 }
 
 fn setupSignalFd() !posix.fd_t {
+    // Mask size is load-bearing: standard signals coalesce to one pending
+    // signalfd_siginfo per signo, so event_loop.zig sizes its read buffer
+    // (`read_buf_size`) to hold exactly this many records. Adding a signo
+    // here only delays the excess record by one re-arm cycle, but keep the
+    // two in step anyway.
     var mask = linux.sigemptyset();
     linux.sigaddset(&mask, linux.SIG.INT);
     linux.sigaddset(&mask, linux.SIG.TERM);
