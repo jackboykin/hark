@@ -1056,6 +1056,89 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
 
 // ── Top-level parse ────────────────────────────────────────────────────
 
+/// Free a slice of wire-parsed RRs and its backing (error-path cleanup
+/// for `parseRRSection` results; success paths hand off to the Message).
+fn freeWireParsedRRSlice(allocator: Allocator, rrs: []const ResourceRecord) void {
+    for (rrs) |rr| freeWireParsedRR(allocator, rr);
+    allocator.free(rrs);
+}
+
+/// Parse `count` questions into an owned slice. On error, everything
+/// parsed so far (including backing) is freed.
+fn parseQuestionSection(allocator: Allocator, parser: *Parser, count: u16, max_questions: usize) Error![]Question {
+    var list: ArrayList(Question) = .empty;
+    try list.ensureTotalCapacity(allocator, @min(count, max_questions));
+    errdefer {
+        for (list.items) |q| freeWireParsedName(allocator, q.name);
+        list.deinit(allocator);
+    }
+    for (0..count) |_| {
+        const q = try parser.parseQuestion(allocator);
+        list.append(allocator, q) catch {
+            freeWireParsedName(allocator, q.name);
+            return error.OutOfMemory;
+        };
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Parse `count` resource records into an owned slice. On error,
+/// everything parsed so far (including backing) is freed; a previously
+/// written `opt_out.*` is the caller's errdefer to release.
+///
+/// `opt_out` non-null marks the additional section: OPT records are
+/// extracted into it (RFC 6891) instead of appended. Null (answer /
+/// authority) keeps any OPT as an ordinary record — question-section
+/// placement rules don't apply there.
+fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: usize, opt_out: ?*?OptRecord) Error![]ResourceRecord {
+    var list: ArrayList(ResourceRecord) = .empty;
+    try list.ensureTotalCapacity(allocator, @min(count, max_rrs));
+    errdefer {
+        for (list.items) |rr| freeWireParsedRR(allocator, rr);
+        list.deinit(allocator);
+    }
+    for (0..count) |_| {
+        const rr = try parser.parseResourceRecord(allocator);
+        if (opt_out) |opt| if (rr.rtype == .opt) {
+            // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
+            if (opt.* != null) {
+                freeWireParsedRR(allocator, rr);
+                return error.MultipleOptRecords;
+            }
+            // RFC 6891 §6.1.2: OPT owner name MUST be root ("."). Non-root
+            // OPT is malformed; treat as FormatError so the server replies
+            // FORMERR rather than silently absorbing whatever owner appears.
+            if (rr.name.labels.len != 0) {
+                freeWireParsedRR(allocator, rr);
+                return error.FormatError;
+            }
+            // Parse options into a local first; assigning into the optional
+            // `opt` before this point would let Zig write the tag (Some) with
+            // the payload still undefined — the caller's opt errdefer would
+            // then dereference garbage on a later failure.
+            const opt_options = parseEdnsOptions(allocator, rr.rdata.unknown) catch |err| {
+                freeWireParsedRR(allocator, rr);
+                return err;
+            };
+            opt.* = .{
+                .udp_payload_size = @intFromEnum(rr.rclass),
+                .extended_rcode = @intCast(rr.ttl >> 24),
+                .version = @intCast((rr.ttl >> 16) & 0xFF),
+                .do_bit = (rr.ttl & 0x8000) != 0,
+                .options = opt_options,
+            };
+            // OPT rr's name (root) and rdata (.unknown alias) carry no heap;
+            // freeing the wire-parsed OPT rr is a no-op since rr.name.labels.len == 0.
+            continue;
+        };
+        list.append(allocator, rr) catch {
+            freeWireParsedRR(allocator, rr);
+            return error.OutOfMemory;
+        };
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
 /// Parse a DNS wire message.
 ///
 /// Lifetime contract: parsed `Name.labels[i]` byte slices and rdata byte
@@ -1084,124 +1167,28 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const max_questions = payload / 5; // min question: 1 name + 2 type + 2 class
     const max_rrs = payload / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
 
-    var questions: ArrayList(Question) = .empty;
-    try questions.ensureTotalCapacity(allocator, @min(hdr.qd_count, max_questions));
+    // Each section arrives as a completed owned slice before the next
+    // parses, so error cleanup is one errdefer per section — no partial
+    // ArrayList/toOwnedSlice interleaving to reason about.
+    const questions = try parseQuestionSection(allocator, &parser, hdr.qd_count, max_questions);
     errdefer {
-        for (questions.items) |q| freeWireParsedName(allocator, q.name);
-        questions.deinit(allocator);
+        for (questions) |q| freeWireParsedName(allocator, q.name);
+        allocator.free(questions);
     }
-    for (0..hdr.qd_count) |_| {
-        const q = try parser.parseQuestion(allocator);
-        questions.append(allocator, q) catch {
-            freeWireParsedName(allocator, q.name);
-            return error.OutOfMemory;
-        };
-    }
-
-    var answers: ArrayList(ResourceRecord) = .empty;
-    try answers.ensureTotalCapacity(allocator, @min(hdr.an_count, max_rrs));
-    errdefer {
-        for (answers.items) |rr| freeWireParsedRR(allocator, rr);
-        answers.deinit(allocator);
-    }
-    for (0..hdr.an_count) |_| {
-        const rr = try parser.parseResourceRecord(allocator);
-        answers.append(allocator, rr) catch {
-            freeWireParsedRR(allocator, rr);
-            return error.OutOfMemory;
-        };
-    }
-
-    var authorities: ArrayList(ResourceRecord) = .empty;
-    try authorities.ensureTotalCapacity(allocator, @min(hdr.ns_count, max_rrs));
-    errdefer {
-        for (authorities.items) |rr| freeWireParsedRR(allocator, rr);
-        authorities.deinit(allocator);
-    }
-    for (0..hdr.ns_count) |_| {
-        const rr = try parser.parseResourceRecord(allocator);
-        authorities.append(allocator, rr) catch {
-            freeWireParsedRR(allocator, rr);
-            return error.OutOfMemory;
-        };
-    }
-
-    var additionals: ArrayList(ResourceRecord) = .empty;
-    try additionals.ensureTotalCapacity(allocator, @min(hdr.ar_count, max_rrs));
-    errdefer {
-        for (additionals.items) |rr| freeWireParsedRR(allocator, rr);
-        additionals.deinit(allocator);
-    }
+    const answers = try parseRRSection(allocator, &parser, hdr.an_count, max_rrs, null);
+    errdefer freeWireParsedRRSlice(allocator, answers);
+    const authorities = try parseRRSection(allocator, &parser, hdr.ns_count, max_rrs, null);
+    errdefer freeWireParsedRRSlice(allocator, authorities);
     var opt: ?OptRecord = null;
     errdefer if (opt) |o| if (o.options.len > 0) allocator.free(o.options);
-    for (0..hdr.ar_count) |_| {
-        const rr = try parser.parseResourceRecord(allocator);
-        if (rr.rtype == .opt) {
-            // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
-            if (opt != null) {
-                freeWireParsedRR(allocator, rr);
-                return error.MultipleOptRecords;
-            }
-            // RFC 6891 §6.1.2: OPT owner name MUST be root ("."). Non-root
-            // OPT is malformed; treat as FormatError so the server replies
-            // FORMERR rather than silently absorbing whatever owner appears.
-            if (rr.name.labels.len != 0) {
-                freeWireParsedRR(allocator, rr);
-                return error.FormatError;
-            }
-            // Parse options into a local first; assigning into the optional
-            // `opt` before this point would let Zig write the tag (Some) with
-            // the payload still undefined — the opt errdefer below would then
-            // dereference garbage on a later failure.
-            const opt_options = parseEdnsOptions(allocator, rr.rdata.unknown) catch |err| {
-                freeWireParsedRR(allocator, rr);
-                return err;
-            };
-            opt = .{
-                .udp_payload_size = @intFromEnum(rr.rclass),
-                .extended_rcode = @intCast(rr.ttl >> 24),
-                .version = @intCast((rr.ttl >> 16) & 0xFF),
-                .do_bit = (rr.ttl & 0x8000) != 0,
-                .options = opt_options,
-            };
-            // OPT rr's name (root) and rdata (.unknown alias) carry no heap;
-            // freeing the wire-parsed OPT rr is a no-op since rr.name.labels.len == 0.
-        } else {
-            additionals.append(allocator, rr) catch {
-                freeWireParsedRR(allocator, rr);
-                return error.OutOfMemory;
-            };
-        }
-    }
-
-    // toOwnedSlice zeros the source ArrayList; a later toOwnedSlice failure
-    // would orphan already-transferred slices because their errdefer would
-    // see an empty list. Materialise all four, then take each list's outer
-    // backing in turn — on any failure the surviving lists' errdefers fire
-    // with their items intact.
-    const questions_slice = try questions.toOwnedSlice(allocator);
-    errdefer {
-        for (questions_slice) |q| freeWireParsedName(allocator, q.name);
-        allocator.free(questions_slice);
-    }
-    const answers_slice = try answers.toOwnedSlice(allocator);
-    errdefer {
-        for (answers_slice) |rr| freeWireParsedRR(allocator, rr);
-        allocator.free(answers_slice);
-    }
-    const authorities_slice = try authorities.toOwnedSlice(allocator);
-    errdefer {
-        for (authorities_slice) |rr| freeWireParsedRR(allocator, rr);
-        allocator.free(authorities_slice);
-    }
-    const additionals_slice = try additionals.toOwnedSlice(allocator);
+    const additionals = try parseRRSection(allocator, &parser, hdr.ar_count, max_rrs, &opt);
 
     return .{
         .header = hdr,
-        .questions = questions_slice,
-        .answers = answers_slice,
-        .authorities = authorities_slice,
-        .additionals = additionals_slice,
+        .questions = questions,
+        .answers = answers,
+        .authorities = authorities,
+        .additionals = additionals,
         .opt = opt,
     };
 }
