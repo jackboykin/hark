@@ -413,6 +413,50 @@ test "zone hash different zones differ" {
     try testing.expect(zoneHash(a) != zoneHash(b));
 }
 
+test "ArmKeyContext: 16-shard distribution in the LOW bits" {
+    // shardFor truncates the LOW bits of ArmKeyContext.hash — safe only
+    // because the composed AddressKey hash is fmix64-finalized before the
+    // zone xor/multiply. ns_rtt's sibling test (net_address.zig) pins the
+    // HIGH bits; this pins the low-bit floor so a hash tweak that breaks
+    // low-bit diffusion single-shards loudly instead of silently.
+    const zone = zoneHash(dns.Name{ .labels = &.{ "example", "com" } });
+    const addr_key = AddressKey.fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 53));
+
+    // Axis 1: sequential addresses, fixed zone.
+    var counts: [16]u32 = @splat(0);
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const k = ArmKey{
+            .zone_hash = zone,
+            .addr_key = AddressKey.fromAddress(na.initIp4(.{
+                @intCast((i >> 16) & 0xff),
+                @intCast((i >> 8) & 0xff),
+                @intCast(i & 0xff),
+                1,
+            }, 53)),
+        };
+        counts[@as(u32, @truncate(ArmKeyContext.hash(.{}, k))) & shard_mask] += 1;
+    }
+    // Uniform expectation 256/bucket; same ±60%-class floor/ceiling as the
+    // net_address sibling test.
+    for (counts) |c| {
+        try testing.expect(c >= 100);
+        try testing.expect(c <= 700);
+    }
+
+    // Axis 2: sequential zone hashes, fixed address (many zones, one server).
+    counts = @splat(0);
+    var z: u64 = 0;
+    while (z < 4096) : (z += 1) {
+        const k = ArmKey{ .zone_hash = z, .addr_key = addr_key };
+        counts[@as(u32, @truncate(ArmKeyContext.hash(.{}, k))) & shard_mask] += 1;
+    }
+    for (counts) |c| {
+        try testing.expect(c >= 100);
+        try testing.expect(c <= 700);
+    }
+}
+
 test "beta sample in range" {
     // Draw many samples, all should be in (0, 1)
     for (0..1000) |_| {
