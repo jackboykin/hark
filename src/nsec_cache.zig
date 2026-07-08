@@ -236,19 +236,6 @@ fn freeEntry(alloc: Allocator, e: *NsecEntry) void {
     if (e.sigs.len > 0) alloc.free(e.sigs);
 }
 
-/// Closest encloser derived from the cover NSEC's endpoints (RFC 8198 §5.3,
-/// matches validateNegativeProof). CE is a label-suffix of qname by the
-/// slice expression below; the clamp keeps apex-wrap NSECs (next == apex,
-/// a suffix of qname) from saturating CE to qname itself.
-fn closestEncloserFromCover(qname: dns.Name, cover: *const NsecEntry) ?dns.Name {
-    if (qname.labels.len == 0) return null;
-    const ce_depth = @min(@max(
-        dnssec.commonSuffixLabels(qname, cover.owner),
-        dnssec.commonSuffixLabels(qname, cover.next_domain),
-    ), qname.labels.len - 1);
-    return dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
-}
-
 /// RFC 6840 §4.1: a parent-side NSEC at a delegation cut (NS+!SOA) is
 /// authoritative for the cut, not the subtree below. Fires only when
 /// `target` is at-or-below `nsec.owner` — the shape where misuse would
@@ -629,7 +616,8 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
     if (isParentSideNsec(qname_cover, qname, qtype)) return .unknown;
 
     // (b) Derive closest encloser from cover, then check wildcard
-    const ce = closestEncloserFromCover(qname, qname_cover) orelse return .unknown;
+    const ce = dnssec.closestEncloser(qname, qname_cover.owner, qname_cover.next_domain) orelse
+        return .unknown;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const wildcard_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unknown;

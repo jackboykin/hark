@@ -779,6 +779,36 @@ pub fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
     return min_labels;
 }
 
+/// Closest encloser of qname derived from a covering NSEC's endpoints
+/// (RFC 4035 §5.4 / RFC 8198 §5.3): the longest label-suffix of qname also
+/// shared with either bound, clamped to a PROPER ancestor — an apex-wrap
+/// NSEC bound (e.g. ip6.arpa. → 3.0.0.1.0.0.2.ip6.arpa.) contains qname as
+/// a strict suffix and would otherwise saturate the CE to qname itself.
+/// Null for the root qname. The result aliases qname's labels.
+pub fn closestEncloser(qname: dns.Name, bound_a: dns.Name, bound_b: dns.Name) ?dns.Name {
+    if (qname.labels.len == 0) return null;
+    const depth = @min(@max(
+        commonSuffixLabels(qname, bound_a),
+        commonSuffixLabels(qname, bound_b),
+    ), qname.labels.len - 1);
+    return .{ .labels = qname.labels[qname.labels.len - depth ..] };
+}
+
+test closestEncloser {
+    const t = std.testing;
+    const qname = dns.Name{ .labels = &.{ "a", "b", "example", "com" } };
+    // Ordinary cover: CE is the deepest shared suffix of either bound.
+    const owner = dns.Name{ .labels = &.{ "z", "b", "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "example", "com" } };
+    try t.expectEqual(@as(usize, 3), closestEncloser(qname, owner, next).?.labels.len);
+    // Apex-wrap bound containing qname as a strict suffix must clamp to a
+    // proper ancestor, never qname itself.
+    const wrap = dns.Name{ .labels = &.{ "x", "a", "b", "example", "com" } };
+    try t.expectEqual(@as(usize, 3), closestEncloser(qname, wrap, wrap).?.labels.len);
+    // Root qname has no proper ancestor.
+    try t.expectEqual(null, closestEncloser(.{ .labels = &.{} }, owner, next));
+}
+
 /// Case-insensitive label comparison, byte-by-byte.
 fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     const min_len = @min(a.len, b.len);
@@ -998,15 +1028,8 @@ pub fn validateNegativeProof(
         // IANA and real signed zones actually emit. Owner-equality with
         // *.CE plus a verified RRSIG is the binding here.
         if (covering_nsec) |cov| {
-            if (qname.labels.len == 0) return .unchecked;
-            // Clamp commonSuffix to a proper ancestor: an apex-NSEC bound
-            // (e.g. ip6.arpa. → 3.0.0.1.0.0.2.ip6.arpa.) saturates at
-            // qname.labels.len when it contains qname as a strict suffix.
-            const ce_depth = @min(@max(
-                commonSuffixLabels(qname, cov.name),
-                commonSuffixLabels(qname, cov.rdata.nsec.next_domain_name),
-            ), qname.labels.len - 1);
-            const ce = dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
+            const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
+                return .unchecked;
 
             var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
             const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
@@ -1037,13 +1060,8 @@ pub fn validateNegativeProof(
     // also a suffix of the covering NSEC's owner or next_domain_name.
     if (is_nxdomain and any_nsec) {
         const covering = covering_nsec orelse return .unchecked;
-        if (qname.labels.len == 0) return .unchecked;
-        // Clamp: see NODATA arm above.
-        const ce_depth = @min(@max(
-            commonSuffixLabels(qname, covering.name),
-            commonSuffixLabels(qname, covering.rdata.nsec.next_domain_name),
-        ), qname.labels.len - 1);
-        const ce = dns.Name{ .labels = qname.labels[qname.labels.len - ce_depth ..] };
+        const ce = closestEncloser(qname, covering.name, covering.rdata.nsec.next_domain_name) orelse
+            return .unchecked;
 
         // RFC 4035 §5.4: the CE must be *proven* to exist via an NSEC that
         // explicitly names it as owner or next. A "covering range strictly
