@@ -278,12 +278,12 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
     // Only fall through on FileNotFound; surface any other error (parse, I/O).
     var cfg = if (config_path) |path|
-        hark.config.parseConfigFile(allocator, path) catch |err| {
+        hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
         }
     else
-        loadDefaultConfig(allocator) catch std.process.exit(1);
+        loadDefaultConfig(allocator, io) catch std.process.exit(1);
     defer cfg.deinit();
 
     // Enable verbose logging from CLI flag or config
@@ -304,12 +304,12 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     };
 }
 
-fn loadDefaultConfig(allocator: std.mem.Allocator) !hark.config.ServerConfig {
+fn loadDefaultConfig(allocator: std.mem.Allocator, io: Io) !hark.config.ServerConfig {
     // No CWD-relative search: under systemd or any non-interactive runner the
     // working directory is unrelated to where the operator put the config.
     // Pass --config <path> for non-default locations.
     const default_path = "/etc/hark/hark.toml";
-    if (hark.config.parseConfigFile(allocator, default_path)) |cfg| {
+    if (hark.config.parseConfigFile(allocator, io, default_path)) |cfg| {
         return cfg;
     } else |err| switch (err) {
         error.FileNotFound => {

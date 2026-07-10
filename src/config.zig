@@ -307,7 +307,10 @@ fn validateSchema(root: toml.Table) ConfigError!void {
 
 fn nonNegativeClamped(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
     const v = table.getInteger(key) orelse return null;
-    if (v < 0) return error.InvalidValue;
+    if (v < 0) {
+        errLog("config: {s} must not be negative, got {d}", .{ key, v });
+        return error.InvalidValue;
+    }
     return @intCast(@min(v, std.math.maxInt(T)));
 }
 
@@ -328,16 +331,25 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             cfg.listen = new_listen;
         }
         if (server.getInteger("workers")) |w| {
-            if (w < 1 or w > 65535) return error.InvalidWorkerCount;
+            if (w < 1 or w > 65535) {
+                errLog("config: workers must be 1-65535, got {d}", .{w});
+                return error.InvalidWorkerCount;
+            }
             cfg.workers = @intCast(w);
         }
         if (server.getInteger("resolution-threads")) |rt| {
-            if (rt < 1 or rt > 256) return error.InvalidWorkerCount;
+            if (rt < 1 or rt > 256) {
+                errLog("config: resolution-threads must be 1-256, got {d}", .{rt});
+                return error.InvalidWorkerCount;
+            }
             cfg.resolution_threads = @intCast(rt);
         }
         if (server.getInteger("max-udp-payload")) |m| {
             const dns_mod = @import("dns.zig");
-            if (m < dns_mod.max_udp_payload or m > dns_mod.max_message_len) return error.InvalidValue;
+            if (m < dns_mod.max_udp_payload or m > dns_mod.max_message_len) {
+                errLog("config: max-udp-payload must be {d}-{d}, got {d}", .{ dns_mod.max_udp_payload, dns_mod.max_message_len, m });
+                return error.InvalidValue;
+            }
             cfg.max_udp_payload = @intCast(m);
         }
         if (try nonNegativeClamped(u32, server, "user")) |u| cfg.drop_uid = u;
@@ -350,11 +362,17 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (try nonNegativeClamped(u32, server, "tcp-idle-timeout-ms")) |v| {
             // RFC 7828 §3.4 caps the wire TIMEOUT field (100-ms units) at u16.
             // Reject configs that would overflow the @intCast at emit time.
-            if (v > 6_553_500) return error.InvalidValue;
+            if (v > 6_553_500) {
+                errLog("config: tcp-idle-timeout-ms must be at most 6553500, got {d}", .{v});
+                return error.InvalidValue;
+            }
             cfg.tcp_idle_timeout_ms = v;
         }
         if (try nonNegativeClamped(u32, server, "tcp-queries-per-conn")) |v| {
-            if (v == 0) return error.InvalidValue;
+            if (v == 0) {
+                errLog("config: tcp-queries-per-conn must not be 0", .{});
+                return error.InvalidValue;
+            }
             cfg.tcp_queries_per_conn = v;
         }
         if (try nonNegativeClamped(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
@@ -453,29 +471,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     return cfg;
 }
 
-pub fn parseConfigFile(allocator: Allocator, path: []const u8) !ServerConfig {
-    const sys = @import("sys.zig");
-    const posix = std.posix;
-    // Null-terminate path for openat syscall
-    var path_buf: [4096]u8 = undefined;
-    if (path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_z: [*:0]const u8 = path_buf[0..path.len :0];
-    const fd = try sys.open(path_z, posix.O{}, 0);
-    defer sys.close(fd);
-
-    var contents = std.ArrayList(u8).empty;
-    defer contents.deinit(allocator);
-    var read_buf: [4096]u8 = undefined;
-    while (true) {
-        const n = try sys.read(fd, &read_buf);
-        if (n == 0) break;
-        try contents.appendSlice(allocator, read_buf[0..n]);
-        if (contents.items.len > 1024 * 1024) return error.ConfigFileTooLarge;
-    }
-
-    return parseConfig(allocator, contents.items);
+pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !ServerConfig {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => return error.ConfigFileTooLarge,
+        else => |e| return e,
+    };
+    defer allocator.free(contents);
+    return parseConfig(allocator, contents);
 }
 
 /// Parse a list of trust-anchor strings in the form
@@ -554,13 +556,19 @@ fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]d
         // zero-label name, and `isSubdomainOf` treats the zero-label parent
         // as matching every RR — so a typo like `allow-zones = [""]` would
         // silently disable rebinding protection entirely. Fail loudly.
-        if (strs[i].len == 0 or mem.eql(u8, strs[i], ".")) return error.InvalidValue;
+        if (strs[i].len == 0 or mem.eql(u8, strs[i], ".")) {
+            errLog("config: allow-zones entry must name a zone, got '{s}'", .{strs[i]});
+            return error.InvalidValue;
+        }
         list[i] = dns.parseDottedName(allocator, strs[i]) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Any other dns parse error (invalid label, name too long, …)
             // surfaces as InvalidValue — operators editing TOML need a clear
             // signal, not a dns-internal error variant.
-            else => return error.InvalidValue,
+            else => {
+                errLog("config: invalid zone name '{s}'", .{strs[i]});
+                return error.InvalidValue;
+            },
         };
     }
     return list;
@@ -570,7 +578,10 @@ fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]a
     const list = try allocator.alloc(acl.Cidr, strs.len);
     errdefer allocator.free(list);
     for (strs, 0..) |s, i| {
-        list[i] = acl.parse(s) orelse return error.InvalidAclEntry;
+        list[i] = acl.parse(s) orelse {
+            errLog("config: invalid CIDR entry '{s}'", .{s});
+            return error.InvalidAclEntry;
+        };
     }
     return list;
 }
@@ -580,7 +591,10 @@ fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port
     errdefer allocator.free(addrs);
 
     for (strs, 0..) |s, i| {
-        addrs[i] = parseAddress(s, default_port) orelse return err;
+        addrs[i] = parseAddress(s, default_port) orelse {
+            errLog("config: invalid address '{s}'", .{s});
+            return err;
+        };
     }
     return addrs;
 }
@@ -608,28 +622,17 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     if (first) |f| {
         if (f == last.?) {
             const port = std.fmt.parseInt(u16, s[f + 1 ..], 10) catch return null;
-            const ip4 = parseIpv4(s[0..f]) orelse return null;
-            return net_addr.initIp4(ip4, port);
+            const ip4 = std.Io.net.Ip4Address.parse(s[0..f], port) catch return null;
+            return .{ .ip4 = ip4 };
         }
         const ip6 = net_addr.Ip6.parse(s, default_port) catch return null;
         return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
     }
 
-    const ip4 = parseIpv4(s) orelse return null;
-    return net_addr.initIp4(ip4, default_port);
-}
-
-fn parseIpv4(s: []const u8) ?[4]u8 {
-    var result: [4]u8 = undefined;
-    var octet_idx: usize = 0;
-    var iter = mem.splitScalar(u8, s, '.');
-    while (iter.next()) |part| {
-        if (octet_idx >= 4) return null;
-        result[octet_idx] = std.fmt.parseInt(u8, part, 10) catch return null;
-        octet_idx += 1;
-    }
-    if (octet_idx != 4) return null;
-    return result;
+    // Same strict dotted-quad grammar as acl.zig's allow-from parsing —
+    // one config file, one IPv4 grammar.
+    const ip4 = std.Io.net.Ip4Address.parse(s, default_port) catch return null;
+    return .{ .ip4 = ip4 };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
