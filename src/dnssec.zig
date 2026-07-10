@@ -19,7 +19,6 @@ const VerifyError = error{
     InvalidSignature,
     UnsupportedAlgorithm,
     InvalidKey,
-    InvalidRData,
     BufferTooSmall,
     SignatureExpired,
     /// CVE-2023-50387 (KeyTrap) defense: per-resolution signature-verify budget
@@ -358,7 +357,7 @@ fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize
 fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) VerifyError!void {
     // Build: canonical_owner_wire || DNSKEY_RDATA
     var wire_buf: [1024]u8 = undefined;
-    const name_len = writeCanonicalNameWire(&wire_buf, owner_name) catch return error.BufferTooSmall;
+    const name_len = try writeCanonicalNameWire(&wire_buf, owner_name);
 
     // DNSKEY RDATA: flags(2) + protocol(1) + algorithm(1) + public_key
     var pos = name_len;
@@ -407,7 +406,7 @@ fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!u
     mem.writeInt(u32, buf[8..12], rrsig.sig_expiration, .big);
     mem.writeInt(u32, buf[12..16], rrsig.sig_inception, .big);
     mem.writeInt(u16, buf[16..18], rrsig.key_tag, .big);
-    const name_len = writeCanonicalNameWire(buf[18..], rrsig.signer_name) catch return error.BufferTooSmall;
+    const name_len = try writeCanonicalNameWire(buf[18..], rrsig.signer_name);
     return 18 + name_len;
 }
 
@@ -446,7 +445,7 @@ fn buildSignedData(
             break :blk dns.Name{ .labels = wc_labels[0 .. rrsig.labels + 1] };
         } else rr.name;
 
-        const owner_len = writeCanonicalNameWire(buf[temp_pos..], owner_name) catch return error.BufferTooSmall;
+        const owner_len = try writeCanonicalNameWire(buf[temp_pos..], owner_name);
         temp_pos += owner_len;
 
         if (temp_pos + 10 > buf.len) return error.BufferTooSmall;
@@ -464,7 +463,7 @@ fn buildSignedData(
 
         // Canonical RDATA
         const rdata_start = temp_pos;
-        temp_pos += writeCanonicalRData(buf[temp_pos..], rr.rdata) catch return error.BufferTooSmall;
+        temp_pos += try writeCanonicalRData(buf[temp_pos..], rr.rdata);
         const rdata_len = temp_pos - rdata_start;
         mem.writeInt(u16, buf[rdlen_pos..][0..2], @intCast(rdata_len), .big);
 
@@ -516,8 +515,8 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
         },
         .soa => |soa| {
             var pos: usize = 0;
-            pos += writeCanonicalNameWire(buf[pos..], soa.mname) catch return error.BufferTooSmall;
-            pos += writeCanonicalNameWire(buf[pos..], soa.rname) catch return error.BufferTooSmall;
+            pos += try writeCanonicalNameWire(buf[pos..], soa.mname);
+            pos += try writeCanonicalNameWire(buf[pos..], soa.rname);
             if (pos + 20 > buf.len) return error.BufferTooSmall;
             mem.writeInt(u32, buf[pos..][0..4], soa.serial, .big);
             pos += 4;
@@ -540,7 +539,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
         },
         .nsec => |nsec_data| {
             var pos: usize = 0;
-            pos += writeCanonicalNameWire(buf[pos..], nsec_data.next_domain_name) catch return error.BufferTooSmall;
+            pos += try writeCanonicalNameWire(buf[pos..], nsec_data.next_domain_name);
             if (pos + nsec_data.type_bit_maps.len > buf.len) return error.BufferTooSmall;
             @memcpy(buf[pos..][0..nsec_data.type_bit_maps.len], nsec_data.type_bit_maps);
             pos += nsec_data.type_bit_maps.len;
@@ -615,7 +614,7 @@ fn verifyRrsig(
 
     // Build the signed data
     var signed_data_buf: [65536]u8 = undefined;
-    const signed_data = buildSignedData(&signed_data_buf, rrsig, rrset) catch return error.BufferTooSmall;
+    const signed_data = try buildSignedData(&signed_data_buf, rrsig, rrset);
 
     switch (rrsig.algorithm) {
         .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha1),
@@ -2201,9 +2200,8 @@ test "NSEC3 hash computation - RFC 5155 Appendix B" {
     // RFC 5155 Appendix B test vectors use:
     // Hash algorithm: 1 (SHA-1), iterations: 12, salt: aabbccdd
     // example -> 0p9mhaveqvm6t7vbl5lop2u3t2rp3tom
-    // The expected hash in raw bytes (not base32hex):
-
-    // We test that the hash is deterministic and 20 bytes
+    // The known-answer assertion against that vector lives in the
+    // base32hex roundtrip test below; here we check shape and determinism.
     const name = dns.Name{
         .labels = &.{@as([]const u8, "example")},
     };
@@ -2613,7 +2611,8 @@ test "base32hex decode/encode roundtrip" {
     // Encode to base32hex
     var enc_buf: [32]u8 = undefined;
     const encoded = dns.base32HexEncode(&enc_buf, &hash);
-    try testing.expectEqual(@as(usize, 32), encoded.len);
+    // RFC 5155 Appendix B known-answer: covers nsec3Hash and base32HexEncode.
+    try testing.expectEqualStrings("0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM", encoded);
 
     // Decode back
     var dec_buf: [20]u8 = undefined;
