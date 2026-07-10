@@ -110,23 +110,14 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
-/// Find a DNSKEY in a set that matches a DS record, or null.
-fn findMatchingDnskey(
-    ds: dns.DsData,
-    dnskeys: []const dns.ResourceRecord,
-    owner_name: dns.Name,
-) ?dns.DnskeyData {
-    for (dnskeys) |rr| {
-        if (rr.rtype != .dnskey) continue;
-        const dk = rr.rdata.dnskey;
-        if (!isValidZoneKey(dk)) continue;
-        if (keyTag(dk) != ds.key_tag) continue;
-        if (@intFromEnum(dk.algorithm) != @intFromEnum(ds.algorithm)) continue;
-        // Verify DS hash matches
-        verifyDs(ds, dk, owner_name) catch continue;
-        return dk;
+/// RFC 6840 §5.2: a SHA-1 DS MUST NOT anchor trust when a SHA-256 DS
+/// covers the same key tag. Applied uniformly to every anchoring check.
+fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
+    if (ds.digest_type != .sha1) return true;
+    for (ds_records) |ds2| {
+        if (ds2.digest_type == .sha256 and ds2.key_tag == ds.key_tag) return false;
     }
-    return null;
+    return true;
 }
 
 /// Find an RRSIG covering a given RType signed by a given key tag.
@@ -164,44 +155,38 @@ pub fn validateDnskeyRrset(
     }
     const filtered = dnskey_only[0..dnskey_count];
 
-    // Try all DS records × all RRSIGs covering DNSKEY (RFC 6840 §5.11)
-    outer: for (ds_records) |ds| {
-        // RFC 6840 §5.2: if a SHA-256 DS covers the same key_tag, MUST NOT use SHA-1.
-        if (ds.digest_type == .sha1) {
-            for (ds_records) |ds2| {
-                if (ds2.digest_type == .sha256 and ds2.key_tag == ds.key_tag) continue :outer;
+    // Anchor pass: mark each usable zone key that some eligible DS
+    // authenticates (tag + algorithm match, digest verifies). The DS
+    // hashing happens once per key here, never per RRSIG attempt below.
+    var key_tags: [64]u16 = undefined;
+    var anchored: [64]bool = undefined;
+    for (filtered, 0..) |rr, i| {
+        const dk = rr.rdata.dnskey;
+        key_tags[i] = keyTag(dk);
+        anchored[i] = blk: {
+            if (!isValidZoneKey(dk)) break :blk false;
+            for (ds_records) |ds| {
+                if (ds.key_tag != key_tags[i]) continue;
+                if (@intFromEnum(ds.algorithm) != @intFromEnum(dk.algorithm)) continue;
+                if (!dsEligible(ds, ds_records)) continue;
+                verifyDs(ds, dk, zone_name) catch continue;
+                break :blk true;
             }
-        }
-        if (findMatchingDnskey(ds, dnskey_records, zone_name)) |ksk| {
-            const ksk_tag = keyTag(ksk);
-            // Try every RRSIG covering DNSKEY
-            for (dnskey_records) |rrsig_rr| {
-                if (rrsig_rr.rtype != .rrsig) continue;
-                if (rrsig_rr.rdata.rrsig.type_covered != .dnskey) continue;
-                const rrsig = rrsig_rr.rdata.rrsig;
+            break :blk false;
+        };
+    }
 
-                if (rrsig.key_tag == ksk_tag) {
-                    // Direct KSK verification
-                    if (try tryVerifyRrsig(rrsig, ksk, filtered, now_u32, budget)) return;
-                    continue;
-                }
-
-                // Fallback: signing key must be DS-authenticated (C2 fix)
-                for (dnskey_records) |rr| {
-                    if (rr.rtype != .dnskey) continue;
-                    const dk = rr.rdata.dnskey;
-                    if (!isValidZoneKey(dk)) continue;
-                    if (keyTag(dk) != rrsig.key_tag) continue;
-                    var ds_auth = false;
-                    for (ds_records) |ds2| {
-                        verifyDs(ds2, dk, zone_name) catch continue;
-                        ds_auth = true;
-                        break;
-                    }
-                    if (!ds_auth) continue;
-                    if (try tryVerifyRrsig(rrsig, dk, filtered, now_u32, budget)) return;
-                }
-            }
+    // RFC 6840 §5.11: try every RRSIG covering DNSKEY against every
+    // anchored key whose tag matches. One flat walk — a (rrsig, key)
+    // pair is attempted at most once, so identical attempts are never
+    // re-charged against the KeyTrap budget.
+    for (dnskey_records) |rrsig_rr| {
+        if (rrsig_rr.rtype != .rrsig) continue;
+        const rrsig = rrsig_rr.rdata.rrsig;
+        if (rrsig.type_covered != .dnskey) continue;
+        for (filtered, 0..) |rr, i| {
+            if (!anchored[i] or key_tags[i] != rrsig.key_tag) continue;
+            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget)) return;
         }
     }
     return error.InvalidSignature;
