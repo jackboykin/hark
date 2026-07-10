@@ -137,6 +137,11 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
         },
     };
 
+    // RFC 1035 §4.1.1: qr=0 is a query, not a response — as unusable as a
+    // parse failure to every consumer. Reject before the lowercase scrub
+    // so garbage doesn't pay for name clones.
+    if (!msg.header.flags.qr) return null;
+
     // `@constCast` is sound — parseMessage returns ArrayList-backed
     // mutable storage typed `[]const`. The pre-scrub label bytes alias
     // the upstream wire buffer; cloneNameLower's arena allocation
@@ -1326,29 +1331,9 @@ pub const RecursiveResolver = struct {
 
         const signer_zone = sig.signer_name;
         if (self.cache) |c| {
-            c.storeResponse(.{
-                .header = .{
-                    .id = 0,
-                    .flags = .{
-                        .qr = true,
-                        .opcode = .query,
-                        .aa = true,
-                        .tc = false,
-                        .rd = false,
-                        .ra = false,
-                        .z = 0,
-                        .ad = false,
-                        .cd = false,
-                        .rcode = .no_error,
-                    },
-                    .qd_count = 0,
-                    .an_count = @intCast(wc_count),
-                    .ns_count = 0,
-                    .ar_count = 0,
-                },
-                .questions = &.{},
-                .answers = wc_records[0..wc_count],
-            }, signer_zone, .secure);
+            // storeResponse reads only rcode + record sections, so the
+            // synthesizedMessage header vehicle is as good as a bespoke one.
+            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure);
         }
     }
 
@@ -1398,7 +1383,6 @@ pub const RecursiveResolver = struct {
         }
 
         const response = try tryParseMessage(allocator, response_data, server) orelse return null;
-        if (!response.header.flags.qr) return null;
         return response;
     }
 
@@ -1419,7 +1403,6 @@ pub const RecursiveResolver = struct {
             return null;
         };
         const response = try tryParseMessage(allocator, tcp_data, server) orelse return null;
-        if (!response.header.flags.qr) return null;
         return response;
     }
 
@@ -1538,7 +1521,6 @@ pub const RecursiveResolver = struct {
             return null;
         };
         const response = try tryParseMessage(allocator, tls_data, server) orelse return null;
-        if (!response.header.flags.qr) return null;
         if (response.header.flags.rcode == .format_error) return null;
         if (!dns.validateQuestionMatch(response, padded_msg.questions[0].name, qtype)) return null;
         return response;
@@ -2198,14 +2180,9 @@ pub const RecursiveResolver = struct {
                     ds_only_count += 1;
                 }
                 if (ds_only_count > 0) {
-                    var key_msg = response;
-                    key_msg.answers = ds_only_buf[0..ds_only_count];
-                    key_msg.authorities = &.{};
-                    key_msg.additionals = &.{};
-                    key_msg.header.an_count = @intCast(ds_only_count);
-                    key_msg.header.ns_count = 0;
-                    key_msg.header.ar_count = 0;
-                    kc.storeResponse(key_msg, zone, .secure);
+                    // fetchRRset only returns .no_error responses, so the
+                    // synthesized header is faithful to the original.
+                    kc.storeResponse(synthesizedMessage(ds_only_buf[0..ds_only_count], &.{}, .no_error, false), zone, .secure);
                 }
             }
             return ds_section;
