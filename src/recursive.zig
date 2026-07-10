@@ -24,6 +24,7 @@ const monotonic = @import("monotonic.zig");
 const na = @import("net_address.zig");
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const NsSelector = @import("ns_selector.zig").NsSelector;
+const NsOutcome = @import("ns_selector.zig").Outcome;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const InFlightTable = @import("dedup.zig").InFlightTable;
@@ -401,7 +402,6 @@ pub const RecursiveResolver = struct {
 
     fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
         var current_name: []const u8 = name;
-        var cname_count: usize = 0;
         // Counts queryAuthoritativeServers calls only; total_probes
         // bounds QMIN iterations (including cache-hit advances).
         var upstream_queries: usize = 0;
@@ -419,11 +419,7 @@ pub const RecursiveResolver = struct {
             const action = special_use.classify(current_name, qtype);
             if (action != .none) {
                 const synth = try special_use.synthesize(allocator, current_name, action);
-                return .{
-                    .message = try withCnameChain(allocator, &cname_chain, synth),
-                    .prefetch_name = null,
-                    .prefetch_qtype = qtype,
-                };
+                return .{ .message = try withCnameChain(allocator, &cname_chain, synth) };
             }
 
             // RFC 8482: minimize ANY responses to a synthetic HINFO answer
@@ -432,24 +428,19 @@ pub const RecursiveResolver = struct {
             // get a valid response.
             if (qtype == .any) {
                 const synth = try synthesizeAnyHinfo(allocator, current_name);
-                return .{
-                    .message = try withCnameChain(allocator, &cname_chain, synth),
-                    .prefetch_name = null,
-                    .prefetch_qtype = qtype,
-                };
+                return .{ .message = try withCnameChain(allocator, &cname_chain, synth) };
             }
 
             // CACHE CHECK 1: Do we already have a cached answer?
-            switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, cname_count, &cname_chain)) {
+            switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, &cname_chain)) {
                 .none => {},
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
-                    if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
+                    if (cname_chain.records.items.len >= max_cname_chain) return error.CnameChainTooLong;
                     if (cnameTargetRevisitsChain(cname_chain.records.items, dispatch.cname_rr.rdata.cname)) {
                         logCnameLoop(dispatch.cname_rr.rdata.cname, "cache-served");
                         return self.bogusServfail(current_name, qtype);
                     }
-                    cname_count += 1;
                     try cname_chain.records.append(allocator, dispatch.cname_rr);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
@@ -577,11 +568,9 @@ pub const RecursiveResolver = struct {
                                     if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
                                 }
                             },
-                            .skip_cache => {},
-                            .bogus => {
-                                minimize_label_count = target_name.labels.len;
-                                continue;
-                            },
+                            // .bogus falls through to the same stop-minimizing
+                            // epilogue as .proceed/.skip_cache — one home for it.
+                            .skip_cache, .bogus => {},
                         }
                         minimize_label_count = target_name.labels.len;
                         continue;
@@ -666,8 +655,7 @@ pub const RecursiveResolver = struct {
                             if (self.dnssec_enabled and security_state == .secure) {
                                 switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
                                     .bogus => {
-                                        if (self.ns_selector) |ns| if (responding_server) |srv|
-                                            ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                                        self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                                         return self.bogusServfail(current_name, qtype);
                                     },
                                     .valid => {
@@ -682,12 +670,11 @@ pub const RecursiveResolver = struct {
 
                                 // Store before following CNAME — won't reach final answer validation
                                 if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status);
-                                if (cname_count >= max_cname_chain) return error.CnameChainTooLong;
+                                if (cname_chain.records.items.len >= max_cname_chain) return error.CnameChainTooLong;
                                 if (cnameTargetRevisitsChain(cname_chain.records.items, cname_rr.rdata.cname)) {
                                     logCnameLoop(cname_rr.rdata.cname, "upstream-served");
                                     return self.bogusServfail(current_name, qtype);
                                 }
-                                cname_count += 1;
                                 try cname_chain.records.append(allocator, cname_rr);
 
                                 try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_chain.wildcard_proofs);
@@ -800,7 +787,7 @@ pub const RecursiveResolver = struct {
     /// lives inside this helper so the recursive call doesn't leak the
     /// flag to other callers. Both stale recursion and prefetch-window
     /// signalling are gated to the head of the CNAME chain
-    /// (cname_count == 0) — mid-chain re-entry would re-walk preceding
+    /// (empty chain) — mid-chain re-entry would re-walk preceding
     /// labels.
     ///
     /// CNAME-follow fallback: when the direct `(current_name, qtype)`
@@ -808,7 +795,7 @@ pub const RecursiveResolver = struct {
     /// A fresh hit returns `.follow_cname`; the outer loop pushes it
     /// onto the chain and continues. Stale CNAMEs at the head of the
     /// chain are skipped so the direct upstream path can run — the
-    /// stale-revalidate gate (cname_count == 0) protects against
+    /// stale-revalidate gate (empty chain) protects against
     /// silently serving a stale redirect when fresh resolution is on
     /// the table.
     fn tryServeFromCache(
@@ -818,7 +805,6 @@ pub const RecursiveResolver = struct {
         current_name: []const u8,
         qtype: dns.RType,
         depth: usize,
-        cname_count: usize,
         chain: *const CnameChain,
     ) !CacheDispatch {
         if (self.bypass_cache) return .none;
@@ -830,12 +816,12 @@ pub const RecursiveResolver = struct {
                     .is_stale = entry.is_stale,
                 },
             };
-            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and cname_count == 0) name else null;
+            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and chain.records.items.len == 0) name else null;
 
             // RFC 8767 §6: a stale cache entry must not be the first answer
             // when fresh resolution is achievable. Try fresh once with
             // bypass_cache; on any failure fall back to the stale answer.
-            if (meta.is_stale and cname_count == 0) {
+            if (meta.is_stale and chain.records.items.len == 0) {
                 // Save/restore so a future caller that arrives here with
                 // bypass_cache already set doesn't get its flag silently
                 // flipped to false.
@@ -880,7 +866,7 @@ pub const RecursiveResolver = struct {
                 // and let the upstream path run. Mid-chain stale is
                 // already a degraded answer — the chain head was fresh
                 // when we entered — so following is acceptable there.
-                if (h.is_stale and cname_count == 0) return .none;
+                if (h.is_stale and chain.records.items.len == 0) return .none;
                 if (h.records.len == 0) return .none;
                 return .{ .follow_cname = .{
                     .cname_rr = h.records[0],
@@ -916,7 +902,7 @@ pub const RecursiveResolver = struct {
             },
             .wildcard_match => {
                 if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, chain)) |result| {
-                    return .{ .message = result, .prefetch_name = null, .prefetch_qtype = qtype };
+                    return .{ .message = result };
                 }
                 return null;
             },
@@ -1142,8 +1128,7 @@ pub const RecursiveResolver = struct {
         if (self.dnssec_enabled) {
             switch (try self.validateAnswer(allocator, response, qtype, security_state, servers)) {
                 .bogus => {
-                    if (self.ns_selector) |ns| if (responding_server) |srv|
-                        ns.recordOutcome(parent_zone, srv, .validation_failure, 0);
+                    self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                     return self.bogusServfail(current_name, qtype);
                 },
                 .valid => {
@@ -1285,6 +1270,13 @@ pub const RecursiveResolver = struct {
         if (self.nsec_cache) |nc| {
             nc.storeFromAuthority(authorities, zone);
         }
+    }
+
+    /// Null-guard wrapper: report an exchange outcome to the NS selector,
+    /// tolerating both a missing selector and an unknown responding server.
+    fn recordNsOutcome(self: *RecursiveResolver, zone: dns.Name, server: ?na.Address, outcome: NsOutcome, elapsed_us: i64) void {
+        const ns = self.ns_selector orelse return;
+        ns.recordOutcome(zone, server orelse return, outcome, elapsed_us);
     }
 
     /// Detect wildcard expansion in validated answers and store the wildcard RRset
@@ -1686,8 +1678,7 @@ pub const RecursiveResolver = struct {
         // without this check. Score and bail to sequential. FORMERR counts
         // (an EDNS-hostile auth shouldn't condemn the zone — try a sibling).
         if (resp.header.flags.rcode.shouldTrySiblingNs()) {
-            if (self.ns_selector) |ns|
-                ns.recordOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
+            self.recordNsOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
             return null;
         }
 
@@ -1695,8 +1686,7 @@ pub const RecursiveResolver = struct {
         // SERVFAIL / 0x20-mismatch / TC-then-TCP-failed winner isn't
         // double-counted as a healthy success on the Thompson arm.
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
-        if (self.ns_selector) |ns|
-            ns.recordOutcome(parent_zone, responding_addr, .success, elapsed_us);
+        self.recordNsOutcome(parent_zone, responding_addr, .success, elapsed_us);
 
         return .{ .message = resp, .server = responding_addr };
     }
@@ -1773,8 +1763,7 @@ pub const RecursiveResolver = struct {
             // ── Do53: UDP with TCP fallback, 0x20-hardened ──
             const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware)) {
                 .timeout => {
-                    if (self.ns_selector) |ns|
-                        ns.recordOutcome(parent_zone, server, .timeout, 0);
+                    self.recordNsOutcome(parent_zone, server, .timeout, 0);
                     continue :server_loop;
                 },
                 .mismatch => continue :server_loop,
@@ -1787,14 +1776,12 @@ pub const RecursiveResolver = struct {
             // condemn a zone its siblings can still serve.
             // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
             if (response.header.flags.rcode.shouldTrySiblingNs()) {
-                if (self.ns_selector) |ns|
-                    ns.recordOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
+                self.recordNsOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
                 last_server_failure = response;
                 continue :server_loop;
             }
 
-            if (self.ns_selector) |ns|
-                ns.recordOutcome(parent_zone, server, .success, exchange.elapsed_us);
+            self.recordNsOutcome(parent_zone, server, .success, exchange.elapsed_us);
             self.fireOteProbe(server);
             return .{ .message = response, .responding_server = server };
         }
