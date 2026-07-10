@@ -16,14 +16,6 @@ pub const Value = union(enum) {
 pub const Table = struct {
     map: std.StringHashMapUnmanaged(Value),
 
-    pub fn getString(self: Table, key: []const u8) ?[]const u8 {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .string => |s| s,
-            else => null,
-        };
-    }
-
     pub fn getInteger(self: Table, key: []const u8) ?i64 {
         const val = self.map.get(key) orelse return null;
         return switch (val) {
@@ -356,7 +348,7 @@ test "parse string value" {
         \\name = "hello"
     );
     defer result.deinit();
-    try testing.expectEqualStrings("hello", result.table.getString("name").?);
+    try testing.expectEqualStrings("hello", result.table.map.get("name").?.string);
 }
 
 test "parse string escapes" {
@@ -364,7 +356,7 @@ test "parse string escapes" {
     const input = "path = \"a\\\"b\\\\c\"";
     var result = try parse(testing.allocator, input);
     defer result.deinit();
-    try testing.expectEqualStrings("a\"b\\c", result.table.getString("path").?);
+    try testing.expectEqualStrings("a\"b\\c", result.table.map.get("path").?.string);
 }
 
 test "parse integer value" {
@@ -456,7 +448,7 @@ test "parse comment with hash in string" {
         \\name = "hello#world"
     );
     defer result.deinit();
-    try testing.expectEqualStrings("hello#world", result.table.getString("name").?);
+    try testing.expectEqualStrings("hello#world", result.table.map.get("name").?.string);
 }
 
 test "error on duplicate key" {
