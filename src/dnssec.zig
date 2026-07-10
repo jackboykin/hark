@@ -652,27 +652,21 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     const sig_fe = RsaFe.fromBytes(n, signature, .big) catch return error.InvalidSignature;
     const decoded_fe = n.powPublic(sig_fe, e) catch return error.InvalidSignature;
 
-    // Comptime dispatch sizes the two stack buffers for the EM comparison.
-    inline for (comptime blk: {
-        var sizes: [(512 - 128) / 8 + 1]usize = undefined;
-        for (0..sizes.len) |i| sizes[i] = 128 + i * 8;
-        break :blk sizes;
-    }) |mod_len| {
-        if (modulus.len == mod_len) {
-            var em_dec: [mod_len]u8 = undefined;
-            decoded_fe.toBytes(&em_dec, .big) catch return error.InvalidSignature;
-            const em_expected = pkcs1v15Encode(mod_len, Hash, msg);
-            if (!std.crypto.timing_safe.eql([mod_len]u8, em_dec, em_expected))
-                return error.InvalidSignature;
-            return;
-        }
-    }
-    unreachable; // 8-byte-aligned 128..512 covered above
+    var em_dec: [512]u8 = undefined;
+    decoded_fe.toBytes(em_dec[0..modulus.len], .big) catch return error.InvalidSignature;
+    var em_expected: [512]u8 = undefined;
+    pkcs1v15Encode(em_expected[0..modulus.len], Hash, msg);
+
+    // Xor-fold compare: no data-dependent branch, so still constant-time —
+    // though EM in signature *verification* is public data anyway.
+    var diff: u8 = 0;
+    for (em_dec[0..modulus.len], em_expected[0..modulus.len]) |a, b| diff |= a ^ b;
+    if (diff != 0) return error.InvalidSignature;
 }
 
 /// EMSA-PKCS1-v1_5 (RFC 8017 §9.2). Inlined because the stdlib's equivalent
 /// in Certificate.rsa is private and we no longer route through it.
-fn pkcs1v15Encode(comptime emLen: usize, comptime Hash: type, msg: []const u8) [emLen]u8 {
+fn pkcs1v15Encode(em: []u8, comptime Hash: type, msg: []const u8) void {
     const hash_der: []const u8 = &switch (Hash) {
         Sha1 => .{
             0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
@@ -690,11 +684,11 @@ fn pkcs1v15Encode(comptime emLen: usize, comptime Hash: type, msg: []const u8) [
         },
         else => @compileError("unsupported hash for PKCS#1 v1.5"),
     };
-    // RFC 8017 §9.2 step 3: PS ≥ 8 octets, else @memset wraps.
-    comptime std.debug.assert(emLen >= hash_der.len + Hash.digest_length + 11);
+    // RFC 8017 §9.2 step 3: PS ≥ 8 octets, else @memset wraps. Guaranteed
+    // by verifyRsa's `modulus.len >= 128` gate — Sha512 needs at most 94.
+    std.debug.assert(em.len >= hash_der.len + Hash.digest_length + 11);
 
-    var em: [emLen]u8 = undefined;
-    var idx: usize = emLen;
+    var idx: usize = em.len;
     idx -= Hash.digest_length;
     Hash.hash(msg, em[idx..][0..Hash.digest_length], .{});
     idx -= hash_der.len;
@@ -704,7 +698,6 @@ fn pkcs1v15Encode(comptime emLen: usize, comptime Hash: type, msg: []const u8) [
     @memset(em[2..idx], 0xff);
     em[1] = 0x01;
     em[0] = 0x00;
-    return em;
 }
 
 /// Verify an ECDSA signature (P-256 or P-384) given raw x||y key and r||s signature.
@@ -1906,7 +1899,8 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
             },
         },
     }) |c| {
-        const em = pkcs1v15Encode(128, c.Hash, "abc");
+        var em: [128]u8 = undefined;
+        pkcs1v15Encode(&em, c.Hash, "abc");
         try testing.expectEqual(@as(u8, 0x00), em[0]);
         try testing.expectEqual(@as(u8, 0x01), em[1]);
         const sep = 128 - c.digest_len - c.der.len - 1;
