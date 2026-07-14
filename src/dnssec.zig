@@ -1608,6 +1608,52 @@ test "validateDnskeyRrset tolerates more DNSKEYs than the 64-key filter buffer" 
     );
 }
 
+test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the budget" {
+    // CVE-2023-50387: colliding-tag keys × DNSKEY-covering RRSIGs force an N×M
+    // verify cross-product. consumeVerify charges before any crypto, so the walk
+    // halts at the ceiling however large N·M grows. Pins that against the walk's
+    // next refactor.
+    var digest = try testDsDigest(test_owner, test_dnskey);
+    const ds = dns.DsData{
+        .key_tag = keyTag(test_dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha256,
+        .digest = &digest,
+    };
+
+    // 3 anchored copies of the DS-matching key × 40 tag-matching RRSIGs with
+    // unverifiable signatures = 120 candidate attempts; the budget permits 8.
+    var records: [43]dns.ResourceRecord = undefined;
+    for (records[0..3]) |*r| r.* = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
+    for (records[3..43]) |*r| r.* = .{
+        .name = test_owner,
+        .rtype = .rrsig,
+        .rclass = .in,
+        .ttl = 86400,
+        .rdata = .{ .rrsig = .{
+            .type_covered = .dnskey,
+            .algorithm = .rsasha256,
+            .labels = 2,
+            .original_ttl = 86400,
+            .sig_expiration = 0xFFFFFFFF,
+            .sig_inception = 0,
+            .key_tag = ds.key_tag,
+            .signer_name = test_owner,
+            .signature = &.{ 0xDE, 0xAD, 0xBE, 0xEF },
+        } },
+    };
+
+    const cap: u32 = 8;
+    var budget: ValidationBudget = .{ .max_sig_verify = cap };
+    try testing.expectError(
+        error.ValidationBudgetExhausted,
+        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
+    );
+    // cap draws succeed, the next trips exhaustion → spent == cap+1: proof the
+    // walk stopped at the ceiling and never touched all 120 attempts.
+    try testing.expectEqual(cap + 1, budget.sig_verify_spent.load(.monotonic));
+}
+
 test "validateAnswerRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     // A DS RRset that arrives at the resolver without a covering RRSIG
     // signed by the parent zone's DNSKEY MUST NOT be trusted as a chain
