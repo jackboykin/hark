@@ -452,6 +452,20 @@ pub const Server = struct {
     /// returns anything other than `CacheOnlyMiss`. Slow path re-runs the
     /// resolve, so the work is duplicated when this happens.
     fast_path_errors: std.atomic.Value(u64) align(std.atomic.cache_line),
+    /// Client-facing cache accounting: exactly one bump per answered client
+    /// query (UDP fast path, UDP slow path, TCP). `hits` = answered with
+    /// zero upstream queries. This is the operator-meaningful hit rate — the
+    /// RRsetCache counters count every internal lookup during recursion
+    /// (CNAME probes, NX-ancestor walks, NS/DS/DNSKEY infra), which
+    /// amplifies each client miss into ~10 counted misses and pins the
+    /// reported rate far below the truth.
+    client_cache_hits: std.atomic.Value(u64) align(std.atomic.cache_line),
+    client_cache_misses: std.atomic.Value(u64) align(std.atomic.cache_line),
+    /// TTL-refresh prefetches dropped: bg pool full and the caller had no
+    /// inline fallback (recv-thread fast path — exactly where prefetch
+    /// flags originate). Nonzero here means near-expiry refreshes are
+    /// silently lost under load.
+    prefetch_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
@@ -553,6 +567,9 @@ pub const Server = struct {
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
             .fast_path_errors = std.atomic.Value(u64).init(0),
+            .client_cache_hits = std.atomic.Value(u64).init(0),
+            .client_cache_misses = std.atomic.Value(u64).init(0),
+            .prefetch_drops = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
             .wake_fds = try createWakeFds(allocator, cfg.workers),
         };
@@ -725,12 +742,20 @@ pub const Server = struct {
             log.warn("{d} worker(s) failed to initialize; running with degraded capacity", .{failed});
         }
 
-        // Log cache stats on shutdown
+        // Log cache stats on shutdown. The client-query line is the
+        // operator-meaningful hit rate (one count per answered query); the
+        // rrset-lookup line below it counts all internal recursion traffic
+        // and reads structurally lower — don't compare the two.
+        const c_hits = self.client_cache_hits.load(.monotonic);
+        const c_misses = self.client_cache_misses.load(.monotonic);
+        const c_total = c_hits + c_misses;
+        const c_pct: u64 = if (c_total > 0) c_hits * 100 / c_total else 0;
+        log.info("client queries: {d} cache-served, {d} upstream ({d}% cache-served)", .{ c_hits, c_misses, c_pct });
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats: {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, asKiB(stats.memory_bytes), stats.hits, stats.misses, hit_pct, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
+            stats.entries, asKiB(stats.memory_bytes), stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
@@ -755,6 +780,7 @@ pub const Server = struct {
         }
         logCounterIfNonzero("UDP send-buffer drops", self.udp_send_drops.load(.monotonic));
         logCounterIfNonzero("fast-path resolver errors (fell through to slow path)", self.fast_path_errors.load(.monotonic));
+        logCounterIfNonzero("prefetches dropped (bg pool full, no inline fallback)", self.prefetch_drops.load(.monotonic));
     }
 
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, wake_fd: posix.fd_t, reuseport: bool) void {
@@ -1324,6 +1350,7 @@ const WorkerState = struct {
 
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
+        self.recordClientOutcome(result.from_cache); // cache_only ⇒ always a hit
         self.dispatchPrefetches(result, name_str, null);
         if (query_msg.header.flags.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
         return true;
@@ -1402,6 +1429,7 @@ const WorkerState = struct {
                 var qtype_buf: [24]u8 = undefined;
                 log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 self.server.cache.cacheServfail(name_str, question.qtype);
+                self.recordClientOutcome(false);
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
                 const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
                 tcpWriteMessage(self.server.io, client_fd, w, write_deadline_ns) orelse return;
@@ -1422,11 +1450,20 @@ const WorkerState = struct {
             const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             tcpWriteMessage(self.server.io, client_fd, wire, write_deadline_ns) orelse return;
 
+            self.recordClientOutcome(result.from_cache);
             self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
             if (query.header.flags.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
         }
+    }
+
+    /// One bump per answered client query — see Server.client_cache_hits.
+    /// SERVFAILs count as misses (the client waited on failed upstream
+    /// work); malformed/refused queries are never counted.
+    fn recordClientOutcome(self: *WorkerState, from_cache: bool) void {
+        const ctr = if (from_cache) &self.server.client_cache_hits else &self.server.client_cache_misses;
+        _ = ctr.fetchAdd(1, .monotonic);
     }
 
     fn resolveQueryWith(
@@ -1584,6 +1621,7 @@ const WorkerState = struct {
             var qtype_buf1: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             self.server.cache.cacheServfail(name_str, question.qtype);
+            self.recordClientOutcome(false);
             self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
             return;
         };
@@ -1594,6 +1632,7 @@ const WorkerState = struct {
 
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
+        self.recordClientOutcome(result.from_cache);
         self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
 
         if (query_msg.header.flags.cd) {
@@ -1623,7 +1662,8 @@ const WorkerState = struct {
 
     fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType, inline_fallback: ?PrefetchInlineFallback) void {
         if (self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) return;
-        if (inline_fallback) |f| self.doPrefetchWith(name, qtype, f.transports, f.prefetch_pta);
+        if (inline_fallback) |f| return self.doPrefetchWith(name, qtype, f.transports, f.prefetch_pta);
+        _ = self.server.prefetch_drops.fetchAdd(1, .monotonic);
     }
 
     /// Schedule background DNSSEC validation for a cache entry populated by
@@ -1667,9 +1707,14 @@ const WorkerState = struct {
         errdefer if (is_leader) {
             if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
         };
-        const result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
+        var result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         if (is_leader) {
             if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
+        } else {
+            // A follower's own resolve is a cache hit by construction (the
+            // leader populated it), but the client still waited on the
+            // leader's upstream round-trip — that's a miss experientially.
+            result.from_cache = false;
         }
         return result;
     }
