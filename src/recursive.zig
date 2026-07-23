@@ -249,6 +249,14 @@ pub const RecursiveResolver = struct {
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
 
+    /// A CNAME-chain member (head redirect or a mid-chain/tail RRset) was
+    /// served from cache inside its prefetch window. Consumed in `resolve()`:
+    /// the prefetch targets (head name, qtype) — a bg re-walk of the whole
+    /// chain refreshes whichever member is aging. Chain members can't flow
+    /// through `prefetch_name` at the hit site because mid-chain hits happen
+    /// before the final result exists; the head name is the stable handle.
+    pending_chain_prefetch: bool = false,
+
     /// Tree-wide DNSSEC CPU budget for the in-flight query — a `dnssec.ValidationBudget`
     /// on `resolve()`'s stack, shared (not reset) across `cloneForThread` so the fan-out
     /// can't multiply the KeyTrap/NSEC3 ceilings. null outside `resolve()` (cache-only +
@@ -331,6 +339,7 @@ pub const RecursiveResolver = struct {
         resolver.gpa = null;
         resolver.resolving_ds = false;
         resolver.pending_dnskey_prefetch = null;
+        resolver.pending_chain_prefetch = false;
         // Neither budget is reset: `self.*` copies the pointers, so clones share the
         // parent's counters. Resetting either re-opens fan-out amplification (NXNS /
         // KeyTrap). Both are atomic, so concurrent draws are safe.
@@ -381,6 +390,13 @@ pub const RecursiveResolver = struct {
         prefetch_dnskey_zone: ?[]const u8 = null,
         /// Happy-Eyeballs (RFC 8305) cousin qtype — A↔AAAA pairing.
         cousin_prefetch_qtype: ?dns.RType = null,
+        /// True iff the answer was produced with zero upstream queries
+        /// (cache hit, NSEC aggressive-use synthesis, or RFC 8020 NX cut).
+        /// Drives the server's client-facing hit accounting — unlike the
+        /// RRsetCache counters, which count every internal lookup during
+        /// recursion. The server flips this to false for dedup followers:
+        /// they waited on a leader's upstream resolve.
+        from_cache: bool = false,
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
@@ -395,6 +411,15 @@ pub const RecursiveResolver = struct {
         defer self.validation_budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
+        // Chain-member prefetch window: refresh via the head so the bg
+        // resolve re-walks the whole chain. `name` is caller-owned and
+        // outlives the result — same lifetime contract as the head-hit
+        // prefetch_name set in tryServeFromCache.
+        if (self.pending_chain_prefetch and result.prefetch_name == null) {
+            result.prefetch_name = name;
+            result.prefetch_qtype = qtype;
+        }
+        result.from_cache = query_budget.spent.load(.monotonic) == 0;
         result.cousin_prefetch_qtype = switch (qtype) {
             .a => .aaaa,
             .aaaa => .a,
@@ -821,7 +846,15 @@ pub const RecursiveResolver = struct {
                     .is_stale = entry.is_stale,
                 },
             };
-            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and chain.records.items.len == 0) name else null;
+            const at_chain_head = chain.records.items.len == 0;
+            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and at_chain_head) name else null;
+            // Mid-chain member (the short-TTL tail of a CNAME chain, in
+            // practice) inside its prefetch window: can't re-enter here as
+            // prefetch_name — flag the resolver so resolve() targets the
+            // head instead. Covers stale mid-chain hits too (needs_prefetch
+            // is always set on stale), so a silently-followed stale link
+            // at least triggers a bg refresh.
+            if (meta.needs_prefetch and !at_chain_head) self.pending_chain_prefetch = true;
 
             // RFC 8767 §6: a stale cache entry must not be the first answer
             // when fresh resolution is achievable. Try fresh once with
@@ -873,6 +906,11 @@ pub const RecursiveResolver = struct {
                 // when we entered — so following is acceptable there.
                 if (h.is_stale and chain.records.items.len == 0) return .none;
                 if (h.records.len == 0) return .none;
+                // The redirect itself is aging. This was previously dropped
+                // on the floor — the CNAME RRset near expiry never triggered
+                // a refresh from the follow path, only from a direct
+                // (name, .cname) hit, which stub queries never produce.
+                if (h.needs_prefetch) self.pending_chain_prefetch = true;
                 return .{ .follow_cname = .{
                     .cname_rr = h.records[0],
                     .security_status = h.security_status,
@@ -3542,6 +3580,129 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
     try testing.expectEqual(@as(usize, 2), result.message.answers.len);
     try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
     try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
+}
+
+// Controllable clock for prefetch-window tests (mirrors cache.zig's).
+var test_time: i64 = 0;
+fn testNowSeconds() i64 {
+    return test_time;
+}
+
+/// Seed (alias → target CNAME, target AAAA) with independent TTLs so either
+/// chain member can be aged into its prefetch window.
+fn seedCnameChain(alloc: mem.Allocator, cache: *RRsetCache, cname_ttl: u32, tail_ttl: u32) !void {
+    {
+        const cname_owner = try makeName(alloc, &.{ "alias", "example", "com" });
+        const cname_target = try makeName(alloc, &.{ "target", "example", "com" });
+        const cname_rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = cname_ttl, .rdata = .{ .cname = cname_target } };
+        const cname_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = cname_rrs };
+        defer dns.freeMessage(alloc, cname_msg);
+        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked);
+    }
+    {
+        const aaaa_owner = try makeName(alloc, &.{ "target", "example", "com" });
+        const aaaa_rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        aaaa_rrs[0] = .{
+            .name = aaaa_owner,
+            .rtype = .aaaa,
+            .rclass = .in,
+            .ttl = tail_ttl,
+            .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+        };
+        const aaaa_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = aaaa_rrs };
+        defer dns.freeMessage(alloc, aaaa_msg);
+        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked);
+    }
+}
+
+test "chain tail in prefetch window flags head prefetch (mid-chain hit)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Long-lived redirect, short-lived tail — the CDN shape.
+    try seedCnameChain(alloc, &cache, 3600, 300);
+
+    // Tail: remaining 10 of 300 → in window. CNAME: remaining 3310 → not.
+    test_time = 1290;
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
+
+    try testing.expectEqual(@as(usize, 2), result.message.answers.len);
+    try testing.expect(result.from_cache);
+    // The aging tail must surface as a prefetch of (head, qtype) — a bg
+    // re-walk refreshes the whole chain.
+    try testing.expect(result.prefetch_name != null);
+    try testing.expectEqualStrings("alias.example.com", result.prefetch_name.?);
+    try testing.expectEqual(dns.RType.aaaa, result.prefetch_qtype);
+}
+
+test "aging CNAME redirect on follow path flags head prefetch" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    // Short-lived redirect, long-lived tail: the CNAME RRset itself ages
+    // into the window and is served via the follow path (never a direct
+    // (name, .cname) hit — stubs don't ask for CNAME).
+    try seedCnameChain(alloc, &cache, 300, 3600);
+
+    test_time = 1290;
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
+
+    try testing.expectEqual(@as(usize, 2), result.message.answers.len);
+    try testing.expect(result.prefetch_name != null);
+    try testing.expectEqualStrings("alias.example.com", result.prefetch_name.?);
+    try testing.expectEqual(dns.RType.aaaa, result.prefetch_qtype);
+}
+
+test "fresh chain sets no prefetch and reports from_cache" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    try seedCnameChain(alloc, &cache, 3600, 3600);
+    test_time = 1010; // both members young
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
+
+    try testing.expect(result.from_cache);
+    try testing.expect(result.prefetch_name == null);
 }
 
 test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache-served path" {
