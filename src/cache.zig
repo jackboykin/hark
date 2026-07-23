@@ -452,11 +452,18 @@ const no_counter_slot: u32 = std.math.maxInt(u32);
 const ReadCounters = struct {
     // hits is cache-line aligned so @sizeOf(ReadCounters) rounds to a full
     // line and array elements never false-share. One thread owns a slot, so
-    // the four counters sharing that line is intended, not contention.
+    // the five counters sharing that line is intended, not contention.
     hits: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Subset of `misses` where an entry for the key existed but had expired
+    /// past the stale window — the name was cached, demanded again, and had
+    /// died in between. This is the direct gauge of the prefetch blind spot
+    /// (query interval > TTL): a high expired_remiss/misses ratio is the
+    /// evidence that would justify hot-set expiry refresh. Absent-key misses
+    /// (never cached, or evicted) do not count.
+    expired_remiss: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 /// Thread's stripe index, assigned once on first cache touch and stable for
@@ -592,6 +599,9 @@ pub const RRsetCache = struct {
         byte_pressure_evictions: u64,
         prefetch_eligible: u64,
         stale_hits: u64,
+        /// Subset of `misses` where the entry existed but had expired. See
+        /// ReadCounters.expired_remiss.
+        expired_remiss: u64,
     };
 
     pub fn getStats(self: *RRsetCache) Stats {
@@ -608,6 +618,7 @@ pub const RRsetCache = struct {
             .byte_pressure_evictions = 0,
             .prefetch_eligible = 0,
             .stale_hits = 0,
+            .expired_remiss = 0,
         };
         for (self.shards[0..self.shard_count]) |*shard| {
             shard.rwlock.lockSharedUncancelable(self.io);
@@ -627,6 +638,7 @@ pub const RRsetCache = struct {
             stats.misses += rc.misses.load(.monotonic);
             stats.prefetch_eligible += rc.prefetch_eligible.load(.monotonic);
             stats.stale_hits += rc.stale_hits.load(.monotonic);
+            stats.expired_remiss += rc.expired_remiss.load(.monotonic);
         }
         return stats;
     }
@@ -807,6 +819,7 @@ pub const RRsetCache = struct {
             // Deferred eviction: under shared read lock we cannot mutate the map;
             // expired entries linger until the next write path calls evictIfNeeded.
             _ = cs.misses.fetchAdd(1, .monotonic);
+            _ = cs.expired_remiss.fetchAdd(1, .monotonic);
             return null;
         }
         _ = cs.hits.fetchAdd(1, .monotonic);
@@ -2224,6 +2237,29 @@ test "cache prefetch disabled by default" {
             .negative => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "cache expired_remiss counts only present-but-expired misses" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc); // serve_stale_ttl = 0: expiry is a full miss
+    defer cache.deinit();
+
+    try storeTestA(&cache, alloc, &.{ "hot", "example" }, 60, .{ 1, 2, 3, 4 });
+
+    // Past expiry: entry still in the map (deferred eviction) → miss + expired_remiss.
+    test_time = 1100;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), "hot.example", .a, .in) == null);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().expired_remiss);
+
+    // Absent key: plain miss, expired_remiss unchanged.
+    try testing.expect(cache.lookup(arena.allocator(), "never.stored", .a, .in) == null);
+    const stats = cache.getStats();
+    try testing.expectEqual(@as(u64, 2), stats.misses);
+    try testing.expectEqual(@as(u64, 1), stats.expired_remiss);
 }
 
 test "cache serve stale within window" {
