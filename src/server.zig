@@ -482,6 +482,9 @@ pub const Server = struct {
     /// with the live root NS RRset (not just the in-source root_hints).
     primed: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
     bg_tasks: BumpGatedGroup = .init(max_bg_tasks),
+    /// Hot-set refresh tracker (`prefetch-hot`); heap-owned so the
+    /// cache's remiss hook holds a stable pointer.
+    hot_set: ?*HotSet = null,
 
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         if (cfg.allow_loopback_upstreams) {
@@ -572,6 +575,11 @@ pub const Server = struct {
             .prefetch_drops = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
             .wake_fds = try createWakeFds(allocator, cfg.workers),
+            .hot_set = if (cfg.prefetch_hot) blk: {
+                const hs = try allocator.create(HotSet);
+                hs.* = .{ .io = io };
+                break :blk hs;
+            } else null,
         };
     }
 
@@ -649,6 +657,7 @@ pub const Server = struct {
         self.allocator.destroy(self.work_queue);
         for (self.wake_fds) |fd| if (fd >= 0) sys.close(fd);
         self.allocator.free(self.wake_fds);
+        if (self.hot_set) |hs| self.allocator.destroy(hs);
     }
 
     /// Flip the shared shutdown atomic and post a wake to every worker's
@@ -701,6 +710,23 @@ pub const Server = struct {
         }
 
         log.info("workers={d}", .{workers});
+
+        // Hot-set refresh: hook wired here, not init — self is at its
+        // final address by run() (init returns by value).
+        var sweeper: ?std.Thread = null;
+        if (self.hot_set) |hs| {
+            self.cache.remiss_hook = .{ .ctx = hs, .call = &hotSetRemissHook };
+            sweeper = std.Thread.spawn(.{}, hotSetSweeper, .{self}) catch |err| blk: {
+                log.warn("hot-set sweeper failed to spawn — prefetch-hot inactive: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+        defer if (sweeper) |t| {
+            // Covers early error returns that never signal shutdown —
+            // without it this join hangs forever.
+            self.requestShutdown();
+            t.join();
+        };
 
         if (workers <= 1) {
             // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
@@ -781,6 +807,10 @@ pub const Server = struct {
         logCounterIfNonzero("UDP send-buffer drops", self.udp_send_drops.load(.monotonic));
         logCounterIfNonzero("fast-path resolver errors (fell through to slow path)", self.fast_path_errors.load(.monotonic));
         logCounterIfNonzero("prefetches dropped (bg pool full, no inline fallback)", self.prefetch_drops.load(.monotonic));
+        if (self.hot_set) |hs| {
+            logCounterIfNonzero("hot-set promotions", hs.promotions.load(.monotonic));
+            logCounterIfNonzero("hot-set refreshes fired", hs.fired.load(.monotonic));
+        }
     }
 
     fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, wake_fd: posix.fd_t, reuseport: bool) void {
@@ -912,6 +942,22 @@ pub const Server = struct {
         if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
     }
 
+    /// Hot-set sweeper: one tick per 500 ms. Shares the cache's clock
+    /// source, so TIME_PASSES test scenarios drive it consistently.
+    fn hotSetSweeper(self: *Server) void {
+        const hs = self.hot_set.?;
+        const Firer = struct {
+            server: *Server,
+            fn fire(f: @This(), name: []const u8, qtype: dns.RType) void {
+                _ = f.server.trySpawnBgPrefetch(name, qtype, .prefetch);
+            }
+        };
+        while (!self.shutdown.load(.acquire)) {
+            hs.tick(monotonic.nowSec(), &self.cache, Firer{ .server = self });
+            self.io.sleep(.fromMilliseconds(500), .awake) catch {};
+        }
+    }
+
     /// Attempt to hand off a prefetch or CD=1 revalidation to a background
     /// task. Returns true if spawned; false means the caller should fall
     /// back (run inline or drop — caller's choice). The task owns the
@@ -935,6 +981,212 @@ pub const Server = struct {
         return true;
     }
 };
+
+/// Hot-set expiry refresh (config `[cache] prefetch-hot`): names found
+/// dead twice within a window (expired-remiss events) earn a refresh
+/// lease; a sweeper re-fetches them just before each expiry. Closes the
+/// prefetch blind spot for query-interval > TTL demand (e.g. behind a
+/// TTL-honoring forwarder, where all repeats arrive post-expiry).
+///
+/// Leases are fixed-length: a working refresh loop turns demand into hits
+/// this tracker never sees, so "demand stopped" is unobservable — the
+/// lease just lapses and live demand re-promotes at the cost of two
+/// misses. CNAME chains refresh piecewise (redirect and tail remiss under
+/// their own keys). No pattern learning — see backlog #13 for the rejected
+/// alternatives.
+const HotSet = struct {
+    const candidate_slots = 512;
+    const registry_slots = 256;
+    /// Remiss events within `candidate_window` to earn a lease.
+    const promote_at = 2;
+    const candidate_window: i64 = 600;
+    const lease_secs: i64 = 1800;
+    /// Fire this early so the fresh entry lands while the old one serves.
+    const fire_lead: i64 = 2;
+    /// Re-probe delay after firing, letting the bg resolve store.
+    const post_fire_delay: i64 = 3;
+    /// Failing-refresh retry floor; doubles up to << max_backoff_shift.
+    const base_backoff: i64 = 5;
+    const max_backoff_shift: u6 = 4;
+    /// Per-tick fire cap — excess due entries just wait a tick.
+    const max_due_per_tick = 16;
+
+    const Candidate = struct { tag: u64 = 0, credit: u8 = 0, last_seen: i64 = 0 };
+
+    const Lease = struct {
+        /// 0 = empty (keyTag never returns 0).
+        tag: u64 = 0,
+        name_buf: [dns.max_name_len + 1]u8 = undefined,
+        name_len: u8 = 0,
+        qtype: dns.RType = .a,
+        lease_until: i64 = 0,
+        next_check: i64 = 0,
+        fail_shift: u6 = 0,
+    };
+
+    /// Leaf lock: taken from the cache's remiss hook (under a shard's
+    /// SHARED lock) and by the sweeper. Nothing that holds this may touch
+    /// a shard lock — see tick()'s copy-out discipline.
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    io: std.Io,
+    candidates: [candidate_slots]Candidate = @splat(.{}),
+    registry: [registry_slots]Lease = @splat(.{}),
+    promotions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fired: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn keyTag(name: []const u8, qtype: dns.RType) u64 {
+        // Static seed: a collision only makes a name fail to promote —
+        // exactly today's behavior, nothing to attack.
+        var h = std.hash.Wyhash.init(0x686f747365745f68);
+        h.update(name);
+        const q = @backingInt(qtype);
+        h.update(std.mem.asBytes(&q));
+        const tag = h.final();
+        return if (tag == 0) 1 else tag;
+    }
+
+    /// Expired-remiss event from the cache hook. Runs under a shard's
+    /// shared lock — leaf mutex only in here, and `name` must be copied,
+    /// not retained.
+    fn onRemiss(self: *HotSet, name: []const u8, qtype: dns.RType, now: i64) void {
+        if (name.len == 0 or name.len > dns.max_name_len + 1) return;
+        const tag = keyTag(name, qtype);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        // Already leased but demand re-missed: refresh loop is struggling.
+        // Renew rather than making the name re-earn its slot.
+        if (self.findSlotLocked(tag)) |slot| {
+            slot.lease_until = now + lease_secs;
+            return;
+        }
+
+        const c = &self.candidates[@intCast(tag % candidate_slots)];
+        if (c.tag != tag or now - c.last_seen > candidate_window) {
+            // Claim the bucket; collision loss is benign (loser stays unprotected).
+            c.* = .{ .tag = tag, .credit = 1, .last_seen = now };
+            return;
+        }
+        c.last_seen = now;
+        c.credit +|= 1;
+        if (c.credit < promote_at) return;
+
+        c.* = .{}; // consumed
+        self.insertLocked(tag, name, qtype, now);
+        _ = self.promotions.fetchAdd(1, .monotonic);
+    }
+
+    fn findSlotLocked(self: *HotSet, tag: u64) ?*Lease {
+        for (&self.registry) |*s| if (s.tag == tag) return s;
+        return null;
+    }
+
+    fn insertLocked(self: *HotSet, tag: u64, name: []const u8, qtype: dns.RType, now: i64) void {
+        // First empty slot, else evict the earliest lease.
+        var victim: *Lease = &self.registry[0];
+        for (&self.registry) |*s| {
+            if (s.tag == 0) {
+                victim = s;
+                break;
+            }
+            if (s.lease_until < victim.lease_until) victim = s;
+        }
+        victim.* = .{
+            .tag = tag,
+            .name_len = @intCast(name.len),
+            .qtype = qtype,
+            .lease_until = now + lease_secs,
+            .next_check = now, // probe on the next tick
+        };
+        @memcpy(victim.name_buf[0..name.len], name);
+    }
+
+    const Due = struct {
+        name_buf: [dns.max_name_len + 1]u8,
+        name_len: u8,
+        qtype: dns.RType,
+        tag: u64,
+    };
+
+    /// One sweep. `cache`/`firer` are anytype so tests can stub them.
+    /// Lock discipline: due slots are COPIED OUT under the mutex, released
+    /// before any cache probe or fire — holding it across shard access
+    /// deadlocks against onRemiss (shared-shard→mutex) once a shard writer
+    /// queues between the two shared acquisitions.
+    fn tick(self: *HotSet, now: i64, cache: anytype, firer: anytype) void {
+        var due: [max_due_per_tick]Due = undefined;
+        var n: usize = 0;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (&self.registry) |*s| {
+                if (s.tag == 0) continue;
+                if (now >= s.lease_until) {
+                    s.* = .{}; // lease lapsed; re-promotion costs two misses
+                    continue;
+                }
+                if (now < s.next_check) continue;
+                if (n == due.len) break;
+                due[n] = .{ .name_buf = s.name_buf, .name_len = s.name_len, .qtype = s.qtype, .tag = s.tag };
+                // Provisional bump so a stalled fire path isn't re-collected.
+                s.next_check = now + post_fire_delay;
+                n += 1;
+            }
+        }
+
+        for (due[0..n]) |*d| {
+            const name = d.name_buf[0..d.name_len];
+            var next_check: i64 = undefined;
+            var healthy = true;
+            if (cache.entryExpiry(name, d.qtype, .in)) |expires_at| {
+                if (expires_at - now > fire_lead) {
+                    // Healthy and young: sleep until the fire window.
+                    next_check = expires_at - fire_lead;
+                } else if (expires_at > now) {
+                    // In the window: refresh before it dies.
+                    firer.fire(name, d.qtype);
+                    _ = self.fired.fetchAdd(1, .monotonic);
+                    next_check = now + post_fire_delay;
+                } else {
+                    // Dead and lingering — last refresh didn't take. Back off.
+                    firer.fire(name, d.qtype);
+                    _ = self.fired.fetchAdd(1, .monotonic);
+                    next_check = now + self.currentBackoff(d.tag);
+                    healthy = false;
+                }
+            } else {
+                // Absent (evicted or never re-stored): same as dead.
+                firer.fire(name, d.qtype);
+                _ = self.fired.fetchAdd(1, .monotonic);
+                next_check = now + self.currentBackoff(d.tag);
+                healthy = false;
+            }
+            self.writeBack(d.tag, next_check, healthy);
+        }
+    }
+
+    /// Read the slot's current backoff (mutex-guarded; slot may be gone).
+    fn currentBackoff(self: *HotSet, tag: u64) i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = self.findSlotLocked(tag) orelse return base_backoff;
+        return base_backoff << slot.fail_shift;
+    }
+
+    fn writeBack(self: *HotSet, tag: u64, next_check: i64, healthy: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = self.findSlotLocked(tag) orelse return; // replaced meanwhile
+        slot.next_check = next_check;
+        slot.fail_shift = if (healthy) 0 else @min(slot.fail_shift + 1, max_backoff_shift);
+    }
+};
+
+/// Remiss-hook thunk: anyopaque → HotSet (see RRsetCache.remiss_hook).
+fn hotSetRemissHook(ctx: *anyopaque, name: []const u8, rtype: dns.RType) void {
+    const hs: *HotSet = @ptrCast(@alignCast(ctx));
+    hs.onRemiss(name, rtype, monotonic.nowSec());
+}
 
 const BgKind = enum {
     /// Cache-refresh prefetch (near-expiry answer RRset or DNSKEY). Always
@@ -2163,6 +2415,109 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     // Drain: no thread should have been spawned for the rejected inputs.
     server.bg_tasks.awaitAll(server.io);
     try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());
+}
+
+// ── HotSet unit tests ──────────────────────────────────────────────────
+
+const HotSetStubCache = struct {
+    expiry: ?i64,
+    pub fn entryExpiry(self: *@This(), name: []const u8, rtype: dns.RType, rclass: dns.RClass) ?i64 {
+        _ = name;
+        _ = rtype;
+        _ = rclass;
+        return self.expiry;
+    }
+};
+
+const HotSetFireLog = struct {
+    count: usize = 0,
+    pub fn fire(self: *@This(), name: []const u8, qtype: dns.RType) void {
+        _ = name;
+        _ = qtype;
+        self.count += 1;
+    }
+};
+
+test "HotSet promotes after two remiss events, not one" {
+    var hs = HotSet{ .io = testing.io };
+    const tag = HotSet.keyTag("cdn.example.com", .a);
+
+    hs.onRemiss("cdn.example.com", .a, 1000);
+    try testing.expect(hs.findSlotLocked(tag) == null);
+
+    hs.onRemiss("cdn.example.com", .a, 1010);
+    const slot = hs.findSlotLocked(tag) orelse return error.TestExpectedPromotion;
+    try testing.expectEqualStrings("cdn.example.com", slot.name_buf[0..slot.name_len]);
+    try testing.expectEqual(dns.RType.a, slot.qtype);
+    try testing.expectEqual(@as(u64, 1), hs.promotions.load(.monotonic));
+}
+
+test "HotSet stale candidate does not accumulate across the window" {
+    var hs = HotSet{ .io = testing.io };
+    const tag = HotSet.keyTag("slow.example.com", .aaaa);
+
+    hs.onRemiss("slow.example.com", .aaaa, 1000);
+    // Second event past the candidate window restarts the count.
+    hs.onRemiss("slow.example.com", .aaaa, 1000 + HotSet.candidate_window + 1);
+    try testing.expect(hs.findSlotLocked(tag) == null);
+}
+
+test "HotSet tick: healthy entry waits, in-window entry fires, dead entry backs off" {
+    var hs = HotSet{ .io = testing.io };
+    hs.onRemiss("hot.example.com", .a, 1000);
+    hs.onRemiss("hot.example.com", .a, 1010);
+    const tag = HotSet.keyTag("hot.example.com", .a);
+
+    var fires = HotSetFireLog{};
+
+    // Fresh and young: no fire, next_check parked at expiry - lead.
+    var cache = HotSetStubCache{ .expiry = 1300 };
+    hs.tick(1011, &cache, &fires);
+    try testing.expectEqual(@as(usize, 0), fires.count);
+    try testing.expectEqual(@as(i64, 1300 - HotSet.fire_lead), hs.findSlotLocked(tag).?.next_check);
+
+    // In the fire window (expiry - now <= lead, still alive): refresh.
+    hs.tick(1299, &cache, &fires);
+    try testing.expectEqual(@as(usize, 1), fires.count);
+
+    // Dead and lingering: fires again, backoff shift grows.
+    cache.expiry = 1200; // past
+    hs.tick(1305, &cache, &fires);
+    try testing.expectEqual(@as(usize, 2), fires.count);
+    try testing.expectEqual(@as(u6, 1), hs.findSlotLocked(tag).?.fail_shift);
+
+    // Recovery: fresh entry resets the backoff.
+    cache.expiry = 1700;
+    hs.tick(1320, &cache, &fires);
+    try testing.expectEqual(@as(u6, 0), hs.findSlotLocked(tag).?.fail_shift);
+}
+
+test "HotSet lease lapses silently and slot frees" {
+    var hs = HotSet{ .io = testing.io };
+    hs.onRemiss("gone.example.com", .a, 1000);
+    hs.onRemiss("gone.example.com", .a, 1010);
+    const tag = HotSet.keyTag("gone.example.com", .a);
+    try testing.expect(hs.findSlotLocked(tag) != null);
+
+    var fires = HotSetFireLog{};
+    var cache = HotSetStubCache{ .expiry = null };
+    hs.tick(1010 + HotSet.lease_secs + 1, &cache, &fires);
+    try testing.expect(hs.findSlotLocked(tag) == null);
+    try testing.expectEqual(@as(usize, 0), fires.count);
+}
+
+test "HotSet remiss on a leased name renews the lease" {
+    var hs = HotSet{ .io = testing.io };
+    hs.onRemiss("busy.example.com", .a, 1000);
+    hs.onRemiss("busy.example.com", .a, 1010);
+    const tag = HotSet.keyTag("busy.example.com", .a);
+    const first_lease = hs.findSlotLocked(tag).?.lease_until;
+
+    hs.onRemiss("busy.example.com", .a, 2000);
+    try testing.expectEqual(@as(i64, 2000 + HotSet.lease_secs), hs.findSlotLocked(tag).?.lease_until);
+    try testing.expect(hs.findSlotLocked(tag).?.lease_until > first_lease);
+    // Renewal must not consume a registry slot or count as a promotion.
+    try testing.expectEqual(@as(u64, 1), hs.promotions.load(.monotonic));
 }
 
 test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {

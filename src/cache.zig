@@ -457,12 +457,9 @@ const ReadCounters = struct {
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     prefetch_eligible: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stale_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Subset of `misses` where an entry for the key existed but had expired
-    /// past the stale window — the name was cached, demanded again, and had
-    /// died in between. This is the direct gauge of the prefetch blind spot
-    /// (query interval > TTL): a high expired_remiss/misses ratio is the
-    /// evidence that would justify hot-set expiry refresh. Absent-key misses
-    /// (never cached, or evicted) do not count.
+    /// Subset of `misses` where the entry existed but had expired — cached,
+    /// demanded again, died in between. Gauges the prefetch blind spot
+    /// (query interval > TTL). Absent-key misses do not count.
     expired_remiss: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
@@ -515,6 +512,16 @@ pub const RRsetCache = struct {
     min_ttl: u32 = 0,
     prefetch: bool = false,
     skip_key_types: bool = false,
+    /// Notified on each expired-remiss event — the demand signal for the
+    /// server's hot-set tracker. Called with the lowercased name under the
+    /// shard's SHARED lock: leaf locks only in the handler, and the name
+    /// slice (stack buffer) must be copied, not retained. Set post-init.
+    remiss_hook: ?RemissHook = null,
+
+    pub const RemissHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, name: []const u8, rtype: dns.RType) void,
+    };
 
     /// `max_bytes` and `max_entries` are split evenly across shards with
     /// floors of 4096 bytes and 1 entry per shard. Configurations smaller
@@ -685,6 +692,30 @@ pub const RRsetCache = struct {
         return fresh;
     }
 
+    /// Expiry probe for the hot-set sweeper: `expires_at` (fresh or
+    /// expired-lingering) or null when absent. Pure observer — no stat
+    /// counters, no SIEVE visited mark.
+    pub fn entryExpiry(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+    ) ?i64 {
+        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        const shard, const h = self.shardWithHash(probe);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return null;
+        return shard.map.values()[idx].expiresAt();
+    }
+
+    fn notifyRemiss(self: *RRsetCache, lower_name: []const u8, rtype: dns.RType) void {
+        const hook = self.remiss_hook orelse return;
+        hook.call(hook.ctx, lower_name, rtype);
+    }
+
     /// Look up an RRset by (name, rtype, rclass). On hit, records and sigs
     /// are cloned into `caller_alloc` with TTLs adjusted to remaining time.
     ///
@@ -714,7 +745,10 @@ pub const RRsetCache = struct {
 
         switch (entry) {
             .positive => |rrset| {
-                const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
+                const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse {
+                    self.notifyRemiss(lower_name, rtype);
+                    return null;
+                };
                 const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
                 // Read path: degrade sigs/proofs to empty on OOM rather than
                 // drop the answer. The stored entry was already proven complete
@@ -736,7 +770,10 @@ pub const RRsetCache = struct {
                 // SERVFAIL never serves stale: short TTL (e.g. 1s for DNSSEC bogus)
                 // is intentional; extending it would prolong failure beyond design.
                 const disable_stale = neg.rcode == .server_failure;
-                const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
+                const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse {
+                    self.notifyRemiss(lower_name, rtype);
+                    return null;
+                };
                 const soa = cloneCachedRecord(caller_alloc, neg.soa, hit.remaining_ttl);
                 const nsec_proofs: []dns.ResourceRecord = if (neg.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, neg.nsec_proofs, hit.remaining_ttl) catch &.{};
                 return .{ .negative = .{
@@ -2260,6 +2297,67 @@ test "cache expired_remiss counts only present-but-expired misses" {
     const stats = cache.getStats();
     try testing.expectEqual(@as(u64, 2), stats.misses);
     try testing.expectEqual(@as(u64, 1), stats.expired_remiss);
+}
+
+test "remiss hook fires on expired entry only, with lowercased name" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const Recorder = struct {
+        var count: usize = 0;
+        var last_name: [64]u8 = undefined;
+        var last_len: usize = 0;
+        var last_rtype: dns.RType = .a;
+        fn hook(ctx: *anyopaque, name: []const u8, rtype: dns.RType) void {
+            _ = ctx;
+            count += 1;
+            @memcpy(last_name[0..name.len], name);
+            last_len = name.len;
+            last_rtype = rtype;
+        }
+    };
+    Recorder.count = 0;
+    var dummy: u8 = 0;
+    cache.remiss_hook = .{ .ctx = &dummy, .call = &Recorder.hook };
+
+    try storeTestA(&cache, alloc, &.{ "hot", "example" }, 60, .{ 1, 2, 3, 4 });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Fresh hit: no hook.
+    try testing.expect(cache.lookup(arena.allocator(), "hot.example", .a, .in) != null);
+    try testing.expectEqual(@as(usize, 0), Recorder.count);
+
+    // Absent key: no hook (never cached ≠ died between demands).
+    try testing.expect(cache.lookup(arena.allocator(), "never.stored", .a, .in) == null);
+    try testing.expectEqual(@as(usize, 0), Recorder.count);
+
+    // Expired: hook fires with the lowercased name.
+    test_time = 1100;
+    try testing.expect(cache.lookup(arena.allocator(), "HOT.example", .a, .in) == null);
+    try testing.expectEqual(@as(usize, 1), Recorder.count);
+    try testing.expectEqualStrings("hot.example", Recorder.last_name[0..Recorder.last_len]);
+    try testing.expectEqual(dns.RType.a, Recorder.last_rtype);
+}
+
+test "entryExpiry reports expires_at for fresh and lingering entries, null when absent" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    try storeTestA(&cache, alloc, &.{ "probe", "example" }, 300, .{ 1, 2, 3, 4 });
+
+    try testing.expectEqual(@as(?i64, 1300), cache.entryExpiry("probe.example", .a, .in));
+    // Past expiry the entry lingers (deferred eviction) and still reports.
+    test_time = 1400;
+    try testing.expectEqual(@as(?i64, 1300), cache.entryExpiry("probe.example", .a, .in));
+    try testing.expectEqual(@as(?i64, null), cache.entryExpiry("absent.example", .a, .in));
 }
 
 test "cache serve stale within window" {
