@@ -143,7 +143,7 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
         },
         .nsec3 => |nsec3| {
             try writer.print("{d} {d} {d} ", .{
-                @intFromEnum(nsec3.hash_algorithm),
+                @backingInt(nsec3.hash_algorithm),
                 nsec3.flags,
                 nsec3.iterations,
             });
@@ -160,7 +160,7 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
         },
         .nsec3param => |nsec3p| {
             try writer.print("{d} {d} {d} ", .{
-                @intFromEnum(nsec3p.hash_algorithm),
+                @backingInt(nsec3p.hash_algorithm),
                 nsec3p.flags,
                 nsec3p.iterations,
             });
@@ -188,7 +188,7 @@ fn printTypeBitmap(bitmap: []const u8, writer: anytype) !void {
             for (0..8) |bit_idx| {
                 if (byte & (@as(u8, 0x80) >> @intCast(bit_idx)) != 0) {
                     const type_num = @as(u16, window) * 256 + @as(u16, @intCast(byte_idx)) * 8 + @as(u16, @intCast(bit_idx));
-                    const rtype: dns.RType = @enumFromInt(type_num);
+                    const rtype: dns.RType = @fromBackingInt(@intCast(type_num));
                     var tbm_buf: [24]u8 = undefined;
                     try writer.print(" {s}", .{dns.safeTagName(dns.RType, rtype, &tbm_buf)});
                 }

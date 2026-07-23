@@ -167,7 +167,7 @@ pub fn validateDnskeyRrset(
             if (!isValidZoneKey(dk)) break :blk false;
             for (ds_records) |ds| {
                 if (ds.key_tag != key_tags[i]) continue;
-                if (@intFromEnum(ds.algorithm) != @intFromEnum(dk.algorithm)) continue;
+                if (@backingInt(ds.algorithm) != @backingInt(dk.algorithm)) continue;
                 if (!dsEligible(ds, ds_records)) continue;
                 verifyDs(ds, dk, zone_name) catch continue;
                 break :blk true;
@@ -299,7 +299,7 @@ fn keyTag(dnskey: dns.DnskeyData) u16 {
     // DNSKEY RDATA wire: flags(2) + protocol(1) + algorithm(1) + public_key
     // Accumulate 16-bit words
     ac += @as(u32, dnskey.flags);
-    ac += @as(u32, dnskey.protocol) << 8 | @intFromEnum(dnskey.algorithm);
+    ac += @as(u32, dnskey.protocol) << 8 | @backingInt(dnskey.algorithm);
 
     var i: usize = 0;
     while (i < dnskey.public_key.len) : (i += 1) {
@@ -351,7 +351,7 @@ fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) Verify
     pos += 2;
     wire_buf[pos] = dnskey.protocol;
     pos += 1;
-    wire_buf[pos] = @intFromEnum(dnskey.algorithm);
+    wire_buf[pos] = @backingInt(dnskey.algorithm);
     pos += 1;
     @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
     pos += dnskey.public_key.len;
@@ -384,8 +384,8 @@ fn verifyDigest(comptime Hash: type, data: []const u8, expected: []const u8) boo
 /// canonical serialization (writeCanonicalRData).
 fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!usize {
     if (buf.len < 18) return error.BufferTooSmall;
-    mem.writeInt(u16, buf[0..2], @intFromEnum(rrsig.type_covered), .big);
-    buf[2] = @intFromEnum(rrsig.algorithm);
+    mem.writeInt(u16, buf[0..2], @backingInt(rrsig.type_covered), .big);
+    buf[2] = @backingInt(rrsig.algorithm);
     buf[3] = rrsig.labels;
     mem.writeInt(u32, buf[4..8], rrsig.original_ttl, .big);
     mem.writeInt(u32, buf[8..12], rrsig.sig_expiration, .big);
@@ -434,9 +434,9 @@ fn buildSignedData(
         temp_pos += owner_len;
 
         if (temp_pos + 10 > buf.len) return error.BufferTooSmall;
-        mem.writeInt(u16, buf[temp_pos..][0..2], @intFromEnum(rr.rtype), .big);
+        mem.writeInt(u16, buf[temp_pos..][0..2], @backingInt(rr.rtype), .big);
         temp_pos += 2;
-        mem.writeInt(u16, buf[temp_pos..][0..2], @intFromEnum(rr.rclass), .big);
+        mem.writeInt(u16, buf[temp_pos..][0..2], @backingInt(rr.rclass), .big);
         temp_pos += 2;
         // Use RRSIG's original_ttl, not the RR's TTL
         mem.writeInt(u32, buf[temp_pos..][0..4], rrsig.original_ttl, .big);
@@ -1277,7 +1277,7 @@ fn rrsetVerifiesWithAnyKey(
         const dk = dk_rr.rdata.dnskey;
         if (!isValidZoneKey(dk)) continue;
         if (keyTag(dk) != rrsig.key_tag) continue;
-        if (@intFromEnum(dk.algorithm) != @intFromEnum(rrsig.algorithm)) continue;
+        if (@backingInt(dk.algorithm) != @backingInt(rrsig.algorithm)) continue;
         if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
     }
     return false;
@@ -1491,7 +1491,7 @@ fn testDsDigestWith(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData
     pos += 2;
     wire_buf[pos] = dnskey.protocol;
     pos += 1;
-    wire_buf[pos] = @intFromEnum(dnskey.algorithm);
+    wire_buf[pos] = @backingInt(dnskey.algorithm);
     pos += 1;
     @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
     pos += dnskey.public_key.len;
@@ -2486,7 +2486,7 @@ test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" 
         nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
     };
 
-    const https: dns.RType = @enumFromInt(65);
+    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
 }
@@ -2517,7 +2517,7 @@ test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
         nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
     };
 
-    const https: dns.RType = @enumFromInt(65);
+    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, https, false, &b));
 }
@@ -2702,7 +2702,7 @@ test "NSEC3 unknown hash algorithm yields .insecure (RFC 6840 §5.11)" {
         .ttl = 300,
         .rdata = .{
             .nsec3 = .{
-                .hash_algorithm = @enumFromInt(2), // not sha1
+                .hash_algorithm = @fromBackingInt(@intCast(2)), // not sha1
                 .flags = 0,
                 .iterations = 0,
                 .salt = &.{},
@@ -2841,7 +2841,7 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.6)" {
         makeNsec3Rr(wc_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
     };
 
-    const https: dns.RType = @enumFromInt(65);
+    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
 }

@@ -715,14 +715,14 @@ test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
     // OPCODE 5 (Update — not in the named enum, use @enumFromInt). A server
     // replying NOTIMP must echo the OPCODE so the client can match the
     // response to its request.
-    const opcode_update: dns.OpCode = @enumFromInt(5);
+    const opcode_update: dns.OpCode = @fromBackingInt(@intCast(5));
     var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, &.{}).?;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const parsed = try dns.parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u4, 5), @intFromEnum(parsed.header.flags.opcode));
+    try testing.expectEqual(@as(u4, 5), @backingInt(parsed.header.flags.opcode));
     try testing.expectEqual(dns.RCode.not_implemented, parsed.header.flags.rcode);
 }
 

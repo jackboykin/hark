@@ -328,7 +328,7 @@ pub const EventLoop = struct {
     }
 
     fn isCancelled(cqe: linux.io_uring_cqe) bool {
-        return cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.CANCELED)));
+        return cqe.res == -@as(i32, @intCast(@backingInt(linux.E.CANCELED)));
     }
 
     fn reapCompletions(self: *EventLoop, buf: []Completion) ![]Completion {
@@ -451,7 +451,7 @@ pub const EventLoop = struct {
     fn parseMultishotRecv(self: *EventLoop, cqe: linux.io_uring_cqe) !MultishotParsed {
         const ring = &self.udp_buf_ring;
         if (cqe.res < 0) {
-            const errno: linux.E = @enumFromInt(@as(u31, @intCast(-cqe.res)));
+            const errno: linux.E = @fromBackingInt(@intCast(@as(u31, @intCast(-cqe.res))));
             return switch (errno) {
                 .NOBUFS => error.NoBuffers,
                 .CANCELED => error.Cancelled,

@@ -1264,7 +1264,7 @@ const WorkerState = struct {
         // Pre-validate from raw header bytes to avoid wasting pool threads
         // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
         const opcode_bits: u4 = @truncate(data[2] >> 3);
-        const client_opcode: dns.OpCode = @enumFromInt(opcode_bits);
+        const client_opcode: dns.OpCode = @fromBackingInt(@intCast(opcode_bits));
         if (opcode_bits != 0) { // Only QUERY (0) supported
             @branchHint(.cold);
             self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, client_addr);
@@ -1379,7 +1379,7 @@ const WorkerState = struct {
                 if (data.len >= 3) {
                     const id = mem.readInt(u16, data[0..2], .big);
                     const op_bits: u4 = @truncate(data[2] >> 3);
-                    const w = serializeErrorResponse(&response_wire, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}) orelse return;
+                    const w = serializeErrorResponse(&response_wire, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{}) orelse return;
                     tcpWriteMessage(self.server.io, client_fd, w, read_deadline_ns) orelse return;
                     continue;
                 }
@@ -1561,7 +1561,7 @@ const WorkerState = struct {
                 const id = mem.readInt(u16, data[0..2], .big);
                 // Best-effort opcode echo from raw header even when parse failed.
                 const op_bits: u4 = @truncate(data[2] >> 3);
-                self.sendErrorUdp(sock, id, @enumFromInt(op_bits), .format_error, 0, false, &.{}, client_addr);
+                self.sendErrorUdp(sock, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{}, client_addr);
             }
             return;
         };
@@ -1795,10 +1795,10 @@ fn classifySignalRead(result: anytype) SignalAction {
     var off: usize = 0;
     while (off + 4 <= r.data.len) : (off += siginfo_size) {
         const signo = std.mem.readInt(u32, r.data[off..][0..4], .little);
-        if (signo == @intFromEnum(linux.SIG.TERM) or signo == @intFromEnum(linux.SIG.INT)) {
+        if (signo == @backingInt(linux.SIG.TERM) or signo == @backingInt(linux.SIG.INT)) {
             return .shutdown;
         }
-        if (signo == @intFromEnum(linux.SIG.USR1) or signo == @intFromEnum(linux.SIG.HUP)) {
+        if (signo == @backingInt(linux.SIG.USR1) or signo == @backingInt(linux.SIG.HUP)) {
             saw_stats = true;
         }
     }

@@ -76,9 +76,9 @@ pub const Handshake = struct {
     client_random: [32]u8 = undefined,
     legacy_session_id_buf: [32]u8 = undefined,
     legacy_session_id: []u8 = &.{},
-    cipher_suite: CipherSuite = @enumFromInt(0),
-    signature_scheme: proto.SignatureScheme = @enumFromInt(0),
-    named_group: proto.NamedGroup = @enumFromInt(0),
+    cipher_suite: CipherSuite = @fromBackingInt(@intCast(0)),
+    signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
+    named_group: proto.NamedGroup = @fromBackingInt(@intCast(0)),
     client_pub_key_buf: [max_pub_key_len]u8 = undefined,
     client_pub_key: []u8 = &.{},
     server_pub_key_buf: [max_pub_key_len]u8 = undefined,
@@ -401,12 +401,12 @@ pub const Handshake = struct {
             while (d.idx < end_idx) {
                 const cipher_suite = try d.decode(CipherSuite);
                 if (cipher_suites.includes(supported_cipher_suites, cipher_suite) and
-                    @intFromEnum(h.cipher_suite) == 0)
+                    @backingInt(h.cipher_suite) == 0)
                 {
                     h.cipher_suite = cipher_suite;
                 }
             }
-            if (@intFromEnum(h.cipher_suite) == 0)
+            if (@backingInt(h.cipher_suite) == 0)
                 return error.TlsNoSupportedCiphers;
         }
         try d.skip(2); // compression methods
@@ -436,7 +436,7 @@ pub const Handshake = struct {
                     const end_idx = try d.decode(u16) + d.idx;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@intFromEnum(named_group)) {
+                        switch (@backingInt(named_group)) {
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
@@ -452,14 +452,14 @@ pub const Handshake = struct {
                             }
                         }
                     }
-                    if (@intFromEnum(h.named_group) == 0)
+                    if (@backingInt(h.named_group) == 0)
                         return error.TlsIllegalParameter;
                 },
                 .supported_groups => {
                     const end_idx = try d.decode(u16) + d.idx;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@intFromEnum(named_group)) {
+                        switch (@backingInt(named_group)) {
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
@@ -469,7 +469,7 @@ pub const Handshake = struct {
                     }
                 },
                 .signature_algorithms => {
-                    if (@intFromEnum(h.signature_scheme) == 0) {
+                    if (@backingInt(h.signature_scheme) == 0) {
                         try d.skip(extension_len);
                     } else {
                         var found = false;
@@ -518,7 +518,7 @@ pub const Handshake = struct {
             }
         }
         if (!key_share_received) return error.TlsMissingExtension;
-        if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
+        if (@backingInt(h.named_group) == 0) return error.TlsIllegalParameter;
     }
 };
 
@@ -599,7 +599,7 @@ pub const NonBlock = struct {
         client_flight_2,
 
         fn next(self: *State) void {
-            self.* = @enumFromInt(@intFromEnum(self.*) + 1);
+            self.* = @fromBackingInt(@intCast(@backingInt(self.*) + 1));
         }
     };
 

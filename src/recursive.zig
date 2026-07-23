@@ -2859,7 +2859,7 @@ fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
     const arr = try allocator.alloc(dns.ResourceRecord, 1);
     arr[0] = .{
         .name = qname,
-        .rtype = @enumFromInt(13), // HINFO
+        .rtype = @fromBackingInt(@intCast(13)), // HINFO
         .rclass = .in,
         .ttl = ttl_any_hinfo,
         .rdata = .{ .unknown = rdata_bytes },
@@ -4156,7 +4156,7 @@ fn writeMixedCaseQuestion(buf: []u8, qtype: dns.RType) usize {
     mem.writeInt(u16, buf[8..10], 0, .big); // ns
     mem.writeInt(u16, buf[10..12], 0, .big); // ar
     @memcpy(buf[12..19], "\x01X\x03coM\x00");
-    mem.writeInt(u16, buf[19..21], @intFromEnum(qtype), .big);
+    mem.writeInt(u16, buf[19..21], @backingInt(qtype), .big);
     mem.writeInt(u16, buf[21..23], 1, .big); // class IN
     return 23;
 }
@@ -4166,7 +4166,7 @@ fn writeMixedCaseQuestion(buf: []u8, qtype: dns.RType) usize {
 fn writeAnswerHeader(buf: []u8, start: usize, rtype: dns.RType, rdlength: u16) usize {
     buf[start] = 0xC0;
     buf[start + 1] = 12;
-    mem.writeInt(u16, buf[start + 2 ..][0..2], @intFromEnum(rtype), .big);
+    mem.writeInt(u16, buf[start + 2 ..][0..2], @backingInt(rtype), .big);
     mem.writeInt(u16, buf[start + 4 ..][0..2], 1, .big); // class IN
     mem.writeInt(u32, buf[start + 6 ..][0..4], 300, .big); // ttl
     mem.writeInt(u16, buf[start + 10 ..][0..2], rdlength, .big);

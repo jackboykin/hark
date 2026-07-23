@@ -128,7 +128,7 @@ fn runDump(gpa: std.mem.Allocator, io: Io) !void {
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
-    const input = stdin_reader.interface.allocRemaining(allocator, @enumFromInt(dns.max_udp_payload * 4)) catch |err| {
+    const input = stdin_reader.interface.allocRemaining(allocator, @fromBackingInt(@intCast(dns.max_udp_payload * 4))) catch |err| {
         log.err("failed to read stdin: {}", .{err});
         std.process.exit(1);
     };

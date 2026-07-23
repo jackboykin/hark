@@ -11,9 +11,9 @@ const ArrayList = std.ArrayList;
 pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
     const info = @typeInfo(E).@"enum";
     inline for (info.field_names, info.field_values) |name, value| {
-        if (@intFromEnum(val) == value) return name;
+        if (@backingInt(val) == value) return name;
     }
-    return std.fmt.bufPrint(buf, "{d}", .{@intFromEnum(val)}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}", .{@backingInt(val)}) catch "?";
 }
 
 /// Check the TC (truncation) bit on raw wire data without full parsing.
@@ -386,7 +386,7 @@ pub const RData = union(enum) {
 /// Check if an RType is present in a type bitmap (RFC 4034 §4.1.2).
 /// Used by NSEC and NSEC3 records.
 pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
-    const type_num = @intFromEnum(rtype);
+    const type_num = @backingInt(rtype);
     const window = type_num >> 8; // high byte = window number
     const bit_offset: u8 = @intCast(type_num & 0xFF); // low byte = offset within window
     const byte_in_window = bit_offset >> 3;
@@ -737,8 +737,8 @@ pub const Parser = struct {
 
     pub fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
         const name = try self.parseName(allocator);
-        const qtype: RType = @enumFromInt(try self.readU16());
-        const qclass: RClass = @enumFromInt(try self.readU16());
+        const qtype: RType = @fromBackingInt(@intCast(try self.readU16()));
+        const qclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         return .{ .name = name, .qtype = qtype, .qclass = qclass };
     }
 
@@ -748,8 +748,8 @@ pub const Parser = struct {
         // any subsequent failure (header reads or parseRData OOM) we must
         // release it so non-arena callers don't leak. See freeWireParsedName.
         errdefer freeWireParsedName(allocator, name);
-        const rtype: RType = @enumFromInt(try self.readU16());
-        const rclass: RClass = @enumFromInt(try self.readU16());
+        const rtype: RType = @fromBackingInt(@intCast(try self.readU16()));
+        const rclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         const ttl = try self.readU32();
         const rdlength: usize = try self.readU16();
 
@@ -829,8 +829,8 @@ pub const Parser = struct {
             },
             .rrsig => {
                 if (rdlength < 18) return error.InvalidRDataLength;
-                const type_covered: RType = @enumFromInt(try self.readU16());
-                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
+                const type_covered: RType = @fromBackingInt(@intCast(try self.readU16()));
+                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
                 const label_count = try self.readU8();
                 const original_ttl = try self.readU32();
                 const sig_expiration = try self.readU32();
@@ -859,7 +859,7 @@ pub const Parser = struct {
                 if (rdlength < 4) return error.InvalidRDataLength;
                 const flags = try self.readU16();
                 const protocol = try self.readU8();
-                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
+                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
                 const public_key = try self.readSlice(rdlength - 4);
                 return .{ .dnskey = .{
                     .flags = flags,
@@ -871,8 +871,8 @@ pub const Parser = struct {
             .ds => {
                 if (rdlength < 4) return error.InvalidRDataLength;
                 const key_tag = try self.readU16();
-                const algorithm: DnssecAlgorithm = @enumFromInt(try self.readU8());
-                const digest_type: DigestType = @enumFromInt(try self.readU8());
+                const algorithm: DnssecAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
+                const digest_type: DigestType = @fromBackingInt(@intCast(try self.readU8()));
                 const digest = try self.readSlice(rdlength - 4);
                 return .{ .ds = .{
                     .key_tag = key_tag,
@@ -895,7 +895,7 @@ pub const Parser = struct {
             },
             .nsec3 => {
                 if (rdlength < 6) return error.InvalidRDataLength;
-                const hash_algorithm: Nsec3HashAlgorithm = @enumFromInt(try self.readU8());
+                const hash_algorithm: Nsec3HashAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
@@ -918,7 +918,7 @@ pub const Parser = struct {
             },
             .nsec3param => {
                 if (rdlength < 5) return error.InvalidRDataLength;
-                const hash_algorithm: Nsec3HashAlgorithm = @enumFromInt(try self.readU8());
+                const hash_algorithm: Nsec3HashAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
@@ -1010,7 +1010,7 @@ pub fn extractKeepaliveTimeout(wire: []const u8) ?u16 {
         const rtype = mem.readInt(u16, wire[pos..][0..2], .big);
         const rdlen = mem.readInt(u16, wire[pos + 8 ..][0..2], .big);
         if (pos + 10 + @as(usize, rdlen) > wire.len) return null;
-        if (rtype == @intFromEnum(RType.opt)) {
+        if (rtype == @backingInt(RType.opt)) {
             // RFC 6891 §6.1.2: OPT owner MUST be root (single zero byte).
             if (wire[name_start] != 0) return null;
             const opt_rdata = wire[pos + 10 .. pos + 10 + rdlen];
@@ -1121,7 +1121,7 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
                 return err;
             };
             opt.* = .{
-                .udp_payload_size = @intFromEnum(rr.rclass),
+                .udp_payload_size = @backingInt(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
                 .version = @intCast((rr.ttl >> 16) & 0xFF),
                 .do_bit = (rr.ttl & 0x8000) != 0,
@@ -1252,8 +1252,8 @@ pub const Serializer = struct {
 
     pub fn writeQuestion(self: *Serializer, q: Question) Error!void {
         try self.writeName(q.name);
-        try self.writeU16(@intFromEnum(q.qtype));
-        try self.writeU16(@intFromEnum(q.qclass));
+        try self.writeU16(@backingInt(q.qtype));
+        try self.writeU16(@backingInt(q.qclass));
     }
 
     pub fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
@@ -1269,8 +1269,8 @@ pub const Serializer = struct {
     /// Ignores `rr.wire`. Returns the TTL byte offset for later patching.
     fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!u16 {
         try self.writeName(rr.name);
-        try self.writeU16(@intFromEnum(rr.rtype));
-        try self.writeU16(@intFromEnum(rr.rclass));
+        try self.writeU16(@backingInt(rr.rtype));
+        try self.writeU16(@backingInt(rr.rclass));
         const ttl_offset: u16 = try castOrRDataErr(u16, self.pos);
         try self.writeU32(rr.ttl);
 
@@ -1308,8 +1308,8 @@ pub const Serializer = struct {
                 }
             },
             .rrsig => |rrsig| {
-                try self.writeU16(@intFromEnum(rrsig.type_covered));
-                try self.writeU8(@intFromEnum(rrsig.algorithm));
+                try self.writeU16(@backingInt(rrsig.type_covered));
+                try self.writeU8(@backingInt(rrsig.algorithm));
                 try self.writeU8(rrsig.labels);
                 try self.writeU32(rrsig.original_ttl);
                 try self.writeU32(rrsig.sig_expiration);
@@ -1321,13 +1321,13 @@ pub const Serializer = struct {
             .dnskey => |dnskey| {
                 try self.writeU16(dnskey.flags);
                 try self.writeU8(dnskey.protocol);
-                try self.writeU8(@intFromEnum(dnskey.algorithm));
+                try self.writeU8(@backingInt(dnskey.algorithm));
                 try self.writeSlice(dnskey.public_key);
             },
             .ds => |ds_data| {
                 try self.writeU16(ds_data.key_tag);
-                try self.writeU8(@intFromEnum(ds_data.algorithm));
-                try self.writeU8(@intFromEnum(ds_data.digest_type));
+                try self.writeU8(@backingInt(ds_data.algorithm));
+                try self.writeU8(@backingInt(ds_data.digest_type));
                 try self.writeSlice(ds_data.digest);
             },
             .nsec => |nsec_data| {
@@ -1335,7 +1335,7 @@ pub const Serializer = struct {
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
-                try self.writeU8(@intFromEnum(nsec3.hash_algorithm));
+                try self.writeU8(@backingInt(nsec3.hash_algorithm));
                 try self.writeU8(nsec3.flags);
                 try self.writeU16(nsec3.iterations);
                 try self.writeU8(try castOrRDataErr(u8, nsec3.salt.len));
@@ -1345,7 +1345,7 @@ pub const Serializer = struct {
                 try self.writeSlice(nsec3.type_bit_maps);
             },
             .nsec3param => |nsec3p| {
-                try self.writeU8(@intFromEnum(nsec3p.hash_algorithm));
+                try self.writeU8(@backingInt(nsec3p.hash_algorithm));
                 try self.writeU8(nsec3p.flags);
                 try self.writeU16(nsec3p.iterations);
                 try self.writeU8(try castOrRDataErr(u8, nsec3p.salt.len));
@@ -2977,15 +2977,15 @@ test "safeTagName handles known and unknown enum values" {
     try testing.expectEqualStrings("no_error", safeTagName(RCode, .no_error, &buf));
 
     // Unknown values — HTTPS (65), SVCB (64), CAA (257)
-    const https: RType = @enumFromInt(65);
+    const https: RType = @fromBackingInt(@intCast(65));
     try testing.expectEqualStrings("65", safeTagName(RType, https, &buf));
-    const svcb: RType = @enumFromInt(64);
+    const svcb: RType = @fromBackingInt(@intCast(64));
     try testing.expectEqualStrings("64", safeTagName(RType, svcb, &buf));
-    const caa: RType = @enumFromInt(257);
+    const caa: RType = @fromBackingInt(@intCast(257));
     try testing.expectEqualStrings("257", safeTagName(RType, caa, &buf));
 
     // Unknown RCode
-    const rcode7: RCode = @enumFromInt(7);
+    const rcode7: RCode = @fromBackingInt(@intCast(7));
     try testing.expectEqualStrings("7", safeTagName(RCode, rcode7, &buf));
 }
 

@@ -514,9 +514,9 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     // would surface as a cryptic SERVFAIL instead of a clear config error.
     // tagName returns null for values that don't match a named variant —
     // the cheapest known-variant check for this shape.
-    const algorithm: dns.DnssecAlgorithm = @enumFromInt(alg_int);
+    const algorithm: dns.DnssecAlgorithm = @fromBackingInt(@intCast(alg_int));
     if (std.enums.tagName(dns.DnssecAlgorithm, algorithm) == null) return error.InvalidValue;
-    const digest_type: dns.DigestType = @enumFromInt(dtype_int);
+    const digest_type: dns.DigestType = @fromBackingInt(@intCast(dtype_int));
     if (std.enums.tagName(dns.DigestType, digest_type) == null) return error.InvalidValue;
     if (digest_str.len % 2 != 0) return error.InvalidValue;
     const digest_len = digest_str.len / 2;
@@ -860,8 +860,8 @@ test "trust-anchors override parses and round-trips" {
     try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
     const ta = cfg.trust_anchors[0];
     try testing.expectEqual(@as(u16, 20326), ta.key_tag);
-    try testing.expectEqual(@as(u8, 8), @intFromEnum(ta.algorithm));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(ta.digest_type));
+    try testing.expectEqual(@as(u8, 8), @backingInt(ta.algorithm));
+    try testing.expectEqual(@as(u8, 2), @backingInt(ta.digest_type));
     try testing.expectEqual(@as(usize, 32), ta.digest.len);
 
     // Accessor returns config-supplied when non-empty.

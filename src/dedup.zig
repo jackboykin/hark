@@ -247,7 +247,7 @@ test "follower waits for leader" {
         fn run(tbl: *InFlightTable, started_flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool), result: *std.atomic.Value(u8)) void {
             started_flag.store(true, .release);
             const r = tbl.acquireOrWait("example.com", .a, 0);
-            result.store(@intFromEnum(r), .release);
+            result.store(@backingInt(r), .release);
             done.store(true, .release);
         }
     }.run, .{ &table, &started, &follower_done, &follower_result });
@@ -270,7 +270,7 @@ test "follower waits for leader" {
     t.join();
 
     try testing.expectEqual(true, follower_done.load(.acquire));
-    try testing.expectEqual(@intFromEnum(AcquireResult.follower), follower_result.load(.acquire));
+    try testing.expectEqual(@backingInt(AcquireResult.follower), follower_result.load(.acquire));
     try testing.expectEqual(@as(u32, 0), table.count());
 }
 
