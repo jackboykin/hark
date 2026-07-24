@@ -1800,8 +1800,9 @@ pub const RecursiveResolver = struct {
 
             // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
             // FORMERR too (RFC 1034 §4.3.5): one parse-hostile NS must not
-            // condemn a zone its siblings can still serve.
-            // Per-query only; no persistent penalty (RFC 4697 requires per-zone+IP keying).
+            // condemn a zone its siblings can still serve. recordNsOutcome
+            // is the persistent per-zone+IP penalty (Thompson arm, reward
+            // 0.1 — still selectable if siblings degrade).
             if (response.header.flags.rcode.shouldTrySiblingNs()) {
                 self.recordNsOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
                 last_server_failure = response;
