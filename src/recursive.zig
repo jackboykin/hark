@@ -2096,17 +2096,19 @@ pub const RecursiveResolver = struct {
     fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) ?[]const dns.ResourceRecord {
         if (self.resolving_ds) return null; // re-entrancy guard
 
-        // Derive parent zone: strip first label (e.g. "example.com" → "com")
-        // TLDs have no dot — parent is root, query root hints (RFC 4035 §3.1.4.1).
-        const parent_zone = parentZoneOf(zone_name);
-        if (parent_zone.len == 0) // root parent — query root hints
-            return self.reproveDelegationSecurity(allocator, zone_name, self.root_hints);
-
+        // Nearest ancestor with a cached NS RRset — the true parent zone can
+        // be several labels up when ENTs sit between cuts (ip6.arpa's nibble
+        // tree). Cached negatives at ENTs (qmin NS probes) are walked past;
+        // ancestors exhausted → root parent, query root hints (RFC 4035
+        // §3.1.4.1).
         const cache = self.cache orelse return null;
-        const ns_hit = switch (cache.lookup(allocator, parent_zone, .ns, .in) orelse return null) {
-            .hit => |h| h,
-            .negative => return null,
-        };
+        var parent_zone = parentZoneOf(zone_name);
+        const ns_hit = while (parent_zone.len > 0) : (parent_zone = parentZoneOf(parent_zone)) {
+            if (cache.lookup(allocator, parent_zone, .ns, .in)) |result| switch (result) {
+                .hit => |h| break h,
+                .negative => {},
+            };
+        } else return self.reproveDelegationSecurity(allocator, zone_name, self.root_hints);
         var ns_names: [max_servers_per_level]dns.Name = undefined;
         var ns_count: usize = 0;
         for (ns_hit.records) |rr| {
@@ -2198,7 +2200,21 @@ pub const RecursiveResolver = struct {
             // signed with the parent zone's DNSKEY before it can anchor child
             // trust. Without this verify step, an on-path attacker who forges
             // both DS and DNSKEY can mint a self-validating chain.
-            const parent_dotted = parentZoneOf(zone_name);
+            //
+            // The parent-zone name comes from the DS RRSIG's signer, not
+            // label arithmetic: with ENTs between cuts the parent sits
+            // several labels up (parent of 0.6.2.ip6.arpa is ip6.arpa;
+            // parentZoneOf names the ENT 6.2.ip6.arpa, whose DNSKEY is
+            // NODATA — the whole reverse tree SERVFAILed). A lying signer
+            // can't anchor: its DNSKEY must chain to the root trust anchor.
+            // The proper-ancestor guard pins it to the qname chain.
+            const signer = for (ds_section) |rr| {
+                if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds)
+                    break rr.rdata.rrsig.signer_name;
+            } else return null;
+            if (!zone.isSubdomainOf(signer) or zone.eql(signer)) return null;
+            var signer_buf: [dns.max_name_len + 1]u8 = undefined;
+            const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
             const ds_status = dnssec.validateAnswerRrset(
                 ds_section,
