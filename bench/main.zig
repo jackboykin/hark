@@ -63,6 +63,10 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
+    // toolchain stamp: baselines outlive nightlies (and their bundled LLVM)
+    const builtin = @import("builtin");
+    try stdout.print("# zig {s} mode={t} backend={t}\n", .{ builtin.zig_version_string, builtin.mode, builtin.zig_backend });
+
     var matched: u32 = 0;
     for (benchmarks) |b| {
         if (filter_opt) |f| {
