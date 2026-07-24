@@ -1005,6 +1005,17 @@ pub fn validateNegativeProof(
         // IANA and real signed zones actually emit. Owner-equality with
         // *.CE plus a verified RRSIG is the binding here.
         if (covering_nsec) |cov| {
+            // ENT: a covering NSEC whose next name descends below qname
+            // proves qname is an empty non-terminal (RFC 4592 §2.2.2) — it
+            // exists, owns no types, and wildcards never apply to existing
+            // names, so this alone completes the proof (Unbound
+            // nsec_proves_nodata, same ENT-before-wildcard order). The open
+            // range excludes next == qname, so isSubdomainOf is strict.
+            // ip6.arpa's NSEC-signed nibble tree is mostly ENTs; every qmin
+            // step landing between delegations takes this path.
+            if (cov.rdata.nsec.next_domain_name.isSubdomainOf(qname))
+                return .secure;
+
             const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
                 return .unchecked;
 
@@ -1040,27 +1051,13 @@ pub fn validateNegativeProof(
         const ce = closestEncloser(qname, covering.name, covering.rdata.nsec.next_domain_name) orelse
             return .unchecked;
 
-        // RFC 4035 §5.4: the CE must be *proven* to exist via an NSEC that
-        // explicitly names it as owner or next. A "covering range strictly
-        // contains CE" branch was considered for empty-non-terminal CEs,
-        // but the CE is by construction a common-suffix ancestor of both
-        // NSEC bounds — canonical order sorts ancestors strictly before
-        // descendants of the same suffix, so any legitimate NSEC has both
-        // bounds sorting *after* the CE and the in-range check is dead.
-        // The branch fires only on attacker-forged NSECs that geometrically
-        // straddle a CE candidate; dropping it closes that pin-CE class
-        // without losing any real ENT-CE proof (real ENT denial uses
-        // NSEC3, which has its own dedicated CE proof in this validator).
-        var ce_proven = false;
-        for (authorities) |rr| {
-            if (rr.rtype != .nsec) continue;
-            if (rr.name.eql(ce) or rr.rdata.nsec.next_domain_name.eql(ce)) {
-                ce_proven = true;
-                break;
-            }
-        }
-        if (!ce_proven) return .unchecked;
-
+        // No separate CE-existence check: CE is by construction a label-
+        // suffix of a signature-verified NSEC bound, and every ancestor of
+        // an existing name exists (RFC 4592 §2.2.2). An owner/next == CE
+        // equality check here rejected ENT closest-enclosers — ip6.arpa
+        // NXDOMAINs SERVFAILed on every query (ENTs never own an NSEC).
+        // Unbound proves name-error from qname + wildcard denial alone;
+        // forged NSECs die at RRSIG verification, not here.
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
 
@@ -2413,23 +2410,52 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, &b));
 }
 
-test "validateNegativeProof NSEC NXDOMAIN requires CE existence proof (RFC 4035 §5.4)" {
-    // qname = a.b.c.example.com. A single NSEC covers qname between two
-    // unrelated bounds — the derived CE (example.com) is neither named by
-    // any NSEC nor strictly between this NSEC's bounds. Without an
-    // independent CE existence proof, an attacker could pin an arbitrary
-    // CE inside any range. Must return .unchecked, not .secure.
+test "validateNegativeProof NSEC NXDOMAIN deep qname still needs wildcard denial" {
+    // qname = a.b.c.example.com, single NSEC covering it. CE derives to
+    // example.com, so the proof needs *.example.com denied — absent here.
+    // Guards the incompleteness bar after the CE-equality check was removed:
+    // a lone covering NSEC must never validate NXDOMAIN as secure.
     const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
     const zzz = dns.Name{ .labels = &.{ "zzz", "example", "com" } };
     const qname = dns.Name{ .labels = &.{ "a", "b", "c", "example", "com" } };
-    // covering = (aaa.example.com, zzz.example.com); qname sorts between
-    // (a.b.c.example.com is between a... and z... in the example.com range).
     const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
     var b: ValidationBudget = .{};
-    // Without a CE-proving NSEC, the answer is unchecked even though the
-    // covering NSEC validly denies qname.
     const status = validateNegativeProof(&authorities, qname, .a, true, &b);
     try testing.expectEqual(SecurityStatus.unchecked, status);
+}
+
+test "validateNegativeProof NSEC NODATA at empty non-terminal (live ip6.arpa shape)" {
+    // Captured 2026-07-24 from b.ip6-servers.arpa: `A 6.2.ip6.arpa` (a
+    // qname-minimization step of a 2600::/12 PTR) answers NOERROR/NODATA
+    // with a single NSEC 1.4.2.ip6.arpa -> 0.6.2.ip6.arpa. The next name
+    // descends below qname ⇒ qname is an ENT ⇒ complete proof. Regression:
+    // this SERVFAILed as "incomplete proof" pre-fix.
+    const owner = dns.Name{ .labels = &.{ "1", "4", "2", "ip6", "arpa" } };
+    const next = dns.Name{ .labels = &.{ "0", "6", "2", "ip6", "arpa" } };
+    const qname = dns.Name{ .labels = &.{ "6", "2", "ip6", "arpa" } };
+    const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+}
+
+test "validateNegativeProof NSEC NXDOMAIN with ENT closest encloser (live ip6.arpa shape)" {
+    // Captured 2026-07-24: `A xx.6.2.ip6.arpa` -> NXDOMAIN with two NSECs:
+    // 3.6.2 -> 0.8.2 covers qname (CE = 6.2.ip6.arpa, an ENT no NSEC
+    // names), 1.4.2 -> 0.6.2 covers the wildcard *.6.2.ip6.arpa. CE
+    // existence is implied by the bounds' shared suffix.
+    const authorities = [_]dns.ResourceRecord{
+        nsecRr(
+            .{ .labels = &.{ "3", "6", "2", "ip6", "arpa" } },
+            .{ .labels = &.{ "0", "8", "2", "ip6", "arpa" } },
+        ),
+        nsecRr(
+            .{ .labels = &.{ "1", "4", "2", "ip6", "arpa" } },
+            .{ .labels = &.{ "0", "6", "2", "ip6", "arpa" } },
+        ),
+    };
+    const qname = dns.Name{ .labels = &.{ "xx", "6", "2", "ip6", "arpa" } };
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
