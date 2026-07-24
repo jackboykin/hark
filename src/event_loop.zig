@@ -57,11 +57,20 @@ pub const AcceptResult = struct {
 };
 
 pub const ReadResult = struct {
-    /// Aliases the op's slot buffer, which is recycled as soon as any new
-    /// op is armed: consume `data` before arming ops (arming can claim
-    /// this completion's freed slot even within the same batch).
-    data: []const u8,
+    /// Owned copy of the payload. Read ops carry only tiny signalfd/
+    /// eventfd records, so reap copies out of the slot buffer and the
+    /// slot can be freed and re-armed mid-batch without invalidating
+    /// this completion. (When `data` aliased the slot, any arm that
+    /// claimed the freed slot — the LIFO free list makes that likely —
+    /// clobbered a not-yet-consumed payload: an accept CQE reaped ahead
+    /// of a signal CQE zeroed the siginfo and turned stats into shutdown.)
+    buf: [read_buf_size]u8,
+    len: usize,
     err: ?anyerror,
+
+    pub fn data(self: *const ReadResult) []const u8 {
+        return self.buf[0..self.len];
+    }
 };
 
 // ── Operation slot ──────────────────────────────────────────────────────
@@ -407,28 +416,18 @@ pub const EventLoop = struct {
                     }
                 },
                 .read => |*rbuf| {
+                    var res = ReadResult{ .buf = undefined, .len = 0, .err = null };
                     if (cqe.res > 0) {
-                        const len: usize = @intCast(cqe.res);
-                        completion.result = .{ .read = .{
-                            .data = rbuf[0..len],
-                            .err = null,
-                        } };
+                        res.len = @intCast(cqe.res);
+                        @memcpy(res.buf[0..res.len], rbuf[0..res.len]);
                     } else if (cqe.res == 0) {
-                        completion.result = .{ .read = .{
-                            .data = &.{},
-                            .err = error.EndOfFile,
-                        } };
+                        res.err = error.EndOfFile;
                     } else if (isCancelled(cqe)) {
-                        completion.result = .{ .read = .{
-                            .data = &.{},
-                            .err = error.Cancelled,
-                        } };
+                        res.err = error.Cancelled;
                     } else {
-                        completion.result = .{ .read = .{
-                            .data = &.{},
-                            .err = error.ReadFailed,
-                        } };
+                        res.err = error.ReadFailed;
                     }
+                    completion.result = .{ .read = res };
                 },
             }
 
@@ -612,4 +611,54 @@ test "EventLoop cancel pending recvFromMulti" {
     }
 
     try testing.expect(got_cancelled);
+}
+
+test "read payload survives an op arming into the freed slot mid-batch" {
+    // Regression: reap frees read slots before the caller consumes the
+    // batch, and the LIFO free list hands the same slot to the very next
+    // arm. When ReadResult aliased the slot buffer, that arm clobbered
+    // the payload — a tcp-accept re-arm ahead of a signal completion
+    // zeroed the siginfo and classifySignalRead turned stats into
+    // shutdown. ReadResult now owns a copy; pin that.
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
+    const sr: isize = @bitCast(rc);
+    try testing.expect(sr >= 0);
+    const efd: posix.fd_t = @intCast(sr);
+    defer sys.close(efd);
+
+    const val: u64 = 0x1122334455667788;
+    _ = try sys.write(efd, std.mem.asBytes(&val));
+
+    var ctx: u8 = 7;
+    _ = try loop.read(efd, @ptrCast(&ctx));
+
+    var completions: [max_operations]Completion = undefined;
+    var saved: ?ReadResult = null;
+    for (0..5) |_| {
+        const results = try loop.tick(&completions);
+        for (results) |c| switch (c.result) {
+            .read => |r| saved = r,
+            else => {},
+        };
+        if (saved != null) break;
+    }
+    try testing.expect(saved != null);
+
+    // Arm a recvmsg — allocSlot pops the just-freed read slot and initOp
+    // writes the recv_multi msghdr over the shared union storage.
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(sock, &bind_pa.any, bind_len);
+    const recv_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
+
+    try loop.cancel(recv_id);
+    loop.flush();
 }

@@ -2088,10 +2088,11 @@ fn classifySignalRead(result: anytype) SignalAction {
     };
     if (r.err != null) return .shutdown;
 
+    const bytes = r.data();
     var saw_stats = false;
     var off: usize = 0;
-    while (off + 4 <= r.data.len) : (off += siginfo_size) {
-        const signo = std.mem.readInt(u32, r.data[off..][0..4], .little);
+    while (off + 4 <= bytes.len) : (off += siginfo_size) {
+        const signo = std.mem.readInt(u32, bytes[off..][0..4], .little);
         if (signo == @backingInt(linux.SIG.TERM) or signo == @backingInt(linux.SIG.INT)) {
             return .shutdown;
         }
