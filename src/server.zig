@@ -412,6 +412,10 @@ const Ctx = struct {
 
 const max_listen_addrs = 8;
 
+/// Consecutive unreadable signalfd completions tolerated before the worker
+/// stops trying. Only a genuinely broken fd reaches this.
+const max_signal_misfires: u32 = 16;
+
 // ── Background task bookkeeping ────────────────────────────────────────
 
 /// Cap concurrent background tasks (prefetch + CD=1 validation). Conservative
@@ -1340,10 +1344,17 @@ const WorkerState = struct {
             tcp_ops[i] = self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])) catch null;
         }
 
-        const signal_op: ?OperationId = if (sig_fd >= 0)
+        // Tracked across re-arms, not captured once: teardown cancels this id,
+        // and reap's LIFO free list hands a released id straight to the next
+        // arm — so a stale id cancels a stranger and leaves the real signal
+        // read armed, blocking flush() until a signal happens to arrive.
+        var signal_op: ?OperationId = if (sig_fd >= 0)
             self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null
         else
             null;
+
+        // Consecutive unreadable signalfd completions; see the `.signal` arm.
+        var signal_misfires: u32 = 0;
 
         // Every worker reads its own wake eventfd. requestShutdown writes 1
         // to each fd, so each worker's tick() returns with no need to
@@ -1380,18 +1391,37 @@ const WorkerState = struct {
             for (results) |c| {
                 const ctx: *Ctx = @ptrCast(@alignCast(c.context));
                 switch (ctx.tag) {
-                    .signal => switch (classifySignalRead(c.result)) {
-                        .stats => {
-                            self.logCacheStats();
-                            _ = self.loop.read(ctx.fd, @ptrCast(ctx)) catch |err|
-                                log.err("failed to re-arm signalfd: {s}", .{@errorName(err)});
-                            continue;
-                        },
-                        .shutdown => {
-                            log.info("shutting down", .{});
-                            self.server.requestShutdown();
-                            break;
-                        },
+                    .signal => {
+                        switch (classifySignalRead(c.result)) {
+                            .shutdown => {
+                                log.info("shutting down", .{});
+                                self.server.requestShutdown();
+                                break;
+                            },
+                            .stats => {
+                                self.logCacheStats();
+                                signal_misfires = 0;
+                            },
+                            // Re-arm rather than exit. A permanently broken fd
+                            // would spin the worker instead, so give up after a
+                            // bounded run — by shutting down, because signals
+                            // are blocked process-wide with this fd as their
+                            // only reader, and a resolver nobody can SIGTERM is
+                            // worse than one that exits for its supervisor to
+                            // restart.
+                            .ignore => {
+                                signal_misfires += 1;
+                                if (signal_misfires > max_signal_misfires) {
+                                    log.err("signalfd unreadable {d}x; shutting down", .{signal_misfires});
+                                    self.server.requestShutdown();
+                                    break;
+                                }
+                            },
+                        }
+                        // Both ways this can fail (slot table full, SQ full)
+                        // clear on the next tick; the repair loop below retries.
+                        signal_op = self.loop.read(ctx.fd, @ptrCast(ctx)) catch null;
+                        continue;
                     },
                     .wake => {
                         // Counterpart wrote to wake_fd — shutdown is in flight.
@@ -1473,6 +1503,14 @@ const WorkerState = struct {
                         }
                     },
                 }
+            }
+
+            // The signalfd read joins the same repair loop as the listeners:
+            // a transient arm failure must not cost the daemon its signals.
+            if (sig_fd >= 0 and signal_op == null and
+                !self.server.shutdown.load(.acquire))
+            {
+                signal_op = self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null;
             }
 
             // Retry re-registration for any listeners that failed above.
@@ -2095,13 +2133,21 @@ fn setupSignalFd() !posix.fd_t {
     linux.sigaddset(&mask, linux.SIG.HUP);
     linux.sigaddset(&mask, linux.SIG.USR1);
 
-    // Block signals so they arrive via signalfd
+    // Create the reader before blocking, not after. Blocking first and then
+    // failing here would leave the process with INT/TERM blocked and nothing
+    // reading them — unkillable except by SIGKILL, for its whole life.
+    const fd = try posix.signalfd(-1, &mask, linux.SFD.NONBLOCK);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
-
-    return posix.signalfd(-1, &mask, linux.SFD.NONBLOCK);
+    return fd;
 }
 
-const SignalAction = enum { stats, shutdown };
+/// `.ignore` is the default for anything unrecognised: only a TERM or INT
+/// record actually present in the buffer may stop the process. Treating an
+/// unexpected read as a shutdown request killed the daemon on a spurious
+/// wake, an errored read, or a signo outside `setupSignalFd`'s mask — the
+/// same family as the eventfd/slot-aliasing bug ReadResult's doc comment
+/// describes.
+const SignalAction = enum { stats, shutdown, ignore };
 
 /// Walk every signalfd_siginfo record in the buffer (the kernel can pack
 /// many into one read). Shutdown signals win over stats.
@@ -2109,9 +2155,10 @@ fn classifySignalRead(result: anytype) SignalAction {
     const siginfo_size = @sizeOf(linux.signalfd_siginfo);
     const r = switch (result) {
         .read => |x| x,
-        else => return .shutdown,
+        else => return .ignore,
     };
-    if (r.err != null) return .shutdown;
+    // Covers the zero-length read too: reap maps `cqe.res == 0` to EndOfFile.
+    if (r.err != null) return .ignore;
 
     const bytes = r.data();
     var saw_stats = false;
@@ -2125,7 +2172,7 @@ fn classifySignalRead(result: anytype) SignalAction {
             saw_stats = true;
         }
     }
-    return if (saw_stats) .stats else .shutdown;
+    return if (saw_stats) .stats else .ignore;
 }
 
 fn makeWakeEventFd() !posix.fd_t {
@@ -2600,6 +2647,59 @@ test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
     try testing.expectEqual(@as(u32, k - 1), fired_at.?);
     const slack: usize = 64 * 1024;
     try testing.expect(capacity_after_fire <= PerThreadArena.SHRINK_LIMIT_BYTES + slack);
+}
+
+// ── classifySignalRead ─────────────────────────────────────────────────
+
+const ELResult = @import("event_loop.zig").Result;
+const ELReadResult = @import("event_loop.zig").ReadResult;
+
+fn signalReadOf(signos: []const u32) ELResult {
+    var r = ELReadResult{ .buf = @splat(0), .len = 0, .err = null };
+    const stride = @sizeOf(linux.signalfd_siginfo);
+    for (signos, 0..) |s, i| {
+        std.mem.writeInt(u32, r.buf[i * stride ..][0..4], s, .little);
+    }
+    r.len = signos.len * stride;
+    return .{ .read = r };
+}
+
+test "classifySignalRead: only a real TERM/INT record may stop the process" {
+    const term: u32 = @backingInt(linux.SIG.TERM);
+    const int: u32 = @backingInt(linux.SIG.INT);
+    const usr1: u32 = @backingInt(linux.SIG.USR1);
+    const hup: u32 = @backingInt(linux.SIG.HUP);
+
+    try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{term})));
+    try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{int})));
+    try testing.expectEqual(SignalAction.stats, classifySignalRead(signalReadOf(&.{usr1})));
+    try testing.expectEqual(SignalAction.stats, classifySignalRead(signalReadOf(&.{hup})));
+
+    // Shutdown still wins when packed alongside stats, in either order.
+    try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{ usr1, term })));
+    try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{ term, usr1 })));
+}
+
+test "classifySignalRead: an unreadable or unrecognised completion is ignored, not a shutdown" {
+    // Regression: every one of these returned .shutdown and the caller
+    // exited the process.
+
+    // Zero-length read. reap maps cqe.res == 0 to EndOfFile, so this is
+    // covered by the err check, but pin the payload shape too.
+    try testing.expectEqual(SignalAction.ignore, classifySignalRead(signalReadOf(&.{})));
+
+    // Errored read (EAGAIN on a NONBLOCK fd, a spurious wake, EOF).
+    var errored = ELReadResult{ .buf = @splat(0), .len = 0, .err = error.ReadFailed };
+    try testing.expectEqual(SignalAction.ignore, classifySignalRead(ELResult{ .read = errored }));
+    errored.err = error.EndOfFile;
+    try testing.expectEqual(SignalAction.ignore, classifySignalRead(ELResult{ .read = errored }));
+
+    // A signo outside setupSignalFd's mask.
+    try testing.expectEqual(SignalAction.ignore, classifySignalRead(signalReadOf(&.{@backingInt(linux.SIG.CHLD)})));
+
+    // A completion that is not a read at all.
+    const not_a_read = ELResult{ .accept = .{ .fd = -1, .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0), .err = error.AcceptFailed } };
+    try testing.expectEqual(SignalAction.ignore, classifySignalRead(not_a_read));
 }
 
 test "Server.init does not leak when a late allocation fails" {
