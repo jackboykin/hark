@@ -589,7 +589,7 @@ pub const RecursiveResolver = struct {
                         // aggressive-use cache instead, so this branch caches
                         // *only* entries the NX-cut will skip by design.
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, servers[0..server_count])) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count])) {
                             .proceed => {
                                 // .secure here means verifiedNegativeResponse
                                 // ran NSEC and accepted it; AA is redundant
@@ -621,7 +621,7 @@ pub const RecursiveResolver = struct {
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
                     {
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, servers[0..server_count])) {
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count])) {
                             .proceed => {
                                 if (response.header.flags.aa) {
                                     if (self.cache) |c| {
@@ -1133,7 +1133,7 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, servers)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers)) {
                 .proceed => {
                     if (security_state == .secure) {
                         response.header.flags.ad = true;
@@ -1209,7 +1209,7 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.aa) {
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, servers)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers)) {
                 .proceed => {
                     if (security_state == .secure) {
                         response.header.flags.ad = true;
@@ -2316,15 +2316,7 @@ pub const RecursiveResolver = struct {
         authorities: []const dns.ResourceRecord,
         parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
-        // Find RRSIG signer_name in authorities
-        var signer_name: ?dns.Name = null;
-        for (authorities) |rr| {
-            if (rr.rtype == .rrsig) {
-                signer_name = rr.rdata.rrsig.signer_name;
-                break;
-            }
-        }
-        const signer = signer_name orelse return .unchecked;
+        const signer = authoritySigner(authorities) orelse return .unchecked;
 
         // RFC 4034 §3.1.3: verify authority record owners are under the signer zone
         for (authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
@@ -2348,6 +2340,7 @@ pub const RecursiveResolver = struct {
         qname: dns.Name,
         qtype: dns.RType,
         is_nxdomain: bool,
+        zone: dns.Name,
         zone_servers: []const na.Address,
     ) NegativeValidation {
         if (security_state != .secure) return .proceed;
@@ -2355,6 +2348,8 @@ pub const RecursiveResolver = struct {
         const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_servers);
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
+
+        if (!negativeProofBinds(authorities, zone, qname)) return .bogus;
 
         return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, self.validationBudget());
     }
@@ -3206,6 +3201,31 @@ fn extractReferral(
 
 const NegativeValidation = enum { proceed, skip_cache, bogus };
 
+/// The zone whose keys an authority section's proofs rest on: the signer of
+/// its first RRSIG. `verifyAuthorityNsecSigs` only reports .secure when every
+/// NSEC/NSEC3 owner verifies under a key fetched for this name, so after a
+/// .secure verdict this name is the proof's whole authority.
+fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
+    for (authorities) |rr| {
+        if (rr.rtype == .rrsig) return rr.rdata.rrsig.signer_name;
+    }
+    return null;
+}
+
+/// Signatures verifying is not the same as the proof being *about* qname.
+/// verifyAuthoritySigs binds NSEC owners to the signer; nothing binds the
+/// signer to the zone we asked or qname to the signer. Without both, one
+/// genuine, publicly-fetchable wrap NSEC from any signed zone is an
+/// authenticated NXDOMAIN and NODATA for arbitrary names — no forged crypto
+/// needed: `zzz.example.net NSEC example.net` covers victim.com (com < net),
+/// the closest encloser clamps to root, and the same record covers the
+/// wildcard. An ancestor signer is the same trap one level up, so the proof
+/// must come from at or below the delegation point we are talking to.
+fn negativeProofBinds(authorities: []const dns.ResourceRecord, zone: dns.Name, qname: dns.Name) bool {
+    const signer = authoritySigner(authorities) orelse return false;
+    return signer.isSubdomainOf(zone) and qname.isSubdomainOf(signer);
+}
+
 fn validateNegativeResponse(
     security_state: dnssec.SecurityStatus,
     authorities: []const dns.ResourceRecord,
@@ -3890,6 +3910,59 @@ test "validateNegativeResponse returns proceed when security_state is not secure
     // unchecked/insecure → proceed regardless of authorities
     try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true, &b));
     try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false, &b));
+}
+
+test "negativeProofBinds rejects a genuine NSEC from an unrelated zone" {
+    // The live counterexample: one publicly-fetchable wrap NSEC out of
+    // example.net proves NXDOMAIN *and* NODATA for victim.com in
+    // validateNegativeProof (com < net, so the wrap range covers it, the
+    // closest encloser clamps to root, and the same record covers the
+    // wildcard). Every signature involved is real — only the binding to the
+    // zone we queried stops it.
+    const net_zone = dns.Name{ .labels = &.{ "example", "net" } };
+    const authorities = [_]dns.ResourceRecord{
+        .{
+            .name = dns.Name{ .labels = &.{ "zzz", "example", "net" } },
+            .rtype = .nsec,
+            .rclass = .in,
+            .ttl = 3600,
+            .rdata = .{ .nsec = .{ .next_domain_name = net_zone, .type_bit_maps = &.{} } },
+        },
+        .{
+            .name = dns.Name{ .labels = &.{ "zzz", "example", "net" } },
+            .rtype = .rrsig,
+            .rclass = .in,
+            .ttl = 3600,
+            .rdata = .{ .rrsig = .{
+                .type_covered = .nsec,
+                .algorithm = .ecdsap256sha256,
+                .labels = 3,
+                .original_ttl = 3600,
+                .sig_inception = 0,
+                .sig_expiration = 0xFFFFFFFF,
+                .key_tag = 1,
+                .signer_name = net_zone,
+                .signature = &.{},
+            } },
+        },
+    };
+    const victim = dns.Name{ .labels = &.{ "victim", "com" } };
+    // The proof itself is still "complete" — that is the whole problem.
+    var b: dnssec.ValidationBudget = .{};
+    try testing.expectEqual(dnssec.SecurityStatus.secure, dnssec.validateNegativeProof(&authorities, victim, .a, true, &b));
+
+    // Queried com's servers: signer isn't under the zone we asked.
+    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{"com"} }, victim));
+    // Queried the root, where every signer passes the zone test: qname is
+    // still not under the signer.
+    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{} }, victim));
+    // Its own zone, its own names: fine.
+    try testing.expect(negativeProofBinds(&authorities, net_zone, dns.Name{ .labels = &.{ "gone", "example", "net" } }));
+    // A deeper child answering for itself is fine; an ancestor signer is not.
+    try testing.expect(negativeProofBinds(&authorities, dns.Name{ .labels = &.{"net"} }, net_zone));
+    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{ "sub", "example", "net" } }, victim));
+    // No RRSIG at all: no authority to bind to.
+    try testing.expect(!negativeProofBinds(&.{}, net_zone, victim));
 }
 
 test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {

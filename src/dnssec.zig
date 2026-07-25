@@ -968,6 +968,12 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
 
 /// Validate an NXDOMAIN or NODATA response using NSEC/NSEC3 proofs.
 /// Returns the security status of the negative proof.
+///
+/// PRECONDITION, and it is load-bearing: the caller must already have bound
+/// these authorities to a signer that covers `qname` (recursive.zig's
+/// `negativeProofBinds`). Nothing here ties the proof to a zone — geometry
+/// alone will happily accept a genuine wrap NSEC from an unrelated zone as
+/// denial of any name in the range.
 pub fn validateNegativeProof(
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
