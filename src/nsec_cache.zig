@@ -243,7 +243,19 @@ fn freeEntry(alloc: Allocator, e: *NsecEntry) void {
 /// (RFC 4035 §5.2). Mirrors Knot's `kr_nsec_children_in_zone_check` and
 /// Unbound's `val_nsec_proves_name_error` / `nsec_proves_nodata`.
 fn isParentSideNsec(nsec: *const NsecEntry, target: dns.Name, qtype: dns.RType) bool {
-    if (qtype == .ds) return false;
+    if (qtype == .ds) {
+        // DS is the one type the parent owns, so a parent-side NSEC is
+        // exactly what a DS proof wants — but only AT the cut. Two clauses,
+        // neither subsuming the other (Unbound's val_nsec_proves_no_ds +
+        // nsec_proves_nodata pair; RFC 6840 §4.4 states both at MUST level):
+        //   · below the cut there is no parent authority at all, and the
+        //     shape has no SOA, so only this clause catches it;
+        //   · a child-side apex NSEC has target == owner, so only the SOA
+        //     clause catches that one. DS never lives on the child side.
+        if (!target.eql(nsec.owner)) return true;
+        if (dns.typeBitmapContains(nsec.type_bit_maps, .soa) and target.labels.len > 0) return true;
+        return false;
+    }
     if (!dns.typeBitmapContains(nsec.type_bit_maps, .ns)) return false;
     if (dns.typeBitmapContains(nsec.type_bit_maps, .soa)) return false;
     return dnssec.commonSuffixLabels(target, nsec.owner) == nsec.owner.labels.len;
@@ -468,10 +480,13 @@ pub const NsecCache = struct {
         // a non-delegation NSEC range from this zone could falsely cover names
         // in a child zone (e.g., a .com NSEC covering nnn.example.com).
         // Verify the direct-child ancestor is covered (proving it doesn't exist,
-        // so no delegation is possible). DS queries are exempt (always answered
-        // by the parent zone).
+        // so no delegation is possible). DS used to be exempt here on the
+        // theory that the parent always answers it — but the parent's
+        // authority stops at the cut, and a wrap-cover shape could make the
+        // exemption load-bearing later. isParentSideNsec carries the DS rule;
+        // this guard has no business restating it.
         const zone_label_count = zoneLabelsLen(zone_lower);
-        if (qname.labels.len > zone_label_count + 1 and qtype != .ds) {
+        if (qname.labels.len > zone_label_count + 1) {
             const direct_child = dns.Name{ .labels = qname.labels[qname.labels.len - zone_label_count - 1 ..] };
             if (list.findCovering(direct_child, now) == null and list.findExact(direct_child, now) == null) {
                 return null; // can't prove no delegation exists
@@ -614,6 +629,16 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
     // (a) Find NSEC covering qname
     const qname_cover = list.findCovering(qname, now) orelse return .unknown;
     if (isParentSideNsec(qname_cover, qname, qtype)) return .unknown;
+
+    // A cover whose next_domain descends below qname proves qname is an empty
+    // non-terminal (RFC 4592 §2.2.2): it exists, so NXDOMAIN is a lie and RFC
+    // 8020 consumers would deny the whole subtree for the negative TTL. The
+    // open range excludes next == qname, so isSubdomainOf is strict — same
+    // reasoning as the validator's arm (dnssec.zig, commit 39c5540). ip6.arpa's
+    // nibble tree and _tcp/_domainkey under SRV/DANE are all this shape.
+    // TODO: an ent_nodata variant would keep the aggressive-cache benefit on
+    // exactly the traffic that motivated 39c5540, instead of forfeiting it.
+    if (qname_cover.next_domain.isSubdomainOf(qname)) return .unknown;
 
     // (b) Derive closest encloser from cover, then check wildcard
     const ce = dnssec.closestEncloser(qname, qname_cover.owner, qname_cover.next_domain) orelse
@@ -1378,4 +1403,102 @@ test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {
     const qname = try dns.parseDottedName(alloc, "b");
     defer dns.freeName(alloc, qname);
     try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .a, "b"), .nxdomain);
+}
+
+// ── DS queries and empty non-terminals ────────────────────────────────
+//
+// The suite had no test for either, which is why three defects lived here:
+// every rule below exists in dnssec.zig or RFC 8198 Appendix B and was
+// simply never ported into the aggressive cache. The cache re-derives
+// negative-proof semantics from geometry while the on-wire validator
+// carries the shape-specific exceptions — any rule added to one belongs
+// in both.
+
+test "NSEC cache: DS query below a delegation is not answered from the parent" {
+    // `bar.example.com NSEC qux.example.com` with NS set and SOA clear is the
+    // example.com side of a cut. Its range covers foo.bar.example.com, but the
+    // parent's authority stops AT bar.example.com — below it only the child
+    // can speak, DS included (RFC 6840 §4.1: "all RRs at that owner name other
+    // than DS RRs, and all RRs below that owner name regardless of type").
+    // The refusal now comes from the shared `nsecProvesNameNonexistence`
+    // primitive, so findCovering never returns the range at all; the DS
+    // clauses in isParentSideNsec handle the owner-match shapes below.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const bar = try dns.parseDottedName(alloc, "bar.example.com");
+    const qux = try dns.parseDottedName(alloc, "qux.example.com");
+    defer dns.freeName(alloc, bar);
+    defer dns.freeName(alloc, qux);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = bar, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = qux, .type_bit_maps = bitmap_delegation } } },
+    }, example_zone);
+
+    const below = try dns.parseDottedName(alloc, "foo.bar.example.com");
+    defer dns.freeName(alloc, below);
+    try testing.expect(nc.lookupSuffixes(alloc, below, .ds, "foo.bar.example.com") == null);
+    try testing.expect(nc.lookupSuffixes(alloc, below, .a, "foo.bar.example.com") == null);
+}
+
+test "NSEC cache: child-side apex NSEC cannot deny DS" {
+    // DS lives only in the parent. A child apex NSEC (SOA present) never
+    // carries the DS bit, so without the SOA clause its bitmap would read as
+    // "no DS here" — an authenticated downgrade of a signed delegation.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    // A NS SOA MX RRSIG NSEC DNSKEY, no DS.
+    const child_apex = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex = try dns.parseDottedName(alloc, "example.com");
+    const next = try dns.parseDottedName(alloc, "mail.example.com");
+    defer dns.freeName(alloc, apex);
+    defer dns.freeName(alloc, next);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = child_apex } } },
+    }, example_zone);
+
+    try testing.expect(nc.lookupSuffixes(alloc, apex, .ds, "example.com") == null);
+    // The same NSEC still answers what it legitimately can.
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, apex, .txt, "example.com"), .nodata);
+}
+
+test "NSEC cache: no NXDOMAIN synthesis at an empty non-terminal" {
+    // The ip6.arpa shape. `example.com NSEC sub.ent.example.com` covers
+    // ent.example.com, but its next descends *below* ent.example.com — which
+    // proves ent.example.com exists as an empty non-terminal. Synthesizing
+    // NXDOMAIN here would deny the whole subtree to every RFC 8020 consumer
+    // downstream for up to the 3h clamp.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const bitmap_apex = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex = try dns.parseDottedName(alloc, "example.com");
+    const deep = try dns.parseDottedName(alloc, "sub.ent.example.com");
+    defer dns.freeName(alloc, apex);
+    defer dns.freeName(alloc, deep);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = deep, .type_bit_maps = bitmap_apex } } },
+    }, example_zone);
+
+    const ent = try dns.parseDottedName(alloc, "ent.example.com");
+    defer dns.freeName(alloc, ent);
+    try testing.expect(nc.lookupSuffixes(alloc, ent, .a, "ent.example.com") == null);
 }
