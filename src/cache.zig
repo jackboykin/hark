@@ -751,9 +751,10 @@ pub const RRsetCache = struct {
                 };
                 const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
                 // Read path: degrade sigs/proofs to empty on OOM rather than
-                // drop the answer. The stored entry was already proven complete
-                // at store time (storeOneRRset refuses truncated stores), so a
-                // transient clone failure here only costs a DO client its proofs.
+                // drop the answer. The records themselves are complete (the
+                // store path skips any RRset that overflows its collect
+                // buffer), so a transient clone failure here only costs a DO
+                // client its proofs.
                 const sigs: []dns.ResourceRecord = if (rrset.sigs.len == 0) &.{} else cloneRRset(caller_alloc, rrset.sigs, hit.remaining_ttl) catch &.{};
                 const nsec_proofs: []dns.ResourceRecord = if (rrset.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, rrset.nsec_proofs, hit.remaining_ttl) catch &.{};
                 return .{ .hit = .{
@@ -1178,10 +1179,13 @@ pub const RRsetCache = struct {
                     sig_count += 1;
                 }
             }
-            const collect_count = @min(match_count, match_buf.len);
-            const sig_collect = @min(sig_count, sig_buf.len);
+            // Don't cache what we can't hold whole. Storing the first 64 would
+            // serve a silently-short RRset without TC=1 for the whole TTL
+            // (RFC 2181 §5.1) while the miss client got all N — correct-but-
+            // uncached beats wrong-and-cached.
+            if (match_count > match_buf.len or sig_count > sig_buf.len) continue;
 
-            self.storeOneRRset(lower_name, rr, match_buf[0..collect_count], sig_buf[0..sig_collect], status, nsec_proofs);
+            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, nsec_proofs);
         }
     }
 
@@ -3099,6 +3103,41 @@ test "storeOneRRset handles backing-allocator OOM without leaking" {
             if (err != error.OutOfMemory) return err;
         };
         try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
+    }
+}
+
+test "storeResponse skips an RRset that overflows the collect buffer" {
+    // A 64-record store of a 70-record RRset would serve a silently-short
+    // answer with no TC=1 for the whole TTL (RFC 2181 §5.1) while the miss
+    // client got all 70. Not caching is the correct degradation.
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // Oversized first, so the "no entry" assertion can't be satisfied by a
+    // leftover from the in-bounds store.
+    for ([_]usize{ max_rrset_collect + 1, max_rrset_collect }) |n| {
+        const answers = try alloc.alloc(dns.ResourceRecord, n);
+        for (answers, 0..) |*a, i| a.* = .{
+            .name = try makeTestName(alloc, &.{ "big", "example", "com" }),
+            .rtype = .a,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .a = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } },
+        };
+        const response = makeTestResponse(answers);
+        defer dns.freeMessage(alloc, response);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const r = cache.lookup(arena.allocator(), "big.example.com", .a, .in);
+        if (n > max_rrset_collect) {
+            try testing.expect(r == null);
+        } else {
+            try testing.expectEqual(n, r.?.hit.records.len);
+        }
     }
 }
 
