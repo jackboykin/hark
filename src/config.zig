@@ -309,15 +309,45 @@ fn validateSchema(root: toml.Table) ConfigError!void {
     }
 }
 
+/// Upper bound for [resolver] stagger-ms. Staggering upstream probes by more
+/// than a second would exceed most stub resolvers' own patience.
+const max_stagger_ms: u32 = 1000;
+
 // ── Parser ─────────────────────────────────────────────────────────────
 
-fn nonNegativeClamped(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
+/// Out-of-range is rejected, not clamped: silent folding to `maxInt(T)`
+/// contradicts the strict schema the rest of this parser enforces, and it hid
+/// a footgun — `user = <huge>` clamped to `(uid_t)-1`, setresuid's "leave
+/// unchanged" sentinel, so the drop silently did nothing and reported success.
+fn nonNegative(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
     const v = table.getInteger(key) orelse return null;
     if (v < 0) {
         errLog("config: {s} must not be negative, got {d}", .{ key, v });
         return error.InvalidValue;
     }
-    return @intCast(@min(v, std.math.maxInt(T)));
+    if (v > std.math.maxInt(T)) {
+        errLog("config: {s} must be at most {d}, got {d}", .{ key, std.math.maxInt(T), v });
+        return error.InvalidValue;
+    }
+    return @intCast(v);
+}
+
+/// Neither `(uid_t)-1` (setresuid's "leave unchanged" sentinel) nor 0 is an id
+/// worth dropping to; both make the drop a no-op that reports success.
+fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
+    const v = try nonNegative(u32, table, key) orelse return null;
+    if (v == std.math.maxInt(u32)) {
+        errLog("config: {s} must be a real id, got the 'unchanged' sentinel {d}", .{ key, v });
+        return error.InvalidValue;
+    }
+    // 0 reaches the same no-op by a likelier route than the sentinel: a
+    // template substituting an unset variable. Dropping *to* root is not
+    // something these keys can express; omitting them is how you stay put.
+    if (v == 0) {
+        errLog("config: {s} must not be 0 — omit the key to run as the current user", .{key});
+        return error.InvalidValue;
+    }
+    return v;
 }
 
 pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
@@ -358,14 +388,14 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             }
             cfg.max_udp_payload = @intCast(m);
         }
-        if (try nonNegativeClamped(u32, server, "user")) |u| cfg.drop_uid = u;
-        if (try nonNegativeClamped(u32, server, "group")) |g| cfg.drop_gid = g;
+        if (try credential(server, "user")) |u| cfg.drop_uid = u;
+        if (try credential(server, "group")) |g| cfg.drop_gid = g;
         if (server.getStringArray("allow-from")) |entries| {
             const new_allow = try parseCidrList(allocator, entries);
             allocator.free(cfg.allow_from);
             cfg.allow_from = new_allow;
         }
-        if (try nonNegativeClamped(u32, server, "tcp-idle-timeout-ms")) |v| {
+        if (try nonNegative(u32, server, "tcp-idle-timeout-ms")) |v| {
             // RFC 7828 §3.4 caps the wire TIMEOUT field (100-ms units) at u16.
             // Reject configs that would overflow the @intCast at emit time.
             if (v > 6_553_500) {
@@ -374,14 +404,14 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             }
             cfg.tcp_idle_timeout_ms = v;
         }
-        if (try nonNegativeClamped(u32, server, "tcp-queries-per-conn")) |v| {
+        if (try nonNegative(u32, server, "tcp-queries-per-conn")) |v| {
             if (v == 0) {
                 errLog("config: tcp-queries-per-conn must not be 0", .{});
                 return error.InvalidValue;
             }
             cfg.tcp_queries_per_conn = v;
         }
-        if (try nonNegativeClamped(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
+        if (try nonNegative(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
         if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
     }
 
@@ -414,26 +444,35 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
-        if (try nonNegativeClamped(usize, resolver, "query-memory-limit")) |val| {
+        if (try nonNegative(usize, resolver, "query-memory-limit")) |val| {
             if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
             // 0 = unlimited. Resolve the sentinel here so every cap site (worker
             // arena, NS-fanout helpers, bg-prefetch) honors it uniformly.
             cfg.query_memory_limit = if (val == 0) std.math.maxInt(usize) else val;
         }
-        if (try nonNegativeClamped(u32, resolver, "stagger-ms")) |v| cfg.stagger_ms = @min(v, 1000);
+        if (try nonNegative(u32, resolver, "stagger-ms")) |v| {
+            // Rejected rather than clamped, for the same reason as the range
+            // check itself: `stagger-ms = 5000` meant 5 seconds to whoever
+            // wrote it.
+            if (v > max_stagger_ms) {
+                errLog("config: stagger-ms must be at most {d}, got {d}", .{ max_stagger_ms, v });
+                return error.InvalidValue;
+            }
+            cfg.stagger_ms = v;
+        }
     }
 
     // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
-        if (try nonNegativeClamped(usize, cache, "size")) |v| cfg.cache_size = v;
-        if (try nonNegativeClamped(u32, cache, "entries")) |v| cfg.cache_entries = v;
-        if (try nonNegativeClamped(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
-        if (try nonNegativeClamped(u32, cache, "key-cache-entries")) |v| cfg.key_cache_entries = v;
+        if (try nonNegative(usize, cache, "size")) |v| cfg.cache_size = v;
+        if (try nonNegative(u32, cache, "entries")) |v| cfg.cache_entries = v;
+        if (try nonNegative(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
+        if (try nonNegative(u32, cache, "key-cache-entries")) |v| cfg.key_cache_entries = v;
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (cache.getBool("prefetch-cousin")) |p| cfg.prefetch_cousin = p;
         if (cache.getBool("prefetch-hot")) |p| cfg.prefetch_hot = p;
-        if (try nonNegativeClamped(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
-        if (try nonNegativeClamped(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
+        if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
+        if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
     }
 
     // [logging] section
@@ -959,4 +998,61 @@ test "test-only knobs gated on -Dtesting" {
     } else {
         try testing.expectError(error.TestOnlyConfigKey, parseConfig(testing.allocator, cfg_text));
     }
+}
+
+test "an out-of-range integer is rejected, never clamped" {
+    // Regression: the parser used to fold anything larger down to
+    // maxInt(u32). For `user` that is 4294967295 == (uid_t)-1, setresuid's
+    // "leave unchanged" sentinel — the kernel returns success and hark
+    // logged that it had dropped privileges while still running as root.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\user = 99999999999
+    ));
+    // Written literally, the sentinel is just as wrong.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\user = 4294967295
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\group = 4294967295
+    ));
+    // 0 reaches the same false "dropped user to uid=0" log by a much likelier
+    // route: a template substituting an unset variable. setresuid(0,0,0)
+    // succeeds trivially, so the report would be a lie while still root.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\user = 0
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[server]
+        \\group = 0
+    ));
+    // Semantic limits are rejected too, not silently clamped: stagger-ms = 5000
+    // meant five seconds to whoever wrote it.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\stagger-ms = 5000
+    ));
+    // Not credential-specific: silent clamping contradicts the strict schema
+    // everywhere, so every nonNegative caller rejects too.
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[cache]
+        \\entries = 99999999999
+    ));
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[cache]
+        \\min-ttl = 4294967296
+    ));
+
+    // Real ids still parse, including the largest legitimate one.
+    var cfg = try parseConfig(testing.allocator,
+        \\[server]
+        \\user = 4294967294
+        \\group = 65534
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 4294967294), cfg.drop_uid);
+    try testing.expectEqual(@as(?u32, 65534), cfg.drop_gid);
 }
