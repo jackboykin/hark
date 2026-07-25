@@ -2265,16 +2265,46 @@ pub const RecursiveResolver = struct {
             // NODATA — the whole reverse tree SERVFAILed). A lying signer
             // can't anchor: its DNSKEY must chain to the root trust anchor.
             // The proper-ancestor guard pins it to the qname chain.
-            const signer = for (ds_section) |rr| {
-                if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds)
-                    break rr.rdata.rrsig.signer_name;
+            // Narrow to *this zone's* DS RRset first. One filter closes three
+            // compounding holes: the signer below came off the first RRSIG
+            // covering any DS, `validateAnswerRrset` reports `.secure` when
+            // *some* owner-group verifies, and the cache loop copied every `.ds`
+            // in the section — so an unsigned DS for an unrelated name could ride
+            // along and be cached `.secure`. A DS is a digest commitment, so a
+            // planted one is what that name's DNSKEY is then checked against:
+            // its subtree SERVFAILs for the DS TTL, and planting needs no key at
+            // all. Scenario 903. The filter drops nothing legitimate — a DS
+            // answer's owner is the qname, a referral's is the child zone.
+            var zone_ds_buf: [32]dns.ResourceRecord = undefined;
+            var ds_count: usize = 0;
+            for (ds_section) |rr| {
+                if (rr.rtype != .ds or !rr.name.eql(zone)) continue;
+                // Fail closed rather than truncate: verifying a prefix and
+                // caching the whole is the A1/C2 laundering shape.
+                if (ds_count == zone_ds_buf.len / 2) return null;
+                zone_ds_buf[ds_count] = rr;
+                ds_count += 1;
+            }
+            if (ds_count == 0) return null;
+            var zone_ds_len = ds_count;
+            for (ds_section) |rr| {
+                if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != .ds) continue;
+                if (!rr.name.eql(zone)) continue;
+                if (zone_ds_len == zone_ds_buf.len) return null;
+                zone_ds_buf[zone_ds_len] = rr;
+                zone_ds_len += 1;
+            }
+            const zone_ds = zone_ds_buf[0..zone_ds_len];
+
+            const signer = for (zone_ds[ds_count..]) |rr| {
+                break rr.rdata.rrsig.signer_name;
             } else return null;
             if (!zone.isSubdomainOf(signer) or zone.eql(signer)) return null;
             var signer_buf: [dns.max_name_len + 1]u8 = undefined;
             const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
             const ds_status = dnssec.validateAnswerRrset(
-                ds_section,
+                zone_ds,
                 .ds,
                 parent_dnskeys,
                 epochNowU32(),
@@ -2291,18 +2321,9 @@ pub const RecursiveResolver = struct {
             // DNSKEY).
             if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
             if (self.key_cache) |kc| {
-                var ds_only_buf: [16]dns.ResourceRecord = undefined;
-                var ds_only_count: usize = 0;
-                for (ds_section) |rr| {
-                    if (rr.rtype != .ds or ds_only_count >= ds_only_buf.len) continue;
-                    ds_only_buf[ds_only_count] = rr;
-                    ds_only_count += 1;
-                }
-                if (ds_only_count > 0) {
-                    // fetchRRset only returns .no_error responses, so the
-                    // synthesized header is faithful to the original.
-                    kc.storeResponse(synthesizedMessage(ds_only_buf[0..ds_only_count], &.{}, .no_error, false), zone, .secure);
-                }
+                // Exactly what was verified above, no wider. fetchRRset only
+                // returns .no_error, so the synthesized header is faithful.
+                kc.storeResponse(synthesizedMessage(zone_ds_buf[0..ds_count], &.{}, .no_error, false), zone, .secure);
             }
             return ds_section;
         }
@@ -2379,14 +2400,12 @@ pub const RecursiveResolver = struct {
         //
         if (!rrsig.signer_name.isSubdomainOf(zone)) return .bogus;
 
-        // TODO: cuts *below* `zone` are still missed — answering AA at the
-        // parent instead of referring keeps `signer == zone`, so the test above
-        // is silent, even when hark holds a validated DS for the child. Closing
-        // it with a bare cache probe (BIND's `closer_secure_ds_exists`) was
-        // tried and reverted: it cannot tell a lying parent from a legitimately
-        // un-delegated child, and guesses wrong on the second — see
-        // scenario 901 and memory/diffroll-t3-plan.md. The design that works is
-        // to *ask* the parent for the child's DS when the conflict arises.
+        // TODO: cuts *below* `zone` are still missed — a parent answering AA
+        // instead of referring keeps `signer == zone`, even when hark holds a
+        // validated DS for the child. A bare cache probe (BIND's
+        // `closer_secure_ds_exists`) was tried and reverted: it cannot tell a
+        // lying parent from a legitimately un-delegated child, since both emit
+        // the same bytes. Ask the parent for the DS instead. Scenario 901.
 
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);

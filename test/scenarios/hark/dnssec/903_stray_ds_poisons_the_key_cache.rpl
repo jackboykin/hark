@@ -1,0 +1,140 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+; hark: dnssec-zone = sibling.child.example.
+
+SCENARIO_BEGIN an unsigned DS riding along in a DS answer must not be cached
+
+; `reproveDelegationSecurityImpl` used to hand the whole DS *section* to
+; `validateAnswerRrset` and then cache every `.ds` record in it as `.secure`.
+; Unsound in combination: the validator returns `.secure` as soon as ONE
+; owner-group verifies, and the cache loop filtered by nothing but the bailiwick
+; test against the zone asked for, so anything at or under it survived.
+;
+; Here example. answers `child.example. DS` with the genuine DS plus a second one
+; two labels down at `sibling.child.example.`, digest all zeroes, carrying no
+; signature of its own. It was stored `.secure` regardless.
+;
+; A DS is a digest commitment, so a planted one is not inert — it is what hark
+; checks that name's DNSKEY against. `sibling.child.example.` is a real signed
+; delegation here, so the planted digest takes its whole subtree down for the DS
+; TTL. Planting needs no key: one record added to a legitimate answer by an
+; on-path injector is enough.
+;
+; The referrals carry NO DS on purpose — that is what forces hark down the
+; explicit DS-query path, which is the path that caches.
+;
+; Topology
+;   root                   127.0.10.1
+;   example                127.0.10.2  answers child.example. DS + the stray
+;   child.example          127.0.10.3  answers sibling.child.example. DS honestly
+;   sibling.child.example  127.0.10.4  the victim subtree
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ; The injection. Exact-match, declared before the referral so it wins.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 3600 IN DS PLACEHOLDER
+      sibling.child.example. 3600 IN DS 12345 13 2 0000000000000000000000000000000000000000000000000000000000000000
+  ENTRY_END
+
+  ; Referral without a DS — forces the DS query above.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 3600 IN NS ns.child.example.
+    SECTION ADDITIONAL
+      ns.child.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+
+  ; The honest DS for the victim zone. hark must reach this rather than trust
+  ; the digest planted by example.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sibling.child.example. IN DS
+    SECTION ANSWER
+      sibling.child.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sibling.child.example. IN A
+    SECTION AUTHORITY
+      sibling.child.example. 3600 IN NS ns.sibling.child.example.
+    SECTION ADDITIONAL
+      ns.sibling.child.example. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sibling.child.example. IN A
+    SECTION ANSWER
+      www.sibling.child.example. 3600 IN A 192.0.2.77
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.sibling.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.sibling.child.example. IN A
+  SECTION ANSWER
+    www.sibling.child.example. 3600 IN A 192.0.2.77
+ENTRY_END
+
+SCENARIO_END
