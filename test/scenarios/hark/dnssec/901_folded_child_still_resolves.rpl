@@ -22,9 +22,14 @@ SCENARIO_BEGIN a child folded back into its signed parent must still resolve
 ; operators to let the DS leave caches first, but the next paragraph expects
 ; resolvers to *aid* such transitions, and BIND and Unbound both serve it.
 ;
-; The design that works is to ask the parent for the child's DS on conflict —
-; example. answers NODATA for it below, so the fold is provable on the wire. See
-; memory/diffroll-t3-plan.md. Until then this pins what any such check must keep.
+; Asking the parent for the child's DS on conflict does remove the false positive
+; — example. answers a signed NODATA for it below, so the fold is provable on the
+; wire — but it cannot be a security check, because the party asked is the party
+; suspected. A forging parent answers that same signed NODATA. DNSSEC gives the
+; parent sole authority over its children's delegations, so no observation
+; distinguishes the two cases; the evidence does not exist rather than being
+; unqueried. This scenario therefore pins the permanent behaviour, not an interim
+; one: hark serves the fold.
 ;
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1

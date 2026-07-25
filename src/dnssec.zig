@@ -120,19 +120,6 @@ fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
     return true;
 }
 
-/// Find an RRSIG covering a given RType signed by a given key tag.
-pub fn findRrsig(
-    records: []const dns.ResourceRecord,
-    covered_type: dns.RType,
-) ?dns.RrsigData {
-    for (records) |rr| {
-        if (rr.rtype != .rrsig) continue;
-        const rrsig = rr.rdata.rrsig;
-        if (rrsig.type_covered == covered_type) return rrsig;
-    }
-    return null;
-}
-
 /// Validate a DNSKEY RRset using a trust anchor DS record.
 /// Returns the validated zone-signing keys (ZSKs) on success.
 pub fn validateDnskeyRrset(
@@ -1428,41 +1415,6 @@ fn validateNsec3NegativeProof(
 
 // ── Answer RRset Validation ──────────────────────────────────────────
 
-/// Validate answer RRsets against a DNSKEY set.
-/// Finds the RRSIG covering `qtype`, matches it to a DNSKEY by key_tag + algorithm,
-/// and verifies the signature. Per RFC 6840 §5.4, tries ALL matching DNSKEYs.
-/// Also validates the CNAME RRset if the answer contains CNAMEs and qtype != .cname.
-/// Bailiwick scrubbing upstream guarantees all answer records share one zone, so the
-/// same DNSKEY set covers them — no signer-name check is needed here.
-pub fn validateAnswerRrset(
-    answers: []const dns.ResourceRecord,
-    qtype: dns.RType,
-    dnskey_records: []const dns.ResourceRecord,
-    now_u32: u32,
-    budget: *ValidationBudget,
-) SecurityStatus {
-    // Validate the main answer type. Propagate .insecure (all-unsupported-algo
-    // RRSIGs) instead of silently upgrading to .secure — otherwise the resolver
-    // would stamp AD on data it never cryptographically verified.
-    const main = validateRrsetForType(answers, qtype, dnskey_records, now_u32, budget);
-    if (main == .bogus) return .bogus;
-
-    // If answers contain CNAME records, validate the CNAME RRset too.
-    // After bailiwick scrubbing, all answer records are from the same zone.
-    if (qtype != .cname) {
-        for (answers) |rr| {
-            if (rr.rtype == .cname) {
-                const cname_status = validateRrsetForType(answers, .cname, dnskey_records, now_u32, budget);
-                if (cname_status == .bogus) return .bogus;
-                if (cname_status == .insecure) return .insecure;
-                break;
-            }
-        }
-    }
-
-    return main;
-}
-
 /// RFC 8624 §3.1: MUST validate RSASHA1/RSASHA1-NSEC3 even though they
 /// are NOT RECOMMENDED for signing — signing-not-recommended is not
 /// validation-unsupported.
@@ -1494,51 +1446,94 @@ fn rrsetVerifiesWithAnyKey(
     return false;
 }
 
-/// RFC 6840 §5.11 anti-downgrade verdict when no signature verified: only
-/// all-unsupported-algos is .insecure; a failed supported attempt (or nothing
-/// attempted) is .bogus, so an injected unsupported RRSIG can't launder a
-/// failure to .insecure. Shared by both validators so the rule can't drift.
+/// Verdict when nothing verified: .bogus, except all-unsupported-algorithms
+/// which yields .insecure. Shared by both validators so the rule can't drift.
+///
+/// TODO: that `.insecure` escape is a keyless downgrade — both callers run
+/// only on a proven-secure zone, so an RRset carrying nothing but an
+/// unimplemented-algorithm RRSIG has been tampered with, and Unbound and BIND
+/// both reach .bogus. Their softening lives on the DS path instead (RFC 4035
+/// §5.2), which `classifyDelegation` lacks. The two must move together.
 fn launderingVerdict(attempted_supported: bool, had_unsupported_algo: bool) SecurityStatus {
     if (attempted_supported) return .bogus;
     return if (had_unsupported_algo) .insecure else .bogus;
 }
 
-/// Validate a single RRset type within the answers against DNSKEYs.
-/// Iterates ALL RRSIGs covering the target type per RFC 6840 §5.11.
-fn validateRrsetForType(
-    answers: []const dns.ResourceRecord,
+/// A message is no better authenticated than its least authenticated RRset.
+pub fn weakest(a: SecurityStatus, b: SecurityStatus) SecurityStatus {
+    return if (verdictRank(a) <= verdictRank(b)) a else b;
+}
+
+fn verdictRank(s: SecurityStatus) u8 {
+    return switch (s) {
+        .bogus => 0,
+        .unchecked => 1,
+        .insecure => 2,
+        .secure => 3,
+    };
+}
+
+/// The RRSIG covering (`owner`, `covered_type`). Owner-scoped: one response
+/// can hold several RRsets of a type at different names, each with its own
+/// signer — the hops of a CNAME chain.
+pub fn findRrsigAt(
+    records: []const dns.ResourceRecord,
+    owner: dns.Name,
+    covered_type: dns.RType,
+) ?dns.RrsigData {
+    for (records) |rr| {
+        if (rr.rtype != .rrsig) continue;
+        const rrsig = rr.rdata.rrsig;
+        if (rrsig.type_covered == covered_type and rr.name.eql(owner)) return rrsig;
+    }
+    return null;
+}
+
+/// Validate the RRset at (`owner`, `covered_type`), trying every covering
+/// RRSIG and every key matching its tag and algorithm (RFC 6840 §5.4).
+/// `dnskey_records` must be *this* RRset's signer's keyset, which in a chain
+/// crossing a zone cut differs between hops.
+///
+/// On `.secure`, `ttl_cap` receives how long this RRset may be held: RFC 4034
+/// §3.1.2's Original TTL and RFC 4035 §5.3.3's remaining window, read from the
+/// signature that verified and nowhere else — deriving it from the RRSIGs
+/// present would let an appended unverifiable one drive the number.
+pub fn validateRrset(
+    records: []const dns.ResourceRecord,
+    owner: dns.Name,
     covered_type: dns.RType,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    ttl_cap: ?*u32,
 ) SecurityStatus {
     var had_unsupported_algo = false;
     var attempted_supported = false;
-    for (answers) |sig_rr| {
+    for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
         const rrsig = sig_rr.rdata.rrsig;
         if (rrsig.type_covered != covered_type) continue;
+        if (!sig_rr.name.eql(owner)) continue;
 
         if (!isSupportedAlgorithm(rrsig.algorithm)) {
             had_unsupported_algo = true;
             continue;
         }
 
-        // Set BEFORE the owner filter — owner-mismatch is itself a forgery
-        // signal, not an excuse to launder to .insecure.
+        // Set BEFORE the collect below can bail — a mismatch is itself a
+        // forgery signal, not an excuse to launder to .insecure.
         attempted_supported = true;
 
-        // Filter RRset by this RRSIG's owner (same owner + type). Refuse
-        // rather than truncate: the caller sets AD on the *unpruned*
-        // response, so verifying a signature over answers[0..64] while
+        // Refuse rather than truncate: the caller sets AD on the *unpruned*
+        // response, so verifying a signature over records[0..64] while
         // shipping 70 records launders the 6 attacker-appended RRs into an
         // authenticated answer. buildSignedData refuses >64 anyway (:412),
         // so a genuine oversized RRset was already unvalidatable here —
         // this only makes the refusal explicit instead of silent.
         var filtered: [64]dns.ResourceRecord = undefined;
         var count: usize = 0;
-        for (answers) |rr| {
-            if (rr.rtype != covered_type or !rr.name.eql(sig_rr.name)) continue;
+        for (records) |rr| {
+            if (rr.rtype != covered_type or !rr.name.eql(owner)) continue;
             if (count == filtered.len) return .bogus;
             filtered[count] = rr;
             count += 1;
@@ -1546,7 +1541,10 @@ fn validateRrsetForType(
         if (count == 0) continue;
 
         // Try ALL matching DNSKEYs (key_tag + algorithm)
-        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return .bogus) return .secure;
+        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return .bogus) {
+            if (ttl_cap) |cap| cap.* = @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
+            return .secure;
+        }
     }
     return launderingVerdict(attempted_supported, had_unsupported_algo);
 }
@@ -1980,7 +1978,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
     try testing.expectEqual(cap + 1, budget.sig_verify_spent.load(.monotonic));
 }
 
-test "validateAnswerRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
+test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     // A DS RRset that arrives at the resolver without a covering RRSIG
     // signed by the parent zone's DNSKEY MUST NOT be trusted as a chain
     // anchor. Without C4's verify step, hark used to cache such records
@@ -2000,7 +1998,7 @@ test "validateAnswerRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     };
     const records = [_]dns.ResourceRecord{ds_record}; // No RRSIG present.
     var b: ValidationBudget = .{};
-    const status = validateAnswerRrset(&records, .ds, &.{}, 1700000000, &b);
+    const status = validateRrset(&records, owner, .ds, &.{}, 1700000000, &b, null);
     try testing.expectEqual(SecurityStatus.bogus, status);
 }
 
@@ -2393,49 +2391,6 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
         var b: ValidationBudget = .{};
         try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
     }
-}
-
-test "findRrsig finds matching RRSIG" {
-    const signer = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
-
-    const records = [_]dns.ResourceRecord{
-        .{
-            .name = signer,
-            .rtype = .a,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-        },
-        .{
-            .name = signer,
-            .rtype = .rrsig,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .rrsig = .{
-                .type_covered = .a,
-                .algorithm = .ecdsap256sha256,
-                .labels = 2,
-                .original_ttl = 300,
-                .sig_expiration = 1700000000,
-                .sig_inception = 1699000000,
-                .key_tag = 12345,
-                .signer_name = signer,
-                .signature = &.{},
-            } },
-        },
-    };
-
-    const result = findRrsig(&records, .a);
-    try testing.expect(result != null);
-    try testing.expectEqual(@as(u16, 12345), result.?.key_tag);
-
-    // No RRSIG for NS
-    try testing.expect(findRrsig(&records, .ns) == null);
 }
 
 // ── M8d: Canonical ordering and NSEC/NSEC3 tests ────────────────────
@@ -3872,7 +3827,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
     ));
 }
 
-test "validateRrsetForType propagates budget exhaustion as bogus" {
+test "validateRrset propagates budget exhaustion as bogus" {
     // Pathological setup: one RRSIG covering A, with a DNSKEY whose key_tag
     // matches. The budget is pre-exhausted, so the very first verifyRrsig
     // attempt trips ValidationBudgetExhausted, which the caller maps to bogus.
@@ -3902,7 +3857,7 @@ test "validateRrsetForType propagates budget exhaustion as bogus" {
         .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
     };
     var budget: ValidationBudget = .{ .max_sig_verify = 0 };
-    const status = validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget);
+    const status = validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, null);
     try testing.expectEqual(SecurityStatus.bogus, status);
 }
 
@@ -4026,26 +3981,31 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
     );
 }
 
-test "validateRrsetForType: owner-mismatch supported + matched unsupported returns bogus" {
-    // Owner-mismatch laundering: a supported-algo RRSIG with no matching
-    // owner (count==0 path) alongside an unsupported-algo RRSIG that does
-    // match must still bogus. Real zones never emit unmatched RRSIGs.
+test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict" {
+    // A signature at another owner says nothing about this RRset either way.
+    // This read `.bogus` when the scan was by type across the whole section —
+    // an artifact, not a defence: omitting the foreign RRSIG yields `.insecure`
+    // anyway, so the rule only punished a record no real zone emits.
     const tag = keyTag(test_ecdsa_dnskey);
     const other_owner = dns.Name{ .labels = &.{ "other", "com" } };
-    const answers = [_]dns.ResourceRecord{
-        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        rrsigRr(test_owner, .a, .dsasha1, 0, test_owner), // unsupported, matched
-        rrsigRr(other_owner, .a, .ecdsap256sha256, tag, other_owner), // supported, unmatched owner
-    };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
-    var budget: ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.bogus,
-        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
-    );
+
+    const with_foreign = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+        rrsigRr(test_owner, .a, .dsasha1, 0, test_owner), // unsupported, this owner
+        rrsigRr(other_owner, .a, .ecdsap256sha256, tag, other_owner), // supported, foreign owner
+    };
+    const without_foreign = with_foreign[0..2];
+
+    var b1: ValidationBudget = .{};
+    var b2: ValidationBudget = .{};
+    const a = validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1, null);
+    const b = validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2, null);
+    try testing.expectEqual(SecurityStatus.insecure, a);
+    try testing.expectEqual(a, b);
 }
 
-test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus" {
+test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     // Same-owner laundering on the answer-validation path.
     const tag = keyTag(test_ecdsa_dnskey);
     const answers = [_]dns.ResourceRecord{
@@ -4057,7 +4017,7 @@ test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus"
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
+        validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, null),
     );
 }
 
@@ -4145,7 +4105,75 @@ fn testSignRrset(
     return .{ .rrsig = rrsig, .dnskey = dnskey };
 }
 
-test "validateRrsetForType: >64-member RRset is bogus, not a validated prefix" {
+test "validateRrset: the TTL cap comes from the signature that verified" {
+    // Regression: the cap used to be derived in the cache by reducing over
+    // every RRSIG present in the entry. The cache cannot tell which signature
+    // verified, so one unverifiable RRSIG — free to append, since nothing
+    // checks it — drove a `.secure` entry's TTL to zero and forced an upstream
+    // query per client query. Unbound and Knot both read the bound off the
+    // verifying signature at verification time; so does this.
+    //
+    // `testSignRrset` signs original_ttl 300 / expiration 1_800_000_000, and
+    // those fields are inside the signature, so the genuine values cannot be
+    // edited after the fact — the junk RRSIG carries the hostile ones instead.
+    const now: u32 = 1_700_000_000;
+    const recs = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try testSignRrset(&recs, .a, test_owner, &sig_bytes, &pub_bytes);
+
+    // Appended, unverifiable, and expiring in one second. Placed FIRST so a
+    // naive scan would reach it before the real one.
+    var junk = signed.rrsig;
+    junk.key_tag = signed.rrsig.key_tag ^ 0x5555;
+    junk.original_ttl = 1;
+    junk.sig_expiration = now + 1;
+
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, signed.dnskey)};
+    const answers = [_]dns.ResourceRecord{
+        recs[0],
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = junk } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
+    };
+    var budget: ValidationBudget = .{};
+    var cap: u32 = std.math.maxInt(u32);
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &cap),
+    );
+    // The verifying signature's own bounds: original_ttl 300 against a
+    // remaining window of 100_000_000 s. Never the junk record's 1.
+    try testing.expectEqual(@as(u32, 300), cap);
+}
+
+test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the shorter bound" {
+    // Same signature, evaluated close to its expiration: now the remaining
+    // window is what binds, not RFC 4034 §3.1.2's original TTL.
+    const recs = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try testSignRrset(&recs, .a, test_owner, &sig_bytes, &pub_bytes);
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, signed.dnskey)};
+    const answers = [_]dns.ResourceRecord{
+        recs[0],
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
+    };
+    // 60 s before the signature dies.
+    const now: u32 = 1_800_000_000 - 60;
+    var budget: ValidationBudget = .{};
+    var cap: u32 = std.math.maxInt(u32);
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &cap),
+    );
+    try testing.expectEqual(@as(u32, 60), cap);
+}
+
+test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     // The caller sets AD on the *unpruned* response, so a signature that
     // verifies over answers[0..64] must not authenticate a 70-record answer
     // section — the 6 appended records would ship authenticated.
@@ -4175,7 +4203,7 @@ test "validateRrsetForType: >64-member RRset is bogus, not a validated prefix" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        validateRrsetForType(&answers, .a, &dnskeys, 1_700_000_000, &budget),
+        validateRrset(&answers, test_owner, .a, &dnskeys, 1_700_000_000, &budget, null),
     );
 
     // Control: the signed 64 on their own still validate.
@@ -4185,13 +4213,12 @@ test "validateRrsetForType: >64-member RRset is bogus, not a validated prefix" {
     var budget2: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.secure,
-        validateRrsetForType(&exact, .a, &dnskeys, 1_700_000_000, &budget2),
+        validateRrset(&exact, test_owner, .a, &dnskeys, 1_700_000_000, &budget2, null),
     );
 }
 
-test "validateAnswerRrset: insecure sub-result propagates (not laundered to secure)" {
-    // All-unsupported RRSIGs → .insecure; the wrapper must propagate it
-    // instead of returning .secure (which would stamp AD on unverified data).
+test "validateRrset: all-unsupported algorithms are .insecure, not .secure" {
+    // Reporting .secure here would stamp AD on data no signature verified.
     const answers = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
         rrsigRr(test_owner, .a, .dsasha1, 0, test_owner),
@@ -4199,7 +4226,7 @@ test "validateAnswerRrset: insecure sub-result propagates (not laundered to secu
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.insecure,
-        validateAnswerRrset(&answers, .a, &.{}, 1699500000, &budget),
+        validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget, null),
     );
 }
 

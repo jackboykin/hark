@@ -1,0 +1,87 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a CNAME signed only with an unvalidatable algorithm costs the answer its AD
+
+; 012's shape, but the CNAME is signed with algorithm 3 (DSA), unimplemented
+; here. What this guards is the fold: the *lowest* verdict governs, so the A
+; verifying under `child.example.` does not lift the CNAME with it.
+;
+; The served-vs-rejected half pins CURRENT behaviour, not known-correct
+; behaviour. Unbound rejects this shape — its only insecure escape is a
+; zone-level check on the DS algorithms, made before the per-signature loop.
+; Since this zone is known secure, an injector who strips the real RRSIGs and
+; attaches one algorithm-3 signature gets data served instead of rejected.
+; Moving the escape to the DS (RFC 4035 §5.2, which hark lacks — it SERVFAILs
+; the real Ed448-signed ed448.nl) flips this expectation to SERVFAIL.
+;
+; Expected today: NOERROR, AD=0.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN CNAME target.child.example.
+      ; Algorithm 3 = DSA/SHA1, never implemented here. Declaring the RRSIG
+      ; keeps the harness from adding a validatable one over the same RRset.
+      www.example. 3600 IN RRSIG CNAME 3 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      target.child.example. 3600 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` is the assertion that matters: NOERROR with AD would mean
+  ; hark authenticated a redirect it could not verify.
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN CNAME target.child.example.
+    target.child.example. 3600 IN A 192.0.2.7
+ENTRY_END
+
+SCENARIO_END

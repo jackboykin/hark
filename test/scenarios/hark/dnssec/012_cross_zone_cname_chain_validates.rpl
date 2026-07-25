@@ -1,0 +1,79 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a CNAME chain crossing a zone cut in one answer validates
+
+; One server authoritative for both `example.` and `child.example.` chases a
+; CNAME into the child and returns both RRsets, each signed by its own zone
+; (RFC 1034 §4.3.2 step 3(c)). Anchoring the message on the *queried* type's
+; signer checked the parent-signed CNAME against the child's keys and
+; SERVFAILed a legitimate two-zone setup.
+;
+; No delegation cut appears in the answer entry, so the harness signs the CNAME
+; as `example.` and the A as `child.example.`. Expected: AD=1 over both.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ; The secure delegation to the child, served by the parent it belongs to.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+
+  ; The cross-zone answer: CNAME signed by example., A signed by child.example.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN CNAME target.child.example.
+      target.child.example. 3600 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN CNAME target.child.example.
+    target.child.example. 3600 IN A 192.0.2.7
+ENTRY_END
+
+SCENARIO_END

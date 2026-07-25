@@ -582,7 +582,7 @@ pub const RecursiveResolver = struct {
                     // may contain NS records in authority that are not valid delegations)
                     if (response.header.flags.rcode == .no_error) {
                         if (extractReferral(response, target_name, parent_zone, self.referralPolicy())) |referral| {
-                            if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
+                            if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
                             try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
                             // Flood/exhaustion classifies the delegation .bogus; fail
                             // closed here — a later CNAME hop would re-elevate it to
@@ -622,7 +622,7 @@ pub const RecursiveResolver = struct {
                                 // as an unsigned delegation, too thin to cache
                                 // against the full query name (RFC 8020).
                                 if (status == .secure) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status);
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
                                 }
                             },
                             // .bogus falls through to the same stop-minimizing
@@ -652,8 +652,8 @@ pub const RecursiveResolver = struct {
                             .proceed => |status| {
                                 if (response.header.flags.aa) {
                                     if (self.cache) |c| {
-                                        c.storeResponse(response, parent_zone, .unchecked);
-                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status);
+                                        c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
+                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
                                     }
                                 }
                             },
@@ -709,14 +709,16 @@ pub const RecursiveResolver = struct {
                             // must carry an RRSIG. validateAnswer returns .bogus when no
                             // RRSIG is present, which closes the strip-RRSIG downgrade.
                             var cname_status: cache_mod.SecurityStatus = .unchecked;
+                            var cname_ttl_cap: u32 = std.math.maxInt(u32);
                             if (self.dnssec_enabled and security_state == .secure) {
                                 switch (try self.validateAnswer(allocator, &response, .cname, security_state, parent_zone, servers[0..server_count])) {
                                     .bogus => {
                                         self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                                         return self.bogusServfail(current_name, qtype);
                                     },
-                                    .valid => {
+                                    .valid => |cap| {
                                         cname_status = .secure;
+                                        cname_ttl_cap = cap;
                                     },
                                     .skip => {},
                                 }
@@ -726,7 +728,7 @@ pub const RecursiveResolver = struct {
                                     cname_rr.rdata.cname.isSubdomainOf(parent_zone);
 
                                 // Store before following CNAME — won't reach final answer validation
-                                if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status);
+                                if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status, cname_ttl_cap);
                                 if (cname_chain.records.items.len >= max_cname_chain) return error.CnameChainTooLong;
                                 if (cnameTargetRevisitsChain(cname_chain.records.items, cname_rr.rdata.cname)) {
                                     logCnameLoop(cname_rr.rdata.cname, "upstream-served");
@@ -771,7 +773,7 @@ pub const RecursiveResolver = struct {
                 const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse
                     return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
 
-                if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked);
+                if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
                 // Flood/exhaustion → .bogus delegation; fail closed (see above).
                 if (security_state == .bogus) return self.bogusServfail(current_name, qtype);
@@ -1187,7 +1189,7 @@ pub const RecursiveResolver = struct {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, parent_zone);
                     }
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status);
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
                 },
                 .skip_cache => {},
                 .bogus => return self.bogusServfail(current_name, qtype),
@@ -1216,20 +1218,22 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         var answer_status: cache_mod.SecurityStatus = .unchecked;
+        var answer_ttl_cap: u32 = std.math.maxInt(u32);
         if (self.dnssec_enabled) {
             switch (try self.validateAnswer(allocator, response, qtype, security_state, parent_zone, servers)) {
                 .bogus => {
                     self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                     return self.bogusServfail(current_name, qtype);
                 },
-                .valid => {
+                .valid => |cap| {
                     answer_status = .secure;
+                    answer_ttl_cap = cap;
                 },
                 .skip => {},
             }
         }
         if (self.cache) |c| if (qtype != .any) {
-            c.storeResponse(response.*, parent_zone, answer_status);
+            c.storeResponse(response.*, parent_zone, answer_status, answer_ttl_cap);
             if (answer_status == .secure and self.nsec_cache != null) {
                 self.storeWildcardRRsets(response.answers, qtype);
             }
@@ -1264,8 +1268,8 @@ pub const RecursiveResolver = struct {
                         self.storeNsec(response.authorities, parent_zone);
                     }
                     if (self.cache) |c| {
-                        c.storeResponse(response.*, parent_zone, .unchecked);
-                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status);
+                        c.storeResponse(response.*, parent_zone, .unchecked, std.math.maxInt(u32));
+                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
                     }
                 },
                 .skip_cache => {},
@@ -1428,7 +1432,7 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| {
             // storeResponse reads only rcode + record sections, so the
             // synthesizedMessage header vehicle is as good as a bespoke one.
-            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure);
+            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure, std.math.maxInt(u32));
         }
     }
 
@@ -1900,7 +1904,10 @@ pub const RecursiveResolver = struct {
     /// parent servers (no chain walk), so 3s is sufficient.
     const ds_dedup_timeout_ns: u64 = 3 * std.time.ns_per_s;
 
-    const AnswerValidation = enum { valid, bogus, skip };
+    /// `.valid` carries the longest the answer may be cached, from the
+    /// signatures that verified. Threaded to the store so the `min_ttl` floor
+    /// cannot lift an entry back past its own proof.
+    const AnswerValidation = union(enum) { valid: u32, bogus, skip };
 
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
@@ -2088,7 +2095,7 @@ pub const RecursiveResolver = struct {
 
         // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation.
         // Store only answers to avoid polluting the key cache with NS/glue.
-        if (kc) |c| c.storeResponse(answersOnly(resp), zone_parsed, .unchecked);
+        if (kc) |c| c.storeResponse(answersOnly(resp), zone_parsed, .unchecked, std.math.maxInt(u32));
 
         return resp.answers;
     }
@@ -2138,7 +2145,7 @@ pub const RecursiveResolver = struct {
             };
             if (response.header.flags.rcode != .no_error) continue;
             if (store_response) {
-                if (self.cache) |c| c.storeResponse(response, authority_zone, .unchecked);
+                if (self.cache) |c| c.storeResponse(response, authority_zone, .unchecked, std.math.maxInt(u32));
             }
             return response;
         }
@@ -2267,7 +2274,7 @@ pub const RecursiveResolver = struct {
             // The proper-ancestor guard pins it to the qname chain.
             // Narrow to *this zone's* DS RRset first. One filter closes three
             // compounding holes: the signer below came off the first RRSIG
-            // covering any DS, `validateAnswerRrset` reports `.secure` when
+            // covering any DS, the validator reports `.secure` when
             // *some* owner-group verifies, and the cache loop copied every `.ds`
             // in the section — so an unsigned DS for an unrelated name could ride
             // along and be cached `.secure`. A DS is a digest commitment, so a
@@ -2303,34 +2310,33 @@ pub const RecursiveResolver = struct {
             var signer_buf: [dns.max_name_len + 1]u8 = undefined;
             const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
-            const ds_status = dnssec.validateAnswerRrset(
+            var ds_ttl_cap: u32 = std.math.maxInt(u32);
+            const ds_status = dnssec.validateRrset(
                 zone_ds,
+                zone,
                 .ds,
                 parent_dnskeys,
                 epochNowU32(),
                 self.validationBudget(),
+                &ds_ttl_cap,
             );
             if (ds_status != .secure) return null;
 
-            // Cache only after the parent-signed DS verifies. NS/glue go to
-            // the answer cache; the key cache gets the DS RRset alone.
-            // Filtering to DS-only avoids polluting the key cache with the
-            // RRSIG/NSEC records that travel alongside the DS — those would
-            // otherwise be written as .secure under their own owners and
-            // sit there as unreachable noise (key cache only reads DS and
-            // DNSKEY).
-            if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
+            // Cache only after the parent-signed DS verifies.
+            if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
             if (self.key_cache) |kc| {
-                // Exactly what was verified above, no wider. fetchRRset only
-                // returns .no_error, so the synthesized header is faithful.
-                kc.storeResponse(synthesizedMessage(zone_ds_buf[0..ds_count], &.{}, .no_error, false), zone, .secure);
+                // DS records alone: the key cache reads only DS and DNSKEY, so
+                // RRSIGs and any NSEC riding along would be unreachable weight.
+                // Bounded by the signature that just verified them. fetchRRset
+                // only returns .no_error, so the synthesized header is faithful.
+                kc.storeResponse(synthesizedMessage(zone_ds_buf[0..ds_count], &.{}, .no_error, false), zone, .secure, ds_ttl_cap);
             }
             return ds_section;
         }
 
         // No DS section — verify NSEC/NSEC3 proof of insecure delegation. NS
         // and glue are still useful for resolution, so cache them.
-        if (self.cache) |c| c.storeResponse(response, zone, .unchecked);
+        if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget());
@@ -2368,60 +2374,125 @@ pub const RecursiveResolver = struct {
 
         const now_u32 = epochNowU32();
 
-        // Find RRSIG in answers to get the signer zone
-        const rrsig = dnssec.findRrsig(response.answers, qtype) orelse return .bogus;
-
-        // RFC 4034 §3.1.3: signer must be at or above the RRset owner name
-        for (response.answers) |rr| if (rr.rtype == qtype) {
-            if (!rr.name.isSubdomainOf(rrsig.signer_name)) return .bogus;
-            break;
-        };
-
-        // Reaching a secure `zone` means its DS was fetched from the parent and
-        // its DNSKEY validated against it — proof that data under `zone` is
-        // `zone`'s to sign. A signer strictly above it is then claiming across a
-        // cut we hold evidence for, so its signature authenticates nothing here.
-        // This is BIND's `closer_secure_ds_exists` (lib/dns/validator.c:255),
-        // which BIND runs only on the insecurity-proof path.
+        // Every RRset in the section, under its own signer's keys, weakest
+        // verdict wins. Narrower scoping has twice produced AD=1 over records
+        // nothing signed; the section ships whole under one AD bit.
         //
-        // Bogus, not merely unauthenticated. This runs before any DNSKEY fetch
-        // or signature check, so a softer verdict would be a *keyless*
-        // downgrade: an RRSIG naming an ancestor need not verify, or even be a
-        // real signature, to turn the SERVFAIL below into a served and cached
-        // answer. The negative path's `.skip_cache` twin does not transfer —
-        // there the absent-signature floor is `.unchecked`, here it is `.bogus`
-        // (`findRrsig` above), so anything softer sits beneath the floor and
-        // beats simply stripping the RRSIGs.
-        //
-        // The zone-fold case argues for softness and loses: a child folded into
-        // an unsigned parent already SERVFAILs on the `findRrsig` line, so hark
-        // is intolerant of stale cuts regardless, and tolerating one sub-case is
-        // not worth a universal bypass.
-        //
-        if (!rrsig.signer_name.isSubdomainOf(zone)) return .bogus;
+        // TODO: DNAME (RFC 6672) needs a carve-out — a server-synthesized CNAME
+        // is unsigned, so this rejects it. Not "inherit the DNAME's signer",
+        // which would hand an injector the redirect target: re-derive the
+        // expected target from the DNAME and accept only an exact match.
+        var status: dnssec.SecurityStatus = .secure;
+        var keys: SignerKeys = .{};
+        var groups: usize = 0;
+        var ttl_cap: u32 = std.math.maxInt(u32);
+        for (response.answers, 0..) |rr, i| {
+            // An RRSIG is the proof, not a thing needing one.
+            if (rr.rtype == .rrsig) continue;
+            if (!firstOfRrset(response.answers, i)) continue;
+            groups += 1;
 
-        // TODO: cuts *below* `zone` are still missed — a parent answering AA
-        // instead of referring keeps `signer == zone`, even when hark holds a
-        // validated DS for the child. A bare cache probe (BIND's
-        // `closer_secure_ds_exists`) was tried and reverted: it cannot tell a
-        // lying parent from a legitimately un-delegated child, since both emit
-        // the same bytes. Ask the parent for the DS instead. Scenario 901.
+            const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .bogus;
+            var group_cap: u32 = std.math.maxInt(u32);
+            const verdict = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget(), &group_cap);
+            if (verdict == .bogus) return .bogus;
+            status = dnssec.weakest(status, verdict);
+            ttl_cap = @min(ttl_cap, group_cap);
+        }
+        // Signatures alone: AD would be a claim about an empty set.
+        if (groups == 0) return .bogus;
 
-        // Extract signer zone name as dotted string
-        const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
-
-        // Fetch DNSKEY for the signer zone (validated against DS before caching — RFC 4035 §5.3)
-        const dnskey_records = (try self.fetchDnskey(allocator, signer_dotted, servers)) orelse return .bogus;
-
-        // Validate the answer RRsets
-        return switch (dnssec.validateAnswerRrset(response.answers, qtype, dnskey_records, now_u32, self.validationBudget())) {
+        switch (status) {
             .secure => {
+                try self.trimAnswerTtls(allocator, response, ttl_cap);
                 response.header.flags.ad = true;
-                return .valid;
+                return .{ .valid = ttl_cap };
             },
-            .bogus => .bogus,
-            .unchecked, .insecure => .skip,
-        };
+            .bogus => return .bogus,
+            .unchecked, .insecure => return .skip,
+        }
+    }
+
+    /// Keysets resolved so far in one answer, by signer; a chain inside one
+    /// zone repeats its signer. Past capacity it stops memoising rather than
+    /// failing — fan-out is bounded by the query quota `fetchRRset` charges.
+    const SignerKeys = struct {
+        const capacity = 4;
+        signers: [capacity]dns.Name = undefined,
+        sets: [capacity][]const dns.ResourceRecord = undefined,
+        len: usize = 0,
+
+        /// Keys that may authenticate `rr`'s RRset; null means bogus.
+        fn forRrset(
+            self: *SignerKeys,
+            resolver: *RecursiveResolver,
+            allocator: mem.Allocator,
+            answers: []const dns.ResourceRecord,
+            rr: dns.ResourceRecord,
+            zone: dns.Name,
+            servers: []const na.Address,
+        ) !?[]const dns.ResourceRecord {
+            const rrsig = dnssec.findRrsigAt(answers, rr.name, rr.rtype) orelse return null;
+
+            // RFC 4034 §3.1.3: signer must be at or above the RRset owner name
+            if (!rr.name.isSubdomainOf(rrsig.signer_name)) return null;
+
+            // A secure `zone` is validated cut evidence, so a signer strictly
+            // above it authenticates nothing here (BIND's
+            // `closer_secure_ds_exists`). Bogus, not soft: this runs before any
+            // key fetch, so a softer verdict would beat simply stripping the
+            // RRSIGs. Cuts *below* `zone` stay undetected by design — scenario
+            // 901.
+            if (!rrsig.signer_name.isSubdomainOf(zone)) return null;
+
+            for (self.signers[0..self.len], self.sets[0..self.len]) |signer, set| {
+                if (signer.eql(rrsig.signer_name)) return set;
+            }
+            const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
+            const set = (try resolver.fetchDnskey(allocator, signer_dotted, servers)) orelse return null;
+            if (self.len < capacity) {
+                self.signers[self.len] = rrsig.signer_name;
+                self.sets[self.len] = set;
+                self.len += 1;
+            }
+            return set;
+        }
+    };
+
+    /// Lower answer TTLs to `cap`, so the *client* on a miss gets the trimmed
+    /// value too — a downstream validator caching past the signature it was
+    /// shown would reject its own copy. Allocates only when something exceeds
+    /// the cap, which for real zones is never.
+    fn trimAnswerTtls(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        response: *dns.Message,
+        cap: u32,
+    ) !void {
+        _ = self;
+        var needs_trim = false;
+        for (response.answers) |rr| {
+            if (rr.ttl > cap) {
+                needs_trim = true;
+                break;
+            }
+        }
+        if (!needs_trim) return;
+        const trimmed = try allocator.alloc(dns.ResourceRecord, response.answers.len);
+        for (response.answers, trimmed) |src, *dst| {
+            dst.* = src;
+            dst.ttl = @min(src.ttl, cap);
+        }
+        response.answers = trimmed;
+    }
+
+    /// True when `records[i]` opens its (owner, type) RRset, so a loop over
+    /// records visits each RRset once.
+    fn firstOfRrset(records: []const dns.ResourceRecord, i: usize) bool {
+        for (records[0..i]) |prev| {
+            if (prev.rtype == records[i].rtype and prev.name.eql(records[i].name)) return false;
+        }
+        return true;
     }
 
     /// Verify RRSIG signatures over NSEC/NSEC3 records in authorities.
@@ -3744,7 +3815,7 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
             .answers = cname_rrs,
         };
         defer dns.freeMessage(alloc, cname_msg);
-        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
     {
         const aaaa_owner = try makeName(alloc, &.{ "target", "example", "com" });
@@ -3762,7 +3833,7 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
             .answers = aaaa_rrs,
         };
         defer dns.freeMessage(alloc, aaaa_msg);
-        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
 
     var resolver: RecursiveResolver = .{
@@ -3798,7 +3869,7 @@ fn seedCnameChain(alloc: mem.Allocator, cache: *RRsetCache, cname_ttl: u32, tail
         cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = cname_ttl, .rdata = .{ .cname = cname_target } };
         const cname_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = cname_rrs };
         defer dns.freeMessage(alloc, cname_msg);
-        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
     {
         const aaaa_owner = try makeName(alloc, &.{ "target", "example", "com" });
@@ -3812,7 +3883,7 @@ fn seedCnameChain(alloc: mem.Allocator, cache: *RRsetCache, cname_ttl: u32, tail
         };
         const aaaa_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = aaaa_rrs };
         defer dns.freeMessage(alloc, aaaa_msg);
-        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
 }
 
@@ -3929,7 +4000,7 @@ test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache
             .answers = rrs,
         };
         defer dns.freeMessage(alloc, msg);
-        cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
 
     var resolver: RecursiveResolver = .{
@@ -4596,7 +4667,7 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
 
     var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
     defer cache.deinit();
-    cache.storeResponse(store_msg, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeResponse(store_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     // Build a target name with mixed case: `WhAtEvEr.example.com`.
     const tgt_labels = try aa.alloc([]const u8, 3);
@@ -4806,17 +4877,22 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
             .rtype = .rrsig,
             .rclass = .in,
             .ttl = 300,
-            .rdata = .{ .rrsig = .{
-                .type_covered = .a,
-                .algorithm = .ecdsap256sha256,
-                .labels = 2,
-                .original_ttl = 300,
-                .sig_inception = 0,
-                .sig_expiration = 0xFFFFFFFF,
-                .key_tag = 1,
-                .signer_name = signer,
-                .signature = &.{},
-            } },
+            .rdata = .{
+                .rrsig = .{
+                    .type_covered = .a,
+                    .algorithm = .ecdsap256sha256,
+                    .labels = 2,
+                    .original_ttl = 300,
+                    .sig_inception = 0,
+                    // Live against the real wall clock, which this cache uses:
+                    // 0xFFFFFFFF would not do — RFC 1982 serial arithmetic puts
+                    // anything more than 2^31 s ahead of now in the *past*.
+                    .sig_expiration = epochNowU32() +% 3600,
+                    .key_tag = 1,
+                    .signer_name = signer,
+                    .signature = &.{},
+                },
+            },
         };
 
         resolver.storeWildcardRRsets(answers, .a);

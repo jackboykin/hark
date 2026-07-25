@@ -1,0 +1,78 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a CNAME that does not verify must not ride out under the answer's AD
+
+; 012's dark twin: the CNAME carries an RRSIG no DNSKEY covers while the A is
+; signed correctly. The CNAME is what asserts the queried name *is* the name
+; the data belongs to, so validating only the queried type would authenticate a
+; redirect nothing signed — a free rewrite of any name in the zone for anyone
+; who can inject one record.
+;
+; As in 006, declaring an RRSIG stops the harness signing that RRset for real.
+; Expected: SERVFAIL, AD=0.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN CNAME target.child.example.
+      ; key_tag 1 matches no generated DNSKEY, so nothing covers this RRset.
+      www.example. 3600 IN RRSIG CNAME 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      target.child.example. 3600 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` covers rcode and AD: the assertion fails if hark either
+  ; answers NOERROR or sets AD on the forged redirect.
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+SCENARIO_END

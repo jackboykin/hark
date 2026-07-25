@@ -872,6 +872,21 @@ pub const RRsetCache = struct {
 
     // ── Store ─────────────────────────────────────────────────────────
 
+    const Lifetime = struct { ttl: u32, expires_at: i64, stored_at: i64 };
+
+    /// `ttl` arrives floored and capped by config; `authenticated_ttl_max` is
+    /// the validator's bound (`maxInt` if none) and goes on last, so `min_ttl`
+    /// cannot lift an entry past its own proof.
+    ///
+    /// The cache does no RRSIG arithmetic: it cannot tell which signature
+    /// verified, and reducing over the ones present let a single appended
+    /// unverifiable RRSIG drive a `.secure` entry's TTL to zero.
+    fn lifetime(self: *RRsetCache, ttl: u32, authenticated_ttl_max: u32) Lifetime {
+        const capped = @min(ttl, authenticated_ttl_max);
+        const now = self.now_fn();
+        return .{ .ttl = capped, .expires_at = now + @as(i64, capped), .stored_at = now };
+    }
+
     /// Cache all RRsets from a DNS response with bailiwick filtering.
     /// Answers get `status`; authorities/additionals always get `.unchecked`
     /// (delegation data). Validate-then-store passes the resolved status
@@ -880,7 +895,7 @@ pub const RRsetCache = struct {
     /// Locking is per-RRset (per shard), not per-response. A reader may
     /// observe a partial-response cache state mid-store; DNS clients
     /// tolerate this as they would tolerate a not-yet-arrived response.
-    pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus) void {
+    pub fn storeResponse(self: *RRsetCache, response: dns.Message, authority_zone: dns.Name, status: SecurityStatus, authenticated_ttl_max: u32) void {
         if (response.header.flags.rcode != .no_error) return;
 
         // RFC 4035 §3.1.3.4: capture the wildcard NSEC denial onto the answer
@@ -892,19 +907,19 @@ pub const RRsetCache = struct {
             proofs = proof_buf[0..n];
         }
 
-        self.storeRRsetsExcept(response.answers, authority_zone, status, &.{}, proofs);
+        self.storeRRsetsExcept(response.answers, authority_zone, status, &.{}, proofs, authenticated_ttl_max);
         if (response.answers.len == 0) {
             // Referral / NODATA-without-SOA: cache everything (bailiwick filter
             // handles cross-zone poisoning).
-            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{}, &.{});
-            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{}, &.{});
+            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{}, &.{}, std.math.maxInt(u32));
+            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{}, &.{}, std.math.maxInt(u32));
         } else {
             // CVE-2025-11411: child auth listing parent NS in its own authority
             // would overwrite a valid delegation. Strip NS from authority and
             // A/AAAA glue from additional. NSEC/NSEC3 + RRSIGs survive — DO=1
             // clients still get proof material on cache-served wildcards.
-            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{.ns}, &.{});
-            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{ .a, .aaaa }, &.{});
+            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{.ns}, &.{}, std.math.maxInt(u32));
+            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{ .a, .aaaa }, &.{}, std.math.maxInt(u32));
         }
     }
 
@@ -919,6 +934,7 @@ pub const RRsetCache = struct {
         authorities: []const dns.ResourceRecord,
         authority_zone: dns.Name,
         security_status: SecurityStatus,
+        authenticated_ttl_max: u32,
     ) void {
         // Find SOA in authority section — required per RFC 2308
         var soa_record: ?dns.ResourceRecord = null;
@@ -972,18 +988,17 @@ pub const RRsetCache = struct {
             return;
         };
 
-        const now = self.now_fn();
         // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
-        const capped_ttl = @min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl);
+        const life = self.lifetime(@min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl), authenticated_ttl_max);
         const neg = slot.alloc.create(NegativeEntry) catch {
             freeStagedNegative(slot.alloc, cached_soa, cached_proofs, slot.key.name);
             return;
         };
         neg.* = .{
             .rcode = rcode,
-            .expires_at = now + @as(i64, capped_ttl),
-            .original_ttl = capped_ttl,
-            .stored_at = now,
+            .expires_at = life.expires_at,
+            .original_ttl = life.ttl,
+            .stored_at = life.stored_at,
             .soa = cached_soa,
             .nsec_proofs = cached_proofs,
             .security_status = security_status,
@@ -1016,21 +1031,21 @@ pub const RRsetCache = struct {
         const slot = self.prepareSlot(lower_view, rtype, rclass, security_status) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
-        const now = self.now_fn();
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
         // DNSSEC SERVFAIL). RFC 9520 §3 caps resolution-failure caching at
         // 5 minutes; NXDOMAIN/NODATA at RFC 2308 §5's 3h SHOULD ceiling.
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
-        const capped_ttl = @min(ttl, ceiling);
+        // Caller-chosen TTL on a record-less entry: nothing to bound it by.
+        const life = self.lifetime(@min(ttl, ceiling), std.math.maxInt(u32));
         const neg = slot.alloc.create(NegativeEntry) catch {
             slot.alloc.free(slot.key.name);
             return;
         };
         neg.* = .{
             .rcode = rcode,
-            .expires_at = now + @as(i64, capped_ttl),
-            .original_ttl = capped_ttl,
-            .stored_at = now,
+            .expires_at = life.expires_at,
+            .original_ttl = life.ttl,
+            .stored_at = life.stored_at,
             .soa = null,
             .security_status = security_status,
         };
@@ -1111,6 +1126,7 @@ pub const RRsetCache = struct {
         status: SecurityStatus,
         skip_types: []const dns.RType,
         nsec_proofs: []const dns.ResourceRecord,
+        authenticated_ttl_max: u32,
     ) void {
         if (records.len == 0) return;
 
@@ -1185,7 +1201,7 @@ pub const RRsetCache = struct {
             // uncached beats wrong-and-cached.
             if (match_count > match_buf.len or sig_count > sig_buf.len) continue;
 
-            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, nsec_proofs);
+            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, nsec_proofs, authenticated_ttl_max);
         }
     }
 
@@ -1237,6 +1253,7 @@ pub const RRsetCache = struct {
         sigs: []const dns.ResourceRecord,
         status: SecurityStatus,
         nsec_proofs: []const dns.ResourceRecord,
+        authenticated_ttl_max: u32,
     ) void {
         // Empty matches would leave min_ttl = maxInt(u32) and store a
         // 1-week-pinned entry once clampTtl saturates. Belt-and-braces:
@@ -1295,27 +1312,24 @@ pub const RRsetCache = struct {
         for (matches) |m| {
             if (m.ttl < min_ttl) min_ttl = m.ttl;
         }
-        // RRSIG TTL contributes too — RFC 4035 §5.3.3 ties the cached TTL
-        // to the RRSIG's expiration window, so an RRSIG-driven shorter TTL
-        // shouldn't be ignored. NSEC proofs ride the same window: if an
-        // NSEC's RRSIG would have expired before the rrset's, the proof is
-        // stale and downstream validators reject it.
+        // RRSIG and NSEC *TTL fields* fold in so nothing outlives its own
+        // advertised lifetime. Not the §5.3.3 bound: §3.1 pins an RRSIG's TTL
+        // to its covered RRset's, so it says nothing about expiry.
         for (sigs) |s| {
             if (s.ttl < min_ttl) min_ttl = s.ttl;
         }
         for (nsec_proofs) |p| {
             if (p.ttl < min_ttl) min_ttl = p.ttl;
         }
-        const now = self.now_fn();
-        const capped_ttl = clampTtl(self.min_ttl, min_ttl);
+        const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), authenticated_ttl_max);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .records = cached_records,
             .sigs = cached_sigs,
             .nsec_proofs = cached_proofs,
             .shared_name_backing = shared_name_backing,
-            .expires_at = now + @as(i64, capped_ttl),
-            .original_ttl = capped_ttl,
-            .stored_at = now,
+            .expires_at = life.expires_at,
+            .original_ttl = life.ttl,
+            .stored_at = life.stored_at,
             .security_status = status,
         } }) catch {
             freeStagedPositive(slot.alloc, cached_records, cached_sigs, cached_proofs, shared_name_backing, slot.key.name);
@@ -1534,7 +1548,7 @@ fn makeTestRrsig(owner: dns.Name, covered: dns.RType, labels: u8, signer: dns.Na
         .algorithm = .ecdsap256sha256,
         .labels = labels,
         .original_ttl = ttl,
-        .sig_expiration = 0,
+        .sig_expiration = @intCast(test_time + max_cache_ttl),
         .sig_inception = 0,
         .key_tag = 0,
         .signer_name = signer,
@@ -1559,7 +1573,7 @@ fn storeTestAWithStatus(cache: *RRsetCache, alloc: Allocator, comptime labels: [
     answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = ttl, .rdata = .{ .a = ip } };
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, status);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, status, std.math.maxInt(u32));
 }
 
 fn expectCachedHitStatus(alloc: Allocator, cache: *RRsetCache, name: []const u8, expected: SecurityStatus) !void {
@@ -1699,7 +1713,7 @@ test "cache negative NXDOMAIN" {
     const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
 
-    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1726,7 +1740,7 @@ test "storeNegative rejects cross-zone SOA" {
     const authorities = try buildTestSoaAuthority(alloc, &.{ "other", "net" }, &.{ "ns1", "other", "net" }, &.{ "admin", "other", "net" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1745,7 +1759,7 @@ test "storeNegative accepts parent-zone SOA" {
     const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1769,7 +1783,7 @@ test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
     // Cache NXDOMAIN at "missing.example.com" for qtype A.
     const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
-    cache.storeNegative("missing.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("missing.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1851,7 +1865,7 @@ test "storeResponse captures wildcard NSEC proofs onto positive cache entry" {
         .answers = answers,
         .authorities = authorities,
     };
-    cache.storeResponse(response, signer, .secure);
+    cache.storeResponse(response, signer, .secure, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1939,7 +1953,7 @@ test "storeResponse ignores orphan-RRSIG wildcard signal (forged-trigger defence
         .answers = answers,
         .authorities = authorities,
     };
-    cache.storeResponse(response, signer, .secure);
+    cache.storeResponse(response, signer, .secure, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1994,7 +2008,7 @@ test "storeNegative captures NSEC proofs onto negative cache entry" {
     authorities[1] = makeTestNsec(nsec_owner, nsec_next, 600);
     authorities[2] = makeTestRrsig(nsec_owner, .nsec, 3, sig_signer, 600);
 
-    cache.storeNegative("b.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .secure);
+    cache.storeNegative("b.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2030,7 +2044,7 @@ test "storeNegative caps TTL at 3h (RFC 2308 §5)" {
     const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, big_ttl, big_ttl);
     defer freeTestAuthorities(alloc, authorities);
 
-    cache.storeNegative("missing.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("missing.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2085,7 +2099,7 @@ test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
         .questions = &.{question},
         .answers = &records,
     };
-    cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2097,6 +2111,91 @@ test "storeResponse uses min TTL across RRset members (RFC 2181 §5.2)" {
         },
         .negative => return error.TestUnexpectedResult,
     }
+}
+
+fn storeCappedA(cache: *RRsetCache, alloc: Allocator, ttl: u32, cap: u32) !dns.Message {
+    const labels = &[_][]const u8{ "exp", "example", "com" };
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{
+        .name = try makeTestName(alloc, labels),
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = ttl,
+        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
+    };
+    const response = makeTestResponse(answers);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, cap);
+    return response;
+}
+
+fn lookupRemainingTtl(cache: *RRsetCache, alloc: Allocator) !?u32 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const r = cache.lookup(arena.allocator(), "exp.example.com", .a, .in) orelse return null;
+    return switch (r) {
+        .hit => |h| h.remaining_ttl,
+        .negative => error.TestUnexpectedResult,
+    };
+}
+
+test "RFC 4035 §5.3.3: the validator's TTL cap bounds a .secure entry's life" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const response = try storeCappedA(&cache, alloc, 86400, 600);
+    defer dns.freeMessage(alloc, response);
+
+    try testing.expectEqual(@as(?u32, 600), try lookupRemainingTtl(&cache, alloc));
+    test_time = 1000 + 599;
+    try testing.expectEqual(@as(?u32, 1), try lookupRemainingTtl(&cache, alloc));
+    test_time = 1000 + 600;
+    try testing.expectEqual(@as(?u32, null), try lookupRemainingTtl(&cache, alloc));
+    test_time = 1000;
+}
+
+test "the min_ttl floor cannot re-inflate an entry past the validator's cap" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+    cache.min_ttl = 3600;
+
+    // The floor lifts 30 to 3600; the cap pulls it back to 600.
+    const response = try storeCappedA(&cache, alloc, 30, 600);
+    defer dns.freeMessage(alloc, response);
+
+    try testing.expectEqual(@as(?u32, 600), try lookupRemainingTtl(&cache, alloc));
+    test_time = 1000;
+}
+
+test "an uncapped store is not shortened by RRSIGs the cache cannot check" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    // Regression: reducing the TTL over every RRSIG travelling with the entry
+    // let one appended already-expired signature zero it.
+    const labels = &[_][]const u8{ "exp", "example", "com" };
+    const answers = try alloc.alloc(dns.ResourceRecord, 2);
+    answers[0] = .{
+        .name = try makeTestName(alloc, labels),
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
+    };
+    var dead = makeTestRrsig(try makeTestName(alloc, labels), .a, 3, try makeTestName(alloc, &.{ "example", "com" }), 3600);
+    dead.rdata.rrsig.sig_expiration = @intCast(test_time - 1);
+    answers[1] = dead;
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
+
+    try testing.expectEqual(@as(?u32, 3600), try lookupRemainingTtl(&cache, alloc));
+    test_time = 1000;
 }
 
 test "storeNegative rejects SOA above zone cut" {
@@ -2114,7 +2213,7 @@ test "storeNegative rejects SOA above zone cut" {
     const authorities = try buildTestSoaAuthority(alloc, &.{"com"}, &.{ "ns1", "com" }, &.{ "admin", "com" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
 
-    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut, .unchecked);
+    cache.storeNegative("www.example.com", .a, .in, .name_error, authorities, zone_cut, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2141,7 +2240,7 @@ test "cache eviction when full" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
         dns.freeMessage(alloc, response);
     }
 
@@ -2165,7 +2264,7 @@ test "cache deep copy independence" {
         const answers = try a.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 10, 20, 30, 40 } } };
 
-        cache.storeResponse(makeTestResponse(answers), dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(makeTestResponse(answers), dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
         // arena destroyed here — cache must still work
     }
 
@@ -2206,7 +2305,7 @@ test "cache negative without SOA is not stored" {
     defer cache.deinit();
 
     // No SOA in authority
-    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2602,7 +2701,7 @@ test "BOGUS invalidates .unchecked positive to SERVFAIL" {
 
     // Step 1: a CD=1 query populates the cache as .unchecked (the CD=1
     // resolver skips inline validation per server.zig's dnssec_enabled gate).
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2686,7 +2785,7 @@ test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
 
     cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
 
@@ -2716,7 +2815,7 @@ test "shard distribution is reasonable for random names" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
         dns.freeMessage(alloc, response);
     }
 
@@ -2770,7 +2869,7 @@ test "eviction stays within shard" {
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
         const response = makeTestResponse(answers);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
         dns.freeMessage(alloc, response);
         stored += 1;
     }
@@ -2820,7 +2919,7 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
 
     var response = makeTestResponse(answers);
     response.authorities = authorities;
-    cache.storeResponse(response, signer, .secure);
+    cache.storeResponse(response, signer, .secure, std.math.maxInt(u32));
 }
 
 test "evictIfNeeded triggers SIEVE on byte pressure" {
@@ -2985,7 +3084,7 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
     // negative proofs-clone bail path is leak-swept.
     auths[1] = makeTestNsec(nsec_owner, nsec_next, 300);
     auths[2] = makeTestRrsig(nsec_owner, .nsec, 2, zone_name, 300);
-    cache.storeNegative("nodata.test", .a, .in, .no_error, auths, zone_name, .unchecked);
+    cache.storeNegative("nodata.test", .a, .in, .no_error, auths, zone_name, .unchecked, std.math.maxInt(u32));
 }
 
 test "negative-store paths handle backing-allocator OOM without leaking" {
@@ -3058,7 +3157,7 @@ test "multi-record RRset round-trip preserves shared owner name" {
     const response = makeTestResponse(answers);
     defer dns.freeMessage(alloc, response);
 
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -3128,7 +3227,7 @@ test "storeResponse skips an RRset that overflows the collect buffer" {
         };
         const response = makeTestResponse(answers);
         defer dns.freeMessage(alloc, response);
-        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure);
+        cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
 
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();

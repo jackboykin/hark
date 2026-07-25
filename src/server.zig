@@ -1010,8 +1010,9 @@ pub const Server = struct {
 /// this tracker never sees, so "demand stopped" is unobservable — the
 /// lease just lapses and live demand re-promotes at the cost of two
 /// misses. CNAME chains refresh piecewise (redirect and tail remiss under
-/// their own keys). No pattern learning — see backlog #13 for the rejected
-/// alternatives.
+/// their own keys). No pattern learning: the lease already refreshes every hot
+/// name, and every scheme considered needed per-name history this tracker
+/// cannot afford at these slot counts.
 const HotSet = struct {
     const candidate_slots = 512;
     const registry_slots = 256;
@@ -2461,7 +2462,7 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
         .questions = &.{},
         .answers = answers,
     };
-    server.cache.storeResponse(resp, dns.Name{ .labels = &.{} }, .secure);
+    server.cache.storeResponse(resp, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
 
     try testing.expect(server.cache.hasValidatedPositive("example.com", .a, .in));
     // .unchecked entries are NOT protected — bg scheduler should still fire.
