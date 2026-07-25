@@ -817,6 +817,27 @@ fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_h
 
 // ── NSEC Proofs ──────────────────────────────────────────────────────
 
+/// DNAME (RFC 6672). Not a `dns.RType` member: naming it there would demand
+/// DNAME arms across the parser and printer, and hark does not synthesize
+/// DNAMEs. RFC 6840 §4.1 still requires recognizing the bitmap bit.
+const dname_rtype: dns.RType = @fromBackingInt(@intCast(39));
+
+/// RFC 6840 §4.1: an "ancestor delegation" NSEC — NS bit set, SOA bit clear
+/// — sits on the *parent* side of a zone cut and MUST NOT be used to assume
+/// the nonexistence of anything below that cut. Only DS lives on the parent
+/// side; everything else must be asked of the child. (The RFC's third
+/// condition, signer shorter than owner, is implied: a zone's own apex NSEC
+/// always carries SOA.)
+///
+/// Without this, a TLD operator's genuine, correctly-signed
+/// `example.com NSEC f.com` authenticates NXDOMAIN for every name under
+/// example.com — the parent legitimately owns a range that spans the whole
+/// child subtree in canonical order.
+fn isAncestorDelegation(type_bit_maps: []const u8) bool {
+    return dns.typeBitmapContains(type_bit_maps, .ns) and
+        !dns.typeBitmapContains(type_bit_maps, .soa);
+}
+
 /// Check if an NSEC record proves that `qname` does not exist.
 /// Returns true if qname falls in the range (nsec_owner, nsec_next).
 pub fn nsecProvesNameNonexistence(
@@ -824,6 +845,18 @@ pub fn nsecProvesNameNonexistence(
     nsec: dns.NsecData,
     qname: dns.Name,
 ) bool {
+    // RFC 6840 §4.1: neither an ancestor-delegation NSEC nor one whose owner
+    // carries DNAME may deny a name beneath its owner — below the cut the
+    // child is authoritative, and beneath a DNAME names are synthesized
+    // rather than absent. Strictly below only: a range starting at an
+    // ancestor still legitimately denies siblings in the same zone.
+    if (qname.labels.len > nsec_owner.labels.len and qname.isSubdomainOf(nsec_owner) and
+        (isAncestorDelegation(nsec.type_bit_maps) or
+            dns.typeBitmapContains(nsec.type_bit_maps, dname_rtype)))
+    {
+        return false;
+    }
+
     return inOpenRangeWrap(
         canonicalNameOrder(nsec_owner, qname),
         canonicalNameOrder(qname, nsec.next_domain_name),
@@ -844,6 +877,10 @@ fn nsecProvesTypeNonexistence(
     qtype: dns.RType,
 ) bool {
     if (!nsec_owner.eql(qname)) return false;
+    // RFC 6840 §4.1: at a cut, the parent's bitmap describes the parent's
+    // view — NS, RRSIG, NSEC, maybe DS. It says nothing about what the child
+    // holds, so it may not prove NODATA for any type but DS.
+    if (qtype != .ds and isAncestorDelegation(nsec.type_bit_maps)) return false;
     if (dns.typeBitmapContains(nsec.type_bit_maps, qtype)) return false;
     if (qtype == .cname) return true;
     return !dns.typeBitmapContains(nsec.type_bit_maps, .cname);
@@ -1006,6 +1043,11 @@ pub fn validateNegativeProof(
         if (matching_nsec) |rr| {
             if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype))
                 return .secure;
+            // A parent-side delegation NSEC at the cut is unusable here, not
+            // contradictory (RFC 6840 §4.1) — the child owns these types, and
+            // the server owed us a referral. Fall through to .unchecked.
+            if (qtype != .ds and isAncestorDelegation(rr.rdata.nsec.type_bit_maps))
+                return .unchecked;
             return .bogus;
         }
 
@@ -2028,7 +2070,7 @@ test "classifyDelegation with NSEC proving no DS" {
                         @as([]const u8, "com"),
                     },
                 },
-                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS, no DS
+                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS, no SOA/DS: parent-side cut
             },
         },
     }};
@@ -2202,11 +2244,11 @@ test "NSEC type non-existence" {
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
 
-    // Bitmap has A and NS but not AAAA
-    // A(1)=0x40, NS(2)=0x20 => byte0 = 0x60
+    // Bitmap has A, NS and SOA but not AAAA
+    // A(1)=0x40, NS(2)=0x20, SOA(6)=0x02 => byte0 = 0x62
     const nsec_data = dns.NsecData{
         .next_domain_name = dns.Name{ .labels = &.{@as([]const u8, "next")} },
-        .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // window 0, len 1, A+NS
+        .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 },
     };
 
     // AAAA doesn't exist at this name
@@ -2337,7 +2379,9 @@ test "validateNegativeProof NSEC NODATA" {
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
 
-    // NSEC at example.com has A and NS but not AAAA
+    // NSEC at the example.com apex has A, NS and SOA but not AAAA. SOA is
+    // load-bearing: NS without it would make this the parent side of a cut,
+    // which RFC 6840 §4.1 bars from proving anything but DS.
     const authorities = [_]dns.ResourceRecord{.{
         .name = name,
         .rtype = .nsec,
@@ -2348,7 +2392,7 @@ test "validateNegativeProof NSEC NODATA" {
                 .next_domain_name = dns.Name{
                     .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
                 },
-                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x60 }, // A + NS
+                .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 }, // A + NS + SOA
             },
         },
     }};
@@ -2357,6 +2401,44 @@ test "validateNegativeProof NSEC NODATA" {
     var b: ValidationBudget = .{};
     const status = validateNegativeProof(&authorities, name, .aaaa, false, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
+}
+
+test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)" {
+    // `example.com NSEC f.com` with NS set and SOA clear is the com side of
+    // the cut. In canonical order its range spans the entire example.com
+    // subtree, so without §4.1 a TLD operator's genuine, correctly-signed
+    // record authenticates NXDOMAIN for every name in the child zone — and
+    // NODATA for every type at the cut itself.
+    const cut = dns.Name{ .labels = &.{ "example", "com" } };
+    const next = dns.Name{ .labels = &.{ "f", "com" } };
+    const parent_side = [_]u8{ 0x00, 0x01, 0x20 }; // NS only
+    const child_apex = [_]u8{ 0x00, 0x01, 0x22 }; // NS + SOA
+    const victim = dns.Name{ .labels = &.{ "www", "example", "com" } };
+
+    var b: ValidationBudget = .{};
+    const parent_auth = [_]dns.ResourceRecord{nsecRrWithBitmap(cut, next, &parent_side)};
+    try testing.expectEqual(
+        SecurityStatus.unchecked,
+        validateNegativeProof(&parent_auth, victim, .a, true, &b),
+    );
+    // NODATA at the cut itself is equally barred — for every type but DS,
+    // which is the one thing that does live on the parent side.
+    try testing.expectEqual(
+        SecurityStatus.unchecked,
+        validateNegativeProof(&parent_auth, cut, .a, false, &b),
+    );
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateNegativeProof(&parent_auth, cut, .ds, false, &b),
+    );
+
+    // Same geometry signed by the child: an apex NSEC carries SOA, and its
+    // range legitimately denies names in its own zone.
+    const child_auth = [_]dns.ResourceRecord{nsecRrWithBitmap(cut, next, &child_apex)};
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateNegativeProof(&child_auth, victim, .a, true, &b),
+    );
 }
 
 test "validateNegativeProof NSEC NXDOMAIN" {
@@ -2596,7 +2678,7 @@ test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
 test "validateNegativeProof NSEC NODATA owner-match with qtype in bitmap is .bogus" {
     const name = dns.Name{ .labels = &.{ "example", "com" } };
     const next = dns.Name{ .labels = &.{ "next", "com" } };
-    const bitmap = [_]u8{ 0x00, 0x04, 0x60, 0x00, 0x00, 0x08 }; // A+NS+AAAA
+    const bitmap = [_]u8{ 0x00, 0x04, 0x62, 0x00, 0x00, 0x08 }; // A+NS+SOA+AAAA
     const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(name, next, &bitmap)};
 
     var b: ValidationBudget = .{};
