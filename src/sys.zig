@@ -180,12 +180,25 @@ pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
     };
 }
 
+/// Arm SO_RCVTIMEO/SO_SNDTIMEO. `ms` is floored at 1 because the kernel reads
+/// `timeval{0,0}` as *no timeout*: deadline arithmetic that truncated to zero
+/// would otherwise fail open, in the one call asking for a bound. Use
+/// `clearSocketTimeout` where infinite is what you mean.
 pub fn setSocketTimeout(sock: posix.fd_t, opt: u32, ms: u32) void {
+    const bounded = @max(ms, 1);
     const timeout = posix.timeval{
-        .sec = @intCast(ms / 1000),
-        .usec = @intCast(@as(u64, ms % 1000) * 1000),
+        .sec = @intCast(bounded / 1000),
+        .usec = @intCast(@as(u64, bounded % 1000) * 1000),
     };
     posix.setsockopt(sock, posix.SOL.SOCKET, opt, std.mem.asBytes(&timeout)) catch {};
+}
+
+/// Disarm SO_RCVTIMEO/SO_SNDTIMEO — the syscall blocks indefinitely and the
+/// deadline is enforced in userspace instead. The explicit spelling of the
+/// `timeval{0,0}` sentinel.
+pub fn clearSocketTimeout(sock: posix.fd_t, opt: u32) void {
+    const none = posix.timeval{ .sec = 0, .usec = 0 };
+    posix.setsockopt(sock, posix.SOL.SOCKET, opt, std.mem.asBytes(&none)) catch {};
 }
 
 /// Disable Nagle's algorithm. Kernel persists this across the fd lifetime.
@@ -272,17 +285,21 @@ pub fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Time
     if (pfd[0].revents & posix.POLL.NVAL != 0) return error.PollFailed;
 }
 
+/// Milliseconds left until `deadline_ns`, for arming a kernel socket timeout.
+/// Sub-millisecond residue is `error.Timeout`, not zero: the budget is spent.
+pub fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
+    const remaining_ns = deadline_ns - monotonic.nowNs();
+    if (remaining_ns < std.time.ns_per_ms) return error.Timeout;
+    return @intCast(@min(
+        @divFloor(remaining_ns, std.time.ns_per_ms),
+        std.math.maxInt(u32),
+    ));
+}
+
 /// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
 /// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
 pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {
-    const remaining_ns = deadline_ns - monotonic.nowNs();
-    if (remaining_ns <= 0) return error.Timeout;
-    const remaining_ms: u32 = @intCast(@min(
-        @divFloor(remaining_ns, 1_000_000),
-        std.math.maxInt(u32),
-    ));
-    if (remaining_ms == 0) return error.Timeout;
-    setSocketTimeout(sock, opt, remaining_ms);
+    setSocketTimeout(sock, opt, try remainingTimeoutMs(deadline_ns));
 }
 
 test "setNoDelay and setQuickAck flip the kernel TCP options" {
@@ -319,4 +336,71 @@ test "setNoDelay and setQuickAck flip the kernel TCP options" {
         try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
         try std.testing.expectEqual(@as(c_int, 1), val);
     }
+}
+
+test "setSocketTimeout never disarms the timeout; clearSocketTimeout is how you mean it" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const sock = try socket(linux.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(sock);
+
+    const readTimeout = struct {
+        fn tv(s: posix.fd_t) !posix.timeval {
+            var out: posix.timeval = undefined;
+            var len: posix.socklen_t = @sizeOf(posix.timeval);
+            const rc = linux.getsockopt(s, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&out), &len);
+            try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
+            return out;
+        }
+    }.tv;
+
+    // Assertions are inequalities on purpose: the kernel stores SO_*TIMEO in
+    // jiffies and getsockopt converts back, so a 1 ms request reads back as
+    // 1000 us at CONFIG_HZ=1000 but 4000 us at HZ=250 (Debian/Ubuntu generic)
+    // and 3333 us at HZ=300 (Arch). Exact equality here passes only on the
+    // machine it was written on.
+
+    // The regression: a deadline of a few hundred microseconds truncates to
+    // connect_ms == 0, and timeval{0,0} means *no timeout* to the kernel —
+    // a blocking read that never returns. Floor it instead.
+    setSocketTimeout(sock, posix.SO.RCVTIMEO, 0);
+    const floored = try readTimeout(sock);
+    try std.testing.expect(floored.sec != 0 or floored.usec != 0);
+    // Armed, and rounded up to at most one jiffy at the coarsest supported HZ.
+    try std.testing.expectEqual(@as(@TypeOf(floored.sec), 0), floored.sec);
+    try std.testing.expect(floored.usec > 0 and floored.usec <= 10_000);
+
+    // Ordinary values are not meaningfully altered by the floor.
+    setSocketTimeout(sock, posix.SO.RCVTIMEO, 2500);
+    const normal = try readTimeout(sock);
+    const normal_us = @as(i64, normal.sec) * 1_000_000 + normal.usec;
+    try std.testing.expect(normal_us >= 2_500_000 and normal_us < 2_510_000);
+
+    // Infinite is still reachable, but only by asking for it by name.
+    clearSocketTimeout(sock, posix.SO.RCVTIMEO);
+    const cleared = try readTimeout(sock);
+    try std.testing.expectEqual(@as(@TypeOf(cleared.sec), 0), cleared.sec);
+    try std.testing.expectEqual(@as(@TypeOf(cleared.usec), 0), cleared.usec);
+}
+
+test "remainingTimeoutMs: sub-millisecond residue is Timeout, not an unbounded socket" {
+    const now = monotonic.nowNs();
+
+    // Regression: a few hundred microseconds of budget truncated to
+    // 0 ms, and setSocketTimeout wrote timeval{0,0} — no timeout at all.
+    try std.testing.expectError(error.Timeout, remainingTimeoutMs(now + 999_999));
+    try std.testing.expectError(error.Timeout, remainingTimeoutMs(now));
+    try std.testing.expectError(error.Timeout, remainingTimeoutMs(now - std.time.ns_per_s));
+
+    // A full millisecond is the smallest arming budget.
+    // Margin is generous on purpose: a stingy one makes the test fail under
+    // scheduling noise, which is the same machine-dependence the jiffies
+    // assertions above had to shed.
+    try std.testing.expect(try remainingTimeoutMs(now + 500 * std.time.ns_per_ms) >= 1);
+
+    // Absurd deadlines saturate rather than wrap.
+    try std.testing.expectEqual(
+        @as(u32, std.math.maxInt(u32)),
+        try remainingTimeoutMs(now + @as(i128, std.math.maxInt(i64))),
+    );
 }

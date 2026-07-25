@@ -370,7 +370,7 @@ pub fn connectTcpRaw(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream
 /// enforced in userspace (`sendAndReceiveTcp`).
 pub fn connectTcp(server: na.Address) !Io.net.Stream {
     const stream = try connectTcpRaw(server, tcp_connect_timeout_ms);
-    sys.setSocketTimeout(stream.socket.handle, posix.SO.SNDTIMEO, 0);
+    sys.clearSocketTimeout(stream.socket.handle, posix.SO.SNDTIMEO);
     return stream;
 }
 
@@ -591,4 +591,33 @@ test "queryTcp loopback query" {
     const resp_id = mem.readInt(u16, response[0..2], .big);
     try testing.expectEqual(@as(u16, 0x1234), resp_id);
     try testing.expect(response[2] & 0x80 != 0);
+}
+
+test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" {
+    // The Do53 TCP data path enforces deadlines in userspace and relies on
+    // the kernel timeout being *off*: Io.Threaded's netWritePosix treats
+    // EAGAIN as a programmer bug and panics. connectTcpRaw arms SNDTIMEO for
+    // the connect itself, so connectTcp must disarm it afterwards.
+    //
+    // This used to be spelled setSocketTimeout(fd, SNDTIMEO, 0), relying on
+    // timeval{0,0} meaning "no timeout"; it is now clearSocketTimeout, since
+    // setSocketTimeout floors at 1 ms. Without this test that conversion had
+    // no coverage — reverting it broke nothing, while arming a 1 ms write
+    // timeout on the data path.
+    try skipIfNotLinux();
+    const io = testing.io;
+
+    const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer server.deinit(io);
+
+    const stream = try connectTcp(server.socket.address);
+    defer sys.close(stream.socket.handle);
+
+    var tv: posix.timeval = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.timeval);
+    const rc = std.os.linux.getsockopt(stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), &len);
+    try testing.expectEqual(@as(std.os.linux.E, .SUCCESS), std.os.linux.errno(rc));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
+    try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
 }

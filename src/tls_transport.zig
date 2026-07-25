@@ -112,9 +112,11 @@ pub const TlsTransport = struct {
         if (self.tryPooledQuery(addr_key, wire_query, response_buf, deadline_ns)) |data| return data;
 
         // ── New connection ──
-        const remaining_ns = deadline_ns - monotonic.nowNs();
-        if (remaining_ns <= 0) return error.Timeout;
-        const connect_ms: u32 = @intCast(@min(@divFloor(remaining_ns, std.time.ns_per_ms), std.math.maxInt(u32)));
+        // Sub-millisecond residue is error.Timeout, not a 0 ms connect: 0
+        // reached setSocketTimeout as timeval{0,0}, disarming the bound
+        // entirely, so a peer that completed TCP and then said nothing hung
+        // the handshake read forever.
+        const connect_ms = try sys.remainingTimeoutMs(deadline_ns);
         const stream = try connectTcpBlocking(self.io, tls_server, connect_ms);
         const conn = try self.initConnection(stream);
 
@@ -231,13 +233,16 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// and read the length-prefixed response.
 ///
 /// `deadline_ns` tightens the kernel SO_SNDTIMEO/SO_RCVTIMEO once before each
-/// direction. SO timeouts are per-syscall, so a slow-trickle peer that drips
-/// data in tiny chunks could in principle exceed the deadline; the bound
-/// achieved here is "no indefinite stall." Acceptable because upstream TLS
-/// peers are chosen authoritative/recursive servers — not arbitrary peers.
-/// True per-payload bounding would require restructuring TLS-layer I/O to
-/// expose hooks for per-syscall deadline checks (the TLS layer buffers
-/// records, not raw syscalls).
+/// direction, which bounds each syscall but not the payload: a peer dripping
+/// one byte per interval resets the timer on every read and can hold a
+/// resolution thread for hours. Under RFC 9539 that peer's address comes from
+/// the delegation of the zone being resolved — chosen by whoever registered
+/// the domain — so "upstream peers are trustworthy" is not a defence here.
+/// What limits the damage today is `opportunistic` being off by default.
+///
+/// TODO: bound the whole payload as the Do53 TCP path does with
+/// `sys.readExactDeadline`. The TLS layer buffers records rather than exposing
+/// raw syscalls, so the read loop needs a per-syscall deadline hook first.
 fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
     // Stage into a single buffer so the TLS layer emits one record + one
     // syscall per query — two writeAll calls would flush twice (ianic
