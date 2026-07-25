@@ -517,7 +517,7 @@ pub const RecursiveResolver = struct {
             var servers: [max_servers_per_level]na.Address = undefined;
             var server_count: usize = undefined;
             var parent_zone: dns.Name = undefined;
-            try self.seedServersForQuery(allocator, current_name, &servers, &server_count, &parent_zone, &security_state);
+            try self.seedServersForQuery(allocator, current_name, qtype, &servers, &server_count, &parent_zone, &security_state);
 
             var seen_zones: [max_delegations]dns.Name = undefined;
             var seen_zone_count: usize = 0;
@@ -787,10 +787,19 @@ pub const RecursiveResolver = struct {
     /// referral path would have caught this via `classifyDelegation`,
     /// but a cache shortcut skips that call, so `hasCachedInsecureDelegation`
     /// stands in.
+    /// Strip the leftmost label. Used only to pick a *starting point* for the
+    /// cached-delegation walk on DS queries, never as a claim about where a
+    /// zone cut is — so an ENT gap costs nothing here.
+    fn parentQueryName(name: []const u8) []const u8 {
+        const dot = mem.indexOfScalar(u8, name, '.') orelse return "";
+        return name[dot + 1 ..];
+    }
+
     fn seedServersForQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         current_name: []const u8,
+        qtype: dns.RType,
         servers: *[max_servers_per_level]na.Address,
         server_count: *usize,
         parent_zone: *dns.Name,
@@ -798,7 +807,19 @@ pub const RecursiveResolver = struct {
     ) !void {
         parent_zone.* = dns.Name{ .labels = &.{} };
 
-        if (try self.findClosestCachedDelegation(allocator, current_name)) |deleg| {
+        // RFC 4035 §5: DS lives in the *parent*. Seeding from the closest
+        // cached delegation for the name itself sends a client's DS query to
+        // the child's own servers, which answer NODATA with their apex
+        // NSEC/NSEC3 — a record that never carries DS and so reads as proof
+        // the delegation is unsigned. The validator now refuses that (RFC
+        // 6840 §4.4), which would turn a wrong answer into a SERVFAIL; seed
+        // one label up instead so the query reaches someone who can answer it.
+        // Deliberately not label arithmetic on a zone name (see 09283b6): the
+        // walk starts at the TLD and keeps the deepest cached hit, so any cut
+        // at or above the parent is found, ENT gaps included.
+        const seed_name = if (qtype == .ds) parentQueryName(current_name) else current_name;
+
+        if (try self.findClosestCachedDelegation(allocator, seed_name)) |deleg| {
             server_count.* = deleg.count;
             @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
             parent_zone.* = deleg.zone;
