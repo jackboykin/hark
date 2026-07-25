@@ -1393,10 +1393,15 @@ pub const RecursiveResolver = struct {
         // then collect all qtype records + covering RRSIGs with wildcard owner name.
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         var wildcard_owner: ?dns.Name = null;
-        var wc_records: [16]dns.ResourceRecord = undefined; // typical wildcard RRsets are 1-3 records; silently caps at 16
+        // Typical wildcard RRsets are 1-3 records. Overflow abandons the store
+        // rather than truncating: this writes `.secure`, and tryWildcardSynth
+        // serves it as an AD=1 answer with no TC=1 for the whole TTL, so a
+        // silently-short set here is the "wrong-and-cached" shape the store
+        // path elsewhere refuses. `dominated` counts RRSIGs too, so a dual-algo
+        // A RRset reaches this at ~14 addresses.
+        var wc_records: [16]dns.ResourceRecord = undefined;
         var wc_count: usize = 0;
         for (answers) |ans_rr| {
-            if (wc_count >= wc_records.len) break;
             if (wildcard_owner == null and ans_rr.rtype == qtype and ans_rr.name.labels.len > sig.labels) {
                 const ce = dns.Name{ .labels = ans_rr.name.labels[ans_rr.name.labels.len - sig.labels ..] };
                 wildcard_owner = dns.makeWildcardName(&wc_labels_buf, ce);
@@ -1404,6 +1409,10 @@ pub const RecursiveResolver = struct {
             const wco = wildcard_owner orelse continue;
             const dominated = ans_rr.rtype == qtype or dns.rrsigCovers(ans_rr) == qtype;
             if (dominated) {
+                // Only a record that genuinely does not fit abandons the
+                // store — a full buffer with only non-dominated records left
+                // to scan is a complete collect.
+                if (wc_count == wc_records.len) return;
                 wc_records[wc_count] = ans_rr;
                 wc_records[wc_count].name = wco;
                 wc_count += 1;
@@ -4632,4 +4641,67 @@ test "tryParseMessage lowercases NSEC next_domain_name via compression pointer" 
     try testing.expectEqual(@as(usize, 2), nsec.next_domain_name.labels.len);
     try testing.expectEqualStrings("x", nsec.next_domain_name.labels[0]);
     try testing.expectEqualStrings("com", nsec.next_domain_name.labels[1]);
+}
+
+test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect buffer" {
+    // storeWildcardRRsets writes `.secure`, and tryWildcardSynth serves that
+    // entry as an AD=1 answer with no TC=1 for the whole TTL. A truncated
+    // collect here is therefore the wrong-and-cached shape the store path
+    // refuses everywhere else. `dominated` counts RRSIGs too, so a dual-algo
+    // A RRset reaches the 16-record buffer at ~14 addresses.
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const expanded = dns.Name{ .labels = &.{ "host", "example", "com" } };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+
+    // n = A records; the covering RRSIG is dominated too, so dominated = n+1.
+    for ([_]usize{ 16, 15 }) |n| {
+        var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+        defer cache.deinit();
+        var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache };
+
+        const answers = try aa.alloc(dns.ResourceRecord, n + 1);
+        for (answers[0..n], 0..) |*r, i| r.* = .{
+            .name = expanded,
+            .rtype = .a,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .a = .{ 192, 0, 2, @intCast(i + 1) } },
+        };
+        // labels=2 (`*.example.com`) against a 3-label owner marks the answer
+        // wildcard-expanded, which is what arms this path at all.
+        answers[n] = .{
+            .name = expanded,
+            .rtype = .rrsig,
+            .rclass = .in,
+            .ttl = 300,
+            .rdata = .{ .rrsig = .{
+                .type_covered = .a,
+                .algorithm = .ecdsap256sha256,
+                .labels = 2,
+                .original_ttl = 300,
+                .sig_inception = 0,
+                .sig_expiration = 0xFFFFFFFF,
+                .key_tag = 1,
+                .signer_name = signer,
+                .signature = &.{},
+            } },
+        };
+
+        resolver.storeWildcardRRsets(answers, .a);
+
+        var look = std.heap.ArenaAllocator.init(alloc);
+        defer look.deinit();
+        const got = cache.lookup(look.allocator(), "*.example.com", .a, .in);
+        if (n + 1 > 16) {
+            try testing.expect(got == null);
+        } else {
+            // 16 dominated exactly fills the buffer: a complete collect, and
+            // the boundary is off-by-one sensitive.
+            try testing.expect(got != null);
+        }
+    }
 }
