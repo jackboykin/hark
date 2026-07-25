@@ -540,6 +540,24 @@ pub const Server = struct {
         errdefer allocator.destroy(work_queue);
         work_queue.init(io);
 
+        // Every remaining fallible step happens here, before the return
+        // literal. Inside it they ran after every field above them, in field
+        // order, with no errdefer in reach — leaking the wake eventfds and
+        // their slice. An infallible literal is what makes that unreachable.
+        const wake_fds = try createWakeFds(allocator, cfg.workers);
+        // Mirrors deinit: the fds are owned too, not just the slice.
+        errdefer {
+            for (wake_fds) |fd| if (fd >= 0) sys.close(fd);
+            allocator.free(wake_fds);
+        }
+
+        const hot_set: ?*HotSet = if (cfg.prefetch_hot) blk: {
+            const hs = try allocator.create(HotSet);
+            hs.* = .{ .io = io };
+            break :blk hs;
+        } else null;
+        errdefer if (hot_set) |hs| allocator.destroy(hs);
+
         return .{
             .config = cfg,
             .allocator = allocator,
@@ -574,12 +592,8 @@ pub const Server = struct {
             .client_cache_misses = std.atomic.Value(u64).init(0),
             .prefetch_drops = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
-            .wake_fds = try createWakeFds(allocator, cfg.workers),
-            .hot_set = if (cfg.prefetch_hot) blk: {
-                const hs = try allocator.create(HotSet);
-                hs.* = .{ .io = io };
-                break :blk hs;
-            } else null,
+            .wake_fds = wake_fds,
+            .hot_set = hot_set,
         };
     }
 
@@ -2586,4 +2600,55 @@ test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
     try testing.expectEqual(@as(u32, k - 1), fired_at.?);
     const slack: usize = 64 * 1024;
     try testing.expect(capacity_after_fire <= PerThreadArena.SHRINK_LIMIT_BYTES + slack);
+}
+
+test "Server.init does not leak when a late allocation fails" {
+    // Regression: createWakeFds and the HotSet allocation used to sit inside the
+    // return literal, which Zig evaluates in field order — so they ran
+    // *after* every cache was constructed, and a failure there returned
+    // past all of them with no errdefer in reach. Both are hoisted above
+    // the literal now, which is what makes it infallible.
+    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    const config = @import("config.zig");
+    var cfg = config.parseConfig(testing.allocator,
+        \\[cache]
+        \\prefetch-hot = true
+    ) catch return error.SkipZigTest;
+    defer cfg.deinit();
+
+    var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
+    {
+        var s = try Server.init(counter.allocator(), cfg, testing.io);
+        s.deinit();
+    }
+    const total = counter.alloc_index;
+    try testing.expect(total > 0);
+
+    // Bytes alone are not enough: wake_fds owns `workers` eventfds as well as
+    // its slice, and the first cut of the errdefer freed the slice while
+    // leaking every fd. Count descriptors across each failure too.
+    // Linux hands out the lowest free descriptor, so opening one and closing
+    // it immediately reports where the fd space currently starts. A leak
+    // pushes that number up.
+    const lowestFreeFd = struct {
+        fn probe() !posix.fd_t {
+            const fd = try sys.socket(linux.AF.INET, posix.SOCK.DGRAM, 0);
+            sys.close(fd);
+            return fd;
+        }
+    }.probe;
+
+    var idx: usize = 0;
+    while (idx < total) : (idx += 1) {
+        const fd_floor = try lowestFreeFd();
+        var f = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        if (Server.init(f.allocator(), cfg, testing.io)) |srv| {
+            var s = srv;
+            s.deinit();
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+        }
+        try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
+        try testing.expectEqual(fd_floor, try lowestFreeFd());
+    }
 }
