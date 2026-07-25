@@ -323,13 +323,26 @@ fn keyTag(dnskey: dns.DnskeyData) u16 {
 /// Write a name in canonical (lowercase, uncompressed) wire format.
 /// Returns the number of bytes written.
 fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
+    return writeNameWire(buf, name, true);
+}
+
+/// Write a name in uncompressed wire format, preserving case. RFC 6840 §5.1
+/// exempts exactly one field from case folding — the NSEC `next_domain_name`
+/// — so this is not a general-purpose escape hatch. RFC 4034 §6.2's list said
+/// to fold it, RFC 3755 said not to, and 6840 settled it against 4034 to match
+/// what signers already did.
+fn writeNameWirePreservingCase(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
+    return writeNameWire(buf, name, false);
+}
+
+fn writeNameWire(buf: []u8, name: dns.Name, comptime lower: bool) error{BufferTooSmall}!usize {
     var pos: usize = 0;
     for (name.labels) |label| {
         if (pos + 1 + label.len > buf.len) return error.BufferTooSmall;
         buf[pos] = @intCast(label.len);
         pos += 1;
         for (label) |c| {
-            buf[pos] = std.ascii.toLower(c);
+            buf[pos] = if (comptime lower) std.ascii.toLower(c) else c;
             pos += 1;
         }
     }
@@ -528,7 +541,9 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
         },
         .nsec => |nsec_data| {
             var pos: usize = 0;
-            pos += try writeCanonicalNameWire(buf[pos..], nsec_data.next_domain_name);
+            // RFC 6840 §5.1: NSEC RDATA names are NOT folded (RRSIG's are —
+            // see the signer_name write above, which correctly is).
+            pos += try writeNameWirePreservingCase(buf[pos..], nsec_data.next_domain_name);
             if (pos + nsec_data.type_bit_maps.len > buf.len) return error.BufferTooSmall;
             @memcpy(buf[pos..][0..nsec_data.type_bit_maps.len], nsec_data.type_bit_maps);
             pos += nsec_data.type_bit_maps.len;

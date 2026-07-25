@@ -2489,7 +2489,22 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
             s.rname = try cloneNameLower(allocator, s.rname);
         },
         .rrsig => |*r| r.signer_name = try cloneNameLower(allocator, r.signer_name),
-        .nsec => |*n| n.next_domain_name = try cloneNameLower(allocator, n.next_domain_name),
+        // RFC 6840 §5.1: names in NSEC RDATA are *not* case-folded when
+        // canonicalizing, while names in RRSIG RDATA are — hark used to do the
+        // exact inverse of both halves. Downcasing here changed the bytes that
+        // later go into the signed data, so any signer preserving case in its
+        // chain failed verification and every NXDOMAIN and NODATA in the zone
+        // came back bogus.
+        //
+        // Still cloned, just not folded: the scrub is also what re-anchors
+        // label bytes off the upstream wire buffer, so skipping it entirely
+        // would leave the name aliasing storage the message does not own.
+        //
+        // The 0x20 motive that justifies the folding elsewhere does not reach
+        // here — case randomization affects the echoed QNAME and owner names,
+        // never a signer-chosen next_domain — and range comparisons go through
+        // case-insensitive cmpLabelsCI regardless.
+        .nsec => |*n| n.next_domain_name = try cloneName(allocator, n.next_domain_name),
     }
 }
 

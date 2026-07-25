@@ -1,0 +1,60 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN NSEC next_domain keeps its case (RFC 6840 §5.1)
+
+; RFC 6840 §5.1, verbatim: "When canonicalizing DNS names (for both ordering
+; and signing), DNS names in the RDATA section of NSEC resource records are
+; not converted to lowercase. DNS names in the RDATA section of RRSIG
+; resource records are converted to lowercase."
+;
+; hark did the exact inverse for NSEC and was correct for RRSIG, in two
+; places: the parse-time RDATA scrub folded next_domain_name, and the
+; canonical serializer folded it again when rebuilding the signed data. So
+; any signer that preserves case in its chain failed verification and every
+; NXDOMAIN and NODATA in that zone came back bogus. RFC 4034 §6.2 originally
+; said to fold, RFC 3755 said not to, and 6840 settled it against 4034 to
+; match what signers already do.
+;
+; This scenario is 003 with `C.` spelled in uppercase in the NSEC RDATA. The
+; harness signs over the bytes as written, so hark and the signer only agree
+; if hark also leaves them alone. Nothing else changes — the canonical
+; ORDER is unaffected, since ordering compares case-insensitively and
+; `a. < b. < C.` either way.
+;
+; The asymmetry is the point: hark signing and verifying with its own
+; canonicalizer would agree with itself no matter which rule it used, so
+; only an external signer can discriminate here.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC C. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+SCENARIO_END

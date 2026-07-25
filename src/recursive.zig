@@ -4653,10 +4653,18 @@ test "tryParseMessage lowercases SOA mname AND rname via compression pointers" {
     try testing.expectEqualStrings("com", soa.rname.labels[1]);
 }
 
-test "tryParseMessage lowercases NSEC next_domain_name via compression pointer" {
-    // NSEC RDATA rides out of aggressive negative-synthesis answers
-    // verbatim via `nsecEntryToRecord` in nsec_cache.zig. Pre-fix,
-    // upstream-chosen case in next_domain_name leaked to DO=1 clients.
+test "tryParseMessage preserves NSEC next_domain_name case via compression pointer" {
+    // RFC 6840 §5.1: NSEC RDATA names are NOT case-folded when canonicalizing.
+    // This test used to assert the opposite, on the theory that
+    // upstream-chosen case leaking to DO=1 clients was the hazard. It is the
+    // other way round: those bytes are what the signature covers, so folding
+    // them breaks verification here *and* for any client validating the
+    // answer we forward. NSEC RDATA rides out of aggressive
+    // negative-synthesis answers verbatim via `nsecEntryToRecord`.
+    //
+    // The compression-pointer shape is the interesting one: the name is not
+    // written inline, so preserving case must not degrade into preserving the
+    // *pointer* into a wire buffer the message does not own.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var buf: [64]u8 = undefined;
@@ -4676,8 +4684,21 @@ test "tryParseMessage lowercases NSEC next_domain_name via compression pointer" 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const nsec = msg.answers[0].rdata.nsec;
     try testing.expectEqual(@as(usize, 2), nsec.next_domain_name.labels.len);
-    try testing.expectEqualStrings("x", nsec.next_domain_name.labels[0]);
-    try testing.expectEqualStrings("com", nsec.next_domain_name.labels[1]);
+    // Wire question is `\x01X\x03coM` — both labels keep their case.
+    try testing.expectEqualStrings("X", nsec.next_domain_name.labels[0]);
+    try testing.expectEqualStrings("coM", nsec.next_domain_name.labels[1]);
+
+    // Owner names ARE folded — only the NSEC RDATA name is exempt. Keeping
+    // both assertions in one test is what stops a future "just stop folding"
+    // from looking equivalent.
+    try testing.expectEqualStrings("x", msg.answers[0].name.labels[0]);
+
+    // And the preserved bytes are the message's own, not a window into `buf`.
+    for (nsec.next_domain_name.labels) |label| {
+        const inside = @intFromPtr(label.ptr) >= @intFromPtr(&buf) and
+            @intFromPtr(label.ptr) < @intFromPtr(&buf) + buf.len;
+        try testing.expect(!inside);
+    }
 }
 
 test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect buffer" {
