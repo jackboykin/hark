@@ -595,6 +595,23 @@ fn verifyRrsig(
         if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
     }
 
+    // An SOA or NS RRset *defines* the name it sits at: SOA marks an apex, and
+    // a signed NS marks a child-side apex, since RFC 4035 §2.2 forbids signing
+    // the parent-side delegation NS. Either way the containing zone is the
+    // owner itself, so a strictly-higher signer is wrong by definition — no
+    // knowledge of where the cuts are required. This is the one case where the
+    // §5.3.1 rule "the Signer's Name MUST be the name of the zone that contains
+    // the RRset" is decidable from the record alone; everywhere else the signer
+    // is an ancestor of the owner for every non-apex record in DNS and the test
+    // says nothing. BIND names it "SOA signer mismatch" / "NS signer mismatch"
+    // (lib/dns/validator.c:1473-1483); it is the only such check in Unbound or
+    // BIND, and hark had no equivalent.
+    if (rrsig.type_covered == .soa or rrsig.type_covered == .ns) {
+        for (rrset) |rr| {
+            if (!rr.name.eql(rrsig.signer_name)) return error.InvalidSignature;
+        }
+    }
+
     // RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
     const skew_ahead = now_u32 +% inception_skew_tolerance;
     const skew_behind = now_u32 -% expiration_skew_tolerance;
@@ -3738,6 +3755,56 @@ test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus"
         SecurityStatus.bogus,
         validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
     );
+}
+
+test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
+    // The signature is genuine and every other rule passes — RFC 4034 §3.1.3
+    // is satisfied because the signer *is* an ancestor of the owner, which is
+    // true of every non-apex record in DNS. Only the type-specific rule
+    // rejects: a signed NS marks a child-side apex (RFC 4035 §2.2 forbids
+    // signing the parent-side delegation NS) and an SOA marks an apex, so the
+    // containing zone is the owner itself.
+    const parent = dns.Name{ .labels = &.{ "example", "com" } };
+    const child = dns.Name{ .labels = &.{ "sub", "example", "com" } };
+    var budget: ValidationBudget = .{};
+
+    inline for (.{ dns.RType.ns, dns.RType.soa }) |rtype| {
+        const rdata: dns.RData = switch (rtype) {
+            .ns => .{ .ns = dns.Name{ .labels = &.{ "ns1", "example", "com" } } },
+            .soa => .{ .soa = .{
+                .mname = parent,
+                .rname = parent,
+                .serial = 1,
+                .refresh = 3600,
+                .retry = 600,
+                .expire = 604800,
+                .minimum = 300,
+            } },
+            else => unreachable,
+        };
+
+        // Owner strictly below the signer: rejected however good the signature.
+        var sig_buf: [64]u8 = undefined;
+        var pub_buf: [32]u8 = undefined;
+        const below = [_]dns.ResourceRecord{
+            .{ .name = child, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
+        };
+        const signed = try testSignRrset(&below, rtype, parent, &sig_buf, &pub_buf);
+        try testing.expectError(
+            error.InvalidSignature,
+            verifyRrsig(signed.rrsig, signed.dnskey, &below, 1_700_000_000, &budget),
+        );
+
+        // Owner == signer is the apex shape and must still verify, or the rule
+        // would reject every legitimate apex NS/SOA in existence.
+        var apex_sig_buf: [64]u8 = undefined;
+        var apex_pub_buf: [32]u8 = undefined;
+        const at_apex = [_]dns.ResourceRecord{
+            .{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
+        };
+        const apex = try testSignRrset(&at_apex, rtype, parent, &apex_sig_buf, &apex_pub_buf);
+        try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget);
+    }
 }
 
 /// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
