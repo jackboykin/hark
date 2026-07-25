@@ -817,42 +817,60 @@ fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_h
 
 // ── NSEC Proofs ──────────────────────────────────────────────────────
 
-/// DNAME (RFC 6672). Not a `dns.RType` member: naming it there would demand
-/// DNAME arms across the parser and printer, and hark does not synthesize
-/// DNAMEs. RFC 6840 §4.1 still requires recognizing the bitmap bit.
-const dname_rtype: dns.RType = @fromBackingInt(@intCast(39));
-
-/// RFC 6840 §4.1: an "ancestor delegation" NSEC — NS bit set, SOA bit clear
-/// — sits on the *parent* side of a zone cut and MUST NOT be used to assume
-/// the nonexistence of anything below that cut. Only DS lives on the parent
-/// side; everything else must be asked of the child. (The RFC's third
-/// condition, signer shorter than owner, is implied: a zone's own apex NSEC
+/// RFC 6840 §4.1: an "ancestor delegation" NSEC/NSEC3 — NS bit set, SOA bit
+/// clear — sits on the *parent* side of a zone cut. (The RFC's third
+/// condition, signer shorter than owner, is implied: a zone's own apex
 /// always carries SOA.)
-///
-/// Without this, a TLD operator's genuine, correctly-signed
-/// `example.com NSEC f.com` authenticates NXDOMAIN for every name under
-/// example.com — the parent legitimately owns a range that spans the whole
-/// child subtree in canonical order.
 fn isAncestorDelegation(type_bit_maps: []const u8) bool {
     return dns.typeBitmapContains(type_bit_maps, .ns) and
         !dns.typeBitmapContains(type_bit_maps, .soa);
 }
 
+/// RFC 6840 §4.1: records that prove nothing *below* their own owner name.
+/// An ancestor delegation may not deny anything under the cut — the child is
+/// authoritative there — and beneath a DNAME owner names are synthesized
+/// rather than absent.
+///
+/// Without this, a TLD operator's genuine, correctly-signed record denies a
+/// whole child zone: `example.com NSEC f.com` spans the entire example.com
+/// subtree in canonical order, and an NSEC3 matching `hash(example.com)`
+/// serves as closest encloser for every name in the child.
+fn provesNothingBelowOwner(type_bit_maps: []const u8) bool {
+    return isAncestorDelegation(type_bit_maps) or
+        dns.typeBitmapContains(type_bit_maps, .dname);
+}
+
+/// RFC 6840 §4.1 + §4.4: whether a bitmap is on the wrong side of a zone cut
+/// to deny `qtype` *at its own owner name*. A parent-side record knows only
+/// NS/DS, so it may prove nothing but DS; a child-side record (SOA set) never
+/// carries DS, so a missing DS bit there is not evidence that the delegation
+/// is unsigned — that is an authenticated downgrade waiting to happen.
+///
+/// Unusable, not self-contradictory: callers return `.unchecked`, because the
+/// server merely answered from the wrong side of its own cut.
+fn wrongSideOfCut(type_bit_maps: []const u8, qname: dns.Name, qtype: dns.RType) bool {
+    if (qtype == .ds) {
+        // The root has no parent, so its own apex record is the only thing
+        // that can ever answer for it.
+        return qname.labels.len > 0 and dns.typeBitmapContains(type_bit_maps, .soa);
+    }
+    return isAncestorDelegation(type_bit_maps);
+}
+
 /// Check if an NSEC record proves that `qname` does not exist.
-/// Returns true if qname falls in the range (nsec_owner, nsec_next).
+/// Returns true if qname falls in the range (nsec_owner, nsec_next) AND the
+/// record is allowed to speak for qname at all (RFC 6840 §4.1 — see
+/// `provesNothingBelowOwner`). `nsec_cache.checkCovering` reaches the §4.1
+/// rule through here, which is deliberate: one home for both callers.
 pub fn nsecProvesNameNonexistence(
     nsec_owner: dns.Name,
     nsec: dns.NsecData,
     qname: dns.Name,
 ) bool {
-    // RFC 6840 §4.1: neither an ancestor-delegation NSEC nor one whose owner
-    // carries DNAME may deny a name beneath its owner — below the cut the
-    // child is authoritative, and beneath a DNAME names are synthesized
-    // rather than absent. Strictly below only: a range starting at an
-    // ancestor still legitimately denies siblings in the same zone.
+    // Strictly below only: a range starting at an ancestor still legitimately
+    // denies siblings in the same zone.
     if (qname.labels.len > nsec_owner.labels.len and qname.isSubdomainOf(nsec_owner) and
-        (isAncestorDelegation(nsec.type_bit_maps) or
-            dns.typeBitmapContains(nsec.type_bit_maps, dname_rtype)))
+        provesNothingBelowOwner(nsec.type_bit_maps))
     {
         return false;
     }
@@ -877,10 +895,7 @@ fn nsecProvesTypeNonexistence(
     qtype: dns.RType,
 ) bool {
     if (!nsec_owner.eql(qname)) return false;
-    // RFC 6840 §4.1: at a cut, the parent's bitmap describes the parent's
-    // view — NS, RRSIG, NSEC, maybe DS. It says nothing about what the child
-    // holds, so it may not prove NODATA for any type but DS.
-    if (qtype != .ds and isAncestorDelegation(nsec.type_bit_maps)) return false;
+    if (wrongSideOfCut(nsec.type_bit_maps, qname, qtype)) return false;
     if (dns.typeBitmapContains(nsec.type_bit_maps, qtype)) return false;
     if (qtype == .cname) return true;
     return !dns.typeBitmapContains(nsec.type_bit_maps, .cname);
@@ -1006,18 +1021,28 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
 /// Validate an NXDOMAIN or NODATA response using NSEC/NSEC3 proofs.
 /// Returns the security status of the negative proof.
 ///
-/// PRECONDITION, and it is load-bearing: the caller must already have bound
-/// these authorities to a signer that covers `qname` (recursive.zig's
-/// `negativeProofBinds`). Nothing here ties the proof to a zone — geometry
-/// alone will happily accept a genuine wrap NSEC from an unrelated zone as
-/// denial of any name in the range.
+/// `zone` is the signer the caller authenticated these records under. It is
+/// not optional bookkeeping: geometry alone cannot tell an unrelated zone's
+/// NSEC from this zone's, so without it one genuine, publicly-fetchable wrap
+/// NSEC out of any signed zone denies arbitrary names (`zzz.example.net NSEC
+/// example.net` covers victim.com, the closest encloser clamps to root, and
+/// the same record covers the wildcard). `classifyDelegation` already takes a
+/// zone; this function being the odd one out is what made the hole reachable.
+///
+/// Tests that exercise pure range geometry pass root, which makes the check
+/// vacuous by construction — the binding itself is pinned by
+/// "validateNegativeProof binds the proof to its zone" below.
 pub fn validateNegativeProof(
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    zone: dns.Name,
     budget: *ValidationBudget,
 ) SecurityStatus {
+    // A proof signed by some other zone says nothing about this name.
+    if (!qname.isSubdomainOf(zone)) return .bogus;
+
     // Reject mixed NSEC/NSEC3
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
@@ -1029,6 +1054,9 @@ pub fn validateNegativeProof(
     var any_nsec = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec) continue;
+        // An owner outside the signing zone cannot be part of its chain, so
+        // it is not proof material here regardless of what its range spans.
+        if (!rr.name.isSubdomainOf(zone)) continue;
         any_nsec = true;
         if (matching_nsec == null and rr.name.eql(qname)) matching_nsec = rr;
         if (covering_nsec == null and
@@ -1043,10 +1071,10 @@ pub fn validateNegativeProof(
         if (matching_nsec) |rr| {
             if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, qname, qtype))
                 return .secure;
-            // A parent-side delegation NSEC at the cut is unusable here, not
-            // contradictory (RFC 6840 §4.1) — the child owns these types, and
-            // the server owed us a referral. Fall through to .unchecked.
-            if (qtype != .ds and isAncestorDelegation(rr.rdata.nsec.type_bit_maps))
+            // Answered from the wrong side of its own cut: unusable, not
+            // contradictory (RFC 6840 §4.1/§4.4). A parent-side NSEC owed us
+            // a referral; a child-side one owed us nothing about DS.
+            if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
                 return .unchecked;
             return .bogus;
         }
@@ -1135,6 +1163,17 @@ pub fn validateNegativeProof(
     return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, budget);
 }
 
+/// The zone whose keys an authority section's proofs rest on: the signer of
+/// its first RRSIG. `verifyAuthorityNsecSigs` only reports .secure when every
+/// NSEC/NSEC3 owner verifies under a key fetched for this name, so after a
+/// .secure verdict this name is the proof's whole authority.
+pub fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
+    for (authorities) |rr| {
+        if (rr.rtype == .rrsig) return rr.rdata.rrsig.signer_name;
+    }
+    return null;
+}
+
 /// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5).
 fn validateNsec3NegativeProof(
     authorities: []const dns.ResourceRecord,
@@ -1186,6 +1225,10 @@ fn validateNsec3NegativeProof(
             const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
                 const nsec3 = rr.rdata.nsec3;
+                // Same side-of-cut rule as the NSEC arm (RFC 6840 §4.1/§4.4).
+                // NSEC3 is the majority wire form — com/net/org all use it —
+                // so omitting it here would leave the rule on the minority case.
+                if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
                 if (dns.typeBitmapContains(nsec3.type_bit_maps, qtype) or
                     dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
                 {
@@ -1212,6 +1255,16 @@ fn validateNsec3NegativeProof(
         for (authorities) |rr| {
             const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
             if (mem.eql(u8, &owner_hash, &ancestor_hash)) {
+                // RFC 6840 §4.1: a closest encloser is by construction a
+                // proper ancestor of qname (ce_offset == 0 is rejected just
+                // below), so everything this proof goes on to deny lies below
+                // it. An ancestor-delegation or DNAME NSEC3 may not serve as
+                // that anchor — otherwise any TLD's own genuine delegation
+                // NSEC3 becomes the CE for every name in the child zone, and
+                // the next-closer and wildcard hashes then fall inside the
+                // parent's chain trivially, because those names are not in
+                // the parent at all.
+                if (provesNothingBelowOwner(rr.rdata.nsec3.type_bit_maps)) return .unchecked;
                 ce_idx = label_offset;
                 break;
             }
@@ -1565,6 +1618,11 @@ const test_dnskey = dns.DnskeyData{
     .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD },
 };
 
+/// Zone argument for tests that exercise pure range geometry: root makes the
+/// qname/owner binding vacuous, so those tests keep testing exactly what they
+/// tested before it existed. The binding has its own test.
+const test_root = dns.Name{ .labels = &.{} };
+
 const test_owner = dns.Name{
     .labels = &.{
         @as([]const u8, "example"),
@@ -1670,6 +1728,100 @@ test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
     try testing.expectError(
         error.InvalidSignature,
         validateDnskeyRrset(records[0..64], &.{ds}, test_owner, 1700000000, &budget),
+    );
+}
+
+test "verifyAuthorityNsecSigs: oversized owner+type is refused, not truncated" {
+    // Honest scope: the old truncating collect ALSO returned .bogus here, so
+    // this pins the boundary and the absence of an out-of-bounds write — not a
+    // closed hole. The refusal is structural consistency with the other two
+    // collects: for the truncated 16 to verify, an attacker would need a valid
+    // zone signature over 16 same-owner NSECs, and RFC 4034 §4 puts exactly one
+    // NSEC at an owner, so no such signature exists without the zone's key.
+    const nsec = dns.NsecData{
+        .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+        .type_bit_maps = &.{ 0x00, 0x01, 0x62 },
+    };
+    var rrs: [17]dns.ResourceRecord = undefined;
+    for (&rrs) |*r| r.* = .{
+        .name = test_owner,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .nsec = nsec },
+    };
+
+    var budget: ValidationBudget = .{};
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        verifyAuthorityNsecSigs(&rrs, &.{}, 1_700_000_000, &budget),
+    );
+    // 16 is within the buffer and fails on the ordinary no-signature path,
+    // so the boundary is the size check and not a signature accident.
+    var budget2: ValidationBudget = .{};
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        verifyAuthorityNsecSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2),
+    );
+}
+
+test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" {
+    // The property the size check exists for, with actual crypto: sign exactly
+    // the 64 keys the old truncating collect would have kept, append a forged
+    // 65th, and confirm the RRset is refused rather than validated as a
+    // prefix. A prefix-verify here would trust every key in the message.
+    var recs: [65]dns.ResourceRecord = undefined;
+    var pub_bufs: [65][32]u8 = undefined;
+    for (&recs, 0..) |*r, i| {
+        pub_bufs[i] = @splat(@intCast(i + 1));
+        r.* = dnskeyRr(test_owner, .{
+            .flags = 256,
+            .protocol = 3,
+            .algorithm = .ed25519,
+            .public_key = &pub_bufs[i],
+        });
+    }
+
+    var sig_bytes: [64]u8 = undefined;
+    var signer_pub: [32]u8 = undefined;
+    const signed = try testSignRrset(recs[0..64], .dnskey, test_owner, &sig_bytes, &signer_pub);
+    // The signing key must itself be in the RRset and DS-anchored, or the
+    // refusal could be blamed on anchoring rather than on size.
+    recs[0] = dnskeyRr(test_owner, signed.dnskey);
+    var sig2: [64]u8 = undefined;
+    const resigned = try testSignRrset(recs[0..64], .dnskey, test_owner, &sig2, &signer_pub);
+    recs[0] = dnskeyRr(test_owner, resigned.dnskey);
+
+    var digest = try testDsDigest(test_owner, resigned.dnskey);
+    const ds = dns.DsData{
+        .key_tag = keyTag(resigned.dnskey),
+        .algorithm = .ed25519,
+        .digest_type = .sha256,
+        .digest = &digest,
+    };
+    const sig_rr = dns.ResourceRecord{
+        .name = test_owner,
+        .rtype = .rrsig,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .rrsig = resigned.rrsig },
+    };
+
+    // Control: the signed 64 plus their RRSIG validate.
+    var ok: [65]dns.ResourceRecord = undefined;
+    @memcpy(ok[0..64], recs[0..64]);
+    ok[64] = sig_rr;
+    var budget: ValidationBudget = .{};
+    try validateDnskeyRrset(&ok, &.{ds}, test_owner, 1_700_000_000, &budget);
+
+    // The 65th key must not ride in on that signature.
+    var laundered: [66]dns.ResourceRecord = undefined;
+    @memcpy(laundered[0..65], &recs);
+    laundered[65] = sig_rr;
+    var budget2: ValidationBudget = .{};
+    try testing.expectError(
+        error.InvalidKey,
+        validateDnskeyRrset(&laundered, &.{ds}, test_owner, 1_700_000_000, &budget2),
     );
 }
 
@@ -2399,7 +2551,7 @@ test "validateNegativeProof NSEC NODATA" {
 
     // NODATA for AAAA should be proven secure
     var b: ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, name, .aaaa, false, &b);
+    const status = validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -2419,17 +2571,17 @@ test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)
     const parent_auth = [_]dns.ResourceRecord{nsecRrWithBitmap(cut, next, &parent_side)};
     try testing.expectEqual(
         SecurityStatus.unchecked,
-        validateNegativeProof(&parent_auth, victim, .a, true, &b),
+        validateNegativeProof(&parent_auth, victim, .a, true, test_root, &b),
     );
     // NODATA at the cut itself is equally barred — for every type but DS,
     // which is the one thing that does live on the parent side.
     try testing.expectEqual(
         SecurityStatus.unchecked,
-        validateNegativeProof(&parent_auth, cut, .a, false, &b),
+        validateNegativeProof(&parent_auth, cut, .a, false, test_root, &b),
     );
     try testing.expectEqual(
         SecurityStatus.secure,
-        validateNegativeProof(&parent_auth, cut, .ds, false, &b),
+        validateNegativeProof(&parent_auth, cut, .ds, false, test_root, &b),
     );
 
     // Same geometry signed by the child: an apex NSEC carries SOA, and its
@@ -2437,7 +2589,7 @@ test "validateNegativeProof rejects an ancestor-delegation NSEC (RFC 6840 §4.1)
     const child_auth = [_]dns.ResourceRecord{nsecRrWithBitmap(cut, next, &child_apex)};
     try testing.expectEqual(
         SecurityStatus.secure,
-        validateNegativeProof(&child_auth, victim, .a, true, &b),
+        validateNegativeProof(&child_auth, victim, .a, true, test_root, &b),
     );
 }
 
@@ -2456,7 +2608,7 @@ test "validateNegativeProof NSEC NXDOMAIN" {
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     var b: ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
+    const status = validateNegativeProof(&authorities, beta, .a, true, test_root, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -2469,7 +2621,7 @@ test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     var b: ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
+    const status = validateNegativeProof(&authorities, beta, .a, true, test_root, &b);
     try testing.expectEqual(SecurityStatus.unchecked, status);
 }
 
@@ -2497,7 +2649,7 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE (not zone apex)" {
         nsecRr(sub, aaa_sub), // covers *.sub.example.com: sub < *.sub < aaa.sub
     };
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, missing, .a, true, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" {
@@ -2515,7 +2667,7 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
         nsecRr(example_com, aaa), // covers *.example.com only (wrong level)
     };
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, missing, .a, true, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN deep qname still needs wildcard denial" {
@@ -2528,7 +2680,7 @@ test "validateNegativeProof NSEC NXDOMAIN deep qname still needs wildcard denial
     const qname = dns.Name{ .labels = &.{ "a", "b", "c", "example", "com" } };
     const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
     var b: ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, qname, .a, true, &b);
+    const status = validateNegativeProof(&authorities, qname, .a, true, test_root, &b);
     try testing.expectEqual(SecurityStatus.unchecked, status);
 }
 
@@ -2543,7 +2695,7 @@ test "validateNegativeProof NSEC NODATA at empty non-terminal (live ip6.arpa sha
     const qname = dns.Name{ .labels = &.{ "6", "2", "ip6", "arpa" } };
     const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN with ENT closest encloser (live ip6.arpa shape)" {
@@ -2563,7 +2715,7 @@ test "validateNegativeProof NSEC NXDOMAIN with ENT closest encloser (live ip6.ar
     };
     const qname = dns.Name{ .labels = &.{ "xx", "6", "2", "ip6", "arpa" } };
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
@@ -2577,7 +2729,7 @@ test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
     var b: ValidationBudget = .{};
-    const status = validateNegativeProof(&authorities, beta, .a, true, &b);
+    const status = validateNegativeProof(&authorities, beta, .a, true, test_root, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
@@ -2601,7 +2753,7 @@ test "validateNegativeProof NSEC NXDOMAIN apex-NSEC shape (clamped CE)" {
     const authorities = [_]dns.ResourceRecord{nsecRr(apex, next)};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" {
@@ -2622,7 +2774,7 @@ test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" 
 
     const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA NXDOMAIN-shape under NOERROR (RFC 4035 §5.4)" {
@@ -2634,7 +2786,7 @@ test "validateNegativeProof NSEC NODATA NXDOMAIN-shape under NOERROR (RFC 4035 �
     const authorities = [_]dns.ResourceRecord{nsecRr(apex, next)};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
@@ -2653,7 +2805,7 @@ test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
 
     const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, https, false, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
@@ -2672,7 +2824,7 @@ test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
     };
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA owner-match with qtype in bitmap is .bogus" {
@@ -2682,7 +2834,7 @@ test "validateNegativeProof NSEC NODATA owner-match with qtype in bitmap is .bog
     const authorities = [_]dns.ResourceRecord{nsecRrWithBitmap(name, next, &bitmap)};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, name, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unchecked" {
@@ -2694,7 +2846,7 @@ test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unche
     const authorities = [_]dns.ResourceRecord{nsecRr(aaa, zzz)};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, &b));
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
 // ── NSEC3 Helper Tests ───────────────────────────────────────────────
@@ -2847,12 +2999,14 @@ test "NSEC3 unknown hash algorithm yields .insecure (RFC 6840 §5.11)" {
     }};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
 test "NSEC3 NODATA - secure" {
     // Query: example.com AAAA (NODATA)
-    // NSEC3 at hash(example.com) has A and NS but not AAAA, not CNAME
+    // NSEC3 at hash(example.com) has A, NS and SOA but not AAAA, not CNAME.
+    // SOA is load-bearing: NS without it is the parent side of a cut, which
+    // RFC 6840 §4.1 bars from proving anything but DS.
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -2863,11 +3017,77 @@ test "NSEC3 NODATA - secure" {
     var bufs: Nsec3OwnerBufs = .{};
     const owner_name = makeNsec3OwnerName(hash, zone_labels, &bufs.enc, &bufs.labels);
 
-    // Bitmap: A(bit1=0x40) + NS(bit2=0x20) = 0x60
-    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x60 })};
+    // Bitmap: A(bit1=0x40) + NS(bit2=0x20) + SOA(bit6=0x02) = 0x62
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x62 })};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
+}
+
+test "NSEC3 rejects an ancestor-delegation record (RFC 6840 §4.1)" {
+    // NSEC3 is what com/net/org actually sign with, so the §4.1 rule matters
+    // more here than on the NSEC path. Two shapes, one genuine record: com's
+    // own NSEC3 matching hash(example.com) with NS set and SOA clear.
+    const salt: []const u8 = &.{};
+    const zone_labels: []const []const u8 = &.{"com"};
+    const cut = dns.Name{ .labels = &.{ "example", "com" } };
+    const below = dns.Name{ .labels = &.{ "www", "example", "com" } };
+
+    const cut_hash = try nsec3Hash(cut, salt, 0);
+    var bufs: Nsec3OwnerBufs = .{};
+    const cut_owner = makeNsec3OwnerName(cut_hash, zone_labels, &bufs.enc, &bufs.labels);
+    const parent_side = [_]u8{ 0x00, 0x01, 0x20 }; // NS only
+
+    // (a) NODATA at the cut for a non-DS type: the parent's bitmap says
+    //     nothing about what the child holds.
+    var b: ValidationBudget = .{};
+    const at_cut = [_]dns.ResourceRecord{makeNsec3Rr(cut_owner, salt, &@as([20]u8, @splat(0xFF)), &parent_side)};
+    try testing.expectEqual(
+        SecurityStatus.unchecked,
+        validateNegativeProof(&at_cut, cut, .a, false, test_root, &b),
+    );
+    // DS is the exception that makes the delegation NSEC3 useful at all.
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateNegativeProof(&at_cut, cut, .ds, false, test_root, &b),
+    );
+
+    // (b) NXDOMAIN below the cut: the delegation NSEC3 must not serve as
+    //     closest encloser. The next-closer and wildcard hashes are covered
+    //     trivially — 0x00..0xFF spans everything — which is exactly why the
+    //     CE anchor is the check that has to hold.
+    const wide = [_]dns.ResourceRecord{
+        makeNsec3Rr(cut_owner, salt, &@as([20]u8, @splat(0xFF)), &parent_side),
+    };
+    try testing.expectEqual(
+        SecurityStatus.unchecked,
+        validateNegativeProof(&wide, below, .a, true, test_root, &b),
+    );
+}
+
+test "NSEC3 child-side apex cannot deny DS (RFC 6840 §4.4)" {
+    // A signed child's own apex NSEC3 never carries the DS bit — DS lives in
+    // the parent. Reading its absence as proof of an unsigned delegation is
+    // an authenticated downgrade of the whole child zone.
+    const salt: []const u8 = &.{};
+    const apex = dns.Name{ .labels = &.{ "example", "com" } };
+    const hash = try nsec3Hash(apex, salt, 0);
+    var bufs: Nsec3OwnerBufs = .{};
+    const owner = makeNsec3OwnerName(hash, &.{ "example", "com" }, &bufs.enc, &bufs.labels);
+    // A NS SOA RRSIG NSEC DNSKEY — no DS.
+    const child_apex = [_]u8{ 0x00, 0x07, 0x62, 0x00, 0x00, 0x00, 0x00, 0x03, 0x80 };
+
+    var b: ValidationBudget = .{};
+    const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner, salt, &@as([20]u8, @splat(0xFF)), &child_apex)};
+    try testing.expectEqual(
+        SecurityStatus.unchecked,
+        validateNegativeProof(&authorities, apex, .ds, false, test_root, &b),
+    );
+    // It still answers what it legitimately can.
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateNegativeProof(&authorities, apex, .txt, false, test_root, &b),
+    );
 }
 
 test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
@@ -2884,7 +3104,7 @@ test "NSEC3 NODATA - CNAME in bitmap is .bogus" {
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x04 })};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
 }
 
 test "NSEC3 NXDOMAIN - closest encloser proof" {
@@ -2921,7 +3141,7 @@ test "NSEC3 NXDOMAIN - closest encloser proof" {
     };
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "NSEC3 NXDOMAIN - missing wildcard cover" {
@@ -2949,7 +3169,7 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
     };
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.6)" {
@@ -2977,7 +3197,7 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.6)" {
 
     const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
 }
 
 test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
@@ -3006,7 +3226,7 @@ test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
     };
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
 test "NSEC3 NXDOMAIN wildcard-match with qtype present is .bogus" {
@@ -3035,7 +3255,7 @@ test "NSEC3 NXDOMAIN wildcard-match with qtype present is .bogus" {
     };
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "classifyDelegation NSEC3 match" {
@@ -3099,7 +3319,7 @@ test "NSEC3 hash budget exhaustion" {
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
 
     var b: ValidationBudget = .{ .max_nsec3_hash = 32 };
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
 }
 
 test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
@@ -3132,8 +3352,8 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
 
     // Both NXDOMAIN and NODATA negative-proof paths return .insecure
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, &b));
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false, &b));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 
     // classifyDelegation matches: high-iteration NSEC3 → insecure delegation
     const child_zone = dns.Name{ .labels = zone_labels };
@@ -3199,7 +3419,7 @@ test "refuses NSEC3 floods before hashing (Knot >8-record cap)" {
     const child_zone = dns.Name{ .labels = &.{ "victim", "example", "com" } };
     try testing.expectEqual(SecurityStatus.bogus, classifyDelegation(&rrs, child_zone, &b));
     const qname = dns.Name{ .labels = &.{ "absent", "example", "com" } };
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&rrs, qname, .a, true, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&rrs, qname, .a, true, test_root, &b));
     try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent.load(.monotonic));
 }
 
@@ -3217,10 +3437,10 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
 
     var b: ValidationBudget = .{ .max_nsec3_hash = 2 };
-    const first = validateNegativeProof(&authorities, qname, .a, false, &b);
+    const first = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.unchecked, first);
     try testing.expectEqual(@as(u32, 2), b.nsec3_hash_spent.load(.monotonic));
-    const second = validateNegativeProof(&authorities, qname, .a, false, &b);
+    const second = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.bogus, second);
 }
 

@@ -2339,7 +2339,7 @@ pub const RecursiveResolver = struct {
         authorities: []const dns.ResourceRecord,
         parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
-        const signer = authoritySigner(authorities) orelse return .unchecked;
+        const signer = dnssec.authoritySigner(authorities) orelse return .unchecked;
 
         // RFC 4034 §3.1.3: verify authority record owners are under the signer zone
         for (authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
@@ -2372,9 +2372,22 @@ pub const RecursiveResolver = struct {
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 
-        if (!negativeProofBinds(authorities, zone, qname)) return .bogus;
+        // `zone` is the deepest *cached* delegation, not the answering
+        // server's real apex. A child folded back into its parent while hark
+        // still holds the cut leaves a server legitimately signing as the
+        // parent — above our tracked zone. That is a lame-cut condition, not
+        // a forgery, so it degrades to unauthenticated-and-uncached rather
+        // than SERVFAIL. Refusing here would be perverse in the other
+        // direction too: an attacker who simply strips the RRSIGs lands on
+        // `.unchecked` above and gets the answer *served*, so the verified
+        // path must not be harsher than the absent one.
+        const signer = dnssec.authoritySigner(authorities) orelse return .skip_cache;
+        if (!signer.isSubdomainOf(zone)) return .skip_cache;
 
-        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, self.validationBudget());
+        // Past here the signer is authenticated and at-or-below the cut, so it
+        // is the authority the proof rests on — the zone geometry is judged
+        // against.
+        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, signer, self.validationBudget());
     }
 
     fn resolveNsAddresses(
@@ -3226,44 +3239,20 @@ fn extractReferral(
 
 const NegativeValidation = enum { proceed, skip_cache, bogus };
 
-/// The zone whose keys an authority section's proofs rest on: the signer of
-/// its first RRSIG. `verifyAuthorityNsecSigs` only reports .secure when every
-/// NSEC/NSEC3 owner verifies under a key fetched for this name, so after a
-/// .secure verdict this name is the proof's whole authority.
-fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
-    for (authorities) |rr| {
-        if (rr.rtype == .rrsig) return rr.rdata.rrsig.signer_name;
-    }
-    return null;
-}
-
-/// Signatures verifying is not the same as the proof being *about* qname.
-/// verifyAuthoritySigs binds NSEC owners to the signer; nothing binds the
-/// signer to the zone we asked or qname to the signer. Without both, one
-/// genuine, publicly-fetchable wrap NSEC from any signed zone is an
-/// authenticated NXDOMAIN and NODATA for arbitrary names — no forged crypto
-/// needed: `zzz.example.net NSEC example.net` covers victim.com (com < net),
-/// the closest encloser clamps to root, and the same record covers the
-/// wildcard. An ancestor signer is the same trap one level up, so the proof
-/// must come from at or below the delegation point we are talking to.
-fn negativeProofBinds(authorities: []const dns.ResourceRecord, zone: dns.Name, qname: dns.Name) bool {
-    const signer = authoritySigner(authorities) orelse return false;
-    return signer.isSubdomainOf(zone) and qname.isSubdomainOf(signer);
-}
-
 fn validateNegativeResponse(
     security_state: dnssec.SecurityStatus,
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    zone: dns.Name,
     budget: *dnssec.ValidationBudget,
 ) NegativeValidation {
     if (security_state != .secure) return .proceed;
     // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative
     // response must carry a complete proof; an incomplete one (.unchecked)
     // fails closed. .insecure (RFC 6840 §5.11) still proceeds without AD.
-    return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, budget)) {
+    return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget)) {
         .secure => .proceed,
         .insecure => .skip_cache,
         .bogus => .bogus,
@@ -3933,17 +3922,19 @@ test "validateNegativeResponse returns proceed when security_state is not secure
     const name = dns.Name{ .labels = &.{ "example", "com" } };
     var b: dnssec.ValidationBudget = .{};
     // unchecked/insecure → proceed regardless of authorities
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true, &b));
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false, &b));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true, test_root, &b));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false, test_root, &b));
 }
 
-test "negativeProofBinds rejects a genuine NSEC from an unrelated zone" {
+const test_root = dns.Name{ .labels = &.{} };
+
+test "validateNegativeResponse binds a proof to the zone that signed it" {
     // The live counterexample: one publicly-fetchable wrap NSEC out of
-    // example.net proves NXDOMAIN *and* NODATA for victim.com in
-    // validateNegativeProof (com < net, so the wrap range covers it, the
-    // closest encloser clamps to root, and the same record covers the
-    // wildcard). Every signature involved is real — only the binding to the
-    // zone we queried stops it.
+    // example.net proves NXDOMAIN *and* NODATA for victim.com on geometry
+    // alone (com < net, so the wrap range covers it, the closest encloser
+    // clamps to root, and the same record covers the wildcard). Every
+    // signature involved is real — only the zone binding stops it.
+    testing.log_level = .err; // silence the fail-closed diagnostic warn
     const net_zone = dns.Name{ .labels = &.{ "example", "net" } };
     const authorities = [_]dns.ResourceRecord{
         .{
@@ -3953,41 +3944,43 @@ test "negativeProofBinds rejects a genuine NSEC from an unrelated zone" {
             .ttl = 3600,
             .rdata = .{ .nsec = .{ .next_domain_name = net_zone, .type_bit_maps = &.{} } },
         },
-        .{
-            .name = dns.Name{ .labels = &.{ "zzz", "example", "net" } },
-            .rtype = .rrsig,
-            .rclass = .in,
-            .ttl = 3600,
-            .rdata = .{ .rrsig = .{
-                .type_covered = .nsec,
-                .algorithm = .ecdsap256sha256,
-                .labels = 3,
-                .original_ttl = 3600,
-                .sig_inception = 0,
-                .sig_expiration = 0xFFFFFFFF,
-                .key_tag = 1,
-                .signer_name = net_zone,
-                .signature = &.{},
-            } },
-        },
     };
     const victim = dns.Name{ .labels = &.{ "victim", "com" } };
-    // The proof itself is still "complete" — that is the whole problem.
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(dnssec.SecurityStatus.secure, dnssec.validateNegativeProof(&authorities, victim, .a, true, &b));
 
-    // Queried com's servers: signer isn't under the zone we asked.
-    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{"com"} }, victim));
-    // Queried the root, where every signer passes the zone test: qname is
-    // still not under the signer.
-    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{} }, victim));
-    // Its own zone, its own names: fine.
-    try testing.expect(negativeProofBinds(&authorities, net_zone, dns.Name{ .labels = &.{ "gone", "example", "net" } }));
-    // A deeper child answering for itself is fine; an ancestor signer is not.
-    try testing.expect(negativeProofBinds(&authorities, dns.Name{ .labels = &.{"net"} }, net_zone));
-    try testing.expect(!negativeProofBinds(&authorities, dns.Name{ .labels = &.{ "sub", "example", "net" } }, victim));
-    // No RRSIG at all: no authority to bind to.
-    try testing.expect(!negativeProofBinds(&.{}, net_zone, victim));
+    // Unbound (root zone): the proof is "complete" — that is the whole problem.
+    try testing.expectEqual(
+        dnssec.SecurityStatus.secure,
+        dnssec.validateNegativeProof(&authorities, victim, .a, true, test_root, &b),
+    );
+
+    // Bound to the zone that actually signed it: victim.com is not under it,
+    // and neither is the NSEC owner a member of any chain covering victim.com.
+    try testing.expectEqual(
+        NegativeValidation.bogus,
+        validateNegativeResponse(.secure, &authorities, victim, .a, true, net_zone, &b),
+    );
+
+    // Positive control: the same zone denying one of its own names. The wrap
+    // covers zzzz.example.net, and the apex NSEC covers *.example.net, so the
+    // §5.4 pair is complete and the binding lets it through.
+    const in_zone_auth = authorities ++ [_]dns.ResourceRecord{.{
+        .name = net_zone,
+        .rtype = .nsec,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{
+            .nsec = .{
+                .next_domain_name = dns.Name{ .labels = &.{ "a", "example", "net" } },
+                .type_bit_maps = &.{ 0x00, 0x01, 0x62 }, // A NS SOA: a real apex
+            },
+        },
+    }};
+    const in_zone = dns.Name{ .labels = &.{ "zzzz", "example", "net" } };
+    try testing.expectEqual(
+        NegativeValidation.proceed,
+        validateNegativeResponse(.secure, &in_zone_auth, in_zone, .a, true, net_zone, &b),
+    );
 }
 
 test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
@@ -4023,7 +4016,7 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true, &b));
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true, test_root, &b));
 }
 
 test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
@@ -4045,7 +4038,7 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false, &b));
+    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false, test_root, &b));
 }
 
 test "validateNegativeResponse returns bogus when no proof found in secure zone" {
@@ -4056,8 +4049,8 @@ test "validateNegativeResponse returns bogus when no proof found in secure zone"
     // signed zones. Fail closed rather than serving the unauthenticated
     // NXDOMAIN/NODATA.
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true, &b));
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false, &b));
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true, test_root, &b));
+    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false, test_root, &b));
 }
 
 test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
@@ -4079,7 +4072,7 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
     var b: dnssec.ValidationBudget = .{};
     try testing.expectEqual(
         NegativeValidation.bogus,
-        validateNegativeResponse(.secure, &authorities, beta, .a, true, &b),
+        validateNegativeResponse(.secure, &authorities, beta, .a, true, test_root, &b),
     );
 }
 

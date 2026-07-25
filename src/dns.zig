@@ -93,6 +93,10 @@ pub const RType = enum(u16) {
     mx = 15,
     txt = 16,
     aaaa = 28,
+    /// RFC 6672. hark does not synthesize DNAMEs (RDATA parses as `.unknown`),
+    /// but RFC 6840 §4.1 requires recognizing the bit in an NSEC/NSEC3 bitmap:
+    /// names beneath a DNAME owner are synthesized, not absent.
+    dname = 39,
     opt = 41,
     ds = 43,
     rrsig = 46,
@@ -932,7 +936,7 @@ pub const Parser = struct {
                     .salt = try self.readSlice(salt_len),
                 } };
             },
-            .opt, .any, _ => {
+            .opt, .any, .dname, _ => {
                 const data = try self.readSlice(rdlength);
                 return .{ .unknown = data };
             },

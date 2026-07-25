@@ -1420,9 +1420,12 @@ test "NSEC cache: DS query below a delegation is not answered from the parent" {
     // parent's authority stops AT bar.example.com — below it only the child
     // can speak, DS included (RFC 6840 §4.1: "all RRs at that owner name other
     // than DS RRs, and all RRs below that owner name regardless of type").
-    // The refusal now comes from the shared `nsecProvesNameNonexistence`
-    // primitive, so findCovering never returns the range at all; the DS
-    // clauses in isParentSideNsec handle the owner-match shapes below.
+    // Two independent guards now refuse this, and the test passes if either
+    // survives: the shared `nsecProvesNameNonexistence` primitive (so
+    // findCovering never returns the range) and `isParentSideNsec`'s
+    // `!target.eql(nsec.owner)` DS clause. Deleting one alone will NOT fail
+    // this test — the belt-and-braces is deliberate, but do not read a green
+    // run here as coverage of either guard on its own.
     const alloc = testing.allocator;
     test_time = 1000000;
     var nc = testCache(alloc);
