@@ -124,7 +124,7 @@ const max_minimize_count = 10;
 /// Leaves the question section alone — `eqlExact` compares it byte-for-
 /// byte against the outgoing 0x20-echo query.
 fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Address) error{OutOfMemory}!?dns.Message {
-    const msg = dns.parseMessage(allocator, data) catch |err| switch (err) {
+    var msg = dns.parseMessage(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => {
             @branchHint(.cold);
             return error.OutOfMemory;
@@ -141,6 +141,16 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
     // parse failure to every consumer. Reject before the lowercase scrub
     // so garbage doesn't pay for name clones.
     if (!msg.header.flags.qr) return null;
+
+    // RFC 4035 §3.2.3: AD is a validator's *output*. Authoritative servers
+    // have no business setting it, but Route 53 sets it on every DO=1 reply,
+    // including for zones with no DS at all — and hark carried the bit
+    // through resolution into the client reply (response.zig only ANDs it
+    // with the client's DO/AD bit). Every unsigned domain on Route 53 was
+    // therefore answered "DNSSEC-authenticated". hark's own verdict re-sets
+    // the bit in validateAnswer and the negative-proof paths; nothing
+    // upstream may.
+    msg.header.flags.ad = false;
 
     // `@constCast` is sound — parseMessage returns ArrayList-backed
     // mutable storage typed `[]const`. The pre-scrub label bytes alias
@@ -4342,6 +4352,21 @@ test "tryParseMessage lowercases answer owner names but preserves question case"
     try testing.expectEqual(@as(usize, 2), msg.answers[0].name.labels.len);
     try testing.expectEqualStrings("x", msg.answers[0].name.labels[0]);
     try testing.expectEqualStrings("com", msg.answers[0].name.labels[1]);
+}
+
+test "tryParseMessage clears an upstream-set AD bit" {
+    // Route 53 sets AD on every DO=1 reply, including for zones with no DS.
+    // Carried through, that bit reaches the client as "DNSSEC-authenticated"
+    // for data hark never validated.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    const wire = buildMixedCaseAnswerPacket(&buf);
+    mem.writeInt(u16, buf[2..4], 0x81A0, .big); // qr rd ra + AD
+
+    const server = na.initIp4(.{ 127, 0, 0, 1 }, 53);
+    const msg = (try tryParseMessage(arena.allocator(), wire, server)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(false, msg.header.flags.ad);
 }
 
 test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
