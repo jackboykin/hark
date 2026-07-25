@@ -2504,7 +2504,10 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         // here — case randomization affects the echoed QNAME and owner names,
         // never a signer-chosen next_domain — and range comparisons go through
         // case-insensitive cmpLabelsCI regardless.
-        .nsec => |*n| n.next_domain_name = try cloneName(allocator, n.next_domain_name),
+        // `cloneNameFlat`, not `cloneName`: same single-allocation shape as the
+        // `cloneNameLower` it replaced. The per-label variant would turn one
+        // allocation into N+1 for every NSEC on the parse path.
+        .nsec => |*n| n.next_domain_name = (try cloneNameFlat(allocator, n.next_domain_name)).toUnownedName(),
     }
 }
 
