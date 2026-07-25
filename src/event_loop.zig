@@ -32,6 +32,17 @@ pub const OperationId = u16;
 pub const Completion = struct {
     context: *anyopaque,
     result: Result,
+    /// True when the kernel finished with this operation and its slot was
+    /// freed — for multishot, when IORING_CQE_F_MORE was clear. The caller
+    /// must re-arm iff this is set.
+    ///
+    /// This travels on the completion rather than being asked of the slot
+    /// table afterwards because by then the answer is gone: a batch frees
+    /// every terminated slot before the caller sees any completion, the free
+    /// list is LIFO, and re-arming one listener mid-batch can hand it the id
+    /// another listener just released. Asking "is op N still armed?" would
+    /// then inspect a stranger's fresh operation.
+    terminated: bool = false,
 };
 
 pub const Result = union(enum) {
@@ -273,16 +284,6 @@ pub const EventLoop = struct {
         self.udp_buf_ring.release(buf_id);
     }
 
-    /// True iff `op_id` refers to a multishot op whose slot the kernel
-    /// still holds (IORING_CQE_F_MORE was set on the most recent CQE).
-    /// Callers use this after processing a CQE to decide whether to
-    /// re-arm the op.
-    pub fn stillArmed(self: *const EventLoop, op_id: ?OperationId) bool {
-        const id = op_id orelse return false;
-        const slot = &self.slots[id];
-        return slot.active and slot.state == .recv_multi;
-    }
-
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
         const id = try self.initOp(.{ .accept = .{
             .addr = std.mem.zeroes(na.PosixAddress),
@@ -431,6 +432,7 @@ pub const EventLoop = struct {
                 },
             }
 
+            completion.terminated = free_after;
             if (free_after) self.freeSlot(id);
             out += 1;
         }
@@ -562,10 +564,12 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
                 },
                 else => {},
             }
+            // Multishot keeps delivering on one SQE: every CQE carrying a
+            // payload must report the op as still live (F_MORE set), so no
+            // re-registration happens between packets.
+            if (c.result == .recv and c.result.recv.err == null and !c.terminated)
+                still_armed_seen = true;
         }
-        // After the first CQE, the SQE should still be armed (F_MORE);
-        // slot stays active with no re-registration.
-        if (received > 0 and loop.stillArmed(op_id)) still_armed_seen = true;
         if (received == payloads.len) break;
     }
 
@@ -611,6 +615,67 @@ test "EventLoop cancel pending recvFromMulti" {
     }
 
     try testing.expect(got_cancelled);
+}
+
+test "termination is reported per-CQE, not by asking the recycled slot table" {
+    // Two multishot listeners terminate in one batch — flood-triggerable for
+    // real via ENOBUFS on the shared buffer ring; here via cancel. reap frees
+    // both slots before the caller sees either completion, and the free list
+    // is LIFO, so re-arming the first listener mid-batch hands it the id the
+    // second just released.
+    //
+    // The old code then asked the slot table "is listener 2 still armed?",
+    // saw listener 1's fresh op sitting in that id, and answered yes — so
+    // listener 2 was never re-armed, and because its op id stayed non-null
+    // the repair loop skipped it too. A permanently deaf UDP listener, with
+    // SO_REUSEPORT still hashing traffic to it, silent until restart.
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    var socks: [2]posix.fd_t = undefined;
+    var ctxs: [2]u8 = .{ 1, 2 };
+    var ops: [2]?OperationId = undefined;
+    for (&socks, 0..) |*s, i| {
+        s.* = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+        var bind_pa: na.PosixAddress = undefined;
+        const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+        try sys.bind(s.*, &bind_pa.any, bind_len);
+        ops[i] = try loop.recvFromMulti(s.*, @ptrCast(&ctxs[i]));
+    }
+    defer for (socks) |s| sys.close(s);
+
+    for (ops) |op| try loop.cancel(op.?);
+
+    var completions: [max_operations]Completion = undefined;
+    var terminations: usize = 0;
+    var rearmed_mid_batch = false;
+
+    for (0..5) |_| {
+        const results = try loop.tick(&completions);
+        for (results) |c| {
+            if (c.result != .recv) continue;
+            // Every cancelled multishot must report termination. The second
+            // one in the batch is the one the ABA used to swallow.
+            try testing.expect(c.terminated);
+            terminations += 1;
+            // Re-arm into the just-freed id while the rest of the batch is
+            // still unread — this is the step that used to corrupt the answer
+            // for everyone after it.
+            if (!rearmed_mid_batch) {
+                rearmed_mid_batch = true;
+                const idx: usize = @as(*u8, @ptrCast(@alignCast(c.context))).* - 1;
+                ops[idx] = try loop.recvFromMulti(socks[idx], @ptrCast(&ctxs[idx]));
+            }
+        }
+        if (terminations >= 2) break;
+    }
+
+    try testing.expectEqual(@as(usize, 2), terminations);
+    try testing.expect(rearmed_mid_batch);
+
+    for (ops) |op| if (op) |o| loop.cancel(o) catch {};
+    loop.flush();
 }
 
 test "read payload survives an op arming into the freed slot mid-batch" {
