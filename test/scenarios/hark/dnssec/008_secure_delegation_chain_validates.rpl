@@ -1,0 +1,75 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN secure two-zone delegation chain validates end to end
+
+; The first scenario in this suite with more than one signed zone. Until the
+; harness learned to emit a DS, every DNSSEC scenario was root-only, so hark's
+; whole chain-walking apparatus — fetchDsFromParent, validateDnskeyAgainstDs,
+; classifyDelegation, reproveDelegationSecurity — had no end-to-end coverage
+; at all. That gap is why a bug as plain as "ask the child for its own DS"
+; (3abd644) survived to be found by diff-rolling instead of by the suite.
+;
+; `DS PLACEHOLDER` is substituted by the responder with the real
+; digest of example.'s generated key: a .rpl record is static text and cannot
+; spell a digest that does not exist until run time.
+;
+; Topology
+;   root     127.0.10.1   delegates example. with a DS, signs the DS as `.`
+;   example  127.0.10.2   apex, signs its own data as `example.`
+;
+; Expected: hark validates `. DNSKEY` against the trust anchor, fetches the DS
+; for example. FROM THE ROOT, validates example.'s DNSKEY against it, then
+; validates the leaf. AD=1.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ; Secure referral. The NS travels unsigned (RFC 4035 §2.2); the DS does not.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

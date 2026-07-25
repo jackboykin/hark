@@ -85,8 +85,11 @@ class Responder:
         # chain-walk bug.
         self._zones_by_address: dict[str, list[harness_dnssec.KeyMaterial]] = {}
         if self._signers:
+            # Populated as a side effect of baking: an address serves zone Z
+            # exactly where it signs as Z. Deriving it instead from "owns a
+            # record under Z" would hand the parent auth the child's DNSKEY
+            # the moment it served a delegation, papering over chain-walk bugs.
             self._bake_signatures()
-            self._zones_by_address = self._build_address_zone_map()
 
     def start(self) -> None:
         for addr in self.addresses:
@@ -271,42 +274,140 @@ class Responder:
     # ── DNSSEC pre-baking + DNSKEY synthesis ──────────────────────────────
 
     def _bake_signatures(self) -> None:
-        """Append an RRSIG to every signable RRset in every entry.
+        """Substitute placeholder DS rdata, then append an RRSIG to every
+        signable RRset in every entry.
 
         Run once at construction time, before sockets are open. Records
         whose owner doesn't fall under any declared signed zone are left
         alone — the scenario can still declare unsigned auths.
+
+        Signer selection follows the zone cut (RFC 4035 §2.2): a DS is signed
+        by the *parent*, and nothing else at or below a cut is signed by the
+        parent — delegation NS and glue travel unsigned. `SIGN_AS` overrides
+        the whole rule for one entry, which is how a scenario expresses a
+        forgery.
         """
         for rng in self.scenario.ranges:
             for entry in rng.entries:
+                forced = self._signer_named(entry.sign_as) if entry.sign_as else None
+                cuts = _delegation_cuts(entry)
                 for section in (entry.answer, entry.authority, entry.additional):
-                    self._sign_section_inplace(section)
+                    self._materialize_ds_inplace(section)
+                    self._sign_section_inplace(section, cuts, forced, rng.address)
 
-    def _sign_section_inplace(self, rrsets: list[dns.rrset.RRset]) -> None:
+    def _materialize_ds_inplace(self, rrsets: list[dns.rrset.RRset]) -> None:
+        """Replace placeholder DS rdata (key tag 0) with the real digest.
+
+        A .rpl record is static text, so a scenario cannot spell the digest of
+        a key generated at run time. Writing the sentinel says "the DS for this
+        child, whatever it turns out to be" — without it no scenario can build
+        a secure delegation, which is why every DNSSEC scenario in this suite
+        was a single zone.
+        """
+        for i, rrset in enumerate(rrsets):
+            if rrset.rdtype != dns.rdatatype.DS:
+                continue
+            if not all(rd.key_tag == 0 for rd in rrset):
+                continue  # scenario spelled a real (or deliberately wrong) DS
+            km = self._signer_named_exact(rrset.name)
+            if km is None:
+                raise ValueError(
+                    f"placeholder DS at {rrset.name} but no `; hark: dnssec-zone = "
+                    f"{rrset.name}` declared — nothing to take a digest of"
+                )
+            rrsets[i] = dns.rrset.from_rdata(rrset.name, rrset.ttl, km.ds)
+
+    def _sign_section_inplace(
+        self,
+        rrsets: list[dns.rrset.RRset],
+        cuts: list[dns.name.Name],
+        forced: harness_dnssec.KeyMaterial | None,
+        address: str,
+    ) -> None:
         # Snapshot original RRsets first — appending RRSIGs while iterating
         # would re-feed signatures back into the signer.
         originals = [rr for rr in rrsets if rr.rdtype != dns.rdatatype.RRSIG]
         for rrset in originals:
-            signer = self._signer_for(rrset.name)
+            signer = forced or self._signer_for(rrset.name, rrset.rdtype, cuts)
             if signer is None:
                 continue
+            # An auth may synthesize Z's DNSKEY exactly where it serves data
+            # that Z signs. Registered before the double-sign check, not after:
+            # a scenario that hand-rolls its own RRSIG (to assert a *bogus*
+            # one) is still declaring this address authoritative for Z, and
+            # gating registration on "we minted a signature" silently cost 006
+            # its root-DNSKEY synthesis — leaving it passing for the wrong
+            # reason, off an unfetchable trust anchor rather than the orphan
+            # RRSIG it means to test.
+            #
+            # A forced signer registers nothing: SIGN_AS says "this server
+            # produced the wrong signature", not "this server is authoritative
+            # for that zone". Letting a forgery confer authority over the keys
+            # it forges with would hand the attacker the answer under test.
+            if forced is None:
+                served = self._zones_by_address.setdefault(address, [])
+                if signer not in served:
+                    served.append(signer)
             if _has_covering_rrsig(rrsets, rrset):
                 continue  # scenario declared its own — don't double-sign
             rrsets.append(signer.sign(rrset))
 
-    def _signer_for(self, owner: dns.name.Name) -> harness_dnssec.KeyMaterial | None:
-        """Return the deepest enclosing signed zone's KeyMaterial, or None.
+    def _signer_for(
+        self,
+        owner: dns.name.Name,
+        rdtype: dns.rdatatype.RdataType,
+        cuts: list[dns.name.Name],
+    ) -> harness_dnssec.KeyMaterial | None:
+        """Return the KeyMaterial of the zone authoritative for this record.
 
-        `example.com.` signed by both `.` and `example.com.` picks the
-        latter — RRSIGs are minted by the closest enclosing zone.
+        Normally the deepest enclosing signed zone — `example.com.` signed by
+        both `.` and `example.com.` picks the latter. The zone cut carves out
+        two exceptions.
+
+        A DS belongs to the parent side, so it is signed by the deepest zone
+        *strictly above* it. So does an NSEC sitting exactly at the cut, which
+        is how the parent proves a delegation is insecure — that one must keep
+        the parent's signature or the proof is unverifiable.
+
+        Everything else at or below the cut is the child's: the delegation NS
+        travels unsigned (RFC 4035 §2.2) and so does glue, so the parent signs
+        neither.
         """
+        if rdtype == dns.rdatatype.DS:
+            return self._deepest_signer(owner, strictly_above=True)
+        # NSEC only: an NSEC3 owner is `<hash>.<zone>`, never equal to a cut
+        # name, and the fallthrough already routes it to the parent because
+        # `<hash>.parent` is not a subdomain of `child.parent`.
+        if rdtype == dns.rdatatype.NSEC and any(owner == cut for cut in cuts):
+            return self._deepest_signer(owner, strictly_above=True)
+        if any(owner.is_subdomain(cut) for cut in cuts):
+            return None
+        return self._deepest_signer(owner, strictly_above=False)
+
+    def _deepest_signer(
+        self, owner: dns.name.Name, strictly_above: bool
+    ) -> harness_dnssec.KeyMaterial | None:
         best: harness_dnssec.KeyMaterial | None = None
         for km in self._signers:
             if not owner.is_subdomain(km.zone_name):
                 continue
+            if strictly_above and km.zone_name == owner:
+                continue
             if best is None or len(km.zone_name) > len(best.zone_name):
                 best = km
         return best
+
+    def _signer_named(self, zone: str) -> harness_dnssec.KeyMaterial:
+        km = self._signer_named_exact(dns.name.from_text(zone))
+        if km is None:
+            raise ValueError(f"SIGN_AS {zone}: no such `; hark: dnssec-zone`")
+        return km
+
+    def _signer_named_exact(self, name: dns.name.Name) -> harness_dnssec.KeyMaterial | None:
+        for km in self._signers:
+            if km.zone_name == name:
+                return km
+        return None
 
     def _synthesize_dnskey_response(self, address: str, query: dns.message.Message) -> dns.message.Message | None:
         if not query.question:
@@ -322,24 +423,6 @@ class Responder:
                 return r
         return None
 
-    def _build_address_zone_map(self) -> dict[str, list[harness_dnssec.KeyMaterial]]:
-        """For each bind address, the signed zones whose content it serves.
-
-        An auth is considered to serve zone Z if any entry in any of its
-        ranges declares an RR whose owner falls under Z. DNSKEY synthesis
-        then only answers for those zones from that address — a root auth
-        can't pretend to be authoritative for `example.com.` DNSKEY.
-        """
-        result: dict[str, list[harness_dnssec.KeyMaterial]] = {addr: [] for addr in self.addresses}
-        for rng in self.scenario.ranges:
-            for entry in rng.entries:
-                for section in (entry.answer, entry.authority, entry.additional):
-                    for rrset in section:
-                        km = self._signer_for(rrset.name)
-                        if km is not None and km not in result[rng.address]:
-                            result[rng.address].append(km)
-        return result
-
     def _find_entry(self, address: str, query: dns.message.Message, transport: str) -> rpl.Entry | None:
         with self._step_lock:
             step = self._current_step
@@ -352,6 +435,39 @@ class Responder:
                 if _entry_matches_query(entry, query, transport):
                     return entry
         return None
+
+
+def _delegation_cuts(entry: rpl.Entry) -> list[dns.name.Name]:
+    """Owner names this entry delegates across.
+
+    Two markers, because the two delegation shapes differ: a DS RRset always
+    sits on the parent side of a cut, and a referral cuts at the NS owner even
+    when the child is insecure and so has no DS. Everything at or below a cut
+    is the child's to sign, so the parent serves it bare — RFC 4035 §2.2 for
+    the delegation NS, and glue is never signed by anyone.
+
+    "Referral" is RFC 2308's distinction, not a guess: empty ANSWER, NS in
+    AUTHORITY, and *no SOA*. The SOA clause is load-bearing. A NODATA or
+    NXDOMAIN response also has an empty ANSWER and may legitimately carry the
+    zone's own apex NS beside the SOA (see
+    regression/001_parent_ns_in_nodata_authority.rpl). Reading that as a cut at
+    the apex suppresses signing for the entire zone — every record is at or
+    below its own apex — and the scenario then fails with a bare missing-AD
+    mismatch that says nothing about why.
+    """
+    cuts: list[dns.name.Name] = []
+    for section in (entry.answer, entry.authority, entry.additional):
+        for rrset in section:
+            if rrset.rdtype == dns.rdatatype.DS and rrset.name not in cuts:
+                cuts.append(rrset.name)
+    is_referral = not entry.answer and not any(
+        rrset.rdtype == dns.rdatatype.SOA for rrset in entry.authority
+    )
+    if is_referral:
+        for rrset in entry.authority:
+            if rrset.rdtype == dns.rdatatype.NS and rrset.name not in cuts:
+                cuts.append(rrset.name)
+    return cuts
 
 
 def _has_covering_rrsig(rrsets: list[dns.rrset.RRset], target: dns.rrset.RRset) -> bool:

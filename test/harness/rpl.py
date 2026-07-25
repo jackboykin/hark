@@ -18,6 +18,8 @@ Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
+  - SIGN_AS <zone>                          force this entry's signer (forgeries)
+  - <child> <ttl> IN DS PLACEHOLDER         real digest substituted at load
   - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
   - STEP n CHECK_OUT_QUERY                  positional upstream-query check
   - STEP n CHECK_MAX_QUERIES <N>            assert <= N total upstream queries
@@ -125,6 +127,11 @@ class Entry:
     want_dnssec: bool = False
     # Parsed ADJUST flags the responder acts on (most are documentation-only).
     adjust: set[str] = dataclasses.field(default_factory=set)
+    # SIGN_AS <zone>: force every signable RRset in this entry to be signed
+    # by <zone>'s key, overriding the derive-from-owner rule. Exists so a
+    # scenario can express a *wrong* signer — a parent forging data for a
+    # delegated child — which is otherwise unconstructible.
+    sign_as: str | None = None
 
 
 @dataclasses.dataclass
@@ -398,6 +405,10 @@ class _Parser:
                 flags = [t.lower() for t in tokens[1:]]
                 self._validate_flags(flags, ADJUST_VALID_FLAGS, "ADJUST")
                 entry.adjust.update(flags)
+            elif head == "SIGN_AS":
+                if len(tokens) != 2:
+                    raise self.err(f"SIGN_AS takes one zone name: {line!r}")
+                entry.sign_as = tokens[1]
             elif head == "REPLY":
                 self._parse_reply(entry, tokens[1:])
             elif head == "SECTION":
@@ -466,7 +477,7 @@ class _Parser:
             return
         # Answer/authority/additional: full RR with rdata.
         try:
-            args = _split_rr_line(line)
+            args = _split_rr_line(_expand_ds_placeholder(line))
             rrset = dns.rrset.from_text_list(
                 *args, origin=dns.name.root, relativize=False
             )
@@ -479,6 +490,22 @@ class _Parser:
 # TTL=0 records (RFC 1035 §4.1.3 / RFC 2181 §8), so the default has to be
 # non-zero or no delegation ever sticks. 3600 matches testbound's default.
 _DEFAULT_RR_TTL = 3600
+
+
+# A .rpl record is static text, but a DS digest covers a key that does not
+# exist until the harness generates it at run time. `DS PLACEHOLDER` stands in
+# for "the DS of whatever key this child zone gets"; the responder substitutes
+# the real digest before signing. Expanded here to an all-zero SHA-256 digest
+# purely so dnspython will parse it — it validates both digest type and length,
+# so the sentinel has to be well-formed. Key tag 0 is what marks it.
+_DS_PLACEHOLDER_RDATA = "0 13 2 " + "00" * 32
+
+
+def _expand_ds_placeholder(line: str) -> str:
+    parts = line.split()
+    if len(parts) >= 2 and parts[-1].upper() == "PLACEHOLDER" and parts[-2].upper() == "DS":
+        return " ".join(parts[:-1]) + " " + _DS_PLACEHOLDER_RDATA
+    return line
 
 
 def _absolutize(name: str) -> str:
