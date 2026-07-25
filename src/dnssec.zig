@@ -658,6 +658,22 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
     if (exponent[exponent.len - 1] & 1 == 0) return error.InvalidKey; // even
     if (exponent.len == 1 and exponent[0] <= 1) return error.InvalidKey; // 0, 1
 
+    // powPublic is square-and-multiply, so its cost is linear in the exponent's
+    // bit length. Measured on a 4096-bit modulus: e=65537 costs 0.8 ms and a
+    // 511-byte exponent costs 31.6 ms. The KeyTrap budget caps the verify
+    // *count* at 96, not the cost of each, so a fat exponent multiplies the
+    // whole budget — 96 x 31.6 ms = 3.0 s of CPU for one query, against 4
+    // resolution threads per worker. That is under 2 QPS to saturate.
+    //
+    // 8 bytes is 32x the largest exponent anyone actually publishes and keeps
+    // the point of 500285a, which removed the stdlib's 4-byte cap so
+    // xelerance.com's 5-byte e = 2^32+1 would validate.
+    //
+    // The exponent is already bounded below the modulus by RsaFe.fromBytes, so
+    // the pre-existing ceiling was 511 bytes rather than the 65535 that RFC
+    // 3110's length encoding allows. Bounded, but not nearly enough.
+    if (exponent.len > 8) return error.InvalidKey;
+
     // Require 1024-bit minimum modulus, 8-byte step (1024/2048/3072/4096 are
     // the only sizes generated in practice). RFC 6781 recommends 2048 but
     // 1024-bit ZSKs are still common, including in TLDs like .org.
@@ -3970,4 +3986,35 @@ test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
     var expected: [Sha1.digest_length]u8 = undefined;
     _ = try dns.base32HexDecode(&expected, "DF7PJ50CNKS1EEOTS4FK0RPUAVGUGL2T");
     try testing.expectEqualSlices(u8, &expected, &computed);
+}
+
+test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
+    // powPublic is linear in exponent bits and the KeyTrap budget caps only the
+    // verify count, so an oversized exponent multiplies the entire per-query
+    // budget. RsaFe.fromBytes already forces e < n, but with a 4096-bit modulus
+    // that still left 511 bytes -- 31.6 ms a verify, 3.0 s a query.
+    //
+    // Both directions matter: 8 bytes must still be accepted, or this breaks
+    // xelerance.com's 5-byte e = 2^32+1, which is the whole reason 500285a
+    // dropped the stdlib's 4-byte cap.
+    var buf: [1024]u8 = undefined;
+    var sig: [256]u8 = undefined;
+    @memset(&sig, 0xAB);
+
+    inline for (.{ .{ 8, false }, .{ 9, true } }) |cfg| {
+        const elen: usize = cfg[0];
+        const want_rejected: bool = cfg[1];
+        buf[0] = @intCast(elen);
+        @memset(buf[1..][0..elen], 0xFF);
+        @memset(buf[1 + elen ..][0..256], 0xFF);
+        const key_data = buf[0 .. 1 + elen + 256];
+        const res = verifyRsa(&sig, "hello", key_data, Sha256);
+        if (want_rejected) {
+            // Rejected on the key, before any modular arithmetic runs.
+            try testing.expectError(error.InvalidKey, res);
+        } else {
+            // Got past every key check and died on the signature instead.
+            try testing.expectError(error.InvalidSignature, res);
+        }
+    }
 }
