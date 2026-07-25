@@ -613,12 +613,16 @@ pub const RecursiveResolver = struct {
                         // *only* entries the NX-cut will skip by design.
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count])) {
-                            .proceed => {
+                            .proceed => |status| {
                                 // .secure here means verifiedNegativeResponse
                                 // ran NSEC and accepted it; AA is redundant
                                 // (cryptographic proof supersedes the bit).
-                                if (security_state == .secure) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                // `.insecure` is excluded: an Opt-Out denial
+                                // leaves the intermediate name possibly existing
+                                // as an unsigned delegation, too thin to cache
+                                // against the full query name (RFC 8020).
+                                if (status == .secure) {
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status);
                                 }
                             },
                             // .bogus falls through to the same stop-minimizing
@@ -645,11 +649,11 @@ pub const RecursiveResolver = struct {
                     {
                         const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count])) {
-                            .proceed => {
+                            .proceed => |status| {
                                 if (response.header.flags.aa) {
                                     if (self.cache) |c| {
                                         c.storeResponse(response, parent_zone, .unchecked);
-                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status);
                                     }
                                 }
                             },
@@ -1178,12 +1182,12 @@ pub const RecursiveResolver = struct {
     ) !ResolveResult {
         if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers)) {
-                .proceed => {
-                    if (security_state == .secure) {
+                .proceed => |status| {
+                    if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, parent_zone);
                     }
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status);
                 },
                 .skip_cache => {},
                 .bogus => return self.bogusServfail(current_name, qtype),
@@ -1254,14 +1258,14 @@ pub const RecursiveResolver = struct {
     ) !ResolveResult {
         if (response.header.flags.aa) {
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers)) {
-                .proceed => {
-                    if (security_state == .secure) {
+                .proceed => |status| {
+                    if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, parent_zone);
                     }
                     if (self.cache) |c| {
                         c.storeResponse(response.*, parent_zone, .unchecked);
-                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, cacheSecurityStatus(security_state));
+                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status);
                     }
                 },
                 .skip_cache => {},
@@ -2373,12 +2377,16 @@ pub const RecursiveResolver = struct {
         // is intolerant of stale cuts regardless, and tolerating one sub-case is
         // not worth a universal bypass.
         //
-        // TODO: cuts *below* `zone` are still missed, and that is the attacker's
-        // move — answering AA at the parent instead of referring keeps
-        // `signer == zone`. Closing it is BIND's `closer_secure_ds_exists`: walk
-        // the names strictly between signer and owner and reject on a cached
-        // secure DS. `hasCachedInsecureDelegation` already has the lookup.
         if (!rrsig.signer_name.isSubdomainOf(zone)) return .bogus;
+
+        // TODO: cuts *below* `zone` are still missed — answering AA at the
+        // parent instead of referring keeps `signer == zone`, so the test above
+        // is silent, even when hark holds a validated DS for the child. Closing
+        // it with a bare cache probe (BIND's `closer_secure_ds_exists`) was
+        // tried and reverted: it cannot tell a lying parent from a legitimately
+        // un-delegated child, and guesses wrong on the second — see
+        // scenario 901 and memory/diffroll-t3-plan.md. The design that works is
+        // to *ask* the parent for the child's DS when the conflict arises.
 
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
@@ -2433,7 +2441,7 @@ pub const RecursiveResolver = struct {
         zone: dns.Name,
         zone_servers: []const na.Address,
     ) NegativeValidation {
-        if (security_state != .secure) return .proceed;
+        if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
 
         const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_servers);
         if (auth_status == .bogus) return .bogus;
@@ -3304,7 +3312,19 @@ fn extractReferral(
 
 // ── Negative proof validation ──────────────────────────────────────────
 
-const NegativeValidation = enum { proceed, skip_cache, bogus };
+/// `proceed` carries the *proof's* verdict, not the zone's, so AD and the cached
+/// rank come from one source. Deriving both from `security_state` left an
+/// Opt-Out proof — valid, but §9.2 forbids AD — with nowhere to land but
+/// `skip_cache`, and a correct denial went uncached at 100 ms per repeat.
+/// Unbound, BIND and Knot all cache these under an explicit insecure rank.
+const NegativeValidation = union(enum) {
+    /// Serve, and cache under this status. AD only when `.secure`.
+    proceed: cache_mod.SecurityStatus,
+    /// Serve, cache nothing: authority signatures did not verify at all, so
+    /// there is no verdict worth persisting.
+    skip_cache,
+    bogus,
+};
 
 fn validateNegativeResponse(
     security_state: dnssec.SecurityStatus,
@@ -3315,13 +3335,14 @@ fn validateNegativeResponse(
     zone: dns.Name,
     budget: *dnssec.ValidationBudget,
 ) NegativeValidation {
-    if (security_state != .secure) return .proceed;
-    // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative
-    // response must carry a complete proof; an incomplete one (.unchecked)
-    // fails closed. .insecure (RFC 6840 §5.11) still proceeds without AD.
+    if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
+    // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative response
+    // must carry a complete proof; an incomplete one (.unchecked) fails closed.
+    // `.insecure` — Opt-Out (§9.2) or unevaluable (RFC 6840 §5.11) — is served
+    // and cached without AD.
     return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget)) {
-        .secure => .proceed,
-        .insecure => .skip_cache,
+        .secure => .{ .proceed = .secure },
+        .insecure => .{ .proceed = .insecure },
         .bogus => .bogus,
         .unchecked => {
             @branchHint(.cold);
@@ -3989,8 +4010,38 @@ test "validateNegativeResponse returns proceed when security_state is not secure
     const name = dns.Name{ .labels = &.{ "example", "com" } };
     var b: dnssec.ValidationBudget = .{};
     // unchecked/insecure → proceed regardless of authorities
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.unchecked, &.{}, name, .a, true, test_root, &b));
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.insecure, &.{}, name, .a, false, test_root, &b));
+    try testing.expectEqual(NegativeValidation{ .proceed = .unchecked }, validateNegativeResponse(.unchecked, &.{}, name, .a, true, test_root, &b));
+    try testing.expectEqual(NegativeValidation{ .proceed = .insecure }, validateNegativeResponse(.insecure, &.{}, name, .a, false, test_root, &b));
+}
+
+test "validateNegativeResponse caches an .insecure proof instead of discarding it" {
+    // `.insecure` in a secure zone is a valid denial that may not carry AD.
+    // Mapping it to `.skip_cache` conflated it with "signatures did not verify"
+    // and threw the answer away. The Opt-Out verdict is covered in dnssec.zig;
+    // this pins the mapping, via the cheapest `.insecure` producer.
+    const qname = dns.Name{ .labels = &.{ "victim", "com" } };
+    var salt_buf: [4]u8 = @splat(0xAB);
+    const high_iteration_nsec3 = [_]dns.ResourceRecord{.{
+        .name = dns.Name{ .labels = &.{ "hash", "com" } },
+        .rtype = .nsec3,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{
+            .nsec3 = .{
+                .hash_algorithm = .sha1,
+                .flags = 0,
+                .iterations = 200, // > max_nsec3_iterations → RFC 9276 §3.2
+                .salt = &salt_buf,
+                .next_hashed_owner = &@as([20]u8, @splat(0x43)),
+                .type_bit_maps = &.{},
+            },
+        },
+    }};
+    var b: dnssec.ValidationBudget = .{};
+    try testing.expectEqual(
+        NegativeValidation{ .proceed = .insecure },
+        validateNegativeResponse(.secure, &high_iteration_nsec3, qname, .a, true, test_root, &b),
+    );
 }
 
 const test_root = dns.Name{ .labels = &.{} };
@@ -4045,7 +4096,7 @@ test "validateNegativeResponse binds a proof to the zone that signed it" {
     }};
     const in_zone = dns.Name{ .labels = &.{ "zzzz", "example", "net" } };
     try testing.expectEqual(
-        NegativeValidation.proceed,
+        NegativeValidation{ .proceed = .secure },
         validateNegativeResponse(.secure, &in_zone_auth, in_zone, .a, true, net_zone, &b),
     );
 }
@@ -4105,7 +4156,7 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.proceed, validateNegativeResponse(.secure, &authorities, name, .a, false, test_root, &b));
+    try testing.expectEqual(NegativeValidation{ .proceed = .secure }, validateNegativeResponse(.secure, &authorities, name, .a, false, test_root, &b));
 }
 
 test "validateNegativeResponse returns bogus when no proof found in secure zone" {
