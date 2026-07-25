@@ -1,0 +1,142 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a child folded back into its signed parent must still resolve
+
+; A regression guard for a design that was tried and reverted, kept because it is
+; the only artifact that states the cost.
+;
+; On the second query example. answers AA for a name under child.example., signed
+; with its own key, while hark holds a validated DS for child.example. — wire
+; trace identical to a forging parent. hark must still serve it: the operator
+; removed the delegation and now serves those names from example. itself, an
+; everyday consolidation, and the answer is DNSSEC-valid root-down.
+;
+; A cut check keyed on cached DS alone (BIND's `closer_secure_ds_exists` moved to
+; the positive answer path) SERVFAILs this for up to the DS TTL — 86400 s at
+; com/net/org. It was built, grilled and reverted: it cannot separate the two
+; cases, because the bytes are the same. RFC 6781 §4.2.1.2/§4.3.5.2 do tell
+; operators to let the DS leave caches first, but the next paragraph expects
+; resolvers to *aid* such transitions, and BIND and Unbound both serve it.
+;
+; The design that works is to ask the parent for the child's DS on conflict —
+; example. answers NODATA for it below, so the fold is provable on the wire. See
+; memory/diffroll-t3-plan.md. Until then this pins what any such check must keep.
+;
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Phase A: the delegation still exists. DS lands in the key cache at 3600;
+;    the NS at TTL 0 is usable for the resolution in flight but never cached.
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 0 IN NS ns.child.example.
+      child.example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.child.example. 0 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.3
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      other.child.example. IN A
+    SECTION ANSWER
+      other.child.example. 3600 IN A 192.0.2.3
+  ENTRY_END
+RANGE_END
+
+; ── Phase B: the fold. No delegation, no DS, no child servers. example. is
+;    authoritative for the whole subtree and signs it with its own key.
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    SIGN_AS example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 3600 IN A 192.0.2.66
+  ENTRY_END
+
+  ; The fold is visible to anyone who asks: no DS at child.example. any more.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    SIGN_AS example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. root.example. 2 3600 900 604800 3600
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    other.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    other.child.example. IN A
+  SECTION ANSWER
+    other.child.example. 3600 IN A 192.0.2.3
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.child.example. IN A
+  SECTION ANSWER
+    www.child.example. 3600 IN A 192.0.2.66
+ENTRY_END
+
+SCENARIO_END
