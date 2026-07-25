@@ -105,6 +105,19 @@ const CnameChain = struct {
     /// authority (cf. Unbound `iter_add_prepend_auth`). Members borrow the
     /// per-query arena's parse buffers — would dangle under a heap allocator.
     wildcard_proofs: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty,
+    /// Cleared by the first hop that was not proven `.secure`. AD is a claim
+    /// about the whole answer, and an unsigned CNAME redirecting into a
+    /// signed zone yields a signed *tail* and nothing more — the redirect
+    /// itself is unauthenticated, so it could point anywhere (RFC 4035
+    /// §3.2.3). `withCnameChain` is the single funnel every chained answer
+    /// exits through, so folding it in there covers the negative and error
+    /// chains too.
+    all_secure: bool = true,
+
+    fn hop(self: *CnameChain, allocator: mem.Allocator, rr: dns.ResourceRecord, status: cache_mod.SecurityStatus) !void {
+        try self.records.append(allocator, rr);
+        self.all_secure = self.all_secure and status == .secure;
+    }
 
     fn deinit(self: *CnameChain, allocator: mem.Allocator) void {
         self.records.deinit(allocator);
@@ -481,7 +494,7 @@ pub const RecursiveResolver = struct {
                         logCnameLoop(dispatch.cname_rr.rdata.cname, "cache-served");
                         return self.bogusServfail(current_name, qtype);
                     }
-                    try cname_chain.records.append(allocator, dispatch.cname_rr);
+                    try cname_chain.hop(allocator, dispatch.cname_rr, dispatch.security_status);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
                     // Mirror the upstream CNAME branch: re-resolve the
@@ -715,7 +728,7 @@ pub const RecursiveResolver = struct {
                                     logCnameLoop(cname_rr.rdata.cname, "upstream-served");
                                     return self.bogusServfail(current_name, qtype);
                                 }
-                                try cname_chain.records.append(allocator, cname_rr);
+                                try cname_chain.hop(allocator, cname_rr, cname_status);
 
                                 try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_chain.wildcard_proofs);
 
@@ -3038,6 +3051,8 @@ fn withCnameChain(
     const auth_aggregate = cc.wildcard_proofs.items;
     if (chain.len == 0 and auth_aggregate.len == 0) return response;
     var msg = response;
+    // The tail's own verdict says nothing about the hops that led here.
+    if (!cc.all_secure) msg.header.flags.ad = false;
     if (chain.len > 0) {
         const new_answers = try allocator.alloc(dns.ResourceRecord, chain.len + response.answers.len);
         @memcpy(new_answers[0..chain.len], chain);
@@ -4197,6 +4212,43 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
     try testing.expectEqual(dns.RType.a, stitched.answers[1].rtype);
     try testing.expectEqual(@as(usize, 1), stitched.authorities.len); // NSEC aggregated
     try testing.expectEqual(dns.RType.nsec, stitched.authorities[0].rtype);
+}
+
+test "withCnameChain clears AD when any hop was not proven secure" {
+    // The live shape: an unsigned zone CNAMEs into a signed CDN. The tail
+    // validates, so the terminal response carries AD — but the redirect that
+    // chose that tail was never authenticated, so the answer as a whole is
+    // not. Both AD-setting sites are upstream of this funnel: validateAnswer
+    // for a freshly-resolved target, and the cache-served synthesizedMessage
+    // for a repeat of the same (qname, qtype), which files the answer under
+    // the CNAME target and so flips AD 0→1 on the second identical query.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const owner = dns.Name{ .labels = &.{ "unsigned", "example" } };
+    const cname_target = dns.Name{ .labels = &.{ "tgt", "signed", "example" } };
+    const cname_rr = dns.ResourceRecord{ .name = owner, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = cname_target } };
+    const a_rr = dns.ResourceRecord{ .name = cname_target, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } };
+
+    const validated_tail = synthesizedMessage(&.{a_rr}, &.{}, .no_error, true);
+    try testing.expect(validated_tail.header.flags.ad);
+
+    var insecure_hop: CnameChain = .{};
+    defer insecure_hop.deinit(a);
+    try insecure_hop.hop(a, cname_rr, .unchecked);
+    try testing.expectEqual(false, (try withCnameChain(a, &insecure_hop, validated_tail)).header.flags.ad);
+
+    // A fully-proven chain keeps it.
+    var secure_hop: CnameChain = .{};
+    defer secure_hop.deinit(a);
+    try secure_hop.hop(a, cname_rr, .secure);
+    try testing.expectEqual(true, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
+
+    // One bad hop anywhere in the chain poisons the whole answer.
+    try secure_hop.hop(a, cname_rr, .insecure);
+    try secure_hop.hop(a, cname_rr, .secure);
+    try testing.expectEqual(false, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 }
 
 // ── cache_only guard tests ────────────────────────────────────────────
