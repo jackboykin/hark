@@ -145,13 +145,17 @@ pub fn validateDnskeyRrset(
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
     // including them in buildSignedData would corrupt the verification.
+    // Overflow refuses instead of truncating: a signature that verifies over
+    // dnskey_only[0..64] would authenticate a *subset* while the caller keeps
+    // and caches every key in the message — appended forged keys would ride in
+    // as trusted. Same rule as validateRrsetForType and verifyAuthorityNsecSigs.
     var dnskey_only: [64]dns.ResourceRecord = undefined;
     var dnskey_count: usize = 0;
     for (dnskey_records) |rr| {
-        if (rr.rtype == .dnskey and dnskey_count < dnskey_only.len) {
-            dnskey_only[dnskey_count] = rr;
-            dnskey_count += 1;
-        }
+        if (rr.rtype != .dnskey) continue;
+        if (dnskey_count == dnskey_only.len) return error.InvalidKey;
+        dnskey_only[dnskey_count] = rr;
+        dnskey_count += 1;
     }
     const filtered = dnskey_only[0..dnskey_count];
 
@@ -1314,14 +1318,20 @@ fn validateRrsetForType(
         // signal, not an excuse to launder to .insecure.
         attempted_supported = true;
 
-        // Filter RRset by this RRSIG's owner (same owner + type)
+        // Filter RRset by this RRSIG's owner (same owner + type). Refuse
+        // rather than truncate: the caller sets AD on the *unpruned*
+        // response, so verifying a signature over answers[0..64] while
+        // shipping 70 records launders the 6 attacker-appended RRs into an
+        // authenticated answer. buildSignedData refuses >64 anyway (:412),
+        // so a genuine oversized RRset was already unvalidatable here —
+        // this only makes the refusal explicit instead of silent.
         var filtered: [64]dns.ResourceRecord = undefined;
         var count: usize = 0;
         for (answers) |rr| {
-            if (rr.rtype == covered_type and rr.name.eql(sig_rr.name) and count < filtered.len) {
-                filtered[count] = rr;
-                count += 1;
-            }
+            if (rr.rtype != covered_type or !rr.name.eql(sig_rr.name)) continue;
+            if (count == filtered.len) return .bogus;
+            filtered[count] = rr;
+            count += 1;
         }
         if (count == 0) continue;
 
@@ -1350,14 +1360,17 @@ pub fn verifyAuthorityNsecSigs(
         if (rr.rtype != .nsec and rr.rtype != .nsec3) continue;
         any_nsec = true;
 
-        // Collect the RRset (all records with same owner+type)
+        // Collect the RRset (all records with same owner+type). Overflow is
+        // .bogus, not a truncated collect: verifying a sig over the first 16
+        // would leave the overflow records unverified while validateNegativeProof
+        // still reads them out of `authorities` as proof material.
         var rrset: [16]dns.ResourceRecord = undefined;
         var rrset_count: usize = 0;
         for (authorities) |rr2| {
-            if (rr2.rtype == rr.rtype and rr2.name.eql(rr.name) and rrset_count < rrset.len) {
-                rrset[rrset_count] = rr2;
-                rrset_count += 1;
-            }
+            if (rr2.rtype != rr.rtype or !rr2.name.eql(rr.name)) continue;
+            if (rrset_count == rrset.len) return .bogus;
+            rrset[rrset_count] = rr2;
+            rrset_count += 1;
         }
 
         // Find a matching RRSIG and verify it
@@ -1571,10 +1584,11 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     );
 }
 
-test "validateDnskeyRrset tolerates more DNSKEYs than the 64-key filter buffer" {
-    // A hostile zone can serve >64 DNSKEYs over TCP. The dnskey_only filter
-    // buffer clamps at 64 entries; the overflow key must be skipped cleanly,
-    // never written out of bounds.
+test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
+    // A hostile zone can serve >64 DNSKEYs over TCP. Skipping the overflow
+    // would let a signature over the first 64 authenticate a set the caller
+    // then caches whole — appended forgeries included — so overflow is a
+    // hard refusal, not a truncated collect.
     var digest = try testDsDigest(test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
@@ -1597,11 +1611,17 @@ test "validateDnskeyRrset tolerates more DNSKEYs than the 64-key filter buffer" 
     for (records[0..64]) |*r| r.* = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = filler } };
     records[64] = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
 
-    // No RRSIG present, so validation must reject cleanly rather than panic.
     var budget: ValidationBudget = .{};
     try testing.expectError(
-        error.InvalidSignature,
+        error.InvalidKey,
         validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
+    );
+
+    // 64 exactly is still accepted (and rejected on signature grounds, not
+    // size) — the boundary is off-by-one sensitive.
+    try testing.expectError(
+        error.InvalidSignature,
+        validateDnskeyRrset(records[0..64], &.{ds}, test_owner, 1700000000, &budget),
     );
 }
 
@@ -3409,6 +3429,84 @@ test "validateRrsetForType: failing supported + unsupported RRSIG returns bogus"
     try testing.expectEqual(
         SecurityStatus.bogus,
         validateRrsetForType(&answers, .a, &dnskeys, 1699500000, &budget),
+    );
+}
+
+/// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
+/// that verifies it. Buffers are caller-owned so the slices outlive the call.
+fn testSignRrset(
+    rrset: []const dns.ResourceRecord,
+    covered: dns.RType,
+    signer: dns.Name,
+    sig_buf: *[64]u8,
+    pub_buf: *[32]u8,
+) !struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData } {
+    const kp = Ed25519.KeyPair.generate(testing.io);
+    pub_buf.* = kp.public_key.toBytes();
+    const dnskey = dns.DnskeyData{
+        .flags = 256, // ZONE, not SEP
+        .protocol = 3,
+        .algorithm = .ed25519,
+        .public_key = pub_buf,
+    };
+    var rrsig = dns.RrsigData{
+        .type_covered = covered,
+        .algorithm = .ed25519,
+        .labels = @intCast(rrset[0].name.labels.len),
+        .original_ttl = 300,
+        .sig_inception = 1_699_000_000,
+        .sig_expiration = 1_800_000_000,
+        .key_tag = keyTag(dnskey),
+        .signer_name = signer,
+        .signature = &.{},
+    };
+    var data_buf: [65536]u8 = undefined;
+    sig_buf.* = (try kp.sign(try buildSignedData(&data_buf, rrsig, rrset), null)).toBytes();
+    rrsig.signature = sig_buf;
+    return .{ .rrsig = rrsig, .dnskey = dnskey };
+}
+
+test "validateRrsetForType: >64-member RRset is bogus, not a validated prefix" {
+    // The caller sets AD on the *unpruned* response, so a signature that
+    // verifies over answers[0..64] must not authenticate a 70-record answer
+    // section — the 6 appended records would ship authenticated.
+    var recs: [70]dns.ResourceRecord = undefined;
+    for (&recs, 0..) |*r, i| r.* = .{
+        .name = test_owner,
+        .rtype = .a,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .a = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } },
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try testSignRrset(recs[0..64], .a, test_owner, &sig_bytes, &pub_bytes);
+    const sig_rr = dns.ResourceRecord{
+        .name = test_owner,
+        .rtype = .rrsig,
+        .rclass = .in,
+        .ttl = 300,
+        .rdata = .{ .rrsig = signed.rrsig },
+    };
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, signed.dnskey)};
+
+    var answers: [71]dns.ResourceRecord = undefined;
+    @memcpy(answers[0..70], &recs);
+    answers[70] = sig_rr;
+    var budget: ValidationBudget = .{};
+    try testing.expectEqual(
+        SecurityStatus.bogus,
+        validateRrsetForType(&answers, .a, &dnskeys, 1_700_000_000, &budget),
+    );
+
+    // Control: the signed 64 on their own still validate.
+    var exact: [65]dns.ResourceRecord = undefined;
+    @memcpy(exact[0..64], recs[0..64]);
+    exact[64] = sig_rr;
+    var budget2: ValidationBudget = .{};
+    try testing.expectEqual(
+        SecurityStatus.secure,
+        validateRrsetForType(&exact, .a, &dnskeys, 1_700_000_000, &budget2),
     );
 }
 
