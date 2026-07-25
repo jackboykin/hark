@@ -563,10 +563,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
 
 // ── RRSIG Verification ───────────────────────────────────────────────
 
-/// RFC 1982 serial number "greater than" for 32-bit timestamps.
-fn serialAfter(s1: u32, s2: u32) bool {
-    return s1 != s2 and (s1 -% s2) < 0x80000000;
-}
+const serialAfter = dns.serialAfter;
 
 // RFC 4035 §5.3.1 mandates zero grace; we deviate minimally and asymmetrically.
 // Inception grace forgives a signer with a slightly-ahead clock (misconfig, no
@@ -3781,18 +3778,6 @@ test "NSEC3 budget accumulates across negative-proof calls" {
 }
 
 // ── RRSIG expiration tests ──────────────────────────────────────────
-
-test "serialAfter: basic comparisons" {
-    // s1 > s2 in serial arithmetic
-    try testing.expect(serialAfter(10, 5));
-    // s1 < s2
-    try testing.expect(!serialAfter(5, 10));
-    // equal
-    try testing.expect(!serialAfter(5, 5));
-    // wrap-around: 0xFFFFFFFF is "before" 0x00000001
-    try testing.expect(serialAfter(0x00000001, 0xFFFFFFFF));
-    try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
-}
 
 // Shared fixture for the verifyRrsig time-window tests. Empty key/signature
 // means the ECDSA path always returns InvalidSignature — anything before

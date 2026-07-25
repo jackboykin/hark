@@ -300,7 +300,49 @@ pub const RrsigData = struct {
     key_tag: u16,
     signer_name: Name,
     signature: []const u8,
+
+    /// Seconds until this signature expires at `now`, saturating at 0. For
+    /// the RFC 4035 §5.3.3 TTL ceiling, not the validator's freshness check,
+    /// which needs the clock-skew-tolerant comparison in dnssec.zig.
+    pub fn secondsUntilExpiry(self: RrsigData, now: u32) u32 {
+        return if (serialAfter(self.sig_expiration, now)) self.sig_expiration -% now else 0;
+    }
 };
+
+/// RFC 1982 serial comparison. RRSIG timestamps are mod-2^32 serials (RFC
+/// 4034 §3.1.5) and must never be compared or subtracted directly.
+pub fn serialAfter(s1: u32, s2: u32) bool {
+    return s1 != s2 and (s1 -% s2) < 0x80000000;
+}
+
+test "serialAfter: basic comparisons" {
+    try testing.expect(serialAfter(10, 5));
+    try testing.expect(!serialAfter(5, 10));
+    try testing.expect(!serialAfter(5, 5));
+    // Wrap: 0xFFFFFFFF is "before" 0x00000001.
+    try testing.expect(serialAfter(0x00000001, 0xFFFFFFFF));
+    try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
+}
+
+test "secondsUntilExpiry: saturates at zero and wraps as a serial" {
+    var sig: RrsigData = .{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 2,
+        .original_ttl = 3600,
+        .sig_expiration = 1000,
+        .sig_inception = 0,
+        .key_tag = 0,
+        .signer_name = .{ .labels = &.{} },
+        .signature = "",
+    };
+    try testing.expectEqual(@as(u32, 400), sig.secondsUntilExpiry(600));
+    try testing.expectEqual(@as(u32, 0), sig.secondsUntilExpiry(1000));
+    try testing.expectEqual(@as(u32, 0), sig.secondsUntilExpiry(1001));
+    // Expiration just past the 2^32 wrap is still in the future.
+    sig.sig_expiration = 5;
+    try testing.expectEqual(@as(u32, 10), sig.secondsUntilExpiry(0xFFFFFFFB));
+}
 
 /// Returns the rtype an RRSIG record covers, or null if `rr` isn't an RRSIG.
 /// Centralised because RFC 4035 RRSIG-vs-covered-RRset bookkeeping recurs
