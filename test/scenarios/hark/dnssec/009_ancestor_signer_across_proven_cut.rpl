@@ -1,0 +1,81 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN answer signed across a proven zone cut must SERVFAIL
+
+; hark has walked root -> example. and PROVEN the cut: it fetched example.'s DS
+; from the root and validated example.'s DNSKEY against it. So it holds
+; validated evidence that data under example. is example.'s to sign.
+;
+; The server then answers `www.example. A` carrying the ROOT's signature.
+; RFC 4034 §3.1.3 is satisfied (`.` is an ancestor of the owner) and the
+; signature verifies against a genuinely trust-anchored key, so hark accepted
+; it and set AD=1 — authenticating the parent's word over a child whose
+; delegation it had just proven. RFC 4035 §5.3.1 requires the signer to be
+; "the name of the zone that contains the RRset", which this is not.
+;
+; This is BIND's `closer_secure_ds_exists` check (lib/dns/validator.c:255),
+; which BIND applies only on the insecurity-proof path.
+;
+; SERVFAIL, not served-without-AD. The check runs before any DNSKEY fetch, so
+; a softer verdict would be a keyless downgrade: the RRSIG would not have to
+; verify, only to name an ancestor. See 010 for the control — the same forgery
+; signed as the cut zone, which must fail through the crypto path instead.
+;
+; Topology
+;   root     127.0.10.1   delegates example. with a DS
+;   example  127.0.10.2   answers for its own zone, but SIGN_AS `.`
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    ; The forgery: the child's own data, signed by the parent's key. This
+    ; address is deliberately NOT registered as serving `.`, so it could not
+    ; answer `. DNSKEY` — hark must never need to ask it, because the root key
+    ; it validates against is one it already holds.
+    SIGN_AS .
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.66
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+SCENARIO_END

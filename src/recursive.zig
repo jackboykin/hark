@@ -706,7 +706,7 @@ pub const RecursiveResolver = struct {
                             // RRSIG is present, which closes the strip-RRSIG downgrade.
                             var cname_status: cache_mod.SecurityStatus = .unchecked;
                             if (self.dnssec_enabled and security_state == .secure) {
-                                switch (try self.validateAnswer(allocator, &response, .cname, security_state, servers[0..server_count])) {
+                                switch (try self.validateAnswer(allocator, &response, .cname, security_state, parent_zone, servers[0..server_count])) {
                                     .bogus => {
                                         self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                                         return self.bogusServfail(current_name, qtype);
@@ -1213,7 +1213,7 @@ pub const RecursiveResolver = struct {
     ) !ResolveResult {
         var answer_status: cache_mod.SecurityStatus = .unchecked;
         if (self.dnssec_enabled) {
-            switch (try self.validateAnswer(allocator, response, qtype, security_state, servers)) {
+            switch (try self.validateAnswer(allocator, response, qtype, security_state, parent_zone, servers)) {
                 .bogus => {
                     self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                     return self.bogusServfail(current_name, qtype);
@@ -2318,12 +2318,21 @@ pub const RecursiveResolver = struct {
 
     /// Validate answer RRsets for a response from a secure zone.
     /// Returns .valid (AD bit set), .bogus (should SERVFAIL), or .skip (insecure zone).
+    ///
+    /// `zone` is the delegation point the query was routed to. RFC 4035 §5.3.1
+    /// requires the signer to be "the name of the zone that contains the RRset"
+    /// but never says how to determine that zone, so both Unbound
+    /// (`validator.c` sets its key lookup name *to the signer*) and BIND fall
+    /// back to the weaker RFC 4034 §3.1.3 ancestor test. That weaker test is
+    /// vacuous: the signer is an ancestor of the owner for every non-apex
+    /// record in DNS. `zone` is the one piece of cut evidence hark always has.
     fn validateAnswer(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
         qtype: dns.RType,
         security_state: dnssec.SecurityStatus,
+        zone: dns.Name,
         servers: []const na.Address,
     ) !AnswerValidation {
         if (security_state != .secure) return .skip;
@@ -2342,6 +2351,34 @@ pub const RecursiveResolver = struct {
             if (!rr.name.isSubdomainOf(rrsig.signer_name)) return .bogus;
             break;
         };
+
+        // Reaching a secure `zone` means its DS was fetched from the parent and
+        // its DNSKEY validated against it — proof that data under `zone` is
+        // `zone`'s to sign. A signer strictly above it is then claiming across a
+        // cut we hold evidence for, so its signature authenticates nothing here.
+        // This is BIND's `closer_secure_ds_exists` (lib/dns/validator.c:255),
+        // which BIND runs only on the insecurity-proof path.
+        //
+        // Bogus, not merely unauthenticated. This runs before any DNSKEY fetch
+        // or signature check, so a softer verdict would be a *keyless*
+        // downgrade: an RRSIG naming an ancestor need not verify, or even be a
+        // real signature, to turn the SERVFAIL below into a served and cached
+        // answer. The negative path's `.skip_cache` twin does not transfer —
+        // there the absent-signature floor is `.unchecked`, here it is `.bogus`
+        // (`findRrsig` above), so anything softer sits beneath the floor and
+        // beats simply stripping the RRSIGs.
+        //
+        // The zone-fold case argues for softness and loses: a child folded into
+        // an unsigned parent already SERVFAILs on the `findRrsig` line, so hark
+        // is intolerant of stale cuts regardless, and tolerating one sub-case is
+        // not worth a universal bypass.
+        //
+        // TODO: cuts *below* `zone` are still missed, and that is the attacker's
+        // move — answering AA at the parent instead of referring keeps
+        // `signer == zone`. Closing it is BIND's `closer_secure_ds_exists`: walk
+        // the names strictly between signer and owner and reject on a cached
+        // secure DS. `hasCachedInsecureDelegation` already has the lookup.
+        if (!rrsig.signer_name.isSubdomainOf(zone)) return .bogus;
 
         // Extract signer zone name as dotted string
         const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
