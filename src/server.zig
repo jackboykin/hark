@@ -2137,7 +2137,7 @@ fn setupSignalFd() !posix.fd_t {
     // Create the reader before blocking, not after. Blocking first and then
     // failing here would leave the process with INT/TERM blocked and nothing
     // reading them — unkillable except by SIGKILL, for its whole life.
-    const fd = try posix.signalfd(-1, &mask, linux.SFD.NONBLOCK);
+    const fd = try sys.signalfd(-1, &mask, linux.SFD.NONBLOCK);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
     return fd;
 }

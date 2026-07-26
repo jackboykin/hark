@@ -180,6 +180,23 @@ pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
     };
 }
 
+/// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`. The two are the
+/// same array only in a no-libc build; linking libc (which `-Dtsan` forces)
+/// widens the posix one to glibc's 128 bytes and the mismatch fails to compile.
+/// Every caller already builds its mask with `linux.sigemptyset`, so stay on
+/// the kernel ABI end to end.
+pub fn signalfd(fd: posix.fd_t, mask: *const linux.sigset_t, flags: u32) !posix.fd_t {
+    const rc = linux.signalfd(fd, mask, flags);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .BADF, .INVAL => unreachable,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NODEV, .NOMEM => error.SystemResources,
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
 /// Arm SO_RCVTIMEO/SO_SNDTIMEO. `ms` is floored at 1 because the kernel reads
 /// `timeval{0,0}` as *no timeout*: deadline arithmetic that truncated to zero
 /// would otherwise fail open, in the one call asking for a bound. Use
