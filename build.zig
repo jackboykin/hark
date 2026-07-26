@@ -68,6 +68,30 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
 
+    // Every root that imports `hark` but lives outside the test binary rots
+    // silently on an API change — bench/ did, for the whole tranche that added
+    // storeResponse's authenticated_ttl_max, leaving the contention bench that
+    // gates hot-path changes unbuildable. Compile each as part of `test`.
+    // Nothing consumes these artifacts, so Zig stops after semantic analysis:
+    // no codegen, no link. Deliberately NOT `synth_pellet_exe` itself — that
+    // one is installed, so depending on it would force a real ReleaseSafe build.
+    for ([_]struct { name: []const u8, root: []const u8 }{
+        .{ .name = "bench-check", .root = "bench/main.zig" },
+        .{ .name = "synth-pellet-check", .root = "bench/recursion/synth_pellet.zig" },
+    }) |c| {
+        const check = b.addExecutable(.{
+            .name = c.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(c.root),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = tsan,
+                .imports = &.{.{ .name = "hark", .module = mod }},
+            }),
+        });
+        test_step.dependOn(&check.step);
+    }
+
     const bench_exe = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
