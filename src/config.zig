@@ -1056,3 +1056,47 @@ test "an out-of-range integer is rejected, never clamped" {
     try testing.expectEqual(@as(?u32, 4294967294), cfg.drop_uid);
     try testing.expectEqual(@as(?u32, 65534), cfg.drop_gid);
 }
+
+/// Exercises every allocating key at once: the address, CIDR, zone and
+/// trust-anchor list parsers, plus `defaultConfig`'s own allocations, which
+/// each overriding key frees and replaces — the ordering most likely to
+/// double-free or strand a slice when an allocation midway through fails.
+fn parseConfigOomProbe(allocator: Allocator, contents: []const u8) !void {
+    var cfg = try parseConfig(allocator, contents);
+    cfg.deinit();
+}
+
+test "parseConfig handles OOM without leaking" {
+    const contents =
+        \\[server]
+        \\listen = ["127.0.0.1:8053", "[::1]:8053"]
+        \\allow-from = ["127.0.0.0/8", "10.0.0.0/8"]
+        \\
+        \\[resolver]
+        \\root-hints = ["198.41.0.4:53", "199.9.14.201:53"]
+        \\
+        \\[rebinding]
+        \\enabled = true
+        \\allow-zones = ["home.arpa", "lan"]
+        \\extra-block = ["192.0.2.0/24"]
+        \\extra-allow = ["203.0.113.0/24"]
+    ;
+    try testing.checkAllAllocationFailures(testing.allocator, parseConfigOomProbe, .{contents});
+}
+
+/// `trust-anchors` is gated behind `-Dtesting=true`, so `parseConfig` cannot
+/// reach `parseTrustAnchors` in a default test build. Probe it directly:
+/// it allocates the list, then a digest per entry, and unwinds both.
+fn parseTrustAnchorsOomProbe(allocator: Allocator, strs: []const []const u8) !void {
+    const anchors = try parseTrustAnchors(allocator, strs);
+    for (anchors) |ta| allocator.free(ta.digest);
+    allocator.free(anchors);
+}
+
+test "parseTrustAnchors handles OOM without leaking" {
+    const strs = [_][]const u8{
+        "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+        "19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5",
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, parseTrustAnchorsOomProbe, .{&strs});
+}
