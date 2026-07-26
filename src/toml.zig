@@ -307,8 +307,12 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
                 }
                 end += 1;
             }
+            // Reserve before parsing: `append` after a successful
+            // `parseString` had no owner for `str` if the append itself
+            // failed, stranding one element per array on OOM.
+            try items.ensureUnusedCapacity(allocator, 1);
             const str = try parseString(allocator, inner[pos..end]);
-            try items.append(allocator, str);
+            items.appendAssumeCapacity(str);
             pos = end;
         } else {
             return error.InvalidSyntax; // Only string arrays supported
@@ -319,10 +323,9 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
         if (pos < inner.len and inner[pos] == ',') pos += 1;
     }
 
-    const result = try allocator.dupe([]const u8, items.items);
-    // Clear items without freeing strings (ownership transferred)
-    items.items.len = 0;
-    return .{ .string_array = result };
+    // `toOwnedSlice` remaps in place rather than copying, and leaves the list
+    // untouched on failure so the `defer` above still frees every element.
+    return .{ .string_array = try items.toOwnedSlice(allocator) };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -523,4 +526,28 @@ test "key with hyphens" {
     );
     defer result.deinit();
     try testing.expectEqual(true, result.table.getBool("qname-minimization").?);
+}
+
+/// Every allocating branch in one document: section names, bare keys, quoted
+/// strings, and the two-stage array parse (element slice + each element).
+fn parseOomProbe(allocator: Allocator, input: []const u8) !void {
+    var result = try parse(allocator, input);
+    result.deinit();
+}
+
+test "parse handles OOM without leaking" {
+    const doc =
+        \\[server]
+        \\listen = ["127.0.0.1:8053", "[::1]:8053"]
+        \\workers = 2
+        \\minimal-responses = true
+        \\
+        \\[resolver]
+        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
+        \\dnssec = true
+        \\
+        \\[cache]
+        \\size = 8388608
+    ;
+    try testing.checkAllAllocationFailures(testing.allocator, parseOomProbe, .{doc});
 }
