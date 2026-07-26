@@ -490,6 +490,11 @@ pub const Server = struct {
     /// cache's remiss hook holds a stable pointer.
     hot_set: ?*HotSet = null,
 
+    /// `allocator` must be thread-safe: it backs the RRset/key/NSEC caches,
+    /// which recv workers, resolution pools and bg-prefetch all share. Callers
+    /// pass `init.gpa` or `testing.allocator`, both of which qualify in every
+    /// build mode. The two `FailingAllocator` tests below are safe only because
+    /// neither spawns a worker — do not copy them into one that does.
     pub fn init(allocator: mem.Allocator, cfg: ServerConfig, io: Io) !Server {
         if (cfg.allow_loopback_upstreams) {
             log.warn("allow-loopback-upstreams is enabled — DNS rebinding defence is disabled for upstream addresses; intended for test environments only", .{});
@@ -502,19 +507,18 @@ pub const Server = struct {
         dedup_mod.randomizeHashSeed(io);
         na.randomizeHashSeed(io);
 
-        const cache_alloc = if (builtin.single_threaded)
-            allocator
-        else
-            std.heap.smp_allocator;
-        // Pool threads, NS-fanout helpers, and bg-prefetch all share these
-        // caches via shallow-cloned resolver context. Gate on the same
-        // single_threaded build flag that picks the cache backing allocator.
+        // The caches used to hardcode `std.heap.smp_allocator`, so the largest
+        // region in the process escaped whatever checking allocator the caller
+        // supplied — the server tests and a ReleaseSafe soak both saw nothing
+        // (RRsetCache's own tests always used `testing.allocator`). The shipped
+        // binary is unaffected: it links no libc, so ReleaseFast resolves
+        // `init.gpa` to `smp_allocator`, exactly what was hardcoded here.
         const thread_safe = !builtin.single_threaded;
         // Cache readers = recv workers + their resolution-thread pools; both
         // caches size their shards from this.
         const reader_concurrency: u32 = @as(u32, cfg.workers) * (1 + @as(u32, cfg.resolution_threads));
         var cache = RRsetCache.init(.{
-            .backing = cache_alloc,
+            .backing = allocator,
             .max_bytes = cfg.cache_size,
             .max_entries = cfg.cache_entries,
             .io = io,
@@ -574,13 +578,13 @@ pub const Server = struct {
             .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
             .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
-                .backing = if (builtin.single_threaded) allocator else std.heap.smp_allocator,
+                .backing = allocator,
                 .max_bytes = NsecCache.default_max_bytes,
                 .io = io,
                 .thread_safe = thread_safe,
             }) else null,
             .key_cache = if (cfg.dnssec) RRsetCache.init(.{
-                .backing = cache_alloc,
+                .backing = allocator,
                 .max_bytes = cfg.key_cache_size,
                 .max_entries = cfg.key_cache_entries,
                 .io = io,
