@@ -89,7 +89,7 @@ pub fn populateHostCache(
         const msg = try makeAResponse(setup_alloc, idx, &host_labels_spec, .{
             10, 0, @intCast((idx >> 8) & 0xff), @intCast(idx & 0xff),
         });
-        cache.storeResponse(msg, root_zone, .unchecked);
+        cache.storeResponse(msg, root_zone, .unchecked, std.math.maxInt(u32));
         names[i] = try std.fmt.allocPrint(names_alloc, "host{d}.example.com", .{i});
         filled = i + 1;
     }

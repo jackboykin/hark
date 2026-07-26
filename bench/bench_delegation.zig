@@ -21,7 +21,7 @@ const warmup: usize = 500;
 
 fn storeRecord(cache: *RRsetCache, alloc: std.mem.Allocator, rr: dns.ResourceRecord, authority_zone: dns.Name) !void {
     const msg = try bench_common.singleAnswerMessage(alloc, rr);
-    cache.storeResponse(msg, authority_zone, .unchecked);
+    cache.storeResponse(msg, authority_zone, .unchecked, std.math.maxInt(u32));
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {

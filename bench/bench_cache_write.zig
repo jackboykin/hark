@@ -340,7 +340,7 @@ fn run(
             .questions = &.{},
             .answers = g,
         };
-        cache.storeResponse(msg, root_zone, .unchecked);
+        cache.storeResponse(msg, root_zone, .unchecked, std.math.maxInt(u32));
     }
 
     counter.calls = 0;
@@ -365,7 +365,7 @@ fn run(
         };
         const calls_before = counter.calls;
         const t0 = monotonic.nowNs();
-        cache.storeResponse(msg, root_zone, .unchecked);
+        cache.storeResponse(msg, root_zone, .unchecked, std.math.maxInt(u32));
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
         alloc_deltas[i] = counter.calls - calls_before;
