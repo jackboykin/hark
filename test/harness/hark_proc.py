@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import shlex
 import socket
 import subprocess
 import time
@@ -183,11 +184,25 @@ def find_hark_binary() -> Path:
     enables the `[resolver] upstream-port` and `allow-loopback-upstreams`
     keys; without them hark refuses the test config with
     `error.TestOnlyConfigKey`.
+
+    `HARK_BUILD_ARGS` appends flags, so the pre-tag release check needs no
+    second code path: `HARK_BUILD_ARGS=-Doptimize=ReleaseFast pytest`.
+    Output-prefix flags are refused: the returned path is hardcoded below,
+    so `-p` would silently hand back whatever stale binary sits in
+    `zig-out/bin`.
     """
     repo = Path(__file__).resolve().parents[2]
+    extra = shlex.split(os.environ.get("HARK_BUILD_ARGS", ""))
+    for i, arg in enumerate(extra):
+        if arg in ("-p", "--prefix") or arg.startswith("--prefix="):
+            raise RuntimeError(
+                f"HARK_BUILD_ARGS[{i}]={arg!r} redirects the install prefix, but "
+                f"find_hark_binary() always returns zig-out/bin/hark — the suite "
+                f"would silently test a stale binary. Remove it."
+            )
     try:
         subprocess.run(
-            ["zig", "build", "-Dtesting=true"],
+            ["zig", "build", "-Dtesting=true", *extra],
             cwd=repo,
             check=True,
             capture_output=True,
