@@ -27,6 +27,12 @@ pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
 pub const response = @import("response.zig");
 
+/// This module's own optimize mode. The bench harness is pinned to ReleaseFast
+/// so the instrument stays constant while `-Doptimize` varies the subject, which
+/// means the harness's `builtin.mode` is the constant `fast` and says nothing
+/// about which hark was measured. Read this instead.
+pub const build_mode = @import("builtin").mode;
+
 // Explicit per-file imports drive test discovery by reachability, so tests run
 // regardless of pub-ness — unlike refAllDecls, which sees only pub decls (a
 // dropped `pub` silently drops a file's tests) and is on its way out of std.

@@ -65,7 +65,14 @@ pub fn main(init: std.process.Init) !void {
 
     // toolchain stamp: baselines outlive nightlies (and their bundled LLVM)
     const builtin = @import("builtin");
-    try stdout.print("# zig {s} mode={t} backend={t}\n", .{ builtin.zig_version_string, builtin.mode, builtin.zig_backend });
+    // hark={t} is the subject's mode; the harness is pinned to ReleaseFast, so
+    // its own builtin.mode is a constant and cannot tell the runs apart. The
+    // tsan marker is load-bearing too: those timings must never be compared
+    // against bench/baselines/, and nothing else on the line reveals it.
+    const tsan_marker = if (builtin.sanitize_thread) " TSAN-DO-NOT-COMPARE" else "";
+    try stdout.print("# zig {s} hark={t} harness={t} backend={t}{s}\n", .{
+        builtin.zig_version_string, hark.build_mode, builtin.mode, builtin.zig_backend, tsan_marker,
+    });
 
     var matched: u32 = 0;
     for (benchmarks) |b| {
