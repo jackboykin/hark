@@ -578,6 +578,7 @@ pub const RecursiveResolver = struct {
 
                 // ── Probe response handling (non-final queries) ──
                 if (!is_final) {
+                    const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                     // Check for referral — only from successful responses (error responses
                     // may contain NS records in authority that are not valid delegations)
                     if (response.header.flags.rcode == .no_error) {
@@ -611,7 +612,6 @@ pub const RecursiveResolver = struct {
                         // filter routes them through the dedicated NSEC
                         // aggressive-use cache instead, so this branch caches
                         // *only* entries the NX-cut will skip by design.
-                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count])) {
                             .proceed => |status| {
                                 // .secure here means verifiedNegativeResponse
@@ -647,7 +647,6 @@ pub const RecursiveResolver = struct {
 
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
                     {
-                        const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
                         switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count])) {
                             .proceed => |status| {
                                 if (response.header.flags.aa) {
@@ -793,14 +792,6 @@ pub const RecursiveResolver = struct {
     /// referral path would have caught this via `classifyDelegation`,
     /// but a cache shortcut skips that call, so `hasCachedInsecureDelegation`
     /// stands in.
-    /// Strip the leftmost label. Used only to pick a *starting point* for the
-    /// cached-delegation walk on DS queries, never as a claim about where a
-    /// zone cut is — so an ENT gap costs nothing here.
-    fn parentQueryName(name: []const u8) []const u8 {
-        const dot = mem.indexOfScalar(u8, name, '.') orelse return "";
-        return name[dot + 1 ..];
-    }
-
     fn seedServersForQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -822,8 +813,10 @@ pub const RecursiveResolver = struct {
         // one label up instead so the query reaches someone who can answer it.
         // Deliberately not label arithmetic on a zone name (see 09283b6): the
         // walk starts at the TLD and keeps the deepest cached hit, so any cut
-        // at or above the parent is found, ENT gaps included.
-        const seed_name = if (qtype == .ds) parentQueryName(current_name) else current_name;
+        // at or above the parent is found, ENT gaps included. parentZoneOf here
+        // is a plain leftmost-label strip picking the walk's starting point —
+        // never a claim about where a cut is; keep it dumb.
+        const seed_name = if (qtype == .ds) parentZoneOf(current_name) else current_name;
 
         if (try self.findClosestCachedDelegation(allocator, seed_name)) |deleg| {
             server_count.* = deleg.count;
@@ -1481,8 +1474,7 @@ pub const RecursiveResolver = struct {
             return self.tcpFallback(allocator, wire_query, server);
         }
 
-        const response = try tryParseMessage(allocator, response_data, server) orelse return null;
-        return response;
+        return try tryParseMessage(allocator, response_data, server);
     }
 
     /// Issue the query over TCP (pooled if available). Returns null if TCP
@@ -1501,8 +1493,7 @@ pub const RecursiveResolver = struct {
             log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
         };
-        const response = try tryParseMessage(allocator, tcp_data, server) orelse return null;
-        return response;
+        return try tryParseMessage(allocator, tcp_data, server);
     }
 
     /// Returns the RNG to randomize an outgoing query to `addr_key`, or
@@ -2404,7 +2395,7 @@ pub const RecursiveResolver = struct {
 
         switch (status) {
             .secure => {
-                try self.trimAnswerTtls(allocator, response, ttl_cap);
+                try trimAnswerTtls(allocator, response, ttl_cap);
                 response.header.flags.ad = true;
                 return .{ .valid = ttl_cap };
             },
@@ -2464,12 +2455,10 @@ pub const RecursiveResolver = struct {
     /// shown would reject its own copy. Allocates only when something exceeds
     /// the cap, which for real zones is never.
     fn trimAnswerTtls(
-        self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
         cap: u32,
     ) !void {
-        _ = self;
         var needs_trim = false;
         for (response.answers) |rr| {
             if (rr.ttl > cap) {
