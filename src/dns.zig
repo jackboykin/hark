@@ -27,7 +27,7 @@ pub fn hasTcBit(bytes: []const u8) bool {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-pub const max_label_len = 63;
+const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
 pub const header_len = 12;
@@ -606,7 +606,7 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
 /// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels.
 /// `@constCast` is sound because `parseDottedName` `dupe`s each label, so
 /// the underlying storage is mutable. RFC draft Vixie/Dagon.
-pub fn applyCase0x20(io: std.Io, name: Name) void {
+fn applyCase0x20(io: std.Io, name: Name) void {
     var pool: u64 = 0;
     var bits_left: u8 = 0;
     for (name.labels) |label| {
@@ -686,11 +686,11 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
 
 // ── Parser ─────────────────────────────────────────────────────────────
 
-pub const Parser = struct {
+const Parser = struct {
     msg: []const u8,
     pos: usize,
 
-    pub fn init(msg: []const u8) Parser {
+    fn init(msg: []const u8) Parser {
         return .{ .msg = msg, .pos = 0 };
     }
 
@@ -726,7 +726,7 @@ pub const Parser = struct {
     /// the returned `Name.labels` outer slice is `allocator`-owned, but
     /// each `labels[i]` byte slice points into `self.msg`. Caller must
     /// keep the wire buffer alive for the lifetime of the parsed Name.
-    pub fn parseName(self: *Parser, allocator: Allocator) Error!Name {
+    fn parseName(self: *Parser, allocator: Allocator) Error!Name {
         // Collect on the stack and dupe once at the end — N ArrayList grow
         // allocs per name (4-5 typical) showed up at ~0.5% of CPU on miss.
         var labels_buf: [max_label_count][]const u8 = undefined;
@@ -783,14 +783,14 @@ pub const Parser = struct {
         return .{ .labels = labels };
     }
 
-    pub fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
+    fn parseQuestion(self: *Parser, allocator: Allocator) Error!Question {
         const name = try self.parseName(allocator);
         const qtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const qclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         return .{ .name = name, .qtype = qtype, .qclass = qclass };
     }
 
-    pub fn parseResourceRecord(self: *Parser, allocator: Allocator) Error!ResourceRecord {
+    fn parseResourceRecord(self: *Parser, allocator: Allocator) Error!ResourceRecord {
         const name = try self.parseName(allocator);
         // parseName's outer label slice is the only heap touched so far; on
         // any subsequent failure (header reads or parseRData OOM) we must
@@ -1283,13 +1283,13 @@ pub const Serializer = struct {
         self.pos += data.len;
     }
 
-    pub fn writeHeader(self: *Serializer, hdr: Header) Error!void {
+    fn writeHeader(self: *Serializer, hdr: Header) Error!void {
         try self.ensureSpace(12);
         hdr.serialize(self.buf[self.pos..][0..12]);
         self.pos += 12;
     }
 
-    pub fn writeName(self: *Serializer, name: Name) Error!void {
+    fn writeName(self: *Serializer, name: Name) Error!void {
         for (name.labels) |label| {
             if (label.len > max_label_len) return error.LabelTooLong;
             try self.writeU8(@intCast(label.len));
@@ -1298,7 +1298,7 @@ pub const Serializer = struct {
         try self.writeU8(0); // Root label terminator
     }
 
-    pub fn writeQuestion(self: *Serializer, q: Question) Error!void {
+    fn writeQuestion(self: *Serializer, q: Question) Error!void {
         try self.writeName(q.name);
         try self.writeU16(@backingInt(q.qtype));
         try self.writeU16(@backingInt(q.qclass));
@@ -2251,7 +2251,7 @@ pub fn cloneNameFlatOwned(allocator: Allocator, name: Name) !OwnedFlatName {
 
 /// Like `cloneNameFlat` but lowercases ASCII letters in-flight. Used to
 /// scrub 0x20-randomized case off upstream RR owner names.
-pub fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
+fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
     const owned = try cloneNameFlatImpl(allocator, name, true);
     return .{ .labels = owned.name.labels };
 }
@@ -2340,13 +2340,13 @@ pub fn freeName(allocator: Allocator, name: Name) void {
 
 /// Free a slice that may be empty (parsed data can alias the wire buffer with
 /// zero-length slices that were never heap-allocated).
-pub fn freeIfOwned(allocator: Allocator, slice: []const u8) void {
+fn freeIfOwned(allocator: Allocator, slice: []const u8) void {
     if (slice.len > 0) allocator.free(slice);
 }
 
 /// Duplicate a slice, returning an unallocated empty slice for empty inputs.
 /// Mirrors `freeIfOwned` so clone/free symmetry is preserved.
-pub fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
+fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
     if (slice.len == 0) return &.{};
     return allocator.dupe(u8, slice);
 }
@@ -2558,15 +2558,11 @@ fn freeWireParsedRR(allocator: Allocator, rr: ResourceRecord) void {
     freeWireParsedRData(allocator, rr.rdata);
 }
 
-fn freeResourceRecordContents(allocator: Allocator, rrs: []const ResourceRecord) void {
+fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
     for (rrs) |rr| {
         freeName(allocator, rr.name);
         freeRData(allocator, rr.rdata);
     }
-}
-
-fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
-    freeResourceRecordContents(allocator, rrs);
     allocator.free(rrs);
 }
 
