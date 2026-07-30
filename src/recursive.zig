@@ -550,7 +550,6 @@ pub const RecursiveResolver = struct {
                         if (c.lookup(allocator, query_name, query_type, .in)) |result| {
                             switch (result) {
                                 .hit => {
-                                    // Name exists — advance probe
                                     minimize_label_count += 1;
                                     continue;
                                 },
@@ -640,7 +639,6 @@ pub const RecursiveResolver = struct {
                     }
 
                     if (response.answers.len > 0) {
-                        // Probe got an answer — name exists, advance
                         minimize_label_count += 1;
                         continue;
                     }
@@ -687,7 +685,6 @@ pub const RecursiveResolver = struct {
 
                 self.probeParentChildCut(allocator, target_name, parent_zone, &response, servers[0..server_count], &security_state);
 
-                // Classify response
                 if (response.header.flags.rcode != .no_error)
                     return self.handleErrorResponse(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
 
@@ -768,7 +765,6 @@ pub const RecursiveResolver = struct {
                     return self.finalizeAnswer(allocator, &response, current_name, qtype, security_state, parent_zone, servers[0..server_count], responding_server, &cname_chain);
                 }
 
-                // Check for referral (NS records in authority section)
                 const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse
                     return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
 
@@ -1111,7 +1107,6 @@ pub const RecursiveResolver = struct {
             security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, servers.*[0..server_count.*]);
         }
 
-        // Resolve server addresses
         const addrs: NsAddrResult = switch (referral) {
             .referral => |ref| .{ .addrs = ref.addrs, .count = ref.count },
             .no_glue => |ng| blk: {
@@ -2500,7 +2495,6 @@ pub const RecursiveResolver = struct {
             if (!rr.name.isSubdomainOf(signer)) return .unchecked;
         };
 
-        // Fetch DNSKEY from cache or parent servers
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 

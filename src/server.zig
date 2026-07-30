@@ -1438,19 +1438,12 @@ const WorkerState = struct {
                         }
                         if (self.server.shutdown.load(.acquire)) continue;
                         const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
-                        // Multishot stays armed across CQEs; re-arm only when
-                        // the kernel terminated it. The signal comes from this
-                        // completion's own CQE, never from the slot table: two
-                        // listeners terminating in one batch (ENOBUFS on the
-                        // shared buffer ring is flood-triggerable) are both
-                        // freed before this loop runs, and the LIFO free list
-                        // then hands the first re-arm the id the second just
-                        // released. Consulting the slot table would see that
-                        // fresh op, conclude the second listener was still
-                        // armed, and silently never re-arm it — its op id stays
-                        // non-null so the repair loop below skips it too, and
-                        // SO_REUSEPORT keeps hashing traffic into the dead
-                        // worker until restart.
+                        // Re-arm only on kernel termination, signalled by this
+                        // CQE — never the slot table (see Completion.terminated
+                        // for the mid-batch id-recycle trap). ENOBUFS on the
+                        // shared buffer ring is flood-triggerable; a missed
+                        // re-arm leaves SO_REUSEPORT hashing traffic into a
+                        // dead worker until restart.
                         if (!c.terminated) continue;
                         udp_ops[idx] = self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx)) catch |err| {
                             log.err("failed to re-register UDP recvmsg: {s}", .{@errorName(err)});

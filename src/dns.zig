@@ -742,7 +742,6 @@ const Parser = struct {
             const len_byte = self.msg[cursor];
 
             if (len_byte == 0) {
-                // End of name
                 cursor += 1;
                 if (saved_pos == null) self.pos = cursor;
                 break;
@@ -1199,9 +1198,7 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
 /// aliased slices point into `bytes`, so `freeMessage` is only sound
 /// when `allocator.free` is a no-op. On error, per-item cleanup is
 /// skipped for the same reason — only ArrayList backing buffers are
-/// deinit'd, which is safe under any allocator. Production uses a
-/// per-query arena; tests wrap `testing.allocator` in an `ArenaAllocator`
-/// for successful-parse paths.
+/// deinit'd, which is safe under any allocator.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     if (bytes.len < header_len) return error.EndOfData;
 
@@ -1426,7 +1423,6 @@ pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ser = Serializer.init(buf);
 
-    // Write header with adjusted ar_count for OPT
     var hdr = msg.header;
     if (msg.opt != null) hdr.ar_count += 1;
     try ser.writeHeader(hdr);
@@ -1472,11 +1468,9 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
             try ser.writeSlice(o.data);
         }
 
-        // Write padding option if needed
         if (opt.padding_target > 0) {
             try ser.writeU16(edns_opt_padding);
             try ser.writeU16(padding_len);
-            // Write zero-filled padding
             try ser.ensureSpace(padding_len);
             @memset(ser.buf[ser.pos..][0..padding_len], 0);
             ser.pos += padding_len;
@@ -2532,23 +2526,14 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         },
         .rrsig => |*r| r.signer_name = try cloneNameLower(allocator, r.signer_name),
         // RFC 6840 §5.1: names in NSEC RDATA are *not* case-folded when
-        // canonicalizing, while names in RRSIG RDATA are — hark used to do the
-        // exact inverse of both halves. Downcasing here changed the bytes that
-        // later go into the signed data, so any signer preserving case in its
-        // chain failed verification and every NXDOMAIN and NODATA in the zone
-        // came back bogus.
-        //
-        // Still cloned, just not folded: the scrub is also what re-anchors
-        // label bytes off the upstream wire buffer, so skipping it entirely
-        // would leave the name aliasing storage the message does not own.
-        //
-        // The 0x20 motive that justifies the folding elsewhere does not reach
-        // here — case randomization affects the echoed QNAME and owner names,
-        // never a signer-chosen next_domain — and range comparisons go through
-        // case-insensitive cmpLabelsCI regardless.
-        // `cloneNameFlat`, not `cloneName`: same single-allocation shape as the
-        // `cloneNameLower` it replaced. The per-label variant would turn one
-        // allocation into N+1 for every NSEC on the parse path.
+        // canonicalizing (RRSIG RDATA names are) — hark once did the inverse
+        // of both, so any case-preserving signer failed verification zone-wide.
+        // Still cloned, just not folded: the scrub re-anchors label bytes off
+        // the upstream wire buffer the message does not own. 0x20 never touches
+        // a signer-chosen next_domain, and range comparisons use
+        // case-insensitive cmpLabelsCI regardless. `cloneNameFlat`, not
+        // `cloneName`: same single-allocation shape as the `cloneNameLower` it
+        // replaced (per-label would be N+1 allocs per NSEC on the parse path).
         .nsec => |*n| n.next_domain_name = (try cloneNameFlat(allocator, n.next_domain_name)).toUnownedName(),
     }
 }
@@ -2883,17 +2868,14 @@ test "RRSIG record parse/serialize roundtrip" {
 
 test "NSEC record parse/serialize roundtrip" {
     const next_name = "\x04host\x07example\x03com\x00";
-    // Type bitmap: window 0, length 7 bytes
-    // A(1): byte 0, bit 1 => 0x40
-    // NS(2): byte 0, bit 2 => 0x20
-    // SOA(6): byte 0, bit 6 => 0x02
-    // => byte 0 = 0x62
-    // MX(15): byte 1, bit 7 => 0x01
-    // RRSIG(46): byte 5, bit 6 => 0x02
-    // NSEC(47): byte 5, bit 7 => 0x01
-    // => byte 5 = 0x03
-    // DNSKEY(48): byte 6, bit 0 => 0x80
-    const bitmap = [_]u8{ 0x00, 0x07, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap = [_]u8{
+        0x00, 0x07, // window 0, length 7
+        0x62, // byte 0: A(1), NS(2), SOA(6)
+        0x01, // byte 1: MX(15)
+        0x00, 0x00, 0x00, // bytes 2-4: empty
+        0x03, // byte 5: RRSIG(46), NSEC(47)
+        0x80, // byte 6: DNSKEY(48)
+    };
     var rd = TestRdata{};
     rd.putBytes(next_name);
     rd.putBytes(&bitmap);
@@ -2996,16 +2978,6 @@ test "NSEC3PARAM record parse/serialize roundtrip" {
 }
 
 test "typeBitmapContains" {
-    // Type A = 1: byte 0, bit 1, mask = 0x80>>1 = 0x40
-    // Type NS = 2: byte 0, bit 2, mask = 0x80>>2 = 0x20
-    // Type SOA = 6: byte 0, bit 6, mask = 0x80>>6 = 0x02
-    // => byte 0 = 0x62
-    // Type RRSIG = 46: byte 5, bit 6, mask = 0x80>>6 = 0x02
-    // Type NSEC = 47: byte 5, bit 7, mask = 0x80>>7 = 0x01
-    // => byte 5 = 0x03
-    // Type DNSKEY = 48: byte 6, bit 0, mask = 0x80>>0 = 0x80
-    // => byte 6 = 0x80
-    // Need window 0, length 7 (bytes 0-6)
     const bitmap = [_]u8{
         0x00, 0x07, // window 0, length 7
         0x62, // byte 0: A(1), NS(2), SOA(6)

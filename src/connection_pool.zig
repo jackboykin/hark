@@ -73,9 +73,7 @@ pub const TcpConnectionPool = ConnectionPool(TcpPooledConnection);
 
 pub const PooledConnection = struct {
     stream: Io.net.Stream,
-    /// Carried per-connection for the same reason as `TcpPooledConnection.io`
-    /// — keeps `destroyBroken` matching the generic ConnectionPool shape
-    /// (allocator-only).
+    /// See `TcpPooledConnection.io`.
     io: Io,
     net_reader: File.Reader,
     net_writer: File.Writer,
