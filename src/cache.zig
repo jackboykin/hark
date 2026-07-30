@@ -101,26 +101,14 @@ fn freeCachedRecord(alloc: Allocator, cr: CachedRecord) void {
 const rr_wire_stage_len: usize = 4096;
 
 fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
-    var wire_stage: [rr_wire_stage_len]u8 = undefined;
-    const built = try dns.buildResourceRecordWire(&wire_stage, rr);
-    const wire_owned = try alloc.dupe(u8, built.bytes);
-    errdefer alloc.free(wire_owned);
     const cloned_name = try cloneName(alloc, rr.name);
     errdefer dns.freeName(alloc, cloned_name);
-    const cloned_rdata = try dns.cloneRData(alloc, rr.rdata);
-    return .{
-        .name = cloned_name,
-        .rtype = rr.rtype,
-        .rclass = rr.rclass,
-        .rdata = cloned_rdata,
-        .wire = wire_owned,
-        .wire_ttl_offset = built.ttl_offset,
-    };
+    return buildCachedRecordSharedName(alloc, rr, cloned_name);
 }
 
-/// Variant for the RRset main-records path: the owner name is borrowed
-/// from `CachedRRset.shared_name_backing`, not cloned per-record. The
-/// returned `CachedRecord.name` MUST NOT be freed via `dns.freeName`.
+/// Uses `shared_name` as-is — no per-record clone; name ownership stays with
+/// the caller. On the RRset main-records path the name is borrowed from
+/// `CachedRRset.shared_name_backing` and MUST NOT be freed via `dns.freeName`.
 fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_name: dns.Name) !CachedRecord {
     var wire_stage: [rr_wire_stage_len]u8 = undefined;
     const built = try dns.buildResourceRecordWire(&wire_stage, rr);
@@ -592,41 +580,27 @@ pub const RRsetCache = struct {
     /// Acceptable for monitoring; do not assert invariants like
     /// `stores == entries + evictions` on these values.
     pub const Stats = struct {
-        entries: u32,
-        memory_bytes: usize,
-        max_bytes: usize,
-        hits: u64,
-        misses: u64,
-        stores: u64,
-        negative_stores: u64,
-        evictions: u64,
+        entries: u32 = 0,
+        memory_bytes: usize = 0,
+        max_bytes: usize = 0,
+        hits: u64 = 0,
+        misses: u64 = 0,
+        stores: u64 = 0,
+        negative_stores: u64 = 0,
+        evictions: u64 = 0,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
-        cap_exhausted_evictions: u64,
+        cap_exhausted_evictions: u64 = 0,
         /// Subset of `evictions` triggered by byte-budget pressure.
-        byte_pressure_evictions: u64,
-        prefetch_eligible: u64,
-        stale_hits: u64,
+        byte_pressure_evictions: u64 = 0,
+        prefetch_eligible: u64 = 0,
+        stale_hits: u64 = 0,
         /// Subset of `misses` where the entry existed but had expired. See
         /// ReadCounters.expired_remiss.
-        expired_remiss: u64,
+        expired_remiss: u64 = 0,
     };
 
     pub fn getStats(self: *RRsetCache) Stats {
-        var stats: Stats = .{
-            .entries = 0,
-            .memory_bytes = 0,
-            .max_bytes = 0,
-            .hits = 0,
-            .misses = 0,
-            .stores = 0,
-            .negative_stores = 0,
-            .evictions = 0,
-            .cap_exhausted_evictions = 0,
-            .byte_pressure_evictions = 0,
-            .prefetch_eligible = 0,
-            .stale_hits = 0,
-            .expired_remiss = 0,
-        };
+        var stats: Stats = .{};
         for (self.shards[0..self.shard_count]) |*shard| {
             shard.rwlock.lockSharedUncancelable(self.io);
             stats.entries += @intCast(shard.map.count());

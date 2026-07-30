@@ -71,7 +71,7 @@ const ZoneNsecList = struct {
             // Try expiring stale entries first; fall back to evicting oldest
             self.evictExpired(alloc, now);
             if (self.len >= self.entries.len) {
-                _ = self.evictOldest(alloc);
+                self.evictOldest(alloc);
             }
             // Re-find after compaction shifted entries
             pos = self.findInsertPos(entry.owner);
@@ -88,8 +88,8 @@ const ZoneNsecList = struct {
         self.len += 1;
     }
 
-    /// Evict the entry with the earliest expiration. Returns evicted index.
-    fn evictOldest(self: *ZoneNsecList, alloc: Allocator) usize {
+    /// Evict the entry with the earliest expiration.
+    fn evictOldest(self: *ZoneNsecList, alloc: Allocator) void {
         var oldest_idx: usize = 0;
         var oldest_expires: i64 = self.entries[0].expires_at;
         for (self.entries[1..self.len], 1..) |e, i| {
@@ -99,7 +99,6 @@ const ZoneNsecList = struct {
             }
         }
         self.removeAt(alloc, oldest_idx);
-        return oldest_idx;
     }
 
     fn evictExpired(self: *ZoneNsecList, alloc: Allocator, now: i64) void {
