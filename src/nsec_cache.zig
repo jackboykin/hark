@@ -515,17 +515,15 @@ pub const NsecCache = struct {
             .unknown => nodata: {
                 const nsec = list.findExact(qname, now) orelse return null;
                 if (isParentSideNsec(nsec, qname, qtype)) return null;
-                // Don't synthesize NODATA if CNAME exists — query must follow the
-                // CNAME chain (RFC 1034 §3.6.2, RFC 4035 §2.5).
-                if (qtype != .cname and dns.typeBitmapContains(nsec.type_bit_maps, .cname))
+                // No synthesis if the bitmap asserts qtype, or a CNAME the
+                // query must follow (RFC 1034 §3.6.2, RFC 4035 §2.5).
+                if (dnssec.bitmapContradictsNodata(nsec.type_bit_maps, qtype))
                     return null;
-                if (!dns.typeBitmapContains(nsec.type_bit_maps, qtype))
-                    break :nodata blk: {
-                        proof_refs[0] = nsec;
-                        proof_ref_count = 1;
-                        break :blk .{ .nodata, 0 };
-                    };
-                return null;
+                break :nodata blk: {
+                    proof_refs[0] = nsec;
+                    proof_ref_count = 1;
+                    break :blk .{ .nodata, 0 };
+                };
             },
         };
         const soa = cloneRecord(caller_alloc, cached_soa.*) catch return null;
@@ -649,13 +647,15 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
     // Check if wildcard exists
     if (list.findExact(wildcard_name, now)) |wc_nsec| {
         if (isParentSideNsec(wc_nsec, wildcard_name, qtype)) return .unknown;
-        // Wildcard exists — check type bitmap for synthesis
-        // CNAME at wildcard: must follow CNAME upstream, can't synthesize here
-        if (qtype != .cname and dns.typeBitmapContains(wc_nsec.type_bit_maps, .cname))
-            return .unknown;
-        if (!dns.typeBitmapContains(wc_nsec.type_bit_maps, qtype)) {
+        // Wildcard exists. NODATA synthesis is eligible only when nothing
+        // in the bitmap would have answered the query.
+        if (!dnssec.bitmapContradictsNodata(wc_nsec.type_bit_maps, qtype)) {
             return .{ .wildcard_nodata = .{ .qname_cover = qname_cover, .wildcard_owner = wc_nsec } };
         }
+        // CNAME at the wildcard (for a non-CNAME query) must be followed
+        // upstream — even beside qtype, where the zone is malformed.
+        if (qtype != .cname and dns.typeBitmapContains(wc_nsec.type_bit_maps, .cname))
+            return .unknown;
         return .{ .wildcard_match = .{ .qname_cover = qname_cover, .ce_label_count = @intCast(ce.labels.len) } };
     }
 

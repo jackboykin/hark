@@ -913,12 +913,15 @@ pub fn nsecProvesNameNonexistence(
     );
 }
 
+/// RFC 4035 §5.4 + RFC 6840 §4.3: a NODATA proof fails if the bitmap
+/// asserts qtype — or a CNAME, which would have answered the query —
+/// exists at the owner. Also gates nsec_cache's aggressive synthesis.
+pub fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
+    return dns.typeBitmapContains(type_bit_maps, qtype) or
+        dns.typeBitmapContains(type_bit_maps, .cname);
+}
+
 /// Check if an NSEC record proves that `qtype` does not exist at `qname`.
-/// RFC 4035 §5.4 + RFC 6840 §4.3: the bitmap must show qtype absent AND
-/// CNAME absent — otherwise the name has a CNAME and the answer should
-/// have followed it. (When qtype itself is CNAME, only that absence
-/// matters; the dual check would be self-redundant.) Mirrors the NSEC3
-/// NODATA path in validateNegativeProofNsec3.
 fn nsecProvesTypeNonexistence(
     nsec_owner: dns.Name,
     nsec: dns.NsecData,
@@ -927,9 +930,7 @@ fn nsecProvesTypeNonexistence(
 ) bool {
     if (!nsec_owner.eql(qname)) return false;
     if (wrongSideOfCut(nsec.type_bit_maps, qname, qtype)) return false;
-    if (dns.typeBitmapContains(nsec.type_bit_maps, qtype)) return false;
-    if (qtype == .cname) return true;
-    return !dns.typeBitmapContains(nsec.type_bit_maps, .cname);
+    return !bitmapContradictsNodata(nsec.type_bit_maps, qtype);
 }
 
 // ── NSEC3 Hashing (RFC 5155) ─────────────────────────────────────────
@@ -1150,13 +1151,8 @@ pub fn validateNegativeProof(
                 if (rr.rtype != .nsec) continue;
                 if (rr.name.eql(wildcard)) {
                     // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
-                    if (dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, qtype))
+                    if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
                         return .bogus;
-                    if (qtype != .cname and
-                        dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .cname))
-                    {
-                        return .bogus;
-                    }
                     return .secure;
                 }
                 // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
@@ -1287,9 +1283,7 @@ fn validateNsec3NegativeProof(
                 // NSEC3 is the majority wire form — com/net/org all use it —
                 // so omitting it here would leave the rule on the minority case.
                 if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
-                if (dns.typeBitmapContains(nsec3.type_bit_maps, qtype) or
-                    dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
-                {
+                if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
                     return .bogus;
                 }
                 return .secure;
@@ -1388,9 +1382,7 @@ fn validateNsec3NegativeProof(
             if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
                 wc_proven = true;
             } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
-                if (dns.typeBitmapContains(nsec3.type_bit_maps, qtype) or
-                    dns.typeBitmapContains(nsec3.type_bit_maps, .cname))
-                {
+                if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
                     wc_contradicted = true;
                 } else {
                     wc_proven = true;
@@ -3536,6 +3528,34 @@ test "NSEC3 NXDOMAIN wildcard-match with qtype present is .bogus" {
         makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
         nc_rr,
         makeNsec3Rr(wc_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
+    };
+
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
+}
+
+test "NSEC3 NXDOMAIN wildcard-match with CNAME present is .bogus" {
+    // The wildcard's bitmap asserting a CNAME means the answer should have
+    // been wildcard CNAME expansion, not NXDOMAIN.
+    const qname = dns.Name{ .labels = &.{ "missing", "example", "com" } };
+    const ce_name = dns.Name{ .labels = &.{ "example", "com" } };
+    const wc_name = dns.Name{ .labels = &.{ "*", "example", "com" } };
+    const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
+    const salt: []const u8 = &.{};
+
+    var bufs1: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce_name, salt, 0), zone_labels, &bufs1.enc, &bufs1.labels);
+    var bufs2: Nsec3OwnerBufs = .{};
+    var nc_low: [20]u8 = undefined;
+    var nc_high: [20]u8 = undefined;
+    const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
+    var bufs3: Nsec3OwnerBufs = .{};
+    const wc_owner = makeNsec3OwnerName(try nsec3Hash(wc_name, salt, 0), zone_labels, &bufs3.enc, &bufs3.labels);
+
+    const authorities = [_]dns.ResourceRecord{
+        makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
+        nc_rr,
+        makeNsec3Rr(wc_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x04 }),
     };
 
     var b: ValidationBudget = .{};
