@@ -550,14 +550,11 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
 
 // ── RRSIG Verification ───────────────────────────────────────────────
 
-const serialAfter = dns.serialAfter;
-
-// RFC 4035 §5.3.1 mandates zero grace; we deviate minimally and asymmetrically.
+// RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
 // Inception grace forgives a signer with a slightly-ahead clock (misconfig, no
 // replay value). Expiration grace would widen an attacker's replay window for
 // a captured RRSIG, so it stays zero.
 const inception_skew_tolerance: u32 = 60;
-const expiration_skew_tolerance: u32 = 0;
 
 /// Verify an RRSIG, returning true on success, false on non-budget failure.
 /// Propagates ValidationBudgetExhausted so callers can bail out of loops.
@@ -616,9 +613,8 @@ fn verifyRrsig(
 
     // RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
     const skew_ahead = now_u32 +% inception_skew_tolerance;
-    const skew_behind = now_u32 -% expiration_skew_tolerance;
-    if (serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
-    if (serialAfter(skew_behind, rrsig.sig_expiration)) return error.SignatureExpired;
+    if (dns.serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
+    if (dns.serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
 
     // Build the signed data
     var signed_data_buf: [65536]u8 = undefined;
@@ -3759,7 +3755,7 @@ const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
 test "verifyRrsig rejects expired signature" {
     var budget: ValidationBudget = .{};
     // Expiration tolerance is 0 — any time strictly past expiration rejects.
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + expiration_skew_tolerance + 1, &budget));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + 1, &budget));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
@@ -3771,7 +3767,7 @@ test "verifyRrsig rejects not-yet-valid signature" {
 test "verifyRrsig tolerates clock skew within window" {
     var budget: ValidationBudget = .{};
     inline for (.{
-        1700000000 + expiration_skew_tolerance, // at expiration boundary
+        1700000000, // at expiration boundary
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
@@ -3869,32 +3865,24 @@ test "validateRrset propagates budget exhaustion as bogus" {
 // an NXDOMAIN response with insecure denial-of-existence — a DNSSEC
 // validation bypass on the order of CVE-2023-50387.
 
-fn rrsigData(type_covered: dns.RType, algorithm: dns.DnssecAlgorithm, owner_labels: usize, key_tag: u16, signer: dns.Name) dns.RrsigData {
-    return .{
-        .type_covered = type_covered,
-        .algorithm = algorithm,
-        .labels = @intCast(owner_labels),
-        .original_ttl = 300,
-        .sig_expiration = 1700000000,
-        .sig_inception = 1699000000,
-        .key_tag = key_tag,
-        .signer_name = signer,
-        .signature = &.{},
-    };
-}
-
 fn rrsigRr(owner: dns.Name, type_covered: dns.RType, algorithm: dns.DnssecAlgorithm, key_tag: u16, signer: dns.Name) dns.ResourceRecord {
     return .{
         .name = owner,
         .rtype = .rrsig,
         .rclass = .in,
         .ttl = 300,
-        .rdata = .{ .rrsig = rrsigData(type_covered, algorithm, owner.labels.len, key_tag, signer) },
+        .rdata = .{ .rrsig = .{
+            .type_covered = type_covered,
+            .algorithm = algorithm,
+            .labels = @intCast(owner.labels.len),
+            .original_ttl = 300,
+            .sig_expiration = 1700000000,
+            .sig_inception = 1699000000,
+            .key_tag = key_tag,
+            .signer_name = signer,
+            .signature = &.{},
+        } },
     };
-}
-
-fn nsecRrsigRr(owner: dns.Name, signer: dns.Name, algorithm: dns.DnssecAlgorithm) dns.ResourceRecord {
-    return rrsigRr(owner, .nsec, algorithm, 12345, signer);
 }
 
 const test_ecdsa_dnskey = dns.DnskeyData{
@@ -3932,7 +3920,7 @@ test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
     const signer = dns.Name{ .labels = &.{ "example", "com" } };
     const authorities = [_]dns.ResourceRecord{
         nsecRr(owner1, next1),
-        nsecRrsigRr(owner1, signer, .dsasha1), // unsupported algo, won't verify
+        rrsigRr(owner1, .nsec, .dsasha1, 12345, signer), // unsupported algo, won't verify
         nsecRr(owner2, next2),
         // no RRSIG for owner2 — bogus
     };
@@ -3952,7 +3940,7 @@ test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns insecure" {
     const signer = dns.Name{ .labels = &.{ "example", "com" } };
     const authorities = [_]dns.ResourceRecord{
         nsecRr(owner, next),
-        nsecRrsigRr(owner, signer, .dsasha1), // unsupported — triggers had_unsupported_algo
+        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported — triggers had_unsupported_algo
     };
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
@@ -3970,7 +3958,7 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
     const tag = keyTag(test_ecdsa_dnskey);
     const authorities = [_]dns.ResourceRecord{
         nsecRr(owner, next),
-        nsecRrsigRr(owner, signer, .dsasha1), // unsupported
+        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported
         rrsigRr(owner, .nsec, .ecdsap256sha256, tag, signer), // supported, empty sig → fails
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(signer, test_ecdsa_dnskey)};
