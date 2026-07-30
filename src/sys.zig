@@ -254,7 +254,7 @@ pub fn netWrite(io: std.Io, handle: posix.fd_t, buf: []const u8) std.Io.net.Stre
 /// Errors from the deadline-bounded exact-I/O loops below. `Closed` is a
 /// clean peer FIN (`n == 0`) — routine on client connections; `IoFailed`
 /// wraps any read/write syscall error.
-pub const DeadlineIoError = error{ Timeout, PollFailed, IoFailed, Closed };
+const DeadlineIoError = error{ Timeout, PollFailed, IoFailed, Closed };
 
 /// Read exactly `buf.len` bytes from `handle` before `deadline_ns`. Every
 /// iteration polls with the remaining deadline before issuing a netRead —
@@ -288,7 +288,7 @@ pub fn writeAllDeadline(io: std.Io, handle: posix.fd_t, data: []const u8, deadli
 /// `netReadPosix`/`netWritePosix` treat `EAGAIN` as a programmer bug,
 /// so `SO_RCVTIMEO`/`SO_SNDTIMEO` can't be used to bound those calls.
 /// Polling first puts the deadline in userspace where it belongs.
-pub fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, PollFailed }!void {
+fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, PollFailed }!void {
     const remaining_ns = deadline_ns - monotonic.nowNs();
     if (remaining_ns <= 0) return error.Timeout;
     const wait_ms: i32 = @intCast(@min(@divFloor(remaining_ns, 1_000_000), std.math.maxInt(i32)));

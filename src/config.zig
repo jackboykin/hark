@@ -139,7 +139,7 @@ pub const ServerConfig = struct {
     }
 };
 
-pub const ConfigError = error{
+const ConfigError = error{
     InvalidListenAddress,
     InvalidRootHintAddress,
     InvalidValue,

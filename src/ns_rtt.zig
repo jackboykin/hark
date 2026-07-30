@@ -247,7 +247,7 @@ pub const RttCache = struct {
         return self.now_fn();
     }
 
-    pub fn count(self: *const RttCache) usize {
+    fn count(self: *const RttCache) usize {
         var total: usize = 0;
         for (&self.shards) |*s| total += s.entries.count();
         return total;

@@ -153,7 +153,7 @@ pub const BlockingUdpTransport = struct {
         }
     }
 
-    pub const StaggeredResult = struct {
+    const StaggeredResult = struct {
         response_data: []const u8,
         responding_idx: u8,
     };
@@ -518,7 +518,7 @@ test "BlockingUdpTransport IPv6 loopback query" {
 }
 
 /// Mock UDP echo server for tests: reads one query, echoes it back with QR bit set.
-pub fn echoServerThread(sock: Io.net.Socket, io: Io) void {
+fn echoServerThread(sock: Io.net.Socket, io: Io) void {
     var recv_buf: [dns.max_udp_payload]u8 = undefined;
     const msg = sock.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } }) catch return;
     if (msg.data.len < 2) return;

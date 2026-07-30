@@ -139,7 +139,7 @@ pub const NsSelector = struct {
         for (&self.shards) |*s| s.arms.deinit();
     }
 
-    pub fn count(self: *NsSelector) usize {
+    fn count(self: *NsSelector) usize {
         var total: usize = 0;
         for (&self.shards) |*s| {
             if (s.mutex) |*mtx| mtx.lockUncancelable(self.io);

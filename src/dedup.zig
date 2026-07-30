@@ -12,7 +12,7 @@ const DedupKey = struct {
     qtype: dns.RType = .a,
     flags: u8 = 0,
 
-    pub fn init(name: []const u8, qtype: dns.RType, flags: u8) ?DedupKey {
+    fn init(name: []const u8, qtype: dns.RType, flags: u8) ?DedupKey {
         if (name.len > dns.max_name_len + 1) return null;
         var key = DedupKey{ .qtype = qtype, .name_len = @intCast(name.len), .flags = flags };
         for (name, 0..) |c, i| {
@@ -52,7 +52,7 @@ const DedupKeyContext = struct {
 
 // ── In-flight table ────────────────────────────────────────────────────
 
-pub const AcquireResult = enum { leader, follower };
+const AcquireResult = enum { leader, follower };
 
 /// One mutex + condvar per shard; broadcast wakes only that shard's
 /// followers. Power of two so modulo compiles to a mask.
@@ -63,7 +63,7 @@ const shard_mask: u64 = shard_count - 1;
 /// uniform-hashing variance well below the cap (max-shard load goes as
 /// `N/k + sqrt(2·(N/k)·ln k)` ≈ 170 here); saturation requires a real
 /// flood, not a fortunate distribution. Worst-case memory ≈ 8.5 MiB.
-pub const max_entries: u32 = 8192;
+const max_entries: u32 = 8192;
 const per_shard_cap: u32 = 2 * max_entries / shard_count;
 
 const Shard = struct {
@@ -91,7 +91,7 @@ pub const InFlightTable = struct {
 
     /// Total entry count across shards. Locks each shard briefly; only used
     /// in tests and not on the hot path.
-    pub fn count(self: *InFlightTable) u32 {
+    fn count(self: *InFlightTable) u32 {
         var total: u32 = 0;
         for (&self.shards) |*s| {
             s.mutex.lockUncancelable(self.io);

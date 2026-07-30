@@ -1040,7 +1040,7 @@ const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
 
 /// Compute NSEC3 hash, charging the per-query budget. Callers map both
 /// ValidationBudgetExhausted (CVE-2023-50868, fail-closed) and HashFailed to .bogus.
-pub fn budgetedNsec3Hash(
+fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
