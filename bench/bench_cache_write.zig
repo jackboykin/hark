@@ -6,7 +6,7 @@
 //! child — this bench measures that asymmetry.
 //!
 //! Workload: cold-cache fill of M=1000 unique RRsets per combo. The cache's
-//! backing allocator is wrapped by an `AllocCounter` so every call from the
+//! backing allocator is wrapped by a `TallyAllocator` so every call from the
 //! cache's `CountingAllocator` lands one tick. The counter is sampled
 //! before/after each store; per-store delta is averaged and reported in
 //! the bench label alongside ops/sec.
@@ -24,57 +24,11 @@ const dns = hark.dns;
 const RRsetCache = hark.cache.RRsetCache;
 const BenchResult = @import("main.zig").BenchResult;
 const Benchmark = @import("main.zig").Benchmark;
+const TallyAllocator = @import("tally_alloc.zig").TallyAllocator;
+const bench_common = @import("bench_common.zig");
 
 const m_rrsets: u32 = 1000;
 const warmup_rrsets: u32 = 32;
-
-// ── Backing-allocator call counter ────────────────────────────────────
-
-const AllocCounter = struct {
-    inner: std.mem.Allocator,
-    calls: u64 = 0,
-    bytes: u64 = 0,
-
-    fn init(inner: std.mem.Allocator) AllocCounter {
-        return .{ .inner = inner };
-    }
-
-    fn allocator(self: *AllocCounter) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = doAlloc,
-        .resize = doResize,
-        .remap = doRemap,
-        .free = doFree,
-    };
-
-    fn doAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *AllocCounter = @ptrCast(@alignCast(ctx));
-        const p = self.inner.rawAlloc(len, alignment, ret_addr);
-        if (p != null) {
-            self.calls += 1;
-            self.bytes += len;
-        }
-        return p;
-    }
-
-    fn doResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *AllocCounter = @ptrCast(@alignCast(ctx));
-        return self.inner.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn doRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *AllocCounter = @ptrCast(@alignCast(ctx));
-        return self.inner.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn doFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *AllocCounter = @ptrCast(@alignCast(ctx));
-        self.inner.rawFree(buf, alignment, ret_addr);
-    }
-};
 
 // ── Record builders ───────────────────────────────────────────────────
 
@@ -271,25 +225,20 @@ fn buildGroup(alloc: std.mem.Allocator, kind: RtypeKind, idx: u32, n: u32) ![]dn
     };
 }
 
-const an_count_header: dns.Header = .{
-    .id = 0,
-    .flags = .{
-        .qr = true,
-        .opcode = .query,
-        .aa = true,
-        .tc = false,
-        .rd = false,
-        .ra = false,
-        .z = 0,
-        .ad = false,
-        .cd = false,
-        .rcode = .no_error,
-    },
-    .qd_count = 0,
-    .an_count = 0,
-    .ns_count = 0,
-    .ar_count = 0,
-};
+fn groupMessage(g: []dns.ResourceRecord) dns.Message {
+    return .{
+        .header = .{
+            .id = 0,
+            .flags = bench_common.single_answer_header.flags,
+            .qd_count = 0,
+            .an_count = @intCast(g.len),
+            .ns_count = 0,
+            .ar_count = 0,
+        },
+        .questions = &.{},
+        .answers = g,
+    };
+}
 
 fn run(
     allocator: std.mem.Allocator,
@@ -299,7 +248,7 @@ fn run(
 ) !BenchResult {
     const backing = std.heap.page_allocator;
 
-    var counter = AllocCounter.init(backing);
+    var counter = TallyAllocator.init(backing);
     const counted_backing = counter.allocator();
 
     // Per-record allocation budget is roomy for DNSKEY (≥1KB owned bytes).
@@ -328,41 +277,17 @@ fn run(
     // Warmup: pre-touch backing pages so the first measured store doesn't
     // pay the page-fault tax.
     for (groups[0..warmup_rrsets]) |g| {
-        const msg = dns.Message{
-            .header = .{
-                .id = 0,
-                .flags = an_count_header.flags,
-                .qd_count = 0,
-                .an_count = @intCast(g.len),
-                .ns_count = 0,
-                .ar_count = 0,
-            },
-            .questions = &.{},
-            .answers = g,
-        };
-        cache.storeResponse(msg, root_zone, .unchecked, std.math.maxInt(u32));
+        cache.storeResponse(groupMessage(g), root_zone, .unchecked, std.math.maxInt(u32));
     }
 
-    counter.calls = 0;
-    counter.bytes = 0;
+    counter.reset();
 
     const samples = try allocator.alloc(i64, m_rrsets);
     const alloc_deltas = try allocator.alloc(u64, m_rrsets);
     defer allocator.free(alloc_deltas);
 
     for (groups[warmup_rrsets..], 0..) |g, i| {
-        const msg = dns.Message{
-            .header = .{
-                .id = 0,
-                .flags = an_count_header.flags,
-                .qd_count = 0,
-                .an_count = @intCast(g.len),
-                .ns_count = 0,
-                .ar_count = 0,
-            },
-            .questions = &.{},
-            .answers = g,
-        };
+        const msg = groupMessage(g);
         const calls_before = counter.calls;
         const t0 = monotonic.nowNs();
         cache.storeResponse(msg, root_zone, .unchecked, std.math.maxInt(u32));
