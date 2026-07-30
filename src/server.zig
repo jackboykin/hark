@@ -42,11 +42,6 @@ const build_options = @import("build_options");
 
 const log = std.log.scoped(.server);
 
-/// Bytes as binary kibibytes, for human-readable cache logging.
-fn asKiB(bytes: usize) u64 {
-    return @as(u64, bytes) / 1024;
-}
-
 /// Response rcode as a leading-space-prefixed tag, or "" when NOERROR — the
 /// common case, kept off the per-query log line so it isn't repeated endlessly.
 fn rcodeSuffix(rcode: dns.RCode, buf: []u8) []const u8 {
@@ -245,9 +240,7 @@ const PerThreadArena = struct {
 
 // ── Work Queue for resolution thread pool ─────────────────────────────
 
-/// Matches `multishot_payload_max` in event_loop.zig — the kernel never
-/// hands us more than this per UDP datagram.
-const max_work_query_bytes = 4096;
+const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
 
 const Protocol = enum { udp, tcp };
 
@@ -803,7 +796,7 @@ pub const Server = struct {
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
         log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, asKiB(stats.memory_bytes), stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
+            stats.entries, stats.memory_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
@@ -1312,7 +1305,7 @@ const WorkerState = struct {
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
         log.info("cache: {d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
-            stats.entries, asKiB(stats.memory_bytes), asKiB(stats.max_bytes), hit_pct, stats.evictions,
+            stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, hit_pct, stats.evictions,
         });
     }
 
@@ -2221,33 +2214,29 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     // this, a process launched as root inherits root's groups (wheel, adm,
     // disk, …) and keeps them after the uid drop. Skip when not root:
     // setgroups would EPERM and there's nothing to clear anyway.
-    if (std.os.linux.geteuid() == 0) {
-        const rc = if (@hasField(std.os.linux.SYS, "setgroups32"))
-            std.os.linux.syscall2(.setgroups32, 0, 0)
+    if (linux.geteuid() == 0) {
+        const rc = if (@hasField(linux.SYS, "setgroups32"))
+            linux.syscall2(.setgroups32, 0, 0)
         else
-            std.os.linux.syscall2(.setgroups, 0, 0);
+            linux.syscall2(.setgroups, 0, 0);
         if (@as(isize, @bitCast(rc)) != 0) return error.SetGroupsFailed;
     }
     // Drop group first so setgid still has CAP_SETGID. Once setuid runs,
     // the thread loses CAP_SETGID along with the rest of root's caps.
     if (gid) |g| {
-        const rc = std.os.linux.setresgid(g, g, g);
+        const rc = linux.setresgid(g, g, g);
         if (rc != 0) return error.SetGidFailed;
     }
     if (uid) |u| {
-        const rc = std.os.linux.setresuid(u, u, u);
+        const rc = linux.setresuid(u, u, u);
         if (rc != 0) return error.SetUidFailed;
     }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-fn isLinuxIoUringAvailable() bool {
-    return builtin.os.tag == .linux;
-}
-
 test "server init and deinit" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
@@ -2259,7 +2248,7 @@ test "server init and deinit" {
 }
 
 test "wakeWorker delivers a read-ready event" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const fd = try makeWakeEventFd();
     defer sys.close(fd);
 
@@ -2274,7 +2263,7 @@ test "wakeWorker delivers a read-ready event" {
 }
 
 test "createWakeFds allocates one eventfd per worker" {
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const fds = try createWakeFds(testing.allocator, 4);
     defer {
         for (fds) |fd| sys.close(fd);
@@ -2376,7 +2365,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // resolver verified. A cache entry stored as .unchecked (e.g. by the
     // CD=1 early-serve path before background validation upgrades it)
     // must not produce AD=1 responses to CD=0 clients.
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2438,7 +2427,7 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
     // repeated CD=1 queries to an already-validated name. A steady CD=1
     // workload would otherwise pay a bg spawn + upstream round-trip per
     // query even after the cache entry is .secure.
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator,
         \\[server]
@@ -2477,7 +2466,7 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     // Input validation before the expensive heap+spawn path. Protects against
     // a malformed name slipping through and the thread getting a truncated
     // or empty buffer.
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
@@ -2713,7 +2702,7 @@ test "Server.init does not leak when a late allocation fails" {
     // *after* every cache was constructed, and a failure there returned
     // past all of them with no errdefer in reach. Both are hoisted above
     // the literal now, which is what makes it infallible.
-    if (!isLinuxIoUringAvailable()) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator,
         \\[cache]

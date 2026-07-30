@@ -21,7 +21,7 @@ const read_buf_size = 4 * @sizeOf(linux.signalfd_siginfo);
 const multishot_group_id: u16 = 0;
 const multishot_buf_count: u16 = 256;
 const multishot_name_reserve: u32 = 28; // sockaddr_in6 max
-const multishot_payload_max: u32 = 4096;
+pub const multishot_payload_max: u32 = 4096;
 /// io_uring_recvmsg_out header + reserved name + payload.
 const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + multishot_payload_max;
 
