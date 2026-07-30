@@ -445,21 +445,25 @@ test "ConnectionPool max entries eviction" {
     try testing.expect(pool.entries.get(key1) == null);
 }
 
-/// Create a minimal PooledConnection for unit testing pool mechanics.
-/// Uses a dup'd /dev/null fd so close() is safe.
+/// Dup'd /dev/null wrapped as a stream so close() is safe.
+fn createTestStream() !Io.net.Stream {
+    const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    const sock = try sys.dup(dev_null);
+    sys.close(dev_null);
+    return .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
+}
+
+/// Minimal PooledConnection for unit testing pool mechanics.
 ///
 /// Note: `tls` is `undefined`. Pool tests reach the connection only via
 /// `destroyBroken` (which doesn't touch `.tls`), never `closeAndDestroy`
 /// (which calls `tls.close()`). If the pool's release path ever switches
 /// to `closeAndDestroy`, this helper must populate a real `tls.Connection`.
 fn createTestConnection(allocator: Allocator) !*PooledConnection {
-    const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
-    const sock = try sys.dup(dev_null);
-    sys.close(dev_null);
-
+    const stream = try createTestStream();
     const conn = try allocator.create(PooledConnection);
     conn.* = .{
-        .stream = .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } },
+        .stream = stream,
         .io = testing.io,
         .net_reader = undefined,
         .net_writer = undefined,
@@ -472,13 +476,10 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
 }
 
 fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
-    const dev_null = try sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
-    const sock = try sys.dup(dev_null);
-    sys.close(dev_null);
-
+    const stream = try createTestStream();
     const conn = try allocator.create(TcpPooledConnection);
     conn.* = .{
-        .stream = .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } },
+        .stream = stream,
         .io = testing.io,
         .last_used = 0,
         .query_count = 0,
