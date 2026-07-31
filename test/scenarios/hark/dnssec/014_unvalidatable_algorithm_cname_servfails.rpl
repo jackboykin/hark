@@ -3,21 +3,18 @@
 ; hark: dnssec-zone = example.
 ; hark: dnssec-zone = child.example.
 
-SCENARIO_BEGIN a CNAME signed only with an unvalidatable algorithm costs the answer its AD
+SCENARIO_BEGIN a CNAME signed only with an unvalidatable algorithm is bogus
 
 ; 012's shape, but the CNAME is signed with algorithm 3 (DSA), unimplemented
-; here. What this guards is the fold: the *lowest* verdict governs, so the A
-; verifying under `child.example.` does not lift the CNAME with it.
+; here. The zone is known secure (its DS carries a supported algorithm), so
+; real supported signatures existed and were stripped: serving this would let
+; an injector swap the RRSIGs on any RRset for one unsupported-algorithm
+; signature and get forged data served instead of rejected. Unbound reaches
+; the same verdict — its only insecure escape is the zone-level DS-algorithm
+; check (RFC 4035 §5.2), which hark applies at the delegation; scenario 017
+; covers that side (the genuinely all-unsupported zone must NOT land here).
 ;
-; The served-vs-rejected half pins CURRENT behaviour, not known-correct
-; behaviour. Unbound rejects this shape — its only insecure escape is a
-; zone-level check on the DS algorithms, made before the per-signature loop.
-; Since this zone is known secure, an injector who strips the real RRSIGs and
-; attaches one algorithm-3 signature gets data served instead of rejected.
-; Moving the escape to the DS (RFC 4035 §5.2, which hark lacks — it SERVFAILs
-; the real Ed448-signed ed448.nl) flips this expectation to SERVFAIL.
-;
-; Expected today: NOERROR, AD=0.
+; Expected: SERVFAIL.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -73,15 +70,10 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  ; `MATCH flags` is the assertion that matters: NOERROR with AD would mean
-  ; hark authenticated a redirect it could not verify.
-  MATCH flags answer question
-  REPLY QR RD RA NOERROR
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example. IN A
-  SECTION ANSWER
-    www.example. 3600 IN CNAME target.child.example.
-    target.child.example. 3600 IN A 192.0.2.7
 ENTRY_END
 
 SCENARIO_END

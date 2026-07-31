@@ -1454,19 +1454,6 @@ fn rrsetVerifiesWithAnyKey(
     return false;
 }
 
-/// Verdict when nothing verified: .bogus, except all-unsupported-algorithms
-/// which yields .insecure. Shared by both validators so the rule can't drift.
-///
-/// TODO: that `.insecure` escape is a keyless downgrade — both callers run
-/// only on a proven-secure zone, so an RRset carrying nothing but an
-/// unimplemented-algorithm RRSIG has been tampered with, and Unbound and BIND
-/// both reach .bogus. Their softening lives on the DS path instead (RFC 4035
-/// §5.2), which `classifyDelegation` lacks. The two must move together.
-fn launderingVerdict(attempted_supported: bool, had_unsupported_algo: bool) SecurityStatus {
-    if (attempted_supported) return .bogus;
-    return if (had_unsupported_algo) .insecure else .bogus;
-}
-
 /// A message is no better authenticated than its least authenticated RRset.
 pub fn weakest(a: SecurityStatus, b: SecurityStatus) SecurityStatus {
     return if (verdictRank(a) <= verdictRank(b)) a else b;
@@ -1515,22 +1502,12 @@ pub fn validateRrset(
     budget: *ValidationBudget,
     ttl_cap: ?*u32,
 ) SecurityStatus {
-    var had_unsupported_algo = false;
-    var attempted_supported = false;
     for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
         const rrsig = sig_rr.rdata.rrsig;
         if (rrsig.type_covered != covered_type) continue;
         if (!sig_rr.name.eql(owner)) continue;
-
-        if (!isSupportedAlgorithm(rrsig.algorithm)) {
-            had_unsupported_algo = true;
-            continue;
-        }
-
-        // Set BEFORE the collect below can bail — a mismatch is itself a
-        // forgery signal, not an excuse to launder to .insecure.
-        attempted_supported = true;
+        if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
         // Refuse rather than truncate: the caller sets AD on the *unpruned*
         // response, so verifying a signature over records[0..64] while
@@ -1554,7 +1531,12 @@ pub fn validateRrset(
             return .secure;
         }
     }
-    return launderingVerdict(attempted_supported, had_unsupported_algo);
+    // Nothing verified on a zone already proven secure — bogus, even when
+    // every candidate RRSIG used an unsupported algorithm: real supported
+    // signatures existed (the zone's DS says so, RFC 4035 §5.2 filtered the
+    // all-unsupported case to .insecure at the delegation) and were stripped.
+    // A softer verdict here is a keyless downgrade; Unbound and BIND agree.
+    return .bogus;
 }
 
 // ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
@@ -1571,7 +1553,6 @@ pub fn verifyAuthorityNsecSigs(
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
     // so no dedup is needed.
     var any_nsec = false;
-    var any_unsupported = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3) continue;
         any_nsec = true;
@@ -1591,41 +1572,23 @@ pub fn verifyAuthorityNsecSigs(
 
         // Find a matching RRSIG and verify it
         var sig_verified = false;
-        var had_unsupported_algo = false;
-        var attempted_supported = false;
         for (authorities) |sig_rr| {
             if (sig_rr.rtype != .rrsig) continue;
             const rrsig = sig_rr.rdata.rrsig;
             if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
-
-            if (!isSupportedAlgorithm(rrsig.algorithm)) {
-                had_unsupported_algo = true;
-                continue;
-            }
-
-            attempted_supported = true;
+            if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
             if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
                 sig_verified = true;
                 break;
             }
         }
-        if (!sig_verified) {
-            // RFC 4035 §5.3: every NSEC owner must verify; fall back to the
-            // shared §5.11 anti-downgrade verdict (.bogus aborts the whole
-            // proof, .insecure means this owner had only unsupported algos).
-            switch (launderingVerdict(attempted_supported, had_unsupported_algo)) {
-                .bogus => return .bogus,
-                .insecure => any_unsupported = true,
-                else => unreachable,
-            }
-        }
+        // RFC 4035 §5.3: every NSEC owner must verify. Only-unsupported-algo
+        // owners are bogus too — see validateRrset's closing verdict.
+        if (!sig_verified) return .bogus;
     }
 
-    if (!any_nsec) return .unchecked;
-    // RFC 6840 §5.11: every owner ended up with only unsupported algorithms.
-    if (any_unsupported) return .insecure;
-    return .secure;
+    return if (any_nsec) .secure else .unchecked;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -4000,20 +3963,21 @@ test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
     );
 }
 
-test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns insecure" {
-    // RFC 6840 §5.11: when every candidate signature uses an unsupported
-    // algorithm, the result is .insecure (not .bogus). Validators must
-    // not treat unsupported-algo zones as authentication failures.
+test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns bogus" {
+    // This function runs only under a zone already proven secure, where an
+    // all-unsupported-algorithm zone never arrives (RFC 4035 §5.2 makes it
+    // insecure at the delegation). An NSEC whose only RRSIG is unsupported
+    // is therefore the stripped-signature shape, not a legitimate zone.
     const owner = dns.Name{ .labels = &.{ "example", "com" } };
     const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
     const signer = dns.Name{ .labels = &.{ "example", "com" } };
     const authorities = [_]dns.ResourceRecord{
         nsecRr(owner, next),
-        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported — triggers had_unsupported_algo
+        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported
     };
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
-        SecurityStatus.insecure,
+        SecurityStatus.bogus,
         verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
     );
 }
@@ -4039,10 +4003,8 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
 }
 
 test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict" {
-    // A signature at another owner says nothing about this RRset either way.
-    // This read `.bogus` when the scan was by type across the whole section —
-    // an artifact, not a defence: omitting the foreign RRSIG yields `.insecure`
-    // anyway, so the rule only punished a record no real zone emits.
+    // A signature at another owner says nothing about this RRset either way:
+    // the verdict must be identical with and without the foreign RRSIG.
     const tag = keyTag(test_ecdsa_dnskey);
     const other_owner = dns.Name{ .labels = &.{ "other", "com" } };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
@@ -4058,7 +4020,7 @@ test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict"
     var b2: ValidationBudget = .{};
     const a = validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1, null);
     const b = validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2, null);
-    try testing.expectEqual(SecurityStatus.insecure, a);
+    try testing.expectEqual(SecurityStatus.bogus, a);
     try testing.expectEqual(a, b);
 }
 
@@ -4274,15 +4236,18 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     );
 }
 
-test "validateRrset: all-unsupported algorithms are .insecure, not .secure" {
-    // Reporting .secure here would stamp AD on data no signature verified.
+test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
+    // .secure would stamp AD on data no signature verified; .insecure would
+    // let an injector swap real RRSIGs for one unsupported-algo signature and
+    // get forged data served instead of SERVFAILed (the zone is known secure
+    // here — the all-unsupported-zone case goes insecure at the delegation).
     const answers = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
         rrsigRr(test_owner, .a, .dsasha1, 0, test_owner),
     };
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
-        SecurityStatus.insecure,
+        SecurityStatus.bogus,
         validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget, null),
     );
 }
