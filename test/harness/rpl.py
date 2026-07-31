@@ -57,7 +57,7 @@ MATCH_VALID_FLAGS = frozenset({
     # CHECK_ANSWER
     "all", "answer", "authority", "additional", "flags", "rcode", "ttl",
     # CHECK_QUERY_LOG
-    "order", "address",
+    "order",
 })
 
 # ADJUST directive: dnspython's make_response already copies the ID, so
@@ -147,7 +147,7 @@ class Range:
 class Step:
     """STEP n KIND ..: a client action or assertion."""
     n: int
-    kind: str          # "QUERY" | "CHECK_ANSWER" | "CHECK_QUERY_LOG" | "TIME_PASSES"
+    kind: str
     entry: Entry | None = None
     time_seconds: int = 0
     # CHECK_MAX_QUERIES: upper bound on total upstream queries logged so far.
@@ -156,7 +156,6 @@ class Step:
 
 @dataclasses.dataclass
 class Scenario:
-    name: str
     path: Path
     root_hints: list[str] = dataclasses.field(default_factory=list)
     ranges: list[Range] = dataclasses.field(default_factory=list)
@@ -280,12 +279,10 @@ class _Parser:
     def parse(self) -> Scenario:
         # Header may contain `; hark: x = y` directives before SCENARIO_BEGIN.
         # Stash them on a sentinel scenario so _next_line can apply them.
-        self.scenario = Scenario(name=self.path.stem, path=self.path)
+        self.scenario = Scenario(path=self.path)
         line = self._next_line()
         if line is None or not line.startswith("SCENARIO_BEGIN"):
             raise self.err(f"expected SCENARIO_BEGIN, got {line!r}")
-        name = line[len("SCENARIO_BEGIN"):].strip() or self.scenario.name
-        self.scenario.name = name
         self.i += 1
 
         seen_step_numbers: set[int] = set()

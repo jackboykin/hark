@@ -133,8 +133,7 @@ def assert_out_query_matches(rec: QueryLog, expected: rpl.Entry) -> None:
 
     Used by `STEP n CHECK_OUT_QUERY`. The expected entry's QUESTION carries
     `qname [qclass] qtype`; MATCH flags pick which fields are compared.
-    `qname`, `qtype`, `qclass`, and `opcode` are supported (opcode is checked
-    only nominally since the responder always sees QUERY in test traffic).
+    `qname`, `qtype`, and `qclass` are supported.
     """
     if not expected.question:
         raise ValueError("CHECK_OUT_QUERY entry has no QUESTION section")

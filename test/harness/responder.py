@@ -20,7 +20,6 @@ from __future__ import annotations
 import dataclasses
 import socket
 import threading
-import time
 
 import dns.flags
 import dns.message
@@ -37,9 +36,7 @@ from . import rpl
 @dataclasses.dataclass
 class QueryLog:
     """One received-query record. Used for CHECK_QUERY_LOG assertions."""
-    ts: float
     address: str            # the fake-auth's bind address (which auth received it)
-    src_port: int
     qname: str              # absolute dotted form, lowercase
     qtype: str              # uppercase mnemonic
     qclass: str = "IN"
@@ -63,9 +60,9 @@ class Responder:
         self._stop = threading.Event()
         self.query_log: list[QueryLog] = []
         self._log_lock = threading.Lock()
-        # Current step is bumped by the driver after each STEP CHECK_ANSWER /
-        # QUERY pair so RANGE [start..end] activation tracks the scenario timeline.
-        # Most scenarios use wide ranges (0..100) and never bump.
+        # The driver calls set_step at the top of every step so RANGE
+        # [start..end] activation tracks the scenario timeline. Most
+        # scenarios use wide ranges (0..100) and never notice.
         self._current_step = 0
         self._step_lock = threading.Lock()
         # Drop count: number of next incoming queries to drop without
@@ -158,7 +155,7 @@ class Responder:
                 query = dns.message.from_wire(data)
             except Exception:
                 continue
-            self._log(address, src, query)
+            self._log(address, query)
             if self._consume_drop():
                 continue  # simulate auth timeout
             response = self._build_response(address, query, transport="udp")
@@ -168,7 +165,7 @@ class Responder:
     def _accept_tcp(self, address: str, listen_sock: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                conn, src = listen_sock.accept()
+                conn, _src = listen_sock.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -182,9 +179,9 @@ class Responder:
             # Track the handler thread so `stop()` can join it — otherwise a
             # mid-flight `_handle_tcp` can race the scenario teardown (the
             # ranges/log are about to be GC'd) and read freed state.
-            self._spawn(self._handle_tcp, address, conn, src)
+            self._spawn(self._handle_tcp, address, conn)
 
-    def _handle_tcp(self, address: str, conn: socket.socket, src: tuple[str, int]) -> None:
+    def _handle_tcp(self, address: str, conn: socket.socket) -> None:
         # RFC 1035 §4.2.2: TCP DNS framed as 2-byte big-endian length + message.
         try:
             conn.settimeout(2.0)
@@ -199,7 +196,7 @@ class Responder:
                 query = dns.message.from_wire(body)
             except Exception:
                 return
-            self._log(address, src, query)
+            self._log(address, query)
             if self._consume_drop():
                 return  # simulate auth timeout (close without response)
             response = self._build_response(address, query, transport="tcp")
@@ -209,7 +206,7 @@ class Responder:
         finally:
             conn.close()
 
-    def _log(self, address: str, src: tuple[str, int], query: dns.message.Message) -> None:
+    def _log(self, address: str, query: dns.message.Message) -> None:
         """Append a record to query_log unless the query is hark's RFC 8109
         root-priming probe (`. NS`) — including it would offset positional
         CHECK_OUT_QUERY indices and scenarios rarely declare a matcher."""
@@ -221,9 +218,7 @@ class Responder:
         if qname == "." and qtype == "NS":
             return
         rec = QueryLog(
-            ts=time.monotonic(),
             address=address,
-            src_port=src[1],
             qname=qname,
             qtype=qtype,
             qclass=dns.rdataclass.to_text(q.rdclass),

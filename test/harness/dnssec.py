@@ -48,8 +48,8 @@ class KeyMaterial:
         rrset = self.dnskey_rrset()
         self.signed_dnskey_response = (rrset, self.sign(rrset))
 
-    def dnskey_rrset(self, ttl: int = 3600) -> dns.rrset.RRset:
-        return dns.rrset.from_rdata(self.zone_name, ttl, self.dnskey)
+    def dnskey_rrset(self) -> dns.rrset.RRset:
+        return dns.rrset.from_rdata(self.zone_name, 3600, self.dnskey)
 
     @classmethod
     def generate(cls, zone_name: str) -> KeyMaterial:

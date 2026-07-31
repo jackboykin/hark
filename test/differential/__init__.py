@@ -1,4 +1,5 @@
 """Differential tests: hark vs Unbound oracle on edge-case behaviour.
 
-Excluded by default. Run with `pytest -m differential`.
+Collected by default (`testpaths` in pytest.ini); requires `unbound`
+on PATH (provided by test/shell.nix).
 """

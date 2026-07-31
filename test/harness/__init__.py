@@ -3,17 +3,22 @@
 Conventions a scenario author needs to know (gathered from across the
 modules so contributors don't have to spelunk):
 
-  * **Loopback IPs.** Scenarios bind RANGE addresses on 127.0.10.* (the
-    second octet is the per-worker /16 slice; see conftest.py:_worker_offset).
-    Each scenario lives in its own subprocess; addresses don't collide.
+  * **Process model.** Scenarios run inside the pytest process; hark is
+    the subprocess, spawned per scenario (hark_proc.py).
 
-  * **Ports.** Responders bind on RESP_PORT (default 5353, offset per
-    xdist worker). Hark listens on RESP_PORT+1. Root-hints in `.rpl`
-    scenarios are written as bare IPs — the harness stamps the port on
-    via conftest.py:_with_port.
+  * **Addresses & ports.** Responders bind fixed 127.0.10.* RANGE
+    addresses on RESP_PORT (default 5353); hark listens on RESP_PORT+1.
+    Under pytest-xdist each worker offsets the *ports* only
+    (conftest.py:_worker_offset) — addresses never change. Root-hints in
+    `.rpl` scenarios are bare IPs; conftest.py:_with_port stamps the
+    port on.
 
   * **`; hark: root-hints = <ip>[, <ip>...]`** — required header directive
     in every scenario. Names the fake roots hark will be configured with.
+
+  * **Transports.** The responder serves UDP and TCP on every address;
+    `MATCH UDP` / `MATCH TCP` restrict an entry to one transport
+    (TC-fallback scenarios).
 
   * **`REPLY` without `QR`** is treated as `REPLY QR ...` by the
     responder (responder.py forces QR=1). Scenarios still SHOULD include
@@ -23,19 +28,16 @@ modules so contributors don't have to spelunk):
     `make_response` already copies the query ID. Kept in scenarios for
     testbound/Stelline compatibility.
 
-  * **`CHECK_QUERY_LOG` with QUESTION-only** checks presence of each
-    `(qname, qtype)` tuple in the upstream-query log. With ANSWER A
-    records (where rdata is the destination IP), checks `(qname, qtype,
-    dest)` — but qtype is constrained by the A-record encoding, so
-    AAAA destinations cannot currently be expressed.
+  * **`CHECK_QUERY_LOG`** takes `SECTION QUERY_LOG` rows of
+    `<qname> <qtype> [<dest>]`. Presence check by default; `MATCH order`
+    requires the rows as an ordered subsequence of the log; a row
+    without `dest` wildcards the destination.
 
   * **`MATCH` defaults differ by context.** Responder entries default to
     `MATCH question` (qname + qtype + qclass). CHECK_ANSWER entries
     default to `MATCH all`. This matches .rpl convention but is a footgun.
 
-  * **`TIME_PASSES`** is parsed but not yet implemented — requires hark
-    test-clock support, deferred to Month 3.
-
-  * **TCP retry** — the responder is UDP-only. Scenarios that need to
-    test TC-bit fallback will need TCP responder support. Track in plan.
+  * **`TIME_PASSES`** advances hark's synthetic test clock via a
+    `_advance-clock.<N>.testharness.invalid.` control query
+    (conftest.py; requires a `-Dtesting=true` build).
 """

@@ -12,8 +12,8 @@ that. This test asserts the resolver stays an order of magnitude below the old
 behaviour for one client query.
 
 A static `.rpl` can't express this — the amplification needs an unbounded supply
-of distinct NS names — so it lives as a dynamic harness test. The malicious
-server itself is shared with the standalone exploit (see nxns_evil.EvilRoot).
+of distinct NS names — so it lives as a dynamic harness test around
+nxns_evil.EvilRoot.
 """
 
 from __future__ import annotations

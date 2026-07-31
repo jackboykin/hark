@@ -3,11 +3,7 @@
 Answers EVERY query with a glueless delegation to fresh, globally-unique NS
 names, so one client query fans out across a tree of resolver sub-resolutions
 with nothing short-circuiting via cache or glue. Counts every query it sees.
-
-Shared by the regression test (test_nxns_amplification.py) and the standalone
-exploit (../exploit/nxns_amplify.py) — the only differences between their needs
-are the bind port and whether they read the per-depth histogram, both of which
-this module exposes.
+Sole consumer: the regression test (test_nxns_amplification.py).
 
 Zone labels encode the tree path: 'n' is the root zone, 'n-0'/'n-1' its
 children, 'n-0-3' a grandchild, etc. Depth = number of path segments.
@@ -17,7 +13,6 @@ from __future__ import annotations
 
 import socket
 import threading
-from collections import Counter
 
 import dns.flags
 import dns.message
@@ -60,8 +55,7 @@ class EvilRoot:
     """Authoritative for the whole tree. Hands back glueless delegations.
 
     Usable either as a context manager (`with EvilRoot(ip, port) as evil:`) or
-    via explicit `start()`/`stop()`. `total` is the query count; `by_depth` is
-    the per-delegation-depth histogram.
+    via explicit `start()`/`stop()`. `total` is the query count.
     """
 
     def __init__(self, ip: str, port: int) -> None:
@@ -72,7 +66,6 @@ class EvilRoot:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.total = 0
-        self.by_depth: Counter[int] = Counter()
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
     def start(self) -> "EvilRoot":
@@ -119,7 +112,6 @@ class EvilRoot:
             return self._nodata(query)
         with self._lock:
             self.total += 1
-            self.by_depth[len(path)] += 1
         if len(path) >= SERVER_MAX_DEPTH:
             return self._nodata(query)
         return self._referral(query, labels[-1], path)
