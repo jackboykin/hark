@@ -120,14 +120,20 @@ pub fn scrub(
     };
 
     var drop_count: usize = 0;
+    var first_drop: usize = 0;
     for (answers, 0..) |rr, i| {
         marks[i] = shouldDrop(rr, cfg);
         if (marks[i]) {
+            if (drop_count == 0) first_drop = i;
             drop_count += 1;
-            logScrub(rr);
         }
     }
     if (drop_count == 0) return answers;
+
+    // One line per scrubbed answer, not per RR — a hostile domain can carry
+    // hundreds of private-address records.
+    var name_buf: [dns.max_name_len + 1]u8 = undefined;
+    log.info("scrub dropped={d} owner={s}", .{ drop_count, answers[first_drop].name.formatLower(&name_buf) });
 
     // Orphan-RRSIG sweep. Dropping any record from an A/AAAA rrset
     // invalidates the upstream's RRSIG (it signed the full set as it
@@ -156,23 +162,6 @@ pub fn scrub(
         j += 1;
     }
     return out;
-}
-
-fn logScrub(rr: dns.ResourceRecord) void {
-    var name_buf: [dns.max_name_len + 1]u8 = undefined;
-    const name = rr.name.formatLower(&name_buf);
-    switch (rr.rtype) {
-        .a => log.info("scrub a owner={s} addr={d}.{d}.{d}.{d}", .{
-            name, rr.rdata.a[0], rr.rdata.a[1], rr.rdata.a[2], rr.rdata.a[3],
-        }),
-        .aaaa => {
-            // `na.format` emits "[addr]:0" — minor cosmetic noise in the log
-            // line; not worth a dedicated formatter.
-            var addr_buf: [64]u8 = undefined;
-            log.info("scrub aaaa owner={s} addr={s}", .{ name, na.format(na.initIp6(rr.rdata.aaaa, 0, 0, 0), &addr_buf) });
-        },
-        else => unreachable,
-    }
 }
 
 /// Address is private by this policy when it matches the built-in default
