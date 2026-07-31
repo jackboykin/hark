@@ -2308,6 +2308,15 @@ pub const RecursiveResolver = struct {
             );
             if (ds_status != .secure) return null;
 
+            // RFC 4035 §5.2: authenticated DS RRset, but no member hark can
+            // use — same as a proven no-DS delegation. Cache the negative so
+            // every consumer of the null-plus-negative contract sees insecure.
+            if (!dnssec.anySupportedDs(zone_ds_buf[0..ds_count])) {
+                if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
+                cacheInsecureDelegation(self.keyCache(), .insecure, zone, zone_ds_buf[0..ds_count]);
+                return null;
+            }
+
             // Cache only after the parent-signed DS verifies.
             if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
             if (self.key_cache) |kc| {

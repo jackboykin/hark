@@ -1413,6 +1413,26 @@ fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     };
 }
 
+/// RFC 4035 §5.2: a DS contributes an authentication path only when both its
+/// key algorithm and digest type are implemented here. An authenticated DS
+/// RRset with no such member must be treated as proven-no-DS (insecure), not
+/// secure — otherwise every zone signed only with an unimplemented algorithm
+/// SERVFAILs (live shape: ed448.nl / ed448.no, Ed448-only). Unbound's
+/// equivalent is the "zone has no known algorithms" → sec_status_insecure
+/// check; the digest arms mirror verifyDs.
+pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
+    for (records) |rr| {
+        if (rr.rtype != .ds) continue;
+        const ds = rr.rdata.ds;
+        if (!isSupportedAlgorithm(ds.algorithm)) continue;
+        switch (ds.digest_type) {
+            .sha1, .sha256, .sha384 => return true,
+            _ => {},
+        }
+    }
+    return false;
+}
+
 /// Try every DNSKEY whose tag and algorithm match `rrsig`; true if any verifies
 /// `rrset`. Shared by the answer-side and authority-side validators so the
 /// key-matching rule has one home.
@@ -1756,6 +1776,35 @@ test "DS hash verification - sha1 and sha384 digest types" {
         .digest_type = .sha384,
         .digest = &d384,
     }, test_dnskey, test_owner);
+}
+
+test "anySupportedDs: unsupported algorithm or digest contributes no path" {
+    const zero_digest: [32]u8 = @splat(0);
+    const ds_rr = struct {
+        fn make(algo: dns.DnssecAlgorithm, digest_type: dns.DigestType) dns.ResourceRecord {
+            return .{
+                .name = test_owner,
+                .rtype = .ds,
+                .rclass = .in,
+                .ttl = 3600,
+                .rdata = .{ .ds = .{
+                    .key_tag = 1,
+                    .algorithm = algo,
+                    .digest_type = digest_type,
+                    .digest = &zero_digest,
+                } },
+            };
+        }
+    }.make;
+
+    // Ed448-only (the live ed448.nl shape) — no path.
+    try testing.expect(!anySupportedDs(&.{ds_rr(.ed448, .sha256)}));
+    // Supported algorithm, unknown digest — still no path.
+    try testing.expect(!anySupportedDs(&.{ds_rr(.ecdsap256sha256, @fromBackingInt(3))}));
+    // Non-DS records are ignored; empty set has no path.
+    try testing.expect(!anySupportedDs(&.{}));
+    // One supported member is enough, wherever it sits.
+    try testing.expect(anySupportedDs(&.{ ds_rr(.ed448, .sha256), ds_rr(.ecdsap256sha256, .sha256) }));
 }
 
 test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {

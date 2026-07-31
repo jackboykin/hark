@@ -1,0 +1,71 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a delegation whose only DS uses an unimplemented algorithm is insecure
+
+; RFC 4035 §5.2: if the validator supports none of the algorithms in an
+; authenticated DS RRset, there is no authentication path and the delegation
+; must be treated as if an authenticated NSEC proved no DS exists — insecure,
+; served without AD. Before this held, hark called the delegation secure,
+; failed to validate the child DNSKEY, and SERVFAILed the whole zone.
+;
+; Live shape: ed448.nl / ed448.no (Ed448-only, algorithm 16). 1.1.1.1 and
+; 8.8.8.8 answer NOERROR AD=0; hark alone answered SERVFAIL.
+;
+; The DS here is static (not PLACEHOLDER): algorithm 16 with a well-formed
+; SHA-256 digest. The root signs it, so hark authenticates the DS RRset
+; before judging its algorithms — an unauthenticated all-unsupported DS must
+; NOT downgrade, or forging one referral buys a downgrade to insecure.
+; example. is deliberately unsigned: hark must never ask for its DNSKEY.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ; Secure referral carrying the Ed448-only DS, signed by the root.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS 1 16 2 0000000000000000000000000000000000000000000000000000000000000000
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+; NOERROR without AD: served, not authenticated, not SERVFAILed.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END
