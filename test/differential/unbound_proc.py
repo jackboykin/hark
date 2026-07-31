@@ -10,11 +10,11 @@ so we sidestep the same glue-port limitation hark has.
 from __future__ import annotations
 
 import dataclasses
-import socket
 import subprocess
-import time
 from pathlib import Path
 from typing import IO
+
+from harness.proc import ServerProcess
 
 
 @dataclasses.dataclass
@@ -68,8 +68,10 @@ class UnboundConfig:
         )
 
 
-class UnboundProcess:
+class UnboundProcess(ServerProcess):
     """Wrap a running unbound binary. Use as a context manager."""
+
+    name = "unbound"
 
     def __init__(self, config: UnboundConfig, tmpdir: Path):
         self.config = config
@@ -92,42 +94,3 @@ class UnboundProcess:
         )
         self._wait_ready()
         return self
-
-    def __exit__(self, *_exc) -> None:
-        try:
-            if self.proc is not None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    self.proc.wait(timeout=1.0)
-        finally:
-            if self._log_fd is not None:
-                self._log_fd.close()
-                self._log_fd = None
-
-    def read_log(self) -> str:
-        return self.log_path.read_text() if self.log_path else ""
-
-    @property
-    def listen_addr(self) -> tuple[str, int]:
-        return (self.config.listen_ip, self.config.listen_port)
-
-    def _wait_ready(self, timeout_s: float = 5.0) -> None:
-        deadline = time.monotonic() + timeout_s
-        ip, port = self.listen_addr
-        while time.monotonic() < deadline:
-            if self.proc and self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"unbound exited early (code={self.proc.returncode}); "
-                    f"log:\n{self.read_log()}"
-                )
-            try:
-                with socket.create_connection((ip, port), timeout=0.2):
-                    return
-            except (ConnectionRefusedError, socket.timeout, OSError):
-                time.sleep(0.05)
-        raise RuntimeError(
-            f"unbound did not become ready within {timeout_s}s; log:\n{self.read_log()}"
-        )

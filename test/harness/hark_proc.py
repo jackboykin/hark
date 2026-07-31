@@ -11,11 +11,11 @@ import dataclasses
 import functools
 import os
 import shlex
-import socket
 import subprocess
-import time
 from pathlib import Path
 from typing import IO
+
+from .proc import ServerProcess
 
 
 @dataclasses.dataclass
@@ -33,8 +33,8 @@ class HarkConfig:
     # staggered race, forcing the deterministic sequential server loop.
     stagger_ms: int | None = None
     # Each entry is a `"<key-tag> <alg> <dtype> <hex>"` string fed to
-    # hark's test-only `[resolver] trust-anchors = [...]` knob. Implies
-    # `dnssec = true`; conftest enforces that pairing.
+    # hark's test-only `[resolver] trust-anchors = [...]` knob. Requires
+    # `dnssec = true`; to_toml enforces that pairing.
     trust_anchors: list[str] = dataclasses.field(default_factory=list)
     # Rebinding scrub. Harness default is *off* — scripted authoritatives
     # routinely answer with TEST-NET (RFC 5737) and RFC 1918 addresses
@@ -49,6 +49,11 @@ class HarkConfig:
     verbose: bool = True
 
     def to_toml(self) -> str:
+        if self.trust_anchors and not self.dnssec:
+            raise ValueError(
+                "trust_anchors set without dnssec=True — hark would never "
+                "consult the anchors and the scenario would test nothing"
+            )
         # Root hints are passed in "ip:port" form so the existing parseAddress
         # path lifts them; the upstream-port knob covers glue records, which
         # have no port.
@@ -96,8 +101,10 @@ class HarkConfig:
         return "\n".join(lines) + "\n"
 
 
-class HarkProcess:
+class HarkProcess(ServerProcess):
     """Wrap a running hark binary. Use as a context manager."""
+
+    name = "hark"
 
     def __init__(self, binary: Path, config: HarkConfig, tmpdir: Path):
         self.binary = binary
@@ -113,67 +120,20 @@ class HarkProcess:
         self.config_path.write_text(self.config.to_toml())
         self.log_path = self.tmpdir / "hark.log"
         self._log_fd = self.log_path.open("wb")
-        env = os.environ.copy()
-        # Hark logs to stderr.
         argv = [str(self.binary), "serve", "--config", str(self.config_path)]
         if self.config.verbose:
             argv.append("--verbose")
+        # Hark logs to stderr; capture both streams in one log file.
         self.proc = subprocess.Popen(
             argv,
             stdout=self._log_fd,
             stderr=self._log_fd,
-            env=env,
         )
         self._wait_ready()
         return self
 
-    def __exit__(self, *_exc) -> None:
-        try:
-            if self.proc is not None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    self.proc.wait(timeout=1.0)
-        finally:
-            if self._log_fd is not None:
-                self._log_fd.close()
-                self._log_fd = None
-
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
-
-    @property
-    def listen_addr(self) -> tuple[str, int]:
-        return (self.config.listen_ip, self.config.listen_port)
-
-    def read_log(self) -> str:
-        return self.log_path.read_text() if self.log_path else ""
-
-    def _wait_ready(self, timeout_s: float = 5.0) -> None:
-        """Block until hark accepts a TCP connect on its listen port.
-
-        Hark binds UDP and TCP in lockstep, so a successful TCP accept means
-        the UDP socket is also live. TCP connect is the cleanest readiness
-        signal — UDP send/recv would race the server's first poll.
-        """
-        deadline = time.monotonic() + timeout_s
-        ip, port = self.listen_addr
-        while time.monotonic() < deadline:
-            if self.proc and self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"hark exited early (code={self.proc.returncode}); "
-                    f"log:\n{self.read_log()}"
-                )
-            try:
-                with socket.create_connection((ip, port), timeout=0.2):
-                    return
-            except (ConnectionRefusedError, socket.timeout, OSError):
-                time.sleep(0.05)
-        raise RuntimeError(
-            f"hark did not become ready within {timeout_s}s; log:\n{self.read_log()}"
-        )
 
 
 @functools.cache
