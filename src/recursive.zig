@@ -3543,7 +3543,7 @@ test "extractReferral with NS and glue A records" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
@@ -3551,7 +3551,7 @@ test "extractReferral with NS and glue A records" {
     switch (result) {
         .referral => |ref| {
             try testing.expectEqual(@as(usize, 1), ref.count);
-            const expected = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+            const expected = na.initIp4(.{ 1, 2, 3, 4 }, 53);
             try testing.expectEqual(expected.ip4.bytes, ref.addrs[0].ip4.bytes);
             try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
             try testing.expect(ref.zone_cut.eql(zone_name));
@@ -3593,7 +3593,7 @@ test "extractReferral case-insensitive glue matching" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "NS1", "EXAMPLE", "COM" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 198, 51, 100, 1 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
@@ -3675,7 +3675,7 @@ test "extractReferral accepts in-zone glue" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{"com"});
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 53 })});
+    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
@@ -3688,7 +3688,7 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const ipv6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const ipv6 = [_]u8{ 0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueAaaa(glue_name, ipv6)});
     defer dns.freeMessage(alloc, response);
 

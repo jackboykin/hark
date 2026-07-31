@@ -184,10 +184,7 @@ fn logScrub(rr: dns.ResourceRecord) void {
 /// when an AAAA-flavoured DNSBL returns a mapped 127.0.0.x. Mirrors the
 /// recursion `matchesDefault` already does for the built-in v4 set.
 fn isPrivate(bytes: []const u8, cfg: Config) bool {
-    const mapped_v4: ?*const [4]u8 = if (bytes.len == 16 and isIp4Mapped(bytes))
-        bytes[12..16]
-    else
-        null;
+    const mapped_v4: ?*const [4]u8 = if (na.isIp4Mapped(bytes)) bytes[12..16] else null;
 
     for (cfg.extra_allow) |c| {
         if (c.matchesBytes(bytes)) return false;
@@ -201,56 +198,14 @@ fn isPrivate(bytes: []const u8, cfg: Config) bool {
     return false;
 }
 
-fn isIp4Mapped(bytes: []const u8) bool {
-    return mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and bytes[10] == 0xff and bytes[11] == 0xff;
-}
-
+/// Default block set is the shared special-use table (net_address.zig) —
+/// deliberately multicast-free here, unlike NS egress.
 fn matchesDefault(bytes: []const u8) bool {
     return switch (bytes.len) {
-        4 => isPrivateIp4(bytes[0..4].*),
-        16 => isPrivateIp6(bytes[0..16].*),
+        4 => na.isSpecialUseIp4(bytes[0..4].*),
+        16 => na.isSpecialUseIp6(bytes[0..16].*),
         else => false,
     };
-}
-
-/// Built-in IPv4 block set. Knot's set + the IANA special-use registries
-/// (RFC 6890): CGNAT (RFC 6598), IETF protocol assignments (RFC 6890),
-/// TEST-NET 1/2/3 (RFC 5737), benchmarking (RFC 2544), reserved (RFC 1112),
-/// and broadcast. Multicast 224.0.0.0/4 is deliberately *not* in this set
-/// — mDNS-adjacent flows surface it as a legitimate answer in some
-/// authoritatives, and a recursive resolver returning multicast addresses
-/// to a stub is not in itself a rebinding-attack primitive.
-fn isPrivateIp4(b: [4]u8) bool {
-    if (b[0] == 0) return true; // 0.0.0.0/8         (this network, RFC 1122)
-    if (b[0] == 10) return true; // 10.0.0.0/8       (RFC 1918)
-    if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT, RFC 6598)
-    if (b[0] == 127) return true; // 127.0.0.0/8     (loopback, RFC 1122)
-    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local, RFC 3927)
-    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12 (RFC 1918)
-    if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF, RFC 6890)
-    if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
-    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC 1918)
-    if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
-    if (b[0] == 198 and b[1] == 51 and b[2] == 100) return true; // 198.51.100.0/24 (TEST-NET-2)
-    if (b[0] == 203 and b[1] == 0 and b[2] == 113) return true; // 203.0.113.0/24 (TEST-NET-3)
-    if (b[0] >= 240) return true; // 240.0.0.0/4     (reserved, includes 255.255.255.255)
-    return false;
-}
-
-/// Built-in IPv6 block set. Loopback, unspecified, ULA, link-local, the
-/// documentation prefix (RFC 3849), and IPv4-mapped addresses re-evaluated
-/// against the v4 block set. Multicast ff00::/8 deliberately excluded for
-/// symmetry with IPv4 multicast.
-fn isPrivateIp6(b: [16]u8) bool {
-    // ::/128 and ::1/128
-    if (mem.eql(u8, b[0..15], &@as([15]u8, @splat(0)))) return b[15] <= 1;
-    // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
-    // doesn't slip through as a "v6 address" the v6 set has no opinion on.
-    if (isIp4Mapped(&b)) return isPrivateIp4(b[12..16].*);
-    if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0d and b[3] == 0xb8) return true; // 2001:db8::/32 (RFC 3849)
-    if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7  (ULA, RFC 4193)
-    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 (link-local)
-    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -283,57 +238,6 @@ fn rrsigOver(covered: dns.RType) dns.ResourceRecord {
         .signer_name = public_name,
         .signature = &.{},
     } } };
-}
-
-test "default IPv4 block set covers RFC 1918 + loopback + link-local + TEST-NET + CGNAT" {
-    inline for ([_][4]u8{
-        .{ 0, 0, 0, 0 },
-        .{ 10, 1, 2, 3 },
-        .{ 100, 64, 0, 1 }, // CGNAT
-        .{ 100, 127, 255, 255 }, // CGNAT upper edge
-        .{ 127, 0, 0, 1 },
-        .{ 169, 254, 1, 1 },
-        .{ 172, 16, 0, 1 },
-        .{ 172, 31, 255, 255 },
-        .{ 192, 0, 0, 1 }, // IETF
-        .{ 192, 0, 2, 1 }, // TEST-NET-1
-        .{ 192, 168, 1, 1 },
-        .{ 198, 18, 0, 1 }, // benchmarking
-        .{ 198, 19, 255, 255 },
-        .{ 198, 51, 100, 1 }, // TEST-NET-2
-        .{ 203, 0, 113, 1 }, // TEST-NET-3
-        .{ 240, 0, 0, 1 },
-        .{ 255, 255, 255, 255 },
-    }) |bytes| try testing.expect(isPrivateIp4(bytes));
-}
-
-test "default IPv4 block set leaves routable space alone (incl. boundaries + multicast)" {
-    inline for ([_][4]u8{
-        .{ 1, 1, 1, 1 },
-        .{ 8, 8, 8, 8 },
-        .{ 100, 63, 255, 255 }, // just below CGNAT
-        .{ 100, 128, 0, 0 }, // just above CGNAT
-        .{ 172, 15, 255, 255 }, // just below RFC 1918
-        .{ 172, 32, 0, 0 }, // just above RFC 1918
-        .{ 192, 0, 1, 1 }, // 192.0.1/24 allocated, not reserved
-        .{ 198, 17, 255, 255 }, // just below benchmarking
-        .{ 198, 20, 0, 0 }, // just above benchmarking
-        .{ 224, 0, 0, 1 }, // multicast — deliberately not blocked
-        .{ 239, 255, 255, 255 },
-    }) |bytes| try testing.expect(!isPrivateIp4(bytes));
-}
-
-test "default IPv6 block set covers ::/::1, ULA, link-local, docs, mapped-v4" {
-    try testing.expect(isPrivateIp6(@as([16]u8, @splat(0)))); // ::
-    try testing.expect(isPrivateIp6(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
-    try testing.expect(isPrivateIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0)))); // fc00::/7
-    try testing.expect(isPrivateIp6([_]u8{0xfd} ++ @as([15]u8, @splat(0))));
-    try testing.expect(isPrivateIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)))); // fe80::/10
-    try testing.expect(isPrivateIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)))); // 2001:db8::/32
-    try testing.expect(isPrivateIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 })); // mapped 127
-    try testing.expect(!isPrivateIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 })); // mapped public
-    try testing.expect(!isPrivateIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)))); // multicast — not blocked
-    try testing.expect(!isPrivateIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)))); // public
 }
 
 test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL behaviour)" {
@@ -390,6 +294,6 @@ test "scrub heap path: >128-RR section drops private A and the orphaned RRSIG" {
     try testing.expectEqual(@as(usize, public_count), scrubbed.len);
     for (scrubbed) |rr| {
         try testing.expectEqual(dns.RType.a, rr.rtype); // RRSIG dropped, no private survived
-        try testing.expect(!isPrivateIp4(rr.rdata.a));
+        try testing.expect(!na.isSpecialUseIp4(rr.rdata.a));
     }
 }

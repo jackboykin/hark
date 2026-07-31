@@ -204,6 +204,8 @@ pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
 
 /// Returns true if the address is in a private, reserved, or loopback range
 /// that should not be contacted during recursive resolution (DNS rebinding defense).
+/// Superset of the shared special-use table: NS contact also refuses multicast,
+/// which the answer scrub (rebinding.zig) deliberately serves.
 pub fn isNonRoutableNs(addr: Address) bool {
     return switch (addr) {
         .ip4 => |v4| isNonRoutableIp4(v4.bytes),
@@ -212,38 +214,55 @@ pub fn isNonRoutableNs(addr: Address) bool {
 }
 
 fn isNonRoutableIp4(b: [4]u8) bool {
-    if (b[0] == 0) return true; // 0.0.0.0/8  (this network)
-    if (b[0] == 10) return true; // 10.0.0.0/8  (RFC 1918)
-    if (b[0] == 127) return true; // 127.0.0.0/8 (loopback)
-    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local)
-    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12 (RFC 1918)
-    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC 1918)
-    if (b[0] >= 224) return true; // 224.0.0.0/4+ (multicast + reserved)
-    return false;
+    return isSpecialUseIp4(b) or b[0] >= 224; // + 224.0.0.0/4 multicast
 }
 
 fn isNonRoutableIp6(b: [16]u8) bool {
-    return switch (b[0]) {
-        0x00 => isNonRoutableIp6Zero(b),
-        0xfc, 0xfd => true, // fc00::/7  (unique local)
-        0xfe => (b[1] & 0xc0) == 0x80, // fe80::/10 (link-local)
-        0xff => true, // ff00::/8  (multicast)
-        else => false,
-    };
+    if (isIp4Mapped(&b)) return isNonRoutableIp4(b[12..16].*);
+    return isSpecialUseIp6(b) or b[0] == 0xff; // + ff00::/8 multicast
 }
 
-fn isNonRoutableIp6Zero(b: [16]u8) bool {
-    // All addresses starting with 0x00: check for ::, ::1, and ::ffff:mapped
-    if (!mem.eql(u8, b[1..10], &@as([9]u8, @splat(0)))) return false;
-    if (b[10] == 0 and b[11] == 0) {
-        // :: (unspecified) or ::1 (loopback)
-        return mem.eql(u8, b[12..15], &@as([3]u8, @splat(0))) and b[15] <= 1;
-    }
-    if (b[10] == 0xff and b[11] == 0xff) {
-        // ::ffff:0:0/96 (IPv4-mapped) — check the mapped IPv4 address
-        return isNonRoutableIp4(b[12..16].*);
-    }
+/// Shared special-use IPv4 set: Knot's set + the IANA special-use registries
+/// (RFC 6890): CGNAT (RFC 6598), IETF protocol assignments, TEST-NET 1/2/3
+/// (RFC 5737), benchmarking (RFC 2544), reserved (RFC 1112), broadcast.
+/// Multicast 224.0.0.0/4 is deliberately *not* here — a recursive resolver
+/// returning multicast to a stub is not a rebinding-attack primitive, so the
+/// answer scrub serves it; NS egress re-adds it above.
+pub fn isSpecialUseIp4(b: [4]u8) bool {
+    if (b[0] == 0) return true; // 0.0.0.0/8         (this network, RFC 1122)
+    if (b[0] == 10) return true; // 10.0.0.0/8       (RFC 1918)
+    if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT, RFC 6598)
+    if (b[0] == 127) return true; // 127.0.0.0/8     (loopback, RFC 1122)
+    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local, RFC 3927)
+    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12 (RFC 1918)
+    if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF, RFC 6890)
+    if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
+    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC 1918)
+    if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
+    if (b[0] == 198 and b[1] == 51 and b[2] == 100) return true; // 198.51.100.0/24 (TEST-NET-2)
+    if (b[0] == 203 and b[1] == 0 and b[2] == 113) return true; // 203.0.113.0/24 (TEST-NET-3)
+    if (b[0] >= 240) return true; // 240.0.0.0/4     (reserved, includes 255.255.255.255)
     return false;
+}
+
+/// Shared special-use IPv6 set: loopback, unspecified, ULA, link-local, the
+/// documentation prefix (RFC 3849), and IPv4-mapped addresses re-evaluated
+/// against the v4 set. Multicast ff00::/8 excluded for symmetry with IPv4.
+pub fn isSpecialUseIp6(b: [16]u8) bool {
+    // ::/128 and ::1/128
+    if (mem.eql(u8, b[0..15], &@as([15]u8, @splat(0)))) return b[15] <= 1;
+    // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
+    // doesn't slip through as a "v6 address" the v6 set has no opinion on.
+    if (isIp4Mapped(&b)) return isSpecialUseIp4(b[12..16].*);
+    if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0d and b[3] == 0xb8) return true; // 2001:db8::/32 (RFC 3849)
+    if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7  (ULA, RFC 4193)
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 (link-local)
+    return false;
+}
+
+/// ::ffff:0:0/96 — IPv4-mapped IPv6.
+pub fn isIp4Mapped(bytes: []const u8) bool {
+    return bytes.len == 16 and mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and bytes[10] == 0xff and bytes[11] == 0xff;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -317,35 +336,85 @@ test "format produces ip:port and RFC 5952 IPv6" {
     );
 }
 
-test "isNonRoutableNs blocks private/reserved IPv4" {
-    // Loopback
+test "special-use IPv4 set covers RFC 1918 + loopback + link-local + TEST-NET + CGNAT" {
+    inline for ([_][4]u8{
+        .{ 0, 0, 0, 0 },
+        .{ 10, 1, 2, 3 },
+        .{ 100, 64, 0, 1 }, // CGNAT
+        .{ 100, 127, 255, 255 }, // CGNAT upper edge
+        .{ 127, 0, 0, 1 },
+        .{ 169, 254, 1, 1 },
+        .{ 172, 16, 0, 1 },
+        .{ 172, 31, 255, 255 },
+        .{ 192, 0, 0, 1 }, // IETF
+        .{ 192, 0, 2, 1 }, // TEST-NET-1
+        .{ 192, 168, 1, 1 },
+        .{ 198, 18, 0, 1 }, // benchmarking
+        .{ 198, 19, 255, 255 },
+        .{ 198, 51, 100, 1 }, // TEST-NET-2
+        .{ 203, 0, 113, 1 }, // TEST-NET-3
+        .{ 240, 0, 0, 1 },
+        .{ 255, 255, 255, 255 },
+    }) |bytes| try testing.expect(isSpecialUseIp4(bytes));
+}
+
+test "special-use IPv4 set leaves routable space alone (incl. boundaries + multicast)" {
+    inline for ([_][4]u8{
+        .{ 1, 1, 1, 1 },
+        .{ 8, 8, 8, 8 },
+        .{ 100, 63, 255, 255 }, // just below CGNAT
+        .{ 100, 128, 0, 0 }, // just above CGNAT
+        .{ 172, 15, 255, 255 }, // just below RFC 1918
+        .{ 172, 32, 0, 0 }, // just above RFC 1918
+        .{ 192, 0, 1, 1 }, // 192.0.1/24 allocated, not reserved
+        .{ 198, 17, 255, 255 }, // just below benchmarking
+        .{ 198, 20, 0, 0 }, // just above benchmarking
+        .{ 224, 0, 0, 1 }, // multicast — deliberately not blocked
+        .{ 239, 255, 255, 255 },
+    }) |bytes| try testing.expect(!isSpecialUseIp4(bytes));
+}
+
+test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
+    try testing.expect(isSpecialUseIp6(@as([16]u8, @splat(0)))); // ::
+    try testing.expect(isSpecialUseIp6(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
+    try testing.expect(isSpecialUseIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0)))); // fc00::/7
+    try testing.expect(isSpecialUseIp6([_]u8{0xfd} ++ @as([15]u8, @splat(0))));
+    try testing.expect(isSpecialUseIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)))); // fe80::/10
+    try testing.expect(isSpecialUseIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)))); // 2001:db8::/32
+    try testing.expect(isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 })); // mapped 127
+    try testing.expect(!isSpecialUseIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 })); // mapped public
+    try testing.expect(!isSpecialUseIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)))); // multicast — not blocked
+    try testing.expect(!isSpecialUseIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)))); // public
+}
+
+test "isNonRoutableNs blocks special-use + multicast IPv4" {
+    // Special-use (shared table)
     try testing.expect(isNonRoutableNs(initIp4(.{ 127, 0, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 127, 255, 255, 255 }, 53)));
-    // RFC 1918
     try testing.expect(isNonRoutableNs(initIp4(.{ 10, 0, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 172, 16, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 172, 31, 255, 255 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 192, 168, 1, 1 }, 53)));
-    // Link-local
     try testing.expect(isNonRoutableNs(initIp4(.{ 169, 254, 1, 1 }, 53)));
-    // This network
     try testing.expect(isNonRoutableNs(initIp4(.{ 0, 0, 0, 0 }, 53)));
-    // Multicast
+    // Widened vs the old NS-only set: CGNAT, TEST-NET, benchmarking
+    try testing.expect(isNonRoutableNs(initIp4(.{ 100, 64, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 192, 0, 2, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 198, 51, 100, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 203, 0, 113, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 198, 18, 0, 1 }, 53)));
+    // Multicast — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(initIp4(.{ 224, 0, 0, 1 }, 53)));
+    try testing.expect(isNonRoutableNs(initIp4(.{ 239, 255, 255, 255 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 255, 255, 255, 255 }, 53)));
 }
 
 test "isNonRoutableNs allows routable IPv4" {
     try testing.expect(!isNonRoutableNs(initIp4(.{ 1, 1, 1, 1 }, 53)));
     try testing.expect(!isNonRoutableNs(initIp4(.{ 8, 8, 8, 8 }, 53)));
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 192, 0, 2, 1 }, 53)));
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 198, 51, 100, 1 }, 53)));
     // 172.15.x and 172.32.x are routable
     try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 15, 255, 255 }, 53)));
     try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 32, 0, 1 }, 53)));
 }
 
-test "isNonRoutableNs blocks private/reserved IPv6" {
+test "isNonRoutableNs blocks special-use + multicast IPv6" {
     // Loopback ::1
     try testing.expect(isNonRoutableNs(initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
     // Unspecified ::
@@ -355,17 +424,20 @@ test "isNonRoutableNs blocks private/reserved IPv6" {
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfd, 0x12 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // Link-local fe80::/10
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
-    // Multicast ff00::/8
+    // Multicast ff00::/8 — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
+    // Documentation 2001:db8::/32 — widened vs the old NS-only set
+    try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
     // IPv4-mapped ::ffff:127.0.0.1
     try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
     // IPv4-mapped ::ffff:10.0.0.1
     try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 }, 53, 0, 0)));
+    // IPv4-mapped multicast ::ffff:224.0.0.1 — must stay blocked at NS-time
+    try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 224, 0, 0, 1 }, 53, 0, 0)));
 }
 
 test "isNonRoutableNs allows routable IPv6" {
-    // 2001:db8::1 (documentation, but routable from resolver perspective)
-    try testing.expect(!isNonRoutableNs(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
+    try testing.expect(!isNonRoutableNs(initIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
     try testing.expect(!isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
 }
