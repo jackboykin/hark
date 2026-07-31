@@ -118,9 +118,10 @@ remainder.
 
 ---
 
-## Excluded fixtures (not in the manifest at all)
+## Fixtures deliberately not vendored
 
-Two reasons a vendored `.rpl` is left out entirely rather than run-as-xfail:
+Two reasons an upstream `.rpl` is absent from `../../corpus/unbound/`
+entirely rather than run-as-xfail:
 
 ### Non-portable upstream signatures
 

@@ -19,8 +19,7 @@ SCENARIO_BEGIN REFUSED from sole authority surfaces (does not hang or crash)
 ;   (b) infinite retry loop against the lame NS — test times out
 ;   (c) hark crashes on unexpected REFUSED rcode mid-resolution
 ;
-; Companion test for the multi-NS fallthrough case lives in the
-; .divergence sidecar (RFC 1034 §4.3.5; not yet implemented in hark).
+; The multi-NS fallthrough companion (RFC 1034 §4.3.5) is scenario 005.
 
 ; ── Fake root server ───────────────────────────────────────────────
 RANGE_BEGIN 0 100

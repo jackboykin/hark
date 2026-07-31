@@ -1,26 +1,20 @@
 ; hark: root-hints = 127.0.10.1
 
-SCENARIO_BEGIN FORMERR from sole authority surfaces (does not hang)
+SCENARIO_BEGIN SERVFAIL from sole authority surfaces as SERVFAIL to the client
 
-; The single listed NS for example.com returns FORMERR (RFC 1035 §4.1.1,
-; "the name server was unable to interpret the query"). Real-world causes:
-; auths that reject EDNS options, COOKIE-aware middleboxes, or genuinely
-; malformed forwarding. RFC 8914 categorises this as advisory-grade
-; failure; resolvers commonly retry without EDNS, but with only one NS
-; available the resolver must still produce a response.
+; A leaf query against the only NS for a zone returns SERVFAIL (transient
+; auth backend failure, RFC 2308 §7.1). Hark has no alternative NS to try,
+; so the correct behaviour per RFC 1034 §4.3 is to relay the failure to
+; the stub as SERVFAIL.
 ;
-; With a single NS, hark has nowhere to fall through. This scenario asserts
-; that hark *does respond at all* (no hang, no drop) within the test
-; window. The exact rcode is whatever hark currently emits; the scenario
-; pins that down to catch regressions.
+; What this scenario asserts (and what hark currently does):
+;   - the leaf SERVFAIL is propagated as a SERVFAIL response to the stub
+;   - hark does not hang, crash, or invent a synthetic answer
+;   - the upstream is contacted exactly once for the leaf (no spin loop)
 ;
-; Bug-modes this catches:
-;   (a) FORMERR causes hark to short-circuit without responding to the stub
-;   (b) Hark loops retrying FORMERR forever -> test timeout
-;   (c) Hark crashes on FORMERR mid-resolution
-;
-; Multi-NS FORMERR-on-all-auths -> SERVFAIL behaviour is the more
-; interesting RFC 1034 §4.3.5 case; see the .divergence sidecar.
+; Multi-NS fallthrough (RFC 1034 §4.3.5) is covered separately by
+; scenarios 004-006. This single-NS shape isolates the
+; passthrough-vs-synthesis property.
 
 ; ── Fake root server ───────────────────────────────────────────────
 RANGE_BEGIN 0 100
@@ -54,20 +48,24 @@ RANGE_BEGIN 0 100
   ENTRY_END
 RANGE_END
 
-; ── Sole example.com auth: FORMERRs everything ─────────────────────
+; ── Sole example.com auth: returns SERVFAIL for the leaf ───────────
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.3
+  ; QMIN probe at example.com. answers NODATA so iteration continues
+  ; (matches the shape used in regression/002).
   ENTRY_BEGIN
     MATCH opcode qname
     ADJUST copy_id copy_query
-    REPLY QR FORMERR
+    REPLY QR AA NOERROR
     SECTION QUESTION
       example.com. IN A
   ENTRY_END
+  ; The leaf query: SERVFAIL with empty body. Stand-in for a broken auth
+  ; backend or post-DNS-software bug at the upstream.
   ENTRY_BEGIN
     MATCH opcode qname qtype
     ADJUST copy_id copy_query
-    REPLY QR FORMERR
+    REPLY QR AA SERVFAIL
     SECTION QUESTION
       www.example.com. IN A
   ENTRY_END
@@ -80,18 +78,16 @@ ENTRY_BEGIN
     www.example.com. IN A
 ENTRY_END
 
-; Hark currently passes FORMERR through to the client. A future change
-; that maps it to SERVFAIL (FORMERR semantically means "the server
-; couldn't parse the stub's query", which is false from the stub's
-; perspective) would need to flip this.
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH rcode question
-  REPLY QR RD RA FORMERR
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END
 
+; The leaf query must have reached the auth — proves the failure mode was
+; the auth's SERVFAIL, not a hark-side bailiwick reject or timeout.
 STEP 3 CHECK_QUERY_LOG
 ENTRY_BEGIN
   SECTION QUERY_LOG

@@ -14,22 +14,19 @@ Every entry runs. None are skipped:
     If hark ever passes one of these, pytest reports an unexpected pass
     and the suite fails — forcing the divergence note to be revisited.
 
-Currently blocked (NOT in the manifest, can't even run):
+Upstream fixtures deliberately not vendored (absent from
+`test/corpus/unbound/` entirely):
 
-  - `iter_donotq127.rpl` — asserts hark blocks 127/8 upstreams; our test
-    harness *requires* 127/8 (the responder binds 127.0.10.x). Would need
-    a per-CIDR `allow-loopback-upstreams` whitelist in hark plus a lifter
-    rule to preserve specific 127/8 IPs without remapping. Structural,
-    1 scenario. The underlying behaviour is covered by the
+  - `iter_donotq127.rpl` — asserts hark blocks 127/8 upstreams; this
+    harness *requires* 127/8 (the responder binds 127.0.10.x), so the
+    scenario cannot run here. The underlying behaviour is covered by the
     `isNonRoutableNs` unit test in `src/net_address.zig`.
-
-Non-portable upstream scenarios (intentionally NOT in the manifest):
 
   - `iter_cname_minimise_nx.rpl`, `iter_class_any.rpl` — both depend on
     Unbound's testbound-only `fake-sha1: yes` algorithm,
     `val-override-date` clock override, and a hardcoded test key fused
     into the Unbound binary. The signatures are unverifiable by any
-    conformant validator. Replacements live as hark-authored DNSSEC
+    conformant validator. Replacement coverage is hark-authored DNSSEC
     scenarios under `test/scenarios/hark/dnssec/` using the harness's
     real ECDSA signing.
 
@@ -72,8 +69,8 @@ MANIFEST: list[LiftedEntry] = [
     # iter_cname — CNAME-chase edges; cluster of hark divergences (xfail strict)
     LiftedEntry("iter_cname_double.rpl",                  "iter_cname",       None),
     LiftedEntry("iter_cname_minimise.rpl",                "iter_cname",       None),
-    # iter_cname_minimise_nx is intentionally *not* in this manifest — see
-    # the "Non-portable upstream scenarios" section of the module docstring.
+    # iter_cname_minimise_nx is not vendored — see the "deliberately not
+    # vendored" section of the module docstring.
     LiftedEntry("iter_cname_nx.rpl",                      "iter_cname",       None),
     LiftedEntry("iter_cname_qnamecopy.rpl",               "iter_cname",       None),
     # iter_cname_cache uses an IPv6 ADDRESS (`2002::5`). The lifter maps
@@ -91,8 +88,8 @@ MANIFEST: list[LiftedEntry] = [
     LiftedEntry("iter_dname_ttl.rpl",                     "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
     LiftedEntry("iter_dname_ttl0.rpl",                    "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
 
-    # iter_class_any is intentionally *not* in this manifest — see the
-    # "Non-portable upstream scenarios" section of the module docstring.
+    # iter_class_any is not vendored — see the "deliberately not vendored"
+    # section of the module docstring.
 
     # iter_domain_sale — needs test-clock to observe TTL expiry. Hark
     # implements one behind `-Dtesting=true` (see `src/monotonic.zig`); the
@@ -105,7 +102,3 @@ MANIFEST: list[LiftedEntry] = [
     LiftedEntry("iter_domain_sale.rpl",                   "iter_domain_sale", "hark behaviour diverges: cached positive responses don't carry AUTHORITY NS records (CVE-2025-11411 mitigation; see src/cache.zig:storeResponse). TTL expiry itself works correctly."),
     LiftedEntry("iter_domain_sale_nschange.rpl",          "iter_domain_sale", "hark behaviour diverges: see iter_domain_sale (CVE-2025-11411 mitigation)"),
 ]
-
-
-def all_entries() -> list[LiftedEntry]:
-    return list(MANIFEST)

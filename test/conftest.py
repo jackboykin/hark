@@ -74,7 +74,7 @@ class LiftedManifestCollector(pytest.Module):
 
     def collect(self):
         from scenarios.lifted import manifest as lifted_manifest
-        for entry in lifted_manifest.all_entries():
+        for entry in lifted_manifest.MANIFEST:
             scenario_path = UNBOUND_CORPUS / entry.filename
             name = f"{entry.category}/{Path(entry.filename).stem}"
             item = RplItem.from_parent(self, name=name, scenario_path=scenario_path, lift=True)

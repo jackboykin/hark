@@ -14,6 +14,22 @@ SCENARIO_BEGIN cache-served NXDOMAIN carries NSEC proofs for downstream validato
 ; query that must come from cache. Both CHECK_ANSWER steps assert the
 ; same authority shape: SOA + the two NSEC records that prove (a) b.
 ; doesn't exist and (b) no wildcard would have matched. AD=1 must survive.
+;
+; Zone layout (signed root, harness-generated key):
+;   `.`   — apex (SOA + NS + DNSKEY)
+;   `a.`  — A 192.0.2.1
+;   `c.`  — A 192.0.2.2
+;
+; Canonical name ordering: `.` < `a.` < `b.` < `c.`. A query for `b. A`
+; must NXDOMAIN with two NSEC proofs:
+;
+;   1. `a. NSEC c. ...` — covers `b.` since `a. < b. < c.` (proves the
+;      queried name doesn't exist).
+;   2. `. NSEC a. ...`  — covers `*.` since `*` (0x2A) < `a` (0x61)
+;      (proves no wildcard expansion).
+;
+; Both NSEC RRsets, plus the SOA, get auto-signed by the harness with
+; the root key.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1

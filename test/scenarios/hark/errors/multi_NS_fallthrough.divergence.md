@@ -80,22 +80,12 @@ exhibit flaky behaviour depending on which NS they happen to pick first.
 Hark currently has the second mode (flaky picker) for SERVFAIL and
 REFUSED, and the "passthrough FORMERR" mode for FORMERR.
 
-## Suggested follow-up
+## Remaining gaps
 
-A future change to `src/iterative/` (or wherever the per-NS dispatch
-lives) should:
-
-1. On any non-NOERROR/NXDOMAIN rcode from an auth, mark that auth as
-   tried-and-failed for the current resolution and select the next
-   listed NS rather than returning.
-2. Only return SERVFAIL to the client once every listed NS has been
-   tried and failed.
-3. Consider remapping FORMERR / REFUSED received from the upstream into
-   SERVFAIL at the client boundary, since those rcodes describe
-   server-side conditions (parse error, policy refusal) that aren't
-   meaningful to a stub asking about a name.
-
-When that change lands, the two-NS variants of these scenarios can be
-restored (Git history of this directory has them) and the single-NS
-shapes can be reframed to test the all-NSes-fail-with-X → SERVFAIL
-exhaustion path.
+- Stale-glue fallback (see status note above): when one NS's glue TTL
+  expires and the remaining siblings all SERVFAIL, hark doesn't
+  re-resolve the expired NS's address.
+- Rcode shaping at the client boundary: upstream FORMERR / REFUSED are
+  passed through verbatim on the exhaustion path. Remapping them to
+  SERVFAIL (they describe server-side conditions meaningless to a stub)
+  remains an option; scenarios 002/003 pin the current passthrough.

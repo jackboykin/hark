@@ -4,7 +4,7 @@ SCENARIO_BEGIN glueless out-of-bailiwick NS triggers sub-resolution for its addr
 ;
 ; RFC 1034 §4.2.1 / RFC 8499: a referral's NS may live outside the child
 ; zone. When it does, the parent CANNOT supply trustworthy glue (the glue
-; would be out-of-bailiwick and SHOULD be ignored — see scenario 003), so a
+; would be out-of-bailiwick and SHOULD be ignored — see bailiwick/001), so a
 ; correct iterative resolver MUST recursively resolve the NS's address
 ; before it can ask the child auth anything.
 ;
