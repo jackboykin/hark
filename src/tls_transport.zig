@@ -24,32 +24,61 @@ const alpn_dot = "dot";
 
 /// RFC 9539 opportunistic DoT transport: encrypts queries to authoritative
 /// servers over TLS (ALPN "dot", no SNI, no certificate verification),
-/// falling back to Do53 on any failure. Opportunistic is the only mode, so
-/// the query methods carry no qualifier.
+/// falling back to Do53 on any failure.
 pub const TlsTransport = struct {
     pub const port: u16 = 853;
 
     allocator: Allocator,
     io: Io,
-    pool: ?*ConnectionPool = null,
+    /// Non-optional: a poolless transport could serve nothing.
+    pool: *ConnectionPool,
 
-    pub fn init(allocator: Allocator, io: Io) TlsTransport {
-        return .{ .allocator = allocator, .io = io };
+    pub fn init(allocator: Allocator, io: Io, pool: *ConnectionPool) TlsTransport {
+        return .{ .allocator = allocator, .io = io, .pool = pool };
     }
 
-    /// Try a query on a pooled connection for `key`. Returns null if no pool,
-    /// no pooled conn available, or the pooled conn failed (and was released).
-    fn tryPooledQuery(self: *TlsTransport, key: AddressKey, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ?[]const u8 {
-        const pool = self.pool orelse return null;
-        const conn = pool.acquire(key) orelse return null;
-        if (queryOnConnection(conn, wire_query, response_buf, deadline_ns)) |data| {
+    pub const PooledResult = union(enum) {
+        /// Answer bytes, allocated exactly to the response length (the
+        /// allocator is typically a budgeted per-query arena).
+        data: []u8,
+        /// No pooled connection for this server.
+        none,
+        /// A pooled connection existed but the exchange failed (released broken).
+        broken,
+    };
+
+    /// Query strictly on a pooled connection — never dials, so the caller's
+    /// thread never pays TCP+TLS handshake latency. `.none` means the caller
+    /// should serve over Do53 and rebuild warmth in the background.
+    pub fn queryPooled(self: *TlsTransport, allocator: Allocator, wire_query: []const u8, server: na.Address, deadline_ns: i128) PooledResult {
+        const tls_server = toPort(server, TlsTransport.port);
+        const key = AddressKey.fromAddress(tls_server);
+        const conn = self.pool.acquire(key) orelse return .none;
+        if (queryOnConnection(conn, wire_query, allocator, deadline_ns)) |data| {
             pool_mod.applyKeepaliveHint(conn, data);
-            pool.release(key, conn, true);
-            return data;
+            self.pool.release(key, conn, true);
+            return .{ .data = data };
         } else |_| {
-            pool.release(key, conn, false);
-            return null;
+            self.pool.release(key, conn, false);
+            return .broken;
         }
+    }
+
+    /// Dial + handshake a fresh DoT connection into the pool. The only
+    /// connection-creating path, so handshake latency stays on background
+    /// threads. Kernel timeouts stay armed for the handshake reads;
+    /// `queryOnConnection` re-tightens per deadline (`connectTcpRaw`
+    /// `.address` CONTRACT). error.ConnectFailed = transient; anything
+    /// else reached the server and failed the protocol.
+    fn dialAndPool(self: *TlsTransport, tls_server: na.Address, addr_key: AddressKey, connect_ms: u32) !void {
+        const stream = blocking_transport.connectTcpRaw(tls_server, connect_ms) catch return error.ConnectFailed;
+        errdefer stream.close(self.io);
+        sys.setSocketTimeout(stream.socket.handle, posix.SO.RCVTIMEO, connect_ms);
+        const conn = try self.newPooledConnection(stream);
+        errdefer self.allocator.destroy(conn);
+        // RFC 9539 §4.6.3.3/4: no SNI, accept any cert.
+        try self.handshake(conn);
+        self.pool.store(addr_key, conn);
     }
 
     /// Allocate a PooledConnection wired to `stream`. Caller must free via
@@ -102,94 +131,38 @@ pub const TlsTransport = struct {
         }
     }
 
-    /// Encrypted DoT query. Tries a pooled connection first, pools new
-    /// connections on success. `deadline_ns` is an absolute monotonic deadline
-    /// bounding both connect and query.
-    pub fn query(self: *TlsTransport, wire_query: []const u8, server: na.Address, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+    pub const ProbeKind = encrypted_ns_mod.ProbeKind;
+
+    /// Claim (via the cache's gate) and fire a background dial; on
+    /// success the connection is pooled.
+    pub fn probeInBackground(self: *TlsTransport, server: na.Address, enc_ns_cache: *EncryptedNsCache, kind: ProbeKind) void {
         const tls_server = toPort(server, TlsTransport.port);
         const addr_key = AddressKey.fromAddress(tls_server);
-
-        if (self.tryPooledQuery(addr_key, wire_query, response_buf, deadline_ns)) |data| return data;
-
-        // ── New connection ──
-        // Sub-millisecond residue is error.Timeout, not a 0 ms connect: 0
-        // reached setSocketTimeout as timeval{0,0}, disarming the bound
-        // entirely, so a peer that completed TCP and then said nothing hung
-        // the handshake read forever.
-        const connect_ms = try sys.remainingTimeoutMs(deadline_ns);
-        const stream = try connectTcpBlocking(self.io, tls_server, connect_ms);
-        const conn = try self.initConnection(stream);
-
-        const data = queryOnConnection(conn, wire_query, response_buf, deadline_ns) catch |err| {
-            conn.destroyBroken(self.allocator);
-            return err;
-        };
-
-        if (self.pool) |pool| {
-            pool_mod.applyKeepaliveHint(conn, data);
-            pool.store(addr_key, conn);
-        } else {
-            conn.closeAndDestroy(self.allocator);
-        }
-
-        return data;
-    }
-
-    /// Allocate a PooledConnection from a connected stream and perform the
-    /// TLS handshake. Takes ownership of `stream`: closes it on any failure.
-    fn initConnection(self: *TlsTransport, stream: Io.net.Stream) !*PooledConnection {
-        errdefer stream.close(self.io);
-        const conn = try self.newPooledConnection(stream);
-        errdefer self.allocator.destroy(conn);
-
-        // RFC 9539 §4.6.3.3/4: no SNI, accept any cert.
-        try self.handshake(conn);
-        return conn;
-    }
-
-    /// Open a connected TCP stream for TLS via the shared raw connect
-    /// kernel (`blocking_transport.connectTcpRaw` — see the `.address`
-    /// CONTRACT there). Kernel timeouts stay armed on both directions:
-    /// the TLS handshake reads right after this and relies on them;
-    /// `queryOnConnection` re-tightens per deadline. `io` is reserved
-    /// for the eventual `IpAddress.connect` collapse.
-    fn connectTcpBlocking(io: Io, tls_server: na.Address, timeout_ms: u32) !Io.net.Stream {
-        _ = io;
-        const stream = try blocking_transport.connectTcpRaw(tls_server, timeout_ms);
-        sys.setSocketTimeout(stream.socket.handle, posix.SO.RCVTIMEO, timeout_ms);
-        return stream;
-    }
-
-    /// Fire a background probe for a nameserver. The spawned task does
-    /// blocking TCP connect + TLS handshake. On success, the connection
-    /// is pooled.
-    pub fn probeInBackground(self: *TlsTransport, server: na.Address, enc_ns_cache: *EncryptedNsCache) void {
-        const tls_server = toPort(server, TlsTransport.port);
-        const addr_key = AddressKey.fromAddress(tls_server);
+        if (!enc_ns_cache.claim(addr_key, kind)) return;
 
         if (!enc_ns_cache.probes.tryClaim()) {
-            enc_ns_cache.revertProbing(addr_key);
+            enc_ns_cache.revertClaim(addr_key, kind);
             return;
         }
         // Pass TlsTransport by value: the probe outlives the spawning
         // stack frame (pool / bg-prefetch) that holds the original
         // `*TlsTransport`. Copying snaps the small handle (allocator / io /
         // pool ptr) into the spawned task's args.
-        enc_ns_cache.probes.spawn(self.io, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache }) catch {
+        enc_ns_cache.probes.spawn(self.io, probeThread, .{ self.*, tls_server, addr_key, enc_ns_cache, kind }) catch {
             // ConcurrencyUnavailable is transient (spawn pressure), not a
             // protocol failure — revert the .probing claim so the next
             // query can probe again instead of poisoning the entry with
             // `.failed` and skipping DoT for the full damping window.
-            enc_ns_cache.revertProbing(addr_key);
+            enc_ns_cache.revertClaim(addr_key, kind);
             enc_ns_cache.probes.release();
             return;
         };
     }
 
-    fn probeThread(transport: TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache) void {
+    fn probeThread(transport: TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache, kind: ProbeKind) void {
         defer enc_ns_cache.probes.release();
         if (enc_ns_cache.probes.shutting_down.load(.acquire)) {
-            enc_ns_cache.revertProbing(addr_key);
+            enc_ns_cache.revertClaim(addr_key, kind);
             return;
         }
 
@@ -198,25 +171,21 @@ pub const TlsTransport = struct {
         // RFC 9539 §4.3: TCP connect failure is "soft" — could be a
         // transient network blip; retry sooner. TLS handshake failure is
         // "hard" — server reached us but rejected the protocol; damp longer.
-        const stream = connectTcpBlocking(self.io, tls_server, 4000) catch {
-            enc_ns_cache.setStatus(addr_key, .soft_failed);
+        // Hard band is .discover-only: a .rewarm target already proved it
+        // speaks DoT (if it truly dropped DoT, damping decays to .unknown
+        // and the next .discover hard-fails it). OOM is a local resource
+        // event, never a protocol verdict.
+        self.dialAndPool(tls_server, addr_key, 4000) catch |err| {
+            const hard = kind == .discover and
+                err != error.ConnectFailed and err != error.OutOfMemory;
+            enc_ns_cache.setStatus(addr_key, if (hard) .failed else .soft_failed);
             return;
         };
 
-        // ── TLS handshake ──
-        const conn = self.initConnection(stream) catch {
-            enc_ns_cache.setStatus(addr_key, .failed);
-            return;
-        };
-
-        // Success — mark capable and pool the connection
         enc_ns_cache.setStatus(addr_key, .capable);
-        var addr_buf: [64]u8 = undefined;
-        log.info("server {s} supports DoT (RFC 9539)", .{na.format(tls_server, &addr_buf)});
-        if (self.pool) |pool| {
-            pool.store(addr_key, conn);
-        } else {
-            conn.closeAndDestroy(self.allocator);
+        if (kind == .discover) {
+            var addr_buf: [64]u8 = undefined;
+            log.info("server {s} supports DoT (RFC 9539)", .{na.format(tls_server, &addr_buf)});
         }
     }
 };
@@ -243,7 +212,7 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// TODO: bound the whole payload as the Do53 TCP path does with
 /// `sys.readExactDeadline`. The TLS layer buffers records rather than exposing
 /// raw syscalls, so the read loop needs a per-syscall deadline hook first.
-fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator: Allocator, deadline_ns: i128) ![]u8 {
     // Stage into a single buffer so the TLS layer emits one record + one
     // syscall per query — two writeAll calls would flush twice (ianic
     // flushes per record).
@@ -259,14 +228,17 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, response_b
     const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch return error.TlsRecvFailed;
     if (n_len < 2) return error.TlsRecvFailed;
     const resp_len = mem.readInt(u16, &resp_len_buf, .big);
+    if (resp_len == 0) return error.InvalidLength;
 
-    if (resp_len == 0 or resp_len > response_buf.len) return error.InvalidLength;
+    // Exact-size, allocated only after the length prefix is known.
+    const response_buf = try allocator.alloc(u8, resp_len);
+    errdefer allocator.free(response_buf);
 
-    const n_body = conn.tls.readAtLeast(response_buf[0..resp_len], resp_len) catch return error.TlsRecvFailed;
+    const n_body = conn.tls.readAtLeast(response_buf, resp_len) catch return error.TlsRecvFailed;
     if (n_body < resp_len) return error.TlsRecvFailed;
 
     sys.setQuickAck(handle);
-    return response_buf[0..resp_len];
+    return response_buf;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -292,71 +264,55 @@ fn captureClientHello(io: Io, host: []const u8, out: []u8) !usize {
     return cr.send_pos;
 }
 
-test "TlsTransport query against 1.1.1.1:853" {
+test "TlsTransport queryPooled never dials" {
+    // Cold pool must come back instantly as .none — the caller's thread
+    // never pays a handshake.
+    const io = testing.io;
+    var pool = ConnectionPool.init(testing.allocator, io);
+    defer pool.deinit();
+    var tls_t = TlsTransport.init(testing.allocator, io, &pool);
+
+    const server = na.initIp4(.{ 192, 0, 2, 1 }, 53);
+    const deadline = monotonic.nowNs() + std.time.ns_per_s;
+    try testing.expect(tls_t.queryPooled(testing.allocator, &.{}, server, deadline) == .none);
+    try testing.expectEqual(@as(usize, 0), pool.entries.count());
+}
+
+test "TlsTransport dialAndPool then queryPooled against 1.1.1.1:853" {
     try skipIfNotLinux();
     const io = testing.io;
 
-    var tls_t = TlsTransport.init(testing.allocator, io);
+    var pool = ConnectionPool.init(testing.allocator, io);
+    defer pool.deinit();
+    var tls_t = TlsTransport.init(testing.allocator, io, &pool);
+
+    // Background-thread shape: dial + handshake parks a warm connection.
+    const server = na.initIp4(.{ 1, 1, 1, 1 }, 53);
+    const tls_server = toPort(server, TlsTransport.port);
+    tls_t.dialAndPool(tls_server, AddressKey.fromAddress(tls_server), 5000) catch
+        return error.SkipZigTest;
+    try testing.expectEqual(@as(usize, 1), pool.entries.count());
 
     const msg = try dns.buildQuery(testing.allocator, 0xC0DE, "example.com", .a, .{});
     defer dns.freeMessage(testing.allocator, msg);
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const server = na.initIp4(.{ 1, 1, 1, 1 }, 53);
-    var response_buf: [dns.max_message_len]u8 = undefined;
+    // First exchange rides the parked connection.
     const deadline = monotonic.nowNs() + 10 * std.time.ns_per_s;
-
-    const response_data = tls_t.query(wire_query, server, &response_buf, deadline) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed, error.Timeout => return error.SkipZigTest,
-        else => return err,
+    const response_data = switch (tls_t.queryPooled(testing.allocator, wire_query, server, deadline)) {
+        .data => |data| data,
+        .none, .broken => return error.SkipZigTest,
     };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const response = try dns.parseMessage(arena.allocator(), response_data);
-
-    try testing.expect(response.header.flags.qr);
-    try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
-    try testing.expect(response.answers.len > 0);
-}
-
-test "TlsTransport connection pooling reuses connection" {
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    var pool = ConnectionPool.init(testing.allocator, io);
-    defer pool.deinit();
-
-    var tls_t = TlsTransport.init(testing.allocator, io);
-    tls_t.pool = &pool;
-
-    const msg = try dns.buildQuery(testing.allocator, 0xABCD, "example.com", .a, .{});
-    defer dns.freeMessage(testing.allocator, msg);
-    var wire_buf: [dns.max_udp_payload]u8 = undefined;
-    const wire_query = try dns.serializeMessage(&wire_buf, msg);
-
-    const server = na.initIp4(.{ 1, 1, 1, 1 }, 53);
-    var response_buf: [dns.max_message_len]u8 = undefined;
-
-    // First query — establishes connection, stores in pool
-    const deadline1 = monotonic.nowNs() + 10 * std.time.ns_per_s;
-    _ = tls_t.query(wire_query, server, &response_buf, deadline1) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed, error.Timeout => return error.SkipZigTest,
-        else => return err,
-    };
-
-    // Pool should have one entry
+    defer testing.allocator.free(response_data);
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
 
-    // Second query — should reuse pooled connection
+    // Second exchange reuses it (still exactly one pooled conn).
     const deadline2 = monotonic.nowNs() + 10 * std.time.ns_per_s;
-    const response_data = tls_t.query(wire_query, server, &response_buf, deadline2) catch |err| switch (err) {
-        error.ConnectFailed, error.TlsHandshakeFailed, error.TlsSendFailed, error.TlsRecvFailed, error.Timeout => return error.SkipZigTest,
-        else => return err,
-    };
-
-    // Pool should still have one entry (returned after reuse)
+    switch (tls_t.queryPooled(testing.allocator, wire_query, server, deadline2)) {
+        .data => |data2| testing.allocator.free(data2),
+        .none, .broken => return error.SkipZigTest,
+    }
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -417,40 +373,20 @@ test "probeInBackground reverts .probing when max_probes hit" {
     const tls_server = toPort(server, 853);
     const addr_key = AddressKey.fromAddress(tls_server);
 
-    // Claim the probe slot (sets .probing)
-    try testing.expect(enc_ns_cache.claimProbe(addr_key));
-    try testing.expectEqual(encrypted_ns_mod.ServerStatus.probing, enc_ns_cache.getStatus(addr_key));
-
-    // Saturate the probe-cap counter so the guard triggers
+    // Saturate the probe-cap counter so the guard triggers.
     enc_ns_cache.probes.active.store(encrypted_ns_mod.max_probes, .seq_cst);
 
-    // probeInBackground should hit the max_probes guard and revert.
-    var tls_t = TlsTransport.init(testing.allocator, testing.io);
-    tls_t.probeInBackground(server, &enc_ns_cache);
+    var pool = ConnectionPool.init(testing.allocator, io);
+    defer pool.deinit();
+    var tls_t = TlsTransport.init(testing.allocator, io, &pool);
 
+    // .discover: claim then cap-revert forgets the entry entirely.
+    tls_t.probeInBackground(server, &enc_ns_cache, .discover);
     try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
-}
 
-test "probeThread reverts .probing on shutdown" {
-    const io = testing.io;
-    var enc_ns_cache = EncryptedNsCache.init(testing.allocator, io);
-    defer enc_ns_cache.deinit();
-
-    const server = na.initIp4(.{ 10, 0, 0, 2 }, 53);
-    const tls_server = toPort(server, 853);
-    const addr_key = AddressKey.fromAddress(tls_server);
-
-    // Claim the probe slot
-    try testing.expect(enc_ns_cache.claimProbe(addr_key));
-
-    // Signal shutdown before spawning so tryClaim short-circuits
-    enc_ns_cache.probes.shutting_down.store(true, .release);
-
-    var tls_t = TlsTransport.init(testing.allocator, testing.io);
-    tls_t.probeInBackground(server, &enc_ns_cache);
-
-    // Wait for the spawned probe to finish via the Group's await.
-    enc_ns_cache.awaitProbes();
-
-    try testing.expectEqual(encrypted_ns_mod.ServerStatus.unknown, enc_ns_cache.getStatus(addr_key));
+    // .rewarm: the same revert must RESTORE .capable — spawn pressure on
+    // the probe pool must not erase proven capability.
+    enc_ns_cache.setStatus(addr_key, .capable);
+    tls_t.probeInBackground(server, &enc_ns_cache, .rewarm);
+    try testing.expectEqual(encrypted_ns_mod.ServerStatus.capable, enc_ns_cache.getStatus(addr_key));
 }

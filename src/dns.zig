@@ -526,8 +526,9 @@ pub const OptRecord = struct {
     do_bit: bool,
     options: []const EdnsOption,
     /// If non-zero, serializeMessage adds an EDNS0 padding option (code 12)
-    /// so the total message reaches this size. Set by buildQuery.
-    padding_target: u16 = 0,
+    /// so the total message is a multiple of this block size. Set by
+    /// buildQuery.
+    padding_block: u16 = 0,
 };
 
 // ── Question ───────────────────────────────────────────────────────────
@@ -626,15 +627,16 @@ fn applyCase0x20(io: std.Io, name: Name) void {
     }
 }
 
-/// RFC 8467 §4.1 recommended block-size for DoT query padding.
-pub const dot_padding_target: u16 = 468;
+/// RFC 8467 §4.1 client policy: pad *queries* to multiples of 128
+/// octets (468 is the same section's *response* block — don't swap them).
+pub const dot_padding_block: u16 = 128;
 
 const EdnsConfig = struct {
     udp_payload_size: u16 = edns_udp_payload,
     do_bit: bool = false,
-    /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) to reach
-    /// this total message size. See `dot_padding_target` for DoT.
-    padding_target: u16 = 0,
+    /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) so the
+    /// total message is a multiple of this. See `dot_padding_block` for DoT.
+    padding_block: u16 = 0,
 };
 
 const QueryOptions = struct {
@@ -679,7 +681,7 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
             .version = 0,
             .do_bit = edns.do_bit,
             .options = &.{},
-            .padding_target = edns.padding_target,
+            .padding_block = edns.padding_block,
         } else null,
     };
 }
@@ -1447,17 +1449,17 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
         var rdlength: u16 = 0;
         for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
 
-        // EDNS0 padding (RFC 7830, option code 12): pad total message to padding_target
+        // EDNS0 padding (RFC 7830, option code 12): pad total message up to
+        // the next multiple of padding_block (RFC 8467 §4.1 client policy).
         var padding_len: u16 = 0;
-        if (opt.padding_target > 0) {
+        if (opt.padding_block > 0) {
             // ser.pos already includes name(1) + type(2) + class(2) + ttl(4) = 9
             // bytes of OPT. Only the rdlength (2) and the padding option header
             // (4) remain unwritten, so the predicted final size is ser.pos + 6
             // + rdlength + padding_len.
             const msg_size_before_padding = ser.pos + 2 + rdlength + 4;
-            if (opt.padding_target > msg_size_before_padding) {
-                padding_len = @intCast(opt.padding_target - msg_size_before_padding);
-            }
+            const rem = msg_size_before_padding % opt.padding_block;
+            if (rem != 0) padding_len = @intCast(opt.padding_block - rem);
             rdlength += 4 + padding_len; // code(2) + length(2) + padding data
         }
 
@@ -1468,7 +1470,7 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
             try ser.writeSlice(o.data);
         }
 
-        if (opt.padding_target > 0) {
+        if (opt.padding_block > 0) {
             try ser.writeU16(edns_opt_padding);
             try ser.writeU16(padding_len);
             try ser.ensureSpace(padding_len);
@@ -2113,20 +2115,33 @@ test "EDNS0: serialized OPT has correct wire format" {
     try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
 }
 
-test "EDNS0: padding_target produces wire of exactly that size" {
+test "EDNS0: padding_block pads to the next multiple (RFC 8467 §4.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const msg = try buildQuery(alloc, 0xBEEF, "example.com", .a, .{
         .rd = true,
-        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_target = dot_padding_target },
+        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_block = dot_padding_block },
     });
 
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
-    try testing.expectEqual(@as(usize, dot_padding_target), wire.len);
+    // A short query lands exactly one block; never zero, never off-block.
+    try testing.expectEqual(@as(usize, dot_padding_block), wire.len);
+
+    // A long QNAME crosses into the second block, still block-aligned.
+    const long_name = "a-fairly-long-label-for-padding.subdomain-with-more-length." ++
+        "yet-another-label-to-cross-128.example.com";
+    const msg2 = try buildQuery(alloc, 0xBEF0, long_name, .a, .{
+        .rd = true,
+        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_block = dot_padding_block },
+    });
+    var buf2: [max_udp_payload]u8 = undefined;
+    const wire2 = try serializeMessage(&buf2, msg2);
+    try testing.expect(wire2.len > dot_padding_block);
+    try testing.expectEqual(@as(usize, 0), wire2.len % dot_padding_block);
 
     // And it should still parse cleanly with the OPT carrying a padding option.
     const parsed = try parseMessage(alloc, wire);

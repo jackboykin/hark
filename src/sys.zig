@@ -304,7 +304,7 @@ fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout,
 
 /// Milliseconds left until `deadline_ns`, for arming a kernel socket timeout.
 /// Sub-millisecond residue is `error.Timeout`, not zero: the budget is spent.
-pub fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
+fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
     const remaining_ns = deadline_ns - monotonic.nowNs();
     if (remaining_ns < std.time.ns_per_ms) return error.Timeout;
     return @intCast(@min(

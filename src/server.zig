@@ -610,11 +610,12 @@ pub const Server = struct {
         pub fn init(server: *Server) UpstreamTransports {
             return .{
                 .udp = BlockingUdpTransport.init(.{}, server.io),
-                .tls = if (server.config.opportunistic) blk: {
-                    var t = TlsTransport.init(server.allocator, server.io);
-                    t.pool = if (server.enc_pool) |*pool| pool else null;
-                    break :blk t;
-                } else null,
+                // enc_pool exists iff `opportunistic` — its presence IS the
+                // "encrypted upstream enabled" predicate.
+                .tls = if (server.enc_pool) |*pool|
+                    TlsTransport.init(server.allocator, server.io, pool)
+                else
+                    null,
             };
         }
 
@@ -649,6 +650,18 @@ pub const Server = struct {
             .key_cache = if (self.key_cache) |*kc| kc else null,
             .tcp_pool = null,
         };
+    }
+
+    /// `0% while capable > 0` is the signature of capability knowledge
+    /// going unused — the failure shape this line exists to catch.
+    fn logOteStats(self: *Server) void {
+        const oc = if (self.encrypted_ns_cache) |*o| o else return;
+        const s = oc.getStats();
+        const total = s.dot_answers + s.do53_answers;
+        const pct: u64 = if (total > 0) s.dot_answers * 100 / total else 0;
+        log.info("ote: {d}/{d} upstream answers over DoT ({d}%), {d} servers capable", .{
+            s.dot_answers, total, pct, s.capable,
+        });
     }
 
     pub fn deinit(self: *Server) void {
@@ -798,6 +811,7 @@ pub const Server = struct {
         log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
             stats.entries, stats.memory_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
+        self.logOteStats();
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
             const k_total = ks.hits + ks.misses;
@@ -1307,6 +1321,7 @@ const WorkerState = struct {
         log.info("cache: {d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
             stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, hit_pct, stats.evictions,
         });
+        self.server.logOteStats();
     }
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t, wake_fd: posix.fd_t) void {

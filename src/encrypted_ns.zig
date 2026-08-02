@@ -44,6 +44,11 @@ pub const ServerStatus = enum {
     soft_failed,
 };
 
+/// `.discover` = first-contact probe (logs capability); `.rewarm` =
+/// re-dial for a known-capable server's cold pool (quiet, and a failed
+/// claim reverts to .capable, not .unknown).
+pub const ProbeKind = enum { discover, rewarm };
+
 const NsEntry = struct {
     status: ServerStatus = .unknown,
     last_probe: i64 = 0,
@@ -58,6 +63,10 @@ pub const EncryptedNsCache = struct {
     /// Caps + joins in-flight probes; see `BumpGatedGroup`.
     probes: BumpGatedGroup = .init(max_probes),
     now_fn: *const fn () i64 = &monotonic.nowSec,
+    /// Upstream answers by transport (RFC 9539 §8 asks deployments to
+    /// report encrypted-egress share).
+    dot_answers: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
+    do53_answers: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
 
     pub fn init(allocator: Allocator, io: std.Io) EncryptedNsCache {
         return .{
@@ -94,19 +103,30 @@ pub const EncryptedNsCache = struct {
         return effectiveStatus(entry, self.now_fn());
     }
 
-    /// Atomically claim a probe slot for `key`. Returns true if this caller
-    /// should fire the probe (sets status to .probing). Returns false if
-    /// already probing, already capable, or in damping window.
-    pub fn claimProbe(self: *EncryptedNsCache, key: AddressKey) bool {
+    /// Claim the probe slot (status -> .probing; dedups dials and parks
+    /// the server out of the encrypted-first scan). `.discover` requires
+    /// effective .unknown, `.rewarm` requires .capable. True = caller
+    /// fires the dial.
+    pub fn claim(self: *EncryptedNsCache, key: AddressKey, kind: ProbeKind) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const now = self.now_fn();
 
-        if (self.entries.get(key)) |entry| {
-            if (effectiveStatus(entry, now) != .unknown) return false;
-        }
+        const existing = self.entries.get(key);
+        const current: ServerStatus = if (existing) |entry|
+            effectiveStatus(entry, now)
+        else
+            .unknown;
+        const required: ServerStatus = switch (kind) {
+            .discover => .unknown,
+            .rewarm => .capable,
+        };
+        if (current != required) return false;
 
-        if (self.entries.count() >= max_entries) {
+        // Evict only on a genuinely new key: overwrites don't grow the
+        // map, and evictOldest preferentially hits long-stable .capable
+        // entries.
+        if (existing == null and self.entries.count() >= max_entries) {
             self.evictOldest();
         }
         self.entries.put(key, .{
@@ -119,7 +139,7 @@ pub const EncryptedNsCache = struct {
 
     /// Record a probe outcome for `key`. Caller selects the damping band
     /// (.capable persists 3 days; .failed 1 hour; .soft_failed 60 s).
-    /// `.probing` is reserved for `claimProbe`'s atomic gate; `.unknown` is
+    /// `.probing` is reserved for `claim`'s atomic gate; `.unknown` is
     /// implied by absence — callers should not write either.
     pub fn setStatus(self: *EncryptedNsCache, key: AddressKey, status: ServerStatus) void {
         std.debug.assert(status != .unknown and status != .probing);
@@ -131,15 +151,40 @@ pub const EncryptedNsCache = struct {
         }) catch {};
     }
 
-    /// Revert a .probing entry to .unknown (probe was never attempted).
-    pub fn revertProbing(self: *EncryptedNsCache, key: AddressKey) void {
+    /// Roll back a claim whose dial never ran (spawn pressure, shutdown):
+    /// `.discover` forgets the entry, `.rewarm` restores .capable. Known
+    /// slack: the restore keeps claim()'s fresh last_probe stamp, renewing
+    /// the persistence window without a dial — bounded, a stale .capable
+    /// costs one pooled miss.
+    pub fn revertClaim(self: *EncryptedNsCache, key: AddressKey, kind: ProbeKind) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.entries.get(key)) |entry| {
-            if (entry.status == .probing) {
-                _ = self.entries.fetchRemove(key);
-            }
+        const entry = self.entries.getPtr(key) orelse return;
+        if (entry.status != .probing) return;
+        switch (kind) {
+            .discover => _ = self.entries.remove(key),
+            .rewarm => entry.status = .capable,
         }
+    }
+
+    pub const Stats = struct { dot_answers: u64, do53_answers: u64, capable: u32 };
+
+    /// Snapshot for the stats log: answer counts plus how many servers are
+    /// currently effective-.capable.
+    pub fn getStats(self: *EncryptedNsCache) Stats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now = self.now_fn();
+        var capable: u32 = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (effectiveStatus(kv.value_ptr.*, now) == .capable) capable += 1;
+        }
+        return .{
+            .dot_answers = self.dot_answers.load(.monotonic),
+            .do53_answers = self.do53_answers.load(.monotonic),
+            .capable = capable,
+        };
     }
 
     /// Block until all background probes have completed (for shutdown).
@@ -231,21 +276,21 @@ test "EncryptedNsCache soft_failed uses shorter damping" {
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
-test "EncryptedNsCache claimProbe dedup" {
+test "EncryptedNsCache claim(.discover) dedup" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 9, 9, 9, 9 });
 
     // First claim succeeds
-    try testing.expect(cache.claimProbe(key));
+    try testing.expect(cache.claim(key, .discover));
     try testing.expectEqual(ServerStatus.probing, cache.getStatus(key));
 
     // Second claim for same key fails (dedup)
-    try testing.expect(!cache.claimProbe(key));
+    try testing.expect(!cache.claim(key, .discover));
 }
 
-test "EncryptedNsCache claimProbe respects damping" {
+test "EncryptedNsCache claim(.discover) respects damping" {
     en_test_now = 100_000;
 
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
@@ -257,14 +302,14 @@ test "EncryptedNsCache claimProbe respects damping" {
 
     // Within damping — claim should fail
     en_test_now = 100_000 + damping_sec - 1;
-    try testing.expect(!cache.claimProbe(key));
+    try testing.expect(!cache.claim(key, .discover));
 
     // Past damping — claim should succeed
     en_test_now = 100_000 + damping_sec;
-    try testing.expect(cache.claimProbe(key));
+    try testing.expect(cache.claim(key, .discover));
 }
 
-test "EncryptedNsCache claimProbe skips capable" {
+test "EncryptedNsCache claim(.discover) skips capable" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
@@ -272,7 +317,7 @@ test "EncryptedNsCache claimProbe skips capable" {
     cache.setStatus(key, .capable);
 
     // Should not re-probe a capable server
-    try testing.expect(!cache.claimProbe(key));
+    try testing.expect(!cache.claim(key, .discover));
 }
 
 test "EncryptedNsCache capable after failed" {
@@ -301,35 +346,110 @@ test "EncryptedNsCache capable expires after persistence_sec" {
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 
     // Should not re-probe within window
-    try testing.expect(!cache.claimProbe(key));
+    try testing.expect(!cache.claim(key, .discover));
 
     // Past persistence window — should revert to unknown
     en_test_now = 100_000 + persistence_sec;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 
     // Should allow re-probing
-    try testing.expect(cache.claimProbe(key));
+    try testing.expect(cache.claim(key, .discover));
 }
 
-test "EncryptedNsCache revertProbing clears probing entry" {
+test "EncryptedNsCache revertClaim(.discover) clears probing entry" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 4, 4, 4, 4 });
-    try testing.expect(cache.claimProbe(key));
+    try testing.expect(cache.claim(key, .discover));
     try testing.expectEqual(ServerStatus.probing, cache.getStatus(key));
 
-    cache.revertProbing(key);
+    cache.revertClaim(key, .discover);
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 }
 
-test "EncryptedNsCache revertProbing is no-op for capable" {
+test "EncryptedNsCache getStats counts capable and answers" {
+    en_test_now = 100_000;
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
+    defer cache.deinit();
+    cache.now_fn = &enTestNow;
+
+    cache.setStatus(makeKey(.{ 9, 0, 0, 1 }), .capable);
+    cache.setStatus(makeKey(.{ 9, 0, 0, 2 }), .capable);
+    cache.setStatus(makeKey(.{ 9, 0, 0, 3 }), .failed);
+    _ = cache.dot_answers.fetchAdd(3, .monotonic);
+    _ = cache.do53_answers.fetchAdd(7, .monotonic);
+
+    var s = cache.getStats();
+    try testing.expectEqual(@as(u32, 2), s.capable);
+    try testing.expectEqual(@as(u64, 3), s.dot_answers);
+    try testing.expectEqual(@as(u64, 7), s.do53_answers);
+
+    // Expired .capable marks drop out of the gauge.
+    en_test_now += persistence_sec;
+    s = cache.getStats();
+    try testing.expectEqual(@as(u32, 0), s.capable);
+}
+
+test "EncryptedNsCache claim(.rewarm): capable -> probing, no stampede" {
+    en_test_now = 100_000;
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
+    defer cache.deinit();
+    cache.now_fn = &enTestNow;
+
+    const key = makeKey(.{ 6, 6, 6, 6 });
+    // Unknown server: nothing to rewarm.
+    try testing.expect(!cache.claim(key, .rewarm));
+
+    cache.setStatus(key, .capable);
+    try testing.expect(cache.claim(key, .rewarm));
+    try testing.expectEqual(ServerStatus.probing, cache.getStatus(key));
+    // Concurrent misses must not fire duplicate dials.
+    try testing.expect(!cache.claim(key, .rewarm));
+
+    // Damped statuses are not rewarm-eligible.
+    cache.setStatus(key, .soft_failed);
+    try testing.expect(!cache.claim(key, .rewarm));
+
+    // A .capable mark past its persistence window is stale — no rewarm.
+    cache.setStatus(key, .capable);
+    en_test_now += persistence_sec;
+    try testing.expect(!cache.claim(key, .rewarm));
+}
+
+test "EncryptedNsCache claim on a present key never evicts" {
+    en_test_now = 100_000;
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
+    defer cache.deinit();
+    cache.now_fn = &enTestNow;
+
+    var i: usize = 0;
+    while (i < max_entries) : (i += 1) {
+        en_test_now += 1;
+        cache.setStatus(makeKey(.{ 1, 1, @intCast(i >> 8), @intCast(i & 0xff) }), .capable);
+    }
+    try testing.expectEqual(max_entries, @as(usize, cache.entries.count()));
+
+    // .rewarm on a present key at capacity: overwrite in place — the
+    // oldest (stablest) entry must survive.
+    const oldest = makeKey(.{ 1, 1, 0, 0 });
+    en_test_now += 1;
+    try testing.expect(cache.claim(makeKey(.{ 1, 1, 0, 42 }), .rewarm));
+    try testing.expectEqual(max_entries, @as(usize, cache.entries.count()));
+    try testing.expectEqual(ServerStatus.capable, cache.getStatus(oldest));
+
+    // .discover on a NEW key at capacity still evicts (bound holds).
+    try testing.expect(cache.claim(makeKey(.{ 2, 2, 2, 2 }), .discover));
+    try testing.expectEqual(max_entries, @as(usize, cache.entries.count()));
+}
+
+test "EncryptedNsCache revertClaim is no-op for non-probing" {
     var cache = EncryptedNsCache.init(testing.allocator, testing.io);
     defer cache.deinit();
 
     const key = makeKey(.{ 5, 5, 5, 5 });
     cache.setStatus(key, .capable);
 
-    cache.revertProbing(key);
+    cache.revertClaim(key, .discover);
     try testing.expectEqual(ServerStatus.capable, cache.getStatus(key));
 }

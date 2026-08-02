@@ -229,6 +229,17 @@ pub const RttCache = struct {
         }
     }
 
+    /// Clear death-tracking without an RTT sample (DoT successes must not
+    /// shape Do53 estimates, but must break the one-way timeout ratchet).
+    pub fn recordAlive(self: *RttCache, key: AddressKey) void {
+        const shard = self.shardFor(key);
+        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        const state = shard.entries.getPtr(key) orelse return;
+        state.consecutive_timeouts = 0;
+        state.dead_until_ms = 0;
+    }
+
     /// Check whether the server is currently marked dead. If `now_ms` is past
     /// the shard's death high-water, no entry can be dead and the rwlock is
     /// skipped — the dominant case under healthy upstream.

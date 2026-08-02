@@ -1586,35 +1586,59 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         server: na.Address,
     ) !?dns.Message {
+        // Caller gates on `.capable`; a stale read costs at worst one
+        // wasted pooled attempt.
         const tls_t = self.transports.?.tls orelse return null;
         const oc = self.encrypted_ns_cache orelse return null;
         const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
-        switch (oc.getStatus(tls_key)) {
-            .capable => {},
-            .unknown => return null, // First contact → Do53 now, probe after
-            .probing, .failed, .soft_failed => return null, // Skip, go straight to Do53
-        }
 
         const query_id = rand.queryId(self.io);
         const padded_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
             .rd = false,
-            .edns = .{ .do_bit = self.dnssec_aware, .padding_target = dns.dot_padding_target },
+            .edns = .{ .do_bit = self.dnssec_aware, .padding_block = dns.dot_padding_block },
         });
         var padded_buf: [dns.edns_udp_payload]u8 = undefined;
         const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-        const tls_response_buf = try allocator.alloc(u8, dns.max_message_len);
+        // Fixed 4s: encryption may cost more than Do53 — accepted trade.
         const deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
-        const tls_data = tls_t.query(padded_query, server, tls_response_buf, deadline_ns) catch {
-            // RFC 9539 §4.3: a query-time TLS error on a previously-capable
-            // server is soft (timeout, RST, transient). Don't evict the
-            // encrypted path for an hour because of one flaky packet.
-            oc.setStatus(tls_key, .soft_failed);
+        const tls_data = switch (tls_t.queryPooled(allocator, padded_query, server, deadline_ns)) {
+            .data => |data| data,
+            .none => {
+                // Cold pool: serve over Do53 now, re-dial in background.
+                tls_t.probeInBackground(server, oc, .rewarm);
+                return null;
+            },
+            // RFC 9539 §4.3: transport failure on a known-capable server
+            // is soft (timeout, RST, transient).
+            .broken => {
+                oc.setStatus(tls_key, .soft_failed);
+                return null;
+            },
+        };
+        // Semantic rejection over a healthy transport (bad parse, FORMERR
+        // — likely the padding option — question mismatch) is deterministic
+        // per-server: hard band.
+        const response = try tryParseMessage(allocator, tls_data, server) orelse {
+            oc.setStatus(tls_key, .failed);
             return null;
         };
-        const response = try tryParseMessage(allocator, tls_data, server) orelse return null;
-        if (response.header.flags.rcode == .format_error) return null;
-        if (!dns.validateQuestionMatch(response, padded_msg.questions[0].name, qtype)) return null;
+        if (response.header.flags.rcode == .format_error) {
+            oc.setStatus(tls_key, .failed);
+            return null;
+        }
+        if (!dns.validateQuestionMatch(response, padded_msg.questions[0].name, qtype)) {
+            // RFC 9619: error replies may omit the question section, as on
+            // the Do53 path — no demotion for that shape.
+            if (response.questions.len == 0 and response.header.flags.rcode.isServerError()) return null;
+            oc.setStatus(tls_key, .failed);
+            return null;
+        }
+        // Clear the Do53 death ratchet; RTT estimates stay untouched.
+        if (self.rtt_cache) |rc| rc.recordAlive(AddressKey.fromAddress(server));
+        _ = oc.dot_answers.fetchAdd(1, .monotonic);
+        var addr_buf: [64]u8 = undefined;
+        log.debug("answered over DoT by {s}", .{na.format(server, &addr_buf)});
         return response;
     }
 
@@ -1800,10 +1824,39 @@ pub const RecursiveResolver = struct {
 
         var last_server_failure: ?dns.Message = null;
 
+        // ── RFC 9539: capability discovery + encrypted-first ──
+        // Probe the top-ranked candidates (not just responders — a capable
+        // server can lose the race forever), then spend one TLS attempt on
+        // the best-ranked capable one; the race below is UDP-only. Any
+        // failure falls through to Do53. Probe surface to attacker-chosen
+        // IPs is bounded by the special-use egress filter, per-IP claim
+        // damping, and max_probes. All-Do53-dead zones get no discovery
+        // until a server revives.
+        if (self.encrypted_ns_cache) |oc| {
+            if (self.transports.?.tls) |tls_t| {
+                for (sel.order[0..@min(sel.live_count, max_staggered_legs)]) |idx|
+                    tls_t.probeInBackground(servers[idx], oc, .discover);
+                for (sel.order[0..sel.live_count]) |idx| {
+                    const tls_key = AddressKey.fromAddressWithPort(servers[idx], TlsTransport.port);
+                    if (oc.getStatus(tls_key) != .capable) continue;
+                    if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx])) |tls_response| {
+                        if (tls_response.header.flags.rcode.isServerError()) {
+                            last_server_failure = tls_response;
+                        } else {
+                            // No RTT/selector feedback from TLS: its latency
+                            // would poison the Do53 estimates.
+                            return .{ .message = tls_response, .responding_server = null };
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         // ── Staggered NS racing ──
         if (sel.order.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
-                self.fireOteProbe(stag.server);
+                if (self.encrypted_ns_cache) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
                 return .{ .message = stag.message, .responding_server = stag.server };
             }
         }
@@ -1822,17 +1875,6 @@ pub const RecursiveResolver = struct {
             if (dead_skip) continue;
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
-
-            // ── RFC 9539: Opportunistic encrypted query ──
-            if (try self.tryOpportunisticTls(allocator, query_name, query_type, server)) |tls_response| {
-                if (tls_response.header.flags.rcode.isServerError()) {
-                    last_server_failure = tls_response;
-                    continue :server_loop;
-                }
-                // Don't update RTT cache or NS selector from TLS —
-                // different transport latency would poison Do53 estimates.
-                return .{ .message = tls_response, .responding_server = null };
-            }
 
             // ── Do53: UDP with TCP fallback, 0x20-hardened ──
             const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware)) {
@@ -1857,7 +1899,7 @@ pub const RecursiveResolver = struct {
             }
 
             self.recordNsOutcome(parent_zone, server, .success, exchange.elapsed_us);
-            self.fireOteProbe(server);
+            if (self.encrypted_ns_cache) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
             return .{ .message = response, .responding_server = server };
         }
 
@@ -1866,15 +1908,6 @@ pub const RecursiveResolver = struct {
             return .{ .message = sf, .responding_server = null };
         }
         return error.Timeout;
-    }
-
-    fn fireOteProbe(self: *RecursiveResolver, server: na.Address) void {
-        const oc = self.encrypted_ns_cache orelse return;
-        const tls_t = self.transports.?.tls orelse return;
-        const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
-        if (oc.claimProbe(tls_key)) {
-            tls_t.probeInBackground(server, oc);
-        }
     }
 
     // ── DNSSEC Answer Validation ───────────────────────────────────────

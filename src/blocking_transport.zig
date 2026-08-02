@@ -291,8 +291,7 @@ const tcp_connect_timeout_ms: u32 = 5000;
 const tcp_response_timeout_ms: u32 = 10000;
 
 /// Send a DNS query over TCP. With pool != null, tries an idle pooled
-/// connection first and stores a fresh one on success. Mirrors
-/// TlsTransport.query's optional-pool shape.
+/// connection first and stores a fresh one on success.
 pub fn queryTcp(
     io: Io,
     wire_query: []const u8,
@@ -339,7 +338,7 @@ pub fn queryTcp(
 }
 
 /// Open a connected TCP stream — the raw connect kernel shared by Do53
-/// (`connectTcp`) and DoT (`tls_transport.connectTcpBlocking`). The fd is
+/// (`connectTcp`) and DoT (`tls_transport.dialAndPool`). The fd is
 /// opened via raw posix so we can apply SO_SNDTIMEO for the connect
 /// itself — Zig's `IpAddress.connect` accepts a timeout option but its
 /// Io.Threaded backend panics on it. SNDTIMEO is left set to
