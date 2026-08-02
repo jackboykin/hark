@@ -51,8 +51,11 @@ pub fn tryClaim(self: *BumpGatedGroup) bool {
             // Between pre-check and CAS, awaitAll may have set shutting_down
             // and observed inFlight==0 (because our bump hadn't published yet)
             // and exited. If shutdown is now set, roll back so we don't spawn
-            // into torn-down state.
-            if (self.shutting_down.load(.acquire)) {
+            // into torn-down state. seq_cst pairs with awaitAll's store:
+            // release/acquire alone doesn't order our write-then-read against
+            // its store-then-load (store-buffer reordering lets both sides
+            // miss each other).
+            if (self.shutting_down.load(.seq_cst)) {
                 _ = self.active.fetchSub(1, .release);
                 return false;
             }
@@ -89,7 +92,7 @@ pub fn spawn(
 /// before the group's internal `num_running` decrement, so the group may
 /// still hold outstanding work even after `active` hits zero.
 pub fn awaitAll(self: *BumpGatedGroup, io: Io) void {
-    self.shutting_down.store(true, .release);
+    self.shutting_down.store(true, .seq_cst);
     while (self.inFlight() > 0) {
         io.sleep(drain_poll, .awake) catch {};
     }
