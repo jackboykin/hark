@@ -257,6 +257,22 @@ pub const CertificateBuilder = struct {
                 const signature = try signer.finalize(&buf, h.rng);
                 break :brk .{ signature.bytes, comptime_scheme };
             },
+            .ed25519 => brk: {
+                // EdDSA signs the whole message in one shot (no incremental
+                // hash state), so unlike the branches above this bypasses
+                // setSignatureVerifyBytes and builds the TLS 1.3 CertificateVerify
+                // content directly. Ed25519 isn't defined for TLS 1.2's
+                // CertificateVerify construction, so tls_1_2 isn't handled here.
+                const Eddsa = crypto.sign.Ed25519;
+                const message = if (h.side == .server)
+                    h.transcript.serverCertificateVerify()
+                else
+                    h.transcript.clientCertificateVerify();
+                const signature = try h.cert_key_pair.key.key.ed25519.sign(message, null);
+                var buf: [Eddsa.Signature.encoded_length]u8 = undefined;
+                buf = signature.toBytes();
+                break :brk .{ &buf, .ed25519 };
+            },
             else => return error.TlsUnknownSignatureScheme,
         };
 
@@ -557,4 +573,36 @@ test "DhKeyPair.x25519" {
     );
     var kp = try DhKeyPair.init(seed, &.{.x25519});
     try testing.expectEqualSlices(u8, expected, try kp.sharedKey(.x25519, server_pub_key));
+}
+
+test "CertificateBuilder.makeCertificateVerify ed25519" {
+    // Bundle is unused by makeCertificateVerify (it only signs the
+    // transcript with cert_key_pair.key), so an empty one is fine here.
+    var cert_key_pair = CertKeyPair{
+        .bundle = .{ .map = .{}, .bytes = .{ .items = &.{}, .capacity = 0 } },
+        .key = try PrivateKey.parsePem(@embedFile("testdata/ed25519_private_key.pem")),
+    };
+    var transcript = Transcript{};
+    var prng = std.Random.DefaultPrng.init(0);
+    const cb = CertificateBuilder{
+        .cert_key_pair = &cert_key_pair,
+        .transcript = &transcript,
+        .side = .server,
+        .rng = prng.random(),
+    };
+
+    var buf: [256]u8 = undefined;
+    var w = record.Writer.init(&buf);
+    try cb.makeCertificateVerify(&w);
+
+    // Decode the message as a peer would off the wire and check the
+    // signature verifies against the key's own public key.
+    var d = record.Decoder.init(.handshake, w.buffered()[4..]); // skip 1-byte type + u24 length header
+    const signature_scheme = try d.decode(proto.SignatureScheme);
+    try testing.expectEqual(.ed25519, signature_scheme);
+    const signature = try d.slice(try d.decode(u16));
+
+    const Eddsa = crypto.sign.Ed25519;
+    const sig = Eddsa.Signature.fromBytes(signature[0..Eddsa.Signature.encoded_length].*);
+    try sig.verify(transcript.serverCertificateVerify(), cert_key_pair.key.key.ed25519.public_key);
 }

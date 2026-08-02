@@ -22,6 +22,7 @@ pub const Connection = struct {
     max_encrypt_seq: u64 = std.math.maxInt(u64) - 1,
     key_update_requested: bool = false,
     received_close_notify: bool = false,
+    close_alert: proto.Alert = .close_notify,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
 
@@ -75,7 +76,7 @@ pub const Connection = struct {
             // Write alert on tls errors.
             // Stream errors return to the caller.
             if (mem.startsWith(u8, @errorName(err), "Tls"))
-                try c.encryptWrite(.alert, &proto.alertFromError(err));
+                @atomicStore(proto.Alert, &c.close_alert, proto.Alert.fromError(err), .monotonic);
             return err;
         };
     }
@@ -85,7 +86,7 @@ pub const Connection = struct {
     /// record.
     fn nextRecord(c: *Self, buffer: []u8) ![]const u8 {
         assert(c.cleartext_buf.len == 0);
-        if (c.received_close_notify) return error.EndOfStream;
+        if (@atomicLoad(bool, &c.received_close_notify, .monotonic)) return error.EndOfStream;
         while (true) {
             const rec = try Record.read(c.input);
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
@@ -133,7 +134,7 @@ pub const Connection = struct {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
                     try proto.Alert.parse(cleartext[0..2].*).toError();
                     // server side clean shutdown
-                    c.received_close_notify = true;
+                    @atomicStore(bool, &c.received_close_notify, true, .monotonic);
                     return error.EndOfStream;
                 },
                 else => return error.TlsUnexpectedMessage,
@@ -143,12 +144,13 @@ pub const Connection = struct {
     }
 
     pub fn eof(c: *Self) bool {
-        return c.received_close_notify and c.cleartext_buf.len == 0;
+        return @atomicLoad(bool, &c.received_close_notify, .monotonic) and c.cleartext_buf.len == 0;
     }
 
     pub fn close(c: *Self) anyerror!void {
-        if (c.received_close_notify) return;
-        try c.writeRecord(.alert, &proto.Alert.closeNotify());
+        if (@atomicLoad(bool, &c.received_close_notify, .monotonic)) return;
+        const alert = @atomicLoad(proto.Alert, &c.close_alert, .monotonic);
+        try c.writeRecord(.alert, &alert.format());
     }
 
     // write/read
@@ -179,7 +181,7 @@ pub const Connection = struct {
             const cleartext = c.nextRecord(buffer) catch |err| {
                 if (err == error.EndOfStream) return 0;
                 if (mem.startsWith(u8, @errorName(err), "Tls"))
-                    try c.encryptWrite(.alert, &proto.alertFromError(err));
+                    @atomicStore(proto.Alert, &c.close_alert, proto.Alert.fromError(err), .monotonic);
                 return err;
             };
             if (cleartext.ptr == buffer.ptr) {
@@ -630,7 +632,7 @@ pub const NonBlock = struct {
             .ciphertext_pos = input.seek,
             .unused_ciphertext = input.buffered(),
             .cleartext = cleartext[0..n],
-            .closed = self.inner.received_close_notify,
+            .closed = @atomicLoad(bool, &self.inner.received_close_notify, .monotonic),
         };
     }
 

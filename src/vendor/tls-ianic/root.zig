@@ -40,7 +40,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, opt: config.Client) !Connec
         .output = output,
         .session_resumption_secret_idx = session_resumption_secret_idx,
         .session_resumption = opt.session_resumption,
-        .alpn_protocol = hc.alpn_protocol,
+        .alpn_protocol = findAlpnProtocol(opt.alpn_protocols, hc.alpn_protocol),
     };
 }
 
@@ -59,6 +59,16 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, opt: config.Server) !Connec
         .output = output,
         .alpn_protocol = hs.alpn_protocol,
     };
+}
+
+fn findAlpnProtocol(protocols: []const []const u8, selected: ?[]const u8) ?[]const u8 {
+    if (selected) |sel| {
+        for (protocols) |proto| {
+            if (std.mem.eql(u8, proto, sel)) return proto;
+        }
+        // if we got a protocol that is not in the list, that's a violation of RFC 7301
+    }
+    return null;
 }
 
 /// With default buffer sizes

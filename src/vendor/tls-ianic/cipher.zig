@@ -671,7 +671,7 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
             CBC.init(self.decrypt_key).decrypt(plaintext, ciphertext, iv[0..iv_len].*) catch return error.TlsDecryptError;
 
             // get padding len from last padding byte
-            const padding_len = plaintext[plaintext.len - 1] + 1;
+            const padding_len = @as(usize, plaintext[plaintext.len - 1]) + 1;
             if (plaintext.len < mac_len + padding_len) return error.TlsDecryptError;
             // split plaintext into cleartext and mac
             const cleartext_len = plaintext.len - mac_len - padding_len;

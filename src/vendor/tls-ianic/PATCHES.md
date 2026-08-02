@@ -1,12 +1,13 @@
 # Local patches against ianic/tls.zig
 
 Upstream: https://github.com/ianic/tls.zig
-Pinned commit: `5452bafc98d23e304209cb24d81fd2d19434e52d`
+Pinned commit: `d633a0f276294f84836ab9a81ba79b805790b2c8`
 
-The SNI guard below is the **only** local delta against this pin — confirm with
-`diff -ru <upstream-src> src/vendor/tls-ianic` after a refresh. Zig 0.17
-compatibility (`**`→`@splat`) is upstream-native as of this pin, so no local
-0.17 port is carried.
+The SNI guard below is the **only** semantic delta against this pin. The tree
+is additionally `zig fmt`-normalized for our nightly (mechanical builtin
+renames, e.g. `@enumFromInt`→`@fromBackingInt`); to verify the delta, run the
+same `zig fmt` over the upstream clone first, then
+`diff -ru <upstream-src> src/vendor/tls-ianic` must show exactly one hunk.
 
 ## SNI: skip extension when host is empty
 
@@ -31,10 +32,15 @@ Upstream tracking: TODO file an issue/PR.
 
 ```
 git clone https://github.com/ianic/tls.zig /tmp/tls-ianic
-rsync -a /tmp/tls-ianic/src/ src/vendor/tls-ianic/
+rsync -a --delete --exclude LICENSE.tls-ianic --exclude PATCHES.md \
+    /tmp/tls-ianic/src/ src/vendor/tls-ianic/
 cp /tmp/tls-ianic/LICENSE src/vendor/tls-ianic/LICENSE.tls-ianic
+# positive control: `zig build test` here must fail EXACTLY the SNI guard test
 # re-apply the patches above (and update the pinned commit at the top)
-zig build test
+zig fmt src/vendor/tls-ianic/
+zig build test          # quiet on success; run the test binary directly to
+                        # confirm the live 1.1.1.1:853 tests RAN (build runner
+                        # may skip them; direct run should show 1 skip max)
 ```
 
 Note: `testdata/` (and `rsa/testdata/`) is included even though it only feeds
@@ -48,14 +54,19 @@ When pulling a newer upstream, confirm each item still holds before merging.
 "Confirm" usually means a one-line grep or running the named test.
 
 - **Hostname verification fires when `host.len > 0` and `insecure_skip_verify
-  = false`.** Currently at `handshake_common.zig:342-343`. Without this, a
-  cert from any trusted CA would be accepted regardless of the SNI name.
-  Test: `TlsTransport authenticated mode rejects hostname mismatch`.
+  = false`.** Currently at `handshake_common.zig:358-359`. Dormant property:
+  hark runs opportunistic-only today (`8613210` dropped authenticated DoT and
+  its mismatch test), but this must hold before any ADoT revival. Confirm by
+  grep — no in-tree test covers it.
 - **SNI extension is elided when `host.len == 0`.** This is our patch above.
   Test: `ianic SNI patch: host="" elides server_name extension`.
 - **ALPN echo can be inspected post-handshake via `Connection.alpn_protocol`.**
   hark rejects non-`"dot"` echoes; if upstream changes the field name or
   semantics, the ALPN-mismatch guard at `tls_transport.zig` silently no-ops.
+  Since upstream `47c402a` the slice aliases the caller's `alpn_protocols`
+  entry (before that it dangled into the handshake's stack frame — one of the
+  two fixes that motivated the `d633a0f` refresh, along with `106d10b`'s CBC
+  padding `u8` overflow, remotely reachable via a delegation-chosen DoT peer).
 - **`Connection.close()` writes a `close_notify` alert and flushes.** Pool
   cleanup in `connection_pool.zig` calls this; if upstream makes `close` a
   no-op or removes the flush, we leak un-acked plaintext on tear-down.

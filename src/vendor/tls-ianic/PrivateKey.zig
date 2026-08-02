@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Certificate = std.crypto.Certificate;
 const der = Certificate.der;
 const rsa = @import("rsa/rsa.zig");
+const Ed25519 = std.crypto.sign.Ed25519;
 const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const proto = @import("protocol.zig");
 
@@ -13,6 +14,7 @@ signature_scheme: proto.SignatureScheme,
 key: union {
     rsa: rsa.KeyPair,
     ecdsa: [max_ecdsa_key_len]u8,
+    ed25519: Ed25519.KeyPair,
 },
 
 const PrivateKey = @This();
@@ -64,14 +66,17 @@ pub fn parseDer(buf: []const u8) !PrivateKey {
 
     const algo_seq = try der.Element.parse(buf, version.slice.end);
     const algo_cat = try der.Element.parse(buf, algo_seq.slice.start);
-
-    const key_str = try der.Element.parse(buf, algo_seq.slice.end);
-    const key_seq = try der.Element.parse(buf, key_str.slice.start);
-    const key_int = try der.Element.parse(buf, key_seq.slice.start);
-
     const category = try Certificate.parseAlgorithmCategory(buf, algo_cat);
+
+    // privateKey field of the PKCS#8 OneAsymmetricKey; its position doesn't
+    // depend on key type, but what's nested inside it does, so key_seq/key_int
+    // (which assume a SEQUENCE, not true for Ed25519) are parsed per-category below.
+    const key_str = try der.Element.parse(buf, algo_seq.slice.end);
+
     switch (category) {
         .rsaEncryption => {
+            const key_seq = try der.Element.parse(buf, key_str.slice.start);
+            const key_int = try der.Element.parse(buf, key_seq.slice.start);
             const modulus = try der.Element.parse(buf, key_int.slice.end);
             const public_exponent = try der.Element.parse(buf, modulus.slice.end);
             const private_exponent = try der.Element.parse(buf, public_exponent.slice.end);
@@ -90,6 +95,8 @@ pub fn parseDer(buf: []const u8) !PrivateKey {
             };
         },
         .X9_62_id_ecPublicKey => {
+            const key_seq = try der.Element.parse(buf, key_str.slice.start);
+            const key_int = try der.Element.parse(buf, key_seq.slice.start);
             const key = try der.Element.parse(buf, key_int.slice.end);
             const algo_param = try der.Element.parse(buf, algo_cat.slice.end);
             const named_curve = try Certificate.parseNamedCurve(buf, algo_param);
@@ -98,7 +105,24 @@ pub fn parseDer(buf: []const u8) !PrivateKey {
                 .key = .{ .ecdsa = ecdsaKey(buf, key) },
             };
         },
-        else => unreachable,
+        .curveEd25519 => {
+            // RFC 8410: the "privateKey" OCTET STRING (key_str) wraps a second,
+            // inner OCTET STRING (CurvePrivateKey) holding the raw 32-byte seed.
+            // Unlike RSA/EC there's no algorithm parameter (curve is implied by
+            // the OID), and no SEQUENCE to descend into.
+            const seed_str = try der.Element.parse(buf, key_str.slice.start);
+            const seed = content(buf, seed_str);
+            if (seed.len != Ed25519.KeyPair.seed_length) return error.InvalidEncoding;
+            return .{
+                .signature_scheme = .ed25519,
+                .key = .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed[0..Ed25519.KeyPair.seed_length].*) },
+            };
+        },
+        // Explicit RSASSA-PSS OID (rather than plain rsaEncryption); not
+        // produced by the common `openssl genpkey` flows this parser
+        // otherwise supports. Out of scope here, but must be a real error
+        // now that the switch is exhaustive, not a silent `unreachable`.
+        .rsassa_pss => return error.UnsupportedKeyAlgorithm,
     }
 }
 
@@ -139,6 +163,37 @@ fn content(bytes: []const u8, e: der.Element) []const u8 {
 
 const testing = std.testing;
 const testu = @import("testu.zig");
+
+test "parse ed25519 pem" {
+    const data = @embedFile("testdata/ed25519_private_key.pem");
+    const pk = try parsePem(data);
+
+    try testing.expectEqual(.ed25519, pk.signature_scheme);
+
+    // $ openssl asn1parse -in testdata/ed25519_private_key.pem
+    // seed is the content of the inner OCTET STRING
+    const seed = &testu.hexToBytes(
+        \\ 46 35 11 bb 6c e5 54 95 1c 48 ff 2a c1 7a 8a 51
+        \\ da 1b c6 9b e7 b5 41 c8 b9 81 92 6e ff 61 7b dd
+    );
+    try testing.expectEqualSlices(u8, seed, &pk.key.ed25519.secret_key.seed());
+
+    // $ openssl pkey -in testdata/ed25519_private_key.pem -pubout | \
+    //   openssl pkey -pubin -text -noout
+    const public_key = &testu.hexToBytes(
+        \\ c6 48 42 9f d6 12 8f 6f 3b 06 cd cd 77 71 30 a1
+        \\ 58 59 15 53 6f 36 40 8c 8f 48 02 71 20 2b d1 a9
+    );
+    try testing.expectEqualSlices(u8, public_key, &pk.key.ed25519.public_key.toBytes());
+
+    // A signature made with the parsed key must verify against its own
+    // derived public key -- the same property the TLS 1.3 CertificateVerify
+    // signing path (handshake_common.zig CertificateBuilder.makeCertificateVerify)
+    // relies on.
+    const message = "test message";
+    const signature = try pk.key.ed25519.sign(message, null);
+    try signature.verify(message, pk.key.ed25519.public_key);
+}
 
 test "parse ec pem" {
     const data = @embedFile("testdata/ec_private_key.pem");
