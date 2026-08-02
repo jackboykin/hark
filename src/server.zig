@@ -965,10 +965,10 @@ pub const Server = struct {
         ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd, wake_fd);
 
         for (pool_threads[0..spawned]) |pt| pt.join();
-
-        // Drain in-flight DoT probe tasks before the per-pool-thread
-        // TlsTransport instances they captured go out of scope.
-        if (self.encrypted_ns_cache) |*enc| enc.awaitProbes();
+        // DoT probes are drained once, in deinit — probes capture the
+        // TlsTransport by value and its pool pointer targets a Server
+        // field, so nothing here goes out of scope. A per-worker await
+        // would race: Io.Group.await is not threadsafe.
     }
 
     /// Hot-set sweeper: one tick per 500 ms. Shares the cache's clock
@@ -1392,7 +1392,14 @@ const WorkerState = struct {
         const log_stats = sig_fd >= 0;
 
         while (!self.server.shutdown.load(.acquire)) {
-            const results = self.loop.tick(&completions) catch break;
+            // A tick failure must signal shutdown like every other exit:
+            // pool threads block on a condvar only signalShutdown
+            // broadcasts, so a bare break leaves them (and our join)
+            // hanging forever in a half-alive process.
+            const results = self.loop.tick(&completions) catch {
+                self.server.requestShutdown();
+                break;
+            };
 
             // Periodic cache stats logging
             const now_ns = monotonic.nowNs();
