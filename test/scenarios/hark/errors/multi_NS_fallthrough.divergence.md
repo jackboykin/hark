@@ -3,7 +3,11 @@
 **Status (2026-05-29): fixed for SERVFAIL / REFUSED / FORMERR.** The two-NS
 fallthrough scenarios are committed as `004_servfail_first_NS_fallthrough_to_second
 .rpl`, `005_refused_first_NS_fallthrough_to_second.rpl`, and
-`006_formerr_first_NS_fallthrough_to_second.rpl`, all green. FORMERR now
+`006_formerr_first_NS_fallthrough_to_second.rpl`, all green. The recovery
+scenarios have probabilistic teeth (randomized cold NS pick — see 004's
+header); the deterministic all-fail siblings with CHECK_QUERY_LOG teeth are
+`007` (FORMERR), `008` (SERVFAIL), `009` (REFUSED), each ablation-verified
+to fail every run on a no-fallthrough `shouldTrySiblingNs`. FORMERR now
 counts as a sibling-fallthrough signal via `RCode.shouldTrySiblingNs`
 (deliberately distinct from `isServerError`, which still keys lame-scoring
 and the DoT guard on SERVFAIL/REFUSED only). Sole-NS FORMERR still surfaces

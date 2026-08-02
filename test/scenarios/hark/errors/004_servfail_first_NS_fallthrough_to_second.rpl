@@ -6,6 +6,14 @@ SCENARIO_BEGIN SERVFAIL from one of two NSes falls through to the second (RFC 10
 ; leaf query, ns2 answers. Hark must iterate to ns2 rather than propagate
 ; ns1's SERVFAIL to the stub.
 ;
+; Teeth are probabilistic BY DESIGN: cold NS selection is randomized, so on
+; code with no fallthrough this still passes whenever ns2 is picked first
+; (measured 17/30 on an ablated shouldTrySiblingNs). A QUERY_LOG assertion
+; can't fix that — on correct code an ns2-first run legitimately never
+; queries ns1. The deterministic teeth live in 008, the all-fail sibling;
+; this scenario pins the recovery property 008 can't: the healthy answer
+; actually surfaces.
+;
 ; Companion divergence note: multi_NS_fallthrough.divergence.md
 
 ; ── Fake root server ───────────────────────────────────────────────
