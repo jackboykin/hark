@@ -67,11 +67,7 @@ pub const TlsTransport = struct {
             return .{ .data = data };
         } else |err| {
             self.pool.release(key, conn, false);
-            if (err == error.DeadOnArrival) {
-                var addr_buf: [64]u8 = undefined;
-                log.debug("pooled DoT conn to {s} was already closed by peer", .{na.format(tls_server, &addr_buf)});
-                return .none;
-            }
+            if (err == error.DeadOnArrival) return .none;
             return .broken;
         }
     }

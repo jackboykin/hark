@@ -1637,8 +1637,6 @@ pub const RecursiveResolver = struct {
         // Clear the Do53 death ratchet; RTT estimates stay untouched.
         if (self.rtt_cache) |rc| rc.recordAlive(AddressKey.fromAddress(server));
         _ = oc.dot_answers.fetchAdd(1, .monotonic);
-        var addr_buf: [64]u8 = undefined;
-        log.debug("answered over DoT by {s}", .{na.format(server, &addr_buf)});
         return response;
     }
 
