@@ -85,7 +85,7 @@ pub const TlsTransport = struct {
         const conn = try self.newPooledConnection(stream);
         errdefer self.allocator.destroy(conn);
         // RFC 9539 §4.6.3.3/4: no SNI, accept any cert.
-        try self.handshake(conn);
+        try self.handshake(conn, tls_server);
         self.pool.store(addr_key, conn);
     }
 
@@ -118,7 +118,8 @@ pub const TlsTransport = struct {
     /// is tolerated (Cloudflare / Google do this in violation of RFC 7301
     /// §3.2); a non-"dot" echo is rejected — sending a length-prefixed DNS
     /// frame to e.g. an h2 endpoint would corrupt state.
-    fn handshake(self: *TlsTransport, conn: *PooledConnection) !void {
+    fn handshake(self: *TlsTransport, conn: *PooledConnection, tls_server: na.Address) !void {
+        var addr_buf: [64]u8 = undefined;
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
         conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
             .rng = rng_impl.interface(),
@@ -128,12 +129,12 @@ pub const TlsTransport = struct {
             .insecure_skip_verify = true,
             .alpn_protocols = &.{alpn_dot},
         }) catch |err| {
-            log.debug("TLS handshake failed: {s}", .{@errorName(err)});
+            log.debug("TLS handshake failed: {s} server={s}", .{ @errorName(err), na.format(tls_server, &addr_buf) });
             return error.TlsHandshakeFailed;
         };
         if (conn.tls.alpn_protocol) |proto| {
             if (!std.mem.eql(u8, proto, alpn_dot)) {
-                log.warn("TLS ALPN mismatch: peer echoed {s}", .{proto});
+                log.warn("TLS ALPN mismatch: peer echoed {s} server={s}", .{ proto, na.format(tls_server, &addr_buf) });
                 return error.TlsHandshakeFailed;
             }
         }
