@@ -123,11 +123,9 @@ pub const EncryptedNsCache = struct {
         };
         if (current != required) return false;
 
-        // Evict only on a genuinely new key: overwrites don't grow the
-        // map, and evictOldest preferentially hits long-stable .capable
-        // entries.
+        // Evict only on a genuinely new key: overwrites don't grow the map.
         if (existing == null and self.entries.count() >= max_entries) {
-            self.evictOldest();
+            self.evictOldest(now);
         }
         self.entries.put(key, .{
             .status = .probing,
@@ -193,20 +191,30 @@ pub const EncryptedNsCache = struct {
         self.probes.awaitAll(self.io);
     }
 
-    /// Evict the oldest entry when at capacity. Caller must hold mutex.
-    fn evictOldest(self: *EncryptedNsCache) void {
-        var oldest_key: ?AddressKey = null;
-        var oldest_time: i64 = std.math.maxInt(i64);
+    /// Evict the oldest non-capable entry when at capacity; only an
+    /// all-capable map sacrifices a capable one. Capable entries are the
+    /// map's payload — damping junk churns fast under discovery (every
+    /// Do53-only candidate claims a slot), and age-only eviction let that
+    /// churn erase stable capable servers, forcing a re-discovery dial
+    /// each time. Caller must hold mutex.
+    fn evictOldest(self: *EncryptedNsCache, now: i64) void {
+        var victim: ?AddressKey = null;
+        var victim_time: i64 = std.math.maxInt(i64);
+        var victim_capable = true;
 
         var iter = self.entries.iterator();
         while (iter.next()) |kv| {
-            if (kv.value_ptr.last_probe < oldest_time) {
-                oldest_time = kv.value_ptr.last_probe;
-                oldest_key = kv.key_ptr.*;
+            const capable = effectiveStatus(kv.value_ptr.*, now) == .capable;
+            const prefer = (!capable and victim_capable) or
+                (capable == victim_capable and kv.value_ptr.last_probe < victim_time);
+            if (prefer) {
+                victim_time = kv.value_ptr.last_probe;
+                victim = kv.key_ptr.*;
+                victim_capable = capable;
             }
         }
 
-        if (oldest_key) |k| {
+        if (victim) |k| {
             _ = self.entries.fetchRemove(k);
         }
     }
@@ -441,6 +449,31 @@ test "EncryptedNsCache claim on a present key never evicts" {
     // .discover on a NEW key at capacity still evicts (bound holds).
     try testing.expect(cache.claim(makeKey(.{ 2, 2, 2, 2 }), .discover));
     try testing.expectEqual(max_entries, @as(usize, cache.entries.count()));
+}
+
+test "EncryptedNsCache eviction spares capable entries" {
+    en_test_now = 100_000;
+    var cache = EncryptedNsCache.init(testing.allocator, testing.io);
+    defer cache.deinit();
+    cache.now_fn = &enTestNow;
+
+    // Capacity − 1 capable entries, oldest stamp first…
+    var i: usize = 0;
+    while (i < max_entries - 1) : (i += 1) {
+        en_test_now += 1;
+        cache.setStatus(makeKey(.{ 1, 1, @intCast(i >> 8), @intCast(i & 0xff) }), .capable);
+    }
+    // …then damping junk carrying the freshest stamp of all.
+    en_test_now += 1;
+    const junk = makeKey(.{ 2, 2, 2, 2 });
+    cache.setStatus(junk, .soft_failed);
+
+    // A new claim at capacity must evict the junk, not the oldest capable.
+    en_test_now += 1;
+    try testing.expect(cache.claim(makeKey(.{ 3, 3, 3, 3 }), .discover));
+    try testing.expectEqual(max_entries, @as(usize, cache.entries.count()));
+    try testing.expect(cache.entries.get(junk) == null);
+    try testing.expectEqual(ServerStatus.capable, cache.getStatus(makeKey(.{ 1, 1, 0, 0 })));
 }
 
 test "EncryptedNsCache revertClaim is no-op for non-probing" {
