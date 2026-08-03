@@ -50,6 +50,13 @@ pub const TlsTransport = struct {
     /// Query strictly on a pooled connection — never dials, so the caller's
     /// thread never pays TCP+TLS handshake latency. `.none` means the caller
     /// should serve over Do53 and rebuild warmth in the background.
+    ///
+    /// A conn the peer already idle-closed fails before any response byte;
+    /// that says the pool was cold, not that the server is bad — report
+    /// `.none`, never `.broken` (demoting cycled every short-lived-conn
+    /// server through soft-damping and starved the encrypted path; a server
+    /// that always closes unanswered thus stays .capable — accepted).
+    /// `.broken` means the server took the query, then wedged or died.
     pub fn queryPooled(self: *TlsTransport, allocator: Allocator, wire_query: []const u8, server: na.Address, deadline_ns: i128) PooledResult {
         const tls_server = toPort(server, TlsTransport.port);
         const key = AddressKey.fromAddress(tls_server);
@@ -58,8 +65,13 @@ pub const TlsTransport = struct {
             pool_mod.applyKeepaliveHint(conn, data);
             self.pool.release(key, conn, true);
             return .{ .data = data };
-        } else |_| {
+        } else |err| {
             self.pool.release(key, conn, false);
+            if (err == error.DeadOnArrival) {
+                var addr_buf: [64]u8 = undefined;
+                log.debug("pooled DoT conn to {s} was already closed by peer", .{na.format(tls_server, &addr_buf)});
+                return .none;
+            }
             return .broken;
         }
     }
@@ -219,13 +231,24 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
     var staging: [2 + dns.edns_udp_payload]u8 = undefined;
     const framed = try dns.stageLengthPrefixed(&staging, wire_query);
 
+    // Dead-on-arrival (see queryPooled): an idle-closed conn is caught on
+    // the read side — the write succeeds under half-close, then the buffered
+    // close_notify returns EOF without touching the wire. A peer that RSTs
+    // idle conns instead fails the write with ECONNRESET, which File.Writer
+    // leaves unmapped → .broken; the symptom would be a sawtoothing
+    // capable gauge on the ote stats line.
     const handle = conn.stream.socket.handle;
     try sys.updateTimeout(handle, posix.SO.SNDTIMEO, deadline_ns);
     conn.tls.writeAll(framed) catch return error.TlsSendFailed;
 
     try sys.updateTimeout(handle, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
-    const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch return error.TlsRecvFailed;
+    const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch {
+        // err is null at entry: errored conns are destroyed, never re-pooled.
+        if (conn.net_reader.err) |e| if (e == error.ConnectionResetByPeer) return error.DeadOnArrival;
+        return error.TlsRecvFailed;
+    };
+    if (n_len == 0) return error.DeadOnArrival;
     if (n_len < 2) return error.TlsRecvFailed;
     const resp_len = mem.readInt(u16, &resp_len_buf, .big);
     if (resp_len == 0) return error.InvalidLength;
