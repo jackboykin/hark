@@ -56,6 +56,7 @@ pub fn connect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t
         .INTR => error.Interrupted,
         .ISCONN => error.AlreadyConnected,
         .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
         .NOENT => error.FileNotFound,
         .TIMEDOUT => error.ConnectionTimedOut,
         else => |e| posix.unexpectedErrno(e),
