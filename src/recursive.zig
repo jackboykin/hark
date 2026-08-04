@@ -443,7 +443,10 @@ pub const RecursiveResolver = struct {
             result.prefetch_qtype = qtype;
         }
         result.from_cache = query_budget.spent.load(.monotonic) == 0;
-        result.cousin_prefetch_qtype = switch (qtype) {
+        // Non-NOERROR answers never earn a cousin: NXDOMAIN is
+        // qtype-independent (RFC 8020) and SERVFAIL would re-walk a
+        // path that just failed.
+        result.cousin_prefetch_qtype = if (result.message.header.flags.rcode != .no_error) null else switch (qtype) {
             .a => .aaaa,
             .aaaa => .a,
             else => null,
@@ -3874,6 +3877,38 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
     try testing.expectEqual(@as(usize, 2), result.message.answers.len);
     try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
     try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
+}
+
+test "cousin prefetch: set on NOERROR A/AAAA, suppressed on NXDOMAIN" {
+    const alloc = testing.allocator;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+    {
+        const owner = try makeName(alloc, &.{ "host", "example", "com" });
+        const rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        rrs[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+        const msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = rrs };
+        defer dns.freeMessage(alloc, msg);
+        cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+    }
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const hit = try resolver.resolve(arena.allocator(), "host.example.com", .a);
+    try testing.expectEqual(@as(?dns.RType, .aaaa), hit.cousin_prefetch_qtype);
+
+    // RFC 6761 special-use synthesis: NXDOMAIN with zero upstream work.
+    const nx = try resolver.resolve(arena.allocator(), "host.invalid", .a);
+    try testing.expectEqual(dns.RCode.name_error, nx.message.header.flags.rcode);
+    try testing.expectEqual(@as(?dns.RType, null), nx.cousin_prefetch_qtype);
 }
 
 // Controllable clock for prefetch-window tests (mirrors cache.zig's).
