@@ -1245,6 +1245,12 @@ const BgKind = enum {
     /// runs with `bypass_cache=true` and dnssec_enabled mirrors config —
     /// semantically equivalent to a fresh CD=0 query.
     prefetch,
+    /// Happy-Eyeballs A↔AAAA co-prefetch, fired on cache *absence*. Runs
+    /// with the cache (unlike .prefetch) so it is semantically the client
+    /// query it pre-empts — CNAME follows, NX cuts and all. The only kind
+    /// that records its failures (RFC 9520): absence is the fire condition,
+    /// so an unrecorded failure re-fires on every client query.
+    cousin,
     /// CD=1 revalidation. Re-resolve with dnssec_enabled=true
     /// to upgrade the .unchecked cache entry to .secure (or invalidate on
     /// BOGUS). Runs with `bypass_cache=true` so validation actually fires
@@ -1272,7 +1278,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     // Coalesce bursts of near-expiry client queries that would otherwise
     // fan out into N upstream refreshes for the same (name, qtype, kind).
     const dedup_flag: u8 = switch (ctx.kind) {
-        .prefetch => 0,
+        .prefetch, .cousin => 0,
         .revalidate => bg_revalidate_flag,
     };
     const dedup_opt: ?*InFlightTable = if (server.dedup) |*d| d else null;
@@ -1295,7 +1301,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     var resolver = recursive.RecursiveResolver.fromContext(
         server.resolverContext(),
         upstream.transports(),
-        .{ .bypass_cache = true },
+        .{ .bypass_cache = ctx.kind != .cousin },
     );
 
     // Errors are common (network flakiness, upstream SERVFAIL) and not
@@ -1303,6 +1309,12 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     _ = resolver.resolve(alloc, name, qtype) catch |err| {
         var qtype_buf: [24]u8 = undefined;
         log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(dns.RType, qtype, &qtype_buf), @errorName(err) });
+        // Only cousins record: a refresh kind still holds the entry it meant
+        // to refresh, so a SERVFAIL would clobber it. containsFresh narrows the
+        // race with a concurrent successful resolve.
+        if (ctx.kind == .cousin and !server.cache.containsFresh(name, qtype, .in)) {
+            server.cache.cacheServfail(name, qtype);
+        }
     };
 }
 
@@ -2007,7 +2019,7 @@ const WorkerState = struct {
         const cousin_qtype = result.cousin_prefetch_qtype orelse return;
         if (!self.server.config.prefetch_cousin) return;
         if (self.server.cache.containsFresh(query_name, cousin_qtype, .in)) return;
-        _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .prefetch);
+        _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .cousin);
     }
 
     fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType, inline_fallback: ?PrefetchInlineFallback) void {
@@ -2519,6 +2531,72 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     // Drain: no thread should have been spawned for the rejected inputs.
     server.bg_tasks.awaitAll(server.io);
     try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());
+}
+
+test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh entries survive" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const config = @import("config.zig");
+    var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
+    defer cfg.deinit();
+    // Starve the bg resolve arena: every resolve fails before upstream I/O.
+    cfg.query_memory_limit = 1;
+
+    var server = try Server.init(testing.allocator, cfg, testing.io);
+    defer server.deinit();
+
+    // Non-terminal drain: awaitAll is a one-way shutdown join and would
+    // poison later tryClaims. cacheServfail happens before the task's
+    // release, so inFlight==0 implies the cache write is visible.
+    const drain = struct {
+        fn drain(s: *Server) void {
+            while (s.bg_tasks.inFlight() > 0) s.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }.drain;
+
+    // Cousin failure on an absent key → RFC 9520 SERVFAIL marker.
+    try testing.expect(server.trySpawnBgPrefetch("brk.example.com", .aaaa, .cousin));
+    drain(&server);
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const r = server.cache.lookup(arena.allocator(), "brk.example.com", .aaaa, .in) orelse return error.TestUnexpectedResult;
+        switch (r) {
+            .negative => |n| try testing.expectEqual(dns.RCode.server_failure, n.rcode),
+            .hit => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Same failure under a refresh kind → nothing recorded.
+    try testing.expect(server.trySpawnBgPrefetch("brk2.example.com", .aaaa, .prefetch));
+    drain(&server);
+    try testing.expect(!server.cache.containsFresh("brk2.example.com", .aaaa, .in));
+
+    // Cousin failure with a fresh entry present → guard keeps the entry.
+    {
+        var store_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer store_arena.deinit();
+        const sa = store_arena.allocator();
+        const owner = try dns.parseDottedName(sa, "fresh.example.com");
+        const rrs = try sa.alloc(dns.ResourceRecord, 1);
+        rrs[0] = .{ .name = owner, .rtype = .aaaa, .rclass = .in, .ttl = 300, .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } };
+        const msg = dns.Message{
+            .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
+            .questions = &.{},
+            .answers = rrs,
+        };
+        server.cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+    }
+    try testing.expect(server.trySpawnBgPrefetch("fresh.example.com", .aaaa, .cousin));
+    drain(&server);
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const r = server.cache.lookup(arena.allocator(), "fresh.example.com", .aaaa, .in) orelse return error.TestUnexpectedResult;
+        switch (r) {
+            .hit => {},
+            .negative => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 // ── HotSet unit tests ──────────────────────────────────────────────────
