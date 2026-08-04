@@ -244,12 +244,16 @@ const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
 
 const Protocol = enum { udp, tcp };
 
+// No field defaults: a defaulted Slot inside `slots: ... = @splat(.{})`
+// once made Zig emit all 256 copies (1 MiB, mostly zeros) into .rodata as
+// the memcpy template for WorkQueue's default aggregate. init() writes the
+// sentinels instead.
 const Slot = struct {
-    buf: [max_work_query_bytes]u8 = undefined,
-    len: u16 = 0,
-    client_addr: na.Address = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-    sock_fd: posix.fd_t = -1,
-    protocol: Protocol = .udp,
+    buf: [max_work_query_bytes]u8,
+    len: u16,
+    client_addr: na.Address,
+    sock_fd: posix.fd_t,
+    protocol: Protocol,
 };
 
 const PopResult = struct {
@@ -267,7 +271,7 @@ const PopResult = struct {
 // means the wrapper does one lock acquisition per operation, not two.
 
 const WorkQueue = struct {
-    slots: [work_queue_capacity]Slot = @splat(.{}),
+    slots: [work_queue_capacity]Slot = undefined,
     order: [work_queue_capacity]u16 = undefined,
     head: u16 = 0,
     tail: u16 = 0,
@@ -282,6 +286,12 @@ const WorkQueue = struct {
 
     fn init(self: *WorkQueue, io: Io) void {
         self.* = .{ .io = io };
+        for (&self.slots) |*s| {
+            s.len = 0;
+            s.client_addr = na.initIp4(.{ 0, 0, 0, 0 }, 0);
+            s.sock_fd = -1;
+            s.protocol = .udp;
+        }
         for (0..work_queue_capacity) |i| self.free_list[i] = @intCast(work_queue_capacity - 1 - i);
         self.free_count = work_queue_capacity;
     }
@@ -330,6 +340,10 @@ const WorkQueue = struct {
     }
 
     fn push(self: *WorkQueue, data: []const u8, client_addr: na.Address, sock_fd: posix.fd_t, protocol: Protocol) bool {
+        // Slots are never read before push populates them; every field must
+        // be written below (and read back in pop). Grew a field? Wire it
+        // through here, pop(), and init()'s sentinels, then bump the count.
+        comptime std.debug.assert(@typeInfo(Slot).@"struct".field_names.len == 5);
         if (data.len > max_work_query_bytes) return false;
         var t: QInstrTimer = .{};
         t.start();
@@ -554,7 +568,7 @@ pub const Server = struct {
 
         const hot_set: ?*HotSet = if (cfg.prefetch_hot) blk: {
             const hs = try allocator.create(HotSet);
-            hs.* = .{ .io = io };
+            hs.init(io);
             break :blk hs;
         } else null;
         errdefer if (hot_set) |hs| allocator.destroy(hs);
@@ -1059,10 +1073,18 @@ const HotSet = struct {
     /// a shard lock — see tick()'s copy-out discipline.
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     io: std.Io,
-    candidates: [candidate_slots]Candidate = @splat(.{}),
-    registry: [registry_slots]Lease = @splat(.{}),
+    // undefined + init(): `@splat(.{})` defaults made the whole default
+    // aggregate an ~86 KiB mostly-zero .rodata memcpy template.
+    candidates: [candidate_slots]Candidate = undefined,
+    registry: [registry_slots]Lease = undefined,
     promotions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     fired: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn init(self: *HotSet, io: std.Io) void {
+        self.* = .{ .io = io };
+        for (&self.candidates) |*c| c.* = .{};
+        for (&self.registry) |*l| l.* = .{};
+    }
 
     fn keyTag(name: []const u8, qtype: dns.RType) u64 {
         // Static seed: a collision only makes a name fail to promote —
@@ -2521,7 +2543,8 @@ const HotSetFireLog = struct {
 };
 
 test "HotSet promotes after two remiss events, not one" {
-    var hs = HotSet{ .io = testing.io };
+    var hs: HotSet = undefined;
+    hs.init(testing.io);
     const tag = HotSet.keyTag("cdn.example.com", .a);
 
     hs.onRemiss("cdn.example.com", .a, 1000);
@@ -2535,7 +2558,8 @@ test "HotSet promotes after two remiss events, not one" {
 }
 
 test "HotSet stale candidate does not accumulate across the window" {
-    var hs = HotSet{ .io = testing.io };
+    var hs: HotSet = undefined;
+    hs.init(testing.io);
     const tag = HotSet.keyTag("slow.example.com", .aaaa);
 
     hs.onRemiss("slow.example.com", .aaaa, 1000);
@@ -2545,7 +2569,8 @@ test "HotSet stale candidate does not accumulate across the window" {
 }
 
 test "HotSet tick: healthy entry waits, in-window entry fires, dead entry backs off" {
-    var hs = HotSet{ .io = testing.io };
+    var hs: HotSet = undefined;
+    hs.init(testing.io);
     hs.onRemiss("hot.example.com", .a, 1000);
     hs.onRemiss("hot.example.com", .a, 1010);
     const tag = HotSet.keyTag("hot.example.com", .a);
@@ -2575,7 +2600,8 @@ test "HotSet tick: healthy entry waits, in-window entry fires, dead entry backs 
 }
 
 test "HotSet lease lapses silently and slot frees" {
-    var hs = HotSet{ .io = testing.io };
+    var hs: HotSet = undefined;
+    hs.init(testing.io);
     hs.onRemiss("gone.example.com", .a, 1000);
     hs.onRemiss("gone.example.com", .a, 1010);
     const tag = HotSet.keyTag("gone.example.com", .a);
@@ -2589,7 +2615,8 @@ test "HotSet lease lapses silently and slot frees" {
 }
 
 test "HotSet remiss on a leased name renews the lease" {
-    var hs = HotSet{ .io = testing.io };
+    var hs: HotSet = undefined;
+    hs.init(testing.io);
     hs.onRemiss("busy.example.com", .a, 1000);
     hs.onRemiss("busy.example.com", .a, 1010);
     const tag = HotSet.keyTag("busy.example.com", .a);
