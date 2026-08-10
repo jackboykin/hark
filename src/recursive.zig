@@ -267,10 +267,14 @@ pub const RecursiveResolver = struct {
     /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
     resolving_ds: bool = false,
 
-    /// DNSKEY zone needing proactive refresh — stored in fixed buffer (not arena)
-    /// to survive past the per-query arena lifetime.
+    /// DNSKEY zone needing proactive refresh — stored in fixed buffer (set
+    /// deep in recursion, far from any caller allocator), duped into the
+    /// query arena at `resolve()`'s tail.
     pending_dnskey_prefetch: ?[]const u8 = null,
     pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
+
+    /// Mirrors config `prefetch-cousin`; gates SVCB cousin extraction.
+    prefetch_cousin: bool = true,
 
     /// A CNAME-chain member (head redirect or a mid-chain/tail RRset) was
     /// served from cache inside its prefetch window. Consumed in `resolve()`:
@@ -343,6 +347,7 @@ pub const RecursiveResolver = struct {
             .bypass_cache = opts.bypass_cache,
             .cache_only = opts.cache_only,
             .stagger_ms = ctx.config.stagger_ms,
+            .prefetch_cousin = ctx.config.prefetch_cousin,
             .case_state = ctx.case_state,
             .dedup = ctx.dedup,
             .tcp_pool = ctx.tcp_pool,
@@ -413,6 +418,9 @@ pub const RecursiveResolver = struct {
         prefetch_dnskey_zone: ?[]const u8 = null,
         /// Happy-Eyeballs (RFC 8305) cousin qtype — A↔AAAA pairing.
         cousin_prefetch_qtype: ?dns.RType = null,
+        /// HEv3 §4.2.1 cousin — SVCB/HTTPS TargetName the client can only
+        /// chase with A/AAAA queries after this answer arrives.
+        cousin_prefetch_name: ?[]const u8 = null,
         /// True iff the answer was produced with zero upstream queries
         /// (cache hit, NSEC aggressive-use synthesis, or RFC 8020 NX cut).
         /// Drives the server's client-facing hit accounting — unlike the
@@ -433,7 +441,11 @@ pub const RecursiveResolver = struct {
         self.validation_budget = &validation_budget;
         defer self.validation_budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
-        result.prefetch_dnskey_zone = self.pending_dnskey_prefetch;
+        // ResolveResult names are caller- or arena-owned, never resolver-owned:
+        // dupe out of the stack-local pending buffer before returning.
+        if (self.pending_dnskey_prefetch) |z| {
+            result.prefetch_dnskey_zone = allocator.dupe(u8, z) catch null;
+        }
         // Chain-member prefetch window: refresh via the head so the bg
         // resolve re-walks the whole chain. `name` is caller-owned and
         // outlives the result — same lifetime contract as the head-hit
@@ -446,12 +458,66 @@ pub const RecursiveResolver = struct {
         // Non-NOERROR answers never earn a cousin: NXDOMAIN is
         // qtype-independent (RFC 8020) and SERVFAIL would re-walk a
         // path that just failed.
-        result.cousin_prefetch_qtype = if (result.message.header.flags.rcode != .no_error) null else switch (qtype) {
-            .a => .aaaa,
-            .aaaa => .a,
-            else => null,
+        if (result.message.header.flags.rcode == .no_error) switch (qtype) {
+            .a => result.cousin_prefetch_qtype = .aaaa,
+            .aaaa => result.cousin_prefetch_qtype = .a,
+            .svcb, .https => if (self.prefetch_cousin) {
+                var buf: [dns.max_name_len + 1]u8 = undefined;
+                if (svcbCousinTarget(result.message.answers, qtype, name, &buf)) |t| {
+                    result.cousin_prefetch_name = allocator.dupe(u8, t) catch null;
+                }
+            },
+            else => {},
         };
         return result;
+    }
+
+    /// First SVCB/HTTPS answer whose TargetName the client must chase
+    /// serially — "." and qname/owner-equal targets are already covered by
+    /// the client's parallel A/AAAA queries (HEv3 §4.2.1). Strict parse,
+    /// LDH-only labels: anything else forfeits the cousin rather than
+    /// risking a mangled prefetch name.
+    fn svcbCousinTarget(
+        answers: []const dns.ResourceRecord,
+        qtype: dns.RType,
+        qname: []const u8,
+        buf: *[dns.max_name_len + 1]u8,
+    ) ?[]const u8 {
+        rr_loop: for (answers) |rr| {
+            if (rr.rtype != qtype) continue;
+            const rdata = rr.rdata.unknown;
+            var pos: usize = 2; // SvcPriority
+            var len: usize = 0;
+            while (true) {
+                if (pos >= rdata.len) continue :rr_loop;
+                const label_len = rdata[pos];
+                pos += 1;
+                if (label_len == 0) break;
+                if (label_len > dns.max_label_len) continue :rr_loop;
+                if (pos + label_len > rdata.len) continue :rr_loop;
+                if (len + label_len + @intFromBool(len > 0) > dns.max_name_len) continue :rr_loop;
+                if (len > 0) {
+                    buf[len] = '.';
+                    len += 1;
+                }
+                for (rdata[pos..][0..label_len]) |c| {
+                    buf[len] = switch (c) {
+                        'a'...'z', '0'...'9', '-', '_' => c,
+                        'A'...'Z' => c | 0x20,
+                        else => continue :rr_loop,
+                    };
+                    len += 1;
+                }
+                pos += label_len;
+            }
+            if (len == 0) continue;
+            const target = buf[0..len];
+            if (std.ascii.eqlIgnoreCase(target, qname)) continue;
+            var owner_buf: [dns.max_name_len + 1]u8 = undefined;
+            if (mem.eql(u8, target, rr.name.formatLower(&owner_buf))) continue;
+            return target;
+        }
+        return null;
     }
 
     const max_resolve_depth = 3;
@@ -3909,6 +3975,68 @@ test "cousin prefetch: set on NOERROR A/AAAA, suppressed on NXDOMAIN" {
     const nx = try resolver.resolve(arena.allocator(), "host.invalid", .a);
     try testing.expectEqual(dns.RCode.name_error, nx.message.header.flags.rcode);
     try testing.expectEqual(@as(?dns.RType, null), nx.cousin_prefetch_qtype);
+}
+
+test "svcb cousin target: extraction, coverage skips, strict parse" {
+    var buf: [dns.max_name_len + 1]u8 = undefined;
+    const owner = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const mk = struct {
+        fn rr(name: dns.Name, rtype: dns.RType, rdata: []const u8) dns.ResourceRecord {
+            return .{ .name = name, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = rdata } };
+        }
+    }.rr;
+    const target = RecursiveResolver.svcbCousinTarget;
+
+    // ServiceMode with a real target: lowercased dotted text.
+    const svc = mk(owner, .https, "\x00\x01\x03SVC\x03cdn\x07example\x00");
+    try testing.expectEqualStrings("svc.cdn.example", target(&.{svc}, .https, "www.example.com", &buf).?);
+
+    // AliasMode targets count too; foreign rtypes are skipped, first
+    // eligible target wins.
+    const alias = mk(owner, .https, "\x00\x00\x03svc\x03cdn\x07example\x00");
+    const dot = mk(owner, .https, "\x00\x01\x00");
+    const cname = mk(owner, .cname, "");
+    try testing.expectEqualStrings("svc.cdn.example", target(&.{ cname, dot, alias }, .https, "www.example.com", &buf).?);
+
+    // Targets the client's parallel queries already cover: ".",
+    // qname-equal, owner-equal (case-insensitive).
+    try testing.expect(target(&.{dot}, .https, "www.example.com", &buf) == null);
+    const qname_eq = mk(owner, .https, "\x00\x01\x03www\x07example\x03com\x00");
+    try testing.expect(target(&.{qname_eq}, .https, "WWW.example.COM", &buf) == null);
+    try testing.expect(target(&.{qname_eq}, .https, "alias.example.com", &buf) == null); // owner-equal
+
+    // Strict parse: compression pointer, truncation, non-LDH byte.
+    try testing.expect(target(&.{mk(owner, .https, "\x00\x01\xc0\x0c")}, .https, "www.example.com", &buf) == null);
+    try testing.expect(target(&.{mk(owner, .https, "\x00\x01\x03svc")}, .https, "www.example.com", &buf) == null);
+    try testing.expect(target(&.{mk(owner, .https, "\x00\x01\x03s?c\x00")}, .https, "www.example.com", &buf) == null);
+}
+
+test "cousin prefetch: https answer carries target name through resolve" {
+    const alloc = testing.allocator;
+
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+    {
+        const owner = try makeName(alloc, &.{ "www", "example", "com" });
+        const rrs = try alloc.alloc(dns.ResourceRecord, 1);
+        rrs[0] = .{ .name = owner, .rtype = .https, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = try alloc.dupe(u8, "\x00\x01\x03svc\x03cdn\x07example\x00") } };
+        const msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = rrs };
+        defer dns.freeMessage(alloc, msg);
+        cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+    }
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const hit = try resolver.resolve(arena.allocator(), "www.example.com", .https);
+    try testing.expectEqual(@as(?dns.RType, null), hit.cousin_prefetch_qtype);
+    try testing.expectEqualStrings("svc.cdn.example", hit.cousin_prefetch_name.?);
 }
 
 // Controllable clock for prefetch-window tests (mirrors cache.zig's).

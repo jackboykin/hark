@@ -1855,12 +1855,7 @@ const WorkerState = struct {
             transports,
             .{ .cd = cd, .bypass_cache = bypass_cache },
         );
-        var result = try resolver.resolve(alloc, name, qtype);
-        // Dupe into arena — points into stack-local resolver.pending_dnskey_buf
-        if (result.prefetch_dnskey_zone) |z| {
-            result.prefetch_dnskey_zone = alloc.dupe(u8, z) catch null;
-        }
-        return result;
+        return resolver.resolve(alloc, name, qtype);
     }
 
     fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, transports: Transports, prefetch_pta: *PerThreadArena) void {
@@ -2015,11 +2010,23 @@ const WorkerState = struct {
         if (result.prefetch_name) |n| self.spawnPrefetch(n, result.prefetch_qtype, inline_fallback);
         if (result.prefetch_dnskey_zone) |z| self.spawnPrefetch(z, .dnskey, inline_fallback);
 
-        // RFC 8305 cousin co-prefetch: fire-and-forget, bg-only on both paths.
-        const cousin_qtype = result.cousin_prefetch_qtype orelse return;
+        // Cousin co-prefetches: fire-and-forget, bg-only on both paths.
         if (!self.server.config.prefetch_cousin) return;
-        if (self.server.cache.containsFresh(query_name, cousin_qtype, .in)) return;
-        _ = self.server.trySpawnBgPrefetch(query_name, cousin_qtype, .cousin);
+        // RFC 8305 A↔AAAA pairing.
+        if (result.cousin_prefetch_qtype) |qt| {
+            if (!self.server.cache.containsFresh(query_name, qt, .in)) {
+                _ = self.server.trySpawnBgPrefetch(query_name, qt, .cousin);
+            }
+        }
+        // HEv3 §4.2.1: A/AAAA of a SVCB/HTTPS TargetName the client
+        // can only chase after this answer arrives.
+        if (result.cousin_prefetch_name) |target| {
+            for ([_]dns.RType{ .aaaa, .a }) |qt| {
+                if (!self.server.cache.containsFresh(target, qt, .in)) {
+                    _ = self.server.trySpawnBgPrefetch(target, qt, .cousin);
+                }
+            }
+        }
     }
 
     fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType, inline_fallback: ?PrefetchInlineFallback) void {
