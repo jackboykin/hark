@@ -420,6 +420,7 @@ pub const RData = union(enum) {
     aaaa: [16]u8,
     ns: Name,
     cname: Name,
+    dname: Name,
     ptr: Name,
     mx: MxData,
     soa: SoaData,
@@ -833,6 +834,7 @@ const Parser = struct {
             },
             .ns => return .{ .ns = try self.parseNameRdata(allocator, rdlength) },
             .cname => return .{ .cname = try self.parseNameRdata(allocator, rdlength) },
+            .dname => return .{ .dname = try self.parseNameRdata(allocator, rdlength) },
             .ptr => return .{ .ptr = try self.parseNameRdata(allocator, rdlength) },
             .mx => {
                 const rdata_end = self.pos + rdlength;
@@ -981,7 +983,7 @@ const Parser = struct {
                     .salt = try self.readSlice(salt_len),
                 } };
             },
-            .opt, .any, .dname, .svcb, .https, _ => {
+            .opt, .any, .svcb, .https, _ => {
                 const data = try self.readSlice(rdlength);
                 return .{ .unknown = data };
             },
@@ -1336,7 +1338,7 @@ pub const Serializer = struct {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
-            .ns, .cname, .ptr => |name| try self.writeName(name),
+            .ns, .cname, .dname, .ptr => |name| try self.writeName(name),
             .mx => |mx| {
                 try self.writeU16(mx.preference);
                 try self.writeName(mx.exchange);
@@ -2365,7 +2367,7 @@ fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
 pub fn freeRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa => {},
-        .ns, .cname, .ptr => |name| freeName(allocator, name),
+        .ns, .cname, .dname, .ptr => |name| freeName(allocator, name),
         .mx => |mx| freeName(allocator, mx.exchange),
         .soa => |soa| {
             freeName(allocator, soa.mname);
@@ -2403,6 +2405,7 @@ pub fn cloneRData(allocator: Allocator, rdata: RData) !RData {
         .aaaa => |v| .{ .aaaa = v },
         .ns => |name| .{ .ns = try cloneName(allocator, name) },
         .cname => |name| .{ .cname = try cloneName(allocator, name) },
+        .dname => |name| .{ .dname = try cloneName(allocator, name) },
         .ptr => |name| .{ .ptr = try cloneName(allocator, name) },
         .mx => |mx| .{ .mx = .{
             .preference = mx.preference,
@@ -2516,7 +2519,7 @@ fn freeWireParsedName(allocator: Allocator, name: Name) void {
 fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
-        .ns, .cname, .ptr => |n| freeWireParsedName(allocator, n),
+        .ns, .cname, .dname, .ptr => |n| freeWireParsedName(allocator, n),
         .mx => |mx| freeWireParsedName(allocator, mx.exchange),
         .soa => |s| {
             freeWireParsedName(allocator, s.mname);
@@ -2535,7 +2538,7 @@ fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
 pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
     switch (rdata.*) {
         .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
-        .ns, .cname, .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
+        .ns, .cname, .dname, .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
         .mx => |*m| m.exchange = try cloneNameLower(allocator, m.exchange),
         .soa => |*s| {
             s.mname = try cloneNameLower(allocator, s.mname);

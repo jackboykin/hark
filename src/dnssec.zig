@@ -498,6 +498,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
     switch (rdata) {
         .ns => |name| return writeCanonicalNameWire(buf, name),
         .cname => |name| return writeCanonicalNameWire(buf, name),
+        .dname => |name| return writeCanonicalNameWire(buf, name),
         .ptr => |name| return writeCanonicalNameWire(buf, name),
         .mx => |mx| {
             if (buf.len < 2) return error.BufferTooSmall;
