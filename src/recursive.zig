@@ -96,11 +96,17 @@ const max_servers_per_level = 26;
 // and Hickory.
 const max_cname_chain = 16;
 
-/// CNAME records collected over one resolveImpl chain walk, plus the
+/// Redirect records collected over one resolveImpl chain walk, plus the
 /// wildcard-expansion proofs authenticating them. Always paired and
 /// same-lifetime, so they travel as one struct.
 const CnameChain = struct {
+    /// Answer-section records the chain contributes, in wire order: per hop
+    /// the synthesizing DNAME RRset if there was one, then the CNAME, each
+    /// with its RRSIGs. A DO=1 client re-validates what it is handed, so a
+    /// redirect travels with its proof or it travels unprovable.
     records: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty,
+    /// What `max_cname_chain` bounds — `records` counts proof records too.
+    hops: usize = 0,
     /// RFC 4035 §3.1.3.4 wildcard-expansion proofs from each CNAME hop's
     /// authority (cf. Unbound `iter_add_prepend_auth`). Members borrow the
     /// per-query arena's parse buffers — would dangle under a heap allocator.
@@ -114,8 +120,9 @@ const CnameChain = struct {
     /// chains too.
     all_secure: bool = true,
 
-    fn hop(self: *CnameChain, allocator: mem.Allocator, rr: dns.ResourceRecord, status: cache_mod.SecurityStatus) !void {
-        try self.records.append(allocator, rr);
+    fn hop(self: *CnameChain, allocator: mem.Allocator, redirect: Redirect, status: cache_mod.SecurityStatus) !void {
+        try self.records.appendSlice(allocator, redirect.records);
+        self.hops += 1;
         self.all_secure = self.all_secure and status == .secure;
     }
 
@@ -558,14 +565,14 @@ pub const RecursiveResolver = struct {
                 .none => {},
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
-                    if (cname_chain.records.items.len >= max_cname_chain) return error.CnameChainTooLong;
-                    if (cnameTargetRevisitsChain(cname_chain.records.items, dispatch.cname_rr.rdata.cname)) {
-                        logCnameLoop(dispatch.cname_rr.rdata.cname, "cache-served");
+                    if (cname_chain.hops >= max_cname_chain) return error.CnameChainTooLong;
+                    if (cnameTargetRevisitsChain(cname_chain.records.items, dispatch.redirect.target)) {
+                        logCnameLoop(dispatch.redirect.target, "cache-served");
                         return self.bogusServfail(current_name, qtype);
                     }
-                    try cname_chain.hop(allocator, dispatch.cname_rr, dispatch.security_status);
+                    try cname_chain.hop(allocator, dispatch.redirect, dispatch.security_status);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
-                    current_name = try nameToDotted(allocator, dispatch.cname_rr.rdata.cname);
+                    current_name = try nameToDotted(allocator, dispatch.redirect.target);
                     // Mirror the upstream CNAME branch: re-resolve the
                     // target with fresh security state, but preserve
                     // .insecure so an unauthenticated cached CNAME can't
@@ -790,18 +797,18 @@ pub const RecursiveResolver = struct {
                                     .skip => {},
                                 }
                             }
-                            if (findCnameRecord(response, target_name)) |cname_rr| {
+                            if (try redirectFor(allocator, response.answers, target_name, parent_zone)) |redirect| {
                                 const is_same_zone = parent_zone.labels.len > 0 and
-                                    cname_rr.rdata.cname.isSubdomainOf(parent_zone);
+                                    redirect.target.isSubdomainOf(parent_zone);
 
                                 // Store before following CNAME — won't reach final answer validation
                                 if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status, cname_ttl_cap);
-                                if (cname_chain.records.items.len >= max_cname_chain) return error.CnameChainTooLong;
-                                if (cnameTargetRevisitsChain(cname_chain.records.items, cname_rr.rdata.cname)) {
-                                    logCnameLoop(cname_rr.rdata.cname, "upstream-served");
+                                if (cname_chain.hops >= max_cname_chain) return error.CnameChainTooLong;
+                                if (cnameTargetRevisitsChain(cname_chain.records.items, redirect.target)) {
+                                    logCnameLoop(redirect.target, "upstream-served");
                                     return self.bogusServfail(current_name, qtype);
                                 }
-                                try cname_chain.hop(allocator, cname_rr, cname_status);
+                                try cname_chain.hop(allocator, redirect, cname_status);
 
                                 try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_chain.wildcard_proofs);
 
@@ -811,8 +818,8 @@ pub const RecursiveResolver = struct {
                                 // only redo cache lookups. Skip back to the inner
                                 // referral loop with the new target.
                                 if (is_same_zone) {
-                                    current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
-                                    target_name = try dns.cloneName(allocator, cname_rr.rdata.cname);
+                                    current_name = try nameToDotted(allocator, redirect.target);
+                                    target_name = try dns.cloneName(allocator, redirect.target);
                                     minimize_label_count = if (self.qname_minimization)
                                         parent_zone.labels.len + 1
                                     else
@@ -820,7 +827,7 @@ pub const RecursiveResolver = struct {
                                     continue;
                                 }
 
-                                current_name = try nameToDotted(allocator, cname_rr.rdata.cname);
+                                current_name = try nameToDotted(allocator, redirect.target);
                                 // Re-resolve CNAME target from root with fresh security state.
                                 // Preserve .insecure: an unauthenticated CNAME could redirect
                                 // anywhere, so the answer must not carry AD (RFC 4035 §3.2.3).
@@ -913,7 +920,7 @@ pub const RecursiveResolver = struct {
         none,
         served: ResolveResult,
         follow_cname: struct {
-            cname_rr: dns.ResourceRecord,
+            redirect: Redirect,
             security_status: cache_mod.SecurityStatus,
             /// Pre-validated wildcard-expansion proofs from the cache.
             /// Trust-at-store; aggregated without re-verifying signatures.
@@ -956,7 +963,7 @@ pub const RecursiveResolver = struct {
                     .is_stale = entry.is_stale,
                 },
             };
-            const at_chain_head = chain.records.items.len == 0;
+            const at_chain_head = chain.hops == 0;
             const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and at_chain_head) name else null;
             // Mid-chain member (the short-TTL tail of a CNAME chain, in
             // practice) inside its prefetch window: can't re-enter here as
@@ -969,7 +976,7 @@ pub const RecursiveResolver = struct {
             // RFC 8767 §6: a stale cache entry must not be the first answer
             // when fresh resolution is achievable. Try fresh once with
             // bypass_cache; on any failure fall back to the stale answer.
-            if (meta.is_stale and chain.records.items.len == 0) {
+            if (meta.is_stale and at_chain_head) {
                 // Save/restore so a future caller that arrives here with
                 // bypass_cache already set doesn't get its flag silently
                 // flipped to false.
@@ -1002,19 +1009,19 @@ pub const RecursiveResolver = struct {
             }
         }
 
-        // Direct miss. Probe (current_name, .cname): the dual-stack win.
-        // A prior A query may have cached the redirect; a subsequent AAAA
-        // can reuse it instead of re-walking from root. Unbound / BIND /
-        // PowerDNS / Knot all collapse this path.
         if (qtype == .cname) return .none;
-        const cname_result = c.lookup(allocator, current_name, .cname, .in) orelse return .none;
-        switch (cname_result) {
+
+        // Probe (current_name, .cname): the dual-stack win. A prior A query
+        // may have cached the redirect; a subsequent AAAA can reuse it
+        // instead of re-walking from root. Unbound / BIND / PowerDNS / Knot
+        // all collapse this path.
+        if (c.lookup(allocator, current_name, .cname, .in)) |cname_result| switch (cname_result) {
             .hit => |h| {
                 // Stale CNAME at the head of the chain: skip the follow
                 // and let the upstream path run. Mid-chain stale is
                 // already a degraded answer — the chain head was fresh
                 // when we entered — so following is acceptable there.
-                if (h.is_stale and chain.records.items.len == 0) return .none;
+                if (h.is_stale and chain.hops == 0) return .none;
                 if (h.records.len == 0) return .none;
                 // The redirect itself is aging. This was previously dropped
                 // on the floor — the CNAME RRset near expiry never triggered
@@ -1022,13 +1029,17 @@ pub const RecursiveResolver = struct {
                 // (name, .cname) hit, which stub queries never produce.
                 if (h.needs_prefetch) self.pending_chain_prefetch = true;
                 return .{ .follow_cname = .{
-                    .cname_rr = h.records[0],
+                    .redirect = .{
+                        .records = try concatRRs(allocator, h.records[0..1], h.sigs),
+                        .target = h.records[0].rdata.cname,
+                    },
                     .security_status = h.security_status,
                     .nsec_proofs = h.nsec_proofs,
                 } };
             },
-            .negative => return .none, // cached NXDOMAIN/NODATA on .cname → upstream path handles it
-        }
+            .negative => {}, // cached NXDOMAIN/NODATA on .cname → upstream path handles it
+        };
+        return .none;
     }
 
     /// RFC 8198 aggressive NSEC use: synthesize negative or wildcard
@@ -2599,22 +2610,14 @@ pub const RecursiveResolver = struct {
         section.* = trimmed;
     }
 
-    /// True when every CNAME in the RRset opening at `answers[first]` is the
-    /// RFC 6672 §2.2 derivation of `dname_rr`: the owner's suffix (the DNAME
-    /// owner) swapped for the DNAME target, prefix labels untouched. Every
-    /// member, not just the first — an extra record in the group would ride
-    /// out under AD otherwise. A derivation exceeding the wire name limit
-    /// can never equal a parsed target, so overflow rejects itself.
+    /// True when every CNAME in the RRset opening at `answers[first]` derives
+    /// from `dname_rr`. Every member, not just the first — an extra record in
+    /// the group would ride out under AD otherwise.
     fn cnameGroupDerivesFrom(answers: []const dns.ResourceRecord, first: usize, dname_rr: dns.ResourceRecord) bool {
         const owner = answers[first].name;
-        const prefix = owner.labels[0 .. owner.labels.len - dname_rr.name.labels.len];
-        const dtarget = dname_rr.rdata.dname;
         for (answers[first..]) |rr| {
             if (rr.rtype != .cname or !rr.name.eql(owner)) continue;
-            const t = rr.rdata.cname.labels;
-            if (t.len != prefix.len + dtarget.labels.len) return false;
-            if (!(dns.Name{ .labels = t[0..prefix.len] }).eql(.{ .labels = prefix })) return false;
-            if (!dtarget.eql(.{ .labels = t[prefix.len..] })) return false;
+            if (!cnameDerivesFrom(rr, dname_rr)) return false;
         }
         return true;
     }
@@ -3291,11 +3294,70 @@ fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
     return allocator.dupe(u8, name.formatInto(&buf));
 }
 
-fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord {
-    for (response.answers) |rr| {
-        if (rr.rtype == .cname and target.eql(rr.name)) {
-            return rr;
-        }
+/// One redirect hop: the answer-section records the client is owed for it,
+/// and where the walk goes next.
+const Redirect = struct {
+    records: []const dns.ResourceRecord,
+    target: dns.Name,
+};
+
+/// The redirect `answers` offers for `target`: the CNAME owned by it, led
+/// by the DNAME that synthesized it when one did. The DNAME rides along
+/// with its RRSIGs — a synthesized CNAME is unsigned (RFC 6672 §2.2),
+/// so the signed DNAME is the only proof a validating stub downstream can
+/// check, and Unbound and BIND both forward it.
+///
+/// `zone` is the bailiwick. A CNAME is in it by construction — it is owned
+/// by the name we asked for — but a DNAME's owner is an *ancestor*, so
+/// without the gate an authority for `evil.example.com` could redirect
+/// `com.` wholesale.
+fn redirectFor(
+    allocator: mem.Allocator,
+    answers: []const dns.ResourceRecord,
+    target: dns.Name,
+    zone: dns.Name,
+) !?Redirect {
+    const cname = findCnameRecord(answers, target) orelse return null;
+
+    var records: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
+    if (synthesizingDname(answers, cname, zone)) |d| for (answers) |rr| {
+        if (rr.name.eql(d.name) and (rr.rtype == .dname or dns.rrsigCovers(rr) == .dname))
+            try records.append(allocator, rr);
+    };
+
+    try records.append(allocator, cname);
+    for (answers) |rr| {
+        if (dns.rrsigCovers(rr) == .cname and rr.name.eql(target)) try records.append(allocator, rr);
+    }
+    return .{ .records = records.items, .target = cname.rdata.cname };
+}
+
+/// True when `cname_rr` is the RFC 6672 §2.2 derivation of `dname_rr`: the
+/// owner's suffix (the DNAME owner) swapped for the DNAME target, prefix
+/// labels untouched. A derivation exceeding the wire name limit can never
+/// equal a parsed target, so overflow rejects itself.
+fn cnameDerivesFrom(cname_rr: dns.ResourceRecord, dname_rr: dns.ResourceRecord) bool {
+    const owner = cname_rr.name;
+    if (owner.labels.len <= dname_rr.name.labels.len or !owner.isSubdomainOf(dname_rr.name)) return false;
+    const prefix = owner.labels[0 .. owner.labels.len - dname_rr.name.labels.len];
+    const target = cname_rr.rdata.cname.labels;
+    const dtarget = dname_rr.rdata.dname;
+    if (target.len != prefix.len + dtarget.labels.len) return false;
+    if (!(dns.Name{ .labels = target[0..prefix.len] }).eql(.{ .labels = prefix })) return false;
+    return dtarget.eql(.{ .labels = target[prefix.len..] });
+}
+
+/// The DNAME in `answers` that produced `cname_rr`, if one did.
+fn synthesizingDname(answers: []const dns.ResourceRecord, cname_rr: dns.ResourceRecord, zone: dns.Name) ?dns.ResourceRecord {
+    for (answers) |rr| {
+        if (rr.rtype == .dname and rr.name.isSubdomainOf(zone) and cnameDerivesFrom(cname_rr, rr)) return rr;
+    }
+    return null;
+}
+
+fn findCnameRecord(answers: []const dns.ResourceRecord, target: dns.Name) ?dns.ResourceRecord {
+    for (answers) |rr| {
+        if (rr.rtype == .cname and target.eql(rr.name)) return rr;
     }
     return null;
 }
@@ -3307,7 +3369,7 @@ fn findCnameRecord(response: dns.Message, target: dns.Name) ?dns.ResourceRecord 
 /// right granularity here.
 fn cnameTargetRevisitsChain(chain: []const dns.ResourceRecord, next_target: dns.Name) bool {
     for (chain) |rr| {
-        if (rr.name.eql(next_target)) return true;
+        if (rr.rtype == .cname and rr.name.eql(next_target)) return true;
     }
     return false;
 }
@@ -3886,7 +3948,7 @@ test "findCnameRecord finds CNAME matching target" {
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
-    const result = findCnameRecord(response, target);
+    const result = findCnameRecord(response.answers, target);
     try testing.expect(result != null);
     try testing.expectEqual(dns.RType.cname, result.?.rtype);
     try testing.expect(target.eql(result.?.name));
@@ -3928,7 +3990,49 @@ test "findCnameRecord returns null when no CNAME present" {
     const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers };
     defer dns.freeMessage(alloc, response);
 
-    try testing.expect(findCnameRecord(response, dns.Name{ .labels = &.{ "example", "com" } }) == null);
+    try testing.expect(findCnameRecord(response.answers, dns.Name{ .labels = &.{ "example", "com" } }) == null);
+}
+
+test "redirectFor carries the DNAME that synthesized the CNAME, and its RRSIG" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zone = dns.Name{ .labels = &.{"example"} };
+    const dname_owner = dns.Name{ .labels = &.{ "doc", "example" } };
+    const dname_target = dns.Name{ .labels = &.{ "archive", "example" } };
+    const qname = dns.Name{ .labels = &.{ "www", "doc", "example" } };
+
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = dname_owner, .rtype = .dname, .rclass = .in, .ttl = 300, .rdata = .{ .dname = dname_target } },
+        .{ .name = dname_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
+            .type_covered = .dname,
+            .algorithm = .ecdsap256sha256,
+            .labels = 2,
+            .original_ttl = 300,
+            .sig_expiration = 0,
+            .sig_inception = 0,
+            .key_tag = 1,
+            .signer_name = zone,
+            .signature = &.{},
+        } } },
+        .{ .name = qname, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{
+            .cname = .{ .labels = &.{ "www", "archive", "example" } },
+        } },
+    };
+
+    const redirect = (try redirectFor(a, &answers, qname, zone)).?;
+    try testing.expectEqual(@as(usize, 3), redirect.records.len);
+    try testing.expectEqual(dns.RType.dname, redirect.records[0].rtype);
+    try testing.expectEqual(dns.RType.rrsig, redirect.records[1].rtype);
+    try testing.expectEqual(dns.RType.cname, redirect.records[2].rtype);
+    try testing.expect(redirect.target.eql(.{ .labels = &.{ "www", "archive", "example" } }));
+
+    // Out-of-bailiwick DNAME is dropped; the in-bailiwick CNAME survives.
+    const elsewhere = dns.Name{ .labels = &.{ "other", "example" } };
+    const gated = (try redirectFor(a, &answers, qname, elsewhere)).?;
+    try testing.expectEqual(@as(usize, 1), gated.records.len);
+    try testing.expectEqual(dns.RType.cname, gated.records[0].rtype);
 }
 
 test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAAA short-circuit upstream" {
@@ -4667,18 +4771,18 @@ test "withCnameChain clears AD when any hop was not proven secure" {
 
     var insecure_hop: CnameChain = .{};
     defer insecure_hop.deinit(a);
-    try insecure_hop.hop(a, cname_rr, .unchecked);
+    try insecure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .unchecked);
     try testing.expectEqual(false, (try withCnameChain(a, &insecure_hop, validated_tail)).header.flags.ad);
 
     // A fully-proven chain keeps it.
     var secure_hop: CnameChain = .{};
     defer secure_hop.deinit(a);
-    try secure_hop.hop(a, cname_rr, .secure);
+    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure);
     try testing.expectEqual(true, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 
     // One bad hop anywhere in the chain poisons the whole answer.
-    try secure_hop.hop(a, cname_rr, .insecure);
-    try secure_hop.hop(a, cname_rr, .secure);
+    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .insecure);
+    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure);
     try testing.expectEqual(false, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 }
 

@@ -1,0 +1,62 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a DNAME redirect reaches the client alongside the chain it produced
+
+; RFC 6672 §2.2: the CNAME synthesized under a DNAME is unsigned, so the
+; signed DNAME is the only proof of the redirect a validating stub
+; downstream can check. Unbound and BIND both forward it.
+;
+; The discriminator against 019 is that the redirect crosses a query
+; boundary here: `www.doc.example` resolves in one exchange, the target
+; `www.archive.example` in another, so the DNAME and CNAME travel through
+; chain assembly rather than riding out in the terminal response. Chain
+; assembly used to keep the CNAME alone and drop everything proving it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ; Redirect only — no answer for the queried type, which forces the chain
+  ; hop and a second exchange for the target.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+      www.doc.example. 3600 IN CNAME www.archive.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.archive.example. IN A
+    SECTION ANSWER
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    www.doc.example. 3600 IN CNAME www.archive.example.
+    www.archive.example. 3600 IN A 192.0.2.9
+ENTRY_END
+
+SCENARIO_END
