@@ -680,7 +680,8 @@ pub const RecursiveResolver = struct {
                         // filter routes them through the dedicated NSEC
                         // aggressive-use cache instead, so this branch caches
                         // *only* entries the NX-cut will skip by design.
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count])) {
+                        var neg_ttl_cap: u32 = std.math.maxInt(u32);
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count], &neg_ttl_cap)) {
                             .proceed => |status| {
                                 // .secure here means verifiedNegativeResponse
                                 // ran NSEC and accepted it; AA is redundant
@@ -690,7 +691,7 @@ pub const RecursiveResolver = struct {
                                 // as an unsigned delegation, too thin to cache
                                 // against the full query name (RFC 8020).
                                 if (status == .secure) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
+                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status, neg_ttl_cap);
                                 }
                             },
                             // .bogus falls through to the same stop-minimizing
@@ -714,12 +715,13 @@ pub const RecursiveResolver = struct {
 
                     // NODATA (no answers, no referral) — name exists, cache negative, advance
                     {
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count])) {
+                        var neg_ttl_cap: u32 = std.math.maxInt(u32);
+                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count], &neg_ttl_cap)) {
                             .proceed => |status| {
                                 if (response.header.flags.aa) {
                                     if (self.cache) |c| {
                                         c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
-                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
+                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
                                     }
                                 }
                             },
@@ -1142,7 +1144,7 @@ pub const RecursiveResolver = struct {
             }
         }
         if (!has_proof) return;
-        if (self.verifyAuthoritySigs(allocator, authorities, servers) != .secure) return;
+        if (self.verifyAuthoritySigs(allocator, authorities, servers, null) != .secure) return;
         for (authorities) |auth_rr| {
             if (dns.isNsecProofMaterial(auth_rr))
                 try cname_auth_aggregate.append(allocator, auth_rr);
@@ -1240,13 +1242,15 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers)) {
+            var neg_ttl_cap: u32 = std.math.maxInt(u32);
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
-                        self.storeNsec(response.authorities, parent_zone);
+                        self.storeNsec(response.authorities, parent_zone, neg_ttl_cap);
+                        try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
                     }
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
                 },
                 .skip_cache => {},
                 .bogus => return self.bogusServfail(current_name, qtype),
@@ -1292,7 +1296,7 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| if (qtype != .any) {
             c.storeResponse(response.*, parent_zone, answer_status, answer_ttl_cap);
             if (answer_status == .secure and self.nsec_cache != null) {
-                self.storeWildcardRRsets(response.answers, qtype);
+                self.storeWildcardRRsets(response.answers, qtype, answer_ttl_cap);
             }
         };
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
@@ -1318,15 +1322,17 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         if (response.header.flags.aa) {
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers)) {
+            var neg_ttl_cap: u32 = std.math.maxInt(u32);
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
-                    if (status == .secure) {
-                        response.header.flags.ad = true;
-                        self.storeNsec(response.authorities, parent_zone);
-                    }
                     if (self.cache) |c| {
                         c.storeResponse(response.*, parent_zone, .unchecked, std.math.maxInt(u32));
-                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, std.math.maxInt(u32));
+                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
+                    }
+                    if (status == .secure) {
+                        response.header.flags.ad = true;
+                        self.storeNsec(response.authorities, parent_zone, neg_ttl_cap);
+                        try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
                     }
                 },
                 .skip_cache => {},
@@ -1351,10 +1357,11 @@ pub const RecursiveResolver = struct {
         parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
         if (authorities.len > 0) {
-            const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers);
+            var proof_ttl_cap: u32 = std.math.maxInt(u32);
+            const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers, &proof_ttl_cap);
             if (auth_status == .secure) {
                 const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget());
-                cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities);
+                cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
                 return status;
             }
             if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
@@ -1418,9 +1425,9 @@ pub const RecursiveResolver = struct {
     }
 
     /// Store validated NSEC records in the aggressive NSEC cache.
-    fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name) void {
+    fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name, ttl_cap: u32) void {
         if (self.nsec_cache) |nc| {
-            nc.storeFromAuthority(authorities, zone);
+            nc.storeFromAuthority(authorities, zone, ttl_cap);
         }
     }
 
@@ -1438,6 +1445,7 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         answers: []const dns.ResourceRecord,
         qtype: dns.RType,
+        ttl_cap: u32,
     ) void {
         // Pick the RRSIG covering qtype with the highest `labels` count
         // (narrowest wildcard). A smaller-labels forgery alongside the
@@ -1489,7 +1497,7 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| {
             // storeResponse reads only rcode + record sections, so the
             // synthesizedMessage header vehicle is as good as a bespoke one.
-            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure, std.math.maxInt(u32));
+            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure, ttl_cap);
         }
     }
 
@@ -2413,7 +2421,7 @@ pub const RecursiveResolver = struct {
             // every consumer of the null-plus-negative contract sees insecure.
             if (!dnssec.anySupportedDs(zone_ds_buf[0..ds_count])) {
                 if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
-                cacheInsecureDelegation(self.keyCache(), .insecure, zone, zone_ds_buf[0..ds_count]);
+                cacheInsecureDelegation(self.keyCache(), .insecure, zone, zone_ds_buf[0..ds_count], ds_ttl_cap);
                 return null;
             }
 
@@ -2432,11 +2440,12 @@ pub const RecursiveResolver = struct {
         // No DS section — verify NSEC/NSEC3 proof of insecure delegation. NS
         // and glue are still useful for resolution, so cache them.
         if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
-        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers);
+        var proof_ttl_cap: u32 = std.math.maxInt(u32);
+        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers, &proof_ttl_cap);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget());
             if (status == .insecure) {
-                cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities);
+                cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
             }
         }
         return null;
@@ -2499,7 +2508,7 @@ pub const RecursiveResolver = struct {
 
         switch (status) {
             .secure => {
-                try trimAnswerTtls(allocator, response, ttl_cap);
+                try trimSectionTtls(allocator, &response.answers, ttl_cap);
                 response.header.flags.ad = true;
                 return .{ .valid = ttl_cap };
             },
@@ -2554,29 +2563,29 @@ pub const RecursiveResolver = struct {
         }
     };
 
-    /// Lower answer TTLs to `cap`, so the *client* on a miss gets the trimmed
-    /// value too — a downstream validator caching past the signature it was
-    /// shown would reject its own copy. Allocates only when something exceeds
-    /// the cap, which for real zones is never.
-    fn trimAnswerTtls(
+    /// Lower a section's TTLs to `cap`, so the *client* on a miss gets the
+    /// trimmed value too — a downstream validator caching past the signature
+    /// it was shown would reject its own copy. Allocates only when something
+    /// exceeds the cap, which for real zones is never.
+    fn trimSectionTtls(
         allocator: mem.Allocator,
-        response: *dns.Message,
+        section: *[]const dns.ResourceRecord,
         cap: u32,
     ) !void {
         var needs_trim = false;
-        for (response.answers) |rr| {
+        for (section.*) |rr| {
             if (rr.ttl > cap) {
                 needs_trim = true;
                 break;
             }
         }
         if (!needs_trim) return;
-        const trimmed = try allocator.alloc(dns.ResourceRecord, response.answers.len);
-        for (response.answers, trimmed) |src, *dst| {
+        const trimmed = try allocator.alloc(dns.ResourceRecord, section.len);
+        for (section.*, trimmed) |src, *dst| {
             dst.* = src;
             dst.ttl = @min(src.ttl, cap);
         }
-        response.answers = trimmed;
+        section.* = trimmed;
     }
 
     /// True when `records[i]` opens its (owner, type) RRset, so a loop over
@@ -2596,6 +2605,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         authorities: []const dns.ResourceRecord,
         parent_servers: []const na.Address,
+        ttl_cap: ?*u32,
     ) dnssec.SecurityStatus {
         const signer = dnssec.authoritySigner(authorities) orelse return .unchecked;
 
@@ -2608,7 +2618,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
         const now_u32 = epochNowU32();
-        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, self.validationBudget());
+        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, self.validationBudget(), ttl_cap);
     }
 
     /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.
@@ -2622,10 +2632,11 @@ pub const RecursiveResolver = struct {
         is_nxdomain: bool,
         zone: dns.Name,
         zone_servers: []const na.Address,
+        ttl_cap: *u32,
     ) NegativeValidation {
         if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
 
-        const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_servers);
+        const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_servers, ttl_cap);
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 
@@ -3134,12 +3145,14 @@ fn cacheInsecureDelegation(
     security_state: dnssec.SecurityStatus,
     zone_cut: dns.Name,
     authorities: []const dns.ResourceRecord,
+    ttl_cap: u32,
 ) void {
     if (security_state != .insecure) return;
     const c = cache orelse return;
 
-    // Use minimum authority section TTL (from NSEC/NSEC3 proving no DS)
-    var neg_ttl: u32 = 3600;
+    // Use minimum authority section TTL (from NSEC/NSEC3 proving no DS),
+    // bounded by the proof's signature validity.
+    var neg_ttl: u32 = @min(3600, ttl_cap);
     for (authorities) |rr| {
         if (rr.ttl > 0 and rr.ttl < neg_ttl) neg_ttl = rr.ttl;
     }
@@ -5081,7 +5094,7 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
             },
         };
 
-        resolver.storeWildcardRRsets(answers, .a);
+        resolver.storeWildcardRRsets(answers, .a, std.math.maxInt(u32));
 
         var look = std.heap.ArenaAllocator.init(alloc);
         defer look.deinit();
@@ -5094,4 +5107,62 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
             try testing.expect(got != null);
         }
     }
+}
+
+test "storeWildcardRRsets bounds the synthesized entry by the validator's ttl cap" {
+    // The wildcard entry is `.secure` proof-derived material; caching it past
+    // the signatures that verified the expansion would let aggressive
+    // synthesis serve AD=1 answers from a dead proof.
+    const alloc = testing.allocator;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+    var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache };
+
+    const expanded = dns.Name{ .labels = &.{ "host", "example", "com" } };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = expanded, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
+        .{ .name = expanded, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
+            .type_covered = .a,
+            .algorithm = .ecdsap256sha256,
+            .labels = 2,
+            .original_ttl = 300,
+            .sig_inception = 0,
+            .sig_expiration = epochNowU32() +% 3600,
+            .key_tag = 1,
+            .signer_name = signer,
+            .signature = &.{},
+        } } },
+    };
+
+    resolver.storeWildcardRRsets(&answers, .a, 7);
+
+    var look = std.heap.ArenaAllocator.init(alloc);
+    defer look.deinit();
+    const got = cache.lookup(look.allocator(), "*.example.com", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expect(got.hit.remaining_ttl <= 7);
+}
+
+test "cacheInsecureDelegation bounds the negative DS by the proof's ttl cap" {
+    // An insecure-delegation verdict rests on a verified proof (no-DS NSEC or
+    // a parent-signed unsupported-algorithm DS RRset); it must not outlive it.
+    const alloc = testing.allocator;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    defer cache.deinit();
+
+    const zone = dns.Name{ .labels = &.{ "example", "com" } };
+    const authorities = [_]dns.ResourceRecord{
+        .{ .name = zone, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{
+            .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
+            .type_bit_maps = &.{},
+        } } },
+    };
+
+    cacheInsecureDelegation(&cache, .insecure, zone, &authorities, 7);
+
+    var look = std.heap.ArenaAllocator.init(alloc);
+    defer look.deinit();
+    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    const got = cache.lookup(look.allocator(), zone.formatInto(&zone_buf), .ds, .in) orelse return error.TestExpectedHit;
+    try testing.expect(got.negative.remaining_ttl <= 7);
 }

@@ -327,11 +327,14 @@ pub const NsecCache = struct {
 
     /// Extract NSEC records from authority section and store them.
     /// Only stores NSEC (not NSEC3 — marginal effectiveness per DNS-OARC research).
-    /// TTL computed per RFC 9077: min(NSEC TTL, SOA.MINIMUM, SOA TTL, 10800).
+    /// TTL computed per RFC 9077: min(NSEC TTL, SOA.MINIMUM, SOA TTL, 10800),
+    /// further bounded by `ttl_cap` — the verified RRSIG validity window, so
+    /// aggressive synthesis never denies a name past the proof's own life.
     pub fn storeFromAuthority(
         self: *NsecCache,
         authorities: []const dns.ResourceRecord,
         zone: dns.Name,
+        ttl_cap: u32,
     ) void {
         // Find SOA for TTL computation (RFC 9077)
         var soa_rr: ?dns.ResourceRecord = null;
@@ -358,13 +361,13 @@ pub const NsecCache = struct {
         var clone_count: usize = 0;
         for (authorities) |rr| {
             if (rr.rtype != .nsec) continue;
-            if (rr.ttl == 0) continue;
             if (!rr.name.isSubdomainOf(zone)) continue;
             // Skip minimal/black-lies NSEC ranges (next = owner + \000) — these cover
             // only the queried name and waste cache space (Knot Resolver approach).
             if (isMinimalNsec(rr.name, rr.rdata.nsec.next_domain_name)) continue;
             if (clone_count >= max_store_batch) break;
-            const effective_ttl = @min(rr.ttl, soa_minimum, soa_ttl, max_aggressive_ttl);
+            const effective_ttl = @min(rr.ttl, soa_minimum, soa_ttl, max_aggressive_ttl, ttl_cap);
+            if (effective_ttl == 0) continue;
             cloned[clone_count] = cloneEntry(alloc, rr, now + @as(i64, effective_ttl), effective_ttl, authorities) catch continue;
             clone_count += 1;
         }
@@ -526,7 +529,12 @@ pub const NsecCache = struct {
                 };
             },
         };
-        const soa = cloneRecord(caller_alloc, cached_soa.*) catch return null;
+        var soa = cloneRecord(caller_alloc, cached_soa.*) catch return null;
+        // The synthesized verdict lives exactly as long as its weakest proof:
+        // the zone-level SOA record does not decay on its own, so bound it here.
+        for (proof_refs[0..proof_ref_count]) |r| {
+            soa.ttl = @min(soa.ttl, remainingTtl(r, now));
+        }
         const proofs = cloneProofs(caller_alloc, proof_refs[0..proof_ref_count], now);
         _ = self.hits.fetchAdd(1, .monotonic);
         return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len, .proofs = proofs };
@@ -571,6 +579,11 @@ fn nsecEntryToRecord(alloc: Allocator, entry: *const NsecEntry, ttl: u32) !dns.R
     };
 }
 
+/// Seconds of proof life left in `r` at `now`, saturating at 0 and u32.
+fn remainingTtl(r: *const NsecEntry, now: i64) u32 {
+    return @intCast(std.math.clamp(r.expires_at - now, 0, std.math.maxInt(u32)));
+}
+
 /// Clone N NSEC proofs (each with covering RRSIGs) into a fresh slice.
 /// Best-effort: on any allocation failure, unwinds anything written so far
 /// and returns empty (DO=1 clients see the response as insecure rather
@@ -583,12 +596,11 @@ fn cloneProofs(alloc: Allocator, refs: []const *const NsecEntry, now: i64) []dns
     const out = alloc.alloc(dns.ResourceRecord, total) catch return &.{};
     var pos: usize = 0;
     for (refs) |r| {
-        const remaining_i: i64 = r.expires_at - now;
-        if (remaining_i <= 0) {
+        const remaining = remainingTtl(r, now);
+        if (remaining == 0) {
             unwindProofs(alloc, out, pos);
             return &.{};
         }
-        const remaining: u32 = @intCast(@min(remaining_i, @as(i64, std.math.maxInt(u32))));
 
         out[pos] = nsecEntryToRecord(alloc, r, remaining) catch {
             unwindProofs(alloc, out, pos);
@@ -733,7 +745,7 @@ test "NSEC cache: NODATA synthesis" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // TXT not in bitmap → NODATA; A is in bitmap → null
     const qname = try dns.parseDottedName(alloc, "example.com");
@@ -764,7 +776,7 @@ test "NSEC cache: NXDOMAIN synthesis" {
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex_next, .type_bit_maps = bitmap_zone } } },
         .{ .name = alpha_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = gamma_next, .type_bit_maps = bitmap_host } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // beta covered by alpha→gamma, wildcard covered by example.com→alpha
     const qname = try dns.parseDottedName(alloc, "beta.example.com");
@@ -803,7 +815,7 @@ test "NSEC cache: NXDOMAIN synthesis without apex NSEC (nlnetlabs.nl shape)" {
         soa_rr,
         .{ .name = cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex, .type_bit_maps = bitmap } } },
         .{ .name = wc_cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_cover_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "zzz-aggt.example.com");
     defer dns.freeName(alloc, qname);
@@ -854,7 +866,7 @@ test "NSEC cache: parent-side qname-cover usable when qname NOT at-or-below owne
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex_next, .type_bit_maps = bitmap_apex } } },
         .{ .name = cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = cover_next, .type_bit_maps = bitmap_delegation } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // commonSuffix(qname, cover_owner) == 2 < owner.labels.len == 3 → predicate
     // doesn't fire → parent-side cover IS the right proof material.
@@ -891,7 +903,7 @@ test "NSEC cache: rejects parent-side cover when qname is at-or-below owner (RFC
         soa_rr,
         .{ .name = bar_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = qux_next, .type_bit_maps = bitmap_delegation } } },
         .{ .name = wc_cover_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_cover_next, .type_bit_maps = bitmap_delegation } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // foo.bar.example.com: commonSuffix(qname, bar.example.com) == 3 ==
     // owner.labels.len → predicate fires → cover rejected → no synthesis.
@@ -922,7 +934,7 @@ test "NSEC cache: rejects parent-side NODATA at child apex; DS exemption synthes
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = child_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = next_owner, .type_bit_maps = bitmap_delegation } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "child.example.com");
     defer dns.freeName(alloc, qname);
@@ -961,7 +973,7 @@ test "NSEC cache: TTL expiration" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "example.com");
     defer dns.freeName(alloc, qname);
@@ -992,7 +1004,7 @@ test "NSEC cache: CNAME at owner suppresses NODATA synthesis" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "alias.example.com");
     defer dns.freeName(alloc, qname);
@@ -1026,7 +1038,7 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // "foo.example.com" — name doesn't exist, wildcard exists with A
     // → wildcard_match (not NXDOMAIN). Caller synthesizes from RRset cache.
@@ -1055,7 +1067,7 @@ test "NSEC cache: apex NODATA via full-name zone check" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // Query for the zone apex itself — dotted_name == zone name
     const qname = try dns.parseDottedName(alloc, "example.com");
@@ -1081,7 +1093,7 @@ test "NSEC cache: bailiwick check rejects out-of-zone NSECs" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // Out-of-zone NSEC should have been rejected — no synthesis possible
     const qname = try dns.parseDottedName(alloc, "evil.attacker.com");
@@ -1119,7 +1131,7 @@ test "NSEC cache: wrap-around NSEC chain" {
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = beta_name, .type_bit_maps = bitmap } } },
         // beta → apex (wrap-around)
         .{ .name = beta_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex_owner2, .type_bit_maps = bitmap_host } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // "zebra.example.com" sorts after beta → covered by wrap-around NSEC
     // Closest encloser is example.com, wildcard *.example.com is covered by apex→beta
@@ -1178,7 +1190,7 @@ test "NSEC cache: parent-zone depth check prevents cross-zone coverage" {
         com_soa,
         .{ .name = com_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = aaa_next, .type_bit_maps = bitmap } } },
         .{ .name = ggg_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = zzz_next, .type_bit_maps = bitmap_host } } },
-    }, com_zone);
+    }, com_zone, std.math.maxInt(u32));
 
     // nnn.com (1 label deeper than zone) — should work, no depth issue
     const nnn_com = try dns.parseDottedName(alloc, "nnn.com");
@@ -1218,7 +1230,7 @@ test "NSEC cache: wildcard NODATA synthesis" {
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // "foo.example.com" doesn't exist, wildcard exists but lacks TXT → NODATA
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
@@ -1248,7 +1260,7 @@ test "NSEC cache: wildcard match returns wildcard_match" {
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // "foo.example.com" A — wildcard has A → wildcard_match
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
@@ -1297,7 +1309,7 @@ test "NSEC cache: wildcard_match proofs carry NSEC + covering RRSIG" {
             .signer_name = sig_signer,
             .signature = "",
         } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
     defer dns.freeName(alloc, qname);
@@ -1338,7 +1350,7 @@ test "NSEC cache: wildcard CNAME suppression" {
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     // A query when wildcard has CNAME → must NOT synthesize (follow CNAME upstream)
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
@@ -1397,7 +1409,7 @@ test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {
         root_soa,
         .{ .name = dns.Name{ .labels = &.{} }, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = a_name, .type_bit_maps = bitmap_root } } },
         .{ .name = a_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = c_name, .type_bit_maps = bitmap_a } } },
-    }, dns.Name{ .labels = &.{} });
+    }, dns.Name{ .labels = &.{} }, std.math.maxInt(u32));
 
     const qname = try dns.parseDottedName(alloc, "b");
     defer dns.freeName(alloc, qname);
@@ -1440,7 +1452,7 @@ test "NSEC cache: DS query below a delegation is not answered from the parent" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = bar, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = qux, .type_bit_maps = bitmap_delegation } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const below = try dns.parseDottedName(alloc, "foo.bar.example.com");
     defer dns.freeName(alloc, below);
@@ -1469,7 +1481,7 @@ test "NSEC cache: child-side apex NSEC cannot deny DS" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = apex, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = next, .type_bit_maps = child_apex } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     try testing.expect(nc.lookupSuffixes(alloc, apex, .ds, "example.com") == null);
     // The same NSEC still answers what it legitimately can.
@@ -1498,7 +1510,7 @@ test "NSEC cache: no NXDOMAIN synthesis at an empty non-terminal" {
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = apex, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = deep, .type_bit_maps = bitmap_apex } } },
-    }, example_zone);
+    }, example_zone, std.math.maxInt(u32));
 
     const ent = try dns.parseDottedName(alloc, "ent.example.com");
     defer dns.freeName(alloc, ent);

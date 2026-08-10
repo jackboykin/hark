@@ -1542,12 +1542,15 @@ pub fn validateRrset(
 // ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
 
 /// Verify that every NSEC/NSEC3 record in the authority section has a valid RRSIG
-/// signed by one of the provided DNSKEYs.
+/// signed by one of the provided DNSKEYs. On `.secure`, `ttl_cap` is lowered
+/// to the tightest verified signature's bound — a proof-derived verdict must
+/// not be cached past the signatures that justify it.
 pub fn verifyAuthorityNsecSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    ttl_cap: ?*u32,
 ) SecurityStatus {
     // Verify that every NSEC/NSEC3 record has a valid RRSIG.
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
@@ -1579,6 +1582,7 @@ pub fn verifyAuthorityNsecSigs(
             if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
             if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
+                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
                 sig_verified = true;
                 break;
             }
@@ -1861,14 +1865,14 @@ test "verifyAuthorityNsecSigs: oversized owner+type is refused, not truncated" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&rrs, &.{}, 1_700_000_000, &budget),
+        verifyAuthorityNsecSigs(&rrs, &.{}, 1_700_000_000, &budget, null),
     );
     // 16 is within the buffer and fails on the ordinary no-signature path,
     // so the boundary is the size check and not a signature accident.
     var budget2: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2),
+        verifyAuthorityNsecSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, null),
     );
 }
 
@@ -3933,7 +3937,7 @@ test "verifyAuthorityNsecSigs: NSEC without RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
@@ -3956,7 +3960,7 @@ test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
@@ -3975,7 +3979,7 @@ test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget),
+        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
@@ -3995,7 +3999,7 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, &budget),
+        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, &budget, null),
     );
 }
 
