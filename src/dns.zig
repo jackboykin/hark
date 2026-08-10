@@ -93,9 +93,9 @@ pub const RType = enum(u16) {
     mx = 15,
     txt = 16,
     aaaa = 28,
-    /// RFC 6672. hark does not synthesize DNAMEs (RDATA parses as `.unknown`),
-    /// but RFC 6840 §4.1 requires recognizing the bit in an NSEC/NSEC3 bitmap:
-    /// names beneath a DNAME owner are synthesized, not absent.
+    /// RFC 6672. RFC 6840 §4.1 also requires recognizing the bit in an
+    /// NSEC/NSEC3 bitmap: names beneath a DNAME owner are synthesized,
+    /// not absent.
     dname = 39,
     opt = 41,
     ds = 43,
@@ -2309,6 +2309,26 @@ pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser:
     return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
 }
 
+/// RFC 6672 §2.2 substitution: `owner` with its trailing `suffix` labels
+/// replaced by `target`. Null when the result would overflow a legal name —
+/// the same bound the parser enforces, so an overflowing substitution can
+/// never equal a name that arrived on the wire. Labels are borrowed; only
+/// the outer slice is allocated.
+pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target: Name) Allocator.Error!?Name {
+    std.debug.assert(owner.labels.len >= suffix.labels.len);
+    const prefix = owner.labels[0 .. owner.labels.len - suffix.labels.len];
+    if (prefix.len + target.labels.len > max_label_count) return null;
+    var wire: usize = 0;
+    for (prefix) |label| wire += label.len + 1;
+    for (target.labels) |label| wire += label.len + 1;
+    if (wire > max_name_len + 1) return null;
+
+    const labels = try allocator.alloc([]const u8, prefix.len + target.labels.len);
+    @memcpy(labels[0..prefix.len], prefix);
+    @memcpy(labels[prefix.len..], target.labels);
+    return .{ .labels = labels };
+}
+
 /// RFC 5452 §9.1 / RFC 9619: verify response question section echoes the
 /// original query. QDCOUNT must be exactly 1 for standard queries (OPCODE=0).
 pub fn validateQuestionMatch(response: Message, expected_name: Name, expected_type: RType) bool {
@@ -2639,6 +2659,22 @@ test "parseDottedName empty label" {
 test "parseDottedName too-long label" {
     const long_label = @as([64]u8, @splat('a')) ++ ".com".*;
     try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, &long_label));
+}
+
+test "substituteSuffix declines a substitution that overflows a legal name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const long_label: []const u8 = &@as([63]u8, @splat('x'));
+    // Four 63-octet labels is 257 wire octets — past the 255 limit.
+    const owner = Name{ .labels = &.{ long_label, long_label, "short" } };
+    const suffix = Name{ .labels = &.{"short"} };
+    const target = Name{ .labels = &.{ long_label, long_label } };
+    try testing.expect(try substituteSuffix(a, owner, suffix, target) == null);
+
+    const fits = try substituteSuffix(a, owner, suffix, .{ .labels = &.{"net"} });
+    try testing.expect(fits.?.eql(.{ .labels = &.{ long_label, long_label, "net" } }));
 }
 
 test "isSubdomainOf equal names" {

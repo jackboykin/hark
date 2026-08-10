@@ -1,0 +1,59 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a DNAME answer with no CNAME still redirects
+
+; RFC 6672 §3.4.1 step D: "If the response shows a DNAME and that is not
+; the answer itself ... perform the substitution and go to step 1." The
+; server is not obliged to synthesize the CNAME for us, and pre-RFC-6672
+; authorities routinely did not. hark performs the substitution and
+; supplies the CNAME the client is owed.
+;
+; The DNAME here also sits two labels above the queried name, so the
+; substitution has to keep the whole prefix (`a.b`) intact rather than
+; just the leftmost label.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.b.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.b.archive.example. IN A
+    SECTION ANSWER
+      a.b.archive.example. 3600 IN A 192.0.2.12
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.b.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.b.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    a.b.doc.example. 3600 IN CNAME a.b.archive.example.
+    a.b.archive.example. 3600 IN A 192.0.2.12
+ENTRY_END
+
+SCENARIO_END

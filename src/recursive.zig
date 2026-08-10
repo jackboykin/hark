@@ -3301,9 +3301,9 @@ const Redirect = struct {
     target: dns.Name,
 };
 
-/// The redirect `answers` offers for `target`: the CNAME owned by it, led
-/// by the DNAME that synthesized it when one did. The DNAME rides along
-/// with its RRSIGs — a synthesized CNAME is unsigned (RFC 6672 §2.2),
+/// The redirect `answers` offers for `target` — a CNAME owned by it, or the
+/// DNAME above it that derives one. A DNAME leads the records and rides
+/// along with its RRSIGs: a synthesized CNAME is unsigned (RFC 6672 §2.2),
 /// so the signed DNAME is the only proof a validating stub downstream can
 /// check, and Unbound and BIND both forward it.
 ///
@@ -3317,19 +3317,44 @@ fn redirectFor(
     target: dns.Name,
     zone: dns.Name,
 ) !?Redirect {
-    const cname = findCnameRecord(answers, target) orelse return null;
+    const cname = findCnameRecord(answers, target);
+    const dname = if (cname) |c| synthesizingDname(answers, c, zone) else deepestDnameAbove(answers, target, zone);
 
     var records: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
-    if (synthesizingDname(answers, cname, zone)) |d| for (answers) |rr| {
+    if (dname) |d| for (answers) |rr| {
         if (rr.name.eql(d.name) and (rr.rtype == .dname or dns.rrsigCovers(rr) == .dname))
             try records.append(allocator, rr);
     };
 
-    try records.append(allocator, cname);
-    for (answers) |rr| {
-        if (dns.rrsigCovers(rr) == .cname and rr.name.eql(target)) try records.append(allocator, rr);
+    if (cname) |c| {
+        try records.append(allocator, c);
+        for (answers) |rr| {
+            if (dns.rrsigCovers(rr) == .cname and rr.name.eql(target)) try records.append(allocator, rr);
+        }
+        return .{ .records = records.items, .target = c.rdata.cname };
     }
-    return .{ .records = records.items, .target = cname.rdata.cname };
+
+    // RFC 6672 §3.4.1 step D: the server sent the DNAME and left the
+    // substitution to us.
+    const d = dname orelse return null;
+    const synth = try synthesizeCname(allocator, target, d) orelse return null;
+    try records.append(allocator, synth);
+    return .{ .records = records.items, .target = synth.rdata.cname };
+}
+
+/// RFC 6672 §2.2: the CNAME `dname_rr` implies at `owner`, with the DNAME's
+/// TTL — already decremented when the DNAME came from cache, which is what
+/// §2.2 asks a caching server to serve. Null when the substitution overflows
+/// a legal name; declining leaves the authority to answer YXDOMAIN itself.
+fn synthesizeCname(allocator: mem.Allocator, owner: dns.Name, dname_rr: dns.ResourceRecord) !?dns.ResourceRecord {
+    const target = try dns.substituteSuffix(allocator, owner, dname_rr.name, dname_rr.rdata.dname) orelse return null;
+    return .{
+        .name = owner,
+        .rtype = .cname,
+        .rclass = .in,
+        .ttl = dname_rr.ttl,
+        .rdata = .{ .cname = target },
+    };
 }
 
 /// True when `cname_rr` is the RFC 6672 §2.2 derivation of `dname_rr`: the
@@ -3353,6 +3378,18 @@ fn synthesizingDname(answers: []const dns.ResourceRecord, cname_rr: dns.Resource
         if (rr.rtype == .dname and rr.name.isSubdomainOf(zone) and cnameDerivesFrom(cname_rr, rr)) return rr;
     }
     return null;
+}
+
+/// The DNAME with the longest owner name that is a proper ancestor of
+/// `target` — the one whose substitution applies (RFC 6672 §3.3).
+fn deepestDnameAbove(answers: []const dns.ResourceRecord, target: dns.Name, zone: dns.Name) ?dns.ResourceRecord {
+    var best: ?dns.ResourceRecord = null;
+    for (answers) |rr| {
+        if (rr.rtype != .dname or rr.name.labels.len >= target.labels.len) continue;
+        if (!target.isSubdomainOf(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
+        if (best == null or rr.name.labels.len > best.?.name.labels.len) best = rr;
+    }
+    return best;
 }
 
 fn findCnameRecord(answers: []const dns.ResourceRecord, target: dns.Name) ?dns.ResourceRecord {
@@ -4033,6 +4070,33 @@ test "redirectFor carries the DNAME that synthesized the CNAME, and its RRSIG" {
     const gated = (try redirectFor(a, &answers, qname, elsewhere)).?;
     try testing.expectEqual(@as(usize, 1), gated.records.len);
     try testing.expectEqual(dns.RType.cname, gated.records[0].rtype);
+}
+
+test "redirectFor substitutes a DNAME the server left unsynthesized" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zone = dns.Name{ .labels = &.{"example"} };
+    const shallow = dns.Name{ .labels = &.{ "doc", "example" } };
+    const deep = dns.Name{ .labels = &.{ "sub", "doc", "example" } };
+    const qname = dns.Name{ .labels = &.{ "www", "sub", "doc", "example" } };
+
+    // RFC 6672 §3.3: the longest owner name wins, so the shallow DNAME must
+    // not be the one applied.
+    const answers = [_]dns.ResourceRecord{
+        .{ .name = shallow, .rtype = .dname, .rclass = .in, .ttl = 300, .rdata = .{
+            .dname = .{ .labels = &.{ "archive", "example" } },
+        } },
+        .{ .name = deep, .rtype = .dname, .rclass = .in, .ttl = 60, .rdata = .{
+            .dname = .{ .labels = &.{ "vault", "example" } },
+        } },
+    };
+
+    const redirect = (try redirectFor(a, &answers, qname, zone)).?;
+    try testing.expect(redirect.target.eql(.{ .labels = &.{ "www", "vault", "example" } }));
+    // §2.2: the synthesized CNAME takes the DNAME's TTL, not the shallow one's.
+    try testing.expectEqual(@as(u32, 60), redirect.records[redirect.records.len - 1].ttl);
 }
 
 test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAAA short-circuit upstream" {
