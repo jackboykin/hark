@@ -104,6 +104,8 @@ pub const RType = enum(u16) {
     dnskey = 48,
     nsec3 = 50,
     nsec3param = 51,
+    svcb = 64,
+    https = 65,
     any = 255,
     _,
 };
@@ -979,7 +981,7 @@ const Parser = struct {
                     .salt = try self.readSlice(salt_len),
                 } };
             },
-            .opt, .any, .dname, _ => {
+            .opt, .any, .dname, .svcb, .https, _ => {
                 const data = try self.readSlice(rdlength);
                 return .{ .unknown = data };
             },
@@ -3025,11 +3027,9 @@ test "safeTagName handles known and unknown enum values" {
     try testing.expectEqualStrings("aaaa", safeTagName(RType, .aaaa, &buf));
     try testing.expectEqualStrings("no_error", safeTagName(RCode, .no_error, &buf));
 
-    // Unknown values — HTTPS (65), SVCB (64), CAA (257)
-    const https: RType = @fromBackingInt(@intCast(65));
-    try testing.expectEqualStrings("65", safeTagName(RType, https, &buf));
-    const svcb: RType = @fromBackingInt(@intCast(64));
-    try testing.expectEqualStrings("64", safeTagName(RType, svcb, &buf));
+    // Unknown values — CERT (37), CAA (257)
+    const cert: RType = @fromBackingInt(@intCast(37));
+    try testing.expectEqualStrings("37", safeTagName(RType, cert, &buf));
     const caa: RType = @fromBackingInt(@intCast(257));
     try testing.expectEqualStrings("257", safeTagName(RType, caa, &buf));
 

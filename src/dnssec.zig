@@ -2836,9 +2836,8 @@ test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" 
         nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
     };
 
-    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA NXDOMAIN-shape under NOERROR (RFC 4035 §5.4)" {
@@ -2867,9 +2866,8 @@ test "validateNegativeProof NSEC NODATA wildcard with qtype present is .bogus" {
         nsecRrWithBitmap(wildcard, acme, &wc_bitmap),
     };
 
-    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA wildcard with CNAME present is .bogus" {
@@ -3483,9 +3481,8 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
         makeNsec3Rr(wc_owner, salt, &@as([20]u8, @splat(0xFF)), &[_]u8{ 0x00, 0x01, 0x40 }),
     };
 
-    const https: dns.RType = @fromBackingInt(@intCast(65));
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, https, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
 }
 
 test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
