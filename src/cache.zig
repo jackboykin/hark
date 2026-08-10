@@ -1244,6 +1244,23 @@ pub const RRsetCache = struct {
         // but bailing early keeps the invariant ("matches has data")
         // explicit at the function boundary.
         if (matches.len == 0) return;
+
+        // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
+        // facing heterogeneous TTLs MUST treat the RRset as having a single
+        // TTL — the minimum of the members. RRSIG and NSEC *TTL fields* fold
+        // in so nothing outlives its own advertised lifetime. Not the §5.3.3
+        // bound: §3.1 pins an RRSIG's TTL to its covered RRset's, so it says
+        // nothing about expiry.
+        var min_ttl: u32 = std.math.maxInt(u32);
+        for (matches) |m| min_ttl = @min(min_ttl, m.ttl);
+        for (sigs) |s| min_ttl = @min(min_ttl, s.ttl);
+        for (nsec_proofs) |p| min_ttl = @min(min_ttl, p.ttl);
+        // A folded minimum of 0 means some member said "never cache". The
+        // caller's driver loop only skips 0-TTL *drivers* — a nonzero sibling
+        // collects the 0-TTL member right back in — so the store dies here,
+        // where neither the min-ttl floor nor serve-stale can resurrect it.
+        if (min_ttl == 0) return;
+
         const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
@@ -1288,22 +1305,6 @@ pub const RRsetCache = struct {
             return;
         };
 
-        // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
-        // facing heterogeneous TTLs MUST treat the RRset as having a single
-        // TTL — the minimum of the members.
-        var min_ttl: u32 = std.math.maxInt(u32);
-        for (matches) |m| {
-            if (m.ttl < min_ttl) min_ttl = m.ttl;
-        }
-        // RRSIG and NSEC *TTL fields* fold in so nothing outlives its own
-        // advertised lifetime. Not the §5.3.3 bound: §3.1 pins an RRSIG's TTL
-        // to its covered RRset's, so it says nothing about expiry.
-        for (sigs) |s| {
-            if (s.ttl < min_ttl) min_ttl = s.ttl;
-        }
-        for (nsec_proofs) |p| {
-            if (p.ttl < min_ttl) min_ttl = p.ttl;
-        }
         const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), authenticated_ttl_max);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .records = cached_records,
@@ -1602,6 +1603,40 @@ fn freeTestAuthorities(alloc: Allocator, authorities: []dns.ResourceRecord) void
         dns.freeRData(alloc, rr.rdata);
     }
     alloc.free(authorities);
+}
+
+test "an RRset with a 0-TTL member is never cached, floor or no floor" {
+    // RFC 2181 §5.2: heterogeneous TTLs fold to the minimum, and a 0-TTL
+    // member means the zone said "do not cache this set". The driver loop
+    // skips 0-TTL records, but a nonzero sibling drives the group and
+    // collects the 0-TTL member back in — the folded minimum must then kill
+    // the store outright. Neither the min-ttl floor nor serve-stale may
+    // resurrect it, so both are armed here.
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = RRsetCache.init(.{
+        .backing = alloc,
+        .max_bytes = 1024 * 1024,
+        .max_entries = 100,
+        .io = testing.io,
+        .min_ttl = 60,
+        .serve_stale_ttl = 30,
+    });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+
+    const name = try makeTestName(alloc, &.{ "zero", "test" });
+    const answers = try alloc.alloc(dns.ResourceRecord, 2);
+    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    answers[1] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 0, .rdata = .{ .a = .{ 5, 6, 7, 8 } } };
+    const response = makeTestResponse(answers);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+    dns.freeName(alloc, name);
+    alloc.free(answers);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), "zero.test", .a, .in) == null);
 }
 
 test "cache store and lookup positive" {
