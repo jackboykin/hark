@@ -135,7 +135,7 @@ pub fn validateDnskeyRrset(
     // Overflow refuses instead of truncating: a signature that verifies over
     // dnskey_only[0..64] would authenticate a *subset* while the caller keeps
     // and caches every key in the message — appended forged keys would ride in
-    // as trusted. Same rule as validateRrsetForType and verifyAuthorityNsecSigs.
+    // as trusted. Same rule as validateRrsetForType and verifyAuthorityProofSigs.
     var dnskey_only: [64]dns.ResourceRecord = undefined;
     var dnskey_count: usize = 0;
     for (dnskey_records) |rr| {
@@ -1204,9 +1204,9 @@ pub fn validateNegativeProof(
 }
 
 /// The zone whose keys an authority section's proofs rest on: the signer of
-/// its first RRSIG. `verifyAuthorityNsecSigs` only reports .secure when every
-/// NSEC/NSEC3 owner verifies under a key fetched for this name, so after a
-/// .secure verdict this name is the proof's whole authority.
+/// its first RRSIG. `verifyAuthorityProofSigs` only reports .secure when every
+/// NSEC/NSEC3/SOA owner verifies under a key fetched for this name, so after
+/// a .secure verdict this name is the proof's whole authority.
 pub fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
     for (authorities) |rr| {
         if (rr.rtype == .rrsig) return rr.rdata.rrsig.signer_name;
@@ -1541,24 +1541,34 @@ pub fn validateRrset(
 
 // ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
 
-/// Verify that every NSEC/NSEC3 record in the authority section has a valid RRSIG
-/// signed by one of the provided DNSKEYs. On `.secure`, `ttl_cap` is lowered
+/// Verify that every piece of negative-answer material in the authority
+/// section — NSEC/NSEC3 proofs *and* the RFC 2308 SOA — has a valid RRSIG
+/// signed by one of the provided DNSKEYs. The SOA is what a `.secure`
+/// negative's TTL and a downstream validator's own verdict rest on; leaving
+/// it unverified made AD=1 an overclaim (RFC 4035 §3.2.3 covers the whole
+/// authority section). NS and glue stay exempt: at a zone cut they are
+/// legitimately unsigned delegation data. On `.secure`, `ttl_cap` is lowered
 /// to the tightest verified signature's bound — a proof-derived verdict must
 /// not be cached past the signatures that justify it.
-pub fn verifyAuthorityNsecSigs(
+pub fn verifyAuthorityProofSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
     ttl_cap: ?*u32,
 ) SecurityStatus {
-    // Verify that every NSEC/NSEC3 record has a valid RRSIG.
+    // No proof material at all is `.unchecked` regardless of the SOA: the
+    // stripped-everything response already degrades to unauthenticated-and-
+    // uncached, and an unsigned bare SOA must not land *harsher* than that —
+    // the attacker would simply strip the SOA too.
+    for (authorities) |rr| {
+        if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
+    } else return .unchecked;
+
     // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
     // so no dedup is needed.
-    var any_nsec = false;
     for (authorities) |rr| {
-        if (rr.rtype != .nsec and rr.rtype != .nsec3) continue;
-        any_nsec = true;
+        if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
 
         // Collect the RRset (all records with same owner+type). Overflow is
         // .bogus, not a truncated collect: verifying a sig over the first 16
@@ -1592,7 +1602,7 @@ pub fn verifyAuthorityNsecSigs(
         if (!sig_verified) return .bogus;
     }
 
-    return if (any_nsec) .secure else .unchecked;
+    return .secure;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1842,7 +1852,7 @@ test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
     );
 }
 
-test "verifyAuthorityNsecSigs: oversized owner+type is refused, not truncated" {
+test "verifyAuthorityProofSigs: oversized owner+type is refused, not truncated" {
     // Honest scope: the old truncating collect ALSO returned .bogus here, so
     // this pins the boundary and the absence of an out-of-bounds write — not a
     // closed hole. The refusal is structural consistency with the other two
@@ -1865,14 +1875,14 @@ test "verifyAuthorityNsecSigs: oversized owner+type is refused, not truncated" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&rrs, &.{}, 1_700_000_000, &budget, null),
+        verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, null),
     );
     // 16 is within the buffer and fails on the ordinary no-signature path,
     // so the boundary is the size check and not a signature accident.
     var budget2: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, null),
+        verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, null),
     );
 }
 
@@ -3890,7 +3900,7 @@ test "validateRrset propagates budget exhaustion as bogus" {
     try testing.expectEqual(SecurityStatus.bogus, status);
 }
 
-// ── verifyAuthorityNsecSigs: validation-bypass guards ────────────────
+// ── verifyAuthorityProofSigs: validation-bypass guards ────────────────
 //
 // These tests lock the "every NSEC/NSEC3 owner must verify" invariant
 // (RFC 4035 §5.3, RFC 6840 §5.4/§5.11). A regression where the function
@@ -3929,7 +3939,7 @@ fn dnskeyRr(owner: dns.Name, dnskey: dns.DnskeyData) dns.ResourceRecord {
     return .{ .name = owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } };
 }
 
-test "verifyAuthorityNsecSigs: NSEC without RRSIG returns bogus" {
+test "verifyAuthorityProofSigs: NSEC without RRSIG returns bogus" {
     const owner = dns.Name{ .labels = &.{ "example", "com" } };
     const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
     const authorities = [_]dns.ResourceRecord{nsecRr(owner, next)};
@@ -3937,11 +3947,11 @@ test "verifyAuthorityNsecSigs: NSEC without RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
-test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
+test "verifyAuthorityProofSigs: signed NSEC + unsigned NSEC returns bogus" {
     // Even if the FIRST NSEC carries an unsupported-algo RRSIG (which
     // would yield .insecure on its own), a SECOND NSEC with no RRSIG at
     // all must still drive the result to .bogus. The "every owner must
@@ -3960,11 +3970,11 @@ test "verifyAuthorityNsecSigs: signed NSEC + unsigned NSEC returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
-test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns bogus" {
+test "verifyAuthorityProofSigs: only-unsupported-algo RRSIG returns bogus" {
     // This function runs only under a zone already proven secure, where an
     // all-unsupported-algorithm zone never arrives (RFC 4035 §5.2 makes it
     // insecure at the delegation). An NSEC whose only RRSIG is unsupported
@@ -3979,11 +3989,11 @@ test "verifyAuthorityNsecSigs: only-unsupported-algo RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
     );
 }
 
-test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bogus" {
+test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bogus" {
     // Laundering guard: a fake unsupported-algo RRSIG must not downgrade
     // a failing supported-algo RRSIG from .bogus to .insecure.
     const owner = dns.Name{ .labels = &.{ "example", "com" } };
@@ -3999,7 +4009,7 @@ test "verifyAuthorityNsecSigs: failing supported + unsupported RRSIG returns bog
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityNsecSigs(&authorities, &dnskeys, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, null),
     );
 }
 

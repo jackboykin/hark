@@ -17,19 +17,16 @@ remaining validity; without it they read ~3600.
 from __future__ import annotations
 
 import datetime
-import tempfile
 import textwrap
-from pathlib import Path
 
 import dns.flags
 import dns.message
-import dns.query
 import dns.rdatatype
 
 import conftest
 
-from . import dnssec as harness_dnssec
-from . import hark_proc, responder, rpl
+from . import rpl
+from .client import send_raw_query
 
 SIG_VALIDITY_S = 40
 
@@ -85,8 +82,7 @@ SCENARIO = textwrap.dedent(
 
 
 def _ask(qname: str, rdtype: str) -> dns.message.Message:
-    q = dns.message.make_query(qname, rdtype, want_dnssec=True)
-    return dns.query.udp(q, conftest.HARK_LISTEN[0], port=conftest.HARK_LISTEN[1], timeout=5.0)
+    return send_raw_query(qname, rdtype, conftest.HARK_LISTEN, want_dnssec=True)
 
 
 def _max_authority_ttl(r: dns.message.Message) -> int:
@@ -99,52 +95,42 @@ def test_negative_verdicts_bounded_by_sig_validity(tmp_path):
     path.write_text(SCENARIO)
     scenario = rpl.parse(path)
 
-    binary = hark_proc.find_hark_binary()
-    cfg = hark_proc.HarkConfig(
-        listen_ip=conftest.HARK_LISTEN[0],
-        listen_port=conftest.HARK_LISTEN[1],
-        upstream_port=conftest.RESP_PORT,
-        root_hints=[conftest._with_port(h, conftest.RESP_PORT) for h in scenario.root_hints],
-    )
     validity = datetime.timedelta(seconds=SIG_VALIDITY_S)
-    signers = [harness_dnssec.KeyMaterial.generate(z, sig_validity=validity) for z in scenario.dnssec_zones]
-    cfg.dnssec = True
-    cfg.trust_anchors = [signers[0].ds_presentation()]
+    with conftest.scenario_env(scenario, sig_validity=validity) as (resp, proc):
+        resp.set_step(1)
 
-    resp = responder.Responder(scenario, port=conftest.RESP_PORT, signers=signers)
-    resp.start()
-    try:
-        with tempfile.TemporaryDirectory(prefix="harktest-") as td:
-            with hark_proc.HarkProcess(binary, cfg, Path(td)) as proc:
-                resp.set_step(1)
+        # Live NXDOMAIN: verdict validates, and the TTLs handed to the
+        # client are already trimmed to the proof's lifetime.
+        live = _ask("b.", "A")
+        assert live.rcode() == dns.rcode.NXDOMAIN
+        assert live.flags & dns.flags.AD
+        assert _max_authority_ttl(live) <= SIG_VALIDITY_S
 
-                # Live NXDOMAIN: verdict validates, and the TTLs handed to the
-                # client are already trimmed to the proof's lifetime.
-                live = _ask("b.", "A")
-                assert live.rcode() == dns.rcode.NXDOMAIN
-                assert live.flags & dns.flags.AD
-                assert _max_authority_ttl(live) <= SIG_VALIDITY_S
+        # Cached verdict: bounded by the proof, not the SOA's 3600.
+        cached = _ask("b.", "A")
+        assert cached.rcode() == dns.rcode.NXDOMAIN
+        assert cached.flags & dns.flags.AD
+        assert _max_authority_ttl(cached) <= SIG_VALIDITY_S
 
-                # Cached verdict: bounded by the proof, not the SOA's 3600.
-                cached = _ask("b.", "A")
-                assert cached.rcode() == dns.rcode.NXDOMAIN
-                assert cached.flags & dns.flags.AD
-                assert _max_authority_ttl(cached) <= SIG_VALIDITY_S
+        # The cache hit must hand a DO client the same validatable
+        # shape live did: NSEC proofs *and* the SOA's own RRSIG
+        # (regression: only the bare SOA was retained).
+        covers = {rr.covers for rr in cached.authority if rr.rdtype == dns.rdatatype.RRSIG}
+        assert dns.rdatatype.NSEC in covers
+        assert dns.rdatatype.SOA in covers
 
-                # Aggressive-NSEC synthesis for a covered sibling (RFC 8198):
-                # no upstream entry exists for b2., so NXDOMAIN+AD proves the
-                # NSEC cache answered — and its TTL must carry the same bound.
-                synth = _ask("b2.", "A")
-                assert synth.rcode() == dns.rcode.NXDOMAIN
-                assert synth.flags & dns.flags.AD
-                assert _max_authority_ttl(synth) <= SIG_VALIDITY_S
+        # Aggressive-NSEC synthesis for a covered sibling (RFC 8198):
+        # no upstream entry exists for b2., so NXDOMAIN+AD proves the
+        # NSEC cache answered — and its TTL must carry the same bound.
+        synth = _ask("b2.", "A")
+        assert synth.rcode() == dns.rcode.NXDOMAIN
+        assert synth.flags & dns.flags.AD
+        assert _max_authority_ttl(synth) <= SIG_VALIDITY_S
 
-                # NODATA rides the same machinery through its own store site.
-                nodata = _ask("a.", "AAAA")
-                assert nodata.rcode() == dns.rcode.NOERROR
-                assert nodata.flags & dns.flags.AD
-                assert _max_authority_ttl(nodata) <= SIG_VALIDITY_S
-                cached_nodata = _ask("a.", "AAAA")
-                assert _max_authority_ttl(cached_nodata) <= SIG_VALIDITY_S
-    finally:
-        resp.stop()
+        # NODATA rides the same machinery through its own store site.
+        nodata = _ask("a.", "AAAA")
+        assert nodata.rcode() == dns.rcode.NOERROR
+        assert nodata.flags & dns.flags.AD
+        assert _max_authority_ttl(nodata) <= SIG_VALIDITY_S
+        cached_nodata = _ask("a.", "AAAA")
+        assert _max_authority_ttl(cached_nodata) <= SIG_VALIDITY_S

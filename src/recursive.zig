@@ -2618,7 +2618,7 @@ pub const RecursiveResolver = struct {
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
         const now_u32 = epochNowU32();
-        return dnssec.verifyAuthorityNsecSigs(authorities, dnskey_records, now_u32, self.validationBudget(), ttl_cap);
+        return dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, now_u32, self.validationBudget(), ttl_cap);
     }
 
     /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.

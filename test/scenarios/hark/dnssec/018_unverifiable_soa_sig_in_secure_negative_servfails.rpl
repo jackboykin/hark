@@ -1,0 +1,53 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a secure negative whose SOA does not verify is bogus, not AD=1
+
+; The negative verdict rests on the whole authority section: the NSECs prove
+; nonexistence, the SOA carries the RFC 2308 negative TTL, and RFC 4035
+; §3.2.3 makes AD=1 a claim over all of it. Hark once verified only the
+; NSEC/NSEC3 signatures — an attacker (or broken zone) could ride an
+; arbitrary unverified SOA into an AD=1 denial and hark's own negative
+; cache. Zone shape is scenario 004's; the SOA's RRSIG is hand-rolled
+; garbage (key_tag=1 never matches the per-run harness DNSKEY, and
+; `_has_covering_rrsig` stops the responder from signing over it) while
+; both NSECs get legitimate harness signatures.
+;
+; Expected: SERVFAIL, AD=0. NOERROR-without-AD would also be wrong: inside
+; a proven-secure zone a denial with valid NSECs but an unverifiable SOA is
+; a *tampered* response, not an unsigned one — same fail-closed rule as a
+; stripped NSEC signature.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN RRSIG SOA 13 0 3600 20990101000000 20200101000000 1 . AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+SCENARIO_END

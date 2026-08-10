@@ -942,7 +942,16 @@ pub const RRsetCache = struct {
         // RFC 4035 §3.1.3.2 / §3.1.3.3 negative-existence proof. Collected
         // before slot lock acquisition to bound critical-section duration.
         var proof_buf: [32]dns.ResourceRecord = undefined;
-        const proof_count = collectNsecProofs(&proof_buf, authorities, authority_zone);
+        var proof_count = collectNsecProofs(&proof_buf, authorities, authority_zone);
+        // The SOA's own RRSIG rides along: a cache hit must hand a DO client
+        // the same validatable shape live did, and the SOA is the one record
+        // here that collectNsecProofs does not cover.
+        for (authorities) |rr| {
+            if (proof_count >= proof_buf.len) break;
+            if (dns.rrsigCovers(rr) != .soa or !rr.name.eql(soa.name)) continue;
+            proof_buf[proof_count] = rr;
+            proof_count += 1;
+        }
         const proofs = proof_buf[0..proof_count];
 
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
