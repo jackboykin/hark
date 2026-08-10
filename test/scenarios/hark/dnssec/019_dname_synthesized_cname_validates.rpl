@@ -1,0 +1,50 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a signed DNAME authenticates its unsigned synthesized CNAME
+
+; RFC 6672 §5.3.1: the server synthesizes the CNAME at query time, so it
+; is never signed. The validator must accept it iff it is the exact
+; derivation of the (validated) DNAME — DNAME owner's suffix swapped for
+; the DNAME target, prefix labels untouched.
+;
+; Expected: NOERROR with AD=1, the full DNAME → CNAME → A chain intact.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME ARCHIVE.example.
+      www.doc.example. 3600 IN CNAME www.ARCHIVE.example.
+      www.ARCHIVE.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  ; `MATCH flags` covers AD — load-bearing: the pre-fix validator called
+  ; the unsigned synthesized CNAME a forgery and SERVFAILed.
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    www.doc.example. 3600 IN CNAME www.archive.example.
+    www.archive.example. 3600 IN A 192.0.2.9
+ENTRY_END
+
+SCENARIO_END

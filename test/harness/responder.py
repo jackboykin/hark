@@ -323,6 +323,16 @@ class Responder:
         # would re-feed signatures back into the signer.
         originals = [rr for rr in rrsets if rr.rdtype != dns.rdatatype.RRSIG]
         for rrset in originals:
+            # RFC 6672 §5.3.1: a CNAME synthesized under a DNAME travels
+            # unsigned. A scenario asserting a *signed* one declares its own
+            # RRSIG, exactly like any other forgery.
+            if rrset.rdtype == dns.rdatatype.CNAME and any(
+                o.rdtype == dns.rdatatype.DNAME
+                and rrset.name != o.name
+                and rrset.name.is_subdomain(o.name)
+                for o in originals
+            ):
+                continue
             signer = forced or self._signer_for(rrset.name, rrset.rdtype, cuts)
             if signer is None:
                 continue

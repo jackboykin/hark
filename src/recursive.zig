@@ -2481,20 +2481,30 @@ pub const RecursiveResolver = struct {
         // Every RRset in the section, under its own signer's keys, weakest
         // verdict wins. Narrower scoping has twice produced AD=1 over records
         // nothing signed; the section ships whole under one AD bit.
-        //
-        // TODO: DNAME (RFC 6672) needs a carve-out — a server-synthesized CNAME
-        // is unsigned, so this rejects it. Not "inherit the DNAME's signer",
-        // which would hand an injector the redirect target: re-derive the
-        // expected target from the DNAME and accept only an exact match.
         var status: dnssec.SecurityStatus = .secure;
         var keys: SignerKeys = .{};
         var groups: usize = 0;
         var ttl_cap: u32 = std.math.maxInt(u32);
+        var synth: ?dns.ResourceRecord = null;
         for (response.answers, 0..) |rr, i| {
             // An RRSIG is the proof, not a thing needing one.
             if (rr.rtype == .rrsig) continue;
             if (!firstOfRrset(response.answers, i)) continue;
             groups += 1;
+
+            // RFC 6672 §5.3.1: a CNAME the server synthesized under a DNAME
+            // is never signed; the secure DNAME it directly follows plus the
+            // derivation check is "sufficient proof". Only for the exact
+            // derivation — inheriting the DNAME's signer would let an
+            // injector pick the redirect target, so a non-deriving target is
+            // a forgery (Unbound validator.c).
+            if (synth) |d| {
+                synth = null;
+                if (rr.rtype == .cname and rr.name.labels.len > d.name.labels.len and rr.name.isSubdomainOf(d.name)) {
+                    if (!cnameGroupDerivesFrom(response.answers, i, d)) return .bogus;
+                    continue;
+                }
+            }
 
             const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .bogus;
             var group_cap: u32 = std.math.maxInt(u32);
@@ -2502,6 +2512,7 @@ pub const RecursiveResolver = struct {
             if (verdict == .bogus) return .bogus;
             status = dnssec.weakest(status, verdict);
             ttl_cap = @min(ttl_cap, group_cap);
+            if (rr.rtype == .dname and verdict == .secure) synth = rr;
         }
         // Signatures alone: AD would be a claim about an empty set.
         if (groups == 0) return .bogus;
@@ -2586,6 +2597,26 @@ pub const RecursiveResolver = struct {
             dst.ttl = @min(src.ttl, cap);
         }
         section.* = trimmed;
+    }
+
+    /// True when every CNAME in the RRset opening at `answers[first]` is the
+    /// RFC 6672 §2.2 derivation of `dname_rr`: the owner's suffix (the DNAME
+    /// owner) swapped for the DNAME target, prefix labels untouched. Every
+    /// member, not just the first — an extra record in the group would ride
+    /// out under AD otherwise. A derivation exceeding the wire name limit
+    /// can never equal a parsed target, so overflow rejects itself.
+    fn cnameGroupDerivesFrom(answers: []const dns.ResourceRecord, first: usize, dname_rr: dns.ResourceRecord) bool {
+        const owner = answers[first].name;
+        const prefix = owner.labels[0 .. owner.labels.len - dname_rr.name.labels.len];
+        const dtarget = dname_rr.rdata.dname;
+        for (answers[first..]) |rr| {
+            if (rr.rtype != .cname or !rr.name.eql(owner)) continue;
+            const t = rr.rdata.cname.labels;
+            if (t.len != prefix.len + dtarget.labels.len) return false;
+            if (!(dns.Name{ .labels = t[0..prefix.len] }).eql(.{ .labels = prefix })) return false;
+            if (!dtarget.eql(.{ .labels = t[prefix.len..] })) return false;
+        }
+        return true;
     }
 
     /// True when `records[i]` opens its (owner, type) RRset, so a loop over
