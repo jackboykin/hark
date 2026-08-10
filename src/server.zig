@@ -1695,6 +1695,10 @@ const WorkerState = struct {
         var name_buf: [dns.max_name_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
 
+        // Clock-advance control queries must reach the slow-path intercept;
+        // `invalid.` is RFC 6761 special-use and would NXDOMAIN inline here.
+        if (build_options.testing_enabled and parseAdvanceClockQname(name_str) != null) return false;
+
         var resolver = recursive.RecursiveResolver.fromContext(
             self.resolverContext(),
             null,

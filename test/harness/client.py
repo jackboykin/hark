@@ -96,13 +96,28 @@ def _q_tuple(r: dns.rrset.RRset) -> tuple:
     return (r.name.to_text().lower(), r.rdclass, r.rdtype)
 
 
+# `STEP n TIME_PASSES` shifts hark's clock by an offset added to the real
+# wall clock, so a scenario's own runtime lands in every cached TTL it then
+# asserts. Under suite load a step can straddle a second boundary and a
+# `MATCH ttl` expecting 3590 sees 3589. Compare TTLs to the second they were
+# written for, ±this — every divergence these scenarios exist to catch is
+# hundreds of seconds wide, so the slack costs no discrimination.
+_TTL_SLACK = 3
+
+
+def _identity(t: tuple) -> tuple:
+    """Everything but the TTL — the sort key, so slack can never reorder rows."""
+    return t[:3] + t[4:]
+
+
 def _assert_section_matches(label: str, actual: list, expected: list, compare_ttl: bool) -> None:
-    got = sorted(_normalize_rrset(r, compare_ttl) for r in actual)
-    want = sorted(_normalize_rrset(r, compare_ttl) for r in expected)
-    if got != want:
-        raise AssertionError(
-            f"{label} mismatch:\n  got:  {got}\n  want: {want}"
-        )
+    got = sorted((_normalize_rrset(r, compare_ttl) for r in actual), key=_identity)
+    want = sorted((_normalize_rrset(r, compare_ttl) for r in expected), key=_identity)
+    if len(got) != len(want) or any(
+        _identity(g) != _identity(w) or abs(g[3] - w[3]) > _TTL_SLACK
+        for g, w in zip(got, want)
+    ):
+        raise AssertionError(f"{label} mismatch:\n  got:  {got}\n  want: {want}")
 
 
 def _normalize_rrset(r: dns.rrset.RRset, compare_ttl: bool) -> tuple:

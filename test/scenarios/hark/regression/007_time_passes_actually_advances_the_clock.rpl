@@ -1,0 +1,95 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN STEP TIME_PASSES moves the clock a cache hit reads
+
+; Regression: the `_advance-clock.<N>.testharness.invalid.` control query
+; is intercepted on the slow path, but the recv-thread cache-only fast
+; path answered it first — `invalid.` is RFC 6761 special-use, so the
+; resolver synthesized NXDOMAIN inline and the clock never moved. Every
+; `STEP n TIME_PASSES` in the suite was a no-op, and the failure mode was
+; invisible: TTLs simply did not decrement, which reads as "nothing
+; happened" rather than as an error.
+;
+; The assertion that matters is step 5: a cache hit 1800 seconds later
+; must return the remaining TTL, not the original.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 3600 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3600 IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 1800
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 1800 IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END
