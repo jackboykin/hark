@@ -1,0 +1,83 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a cached DNAME redirects a sibling name with no upstream query
+
+; RFC 6672 §3.4.1 step 1: "see if the answer ... can be synthesized from a
+; cached DNAME". Step 1 puts `doc.example. DNAME archive.example.` in the
+; cache. Step 4 asks for a *different* name under it, and the authority
+; has no answer prepared for that name — so hark either synthesizes the
+; redirect itself or the step fails.
+;
+; §2.2 also fixes the synthesized CNAME's TTL at the cached DNAME's
+; decremented TTL, which the 10-second advance pins: DNAME and CNAME come
+; back at 3590 while the freshly-fetched target keeps its own 3600.
+;
+; Only a secure DNAME is picked up from cache (Unbound `dns_cache_lookup`),
+; so the signed root here is load-bearing, not scenery.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+      www.doc.example. 3600 IN CNAME www.archive.example.
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+
+  ; The target of the synthesized redirect. Note there is deliberately no
+  ; entry for `mail.doc.example.` itself.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.archive.example. IN A
+    SECTION ANSWER
+      mail.archive.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 10
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3590 IN DNAME archive.example.
+    mail.doc.example. 3590 IN CNAME mail.archive.example.
+    mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+
+SCENARIO_END

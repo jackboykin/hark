@@ -775,32 +775,19 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
-        // Bound suffix-walk depth: each `lookup` call clones records into
-        // the arena on a positive ancestor hit even when we discard the
-        // result. Real query workloads almost never have NXDOMAIN cuts
-        // deeper than 4–5 labels above the leaf, and the cuts that exist
-        // in practice are at zone-cut depth, not at every intermediate
-        // label. 8 covers TLD + apex + a couple of subdomain levels.
-        const max_suffix_depth: u8 = 8;
-        var rest = name;
-        var depth: u8 = 0;
-        // Strip the leftmost label and probe every suffix.
-        while (mem.indexOfScalar(u8, rest, '.')) |dot| {
-            if (dot + 1 >= rest.len) break; // trailing dot only
-            if (depth >= max_suffix_depth) break;
-            depth += 1;
-            const ancestor = rest[dot + 1 ..];
-            if (self.lookup(caller_alloc, ancestor, rtype, rclass)) |result| {
-                switch (result) {
-                    .negative => |n| {
-                        if (n.rcode == .name_error and n.security_status != .secure) {
-                            return result;
-                        }
-                    },
-                    .hit => {},
-                }
+        // Real query workloads almost never have NXDOMAIN cuts deeper than
+        // 4–5 labels above the leaf, and the cuts that exist in practice are
+        // at zone-cut depth, not at every intermediate label. 8 covers TLD +
+        // apex + a couple of subdomain levels.
+        var ancestors = dns.Ancestors.init(name, 8);
+        while (ancestors.next()) |ancestor| {
+            const result = self.lookup(caller_alloc, ancestor, rtype, rclass) orelse continue;
+            switch (result) {
+                .negative => |n| {
+                    if (n.rcode == .name_error and n.security_status != .secure) return result;
+                },
+                .hit => {},
             }
-            rest = ancestor;
         }
         return null;
     }

@@ -1,0 +1,88 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN an unsigned cached DNAME does not redirect names it never answered
+
+; Cached-DNAME pickup is gated on the DNAME being secure (Unbound
+; `dns_cache_lookup`: "only secure DNAMEs allowed from cache"). An
+; unsigned DNAME is a redirect for an entire subtree that nothing
+; authenticated, and reusing it means never learning the zone grew a
+; deeper one — RFC 6672 §3.3 gives the longest owner name precedence.
+;
+; This zone is unsigned and does exactly that: `doc.example.` redirects to
+; `archive.example.`, but `sub.doc.example.` has its own DNAME to
+; `vault.example.` that only the authority knows about. Synthesizing from
+; the cached ancestor would answer `mail.sub.archive.example.` and never
+; find out.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+      www.doc.example. 3600 IN CNAME www.archive.example.
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.sub.doc.example. IN A
+    SECTION ANSWER
+      sub.doc.example. 3600 IN DNAME vault.example.
+      mail.sub.doc.example. 3600 IN CNAME mail.vault.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.vault.example. IN A
+    SECTION ANSWER
+      mail.vault.example. 3600 IN A 192.0.2.11
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.sub.doc.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.sub.doc.example. IN A
+  SECTION ANSWER
+    sub.doc.example. 3600 IN DNAME vault.example.
+    mail.sub.doc.example. 3600 IN CNAME mail.vault.example.
+    mail.vault.example. 3600 IN A 192.0.2.11
+ENTRY_END
+
+SCENARIO_END

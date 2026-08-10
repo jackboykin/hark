@@ -82,11 +82,12 @@ MANIFEST: list[LiftedEntry] = [
     LiftedEntry("iter_cycle.rpl",                         "iter_cycle",       None),
     LiftedEntry("iter_cycle_noh.rpl",                     "iter_cycle",       "scenario requires accepting out-of-bailiwick glue (Unbound `harden-glue: no`) to break a NS-A↔NS-B delegation cycle. Hark's strict-bailiwick default is the secure choice; a future `accept-promiscuous-glue` knob would let this pass — defensible difference."),
 
-    # iter_dname — DNAME synthesis (RFC 6672); hark diverges across the board
+    # iter_dname — DNAME synthesis (RFC 6672); the xfails below are not
+    # synthesis gaps (DIVERGENCES.md §3).
     LiftedEntry("iter_dname_yx.rpl",                      "iter_dname",       None),
-    LiftedEntry("iter_dname_insec.rpl",                   "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
-    LiftedEntry("iter_dname_ttl.rpl",                     "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
-    LiftedEntry("iter_dname_ttl0.rpl",                    "iter_dname",       "hark behaviour diverges: DNAME synthesis (RFC 6672) not implemented"),
+    LiftedEntry("iter_dname_insec.rpl",                   "iter_dname",       "cases 1-8 pass; 9-12 are self-referential DNAMEs, and hark SERVFAILs a CNAME loop where Unbound returns NOERROR with the partial chain"),
+    LiftedEntry("iter_dname_ttl.rpl",                     "iter_dname",       "everything but AD matches, including the synthesized CNAME's TTL: the zones are signed with testbound-only `fake-sha1` under trust anchors the lifter strips, so no conformant validator can authenticate them"),
+    LiftedEntry("iter_dname_ttl0.rpl",                    "iter_dname",       "same AD limit as iter_dname_ttl, plus the DNAME carries TTL 0 — Unbound serves it from a one-second cache grace, hark refuses to cache a zero-TTL RRset"),
 
     # iter_class_any is not vendored — see the "deliberately not vendored"
     # section of the module docstring.

@@ -1011,6 +1011,10 @@ pub const RecursiveResolver = struct {
 
         if (qtype == .cname) return .none;
 
+        // A DNAME outranks the CNAME derived from it; resynthesizing first
+        // keeps the two consistent.
+        if (try self.tryCachedDname(allocator, current_name)) |dispatch| return dispatch;
+
         // Probe (current_name, .cname): the dual-stack win. A prior A query
         // may have cached the redirect; a subsequent AAAA can reuse it
         // instead of re-walking from root. Unbound / BIND / PowerDNS / Knot
@@ -1040,6 +1044,53 @@ pub const RecursiveResolver = struct {
             .negative => {}, // cached NXDOMAIN/NODATA on .cname → upstream path handles it
         };
         return .none;
+    }
+
+    /// RFC 6672 §3.4.1 step 1: a cached DNAME above `current_name` redirects
+    /// it with no upstream query at all. The CNAME is manufactured here and
+    /// so is unsigned by construction — it inherits the DNAME's verdict and
+    /// travels beside the DNAME RRset and RRSIGs that derive it, which is
+    /// what a downstream validator checks.
+    ///
+    /// Only a `.secure` DNAME is picked up (Unbound `dns_cache_lookup`: "only
+    /// secure DNAMEs allowed from cache"). An unsigned one is a redirect for
+    /// a whole subtree that nothing authenticated, and reusing it means never
+    /// learning that the zone grew a deeper DNAME; the authority is cheap to
+    /// re-ask. Unbound's escape hatch — a CNAME already cached at this exact
+    /// name — is the probe that runs next anyway. `.secure` also excludes
+    /// every stale entry, whose verdict is forced to `.unchecked`.
+    ///
+    /// Closest ancestor first: RFC 6672 §3.3 gives the longest match
+    /// precedence. DNAMEs live at zone apexes, so a shallow bound loses
+    /// nothing a deep one would find.
+    fn tryCachedDname(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        current_name: []const u8,
+    ) !?CacheDispatch {
+        const c = self.cache orelse return null;
+        var ancestors = dns.Ancestors.init(current_name, 8);
+        while (ancestors.next()) |ancestor| {
+            const h = switch (c.lookup(allocator, ancestor, .dname, .in) orelse continue) {
+                .hit => |hit| hit,
+                .negative => continue,
+            };
+            if (h.records.len == 0 or h.security_status != .secure) continue;
+            if (h.needs_prefetch) self.pending_chain_prefetch = true;
+
+            const owner = try dns.parseDottedName(allocator, current_name);
+            const synth = try synthesizeCname(allocator, owner, h.records[0]) orelse return null;
+            const proof = try concatRRs(allocator, h.records, h.sigs);
+            return .{ .follow_cname = .{
+                .redirect = .{
+                    .records = try concatRRs(allocator, proof, &.{synth}),
+                    .target = synth.rdata.cname,
+                },
+                .security_status = h.security_status,
+                .nsec_proofs = h.nsec_proofs,
+            } };
+        }
+        return null;
     }
 
     /// RFC 8198 aggressive NSEC use: synthesize negative or wildcard

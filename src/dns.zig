@@ -2309,6 +2309,27 @@ pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser:
     return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
 }
 
+/// Proper ancestors of a dotted name, closest first, capped at `max_depth`.
+/// Every caller walks suffixes to probe the cache, and every probe costs an
+/// arena clone on a hit — so the bound is the caller's to justify.
+pub const Ancestors = struct {
+    rest: []const u8,
+    left: u8,
+
+    pub fn init(name: []const u8, max_depth: u8) Ancestors {
+        return .{ .rest = name, .left = max_depth };
+    }
+
+    pub fn next(self: *Ancestors) ?[]const u8 {
+        if (self.left == 0) return null;
+        const dot = mem.indexOfScalar(u8, self.rest, '.') orelse return null;
+        if (dot + 1 >= self.rest.len) return null; // trailing dot only
+        self.left -= 1;
+        self.rest = self.rest[dot + 1 ..];
+        return self.rest;
+    }
+};
+
 /// RFC 6672 §2.2 substitution: `owner` with its trailing `suffix` labels
 /// replaced by `target`. Null when the result would overflow a legal name —
 /// the same bound the parser enforces, so an overflowing substitution can
@@ -3333,6 +3354,27 @@ test "extractKeepaliveTimeout returns null on zero-length client form" {
     const empty = [_]u8{};
     const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", false, edns_opt_tcp_keepalive, &empty);
     try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(wire));
+}
+
+test "Ancestors yields proper suffixes, stops at the root and at the bound" {
+    const collect = struct {
+        fn f(buf: [][]const u8, name: []const u8, max_depth: u8) [][]const u8 {
+            var it = Ancestors.init(name, max_depth);
+            var n: usize = 0;
+            while (it.next()) |a| : (n += 1) buf[n] = a;
+            return buf[0..n];
+        }
+    }.f;
+    var buf: [8][]const u8 = undefined;
+
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "b.c.example", "c.example", "example" }), collect(&buf, "a.b.c.example", 8));
+    // A trailing dot is a separator with nothing after it, not a label.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"example."}), collect(&buf, "a.example.", 8));
+    try testing.expectEqual(@as(usize, 0), collect(&buf, "example", 8).len);
+    try testing.expectEqual(@as(usize, 0), collect(&buf, ".", 8).len);
+    // The bound cuts the walk short rather than wrapping or overrunning.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"b.c.example"}), collect(&buf, "a.b.c.example", 1));
+    try testing.expectEqual(@as(usize, 0), collect(&buf, "a.b.c.example", 0).len);
 }
 
 test "extractKeepaliveTimeout rejects malformed wire" {

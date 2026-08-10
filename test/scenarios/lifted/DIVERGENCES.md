@@ -57,19 +57,36 @@ behind a knob that does not yet exist.
 
 ---
 
-## 3. DNAME synthesis — *not implemented*
+## 3. DNAME residue — *three separate reasons, none of them synthesis*
 
 **Scenarios:** `iter_dname_insec.rpl`, `iter_dname_ttl.rpl`, `iter_dname_ttl0.rpl`
 (note: `iter_dname_yx.rpl` *passes* — the YXDOMAIN error path needs no synthesis.)
 
-Hark does not implement DNAME → CNAME synthesis (RFC 6672). A resolver
-encountering a DNAME RR is supposed to synthesise the corresponding CNAME for
-the queried name and continue the chase; hark does not, so any scenario that
-depends on synthesised CNAMEs diverges. The TTL variants (`_ttl`, `_ttl0`)
-are the same gap observed through the lens of the synthesised record's TTL.
+DNAME → CNAME synthesis (RFC 6672) is implemented: from a DNAME in the
+response, and from a cached one. Each remaining scenario fails for its own
+unrelated reason.
 
-**Verdict:** a genuine unimplemented feature, not a behavioural choice. The
-xfail-strict guard is what will tell us the day DNAME support lands.
+`iter_dname_ttl` — **harness limit.** Everything but the AD bit matches,
+including the §2.2 TTL of the cache-synthesised CNAME. Its zones are signed
+with Unbound's testbound-only `fake-sha1` under trust anchors declared in the
+`server:` prelude that the lifter strips, so no conformant validator can
+authenticate them and hark cannot reach AD=1 here. Same class as the
+`iter_cname_minimise_nx` / `iter_class_any` files that are not vendored at
+all; this one is kept because the rest of it is real coverage.
+
+`iter_dname_ttl0` — **deliberate.** Same AD limit, plus the DNAME carries
+TTL 0. Unbound serves 0-TTL records from a one-second cache grace window;
+hark refuses to cache a zero-TTL RRset at all, so the second query has no
+cached DNAME to synthesise from.
+
+`iter_dname_insec` — **deliberate.** Cases 1–8 pass. Cases 9–12 are DNAMEs
+that redirect into themselves, producing a self-referential CNAME. Unbound
+answers NOERROR with the partial chain; hark treats a CNAME loop as an error
+and SERVFAILs (RFC 1034 §3.6.2 asks for an error, without naming one). That
+is a loop-signalling choice, not a DNAME one.
+
+**Verdict:** one harness limit and two choices hark makes elsewhere and
+would have to reverse globally; none of it is a DNAME gap.
 
 ---
 
@@ -81,8 +98,8 @@ These exercise TTL expiry over a simulated clock advance. Hark *does* model
 the clock — a synthetic monotonic clock behind `-Dtesting=true`
 (`src/monotonic.zig:advanceTestClock`), driven by the harness via a control
 query `_advance-clock.<N>.testharness.invalid.` on each `STEP n TIME_PASSES`
-— and the TTL math itself is correct: cached records return decremented TTLs
-after the advance.
+— and the TTL math is correct, which
+`regression/007_time_passes_actually_advances_the_clock.rpl` asserts directly.
 
 The divergence is elsewhere: the scenarios' `MATCH all` also asserts the
 AUTHORITY section, and hark intentionally strips AUTHORITY NS records from
@@ -90,6 +107,13 @@ AUTHORITY section, and hark intentionally strips AUTHORITY NS records from
 CVE-2025-11411 mitigation. Unbound caches and replays the authority section;
 hark does not. So the answer section matches but the authority section does
 not, and `MATCH all` fails.
+
+One wrinkle sits in front of that in the vendored file: its authority entry
+matches on `opcode qname` without qtype, so the cousin AAAA prefetch is
+answered with the A RRset and re-stores it at full TTL. The ANSWER section
+therefore mismatches before the AUTHORITY one does. Tightening the entry to
+match qtype makes the answer pass and the failure land where this section
+says it does.
 
 **Verdict:** the TTL-expiry behaviour the scenarios were written to test
 works correctly; the failure is a deliberate security-driven shaping choice
