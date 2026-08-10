@@ -1,0 +1,76 @@
+; hark: root-hints = 127.0.10.1
+; hark: rebinding-enabled = yes
+
+SCENARIO_BEGIN public zone HTTPS record with private ipv4hint is scrubbed
+
+; The SVCB-era variant of the headline rebinding attack (fixed as a
+; security issue in Unbound 1.25.0): attacker.com publishes an HTTPS
+; record whose ipv4hint carries a private address. HEv3 clients use
+; hints as connection candidates before A/AAAA arrive, so a hint slips
+; past an A/AAAA-only scrub. The whole RR is dropped — rewriting the
+; hint would break DNSSEC validation (RFC 9460 §7.3).
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      attacker.com. IN HTTPS
+    SECTION AUTHORITY
+      attacker.com. 86400 IN NS ns.attacker.com.
+    SECTION ADDITIONAL
+      ns.attacker.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake attacker.com authority — HTTPS with private hint ──────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      attacker.com. IN HTTPS
+    SECTION ANSWER
+      attacker.com. 3600 IN HTTPS 1 . ipv4hint=192.168.1.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    attacker.com. IN HTTPS
+ENTRY_END
+
+; Expected: NOERROR with empty answer section, mirroring the A scrub in
+; scenario 001 — no SOA synthesised, stub re-tries on next config change.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    attacker.com. IN HTTPS
+ENTRY_END
+
+SCENARIO_END

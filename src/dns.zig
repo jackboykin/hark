@@ -27,7 +27,7 @@ pub fn hasTcBit(bytes: []const u8) bool {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-const max_label_len = 63;
+pub const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
 pub const header_len = 12;
