@@ -24,11 +24,11 @@ def send_query(entry: rpl.Entry, hark_addr: tuple[str, int], timeout: float = 5.
     return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
 
 
-def send_raw_query(qname: str, rdtype: str, hark_addr: tuple[str, int], timeout: float = 5.0) -> dns.message.Message:
+def send_raw_query(qname: str, rdtype: str, hark_addr: tuple[str, int], timeout: float = 5.0, want_dnssec: bool = False) -> dns.message.Message:
     """Send a query without an `Entry`. Used by the TIME_PASSES handler to
     hit hark's `_advance-clock` control channel without modelling it as a
-    scenario query."""
-    msg = dns.message.make_query(qname, rdtype)
+    scenario query, and by python tests driving their own assertions."""
+    msg = dns.message.make_query(qname, rdtype, want_dnssec=want_dnssec)
     return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
 
 

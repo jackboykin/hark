@@ -10,6 +10,8 @@ Each `.rpl` file under `scenarios/` becomes one pytest item. Running it:
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import ipaddress
 import os
 import re
@@ -105,7 +107,18 @@ def run_scenario(path: Path, lift: bool = False) -> None:
         raise AssertionError(
             f"{path}: scenario must declare `; hark: root-hints = <ip>[, ...]` in header"
         )
+    with scenario_env(scenario) as (resp, proc):
+        _run_steps(scenario, resp, proc, path)
 
+
+@contextlib.contextmanager
+def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | None = None):
+    """Responder + hark wired for `scenario`; yields `(resp, proc)`.
+
+    Shared by the .rpl step-runner and python tests that drive their own
+    queries (e.g. TTL-bound assertions .rpl CHECK_ANSWER cannot express).
+    `sig_validity` shrinks the harness RRSIG window for proof-lifetime tests.
+    """
     binary = hark_proc.find_hark_binary()
 
     # Map bare-IP root hints to "ip:RESP_PORT" so hark uses the test port.
@@ -137,7 +150,10 @@ def run_scenario(path: Path, lift: bool = False) -> None:
     # DS as hark's trust anchor, and hand the keys to the responder for
     # on-the-fly RRSIG signing. The parser already enforces that the first
     # zone is `.` (hark validates trust anchors at root only).
-    signers = [harness_dnssec.KeyMaterial.generate(z) for z in scenario.dnssec_zones]
+    signers = [
+        harness_dnssec.KeyMaterial.generate(z, sig_validity=sig_validity)
+        for z in scenario.dnssec_zones
+    ]
     if signers:
         cfg.dnssec = True
         cfg.trust_anchors = [signers[0].ds_presentation()]
@@ -147,7 +163,7 @@ def run_scenario(path: Path, lift: bool = False) -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="harktest-") as td:
             with hark_proc.HarkProcess(binary, cfg, Path(td)) as proc:
-                _run_steps(scenario, resp, proc, path)
+                yield resp, proc
     finally:
         resp.stop()
 
