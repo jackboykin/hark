@@ -2007,7 +2007,7 @@ pub const RecursiveResolver = struct {
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
         @branchHint(.cold);
-        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked);
+        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked, .unless_fresh);
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
@@ -3158,7 +3158,7 @@ fn cacheInsecureDelegation(
     }
 
     var zone_buf: [dns.max_name_len + 1]u8 = undefined;
-    c.storeNegativeBare(zone_cut.formatInto(&zone_buf), .ds, .in, .no_error, neg_ttl, .insecure);
+    c.storeNegativeBare(zone_cut.formatInto(&zone_buf), .ds, .in, .no_error, neg_ttl, .insecure, .always);
 }
 
 /// Validate DNSKEY answers against cached DS records (RFC 4035 §5.2).

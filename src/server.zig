@@ -1310,9 +1310,10 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
         var qtype_buf: [24]u8 = undefined;
         log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(dns.RType, qtype, &qtype_buf), @errorName(err) });
         // Only cousins record: a refresh kind still holds the entry it meant
-        // to refresh, so a SERVFAIL would clobber it. containsFresh narrows the
-        // race with a concurrent successful resolve.
-        if (ctx.kind == .cousin and !server.cache.containsFresh(name, qtype, .in)) {
+        // to refresh, so a SERVFAIL would clobber it. cacheServfail refuses
+        // fresh entries under the shard write lock, which closes the race
+        // with a concurrent successful resolve.
+        if (ctx.kind == .cousin) {
             server.cache.cacheServfail(name, qtype);
         }
     };

@@ -956,7 +956,7 @@ pub const RRsetCache = struct {
 
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
-        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status) orelse return;
+        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         const cached_soa = buildCachedRecord(slot.alloc, soa) catch {
@@ -1006,12 +1006,13 @@ pub const RRsetCache = struct {
         rcode: dns.RCode,
         ttl: u32,
         security_status: SecurityStatus,
+        overwrite: Overwrite,
     ) void {
         if (ttl == 0) return;
 
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
-        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status) orelse return;
+        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, overwrite) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
@@ -1044,8 +1045,11 @@ pub const RRsetCache = struct {
     /// Cache a resolution failure per RFC 9520 §3. TTL chosen short (5 s)
     /// — long enough to absorb a misbehaving stub's retry storm, short
     /// enough that recovery from a transient upstream failure is fast.
+    /// Never displaces a fresh entry: a failure marker is the lowest-value
+    /// cache content, and any fresh entry here means a racing resolve
+    /// succeeded after this one started.
     pub fn cacheServfail(self: *RRsetCache, name: []const u8, rtype: dns.RType) void {
-        self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked);
+        self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked, .unless_fresh);
     }
 
     /// True if a non-expired positive entry exists for (name, rtype, rclass)
@@ -1079,10 +1083,20 @@ pub const RRsetCache = struct {
     /// downgrades skip — so a forged `.insecure` cannot displace a real
     /// `.secure`, and a CD=1 `.unchecked` cannot displace either.
     /// Caller passes the precomputed hash to avoid double-hashing.
-    fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus) bool {
+    /// Displacement policy for a store finding a live entry in its slot.
+    /// `.unless_fresh` is for failure markers, which never displace a fresh
+    /// entry of any status; checked under the shard write lock so a
+    /// concurrent successful store cannot be clobbered between a caller's
+    /// freshness probe and the write (TOCTOU on the background-cousin path).
+    pub const Overwrite = enum { always, unless_fresh };
+
+    /// One home for "may this write displace the existing entry": the RFC
+    /// 9520 §3.4 anti-downgrade rank check plus the failure-marker policy.
+    fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus, overwrite: Overwrite) bool {
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const existing = shard.map.values()[idx];
         if (self.now_fn() >= existing.expiresAt()) return false;
+        if (overwrite == .unless_fresh) return true;
         const existing_status: SecurityStatus = switch (existing) {
             .positive => |p| p.security_status,
             .negative => |n| n.security_status,
@@ -1196,16 +1210,17 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
         status: SecurityStatus,
+        overwrite: Overwrite,
     ) ?struct { shard: *Shard, alloc: Allocator, key: CacheKey } {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockUncancelable(self.io);
-        // Anti-downgrade check must run before evictIfNeeded: SIEVE is
+        // Displacement check must run before evictIfNeeded: SIEVE is
         // security-blind, so an eviction here could silently drop the
         // existing .secure entry we're about to refuse to overwrite (RFC
         // 9520 §3.4). Probe key is fine — shouldBlockOverwrite only reads
         // .name bytes for the hash-adapted lookup.
-        if (self.shouldBlockOverwrite(shard, h, probe, status)) {
+        if (self.shouldBlockOverwrite(shard, h, probe, status, overwrite)) {
             shard.rwlock.unlock(self.io);
             return null;
         }
@@ -1261,7 +1276,7 @@ pub const RRsetCache = struct {
         // where neither the min-ttl floor nor serve-stale can resurrect it.
         if (min_ttl == 0) return;
 
-        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status) orelse return;
+        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         const cached_records = slot.alloc.alloc(CachedRecord, matches.len) catch {
@@ -2574,13 +2589,38 @@ test "SERVFAIL never serves stale" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    cache.storeNegativeBare("bogus.test", .a, .in, .server_failure, 1, .unchecked);
+    cache.storeNegativeBare("bogus.test", .a, .in, .server_failure, 1, .unchecked, .always);
 
     // 5s past expiry, well within the 3600s stale window — must still miss.
     test_time = 1000 + 1 + 5;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), "bogus.test", .a, .in) == null);
+}
+
+test "cacheServfail never displaces a fresh entry" {
+    // A background cousin resolve can fail after a concurrent foreground
+    // resolve succeeded; the freshness check lives under the shard write
+    // lock so the marker loses that race deterministically. Once the entry
+    // expires, the marker may land.
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    try storeTestA(&cache, alloc, &.{ "racy", "test" }, 300, .{ 1, 2, 3, 4 });
+    cache.cacheServfail("racy.test", .a);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fresh = cache.lookup(arena.allocator(), "racy.test", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expect(fresh == .hit);
+
+    test_time = 1000 + 301;
+    cache.cacheServfail("racy.test", .a);
+    const after = cache.lookup(arena.allocator(), "racy.test", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expect(after == .negative);
+    try testing.expectEqual(dns.RCode.server_failure, after.negative.rcode);
 }
 
 test "RFC 9520: SERVFAIL TTL clamped to 5 minutes" {
@@ -2593,7 +2633,7 @@ test "RFC 9520: SERVFAIL TTL clamped to 5 minutes" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    cache.storeNegativeBare("flooded.test", .a, .in, .server_failure, 86400, .unchecked);
+    cache.storeNegativeBare("flooded.test", .a, .in, .server_failure, 86400, .unchecked, .always);
 
     // 301s after store: must miss. If the clamp regresses to max_cache_ttl
     // the entry would still be live for hours.
@@ -2731,7 +2771,7 @@ test "BOGUS invalidates .unchecked positive to SERVFAIL" {
     }
 
     // Step 2: bg validation finishes .bogus → bogusServfail path.
-    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
 
     // Step 3: next CD=0 lookup must see the SERVFAIL negative, not the
     // stale .unchecked positive (which would have returned answer bytes
@@ -2767,7 +2807,7 @@ test "fresh .secure positive replaces fresh .secure negative on same key" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    cache.storeNegativeBare("example.com", .a, .in, .name_error, 600, .secure);
+    cache.storeNegativeBare("example.com", .a, .in, .name_error, 600, .secure, .always);
     try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
     try expectCachedHitStatus(alloc, &cache, "example.com", .secure);
 }
@@ -2805,7 +2845,7 @@ test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
 
     cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
 
-    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked);
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2968,7 +3008,7 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
         const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
         const shard, _ = cache.shardWithHash(probe);
         if (shard != &cache.shards[0]) continue;
-        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
+        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked, .always);
         stored += 1;
     }
     try testing.expect(stored == 4);
@@ -3018,7 +3058,7 @@ test "byte-pressure check happens before key-name dupe" {
         const probe = CacheKey{ .name = name, .rtype = .a, .rclass = .in };
         const shard, _ = cache.shardWithHash(probe);
         if (shard != &cache.shards[0]) continue;
-        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked);
+        cache.storeNegativeBare(name, .a, .in, .name_error, 60, .unchecked, .always);
         seeded = name;
     }
     try testing.expect(seeded != null);
@@ -3044,7 +3084,7 @@ test "byte-pressure check happens before key-name dupe" {
     }
     try testing.expect(newname.len > 0);
 
-    cache.storeNegativeBare(newname, .a, .in, .name_error, 60, .unchecked);
+    cache.storeNegativeBare(newname, .a, .in, .name_error, 60, .unchecked, .always);
 
     // Pop the synthetic bump so lookup runs against real state.
     _ = shard0.counting.current_bytes.fetchSub(bump, .monotonic);
@@ -3069,7 +3109,7 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
     defer cache.deinit();
 
     // Bare negative (no SOA, no proofs): exercises the simpler path.
-    cache.storeNegativeBare("missing.test", .a, .in, .name_error, 60, .unchecked);
+    cache.storeNegativeBare("missing.test", .a, .in, .name_error, 60, .unchecked, .always);
 
     // Negative with SOA + NSEC proofs: exercises the larger rollback path.
     var input_arena = std.heap.ArenaAllocator.init(testing.allocator);
