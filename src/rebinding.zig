@@ -3,11 +3,12 @@
 /// zones, so a browser-side attacker can't point `attacker.com` at the
 /// victim's `127.0.0.1:8765` and call the local dev server cross-origin.
 ///
-/// Filter site: a single egress hook in `response.shapeAnswers`. Filtering
-/// once at the wire boundary covers fresh resolution, cache hits, and
-/// TTL=0 answers (which would skip a cache-insertion filter) in one place,
-/// and lets operator config changes (`allow_zones`, `extra_allow`) take
-/// effect immediately instead of waiting for TTL expiry.
+/// Filter site: egress hooks in `response.shapeResponse`, one per
+/// section. Filtering at the wire boundary covers fresh resolution,
+/// cache hits, and TTL=0 answers (which would skip a cache-insertion
+/// filter) in one place, and lets operator config changes
+/// (`allow_zones`, `extra_allow`) take effect immediately instead of
+/// waiting for TTL expiry.
 ///
 /// What we *don't* do, and why:
 ///   • Synthesise SOA in authority on an empty-rrset. RFC 2308 makes SOA

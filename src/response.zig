@@ -64,31 +64,34 @@ fn shapeResponse(
     // Positives shed delegation NS + glue; negatives retain SOA + proofs.
     const positive = response.header.flags.rcode == .no_error and response.answers.len > 0;
 
-    const answers = try shapeAnswers(alloc, response.answers, qtype, keep_dnssec, rebind_cfg);
+    const answers = try shapeAnswers(alloc, response.answers, qtype, keep_dnssec);
     const authorities = try shapeAuthority(alloc, response.authorities, keep_dnssec, apply_minimal, positive);
     const additionals = try shapeAdditional(alloc, response.additionals, keep_dnssec, apply_minimal, positive);
 
+    // Rebinding scrub covers every shaped section: negative responses
+    // pass authority/additional through un-minimised, and RFC 9460 §4.2
+    // steers clients toward consuming Additional-section SVCB/A/AAAA.
+    // Scrubbing after shaping means minimised (near-empty) sections cost
+    // nothing to scan — the security boundary is what reaches the wire.
+    const rb = rebind_cfg.*;
     return .{
-        .answers = answers,
-        .authorities = authorities,
-        .additionals = additionals,
+        .answers = try rebinding.scrub(alloc, answers, rb),
+        .authorities = try rebinding.scrub(alloc, authorities, rb),
+        .additionals = try rebinding.scrub(alloc, additionals, rb),
     };
 }
 
 /// Answer section: keep qtype, CNAME, DNAME unconditionally (the
 /// client's primary payload). Keep RRSIG iff the client wants DNSSEC.
 /// Strip orphan DNSSEC records when DO=0 (already covered by the
-/// keep_dnssec gate). The rebinding scrub runs first; its semantics
-/// live in `src/rebinding.zig`.
+/// keep_dnssec gate).
 fn shapeAnswers(
     alloc: mem.Allocator,
     answers: []const dns.ResourceRecord,
     qtype: dns.RType,
     keep_dnssec: bool,
-    rebind_cfg: *const rebinding.Config,
 ) mem.Allocator.Error![]const dns.ResourceRecord {
-    const post_scrub = try rebinding.scrub(alloc, answers, rebind_cfg.*);
-    return filterRecords(alloc, post_scrub, struct {
+    return filterRecords(alloc, answers, struct {
         qtype: dns.RType,
         keep_dnssec: bool,
         pub fn keep(self: @This(), rr: dns.ResourceRecord) bool {
@@ -956,6 +959,26 @@ fn countByType(records: []const dns.ResourceRecord, rtype: dns.RType) usize {
         if (rr.rtype == rtype) c += 1;
     }
     return c;
+}
+
+test "shape: rebinding scrub reaches additionals on NODATA passthrough" {
+    // Negative responses skip the minimal strip (`else => true`), so the
+    // scrub is the only thing between an upstream's private-address
+    // additional and the client — and RFC 9460 §4.2 trains clients to
+    // consume Additional-section records.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 192, 168, 1, 1 })};
+    const msg = shapePositiveMessage(&.{}, &.{shapeSoaRecord()}, additionals);
+
+    const off = try shapeResponse(a, msg, .a, false, false, true, &rebinding.Config.off);
+    try testing.expectEqual(@as(usize, 1), off.additionals.len);
+
+    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const on = try shapeResponse(a, msg, .a, false, false, true, &scrub_on);
+    try testing.expectEqual(@as(usize, 0), on.additionals.len);
 }
 
 test "shape: positive DO=0 strips NS from authority, glue from additional, RRSIG everywhere" {
