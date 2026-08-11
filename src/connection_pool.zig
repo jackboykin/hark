@@ -79,7 +79,7 @@ pub const PooledConnection = struct {
     net_writer: File.Writer,
     tls: tls.Connection,
     last_used: i64,
-    /// Per-RFC 7766 §6.2.1: bound queries on a single TLS session. Matches the
+    /// Bound queries on a single TLS session (RFC 7766 reuse hygiene). Matches the
     /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
     query_count: u16 = 0,
     max_queries: u16 = 200,
@@ -550,7 +550,7 @@ test "ConnectionPool per-key cap evicts oldest within key" {
     pool.release(key, got, true);
 }
 
-test "TlsPool max queries eviction (RFC 7766 §6.2.1)" {
+test "TlsPool max queries eviction" {
     cp_test_now = 1000;
 
     var pool = TlsPool.init(testing.allocator, undefined);

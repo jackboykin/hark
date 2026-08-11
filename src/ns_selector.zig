@@ -150,9 +150,6 @@ pub const NsSelector = struct {
     }
 
     inline fn shardFor(self: *NsSelector, key: ArmKey) *Shard {
-        // Low bits are safe: ArmKeyContext.hash composes an already
-        // fmix64-finalized AddressKey hash. (ns_rtt.shardFor must use high
-        // bits off the raw FNV-1a chain instead.)
         const h = ArmKeyContext.hash(.{}, key);
         return &self.shards[@as(u32, @truncate(h)) & shard_mask];
     }

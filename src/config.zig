@@ -80,7 +80,7 @@ pub const ServerConfig = struct {
     /// matrix is implemented and documented in `response.zig:shapeResponse`.
     minimal_responses: bool,
 
-    /// RFC 7766 §6.2.1: TCP idle timeout. Hark closes a TCP client
+    /// RFC 7766 §6.2.3: TCP idle timeout. Hark closes a TCP client
     /// connection after this many ms of inactivity. 5000 matches the
     /// previous hard-coded default; raise for long-lived stub clients.
     tcp_idle_timeout_ms: u32,
@@ -396,7 +396,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             cfg.allow_from = new_allow;
         }
         if (try nonNegative(u32, server, "tcp-idle-timeout-ms")) |v| {
-            // RFC 7828 §3.4 caps the wire TIMEOUT field (100-ms units) at u16.
+            // RFC 7828 §3.1 caps the wire TIMEOUT field (100-ms units) at u16.
             // Reject configs that would overflow the @intCast at emit time.
             if (v > 6_553_500) {
                 errLog("config: tcp-idle-timeout-ms must be at most 6553500, got {d}", .{v});
@@ -813,7 +813,7 @@ test "tcp idle/queries/upstream knobs parse and validate" {
         \\tcp-queries-per-conn = 0
     ));
 
-    // RFC 7828 §3.4 caps the wire TIMEOUT field at u16 (100-ms units);
+    // RFC 7828 §3.1 caps the wire TIMEOUT field at u16 (100-ms units);
     // reject configs that would overflow the @intCast at emit time.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]

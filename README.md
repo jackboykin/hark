@@ -11,9 +11,7 @@ Requires Zig 0.17 nightly and Linux 6.1+.
 ```console
 zig build
 zig build test
-zig build bench                                # microbenchmarks; ReleaseFast
-zig build bench -- cache_hit                   # filter to matching names
-zig build -Doptimize=ReleaseSafe               # release
+zig build -Doptimize=ReleaseSafe
 ```
 
 Binary at `zig-out/bin/hark`. Python test harness under `test/` alongside a `shell.nix`: `cd test && nix-shell --run pytest`.

@@ -990,7 +990,7 @@ const Parser = struct {
         }
     }
 
-    /// Parse a single-name RDATA (NS, CNAME, PTR) with rdlength validation.
+    /// Parse a single-name RDATA (NS, CNAME, DNAME, PTR) with rdlength validation.
     fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
         const rdata_end = self.pos + rdlength;
         const name = try self.parseName(allocator);
@@ -2593,8 +2593,7 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         // the upstream wire buffer the message does not own. 0x20 never touches
         // a signer-chosen next_domain, and range comparisons use
         // case-insensitive cmpLabelsCI regardless. `cloneNameFlat`, not
-        // `cloneName`: same single-allocation shape as the `cloneNameLower` it
-        // replaced (per-label would be N+1 allocs per NSEC on the parse path).
+        // `cloneName`: per-label would be N+1 allocs per NSEC on the parse path.
         .nsec => |*n| n.next_domain_name = (try cloneNameFlat(allocator, n.next_domain_name)).toUnownedName(),
     }
 }
@@ -3254,7 +3253,7 @@ test "applyCase0x20 on root and all-numeric is a no-op" {
     try testing.expect(mem.eql(u8, numeric.labels[0], numeric_copy.labels[0]));
 }
 
-test "buildQuery with case_randomize" {
+test "buildQuery with case_rng" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

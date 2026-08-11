@@ -112,9 +112,6 @@ pub const RttCache = struct {
     }
 
     fn shardFor(self: *RttCache, key: AddressKey) *Shard {
-        // Use the upper bits — the FNV-1a chain in HashCtx propagates input
-        // bits leftward, so the bottom 4 bits stay constant for inputs that
-        // share their low 4 bits (which IPv4 keys do, with addr[0..3] alone).
         const h: u32 = @truncate(AddressKey.HashCtx.hash(.{}, key) >> 32);
         return &self.shards[h & shard_mask];
     }

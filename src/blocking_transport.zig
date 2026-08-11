@@ -348,8 +348,8 @@ pub fn queryTcp(
 ///
 /// `.address` is intentionally zero (not populated via getsockname).
 /// CONTRACT: no caller reads `Stream.socket.address` on a client-side
-/// stream. Audit on zig bumps — verified for 0.16 that close/read/
-/// write paths only touch `.handle`. The family-tag may not match
+/// stream. Audit on zig bumps: close/read/write paths must only touch
+/// `.handle`. The family-tag may not match
 /// the peer's family (zero is ip4 here, even on ip6 connects); a
 /// future `Stream.peerAddress()` or address-formatting code would
 /// silently lie. Populate via `na.getSockName` if that ever matters.
