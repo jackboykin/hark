@@ -487,9 +487,9 @@ fn buildSignedData(
     return buf[0 .. pos + out_pos];
 }
 
-/// Write canonical RDATA per RFC 4034 §6.2.
-/// For types with embedded names (NS, CNAME, SOA, PTR, MX, RRSIG, NSEC),
-/// the names are lowercased. Other types are written as-is.
+/// Write canonical RDATA per RFC 4034 §6.2. Each name-bearing arm carries
+/// its own folding rule — most lowercase, NSEC is case-preserving per
+/// RFC 6840 §5.1. Types without embedded names are written as-is.
 ///
 /// Separate from `dns.Serializer.writeRData` (canonical/lowercased, not wire).
 /// Any new name-bearing RData arm MUST add a lowercasing arm here, or the
@@ -1050,7 +1050,7 @@ fn budgetedNsec3Hash(
 
 // ── Mixed NSEC/NSEC3 Detection ───────────────────────────────────────
 
-/// Check if a response mixes NSEC and NSEC3 from the same zone.
+/// Check if a response mixes NSEC and NSEC3.
 /// Returns true if mixed (should reject the proof).
 fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
     var has_nsec = false;
@@ -1076,8 +1076,7 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
 /// zone; this function being the odd one out is what made the hole reachable.
 ///
 /// Tests that exercise pure range geometry pass root, which makes the check
-/// vacuous by construction — the binding itself is pinned by
-/// "validateNegativeProof binds the proof to its zone" below.
+/// vacuous by construction.
 pub fn validateNegativeProof(
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
@@ -1513,7 +1512,7 @@ pub fn validateRrset(
         // Refuse rather than truncate: the caller sets AD on the *unpruned*
         // response, so verifying a signature over records[0..64] while
         // shipping 70 records launders the 6 attacker-appended RRs into an
-        // authenticated answer. buildSignedData refuses >64 anyway (:412),
+        // authenticated answer. buildSignedData refuses >64 anyway,
         // so a genuine oversized RRset was already unvalidatable here —
         // this only makes the refusal explicit instead of silent.
         var filtered: [64]dns.ResourceRecord = undefined;
@@ -1713,7 +1712,7 @@ const test_dnskey = dns.DnskeyData{
 
 /// Zone argument for tests that exercise pure range geometry: root makes the
 /// qname/owner binding vacuous, so those tests keep testing exactly what they
-/// tested before it existed. The binding has its own test.
+/// tested before it existed.
 const test_root = dns.Name{ .labels = &.{} };
 
 const test_owner = dns.Name{
@@ -1996,8 +1995,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
 test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     // A DS RRset that arrives at the resolver without a covering RRSIG
     // signed by the parent zone's DNSKEY MUST NOT be trusted as a chain
-    // anchor. Without C4's verify step, hark used to cache such records
-    // as .unchecked and let DNSKEY validation indirectly bless them.
+    // anchor.
     const owner = dns.Name{ .labels = &.{ "example", "com" } };
     const ds_record = dns.ResourceRecord{
         .name = owner,
@@ -2408,7 +2406,7 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
     }
 }
 
-// ── M8d: Canonical ordering and NSEC/NSEC3 tests ────────────────────
+// ── Canonical ordering and NSEC/NSEC3 tests ─────────────────────────
 
 test "canonical name ordering" {
     const root = dns.Name{ .labels = &.{} };
@@ -4264,7 +4262,7 @@ test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
     );
 }
 
-// ── H3: RSA key validation tests ────────────────────────────────────
+// ── RSA key validation tests ────────────────────────────────────────
 
 test "verifyRsa accepts 1024-bit (128-byte) modulus key parsing" {
     // Build a minimal RSA key with 128-byte modulus (1024-bit)
