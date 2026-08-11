@@ -1110,7 +1110,7 @@ pub const RecursiveResolver = struct {
         if (self.bypass_cache or !self.dnssec_enabled) return null;
         const nc = self.nsec_cache orelse return null;
         const synth = nc.lookupSuffixes(allocator, target_name, qtype, current_name) orelse return null;
-        switch (synth.rcode) {
+        switch (synth.kind) {
             .nxdomain, .nodata => |rc| {
                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
                 return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, chain);

@@ -264,19 +264,19 @@ fn isParentSideNsec(nsec: *const NsecEntry, target: dns.Name, qtype: dns.RType) 
 
 /// Result of an aggressive NSEC lookup (RFC 8198).
 pub const SynthResult = struct {
-    rcode: RCode,
+    kind: Kind,
     /// SOA for authority section (RFC 2308 §3), cloned into caller's allocator.
     soa: dns.ResourceRecord,
     /// For wildcard_match: label count of the closest encloser. Caller reconstructs
     /// *.CE from the qname it already has (CE is the last ce_label_count labels).
     ce_label_count: u8 = 0,
-    /// NSEC records (and their covering RRSIGs) that justify `rcode` for
+    /// NSEC records (and their covering RRSIGs) that justify `kind` for
     /// this specific qname (RFC 4035 §3.1.3.x). Cloned into caller_alloc;
     /// caller appends to authority for downstream revalidation. Empty when
     /// upstream omitted RRSIGs or only the SOA proves the negative.
     proofs: []dns.ResourceRecord = &.{},
 
-    pub const RCode = enum { nxdomain, nodata, wildcard_match };
+    pub const Kind = enum { nxdomain, nodata, wildcard_match };
 };
 
 pub const NsecCache = struct {
@@ -482,11 +482,8 @@ pub const NsecCache = struct {
         // a non-delegation NSEC range from this zone could falsely cover names
         // in a child zone (e.g., a .com NSEC covering nnn.example.com).
         // Verify the direct-child ancestor is covered (proving it doesn't exist,
-        // so no delegation is possible). DS used to be exempt here on the
-        // theory that the parent always answers it — but the parent's
-        // authority stops at the cut, and a wrap-cover shape could make the
-        // exemption load-bearing later. isParentSideNsec carries the DS rule;
-        // this guard has no business restating it.
+        // so no delegation is possible). No DS exemption: the DS rule lives in
+        // isParentSideNsec, not here.
         const zone_label_count = zoneLabelsLen(zone_lower);
         if (qname.labels.len > zone_label_count + 1) {
             const direct_child = dns.Name{ .labels = qname.labels[qname.labels.len - zone_label_count - 1 ..] };
@@ -497,7 +494,7 @@ pub const NsecCache = struct {
 
         var proof_refs: [2]*const NsecEntry = undefined;
         var proof_ref_count: usize = 0;
-        const rcode: SynthResult.RCode, const ce_len: u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
+        const kind: SynthResult.Kind, const ce_len: u8 = switch (tryNameNonExistence(list, qname, qtype, now)) {
             .nxdomain => |refs| blk: {
                 proof_refs[0] = refs.qname_cover;
                 proof_refs[1] = refs.wildcard_cover;
@@ -537,7 +534,7 @@ pub const NsecCache = struct {
         }
         const proofs = cloneProofs(caller_alloc, proof_refs[0..proof_ref_count], now);
         _ = self.hits.fetchAdd(1, .monotonic);
-        return .{ .rcode = rcode, .soa = soa, .ce_label_count = ce_len, .proofs = proofs };
+        return .{ .kind = kind, .soa = soa, .ce_label_count = ce_len, .proofs = proofs };
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
@@ -722,10 +719,10 @@ fn freeSynth(alloc: Allocator, r: *SynthResult) void {
     if (r.proofs.len > 0) alloc.free(r.proofs);
 }
 
-fn expectSynth(alloc: Allocator, result: ?SynthResult, expected: SynthResult.RCode) !void {
+fn expectSynth(alloc: Allocator, result: ?SynthResult, expected: SynthResult.Kind) !void {
     var r = result orelse return error.TestExpectedEqual;
     defer freeSynth(alloc, &r);
-    try testing.expectEqual(expected, r.rcode);
+    try testing.expectEqual(expected, r.kind);
 }
 
 test "NSEC cache: NODATA synthesis" {
@@ -839,10 +836,9 @@ test "NSEC cache: NXDOMAIN synthesis without apex NSEC (nlnetlabs.nl shape)" {
 const bitmap_delegation = &[_]u8{ 0, 6, 0x20, 0x00, 0x00, 0x00, 0x00, 0x03 };
 
 test "NSEC cache: parent-side qname-cover usable when qname NOT at-or-below owner" {
-    // TLD-style: every non-apex NSEC is parent-side (NS+!SOA). The store-time
-    // filter used to drop them all; the predicate only blocks at-or-below, so
-    // sibling NXDOMAINs synthesise from the same proof material the on-wire
-    // validator already accepts.
+    // TLD-style: every non-apex NSEC is parent-side (NS+!SOA). The predicate
+    // only blocks at-or-below, so sibling NXDOMAINs synthesise from the same
+    // proof material the on-wire validator already accepts.
     const alloc = testing.allocator;
     test_time = 1000000;
     var nc = testCache(alloc);
@@ -1046,7 +1042,7 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
     defer dns.freeName(alloc, qname);
     var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
     defer freeSynth(alloc, &result);
-    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    try testing.expectEqual(SynthResult.Kind.wildcard_match, result.kind);
     try testing.expect(result.ce_label_count > 0);
 }
 
@@ -1203,7 +1199,7 @@ test "NSEC cache: parent-zone depth check prevents cross-zone coverage" {
     defer dns.freeName(alloc, deep_name);
     try testing.expect(nc.lookupSuffixes(alloc, deep_name, .a, "nnn.example.com") == null);
 
-    // DS queries are exempt from the depth check (parent zone answers them)
+    // DS gets no exemption — same depth rejection.
     try testing.expect(nc.lookupSuffixes(alloc, deep_name, .ds, "nnn.example.com") == null);
 }
 
@@ -1267,7 +1263,7 @@ test "NSEC cache: wildcard match returns wildcard_match" {
     defer dns.freeName(alloc, qname);
     var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
     defer freeSynth(alloc, &result);
-    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    try testing.expectEqual(SynthResult.Kind.wildcard_match, result.kind);
     try testing.expect(result.ce_label_count > 0);
 }
 
@@ -1315,7 +1311,7 @@ test "NSEC cache: wildcard_match proofs carry NSEC + covering RRSIG" {
     defer dns.freeName(alloc, qname);
     var result = nc.lookupSuffixes(alloc, qname, .a, "foo.example.com") orelse return error.TestExpectedEqual;
     defer freeSynth(alloc, &result);
-    try testing.expectEqual(SynthResult.RCode.wildcard_match, result.rcode);
+    try testing.expectEqual(SynthResult.Kind.wildcard_match, result.kind);
     // 1 NSEC (qname cover) + 1 RRSIG covering it.
     try testing.expectEqual(@as(usize, 2), result.proofs.len);
     var saw_nsec = false;
@@ -1418,12 +1414,9 @@ test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {
 
 // ── DS queries and empty non-terminals ────────────────────────────────
 //
-// The suite had no test for either, which is why three defects lived here:
-// every rule below exists in dnssec.zig or RFC 8198 Appendix B and was
-// simply never ported into the aggressive cache. The cache re-derives
-// negative-proof semantics from geometry while the on-wire validator
-// carries the shape-specific exceptions — any rule added to one belongs
-// in both.
+// The cache re-derives negative-proof semantics from geometry while the
+// on-wire validator carries the shape-specific exceptions — any rule
+// added to one belongs in both.
 
 test "NSEC cache: DS query below a delegation is not answered from the parent" {
     // `bar.example.com NSEC qux.example.com` with NS set and SOA clear is the
