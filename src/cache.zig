@@ -424,7 +424,7 @@ fn deriveShardCount(reader_concurrency: u32, max_entries: u32) u32 {
     return std.math.clamp(@min(by_concurrency, by_budget), min_shards, max_shards);
 }
 
-/// Read-path stat counters (hits/misses/prefetch_eligible/stale_hits) are
+/// Read-path stat counters (hits/misses/prefetch_eligible/stale_hits/expired_remiss) are
 /// bumped on every cache hit/miss; as per-shard atomics they contended one
 /// line across all readers of a hot shard. Stripe by thread into cache-line
 /// slots so each reader bumps its own line; getStats sums. Advisory: a slot is
@@ -479,7 +479,6 @@ const Shard = struct {
     // (they were contending one line per shard); write-path counters below run
     // under the exclusive lock and are rare.
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    negative_stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
     cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -586,7 +585,6 @@ pub const RRsetCache = struct {
         hits: u64 = 0,
         misses: u64 = 0,
         stores: u64 = 0,
-        negative_stores: u64 = 0,
         evictions: u64 = 0,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
         cap_exhausted_evictions: u64 = 0,
@@ -608,7 +606,6 @@ pub const RRsetCache = struct {
             stats.memory_bytes += shard.counting.current_bytes.load(.monotonic);
             stats.max_bytes += shard.counting.max_bytes;
             stats.stores += shard.stores.load(.monotonic);
-            stats.negative_stores += shard.negative_stores.load(.monotonic);
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
             stats.byte_pressure_evictions += shard.byte_pressure_evictions.load(.monotonic);
@@ -979,7 +976,6 @@ pub const RRsetCache = struct {
             return;
         };
         markLastVisited(slot.shard);
-        _ = slot.shard.negative_stores.fetchAdd(1, .monotonic);
     }
 
     /// Store a bare negative entry (no SOA required).
@@ -1026,7 +1022,6 @@ pub const RRsetCache = struct {
             return;
         };
         markLastVisited(slot.shard);
-        _ = slot.shard.negative_stores.fetchAdd(1, .monotonic);
     }
 
     /// Cache a resolution failure per RFC 9520 §3. TTL chosen short (5 s)
@@ -1064,12 +1059,6 @@ pub const RRsetCache = struct {
 
     // ── Internal ──────────────────────────────────────────────────────
 
-    /// RFC 9520 §3.4 anti-downgrade. Block writes that would lower the
-    /// trust rank of a non-expired entry. Same-rank overwrites land
-    /// (refresh, zone-state flip), upgrades land (CD=1 revalidation),
-    /// downgrades skip — so a forged `.insecure` cannot displace a real
-    /// `.secure`, and a CD=1 `.unchecked` cannot displace either.
-    /// Caller passes the precomputed hash to avoid double-hashing.
     /// Displacement policy for a store finding a live entry in its slot.
     /// `.unless_fresh` is for failure markers, which never displace a fresh
     /// entry of any status; checked under the shard write lock so a
@@ -1079,6 +1068,10 @@ pub const RRsetCache = struct {
 
     /// One home for "may this write displace the existing entry": the RFC
     /// 9520 §3.4 anti-downgrade rank check plus the failure-marker policy.
+    /// Same-rank overwrites land (refresh, zone-state flip), upgrades land
+    /// (CD=1 revalidation), downgrades skip — so a forged `.insecure` cannot
+    /// displace a real `.secure`, and a CD=1 `.unchecked` cannot displace
+    /// either.
     fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus, overwrite: Overwrite) bool {
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const existing = shard.map.values()[idx];
