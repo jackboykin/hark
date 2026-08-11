@@ -26,7 +26,7 @@ class UnboundConfig:
     # cache-min-ttl: when >0, Unbound silently bumps every record's TTL to
     # this floor — *including* records the auth marked TTL=0 to prevent
     # caching. Hark's parallel `[cache] min-ttl` knob explicitly excludes
-    # TTL=0 from the bump (`cache.zig:871,776`). The differential test sets
+    # TTL=0 from the bump (cache.zig `storeNegative`/`storeOneRRset`). The differential test sets
     # this >0 to surface the divergence; production resolvers commonly run
     # cache-min-ttl=60-300 for upstream-load shaping.
     #

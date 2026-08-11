@@ -1,8 +1,8 @@
 """Spawn and control a hark subprocess for one scenario.
 
 Writes a generated TOML config (listen address, root hints, upstream port,
-loopback bypass) to a temp file, launches hark, waits until it's ready by
-probing it with a SOA query for the root, and tears it down at exit.
+loopback bypass) to a temp file, launches hark, waits until it accepts a
+TCP connection on its listen port, and tears it down at exit.
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ def find_hark_binary() -> Path:
             capture_output=True,
         )
     except FileNotFoundError as e:
-        raise RuntimeError("`zig` not found in PATH; install zig 0.16+") from e
+        raise RuntimeError("`zig` not found in PATH; install zig 0.17+") from e
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
             f"`zig build -Dtesting=true` failed:\n{e.stderr.decode(errors='replace')}"

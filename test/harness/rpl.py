@@ -45,8 +45,8 @@ import dns.rrset
 
 # Union of MATCH flags accepted anywhere (responder entries, CHECK_ANSWER,
 # CHECK_QUERY_LOG) — used at parse time to catch typos like `MATCH quesiton`.
-# Context-specific rejection is the responder's job; parse-time only filters
-# obvious nonsense.
+# No per-context validation exists: flags that a context does not honour
+# (e.g. `tcp` on CHECK_ANSWER) parse fine and are silently ignored.
 MATCH_VALID_FLAGS = frozenset({
     # responder-side (entry-matching)
     "opcode", "qname", "qtype", "qclass", "question", "subdomain",
@@ -351,8 +351,12 @@ class _Parser:
 
         if kind == "TIME_PASSES":
             # Accept both `EVAL "<n>"` (docs) and `ELAPSE <n>` (corpus convention).
+            # A bare TIME_PASSES would advance the clock by 0 — a silent no-op
+            # assertion-launderer — so refuse it at parse time.
             m = re.search(r'EVAL\s+"(\d+)"', line) or re.search(r"ELAPSE\s+(\d+)", line)
-            return Step(n=n, kind=kind, time_seconds=int(m.group(1)) if m else 0)
+            if m is None:
+                raise self.err("TIME_PASSES needs `ELAPSE <n>` or `EVAL \"<n>\"`")
+            return Step(n=n, kind=kind, time_seconds=int(m.group(1)))
 
         if kind == "TIMEOUT":
             # `STEP n TIMEOUT` — instructs the responder to drop the next

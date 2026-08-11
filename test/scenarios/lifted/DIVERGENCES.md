@@ -127,9 +127,11 @@ past its usefulness — so hark serves cached positive answers without it.
 ## 5. Multi-NS fallthrough & stale-glue re-resolution — *mostly closed*
 
 Not its own lifted scenario, but the connective tissue between several:
-`iter_cname_cache.rpl` exercises the case where one NS's glue TTL expires and
-the remaining siblings all SERVFAIL. Hark does not re-resolve the expired
-NS's address, so it can give up where a re-resolving resolver would recover.
+`iter_cname_cache.rpl` (must-pass, and passing) exercises the case where one
+NS's glue TTL expires and the remaining siblings all SERVFAIL. The theoretical
+remainder — hark does not re-resolve an expired NS's address, so a shape this
+scenario does not reach could give up where a re-resolving resolver recovers —
+is the stale-glue gap below, not something this scenario discriminates on.
 
 The broader "one failing NS must not condemn the resolution" story (RFC 1034
 §4.3.5) is **fixed** for SERVFAIL / REFUSED / FORMERR via

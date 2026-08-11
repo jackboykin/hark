@@ -66,7 +66,7 @@ MANIFEST: list[LiftedEntry] = [
     LiftedEntry("iter_resolve_minimised.rpl",             "iter_resolve",     "hark QMIN merges probe+final at the target name; Unbound sends an extra A-probe before the original-qtype query. RFC 9156 §3.2 permits both ('MAY use the original qtype for the QM query')."),
     LiftedEntry("iter_resolve_minimised_timeout.rpl",     "iter_resolve",     "same QMIN-at-target divergence as iter_resolve_minimised"),
 
-    # iter_cname — CNAME-chase edges; cluster of hark divergences (xfail strict)
+    # iter_cname — CNAME-chase edges; all pass (xfail-strict guards regression)
     LiftedEntry("iter_cname_double.rpl",                  "iter_cname",       None),
     LiftedEntry("iter_cname_minimise.rpl",                "iter_cname",       None),
     # iter_cname_minimise_nx is not vendored — see the "deliberately not
