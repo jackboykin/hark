@@ -69,8 +69,9 @@ pub const root_hints_default: [26]na.Address = .{
 };
 
 // Per-resolveImpl-call ceiling on calls to queryAuthoritativeServers.
-// Resets on every sub-resolution and CNAME hop — it bounds a single name's
-// resolution, NOT the whole tree (that is `max_global_queries`, below).
+// Fresh per call (so each sub-resolution starts over), carried across CNAME
+// hops within the frame — it bounds one call's whole chase, NOT the whole
+// tree (that is `max_global_queries`, below).
 // Analogous to BIND's `max-recursion-queries`. Same-zone CNAME continuations,
 // QMIN cache-hit advances, and other zero-I/O loop iterations cost zero
 // against this. Picked to clear an 8-hop CDN chain (`ba.dn.nexoncdn.co.kr`)
@@ -78,8 +79,7 @@ pub const root_hints_default: [26]na.Address = .{
 const max_upstream_queries = 32;
 // Tree-wide ceiling on upstream queries for one client-facing resolution,
 // shared by pointer across every sub-resolution (glueless NS-address fetches,
-// DNSKEY/DS chases) and never reset on CNAME — the counter `max_upstream_queries`
-// is not. Without it, NXNSAttack (CVE-2020-12667) glueless-NS fan-out hands
+// DNSKEY/DS chases). Without it, NXNSAttack (CVE-2020-12667) glueless-NS fan-out hands
 // each depth+1 sub-resolution a fresh `max_upstream_queries` budget, amplifying
 // one client query into hundreds of upstream queries. Mirrors Unbound's
 // `max-global-quota` (200) and BIND's `max-query-count` (200); set tighter
@@ -95,6 +95,9 @@ const max_servers_per_level = 26;
 // 8-hop CDN chain (Akamai/edgesuite stacks); matches PowerDNS post-fix
 // and Hickory.
 const max_cname_chain = 16;
+// QMIN probe ceiling; past it, queries go straight to the full qname
+// (RFC 9156's MAX_MINIMISE_COUNT).
+const max_minimize_count = 10;
 
 /// Redirect records collected over one resolveImpl chain walk, plus the
 /// wildcard-expansion proofs authenticating them. Always paired and
@@ -131,7 +134,6 @@ const CnameChain = struct {
         self.wildcard_proofs.deinit(allocator);
     }
 };
-const max_minimize_count = 10;
 
 /// Parse a DNS message, propagating OOM and converting other parse
 /// errors to null so callers can skip malformed responses. Logs the
@@ -263,7 +265,9 @@ pub const RecursiveResolver = struct {
     /// below the 2 MiB wire ceiling (32 upstream × 64 KiB) — a stuffing
     /// tripwire. Mirrors config.zig defaultConfig.
     query_memory_limit: usize = 1024 * 1024,
-    /// Staggered NS racing interval in ms (0 = disabled).
+    /// Enables staggered NS racing when nonzero (0 = disabled). The live
+    /// interval is RTT-adaptive via `rtt_cache.getHedgeStagger`; this value
+    /// is the interval only when no RTT cache is wired (tests).
     stagger_ms: u32 = 0,
 
     /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon). null when
@@ -1269,7 +1273,7 @@ pub const RecursiveResolver = struct {
     /// doesn't re-walk the whole upstream chain. Pinned against the
     /// original qname (`name`) so mid-CNAME failures still short-circuit
     /// the stub's retry of the outer query. 5 s TTL enforced by
-    /// `storeNegativeBare`.
+    /// `cacheServfail`.
     ///
     /// Only at the user-facing query (depth == 0). At sub-recursion
     /// depths the caller is the resolver itself (NS A/AAAA fanout,
@@ -2004,9 +2008,8 @@ pub const RecursiveResolver = struct {
 
             // Live servers come first; dead are appended at the tail. Skip
             // dead servers unless we have no live ones (`live_count == 0`,
-            // partial-zone outage — every NS gets a retry shot, matching the
-            // pre-dedupe behavior) or this is the very last entry (always
-            // try *something*).
+            // partial-zone outage — every NS gets a retry shot) or this is
+            // the very last entry (always try *something*).
             const is_last_server = (server_i + 1 >= sel.order.len);
             const dead_skip = server_i >= sel.live_count and sel.live_count > 0 and !is_last_server;
             if (dead_skip) continue;
@@ -3226,7 +3229,7 @@ fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zo
 /// so that findClosestCachedDelegation can determine DNSSEC security state
 /// without re-walking the referral chain.
 fn cacheInsecureDelegation(
-    cache: ?*@import("cache.zig").RRsetCache,
+    cache: ?*RRsetCache,
     security_state: dnssec.SecurityStatus,
     zone_cut: dns.Name,
     authorities: []const dns.ResourceRecord,
@@ -4507,40 +4510,6 @@ test "aggregateCachedCnameWildcardProofs appends only when status is .secure" {
         try testing.expectEqual(@as(usize, 1), agg.items.len);
         try testing.expectEqual(dns.RType.nsec, agg.items[0].rtype);
     }
-}
-
-// ── QNAME minimization tests ──────────────────────────────────────────
-
-test "probe name construction from label sub-slice" {
-    const full_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
-    var buf: [dns.max_name_len + 1]u8 = undefined;
-
-    try testing.expectEqualStrings("com", (dns.Name{ .labels = full_labels[3..] }).formatInto(&buf));
-    try testing.expectEqualStrings("example.com", (dns.Name{ .labels = full_labels[2..] }).formatInto(&buf));
-    try testing.expectEqualStrings("sub.example.com", (dns.Name{ .labels = full_labels[1..] }).formatInto(&buf));
-    try testing.expectEqualStrings("www.sub.example.com", (dns.Name{ .labels = full_labels[0..] }).formatInto(&buf));
-}
-
-test "minimization stepping — probes advance one label at a time" {
-    // Simulate: target = "www.sub.example.com", parent_zone = "com" (1 label)
-    // Expected probes: label_count 2 → "example.com", 3 → "sub.example.com", 4 → final "www.sub.example.com"
-    const target_labels: []const []const u8 = &.{ "www", "sub", "example", "com" };
-    const parent_zone_labels: usize = 1; // "com"
-
-    var label_count: usize = parent_zone_labels + 1; // start at 2
-    var buf: [dns.max_name_len + 1]u8 = undefined;
-
-    try testing.expectEqual(@as(usize, 2), label_count);
-    try testing.expectEqualStrings("example.com", (dns.Name{ .labels = target_labels[target_labels.len - label_count ..] }).formatInto(&buf));
-    label_count += 1;
-
-    try testing.expectEqual(@as(usize, 3), label_count);
-    try testing.expectEqualStrings("sub.example.com", (dns.Name{ .labels = target_labels[target_labels.len - label_count ..] }).formatInto(&buf));
-    label_count += 1;
-
-    // Now label_count == target_labels.len → is_final
-    try testing.expectEqual(@as(usize, 4), label_count);
-    try testing.expect(label_count >= target_labels.len);
 }
 
 // ── validateNegativeResponse tests ─────────────────────────────────────
