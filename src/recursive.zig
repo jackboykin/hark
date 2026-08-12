@@ -513,7 +513,7 @@ pub const RecursiveResolver = struct {
                 }
                 for (rdata[pos..][0..label_len]) |c| {
                     buf[len] = switch (c) {
-                        'a'...'z', '0'...'9', '-', '_' => c,
+                        'a'...'z', '0'...'9', '-' => c,
                         'A'...'Z' => c | 0x20,
                         else => continue :rr_loop,
                     };
