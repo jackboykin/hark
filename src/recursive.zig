@@ -1937,6 +1937,29 @@ pub const RecursiveResolver = struct {
         responding_server: ?na.Address,
     };
 
+    /// Which all-siblings-failed rcode a stub deserves: the most
+    /// resolver-meaningful one wins, so the randomized NS order can't flip
+    /// the surfaced answer. SERVFAIL ("I couldn't resolve this") outranks
+    /// REFUSED (a policy stance) outranks FORMERR — a FORMERR only means an
+    /// upstream couldn't parse *hark's* query, never the stub's.
+    fn failurePrecedence(rcode: dns.RCode) u8 {
+        return switch (rcode) {
+            .server_failure => 3,
+            .refused => 2,
+            .format_error => 1,
+            else => 0,
+        };
+    }
+
+    /// Keep `response` as the fallback failure only if it ranks at least as
+    /// high as the one already held; ties keep the later server so behavior
+    /// matches the old last-wins path when every sibling shares an rcode.
+    fn recordFailure(held: *?dns.Message, response: dns.Message) void {
+        if (held.* == null or
+            failurePrecedence(response.header.flags.rcode) >= failurePrecedence(held.*.?.header.flags.rcode))
+            held.* = response;
+    }
+
     /// Query authoritative nameservers in selection order, with staggered
     /// racing and opportunistic TLS. Returns the first useful response.
     fn queryAuthoritativeServers(
@@ -1982,7 +2005,7 @@ pub const RecursiveResolver = struct {
                     if (oc.getStatus(tls_key) != .capable) continue;
                     if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx])) |tls_response| {
                         if (tls_response.header.flags.rcode.isServerError()) {
-                            last_server_failure = tls_response;
+                            recordFailure(&last_server_failure, tls_response);
                         } else {
                             // No RTT/selector feedback from TLS: its latency
                             // would poison the Do53 estimates.
@@ -2034,7 +2057,7 @@ pub const RecursiveResolver = struct {
             // 0.1 — still selectable if siblings degrade).
             if (response.header.flags.rcode.shouldTrySiblingNs()) {
                 self.recordNsOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
-                last_server_failure = response;
+                recordFailure(&last_server_failure, response);
                 continue :server_loop;
             }
 
@@ -2043,7 +2066,7 @@ pub const RecursiveResolver = struct {
             return .{ .message = response, .responding_server = server };
         }
 
-        // Fall back to last SERVFAIL/REFUSED if all servers failed
+        // Every sibling failed: surface the highest-precedence error kept.
         if (last_server_failure) |sf| {
             return .{ .message = sf, .responding_server = null };
         }
