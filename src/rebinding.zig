@@ -295,6 +295,16 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
     try testing.expect(shouldDrop(rrAAAA(public_name, mapped_rfc1918), cfg));
 }
 
+test "extra_block scrubs a configured public CIDR, leaving its siblings alone" {
+    // extra_block earns its keep only on addresses the default set ignores:
+    // a globally-routable CIDR an operator wants treated as internal. The
+    // sibling proves it blocks that CIDR, not "any public address".
+    const block = acl.parse("93.184.216.0/24") orelse return error.ParseFailed;
+    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{block}, .extra_allow = &.{} };
+    try testing.expect(shouldDrop(rrA(public_name, .{ 93, 184, 216, 34 }), cfg));
+    try testing.expect(!shouldDrop(rrA(public_name, .{ 93, 184, 217, 7 }), cfg));
+}
+
 test "svcb hints: private ipv4hint/ipv6hint drop the RR, public hints pass" {
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const private_v4 = comptime svc_prefix ++ svcParam(4, &.{ 192, 168, 1, 1 });
