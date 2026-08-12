@@ -32,6 +32,15 @@ const CacheKey = struct {
     rclass: dns.RClass,
 };
 
+/// NXDOMAIN denies an entire node for every qtype (RFC 8020 §1 / RFC 1035
+/// RCODE 3), so a `name_error` negative is keyed under one reserved rtype
+/// rather than per-qtype: a single A-NXDOMAIN then answers a later AAAA
+/// without re-walking. qtype 0 is IANA-reserved and can never appear in a
+/// real query (RFC 6895 §3.1), so the sentinel slot shares nothing with a
+/// genuine RRset. NODATA (`no_error`) stays per-qtype — it denies only the
+/// queried type.
+const nxdomain_key: dns.RType = @fromBackingInt(@intCast(0));
+
 /// Hash seed randomized at startup to prevent hash collision attacks.
 /// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
 var hash_seed: u64 = 0;
@@ -701,12 +710,31 @@ pub const RRsetCache = struct {
     ) ?CacheLookupResult {
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
+        if (self.lookupKey(caller_alloc, lower_name, rtype, rclass, false)) |result| return result;
+        // A per-qtype miss retries the RFC 8020 sentinel: an NXDOMAIN cached
+        // by an earlier qtype denies this one too. Only name_error lives
+        // there, so any hit is the node-wide denial.
+        if (rtype != nxdomain_key)
+            return self.lookupKey(caller_alloc, lower_name, nxdomain_key, rclass, true);
+        return null;
+    }
+
+    fn lookupKey(
+        self: *RRsetCache,
+        caller_alloc: Allocator,
+        lower_name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+        name_error_only: bool,
+    ) ?CacheLookupResult {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse {
-            _ = self.read_counters[threadCounterSlot()].misses.fetchAdd(1, .monotonic);
+            // The primary probe owns this query's miss; the sentinel retry
+            // rides on the same lookup and must not double-charge it.
+            if (!name_error_only) _ = self.read_counters[threadCounterSlot()].misses.fetchAdd(1, .monotonic);
             return null;
         };
         markVisited(shard, idx);
@@ -716,6 +744,7 @@ pub const RRsetCache = struct {
 
         switch (entry) {
             .positive => |rrset| {
+                if (name_error_only) return null;
                 const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse {
                     self.notifyRemiss(lower_name, rtype);
                     return null;
@@ -739,6 +768,7 @@ pub const RRsetCache = struct {
                 } };
             },
             .negative => |neg| {
+                if (name_error_only and neg.rcode != .name_error) return null;
                 // SERVFAIL never serves stale: short TTL (e.g. 1s for DNSSEC bogus)
                 // is intentional; extending it would prolong failure beyond design.
                 const disable_stale = neg.rcode == .server_failure;
@@ -762,9 +792,10 @@ pub const RRsetCache = struct {
     }
 
     /// RFC 8020: NXDOMAIN at an ancestor proves all names beneath are also
-    /// non-existent. The qtype-keyed negative cache only catches matches for
-    /// the same qtype — never false-cuts, sometimes misses. Non-secure only;
-    /// signed-zone cuts go through the RFC 8198 NSEC aggressive-use cache.
+    /// non-existent. `lookup` folds in the sentinel key, so an ancestor
+    /// NXDOMAIN cached under any qtype cuts here regardless of `rtype` —
+    /// never false-cuts, no longer qtype-blind. Non-secure only; signed-zone
+    /// cuts go through the RFC 8198 NSEC aggressive-use cache.
     pub fn lookupNxdomainAncestor(
         self: *RRsetCache,
         caller_alloc: Allocator,
@@ -940,7 +971,10 @@ pub const RRsetCache = struct {
 
         var lower_buf: [dns.max_name_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
-        const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, .always) orelse return;
+        // RFC 8020: an NXDOMAIN holds for every qtype, so it lands under the
+        // shared sentinel key; NODATA and any other rcode stay type-scoped.
+        const key_rtype = if (rcode == .name_error) nxdomain_key else rtype;
+        const slot = self.prepareSlot(lower_view, key_rtype, rclass, security_status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         const cached_soa = buildCachedRecord(slot.alloc, soa) catch {
@@ -1740,6 +1774,53 @@ test "cache negative NXDOMAIN" {
         },
         .hit => return error.TestUnexpectedResult,
     }
+}
+
+test "NXDOMAIN answers every qtype via the sentinel key (RFC 8020)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
+
+    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    // A single A-query NXDOMAIN must satisfy a later AAAA (and any other
+    // type) with no re-walk.
+    for ([_]dns.RType{ .a, .aaaa, .mx }) |qt| {
+        switch (cache.lookup(arena.allocator(), "nonexistent.example.com", qt, .in) orelse return error.TestExpectedHit) {
+            .negative => |n| try testing.expectEqual(dns.RCode.name_error, n.rcode),
+            .hit => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "NODATA stays type-scoped and never shares the NXDOMAIN sentinel" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
+    defer freeTestAuthorities(alloc, authorities);
+
+    // NODATA denies only the queried type — the name exists.
+    cache.storeNegative("host.example.com", .a, .in, .no_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    switch (cache.lookup(arena.allocator(), "host.example.com", .a, .in) orelse return error.TestExpectedHit) {
+        .negative => |n| try testing.expectEqual(dns.RCode.no_error, n.rcode),
+        .hit => return error.TestUnexpectedResult,
+    }
+    // AAAA must miss: an A-NODATA proves nothing about AAAA.
+    try testing.expect(cache.lookup(arena.allocator(), "host.example.com", .aaaa, .in) == null);
 }
 
 test "storeNegative rejects cross-zone SOA" {
