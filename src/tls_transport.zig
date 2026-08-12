@@ -239,12 +239,21 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
     // Dead-on-arrival (see queryPooled): an idle-closed conn is caught on
     // the read side — the write succeeds under half-close, then the buffered
     // close_notify returns EOF without touching the wire. A peer that RSTs
-    // idle conns instead fails the write with ECONNRESET, which File.Writer
-    // leaves unmapped → .broken; the symptom would be a sawtoothing
-    // capable gauge on the ote stats line.
+    // idle conns instead fails the write; the std File path maps that to
+    // BrokenPipe (EPIPE) or Unexpected (ECONNRESET → errnoBug), never a
+    // distinct reset error. Any transport-level write failure means the
+    // query never reached the server, so it is a cold-pool signal — report
+    // DeadOnArrival and let the dial path judge real deadness, rather than
+    // demoting a healthy server and sawtoothing the capable gauge.
     const handle = conn.stream.socket.handle;
     try sys.updateTimeout(handle, posix.SO.SNDTIMEO, deadline_ns);
-    conn.tls.writeAll(framed) catch return error.TlsSendFailed;
+    conn.tls.writeAll(framed) catch {
+        // net_writer.err is null at entry: errored conns are destroyed,
+        // never re-pooled. Non-null ⇒ the transport killed the write; null
+        // ⇒ a TLS-layer failure, which is a genuine .broken.
+        if (conn.net_writer.err != null) return error.DeadOnArrival;
+        return error.TlsSendFailed;
+    };
 
     try sys.updateTimeout(handle, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
