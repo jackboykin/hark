@@ -1,0 +1,114 @@
+; hark: root-hints = 127.0.10.1
+; hark: stagger-ms = 0
+
+SCENARIO_BEGIN Mixed FORMERR + SERVFAIL siblings surface SERVFAIL deterministically
+
+; example.com is delegated to two NSes. One FORMERRs the leaf, the other
+; SERVFAILs it — both trigger sibling-fallthrough, so hark queries both and
+; ends with no usable answer. The surfaced rcode must NOT depend on which NS
+; happened to be tried last (NS order is reputation/latency-randomized).
+; failurePrecedence (recursive.zig) keeps the highest-severity failure, so
+; SERVFAIL (> FORMERR) is surfaced regardless of order — no rcode-flip.
+;
+; `stagger-ms = 0` forces the sequential server loop so exactly one NS is
+; tried per hop, making the query-log count deterministic. Companion to 007
+; (all-FORMERR) and 008 (all-SERVFAIL); the mixed case is the flip pin.
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority: delegates example.com to TWO NSes ─────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns1.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+    SECTION ADDITIONAL
+      ns1.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+; ── ns1.example.com: NOERROR on the QMIN probe, FORMERR on the leaf ─
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ── ns2.example.com: NOERROR on the QMIN probe, SERVFAIL on the leaf ─
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR SERVFAIL
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; SERVFAIL outranks FORMERR, so it is surfaced no matter the NS order.
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Teeth: the leaf must have been queried at BOTH NSes (presence-only, so
+; order-independent) — both error rcodes are sibling-fallthrough signals.
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    www.example.com. A 127.0.10.3
+    www.example.com. A 127.0.10.4
+ENTRY_END
+
+SCENARIO_END
