@@ -2223,9 +2223,15 @@ pub const RecursiveResolver = struct {
         zone_name: []const u8,
         servers: []const na.Address,
     ) !?[]const dns.ResourceRecord {
-        // Network fetch — don't cache yet (RFC 4035 §5.3: validate first)
-        const resp = try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true, false) orelse return null;
-        if (resp.answers.len == 0) return null;
+        // Network fetch — don't cache yet (RFC 4035 §5.3: validate first).
+        // A fetch that never reaches a live signer is RFC 4035 §4.3
+        // Indeterminate, not Bogus; retry once so a single transient failure
+        // doesn't collapse into a caller-cached SERVFAIL.
+        const resp = for (0..2) |_| {
+            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true, false)) |r| {
+                if (r.answers.len != 0) break r;
+            }
+        } else return null;
 
         const zone_parsed = try dns.parseDottedName(allocator, zone_name);
 
