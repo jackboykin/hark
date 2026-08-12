@@ -40,8 +40,7 @@ const localhost_label = "localhost";
 
 /// Classify a query against the RFC 6761 special-use table.
 pub fn classify(name: []const u8, qtype: dns.RType) Action {
-    // Strip a single trailing dot so "localhost." and "localhost" match.
-    const stripped = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+    const stripped = dns.stripTrailingDot(name);
 
     if (eqlOrSubdomainOf(stripped, localhost_label)) {
         return switch (qtype) {
@@ -74,7 +73,8 @@ pub fn classify(name: []const u8, qtype: dns.RType) Action {
 fn eqlOrSubdomainOf(name: []const u8, tail: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, tail)) return true;
     if (name.len <= tail.len + 1) return false;
-    if (name[name.len - tail.len - 1] != '.') return false;
+    const dot = name.len - tail.len - 1;
+    if (name[dot] != '.' or dns.isEscapedAt(name, dot)) return false;
     return std.ascii.eqlIgnoreCase(name[name.len - tail.len ..], tail);
 }
 
@@ -89,7 +89,7 @@ pub fn synthesize(
     std.debug.assert(action != .none);
     // Lowercase the client-typed name so synthesized owners match the
     // `tryParseMessage` scrub policy.
-    var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+    var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
     if (name.len > lower_buf.len) return error.NameTooLong;
     const lower = dns.lowerNameIntoBuf(&lower_buf, name);
     const qname = try dns.parseDottedName(allocator, lower);
@@ -182,6 +182,12 @@ test "classify no match falls through" {
     try testing.expectEqual(Action.none, classify("notlocalhost.", .a));
     // testing. is not test. (the dot boundary matters)
     try testing.expectEqual(Action.none, classify("testing.com", .a));
+    // A literal dot inside a label is not a subdomain boundary: `foo\.invalid`
+    // is one label and must resolve, not synthesize NXDOMAIN.
+    try testing.expectEqual(Action.none, classify("foo\\.invalid", .a));
+    try testing.expectEqual(Action.none, classify("bar\\.test.example.com", .a));
+    // ...but an escaped backslash before the dot leaves it a real boundary.
+    try testing.expectEqual(Action.nxdomain, classify("x\\\\.invalid", .a));
 }
 
 test "synthesize localhost A produces 127.0.0.1" {

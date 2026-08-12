@@ -406,8 +406,8 @@ fn answersAreWildcardExpanded(answers: []const dns.ResourceRecord) bool {
 }
 
 /// Lowercase a name into a stack buffer for lookup. Returns null if name too long.
-fn lowerNameBuf(buf: *[dns.max_name_len + 1]u8, name: []const u8) ?[]const u8 {
-    if (name.len > dns.max_name_len) return null;
+fn lowerNameBuf(buf: *[dns.max_dotted_len + 1]u8, name: []const u8) ?[]const u8 {
+    if (name.len > dns.max_dotted_len) return null;
     return dns.lowerNameIntoBuf(buf, name);
 }
 
@@ -659,7 +659,7 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) bool {
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
@@ -681,7 +681,7 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?i64 {
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
@@ -708,7 +708,7 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         if (self.lookupKey(caller_alloc, lower_name, rtype, rclass, false)) |result| return result;
         // A per-qtype miss retries the RFC 8020 sentinel: an NXDOMAIN cached
@@ -969,7 +969,7 @@ pub const RRsetCache = struct {
         }
         const proofs = proof_buf[0..proof_count];
 
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
         // RFC 8020: an NXDOMAIN holds for every qtype, so it lands under the
         // shared sentinel key; NODATA and any other rcode stay type-scoped.
@@ -1027,7 +1027,7 @@ pub const RRsetCache = struct {
     ) void {
         if (ttl == 0) return;
 
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
         const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, overwrite) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
@@ -1078,7 +1078,7 @@ pub const RRsetCache = struct {
         rtype: dns.RType,
         rclass: dns.RClass,
     ) bool {
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(key);
@@ -1167,7 +1167,7 @@ pub const RRsetCache = struct {
             }
 
             // Check if we already processed this (name, type) group
-            var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+            var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const lower_name = rr.name.formatLower(&lower_buf);
             var nh = std.hash.Wyhash.init(0);
             nh.update(lower_name);
@@ -3370,15 +3370,17 @@ test "cache key: read-side and write-side name lowering agree byte-for-byte" {
         .{ .labels = &.{ "WWW", "EXAMPLE", "COM" } },
         .{ .labels = &.{ "xn--nxasmq6b", "example" } }, // punycode
         .{ .labels = &.{ "_sip", "_tcp", "example", "com" } }, // SRV underscores
-        .{ .labels = &.{ "\x01\x7fBIN", "TeSt" } }, // non-printables -> '?'
+        .{ .labels = &.{ "\x01\x7fBIN", "TeSt" } }, // non-printables -> \DDD
+        .{ .labels = &.{ "e.D", "CoM" } }, // literal dot -> \.
+        .{ .labels = &.{ "a\\B", "c" } }, // literal backslash -> \\
         .{ .labels = &.{} }, // root
     };
     for (names) |n| {
-        var fmt_buf: [dns.max_name_len + 1]u8 = undefined;
+        var fmt_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const dotted = n.formatInto(&fmt_buf);
-        var read_buf: [dns.max_name_len + 1]u8 = undefined;
+        var read_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const read_key = lowerNameBuf(&read_buf, dotted).?;
-        var write_buf: [dns.max_name_len + 1]u8 = undefined;
+        var write_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const write_key = n.formatLower(&write_buf);
         try testing.expectEqualStrings(write_key, read_key);
     }

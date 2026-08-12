@@ -350,7 +350,7 @@ pub const NsecCache = struct {
         }
 
         // Format + lowercase zone key before lock (DNS is case-insensitive)
-        var zone_lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var zone_lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const zone_lower = zone.formatLower(&zone_lower_buf);
 
         const now = self.now_fn();
@@ -438,7 +438,7 @@ pub const NsecCache = struct {
         const now = self.now_fn();
 
         // Lowercase the full name once; suffix slices reuse this buffer.
-        var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name_lower = dns.lowerNameIntoBuf(&lower_buf, dotted_name);
 
         if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
@@ -450,7 +450,7 @@ pub const NsecCache = struct {
 
         // Walk parent suffixes (most-specific first)
         var pos: usize = 0;
-        while (mem.indexOfScalarPos(u8, name_lower, pos, '.')) |dot| {
+        while (dns.indexOfUnescapedDot(name_lower, pos)) |dot| {
             pos = dot + 1;
             const zone_lower = name_lower[pos..];
             if (zone_lower.len == 0) break;
@@ -553,8 +553,10 @@ pub const NsecCache = struct {
 fn zoneLabelsLen(zone_lower: []const u8) usize {
     if (zone_lower.len == 0) return 0;
     var count: usize = 1;
-    for (zone_lower) |c| {
-        if (c == '.') count += 1;
+    var pos: usize = 0;
+    while (dns.indexOfUnescapedDot(zone_lower, pos)) |dot| {
+        count += 1;
+        pos = dot + 1;
     }
     return count;
 }
@@ -1359,6 +1361,9 @@ test "zoneLabelsLen" {
     try testing.expectEqual(@as(usize, 1), zoneLabelsLen("com"));
     try testing.expectEqual(@as(usize, 2), zoneLabelsLen("example.com"));
     try testing.expectEqual(@as(usize, 3), zoneLabelsLen("sub.example.com"));
+    // Escaped dots are label content, not boundaries.
+    try testing.expectEqual(@as(usize, 2), zoneLabelsLen("a\\.b.com"));
+    try testing.expectEqual(@as(usize, 3), zoneLabelsLen("a\\\\.b.com"));
 }
 
 test "NSEC cache: root-zone NXDOMAIN synthesis for single-label qname" {

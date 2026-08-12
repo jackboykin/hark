@@ -67,9 +67,8 @@ fn printName(name: dns.Name, writer: anytype) !void {
         try writer.print(".", .{});
         return;
     }
-    for (name.labels) |label| {
-        try writer.print("{s}.", .{label});
-    }
+    var buf: [dns.max_dotted_len + 1]u8 = undefined;
+    try writer.print("{s}.", .{name.formatInto(&buf)});
 }
 
 fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {

@@ -1692,7 +1692,7 @@ const WorkerState = struct {
         if (validateQuery(query_msg)) |_| return false;
         const question = query_msg.questions[0];
 
-        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
 
         // Clock-advance control queries must reach the slow-path intercept;
@@ -1787,7 +1787,7 @@ const WorkerState = struct {
             }
 
             const question = query.questions[0];
-            var name_buf: [dns.max_name_len + 1]u8 = undefined;
+            var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const name_str = question.name.formatInto(&name_buf);
 
             const start_ns = monotonic.nowNs();
@@ -1971,7 +1971,7 @@ const WorkerState = struct {
         }
 
         const question = query_msg.questions[0];
-        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
 
         const start_ns = monotonic.nowNs();

@@ -174,7 +174,7 @@ pub fn scrub(
 
     // One line per scrubbed answer, not per RR — a hostile domain can carry
     // hundreds of private-address records.
-    var name_buf: [dns.max_name_len + 1]u8 = undefined;
+    var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
     log.info("scrub dropped={d} owner={s}", .{ drop_count, records[first_drop].name.formatLower(&name_buf) });
 
     // Orphan-RRSIG sweep. Dropping any record from an rrset invalidates

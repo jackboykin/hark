@@ -282,7 +282,7 @@ pub const RecursiveResolver = struct {
     /// deep in recursion, far from any caller allocator), duped into the
     /// query arena at `resolve()`'s tail.
     pending_dnskey_prefetch: ?[]const u8 = null,
-    pending_dnskey_buf: [dns.max_name_len + 1]u8 = undefined,
+    pending_dnskey_buf: [dns.max_dotted_len + 1]u8 = undefined,
 
     /// Mirrors config `prefetch-cousin`; gates SVCB cousin extraction.
     prefetch_cousin: bool = true,
@@ -524,7 +524,7 @@ pub const RecursiveResolver = struct {
             if (len == 0) continue;
             const target = buf[0..len];
             if (std.ascii.eqlIgnoreCase(target, qname)) continue;
-            var owner_buf: [dns.max_name_len + 1]u8 = undefined;
+            var owner_buf: [dns.max_dotted_len + 1]u8 = undefined;
             if (mem.eql(u8, target, rr.name.formatLower(&owner_buf))) continue;
             return target;
         }
@@ -617,7 +617,7 @@ pub const RecursiveResolver = struct {
                 // Build probe name from target's trailing labels, or use the full name.
                 const query_name: []const u8 = if (is_final) current_name else blk: {
                     const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
-                    var child_buf: [dns.max_name_len + 1]u8 = undefined;
+                    var child_buf: [dns.max_dotted_len + 1]u8 = undefined;
                     break :blk try allocator.dupe(u8, child_view.formatInto(&child_buf));
                 };
                 const query_type: dns.RType = if (is_final) qtype else .a;
@@ -1174,7 +1174,7 @@ pub const RecursiveResolver = struct {
         while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
             const cut_labels = target_name.labels[target_name.labels.len - probe_depth ..];
             const candidate_cut = dns.Name{ .labels = cut_labels };
-            var cut_buf: [dns.max_name_len + 1]u8 = undefined;
+            var cut_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const cut_name = candidate_cut.formatInto(&cut_buf);
             if (self.reproveDelegationSecurity(allocator, cut_name, servers) == null and
                 hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
@@ -1433,7 +1433,7 @@ pub const RecursiveResolver = struct {
             if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
         }
         // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
-        var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+        var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
         if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
             return .secure;
         return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
@@ -1456,7 +1456,7 @@ pub const RecursiveResolver = struct {
         const ce = dns.Name{ .labels = target_name.labels[target_name.labels.len - ce_label_count ..] };
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         const wc_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return null;
-        var wc_buf: [dns.max_name_len + 1]u8 = undefined;
+        var wc_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const wc_dotted = wc_name.formatInto(&wc_buf);
 
         const c = self.cache orelse return null;
@@ -2495,7 +2495,7 @@ pub const RecursiveResolver = struct {
                 break rr.rdata.rrsig.signer_name;
             } else return null;
             if (!zone.isSubdomainOf(signer) or zone.eql(signer)) return null;
-            var signer_buf: [dns.max_name_len + 1]u8 = undefined;
+            var signer_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
             var ds_ttl_cap: u32 = std.math.maxInt(u32);
@@ -3104,7 +3104,7 @@ pub const RecursiveResolver = struct {
 
         // cache.lookup re-copies the name into its own buffer; pass the
         // stack-formatted slice directly instead of duping into the arena.
-        var name_buf: [dns.max_name_len + 1]u8 = undefined;
+        var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const ns_dotted = ns_name.formatInto(&name_buf);
 
         const before = count.*;
@@ -3140,18 +3140,20 @@ pub const RecursiveResolver = struct {
         target_name: []const u8,
     ) !?DelegationResult {
         const cache = self.cache orelse return null;
+        const name = dns.stripTrailingDot(target_name);
+        if (name.len == 0) return null;
 
-        // Split into labels
-        var parts: [dns.max_label_count + 1][]const u8 = undefined;
+        // Byte offset of each label; suffix i is name[starts[i]..].
+        var starts: [dns.max_label_count + 1]u16 = undefined;
         var part_count: usize = 0;
-        var iter = mem.splitScalar(u8, target_name, '.');
-        while (iter.next()) |part| {
-            if (part.len == 0) continue;
-            if (part_count >= dns.max_label_count + 1) break;
-            parts[part_count] = part;
-            part_count += 1;
+        {
+            var pos: usize = 0;
+            while (part_count < starts.len) {
+                starts[part_count] = @intCast(pos);
+                part_count += 1;
+                pos = (dns.indexOfUnescapedDot(name, pos) orelse break) + 1;
+            }
         }
-        if (part_count == 0) return null;
 
         // Walk from TLD toward full name, looking for cached NS + addresses.
         // Intermediate NS/glue clones live in a scratch arena that is reset
@@ -3167,19 +3169,7 @@ pub const RecursiveResolver = struct {
         var i: usize = part_count;
         while (i > 0) {
             i -= 1;
-            // Build zone name string from parts[i..part_count]
-            var zone_buf: [dns.max_name_len + 1]u8 = undefined;
-            var pos: usize = 0;
-            for (parts[i..part_count]) |p| {
-                if (pos > 0) {
-                    zone_buf[pos] = '.';
-                    pos += 1;
-                }
-                if (pos + p.len > dns.max_name_len) break;
-                @memcpy(zone_buf[pos..][0..p.len], p);
-                pos += p.len;
-            }
-            const zone_str = zone_buf[0..pos];
+            const zone_str = name[starts[i]..];
 
             _ = scratch_arena.reset(.retain_capacity);
             const scratch = scratch_arena.allocator();
@@ -3246,7 +3236,7 @@ pub const RecursiveResolver = struct {
 
 fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zone: dns.Name) bool {
     const c = cache orelse return false;
-    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
     const ds_result = c.lookup(allocator, zone.formatInto(&zone_buf), .ds, .in) orelse return false;
     return switch (ds_result) {
         .negative => true,
@@ -3274,7 +3264,7 @@ fn cacheInsecureDelegation(
         if (rr.ttl > 0 and rr.ttl < neg_ttl) neg_ttl = rr.ttl;
     }
 
-    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
     c.storeNegativeBare(zone_cut.formatInto(&zone_buf), .ds, .in, .no_error, neg_ttl, .insecure, .always);
 }
 
@@ -3330,7 +3320,7 @@ fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
     // Lowercase the client-typed name before parsing so the synthetic
     // HINFO owner doesn't echo back mixed case (same scrub policy as the
     // upstream-reply path in `tryParseMessage`).
-    var lower_buf: [dns.max_name_len + 1]u8 = undefined;
+    var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
     if (name.len > lower_buf.len) return error.NameTooLong;
     const lower = dns.lowerNameIntoBuf(&lower_buf, name);
     const qname = try dns.parseDottedName(allocator, lower);
@@ -3349,7 +3339,7 @@ fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
 
 /// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.
 fn parentZoneOf(zone_name: []const u8) []const u8 {
-    const pos = mem.indexOfScalar(u8, zone_name, '.') orelse return "";
+    const pos = dns.indexOfUnescapedDot(zone_name, 0) orelse return "";
     if (pos + 1 >= zone_name.len) return "";
     return zone_name[pos + 1 ..];
 }
@@ -3373,7 +3363,7 @@ fn epochNowU32() u32 {
 }
 
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
-    var buf: [dns.max_name_len + 1]u8 = undefined;
+    var buf: [dns.max_dotted_len + 1]u8 = undefined;
     return allocator.dupe(u8, name.formatInto(&buf));
 }
 
@@ -3498,7 +3488,7 @@ fn cnameTargetRevisitsChain(chain: []const dns.ResourceRecord, next_target: dns.
 /// CNAME loop-detection branches. Single format string keeps both
 /// branches reading the same telemetry.
 fn logCnameLoop(target: dns.Name, where: []const u8) void {
-    var buf: [dns.max_name_len + 1]u8 = undefined;
+    var buf: [dns.max_dotted_len + 1]u8 = undefined;
     log.debug("cname loop detected ({s}): target {s} already in chain", .{ where, target.formatInto(&buf) });
 }
 
@@ -3757,7 +3747,7 @@ fn validateNegativeResponse(
             // Diagnostic for the fail-closed path: a real-world broken auth
             // (or a middlebox stripping NSEC) shows up here as SERVFAIL
             // where other resolvers may serve unauthenticated.
-            var name_buf: [dns.max_name_len + 1]u8 = undefined;
+            var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
             var qtype_buf: [24]u8 = undefined;
             log.warn(
                 "incomplete NSEC/NSEC3 proof for {s} {s} (nx={}); SERVFAIL per RFC 4035 §5.4",
@@ -5410,7 +5400,7 @@ test "cacheInsecureDelegation bounds the negative DS by the proof's ttl cap" {
 
     var look = std.heap.ArenaAllocator.init(alloc);
     defer look.deinit();
-    var zone_buf: [dns.max_name_len + 1]u8 = undefined;
+    var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
     const got = cache.lookup(look.allocator(), zone.formatInto(&zone_buf), .ds, .in) orelse return error.TestExpectedHit;
     try testing.expect(got.negative.remaining_ttl <= 7);
 }

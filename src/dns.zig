@@ -30,6 +30,9 @@ pub fn hasTcBit(bytes: []const u8) bool {
 pub const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
+/// Presentation-format ceiling: every content byte can escape to `\DDD`
+/// (4 chars), separators are free relative to the wire length budget.
+pub const max_dotted_len = 4 * max_name_len;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
 pub const edns_udp_payload: u16 = 1232;
@@ -182,28 +185,43 @@ pub const Header = struct {
 pub const Name = struct {
     labels: []const []const u8,
 
-    /// Format `self` into `buf` as a dotted string. Returns the written slice so
-    /// callers don't need to re-scan for the null terminator.
-    ///
-    /// Display-lossy (non-printables render as `?`); for logging only, not
-    /// byte-exact comparison — use `eqlExact` for that.
-    pub fn formatInto(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
+    /// Format `self` into `buf` as a dotted string in RFC 1035 §5.1 / RFC 4343
+    /// §2.1 presentation format: `.` and `\` escape to `\.` and `\\`, bytes
+    /// outside 0x21–0x7e to `\DDD`. Injective — distinct names render to
+    /// distinct strings, and `parseDottedName` round-trips the result — so the
+    /// output is safe as a cache/dedup key, not just for display. Returns the
+    /// written slice.
+    pub fn formatInto(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
         var pos: usize = 0;
         for (self.labels) |label| {
             if (pos > 0) {
                 buf[pos] = '.';
                 pos += 1;
             }
-            for (label) |byte| {
-                buf[pos] = if (byte >= 0x21 and byte <= 0x7e) byte else '?';
-                pos += 1;
-            }
+            for (label) |byte| switch (byte) {
+                '.', '\\' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = byte;
+                    pos += 2;
+                },
+                0x21...0x2d, 0x2f...0x5b, 0x5d...0x7e => {
+                    buf[pos] = byte;
+                    pos += 1;
+                },
+                else => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = '0' + byte / 100;
+                    buf[pos + 2] = '0' + (byte / 10) % 10;
+                    buf[pos + 3] = '0' + byte % 10;
+                    pos += 4;
+                },
+            };
         }
         return buf[0..pos];
     }
 
     /// Like `formatInto` but lowercased (DNS is case-insensitive).
-    pub fn formatLower(self: Name, buf: *[max_name_len + 1]u8) []const u8 {
+    pub fn formatLower(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
         const dotted = self.formatInto(buf);
         for (buf[0..dotted.len]) |*b| b.* = std.ascii.toLower(b.*);
         return buf[0..dotted.len];
@@ -569,27 +587,80 @@ pub const Message = struct {
 
 // ── Name / Query builders ──────────────────────────────────────────────
 
-pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
-    // Handle root zone
-    if (dotted.len == 0 or (dotted.len == 1 and dotted[0] == '.')) {
-        const labels = try allocator.alloc([]const u8, 0);
-        return .{ .labels = labels };
-    }
+/// Index of the first label-separating `.` at or after `start`, skipping
+/// escaped bytes. Works on any well-formed presentation string; `\DDD`
+/// digits can never be `.` so skipping one byte after `\` suffices.
+pub fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < s.len) : (i += 1) switch (s[i]) {
+        '\\' => i += 1,
+        '.' => return i,
+        else => {},
+    };
+    return null;
+}
 
-    // Strip optional trailing dot
-    const name_str = if (dotted[dotted.len - 1] == '.') dotted[0 .. dotted.len - 1] else dotted;
+/// True when `s[i]` is preceded by an odd run of backslashes, i.e. escaped.
+pub fn isEscapedAt(s: []const u8, i: usize) bool {
+    var n: usize = 0;
+    while (n < i and s[i - 1 - n] == '\\') n += 1;
+    return n % 2 == 1;
+}
+
+/// Strip one unescaped trailing dot (`example.com.` → `example.com`).
+pub fn stripTrailingDot(s: []const u8) []const u8 {
+    if (s.len > 0 and s[s.len - 1] == '.' and !isEscapedAt(s, s.len - 1))
+        return s[0 .. s.len - 1];
+    return s;
+}
+
+/// Decode one presentation-format label (`\.`, `\\`, `\DDD`, `\X` literal)
+/// into `out`. Returns the decoded length.
+fn unescapeLabel(label: []const u8, out: *[max_label_len]u8) Error!usize {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < label.len) {
+        var byte = label[i];
+        i += 1;
+        if (byte == '\\') {
+            if (i >= label.len) return error.FormatError;
+            byte = label[i];
+            i += 1;
+            if (std.ascii.isDigit(byte)) {
+                if (i + 1 >= label.len or !std.ascii.isDigit(label[i]) or !std.ascii.isDigit(label[i + 1]))
+                    return error.FormatError;
+                const value = @as(u16, byte - '0') * 100 + @as(u16, label[i] - '0') * 10 + (label[i + 1] - '0');
+                if (value > 255) return error.FormatError;
+                byte = @intCast(value);
+                i += 2;
+            }
+        }
+        if (len >= max_label_len) return error.LabelTooLong;
+        out[len] = byte;
+        len += 1;
+    }
+    return len;
+}
+
+pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
+    const name_str = stripTrailingDot(dotted);
+    if (name_str.len == 0) return .{ .labels = try allocator.alloc([]const u8, 0) };
 
     // Validate first (no allocations, so no cleanup needed on error)
+    var scratch: [max_label_len]u8 = undefined;
     var total_len: usize = 0;
     var label_count: usize = 0;
     {
-        var iter = mem.splitScalar(u8, name_str, '.');
-        while (iter.next()) |label| {
-            if (label.len == 0) return error.InvalidLabelType;
-            if (label.len > max_label_len) return error.LabelTooLong;
-            total_len += label.len + 1;
+        var start: usize = 0;
+        while (true) {
+            const end = indexOfUnescapedDot(name_str, start) orelse name_str.len;
+            const len = try unescapeLabel(name_str[start..end], &scratch);
+            if (len == 0) return error.InvalidLabelType;
+            total_len += len + 1;
             if (total_len > max_name_len + 1) return error.NameTooLong;
             label_count += 1;
+            if (end == name_str.len) break;
+            start = end + 1;
         }
     }
 
@@ -598,10 +669,13 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     errdefer allocator.free(labels);
     var i: usize = 0;
     errdefer for (labels[0..i]) |l| allocator.free(l);
-    var iter = mem.splitScalar(u8, name_str, '.');
-    while (iter.next()) |label| {
-        labels[i] = try allocator.dupe(u8, label);
+    var start: usize = 0;
+    while (i < label_count) {
+        const end = indexOfUnescapedDot(name_str, start) orelse name_str.len;
+        const len = unescapeLabel(name_str[start..end], &scratch) catch unreachable;
+        labels[i] = try allocator.dupe(u8, scratch[0..len]);
         i += 1;
+        start = end + 1;
     }
 
     return .{ .labels = labels };
@@ -2322,7 +2396,7 @@ pub const Ancestors = struct {
 
     pub fn next(self: *Ancestors) ?[]const u8 {
         if (self.left == 0) return null;
-        const dot = mem.indexOfScalar(u8, self.rest, '.') orelse return null;
+        const dot = indexOfUnescapedDot(self.rest, 0) orelse return null;
         if (dot + 1 >= self.rest.len) return null; // trailing dot only
         self.left -= 1;
         self.rest = self.rest[dot + 1 ..];
@@ -3374,6 +3448,69 @@ test "Ancestors yields proper suffixes, stops at the root and at the bound" {
     // The bound cuts the walk short rather than wrapping or overrunning.
     try testing.expectEqualDeep(@as([]const []const u8, &.{"b.c.example"}), collect(&buf, "a.b.c.example", 1));
     try testing.expectEqual(@as(usize, 0), collect(&buf, "a.b.c.example", 0).len);
+    // An escaped dot is label content, not a boundary (RFC 4343 §2.1).
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "c.d", "d" }), collect(&buf, "a\\.b.c.d", 8));
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"d"}), collect(&buf, "a\\\\.d", 8));
+}
+
+test "formatInto is injective over hostile labels" {
+    var buf: [max_dotted_len + 1]u8 = undefined;
+
+    // The two wire names that motivated RFC 4343 §2.1 escaping: a literal
+    // 0x2e inside a label must not render like the separator.
+    try testing.expectEqualStrings("e\\.d.com", (Name{ .labels = &.{ "e.d", "com" } }).formatInto(&buf));
+    try testing.expectEqualStrings("e.d.com", (Name{ .labels = &.{ "e", "d", "com" } }).formatInto(&buf));
+
+    // Non-printables render as \DDD, so 0x07 no longer collides with '?'.
+    try testing.expectEqualStrings("\\007foo.com", (Name{ .labels = &.{ "\x07foo", "com" } }).formatInto(&buf));
+    try testing.expectEqualStrings("?foo.com", (Name{ .labels = &.{ "?foo", "com" } }).formatInto(&buf));
+
+    try testing.expectEqualStrings("a\\\\b", (Name{ .labels = &.{"a\\b"} }).formatInto(&buf));
+    try testing.expectEqualStrings("\\032.\\255", (Name{ .labels = &.{ " ", "\xff" } }).formatInto(&buf));
+}
+
+test "formatInto/parseDottedName round-trip every label byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var b: usize = 0;
+    while (b < 256) : (b += 1) {
+        const label = [_]u8{ 'A', @intCast(b), 'z' };
+        const original = Name{ .labels = &.{ &label, "example", "com" } };
+        var buf: [max_dotted_len + 1]u8 = undefined;
+        const parsed = try parseDottedName(alloc, original.formatInto(&buf));
+        try testing.expect(original.eqlExact(parsed));
+    }
+
+    // Worst case: a wire-maximal name of pure \DDD content (253 bytes over
+    // four labels) renders to 4·250+3 = 1003 chars and still round-trips.
+    const wide: [max_label_len]u8 = @splat(0);
+    const last: [61]u8 = @splat(0);
+    const original = Name{ .labels = &.{ &wide, &wide, &wide, &last } };
+    var buf: [max_dotted_len + 1]u8 = undefined;
+    const parsed = try parseDottedName(alloc, original.formatInto(&buf));
+    try testing.expect(original.eqlExact(parsed));
+}
+
+test "parseDottedName decodes presentation escapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const escaped_dot = try parseDottedName(alloc, "e\\.d.com");
+    try testing.expect(escaped_dot.eqlExact(.{ .labels = &.{ "e.d", "com" } }));
+
+    // \DDD is a decimal byte, \X a literal, and a trailing escaped dot is
+    // content rather than a stripped separator.
+    try testing.expect((try parseDottedName(alloc, "\\068")).eqlExact(.{ .labels = &.{"D"} }));
+    try testing.expect((try parseDottedName(alloc, "ex\\ample.com")).eqlExact(.{ .labels = &.{ "example", "com" } }));
+    try testing.expect((try parseDottedName(alloc, "a\\.")).eqlExact(.{ .labels = &.{"a."} }));
+
+    try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\"));
+    try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\12"));
+    try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\1x2"));
+    try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\999"));
 }
 
 test "extractKeepaliveTimeout rejects malformed wire" {
