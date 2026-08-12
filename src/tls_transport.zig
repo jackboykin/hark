@@ -79,7 +79,8 @@ pub const TlsTransport = struct {
     /// `.address` CONTRACT). error.ConnectFailed = transient; anything
     /// else reached the server and failed the protocol.
     fn dialAndPool(self: *TlsTransport, tls_server: na.Address, addr_key: AddressKey, connect_ms: u32) !void {
-        const stream = blocking_transport.connectTcpRaw(tls_server, connect_ms) catch return error.ConnectFailed;
+        const stream = blocking_transport.connectTcpRaw(tls_server, connect_ms) catch |e|
+            return if (e == error.ConnectRefused) error.ConnectRefused else error.ConnectFailed;
         errdefer stream.close(self.io);
         sys.setSocketTimeout(stream.socket.handle, posix.SO.RCVTIMEO, connect_ms);
         const conn = try self.newPooledConnection(stream);
@@ -184,7 +185,14 @@ pub const TlsTransport = struct {
         // speaks DoT (if it truly dropped DoT, damping decays to .unknown
         // and the next .discover hard-fails it). OOM is a local resource
         // event, never a protocol verdict.
+        // A refused :853 (RST) is the exception — the port is definitively
+        // closed, not a blip, so hard-band it for an hour on any probe kind
+        // rather than spending ~60 soft rediscovery dials.
         self.dialAndPool(tls_server, addr_key, 4000) catch |err| {
+            if (err == error.ConnectRefused) {
+                enc_ns_cache.setStatus(addr_key, .failed);
+                return;
+            }
             const hard = kind == .discover and
                 err != error.ConnectFailed and err != error.OutOfMemory;
             enc_ns_cache.setStatus(addr_key, if (hard) .failed else .soft_failed);

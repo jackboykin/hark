@@ -359,7 +359,8 @@ pub fn connectTcpRaw(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream
     errdefer sys.close(sock_fd);
     sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, connect_timeout_ms);
     sys.setNoDelay(sock_fd);
-    na.connectTo(sock_fd, &server) catch return error.ConnectFailed;
+    na.connectTo(sock_fd, &server) catch |e|
+        return if (e == error.ConnectionRefused) error.ConnectRefused else error.ConnectFailed;
     return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
 }
 
@@ -619,4 +620,21 @@ test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" 
     try testing.expectEqual(@as(std.os.linux.E, .SUCCESS), std.os.linux.errno(rc));
     try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
     try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
+}
+
+test "connectTcpRaw surfaces a refused port as ConnectRefused, not ConnectFailed" {
+    // The encrypted-NS demotion path hard-bands a refused :853 for an hour
+    // and soft-bands a transient failure for 60 s. That split is only
+    // possible if the refusal errno survives the connect wrapper instead of
+    // collapsing to a generic ConnectFailed.
+    try skipIfNotLinux();
+    const io = testing.io;
+
+    // Grab an ephemeral port, then close the listener so the port refuses.
+    const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    const refused = server.socket.address;
+    server.deinit(io);
+
+    try testing.expectError(error.ConnectRefused, connectTcpRaw(refused, tcp_connect_timeout_ms));
 }
