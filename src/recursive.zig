@@ -3751,7 +3751,7 @@ fn validateNegativeResponse(
             var qtype_buf: [24]u8 = undefined;
             log.warn(
                 "incomplete NSEC/NSEC3 proof for {s} {s} (nx={}); SERVFAIL per RFC 4035 §5.4",
-                .{ qname.formatInto(&name_buf), dns.safeTagName(dns.RType, qtype, &qtype_buf), is_nxdomain },
+                .{ qname.formatInto(&name_buf), dns.safeTagName(qtype, &qtype_buf), is_nxdomain },
             );
             return .bogus;
         },

@@ -6,14 +6,13 @@ const ArrayList = std.ArrayList;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Safe replacement for `@tagName` on non-exhaustive enums.
-/// Returns the field name for known values, or the numeric string for unknown ones.
-pub fn safeTagName(comptime E: type, val: E, buf: *[24]u8) []const u8 {
-    const info = @typeInfo(E).@"enum";
-    inline for (info.field_names, info.field_values) |name, value| {
-        if (@backingInt(val) == value) return name;
-    }
-    return std.fmt.bufPrint(buf, "{d}", .{@backingInt(val)}) catch "?";
+/// Safe replacement for `@tagName`, which is illegal on an unnamed value of a
+/// non-exhaustive enum.
+pub fn safeTagName(val: anytype, buf: *[24]u8) []const u8 {
+    return switch (val) {
+        _ => std.fmt.bufPrint(buf, "{d}", .{@backingInt(val)}) catch "?",
+        else => @tagName(val),
+    };
 }
 
 /// Check the TC (truncation) bit on raw wire data without full parsing.
@@ -3156,19 +3155,19 @@ test "typeBitmapContains" {
 
 test "safeTagName handles known and unknown enum values" {
     var buf: [24]u8 = undefined;
-    try testing.expectEqualStrings("a", safeTagName(RType, .a, &buf));
-    try testing.expectEqualStrings("aaaa", safeTagName(RType, .aaaa, &buf));
-    try testing.expectEqualStrings("no_error", safeTagName(RCode, .no_error, &buf));
+    try testing.expectEqualStrings("a", safeTagName(RType.a, &buf));
+    try testing.expectEqualStrings("aaaa", safeTagName(RType.aaaa, &buf));
+    try testing.expectEqualStrings("no_error", safeTagName(RCode.no_error, &buf));
 
     // Unknown values — CERT (37), CAA (257)
     const cert: RType = @fromBackingInt(@intCast(37));
-    try testing.expectEqualStrings("37", safeTagName(RType, cert, &buf));
+    try testing.expectEqualStrings("37", safeTagName(cert, &buf));
     const caa: RType = @fromBackingInt(@intCast(257));
-    try testing.expectEqualStrings("257", safeTagName(RType, caa, &buf));
+    try testing.expectEqualStrings("257", safeTagName(caa, &buf));
 
     // Unknown RCode
     const rcode7: RCode = @fromBackingInt(@intCast(7));
-    try testing.expectEqualStrings("7", safeTagName(RCode, rcode7, &buf));
+    try testing.expectEqualStrings("7", safeTagName(rcode7, &buf));
 }
 
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {

@@ -7,7 +7,7 @@ pub fn printMessage(msg: dns.Message, writer: anytype) !void {
     var opcode_buf: [24]u8 = undefined;
     var rcode_buf: [24]u8 = undefined;
     try writer.print(";; ->>HEADER<<- opcode: {s}, status: {s}, id: {d}\n", .{
-        dns.safeTagName(dns.OpCode, hdr.flags.opcode, &opcode_buf), dns.safeTagName(dns.RCode, hdr.flags.rcode, &rcode_buf), hdr.id,
+        dns.safeTagName(hdr.flags.opcode, &opcode_buf), dns.safeTagName(hdr.flags.rcode, &rcode_buf), hdr.id,
     });
     try writer.print(";; flags:", .{});
     if (hdr.flags.qr) try writer.print(" qr", .{});
@@ -38,7 +38,7 @@ pub fn printMessage(msg: dns.Message, writer: anytype) !void {
             try printName(q.name, writer);
             var qclass_buf: [24]u8 = undefined;
             var qtype_buf: [24]u8 = undefined;
-            try writer.print("\t\t{s}\t{s}\n", .{ dns.safeTagName(dns.RClass, q.qclass, &qclass_buf), dns.safeTagName(dns.RType, q.qtype, &qtype_buf) });
+            try writer.print("\t\t{s}\t{s}\n", .{ dns.safeTagName(q.qclass, &qclass_buf), dns.safeTagName(q.qtype, &qtype_buf) });
         }
         try writer.print("\n", .{});
     }
@@ -75,7 +75,7 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
     try printName(rr.name, writer);
     var rclass_buf: [24]u8 = undefined;
     var rtype_buf: [24]u8 = undefined;
-    try writer.print("\t{d}\t{s}\t{s}\t", .{ rr.ttl, dns.safeTagName(dns.RClass, rr.rclass, &rclass_buf), dns.safeTagName(dns.RType, rr.rtype, &rtype_buf) });
+    try writer.print("\t{d}\t{s}\t{s}\t", .{ rr.ttl, dns.safeTagName(rr.rclass, &rclass_buf), dns.safeTagName(rr.rtype, &rtype_buf) });
     switch (rr.rdata) {
         .a => |addr| try writer.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }),
         .aaaa => |addr| {
@@ -106,9 +106,9 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
             var tc_buf: [24]u8 = undefined;
             var algo_buf: [24]u8 = undefined;
             try writer.print("{s} {d} {s} {d} {d} {d} {d} ", .{
-                dns.safeTagName(dns.RType, rrsig.type_covered, &tc_buf),
+                dns.safeTagName(rrsig.type_covered, &tc_buf),
                 rrsig.labels,
-                dns.safeTagName(dns.DnssecAlgorithm, rrsig.algorithm, &algo_buf),
+                dns.safeTagName(rrsig.algorithm, &algo_buf),
                 rrsig.original_ttl,
                 rrsig.sig_expiration,
                 rrsig.sig_inception,
@@ -121,7 +121,7 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
             try writer.print("{d} {d} {s}", .{
                 dnskey.flags,
                 dnskey.protocol,
-                dns.safeTagName(dns.DnssecAlgorithm, dnskey.algorithm, &dkalgo_buf),
+                dns.safeTagName(dnskey.algorithm, &dkalgo_buf),
             });
         },
         .ds => |ds_data| {
@@ -129,8 +129,8 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
             var digest_buf: [24]u8 = undefined;
             try writer.print("{d} {s} {s} ", .{
                 ds_data.key_tag,
-                dns.safeTagName(dns.DnssecAlgorithm, ds_data.algorithm, &dsalgo_buf),
-                dns.safeTagName(dns.DigestType, ds_data.digest_type, &digest_buf),
+                dns.safeTagName(ds_data.algorithm, &dsalgo_buf),
+                dns.safeTagName(ds_data.digest_type, &digest_buf),
             });
             for (ds_data.digest) |b| {
                 try writer.print("{X:0>2}", .{b});
@@ -189,7 +189,7 @@ fn printTypeBitmap(bitmap: []const u8, writer: anytype) !void {
                     const type_num = @as(u16, window) * 256 + @as(u16, @intCast(byte_idx)) * 8 + @as(u16, @intCast(bit_idx));
                     const rtype: dns.RType = @fromBackingInt(@intCast(type_num));
                     var tbm_buf: [24]u8 = undefined;
-                    try writer.print(" {s}", .{dns.safeTagName(dns.RType, rtype, &tbm_buf)});
+                    try writer.print(" {s}", .{dns.safeTagName(rtype, &tbm_buf)});
                 }
             }
         }

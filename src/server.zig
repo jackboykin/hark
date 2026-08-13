@@ -47,7 +47,7 @@ const log = std.log.scoped(.server);
 fn rcodeSuffix(rcode: dns.RCode, buf: []u8) []const u8 {
     if (rcode == .no_error) return "";
     var tmp: [24]u8 = undefined;
-    const tag = dns.safeTagName(dns.RCode, rcode, &tmp);
+    const tag = dns.safeTagName(rcode, &tmp);
     return std.fmt.bufPrint(buf, " {s}", .{tag}) catch tag;
 }
 
@@ -1308,7 +1308,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
     // actionable here — the task runs for cache side effects only.
     _ = resolver.resolve(alloc, name, qtype) catch |err| {
         var qtype_buf: [24]u8 = undefined;
-        log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(dns.RType, qtype, &qtype_buf), @errorName(err) });
+        log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(qtype, &qtype_buf), @errorName(err) });
         // Only cousins record: a refresh kind still holds the entry it meant
         // to refresh, so a SERVFAIL would clobber it. cacheServfail refuses
         // fresh entries under the shard write lock, which closes the race
@@ -1794,7 +1794,7 @@ const WorkerState = struct {
             const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, transports) catch |err| {
                 const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
                 var qtype_buf: [24]u8 = undefined;
-                log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
+                log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
                 self.server.cache.cacheServfail(name_str, question.qtype);
                 self.recordClientOutcome(false);
                 const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
@@ -1805,7 +1805,7 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
             var rcode_buf: [24]u8 = undefined;
-            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
+            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
 
             // RFC 7828: advertise our TCP idle timeout so the stub can
             // size its keepalive expectations. Units are 100 ms.
@@ -1981,7 +1981,7 @@ const WorkerState = struct {
             @branchHint(.cold);
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf1: [24]u8 = undefined;
-            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
+            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
             self.server.cache.cacheServfail(name_str, question.qtype);
             self.recordClientOutcome(false);
             self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
@@ -1990,7 +1990,7 @@ const WorkerState = struct {
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf2: [24]u8 = undefined;
         var rcode_buf2: [24]u8 = undefined;
-        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(dns.RType, question.qtype, &qtype_buf2), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
+        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf2), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
 
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
