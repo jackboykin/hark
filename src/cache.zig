@@ -50,12 +50,11 @@ pub fn randomizeHashSeed(io: std.Io) void {
 }
 
 const CacheKeyContext = struct {
+    /// Tags fold into the seed rather than streaming: Wyhash's `update` only
+    /// memcpys into a staging buffer, where one-shot `hash` reads in place.
     pub fn hash(_: @This(), key: CacheKey) u32 {
-        var h = std.hash.Wyhash.init(hash_seed);
-        h.update(key.name);
-        h.update(mem.asBytes(&key.rtype));
-        h.update(mem.asBytes(&key.rclass));
-        return @truncate(h.final());
+        const tag = (@as(u32, @backingInt(key.rtype)) << 16) | @backingInt(key.rclass);
+        return @truncate(std.hash.Wyhash.hash(hash_seed ^ tag, key.name));
     }
 
     pub fn eql(_: @This(), a: CacheKey, b: CacheKey, _: usize) bool {

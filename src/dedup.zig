@@ -35,11 +35,8 @@ pub fn randomizeHashSeed(io: std.Io) void {
 
 const DedupKeyContext = struct {
     pub fn hash(_: @This(), key: DedupKey) u64 {
-        var h = std.hash.Wyhash.init(dedup_hash_seed);
-        h.update(key.name_buf[0..key.name_len]);
-        h.update(mem.asBytes(&key.qtype));
-        h.update(mem.asBytes(&key.flags));
-        return h.final();
+        const tag = (@as(u32, @backingInt(key.qtype)) << 8) | key.flags;
+        return std.hash.Wyhash.hash(dedup_hash_seed ^ tag, key.name_buf[0..key.name_len]);
     }
 
     pub fn eql(_: @This(), a: DedupKey, b: DedupKey) bool {
