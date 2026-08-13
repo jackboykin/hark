@@ -1142,7 +1142,7 @@ pub const RRsetCache = struct {
 
         // Track which (name, type) groups we've already processed in this batch
         // to avoid O(n^2) re-scanning. Small fixed buffer — DNS sections are tiny.
-        var processed: [64]struct { name_hash: u64, rtype: dns.RType } = undefined;
+        var processed: [64]struct { name: dns.Name, rtype: dns.RType } = undefined;
         var processed_count: usize = 0;
 
         record_loop: for (records) |rr| {
@@ -1165,25 +1165,23 @@ pub const RRsetCache = struct {
                 if (rr.rtype == st) continue :record_loop;
             }
 
-            // Check if we already processed this (name, type) group
-            var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-            const lower_name = rr.name.formatLower(&lower_buf);
-            var nh = std.hash.Wyhash.init(0);
-            nh.update(lower_name);
-            const name_hash = nh.final();
-
+            // Check if we already processed this (name, type) group. `eql`
+            // folds case, matching the collection loop below.
             var already = false;
             for (processed[0..processed_count]) |p| {
-                if (p.name_hash == name_hash and p.rtype == rr.rtype) {
+                if (p.rtype == rr.rtype and p.name.eql(rr.name)) {
                     already = true;
                     break;
                 }
             }
             if (already) continue;
             if (processed_count < processed.len) {
-                processed[processed_count] = .{ .name_hash = name_hash, .rtype = rr.rtype };
+                processed[processed_count] = .{ .name = rr.name, .rtype = rr.rtype };
                 processed_count += 1;
             }
+
+            var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
+            const lower_name = rr.name.formatLower(&lower_buf);
 
             // Single-pass collect into stack buffer (avoids double scan).
             var match_buf: [max_rrset_collect]dns.ResourceRecord = undefined;
