@@ -273,11 +273,7 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
     for (raw[close + 1 ..]) |c| if (!std.ascii.isWhitespace(c)) return error.InvalidSyntax;
     const inner = mem.trim(u8, raw[1..close], &std.ascii.whitespace);
 
-    if (inner.len == 0) {
-        // Empty array
-        const empty = try allocator.alloc([]const u8, 0);
-        return .{ .string_array = empty };
-    }
+    if (inner.len == 0) return .{ .string_array = &.{} };
 
     // Split array elements — need to handle quoted strings with commas
     var items = std.ArrayList([]const u8).empty;

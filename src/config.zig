@@ -159,20 +159,12 @@ const ConfigError = error{
 
 fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     const listen = try allocator.alloc(Address, 2);
-    errdefer allocator.free(listen);
     listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
     listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
 
-    const empty_root_hints = try allocator.alloc(Address, 0);
-    const empty_acl = try allocator.alloc(acl.Cidr, 0);
-    const empty_trust_anchors = try allocator.alloc(dns.DsData, 0);
-    const empty_zones = try allocator.alloc(dns.Name, 0);
-    const empty_extra_block = try allocator.alloc(acl.Cidr, 0);
-    const empty_extra_allow = try allocator.alloc(acl.Cidr, 0);
-
     return .{
         .listen = listen,
-        .root_hints = empty_root_hints,
+        .root_hints = &.{},
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
         .cache_size = 16 * 1024 * 1024,
@@ -200,17 +192,17 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .max_udp_payload = @import("dns.zig").edns_udp_payload,
         .drop_uid = null,
         .drop_gid = null,
-        .allow_from = empty_acl,
+        .allow_from = &.{},
         .minimal_responses = true,
         .tcp_idle_timeout_ms = 5_000,
         .tcp_queries_per_conn = 128,
         .upstream_tcp_idle_sec = 30,
-        .trust_anchors = empty_trust_anchors,
+        .trust_anchors = &.{},
         .rebinding = .{
             .enabled = true,
-            .allow_zones = empty_zones,
-            .extra_block = empty_extra_block,
-            .extra_allow = empty_extra_allow,
+            .allow_zones = &.{},
+            .extra_block = &.{},
+            .extra_allow = &.{},
         },
         .allocator = allocator,
     };

@@ -643,7 +643,7 @@ fn unescapeLabel(label: []const u8, out: *[max_label_len]u8) Error!usize {
 
 pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
     const name_str = stripTrailingDot(dotted);
-    if (name_str.len == 0) return .{ .labels = try allocator.alloc([]const u8, 0) };
+    if (name_str.len == 0) return .{ .labels = &.{} };
 
     // Validate first (no allocations, so no cleanup needed on error)
     var scratch: [max_label_len]u8 = undefined;

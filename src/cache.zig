@@ -242,7 +242,7 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
 /// neither can be freed individually. Today every caller uses a per-query
 /// arena.
 fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
-    if (cached.len == 0) return try alloc.alloc(dns.ResourceRecord, 0);
+    if (cached.len == 0) return &.{};
 
     const RR = dns.ResourceRecord;
     const records_bytes = @sizeOf(RR) * cached.len;
@@ -292,7 +292,7 @@ fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.Res
 /// happen per-record. Caller is expected to use an arena (no individual
 /// cleanup on partial-failure).
 fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
-    if (cached.len == 0) return try alloc.alloc(dns.ResourceRecord, 0);
+    if (cached.len == 0) return &.{};
     const out = try alloc.alloc(dns.ResourceRecord, cached.len);
     for (cached, 0..) |cr, i| {
         const name = try cloneName(alloc, cr.name);
