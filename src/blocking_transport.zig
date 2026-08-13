@@ -13,7 +13,7 @@ const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 
 // UDP and TCP both flow through std.Io.net (Socket/Stream — reads via
-// `std.Io.net.Stream.read`/`io.operate(.net_read)`, writes via `io.vtable.netWrite`).
+// `std.Io.net.Stream.read`/`io.operate(.net_read)`, writes via `io.operate(.net_write)`).
 // Connect-side TCP still opens the fd via raw posix for SO_SNDTIMEO — Zig's
 // `netConnectIp` accepts a timeout option but its Io.Threaded backend panics on
 // it. queryStaggered and the TCP loops

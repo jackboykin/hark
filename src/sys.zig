@@ -245,11 +245,17 @@ pub fn netRead(io: std.Io, handle: posix.fd_t, buf: []u8) std.Io.net.Stream.Read
     return stream.read(io, &iovec);
 }
 
-/// `io.vtable.netWrite` adapter for a single contiguous buffer. The vtable's
-/// scatter-gather shape requires a non-empty `data` slice — the empty-string
-/// sentinel with `splat=0` elides into a header-only iovec.
+/// Write adapter for a single contiguous buffer, through `io.operate(.net_write)`
+/// — the 0.17 replacement for the removed `io.vtable.netWrite` method. `data`
+/// must be non-empty (its last element is the splat pattern), so the
+/// empty-string sentinel with `splat=0` elides into a header-only iovec.
 pub fn netWrite(io: std.Io, handle: posix.fd_t, buf: []const u8) std.Io.net.Stream.Writer.Error!usize {
-    return io.vtable.netWrite(io.userdata, handle, buf, &[_][]const u8{""}, 0);
+    return (try io.operate(.{ .net_write = .{
+        .socket_handle = handle,
+        .header = buf,
+        .data = &.{""},
+        .splat = 0,
+    } })).net_write;
 }
 
 /// Errors from the deadline-bounded exact-I/O loops below. `Closed` is a
