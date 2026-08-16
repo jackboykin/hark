@@ -1419,7 +1419,7 @@ const WorkerState = struct {
 
         var completions: [max_operations]Completion = undefined;
         var last_stats_ns: i128 = monotonic.nowNs();
-        const stats_interval_ns: i128 = 60 * std.time.ns_per_s;
+        const stats_interval_ns: i128 = 180 * std.time.ns_per_s;
 
         // The cache is shared per-process, so every worker would log identical
         // stats. Only the main worker (the one holding the signalfd) emits the
@@ -1440,7 +1440,8 @@ const WorkerState = struct {
             const now_ns = monotonic.nowNs();
             if (log_stats and now_ns - last_stats_ns >= stats_interval_ns) {
                 self.logCacheStats();
-                last_stats_ns = now_ns;
+                const elapsed = now_ns - last_stats_ns;
+                last_stats_ns += @divFloor(elapsed, stats_interval_ns) * stats_interval_ns;
             }
 
             for (results) |c| {
