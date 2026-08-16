@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     // cache/resolver/DNSSEC layers, not the client plane. `?bool` matches
     // sanitize_thread: unspecified leaves every module on its default.
     const tsan = b.option(bool, "tsan", "Build with ThreadSanitizer");
+    const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse
+        (optimize != .debug);
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "testing_enabled", testing_enabled);
     build_opts.addOption(bool, "queue_instr", queue_instr);
@@ -46,6 +48,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = tsan,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "hark", .module = mod },
                 .{ .name = "build_options", .module = build_options_mod },
@@ -102,6 +105,7 @@ pub fn build(b: *std.Build) void {
             // the contention benches as a race workout the test suite can't
             // reach. Never compare a tsan run against bench/baselines/.
             .sanitize_thread = tsan,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "hark", .module = mod },
             },
@@ -119,6 +123,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseSafe,
             .sanitize_thread = tsan,
+            .strip = strip,
             .imports = &.{.{ .name = "hark", .module = mod }},
         }),
     });
