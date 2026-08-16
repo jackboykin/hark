@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             // Under -Dtsan the timings are meaningless; the point is to run
             // the contention benches as a race workout the test suite can't
             // reach. Never compare a tsan run against bench/baselines/.
@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/recursion/synth_pellet.zig"),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .sanitize_thread = tsan,
             .strip = strip,
             .imports = &.{.{ .name = "hark", .module = mod }},
