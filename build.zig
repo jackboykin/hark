@@ -23,14 +23,14 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption([]const u8, "version", zon.version);
     const build_options_mod = build_opts.createModule();
 
-    const tls_mod = b.addModule("tls", .{
+    const tls_mod = b.createModule(.{
         .root_source_file = b.path("src/vendor/tls-ianic/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = tsan,
     });
 
-    const mod = b.addModule("hark", .{
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -71,62 +71,38 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
 
-    // Every root that imports `hark` but lives outside the test binary rots
-    // silently on an API change — bench/ did, for the whole tranche that added
-    // storeResponse's authenticated_ttl_max, leaving the contention bench that
-    // gates hot-path changes unbuildable. Compile each as part of `test`.
-    // Nothing consumes these artifacts, so Zig stops after semantic analysis:
-    // no codegen, no link. Deliberately NOT `synth_pellet_exe` itself — that
-    // one is installed, so depending on it would force a real ReleaseSafe build.
-    for ([_]struct { name: []const u8, root: []const u8 }{
-        .{ .name = "bench-check", .root = "bench/main.zig" },
-        .{ .name = "synth-pellet-check", .root = "bench/recursion/synth_pellet.zig" },
-    }) |c| {
-        const check = b.addExecutable(.{
-            .name = c.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(c.root),
-                .target = target,
-                .optimize = optimize,
-                .sanitize_thread = tsan,
-                .imports = &.{.{ .name = "hark", .module = mod }},
-            }),
-        });
-        test_step.dependOn(&check.step);
-    }
-
     // bench and synth-pellet pin optimize and strip so a run compares the
     // subject, never the harness. -Dtsan keeps debug info — its reports
     // symbolize from it — and its timings never belong next to bench/baselines/.
-    const bench_exe = b.addExecutable(.{
-        .name = "bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/main.zig"),
-            .target = target,
-            .optimize = .fast,
-            .sanitize_thread = tsan,
-            .strip = tsan != true,
-            .imports = &.{
-                .{ .name = "hark", .module = mod },
-            },
-        }),
+    // `test` compiles both modules without a consumer (sema only, no codegen):
+    // roots outside the test binary rot silently on an API change.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = .fast,
+        .sanitize_thread = tsan,
+        .strip = tsan != true,
+        .imports = &.{.{ .name = "hark", .module = mod }},
     });
+    const bench_exe = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
+    test_step.dependOn(&b.addExecutable(.{ .name = "bench-check", .root_module = bench_mod }).step);
+
     const bench_step = b.step("bench", "Run microbenchmarks (optional filter: zig build bench -- <name_substring>)");
     const bench_run = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&bench_run.step);
     bench_run.addPassthruArgs();
 
-    const synth_pellet_exe = b.addExecutable(.{
-        .name = "synth-pellet",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/recursion/synth_pellet.zig"),
-            .target = target,
-            .optimize = .safe,
-            .sanitize_thread = tsan,
-            .strip = tsan != true,
-            .imports = &.{.{ .name = "hark", .module = mod }},
-        }),
+    const pellet_mod = b.createModule(.{
+        .root_source_file = b.path("bench/recursion/synth_pellet.zig"),
+        .target = target,
+        .optimize = .safe,
+        .sanitize_thread = tsan,
+        .strip = tsan != true,
+        .imports = &.{.{ .name = "hark", .module = mod }},
     });
+    const synth_pellet_exe = b.addExecutable(.{ .name = "synth-pellet", .root_module = pellet_mod });
+    test_step.dependOn(&b.addExecutable(.{ .name = "synth-pellet-check", .root_module = pellet_mod }).step);
+
     const synth_pellet_install = b.addInstallArtifact(synth_pellet_exe, .{});
     const synth_pellet_step = b.step("synth-pellet", "Build the recursion-bench pellet synthesizer (zig-out/bin/synth-pellet)");
     synth_pellet_step.dependOn(&synth_pellet_install.step);
