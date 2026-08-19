@@ -279,26 +279,23 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
     // Only fall through on FileNotFound; surface any other error (parse, I/O).
-    var cfg = if (config_path) |path|
+    const cfg = if (config_path) |path|
         hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
         }
     else
         loadDefaultConfig(allocator, io) catch std.process.exit(1);
-    defer cfg.deinit();
 
     // Enable verbose logging from CLI flag or config
     if (cli_verbose or cfg.log_queries) {
         log_verbose.store(true, .release);
     }
 
-    // Start server
     var server = Server.init(allocator, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer server.deinit();
 
     server.run() catch |err| {
         log.err("server error: {s}", .{@errorName(err)});

@@ -8,7 +8,7 @@ const log = std.log.scoped(.event_loop);
 
 pub const max_operations = 64;
 
-/// Read ops serve only the signalfd and wake eventfd — the buffer needs
+/// Read ops serve only the signalfd — the buffer needs
 /// room for a few packed signalfd_siginfo records (128 B each; signalfd
 /// coalesces per signo, and excess records stay queued in the fd until
 /// the op is re-armed), never packet data. UDP payloads ride the

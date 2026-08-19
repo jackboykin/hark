@@ -281,7 +281,6 @@ const WorkQueue = struct {
     mutex: Io.Mutex = Io.Mutex.init,
     not_empty: Io.Condition = Io.Condition.init,
     io: Io = undefined,
-    shutdown: bool = false,
     instr: QInstr = .{},
 
     fn init(self: *WorkQueue, io: Io) void {
@@ -321,13 +320,10 @@ const WorkQueue = struct {
         self.not_empty.signal(self.io);
     }
 
-    /// Block until a slot is queued or shutdown. Returns null on
-    /// shutdown with empty queue.
-    fn dequeueLocked(self: *WorkQueue) ?struct { idx: u16, slot: *Slot } {
-        while (self.queued == 0 and !self.shutdown) {
+    fn dequeueLocked(self: *WorkQueue) struct { idx: u16, slot: *Slot } {
+        while (self.queued == 0) {
             self.not_empty.waitUncancelable(self.io, &self.mutex);
         }
-        if (self.queued == 0) return null;
         const idx = self.order[self.head];
         self.head = (self.head + 1) % work_queue_capacity;
         self.queued -= 1;
@@ -365,16 +361,15 @@ const WorkQueue = struct {
     }
 
     /// Returned payload borrows from the slot until `release(reservation)`.
-    fn pop(self: *WorkQueue) ?PopResult {
+    fn pop(self: *WorkQueue) PopResult {
         var t: QInstrTimer = .{};
         t.start();
         self.lock();
         t.locked();
         defer t.finishInto(&self.instr.pop);
         defer self.unlock();
-        const taken_opt = self.dequeueLocked();
+        const taken = self.dequeueLocked();
         t.workBegun();
-        const taken = taken_opt orelse return null;
         return PopResult{
             .payload = taken.slot.buf[0..taken.slot.len],
             .reservation = taken.idx,
@@ -394,15 +389,6 @@ const WorkQueue = struct {
         self.releaseLocked(reservation);
     }
 
-    /// Self-locking; the `*Locked` siblings assume the caller holds
-    /// the lock, but shutdown is a one-shot edge from any thread.
-    fn signalShutdown(self: *WorkQueue) void {
-        self.lock();
-        defer self.unlock();
-        self.shutdown = true;
-        self.not_empty.broadcast(self.io);
-    }
-
     fn dumpInstr(self: *const WorkQueue) void {
         self.instr.dumpAll();
     }
@@ -410,7 +396,7 @@ const WorkQueue = struct {
 
 // ── Context tags for the event loop ────────────────────────────────────
 
-const CtxTag = enum { udp_recv, tcp_accept, signal, wake };
+const CtxTag = enum { udp_recv, tcp_accept, signal };
 
 const Ctx = struct {
     tag: CtxTag,
@@ -449,13 +435,6 @@ pub const Server = struct {
     enc_pool: ?ConnectionPool,
     nsec_cache: ?NsecCache,
     key_cache: ?RRsetCache,
-    /// Hot atomics — each on its own cache line to avoid false sharing.
-    /// `shutdown` is read every tick by every worker; the *_drops counters
-    /// are written by every worker on contention events. Without padding,
-    /// the read on `shutdown` would invalidate alongside writes to the
-    /// drop counters and bounce cache lines across cores.
-    shutdown: std.atomic.Value(bool) align(std.atomic.cache_line),
-    worker_errors: std.atomic.Value(u32) align(std.atomic.cache_line),
     udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     tcp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     udp_send_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
@@ -480,11 +459,7 @@ pub const Server = struct {
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
-    /// One eventfd per worker. Only the main worker reads the signalfd;
-    /// without per-worker wakes, peers would block in io_uring_enter forever
-    /// waiting for a CQE that never arrives (no traffic = no wake). Spawned
-    /// workers take indices [0..workers-1]; the main thread takes the last.
-    wake_fds: []posix.fd_t,
+    exiting: std.atomic.Value(bool) = .init(false),
     /// Number of workers that have finished binding their listen sockets.
     /// Each worker drops privileges itself once this reaches `workers`.
     bound_count: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
@@ -556,16 +531,8 @@ pub const Server = struct {
         work_queue.init(io);
 
         // Every remaining fallible step happens here, before the return
-        // literal. Inside it they ran after every field above them, in field
-        // order, with no errdefer in reach — leaking the wake eventfds and
-        // their slice. An infallible literal is what makes that unreachable.
-        const wake_fds = try createWakeFds(allocator, cfg.workers);
-        // Mirrors deinit: the fds are owned too, not just the slice.
-        errdefer {
-            for (wake_fds) |fd| if (fd >= 0) sys.close(fd);
-            allocator.free(wake_fds);
-        }
-
+        // literal; inside it they'd run after every field above them with
+        // no errdefer in reach.
         const hot_set: ?*HotSet = if (cfg.prefetch_hot) blk: {
             const hs = try allocator.create(HotSet);
             hs.init(io);
@@ -597,8 +564,6 @@ pub const Server = struct {
                 .io = io,
                 .reader_concurrency = reader_concurrency,
             }) else null,
-            .shutdown = std.atomic.Value(bool).init(false),
-            .worker_errors = std.atomic.Value(u32).init(0),
             .udp_queue_drops = std.atomic.Value(u64).init(0),
             .tcp_queue_drops = std.atomic.Value(u64).init(0),
             .udp_send_drops = std.atomic.Value(u64).init(0),
@@ -607,7 +572,6 @@ pub const Server = struct {
             .client_cache_misses = std.atomic.Value(u64).init(0),
             .prefetch_drops = std.atomic.Value(u64).init(0),
             .work_queue = work_queue,
-            .wake_fds = wake_fds,
             .hot_set = hot_set,
         };
     }
@@ -695,23 +659,21 @@ pub const Server = struct {
         self.cache.deinit();
         self.rtt_cache.deinit();
         self.ns_selector.deinit();
-        self.work_queue.dumpInstr();
         self.allocator.destroy(self.work_queue);
-        for (self.wake_fds) |fd| if (fd >= 0) sys.close(fd);
-        self.allocator.free(self.wake_fds);
         if (self.hot_set) |hs| self.allocator.destroy(hs);
     }
 
-    /// Flip the shared shutdown atomic and post a wake to every worker's
-    /// eventfd. Idempotent and safe from any thread; over-posting is harmless
-    /// because each fd's counter accumulates and is drained on close.
-    fn requestShutdown(self: *Server) void {
-        self.shutdown.store(true, .release);
-        self.work_queue.signalShutdown();
-        for (self.wake_fds) |fd| wakeWorker(fd);
+    /// Nothing unwinds: pool threads hold pointers into their worker's frame,
+    /// and a drain has no wall-clock bound.
+    fn exit(self: *Server, status: u8) noreturn {
+        if (self.exiting.swap(true, .monotonic)) {
+            while (true) self.io.sleep(.fromSeconds(60), .awake) catch {};
+        }
+        if (status == 0) self.logFinalStats();
+        std.process.exit(status);
     }
 
-    pub fn run(self: *Server) !void {
+    pub fn run(self: *Server) !noreturn {
         const listen_addrs: []const na.Address = if (self.config.listen.len > 0)
             self.config.listen
         else
@@ -726,7 +688,6 @@ pub const Server = struct {
 
         // Block signals before spawning threads so all workers inherit the mask
         const sig_fd = setupSignalFd() catch -1;
-        defer if (sig_fd >= 0) sys.close(sig_fd);
 
         for (listen_addrs) |addr| {
             var addr_buf: [64]u8 = undefined;
@@ -755,65 +716,27 @@ pub const Server = struct {
 
         // Hot-set refresh: hook wired here, not init — self is at its
         // final address by run() (init returns by value).
-        var sweeper: ?std.Thread = null;
         if (self.hot_set) |hs| {
             self.cache.remiss_hook = .{ .ctx = hs, .call = &hotSetRemissHook };
-            sweeper = std.Thread.spawn(.{}, hotSetSweeper, .{self}) catch |err| blk: {
+            _ = std.Thread.spawn(.{}, hotSetSweeper, .{self}) catch |err| {
                 log.warn("hot-set sweeper failed to spawn — prefetch-hot inactive: {s}", .{@errorName(err)});
-                break :blk null;
             };
         }
-        defer if (sweeper) |t| {
-            // Covers early error returns that never signal shutdown —
-            // without it this join hangs forever.
-            self.requestShutdown();
-            t.join();
-        };
 
-        if (workers <= 1) {
-            // Single-threaded mode: use simple sockets (no SO_REUSEPORT)
-            self.runWorker(listen_addrs, sig_fd, self.wake_fds[0], false);
-        } else {
-            // Spawn N-1 worker threads + run one on main thread. Spawned
-            // workers take wake_fds[0..workers-1]; main takes the last slot.
-            const threads = self.allocator.alloc(std.Thread, workers - 1) catch |err| {
-                log.err("failed to allocate thread array: {s}", .{@errorName(err)});
+        for (1..workers) |i| {
+            _ = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), workers > 1 }) catch |err| {
+                log.err("failed to spawn worker {d}: {s}", .{ i, @errorName(err) });
                 return err;
             };
-            defer self.allocator.free(threads);
-
-            for (threads, 0..) |*t, i| {
-                t.* = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), self.wake_fds[i], true }) catch |err| {
-                    log.err("failed to spawn worker {d}: {s}", .{ i + 1, @errorName(err) });
-                    self.requestShutdown();
-                    for (threads[0..i]) |prev| prev.join();
-                    return err;
-                };
-            }
-
-            // Main thread runs a worker too, with signalfd for shutdown
-            self.runWorker(listen_addrs, sig_fd, self.wake_fds[workers - 1], true);
-
-            for (threads) |t| t.join();
         }
+        self.runWorker(listen_addrs, sig_fd, workers > 1);
+    }
 
-        // Check for worker failures. Every worker increments worker_errors at
-        // most once on its single fatal path, so failed >= worker_count means
-        // nothing is listening — fail loud rather than exit 0 on a dead server.
-        const failed = self.worker_errors.load(.monotonic);
-        const worker_count = @max(workers, 1);
-        if (failed >= worker_count) {
-            log.err("all {d} worker(s) failed to initialize; nothing was served", .{worker_count});
-            return error.AllWorkersFailed;
-        }
-        if (failed > 0) {
-            log.warn("{d} worker(s) failed to initialize; running with degraded capacity", .{failed});
-        }
-
-        // Log cache stats on shutdown. The client-query line is the
-        // operator-meaningful hit rate (one count per answered query); the
-        // rrset-lookup line below it counts all internal recursion traffic
-        // and reads structurally lower — don't compare the two.
+    /// The client-query line is the operator-meaningful hit rate (one count
+    /// per answered query); the rrset-lookup line below it counts all
+    /// internal recursion traffic and reads structurally lower — don't
+    /// compare the two.
+    fn logFinalStats(self: *Server) void {
         const c_hits = self.client_cache_hits.load(.monotonic);
         const c_misses = self.client_cache_misses.load(.monotonic);
         const c_total = c_hits + c_misses;
@@ -854,32 +777,17 @@ pub const Server = struct {
             logCounterIfNonzero("hot-set promotions", hs.promotions.load(.monotonic));
             logCounterIfNonzero("hot-set refreshes fired", hs.fired.load(.monotonic));
         }
+        self.work_queue.dumpInstr();
     }
 
-    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, wake_fd: posix.fd_t, reuseport: bool) void {
-        // Wake every peer out of the bound_count barrier and the io_uring
-        // tick if this worker dies before reaching serveLoop.
-        var failed = false;
-        defer if (failed) self.requestShutdown();
-
-        // Per-thread EventLoop for server accept/recv
+    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) noreturn {
         const server_loop = EventLoop.create(self.allocator) catch |err| {
             log.err("worker failed to create event loop: {s}", .{@errorName(err)});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            _ = self.bound_count.fetchAdd(1, .release);
-            failed = true;
-            return;
+            self.exit(1);
         };
-        defer server_loop.destroy();
 
-        // Per-thread server sockets — one UDP + one TCP per listen address
         var udp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
         var tcp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
-
-        defer for (0..listen_addrs.len) |i| {
-            if (udp_socks[i] >= 0) sys.close(udp_socks[i]);
-            if (tcp_socks[i] >= 0) sys.close(tcp_socks[i]);
-        };
 
         for (listen_addrs, 0..) |addr, i| {
             var addr_buf: [64]u8 = undefined;
@@ -898,16 +806,12 @@ pub const Server = struct {
             };
         }
 
-        // Check at least one address succeeded
         const any_ok = for (udp_socks[0..listen_addrs.len]) |s| {
             if (s >= 0) break true;
         } else false;
         if (!any_ok) {
             log.err("worker failed to bind any listen address", .{});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            _ = self.bound_count.fetchAdd(1, .release);
-            failed = true;
-            return;
+            self.exit(1);
         }
 
         _ = self.bound_count.fetchAdd(1, .release);
@@ -915,17 +819,12 @@ pub const Server = struct {
         // setresuid is per-thread on Linux without libc's SIGSETXID broadcast,
         // so every worker drops independently after the last peer binds.
         if (self.config.drop_gid != null or self.config.drop_uid != null) {
-            while (self.bound_count.load(.acquire) < self.config.workers and
-                !self.shutdown.load(.acquire))
-            {
+            while (self.bound_count.load(.acquire) < self.config.workers) {
                 self.io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
-            if (self.shutdown.load(.acquire)) return;
             dropPrivileges(self.config.drop_gid, self.config.drop_uid) catch |err| {
                 log.err("failed to drop privileges: {s}", .{@errorName(err)});
-                _ = self.worker_errors.fetchAdd(1, .monotonic);
-                self.requestShutdown();
-                return;
+                self.exit(1);
             };
             const is_main = sig_fd >= 0;
             if (is_main) {
@@ -936,14 +835,12 @@ pub const Server = struct {
 
         // Per-worker Do53 TCP connection pool (RFC 7766)
         var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
-        defer do53_tcp_pool.deinit();
         do53_tcp_pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
         // DoT pool lives on Server (per-process) but the idle timeout is
         // a runtime knob; honour the config here too so the docstring
         // ("Upstream TCP / DoT") matches reality.
         if (self.enc_pool) |*pool| pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
 
-        // Worker state
         var ws = WorkerState{
             .server = self,
             .loop = server_loop,
@@ -951,18 +848,9 @@ pub const Server = struct {
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
         };
 
-        const pool_size = self.config.resolution_threads;
-        const pool_threads = self.allocator.alloc(std.Thread, pool_size) catch |err| {
-            log.err("failed to allocate pool threads: {s}", .{@errorName(err)});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            failed = true;
-            return;
-        };
-        defer self.allocator.free(pool_threads);
-
         var spawned: usize = 0;
-        for (pool_threads) |*pt| {
-            pt.* = std.Thread.spawn(.{}, WorkerState.poolThread, .{&ws}) catch |err| {
+        for (0..self.config.resolution_threads) |_| {
+            _ = std.Thread.spawn(.{}, WorkerState.poolThread, .{&ws}) catch |err| {
                 log.err("failed to spawn pool thread: {s}", .{@errorName(err)});
                 break;
             };
@@ -971,23 +859,15 @@ pub const Server = struct {
 
         if (spawned == 0) {
             log.err("no pool threads spawned", .{});
-            _ = self.worker_errors.fetchAdd(1, .monotonic);
-            failed = true;
-            return;
+            self.exit(1);
         }
 
-        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd, wake_fd);
-
-        for (pool_threads[0..spawned]) |pt| pt.join();
-        // DoT probes are drained once, in deinit — probes capture the
-        // TlsTransport by value and its pool pointer targets a Server
-        // field, so nothing here goes out of scope. A per-worker await
-        // would race: Io.Group.await is not threadsafe.
+        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
     }
 
     /// Hot-set sweeper: one tick per 500 ms. Shares the cache's clock
     /// source, so TIME_PASSES test scenarios drive it consistently.
-    fn hotSetSweeper(self: *Server) void {
+    fn hotSetSweeper(self: *Server) noreturn {
         const hs = self.hot_set.?;
         const Firer = struct {
             server: *Server,
@@ -995,7 +875,7 @@ pub const Server = struct {
                 _ = f.server.trySpawnBgPrefetch(name, qtype, .prefetch);
             }
         };
-        while (!self.shutdown.load(.acquire)) {
+        while (true) {
             hs.tick(monotonic.nowSec(), &self.cache, Firer{ .server = self });
             self.io.sleep(.fromMilliseconds(500), .awake) catch {};
         }
@@ -1359,16 +1239,14 @@ const WorkerState = struct {
         self.server.logOteStats();
     }
 
-    fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t, wake_fd: posix.fd_t) void {
+    fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) noreturn {
         const n = udp_socks.len;
 
         self.recv_pta.init(self.server.allocator, self.server.config.query_memory_limit);
-        defer self.recv_pta.deinit();
 
         var udp_ctxs: [max_listen_addrs]Ctx = undefined;
         var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
         var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
-        var wake_ctx = Ctx{ .tag = .wake, .fd = wake_fd };
 
         // Op IDs indexed by listen address; null means inactive
         var udp_ops: [max_listen_addrs]?OperationId = @splat(null);
@@ -1392,10 +1270,6 @@ const WorkerState = struct {
             tcp_ops[i] = self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])) catch null;
         }
 
-        // Tracked across re-arms, not captured once: teardown cancels this id,
-        // and reap's LIFO free list hands a released id straight to the next
-        // arm — so a stale id cancels a stranger and leaves the real signal
-        // read armed, blocking flush() until a signal happens to arrive.
         var signal_op: ?OperationId = if (sig_fd >= 0)
             self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null
         else
@@ -1403,19 +1277,6 @@ const WorkerState = struct {
 
         // Consecutive unreadable signalfd completions; see the `.signal` arm.
         var signal_misfires: u32 = 0;
-
-        // Every worker reads its own wake eventfd. requestShutdown writes 1
-        // to each fd, so each worker's tick() returns with no need to
-        // reason about who else is consuming. If the read can't be
-        // registered the worker would block in tick forever on shutdown —
-        // escalate to a process-wide shutdown so peers exit.
-        if (wake_fd >= 0) {
-            _ = self.loop.read(wake_fd, @ptrCast(&wake_ctx)) catch |err| {
-                log.err("failed to register wake_fd read: {s}", .{@errorName(err)});
-                self.server.requestShutdown();
-                return;
-            };
-        }
 
         var completions: [max_operations]Completion = undefined;
         var last_stats_ns: i128 = monotonic.nowNs();
@@ -1426,17 +1287,12 @@ const WorkerState = struct {
         // periodic line, keeping it to one entry per interval.
         const log_stats = sig_fd >= 0;
 
-        while (!self.server.shutdown.load(.acquire)) {
-            // A tick failure must signal shutdown like every other exit:
-            // pool threads block on a condvar only signalShutdown
-            // broadcasts, so a bare break leaves them (and our join)
-            // hanging forever in a half-alive process.
-            const results = self.loop.tick(&completions) catch {
-                self.server.requestShutdown();
-                break;
+        while (true) {
+            const results = self.loop.tick(&completions) catch |err| {
+                log.err("io_uring tick failed: {s}", .{@errorName(err)});
+                self.server.exit(1);
             };
 
-            // Periodic cache stats logging
             const now_ns = monotonic.nowNs();
             if (log_stats and now_ns - last_stats_ns >= stats_interval_ns) {
                 self.logCacheStats();
@@ -1451,8 +1307,7 @@ const WorkerState = struct {
                         switch (classifySignalRead(c.result)) {
                             .shutdown => {
                                 log.info("shutting down", .{});
-                                self.server.requestShutdown();
-                                break;
+                                self.server.exit(0);
                             },
                             .stats => {
                                 self.logCacheStats();
@@ -1469,8 +1324,7 @@ const WorkerState = struct {
                                 signal_misfires += 1;
                                 if (signal_misfires > max_signal_misfires) {
                                     log.err("signalfd unreadable {d}x; shutting down", .{signal_misfires});
-                                    self.server.requestShutdown();
-                                    break;
+                                    self.server.exit(1);
                                 }
                             },
                         }
@@ -1478,11 +1332,6 @@ const WorkerState = struct {
                         // clear on the next tick; the repair loop below retries.
                         signal_op = self.loop.read(ctx.fd, @ptrCast(ctx)) catch null;
                         continue;
-                    },
-                    .wake => {
-                        // Counterpart wrote to wake_fd — shutdown is in flight.
-                        self.server.shutdown.store(true, .release);
-                        break;
                     },
                     .udp_recv => {
                         switch (c.result) {
@@ -1494,7 +1343,6 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        if (self.server.shutdown.load(.acquire)) continue;
                         const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
                         // Re-arm only on kernel termination, signalled by this
                         // CQE — never the slot table (see Completion.terminated
@@ -1542,23 +1390,19 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        if (!self.server.shutdown.load(.acquire)) {
-                            const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
-                            tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch |err| {
-                                log.err("failed to re-register TCP accept: {s}", .{@errorName(err)});
-                                tcp_ops[idx] = null;
-                                continue;
-                            };
-                        }
+                        const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
+                        tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch |err| {
+                            log.err("failed to re-register TCP accept: {s}", .{@errorName(err)});
+                            tcp_ops[idx] = null;
+                            continue;
+                        };
                     },
                 }
             }
 
             // The signalfd read joins the same repair loop as the listeners:
             // a transient arm failure must not cost the daemon its signals.
-            if (sig_fd >= 0 and signal_op == null and
-                !self.server.shutdown.load(.acquire))
-            {
+            if (sig_fd >= 0 and signal_op == null) {
                 signal_op = self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null;
             }
 
@@ -1573,14 +1417,6 @@ const WorkerState = struct {
                 }
             }
         }
-
-        // Cancel pending operations before draining, so flush() doesn't block
-        for (0..n) |i| {
-            if (udp_ops[i]) |op| self.loop.cancel(op) catch {};
-            if (tcp_ops[i]) |op| self.loop.cancel(op) catch {};
-        }
-        if (signal_op) |op| self.loop.cancel(op) catch {};
-        self.loop.flush();
     }
 
     fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
@@ -1754,7 +1590,7 @@ const WorkerState = struct {
 
         const tcp_idle_timeout_ns: i128 = @as(i128, self.server.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
         var tcp_queries: u32 = 0;
-        while (!self.server.shutdown.load(.acquire) and tcp_queries < self.server.config.tcp_queries_per_conn) {
+        while (tcp_queries < self.server.config.tcp_queries_per_conn) {
             tcp_queries += 1;
             const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
             var len_buf: [2]u8 = undefined;
@@ -1870,18 +1706,15 @@ const WorkerState = struct {
     }
 
     /// Resolution thread pool entry point.
-    fn poolThread(self: *WorkerState) void {
+    fn poolThread(self: *WorkerState) noreturn {
         var upstream = Server.UpstreamTransports.init(self.server);
-        defer upstream.deinit();
         const transports = upstream.transports();
 
         var query_pta: PerThreadArena = undefined;
         query_pta.init(self.server.allocator, self.server.config.query_memory_limit);
-        defer query_pta.deinit();
 
         var prefetch_pta: PerThreadArena = undefined;
         prefetch_pta.init(self.server.allocator, self.server.config.query_memory_limit);
-        defer prefetch_pta.deinit();
 
         // RFC 8109: first pool thread anywhere on this Server primes the
         // cache with a live "." NS lookup. Single CAS gates the work, so
@@ -1909,7 +1742,8 @@ const WorkerState = struct {
             }
         }
 
-        while (self.server.work_queue.pop()) |item| {
+        while (true) {
+            const item = self.server.work_queue.pop();
             switch (item.protocol) {
                 .udp => {
                     // item.payload borrows from the slot; parseMessage
@@ -2235,32 +2069,6 @@ fn classifySignalRead(result: anytype) SignalAction {
     return if (saw_stats) .stats else .ignore;
 }
 
-fn makeWakeEventFd() !posix.fd_t {
-    const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
-    const sr: isize = @bitCast(rc);
-    if (sr < 0) return error.EventFdFailed;
-    return @intCast(sr);
-}
-
-fn createWakeFds(allocator: mem.Allocator, n: usize) ![]posix.fd_t {
-    const fds = try allocator.alloc(posix.fd_t, n);
-    var created: usize = 0;
-    errdefer {
-        for (fds[0..created]) |fd| sys.close(fd);
-        allocator.free(fds);
-    }
-    while (created < n) : (created += 1) {
-        fds[created] = try makeWakeEventFd();
-    }
-    return fds;
-}
-
-fn wakeWorker(fd: posix.fd_t) void {
-    if (fd < 0) return;
-    var v: u64 = 1;
-    _ = sys.write(fd, std.mem.asBytes(&v)) catch {};
-}
-
 /// Drop credentials for the calling thread only (raw syscall). Every worker
 /// thread must call this independently — without libc we have no SIGSETXID
 /// broadcast to propagate the change across threads.
@@ -2305,42 +2113,6 @@ test "server init and deinit" {
 
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
-
-    try testing.expectEqual(false, server.shutdown.load(.acquire));
-}
-
-test "wakeWorker delivers a read-ready event" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const fd = try makeWakeEventFd();
-    defer sys.close(fd);
-
-    wakeWorker(fd);
-
-    var buf: [8]u8 = undefined;
-    const r = try sys.read(fd, &buf);
-    try testing.expectEqual(@as(usize, 8), r);
-
-    // Counter drained — subsequent read returns EAGAIN.
-    try testing.expectError(error.WouldBlock, sys.read(fd, &buf));
-}
-
-test "createWakeFds allocates one eventfd per worker" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const fds = try createWakeFds(testing.allocator, 4);
-    defer {
-        for (fds) |fd| sys.close(fd);
-        testing.allocator.free(fds);
-    }
-    try testing.expectEqual(@as(usize, 4), fds.len);
-
-    // Wake worker 2 only — its fd reads ready, the others don't.
-    wakeWorker(fds[2]);
-    var buf: [8]u8 = undefined;
-    const r = try sys.read(fds[2], &buf);
-    try testing.expectEqual(@as(usize, 8), r);
-    for ([_]usize{ 0, 1, 3 }) |i| {
-        try testing.expectError(error.WouldBlock, sys.read(fds[i], &buf));
-    }
 }
 
 test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
@@ -2830,11 +2602,9 @@ test "classifySignalRead: an unreadable or unrecognised completion is ignored, n
 }
 
 test "Server.init does not leak when a late allocation fails" {
-    // Regression: createWakeFds and the HotSet allocation used to sit inside the
-    // return literal, which Zig evaluates in field order — so they ran
-    // *after* every cache was constructed, and a failure there returned
-    // past all of them with no errdefer in reach. Both are hoisted above
-    // the literal now, which is what makes it infallible.
+    // Regression: the HotSet allocation sat inside the return literal, which
+    // Zig evaluates in field order — after every cache, with no errdefer in
+    // reach.
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator,
@@ -2851,23 +2621,8 @@ test "Server.init does not leak when a late allocation fails" {
     const total = counter.alloc_index;
     try testing.expect(total > 0);
 
-    // Bytes alone are not enough: wake_fds owns `workers` eventfds as well as
-    // its slice, and the first cut of the errdefer freed the slice while
-    // leaking every fd. Count descriptors across each failure too.
-    // Linux hands out the lowest free descriptor, so opening one and closing
-    // it immediately reports where the fd space currently starts. A leak
-    // pushes that number up.
-    const lowestFreeFd = struct {
-        fn probe() !posix.fd_t {
-            const fd = try sys.socket(linux.AF.INET, posix.SOCK.DGRAM, 0);
-            sys.close(fd);
-            return fd;
-        }
-    }.probe;
-
     var idx: usize = 0;
     while (idx < total) : (idx += 1) {
-        const fd_floor = try lowestFreeFd();
         var f = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
         if (Server.init(f.allocator(), cfg, testing.io)) |srv| {
             var s = srv;
@@ -2876,6 +2631,5 @@ test "Server.init does not leak when a late allocation fails" {
             if (err != error.OutOfMemory) return err;
         }
         try testing.expectEqual(f.allocated_bytes, f.freed_bytes);
-        try testing.expectEqual(fd_floor, try lowestFreeFd());
     }
 }
