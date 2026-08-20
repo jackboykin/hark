@@ -149,7 +149,7 @@ pub const EncryptedNsCache = struct {
         }) catch {};
     }
 
-    /// Roll back a claim whose dial never ran (spawn pressure, shutdown):
+    /// Roll back a claim whose dial never ran (spawn pressure):
     /// `.discover` forgets the entry, `.rewarm` restores .capable. Known
     /// slack: the restore keeps claim()'s fresh last_probe stamp, renewing
     /// the persistence window without a dial — bounded, a stale .capable
@@ -185,8 +185,6 @@ pub const EncryptedNsCache = struct {
         };
     }
 
-    /// Block until all background probes have completed (for shutdown).
-    /// Probes mid-flight observe `probes.shutting_down` and bail early.
     pub fn awaitProbes(self: *EncryptedNsCache) void {
         self.probes.awaitAll(self.io);
     }

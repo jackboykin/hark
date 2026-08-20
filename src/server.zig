@@ -2185,15 +2185,6 @@ test "bg_tasks.tryClaim caps concurrent tasks" {
     try testing.expectEqual(@as(u32, 0), bg.inFlight());
 }
 
-test "bg_tasks rejects tryClaim after shutdown" {
-    var bg = BumpGatedGroup.init(max_bg_tasks);
-    bg.shutting_down.store(true, .release);
-    // Even with empty slots, shutdown short-circuits tryClaim so bg threads
-    // can drain to zero and awaitAll can return.
-    try testing.expect(!bg.tryClaim());
-    try testing.expectEqual(@as(u32, 0), bg.inFlight());
-}
-
 test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // RFC 6840 §5.9 / RFC 4035 §3.2.2: AD MUST NOT be set unless the
     // resolver verified. A cache entry stored as .unchecked (e.g. by the
@@ -2329,18 +2320,11 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
 
-    // Non-terminal drain: awaitAll is a one-way shutdown join and would
-    // poison later tryClaims. cacheServfail happens before the task's
-    // release, so inFlight==0 implies the cache write is visible.
-    const drain = struct {
-        fn drain(s: *Server) void {
-            while (s.bg_tasks.inFlight() > 0) s.io.sleep(.fromMilliseconds(1), .awake) catch {};
-        }
-    }.drain;
-
     // Cousin failure on an absent key → RFC 9520 SERVFAIL marker.
+    // cacheServfail happens before the task's release, so awaitAll
+    // returning implies the cache write is visible.
     try testing.expect(server.trySpawnBgPrefetch("brk.example.com", .aaaa, .cousin));
-    drain(&server);
+    server.bg_tasks.awaitAll(server.io);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -2353,7 +2337,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
 
     // Same failure under a refresh kind → nothing recorded.
     try testing.expect(server.trySpawnBgPrefetch("brk2.example.com", .aaaa, .prefetch));
-    drain(&server);
+    server.bg_tasks.awaitAll(server.io);
     try testing.expect(!server.cache.containsFresh("brk2.example.com", .aaaa, .in));
 
     // Cousin failure with a fresh entry present → guard keeps the entry.
@@ -2372,7 +2356,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
         server.cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
     try testing.expect(server.trySpawnBgPrefetch("fresh.example.com", .aaaa, .cousin));
-    drain(&server);
+    server.bg_tasks.awaitAll(server.io);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();

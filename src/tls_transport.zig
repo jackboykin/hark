@@ -171,10 +171,6 @@ pub const TlsTransport = struct {
 
     fn probeThread(transport: TlsTransport, tls_server: na.Address, addr_key: AddressKey, enc_ns_cache: *EncryptedNsCache, kind: ProbeKind) void {
         defer enc_ns_cache.probes.release();
-        if (enc_ns_cache.probes.shutting_down.load(.acquire)) {
-            enc_ns_cache.revertClaim(addr_key, kind);
-            return;
-        }
 
         var self = transport; // value copy owned by this task
 
