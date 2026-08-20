@@ -9,7 +9,6 @@ const dns = @import("dns.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
-const OperationId = @import("event_loop.zig").OperationId;
 const recursive = @import("recursive.zig");
 const acl = @import("acl.zig");
 const TlsTransport = @import("tls_transport.zig").TlsTransport;
@@ -1239,6 +1238,16 @@ const WorkerState = struct {
         self.server.logOteStats();
     }
 
+    /// Logs a failed arm; the repair loop at the bottom of each tick
+    /// retries silently until it takes.
+    fn armed(result: anytype, what: []const u8) bool {
+        _ = result catch |err| {
+            log.err("failed to arm {s}: {s}", .{ what, @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) noreturn {
         const n = udp_socks.len;
 
@@ -1248,32 +1257,25 @@ const WorkerState = struct {
         var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
         var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
 
-        // Op IDs indexed by listen address; null means inactive
-        var udp_ops: [max_listen_addrs]?OperationId = @splat(null);
-        var tcp_ops: [max_listen_addrs]?OperationId = @splat(null);
+        var udp_armed: [max_listen_addrs]bool = @splat(false);
+        var tcp_armed: [max_listen_addrs]bool = @splat(false);
 
         // Multishot recvmsg — one SQE per socket stays armed and produces
         // CQEs for every inbound packet until the kernel terminates it.
         for (udp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
-            udp_ops[i] = self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i])) catch |err| blk: {
-                log.err("failed to register UDP recvmsg: {s}", .{@errorName(err)});
-                break :blk null;
-            };
+            udp_armed[i] = armed(self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i])), "UDP recvmsg");
         }
 
         // Register accept for each TCP socket
         for (tcp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             tcp_ctxs[i] = .{ .tag = .tcp_accept, .fd = fd };
-            tcp_ops[i] = self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])) catch null;
+            tcp_armed[i] = armed(self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])), "TCP accept");
         }
 
-        var signal_op: ?OperationId = if (sig_fd >= 0)
-            self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null
-        else
-            null;
+        var signal_armed = sig_fd >= 0 and !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
 
         // Consecutive unreadable signalfd completions; see the `.signal` arm.
         var signal_misfires: u32 = 0;
@@ -1330,7 +1332,7 @@ const WorkerState = struct {
                         }
                         // Both ways this can fail (slot table full, SQ full)
                         // clear on the next tick; the repair loop below retries.
-                        signal_op = self.loop.read(ctx.fd, @ptrCast(ctx)) catch null;
+                        signal_armed = !std.meta.isError(self.loop.read(ctx.fd, @ptrCast(ctx)));
                         continue;
                     },
                     .udp_recv => {
@@ -1351,11 +1353,7 @@ const WorkerState = struct {
                         // re-arm leaves SO_REUSEPORT hashing traffic into a
                         // dead worker until restart.
                         if (!c.terminated) continue;
-                        udp_ops[idx] = self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx)) catch |err| {
-                            log.err("failed to re-register UDP recvmsg: {s}", .{@errorName(err)});
-                            udp_ops[idx] = null;
-                            continue;
-                        };
+                        udp_armed[idx] = armed(self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx)), "UDP recvmsg");
                     },
                     .tcp_accept => {
                         switch (c.result) {
@@ -1391,29 +1389,25 @@ const WorkerState = struct {
                             else => {},
                         }
                         const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
-                        tcp_ops[idx] = self.loop.accept(ctx.fd, @ptrCast(ctx)) catch |err| {
-                            log.err("failed to re-register TCP accept: {s}", .{@errorName(err)});
-                            tcp_ops[idx] = null;
-                            continue;
-                        };
+                        tcp_armed[idx] = armed(self.loop.accept(ctx.fd, @ptrCast(ctx)), "TCP accept");
                     },
                 }
             }
 
             // The signalfd read joins the same repair loop as the listeners:
             // a transient arm failure must not cost the daemon its signals.
-            if (sig_fd >= 0 and signal_op == null) {
-                signal_op = self.loop.read(sig_fd, @ptrCast(&signal_ctx)) catch null;
+            if (sig_fd >= 0 and !signal_armed) {
+                signal_armed = !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
             }
 
             // Retry re-registration for any listeners that failed above.
             // Placed after completion processing so freshly freed slots are available.
             for (0..n) |i| {
-                if (udp_ops[i] == null) {
-                    udp_ops[i] = self.loop.recvFromMulti(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])) catch null;
+                if (!udp_armed[i]) {
+                    udp_armed[i] = !std.meta.isError(self.loop.recvFromMulti(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])));
                 }
-                if (tcp_ops[i] == null) {
-                    tcp_ops[i] = self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])) catch null;
+                if (!tcp_armed[i]) {
+                    tcp_armed[i] = !std.meta.isError(self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])));
                 }
             }
         }
