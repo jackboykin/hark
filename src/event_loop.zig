@@ -191,10 +191,14 @@ pub const EventLoop = struct {
         //   in our tick loop). Without this, every non-io_uring syscall
         //   (sendto, fcntl, etc.) drains task_work and breaks completion
         //   batching. Requires SINGLE_ISSUER. Kernel 6.1+.
+        // R_DISABLED: the issuer is whoever calls `enable`, not the creator
+        //   — rings are built on the main thread while it still holds
+        //   privilege, then handed to their workers.
         params.flags = linux.IORING_SETUP_CQSIZE |
             linux.IORING_SETUP_COOP_TASKRUN |
             linux.IORING_SETUP_SINGLE_ISSUER |
-            linux.IORING_SETUP_DEFER_TASKRUN;
+            linux.IORING_SETUP_DEFER_TASKRUN |
+            linux.IORING_SETUP_R_DISABLED;
         params.cq_entries = max_operations * 4;
         self.ring = linux.IoUring.init_params(max_operations, &params) catch |err| {
             log.err(
@@ -218,6 +222,12 @@ pub const EventLoop = struct {
             return err;
         };
         return self;
+    }
+
+    /// Binds the ring to the calling thread; must precede the first submit.
+    pub fn enable(self: *EventLoop) !void {
+        const rc = linux.io_uring_register(self.ring.fd, .REGISTER_ENABLE_RINGS, null, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.EnableRingsFailed;
     }
 
     pub fn destroy(self: *EventLoop) void {
@@ -458,10 +468,12 @@ pub const EventLoop = struct {
 
 fn createTestLoop() !*EventLoop {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-    return EventLoop.create(testing.allocator) catch |err| switch (err) {
+    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
+    try loop.enable();
+    return loop;
 }
 
 test "Slot stays lean — read ops must not drag packet-sized buffers back in" {

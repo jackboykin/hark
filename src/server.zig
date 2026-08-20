@@ -459,9 +459,6 @@ pub const Server = struct {
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
     exiting: std.atomic.Value(bool) = .init(false),
-    /// Number of workers that have finished binding their listen sockets.
-    /// Each worker drops privileges itself once this reaches `workers`.
-    bound_count: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
     /// RFC 8109 priming: first pool thread to win the CAS issues a single
     /// `. NS` recursive query so subsequent resolutions hit a warm cache
     /// with the live root NS RRset (not just the in-source root_hints).
@@ -713,6 +710,50 @@ pub const Server = struct {
 
         log.info("workers={d}", .{workers});
 
+        // Everything that needs privilege — rings (io_uring_disabled=1
+        // gates setup on CAP_SYS_ADMIN) and low-port binds — happens here
+        // on the main thread, before the drop and before any thread
+        // exists to inherit the wrong credentials.
+        const rigs = try self.allocator.alloc(Rig, workers);
+        for (rigs) |*rig| {
+            rig.loop = EventLoop.create(self.allocator) catch |err| {
+                log.err("failed to create event loop: {s}", .{@errorName(err)});
+                return err;
+            };
+            rig.udp = @splat(-1);
+            rig.tcp = @splat(-1);
+            for (listen_addrs, 0..) |addr, i| {
+                var addr_buf: [64]u8 = undefined;
+                const addr_str = na.format(addr, &addr_buf);
+                rig.udp[i] = createSocket(addr, posix.SOCK.DGRAM, workers > 1, false) catch |err| {
+                    log.warn("failed to create UDP socket for {s}: {s}", .{ addr_str, @errorName(err) });
+                    continue;
+                };
+                rig.tcp[i] = createSocket(addr, posix.SOCK.STREAM, workers > 1, true) catch |err| {
+                    log.warn("failed to create TCP socket for {s}: {s}", .{ addr_str, @errorName(err) });
+                    sys.close(rig.udp[i]);
+                    rig.udp[i] = -1;
+                    continue;
+                };
+            }
+            const any_ok = for (rig.udp[0..listen_addrs.len]) |fd| {
+                if (fd >= 0) break true;
+            } else false;
+            if (!any_ok) {
+                log.err("failed to bind any listen address", .{});
+                return error.BindFailed;
+            }
+        }
+
+        if (self.config.drop_gid != null or self.config.drop_uid != null) {
+            dropPrivileges(self.config.drop_gid, self.config.drop_uid) catch |err| {
+                log.err("failed to drop privileges: {s}", .{@errorName(err)});
+                return err;
+            };
+            if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
+            if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
+        }
+
         // Hot-set refresh: hook wired here, not init — self is at its
         // final address by run() (init returns by value).
         if (self.hot_set) |hs| {
@@ -722,13 +763,13 @@ pub const Server = struct {
             };
         }
 
-        for (1..workers) |i| {
-            _ = std.Thread.spawn(.{}, runWorker, .{ self, listen_addrs, @as(posix.fd_t, -1), workers > 1 }) catch |err| {
+        for (rigs[1..], 1..) |*rig, i| {
+            _ = std.Thread.spawn(.{}, runWorker, .{ self, rig, listen_addrs.len, @as(posix.fd_t, -1) }) catch |err| {
                 log.err("failed to spawn worker {d}: {s}", .{ i, @errorName(err) });
                 return err;
             };
         }
-        self.runWorker(listen_addrs, sig_fd, workers > 1);
+        self.runWorker(&rigs[0], listen_addrs.len, sig_fd);
     }
 
     /// The client-query line is the operator-meaningful hit rate (one count
@@ -779,59 +820,19 @@ pub const Server = struct {
         self.work_queue.dumpInstr();
     }
 
-    fn runWorker(self: *Server, listen_addrs: []const na.Address, sig_fd: posix.fd_t, reuseport: bool) noreturn {
-        const server_loop = EventLoop.create(self.allocator) catch |err| {
-            log.err("worker failed to create event loop: {s}", .{@errorName(err)});
+    /// One worker's privileged assets, built on the main thread before
+    /// the drop.
+    const Rig = struct {
+        loop: *EventLoop,
+        udp: [max_listen_addrs]posix.fd_t,
+        tcp: [max_listen_addrs]posix.fd_t,
+    };
+
+    fn runWorker(self: *Server, rig: *const Rig, n_addrs: usize, sig_fd: posix.fd_t) noreturn {
+        rig.loop.enable() catch |err| {
+            log.err("failed to enable io_uring: {s}", .{@errorName(err)});
             self.exit(1);
         };
-
-        var udp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
-        var tcp_socks: [max_listen_addrs]posix.fd_t = @splat(-1);
-
-        for (listen_addrs, 0..) |addr, i| {
-            var addr_buf: [64]u8 = undefined;
-            const addr_str = na.format(addr, &addr_buf);
-
-            udp_socks[i] = createSocket(addr, posix.SOCK.DGRAM, reuseport, false) catch |err| {
-                log.warn("failed to create UDP socket for {s}: {s}", .{ addr_str, @errorName(err) });
-                continue;
-            };
-
-            tcp_socks[i] = createSocket(addr, posix.SOCK.STREAM, reuseport, true) catch |err| {
-                log.warn("failed to create TCP socket for {s}: {s}", .{ addr_str, @errorName(err) });
-                sys.close(udp_socks[i]);
-                udp_socks[i] = -1;
-                continue;
-            };
-        }
-
-        const any_ok = for (udp_socks[0..listen_addrs.len]) |s| {
-            if (s >= 0) break true;
-        } else false;
-        if (!any_ok) {
-            log.err("worker failed to bind any listen address", .{});
-            self.exit(1);
-        }
-
-        _ = self.bound_count.fetchAdd(1, .release);
-
-        // setresuid is per-thread on Linux without libc's SIGSETXID broadcast,
-        // so every worker drops independently after the last peer binds.
-        if (self.config.drop_gid != null or self.config.drop_uid != null) {
-            while (self.bound_count.load(.acquire) < self.config.workers) {
-                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
-            }
-            dropPrivileges(self.config.drop_gid, self.config.drop_uid) catch |err| {
-                log.err("failed to drop privileges: {s}", .{@errorName(err)});
-                self.exit(1);
-            };
-            const is_main = sig_fd >= 0;
-            if (is_main) {
-                if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
-                if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
-            }
-        }
-
         // Per-worker Do53 TCP connection pool (RFC 7766)
         var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
         do53_tcp_pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
@@ -842,7 +843,7 @@ pub const Server = struct {
 
         var ws = WorkerState{
             .server = self,
-            .loop = server_loop,
+            .loop = rig.loop,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
         };
@@ -861,7 +862,7 @@ pub const Server = struct {
             self.exit(1);
         }
 
-        ws.serveLoop(udp_socks[0..listen_addrs.len], tcp_socks[0..listen_addrs.len], sig_fd);
+        ws.serveLoop(rig.udp[0..n_addrs], rig.tcp[0..n_addrs], sig_fd);
     }
 
     /// Hot-set sweeper: one tick per 500 ms. Shares the cache's clock
@@ -2063,15 +2064,14 @@ fn classifySignalRead(result: anytype) SignalAction {
     return if (saw_stats) .stats else .ignore;
 }
 
-/// Drop credentials for the calling thread only (raw syscall). Every worker
-/// thread must call this independently — without libc we have no SIGSETXID
-/// broadcast to propagate the change across threads.
+/// Drop credentials for the calling thread only (raw syscall; without libc
+/// there is no SIGSETXID broadcast), so it runs once on main before any
+/// thread exists — threads inherit.
 ///
 /// Scope: clears supplementary groups, sets r/e/s gid and r/e/s uid. On
 /// euid 0 → non-zero the kernel auto-drops the permitted cap set. NOT
-/// covered: ambient capabilities, the bounding set, and io_uring kernel
-/// io-wq workers (forked at ring creation, before this drop). Operators
-/// wanting full credential hygiene should prefer systemd User= /
+/// covered: ambient capabilities and the bounding set. Operators wanting
+/// full credential hygiene should prefer systemd User= /
 /// CapabilityBoundingSet= over this in-process drop.
 fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     // Clear supplementary groups while we still have CAP_SETGID. Without
