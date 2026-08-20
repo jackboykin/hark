@@ -1404,10 +1404,10 @@ const WorkerState = struct {
             // Retry re-registration for any listeners that failed above.
             // Placed after completion processing so freshly freed slots are available.
             for (0..n) |i| {
-                if (!udp_armed[i]) {
+                if (udp_socks[i] >= 0 and !udp_armed[i]) {
                     udp_armed[i] = !std.meta.isError(self.loop.recvFromMulti(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])));
                 }
-                if (!tcp_armed[i]) {
+                if (tcp_socks[i] >= 0 and !tcp_armed[i]) {
                     tcp_armed[i] = !std.meta.isError(self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])));
                 }
             }
