@@ -307,38 +307,17 @@ pub const EventLoop = struct {
         return id;
     }
 
-    pub fn cancel(self: *EventLoop, target_id: OperationId) !void {
+    /// Test-only: the one way to force a multishot termination on demand.
+    /// Production never cancels; the process exits with its ops armed.
+    fn cancel(self: *EventLoop, target_id: OperationId) !void {
         var sqe = try self.ring.get_sqe();
         sqe.prep_cancel(@as(u64, target_id), 0);
-        // Use a sentinel for cancel SQEs — we don't need a slot for them
         sqe.user_data = std.math.maxInt(u64);
-    }
-
-    /// Submit pending SQEs and wait for all active operations to complete.
-    pub fn flush(self: *EventLoop) void {
-        while (self.free_count < max_operations) {
-            _ = self.ring.submit_and_wait(1) catch return;
-            var cqes: [max_operations]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch return;
-            for (cqes[0..count]) |cqe| {
-                if (cqe.user_data == std.math.maxInt(u64)) continue;
-                if (cqe.user_data < max_operations) {
-                    const id: OperationId = @intCast(cqe.user_data);
-                    if (self.slots[id].active) {
-                        self.freeSlot(id);
-                    }
-                }
-            }
-        }
     }
 
     pub fn tick(self: *EventLoop, completions_buf: []Completion) ![]Completion {
         _ = try self.ring.submit_and_wait(1);
         return self.reapCompletions(completions_buf);
-    }
-
-    fn isCancelled(cqe: linux.io_uring_cqe) bool {
-        return cqe.res == -@as(i32, @intCast(@backingInt(linux.E.CANCELED)));
     }
 
     fn reapCompletions(self: *EventLoop, buf: []Completion) ![]Completion {
@@ -347,7 +326,7 @@ pub const EventLoop = struct {
 
         var out: usize = 0;
         for (cqes[0..count]) |cqe| {
-            // Skip cancel completions
+            // The test-only cancel SQE carries a sentinel user_data.
             if (cqe.user_data == std.math.maxInt(u64)) continue;
 
             const id: OperationId = @intCast(cqe.user_data);
@@ -385,13 +364,10 @@ pub const EventLoop = struct {
                             .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = err,
                         } };
-                        // io_uring clears F_MORE on error CQEs (see
-                        // io_req_set_res in kernel/io_uring), so
-                        // free_after is already true on the ENOBUFS /
-                        // CANCELED paths. We force it here for the
-                        // defensive in-process parse-failure paths too:
-                        // a malformed header would otherwise leave the
-                        // slot active with no way to recover it.
+                        // io_uring clears F_MORE on error CQEs, so this is
+                        // already true on ENOBUFS; force it for the
+                        // in-process parse-failure paths too, else the
+                        // slot stays active with no way to recover it.
                         free_after = true;
                     }
                 },
@@ -401,12 +377,6 @@ pub const EventLoop = struct {
                             .fd = @intCast(cqe.res),
                             .addr = na.fromSockaddr(&a.addr),
                             .err = null,
-                        } };
-                    } else if (isCancelled(cqe)) {
-                        completion.result = .{ .accept = .{
-                            .fd = -1,
-                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = error.Cancelled,
                         } };
                     } else {
                         completion.result = .{ .accept = .{
@@ -423,8 +393,6 @@ pub const EventLoop = struct {
                         @memcpy(res.buf[0..res.len], rbuf[0..res.len]);
                     } else if (cqe.res == 0) {
                         res.err = error.EndOfFile;
-                    } else if (isCancelled(cqe)) {
-                        res.err = error.Cancelled;
                     } else {
                         res.err = error.ReadFailed;
                     }
@@ -455,7 +423,6 @@ pub const EventLoop = struct {
             const errno: linux.E = @fromBackingInt(@intCast(@as(u31, @intCast(-cqe.res))));
             return switch (errno) {
                 .NOBUFS => error.NoBuffers,
-                .CANCELED => error.Cancelled,
                 else => error.RecvFailed,
             };
         }
@@ -525,7 +492,7 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     const server_addr = try na.getSockName(sock);
 
     var ctx: u8 = 1;
-    const op_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
     // Send 3 packets from a separate thread — one multishot SQE should
     // produce 3 CQEs without re-arming.
@@ -576,45 +543,6 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     thread.join();
     try testing.expectEqual(payloads.len, received);
     try testing.expect(still_armed_seen);
-
-    // Tear down the multishot SQE before destroy so the kernel doesn't
-    // keep it armed against a torn-down buffer ring.
-    try loop.cancel(op_id);
-    loop.flush();
-}
-
-test "EventLoop cancel pending recvFromMulti" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-    defer sys.close(sock);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(sock, &bind_pa.any, bind_len);
-
-    var ctx: u8 = 99;
-    const recv_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
-    try loop.cancel(recv_id);
-
-    var completions: [max_operations]Completion = undefined;
-    var got_cancelled = false;
-
-    for (0..3) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .recv => |r| {
-                    if (r.err != null) got_cancelled = true;
-                },
-                else => {},
-            }
-        }
-        if (got_cancelled) break;
-    }
-
-    try testing.expect(got_cancelled);
 }
 
 test "termination is reported per-CQE, not by asking the recycled slot table" {
@@ -673,9 +601,6 @@ test "termination is reported per-CQE, not by asking the recycled slot table" {
 
     try testing.expectEqual(@as(usize, 2), terminations);
     try testing.expect(rearmed_mid_batch);
-
-    for (ops) |op| if (op) |o| loop.cancel(o) catch {};
-    loop.flush();
 }
 
 test "read payload survives an op arming into the freed slot mid-batch" {
@@ -720,10 +645,7 @@ test "read payload survives an op arming into the freed slot mid-batch" {
     var bind_pa: na.PosixAddress = undefined;
     const bind_len = na.toSockaddr(&bind_na, &bind_pa);
     try sys.bind(sock, &bind_pa.any, bind_len);
-    const recv_id = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
     try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
-
-    try loop.cancel(recv_id);
-    loop.flush();
 }
