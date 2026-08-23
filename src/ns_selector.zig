@@ -190,7 +190,6 @@ pub const NsSelector = struct {
         for (servers, 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
-            // Check dead status via RttCache (hard failure override).
             const is_dead = if (rtt_cache) |rc| rc.isDead(addr_key, now_ms) else false;
             if (is_dead) {
                 order_buf[max_order - 1 - dead_count] = i;
@@ -214,10 +213,8 @@ pub const NsSelector = struct {
             live_count += 1;
         }
 
-        // Sort live servers by Thompson sample (descending).
         sortByScoreDesc(order_buf[0..live_count], samples[0..live_count]);
 
-        // Append dead servers (shuffled).
         if (dead_count > 0) {
             var dead_buf: [max_order]usize = undefined;
             for (0..dead_count) |d| {
@@ -233,7 +230,6 @@ pub const NsSelector = struct {
         };
     }
 
-    /// Record the outcome of querying a nameserver.
     pub fn recordOutcome(
         self: *NsSelector,
         zone: dns.Name,
@@ -342,7 +338,6 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
         const u = rand.fastUniformFloat(io);
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
-        // Slow accept
         if (@log(u) < 0.5 * x * x + d * (1.0 - v + @log(v))) return d * v;
     }
 }
@@ -379,16 +374,11 @@ fn sortByScoreDesc(indices: []usize, scores: []f32) void {
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "reward mapping" {
-    // Timeout → 0.0
     try testing.expectEqual(@as(f32, 0.0), reward(.timeout, 0));
     try testing.expectEqual(@as(f32, 0.0), reward(.validation_failure, 100_000));
-    // Server error → 0.1
     try testing.expectEqual(@as(f32, 0.1), reward(.server_error, 50_000));
-    // Success at 0ms → 1.0
     try testing.expectEqual(@as(f32, 1.0), reward(.success, 0));
-    // Success at 1000ms → 0.5
     try testing.expectEqual(@as(f32, 0.5), reward(.success, 1_000_000));
-    // Success at 500ms → 0.75
     try testing.expectEqual(@as(f32, 0.75), reward(.success, 500_000));
 }
 
@@ -441,7 +431,6 @@ test "ArmKeyContext: 16-shard distribution in both halves" {
 }
 
 test "beta sample in range" {
-    // Draw many samples, all should be in (0, 1)
     for (0..1000) |_| {
         const s = betaSample(testing.io, 1.0, 1.0);
         try testing.expect(s >= 0.0 and s <= 1.0);

@@ -230,7 +230,6 @@ pub const CacheLookupResult = union(enum) {
 
 const cloneName = dns.cloneName;
 
-/// Apply min-TTL floor and max-TTL cap.
 fn clampTtl(min_ttl: u32, ttl: u32) u32 {
     return @min(@max(ttl, min_ttl), max_cache_ttl);
 }
@@ -1681,7 +1680,6 @@ test "cache store and lookup positive" {
 
     try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 93, 184, 216, 34 });
 
-    // Lookup should hit
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
@@ -1746,7 +1744,6 @@ test "cache case insensitive lookup" {
 
     try storeTestA(&cache, alloc, &.{ "EXAMPLE", "COM" }, 300, .{ 1, 2, 3, 4 });
 
-    // Lookup with lowercase
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
@@ -2773,26 +2770,22 @@ test "cache stats tracking" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // Initial stats should be zero
     const initial = cache.getStats();
     try testing.expectEqual(@as(u64, 0), initial.hits);
     try testing.expectEqual(@as(u64, 0), initial.misses);
     try testing.expectEqual(@as(u64, 0), initial.stores);
     try testing.expectEqual(@as(u32, 0), initial.entries);
 
-    // Miss on empty cache
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     _ = cache.lookup(arena.allocator(), "nonexistent.com", .a, .in);
     try testing.expectEqual(@as(u64, 0), cache.getStats().hits);
     try testing.expectEqual(@as(u64, 1), cache.getStats().misses);
 
-    // Store a record
     try storeTestA(&cache, alloc, &.{ "stats", "test" }, 300, .{ 1, 2, 3, 4 });
     try testing.expectEqual(@as(u64, 1), cache.getStats().stores);
     try testing.expectEqual(@as(u32, 1), cache.getStats().entries);
 
-    // Hit on stored record
     _ = cache.lookup(arena.allocator(), "stats.test", .a, .in);
     try testing.expectEqual(@as(u64, 1), cache.getStats().hits);
     try testing.expectEqual(@as(u64, 1), cache.getStats().misses); // unchanged

@@ -522,7 +522,6 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
             out += 1;
         }
     }
-    // Emit trailing bits (if any)
     if (bit_count > 0) {
         dest[out] = alphabet[@intCast((bits << (5 - bit_count)) & 0x1F)];
         out += 1;
@@ -1491,7 +1490,6 @@ pub const Serializer = struct {
             (@as(u32, @intFromBool(opt.do_bit)) << 15);
         try self.writeU32(ttl);
 
-        // Compute RDLENGTH: existing options + optional padding
         var rdlength: u16 = 0;
         for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
 
@@ -1610,7 +1608,6 @@ test "header roundtrip" {
     try testing.expectEqual(original.ns_count, parsed.ns_count);
     try testing.expectEqual(original.ar_count, parsed.ar_count);
 
-    // Re-serialize and compare bytes
     var buf2: [12]u8 = undefined;
     parsed.serialize(&buf2);
     try testing.expectEqualSlices(u8, &buf, &buf2);
@@ -1907,7 +1904,6 @@ test "TXT record parsing" {
 }
 
 test "roundtrip: parse -> serialize -> parse -> compare" {
-    // Build a query packet
     var original_pkt: [max_udp_payload]u8 = undefined;
     mem.writeInt(u16, original_pkt[0..2], 0xABCD, .big);
     mem.writeInt(u16, original_pkt[2..4], 0x0100, .big); // RD=1
@@ -1943,19 +1939,15 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
     original_pkt[pos + 3] = 4;
     pos += 4;
 
-    // Parse
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const msg1 = try parseMessage(arena.allocator(), original_pkt[0..pos]);
 
-    // Serialize
     var ser_buf: [max_udp_payload]u8 = undefined;
     const serialized = try serializeMessage(&ser_buf, msg1);
 
-    // Parse again
     const msg2 = try parseMessage(arena.allocator(), serialized);
 
-    // Compare
     try testing.expectEqual(msg1.header.id, msg2.header.id);
     try testing.expectEqual(msg1.header.flags.rd, msg2.header.flags.rd);
     try testing.expectEqual(msg1.questions.len, msg2.questions.len);
@@ -2048,7 +2040,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     // Slice to just past the pointer — no type/class/ttl/rdlength/rdata
     const truncated = pkt[0 .. ans_start + 2];
 
-    // hasTcBit works on the truncated wire data
     try testing.expect(hasTcBit(truncated));
 
     // parseMessage fails — this is the bug we're guarding against.
@@ -2057,7 +2048,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     defer arena.deinit();
     try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), truncated));
 
-    // Without TC bit, hasTcBit returns false
     mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1, TC=0
     try testing.expect(!hasTcBit(truncated));
 
@@ -2132,21 +2122,17 @@ test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
 
     const msg = try buildQuery(alloc, 0x1234, "example.com", .a, .{ .rd = true, .edns = .{ .do_bit = true } });
 
-    // Verify opt was set on the built message
     try testing.expect(msg.opt != null);
     const opt = msg.opt.?;
     try testing.expectEqual(edns_udp_payload, opt.udp_payload_size);
     try testing.expect(opt.do_bit);
     try testing.expectEqual(@as(u8, 0), opt.version);
 
-    // Serialize
     var buf: [edns_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
-    // Parse back
     const parsed = try parseMessage(alloc, wire);
 
-    // Verify the opt record survives the roundtrip
     try testing.expect(parsed.opt != null);
     const parsed_opt = parsed.opt.?;
     try testing.expectEqual(edns_udp_payload, parsed_opt.udp_payload_size);
@@ -2163,11 +2149,9 @@ test "EDNS0: parse non-EDNS response has null opt" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Build a query without EDNS
     const msg = try buildQuery(alloc, 0x5678, "example.com", .a, .{});
     try testing.expect(msg.opt == null);
 
-    // Serialize and parse
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
     const parsed = try parseMessage(alloc, wire);
@@ -3164,7 +3148,6 @@ test "typeBitmapContains" {
     try testing.expect(!typeBitmapContains(&bitmap, .txt));
     try testing.expect(!typeBitmapContains(&bitmap, .cname));
 
-    // Empty bitmap
     try testing.expect(!typeBitmapContains(&.{}, .a));
 }
 

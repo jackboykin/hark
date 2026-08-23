@@ -57,7 +57,6 @@ pub const AddressKey = struct {
     addr: [16]u8,
     port: u16,
 
-    /// Create a key from an address, overriding the port.
     pub fn fromAddressWithPort(address: Address, port: u16) AddressKey {
         var key = fromAddress(address);
         key.port = port;
@@ -117,7 +116,6 @@ pub const PosixAddress = extern union {
     in6: posix.sockaddr.in6,
 };
 
-/// Convert an Address to a posix sockaddr. Returns the sockaddr length.
 pub fn toSockaddr(addr: *const Address, storage: *PosixAddress) posix.socklen_t {
     return switch (addr.*) {
         .ip4 => |ip4| {
@@ -139,7 +137,6 @@ pub fn toSockaddr(addr: *const Address, storage: *PosixAddress) posix.socklen_t 
     };
 }
 
-/// Convert a posix sockaddr to an Address.
 pub fn fromSockaddr(sa: *const PosixAddress) Address {
     return switch (sa.any.family) {
         posix.AF.INET => .{ .ip4 = .{
@@ -164,7 +161,6 @@ pub fn afU32(addr: Address) u32 {
     };
 }
 
-/// Get the local address bound to a socket.
 pub fn getSockName(fd: posix.fd_t) !Address {
     var pa: PosixAddress = undefined;
     var len: posix.socklen_t = @sizeOf(PosixAddress);
@@ -172,7 +168,6 @@ pub fn getSockName(fd: posix.fd_t) !Address {
     return fromSockaddr(&pa);
 }
 
-/// Get the remote peer address of a connected socket.
 pub fn getPeerName(fd: posix.fd_t) !Address {
     var pa: PosixAddress = undefined;
     var len: posix.socklen_t = @sizeOf(PosixAddress);
@@ -189,14 +184,12 @@ pub fn format(addr: Address, buf: []u8) []const u8 {
     return w.buffered();
 }
 
-/// Connect a socket to an Address (converts to sockaddr internally).
 pub fn connectTo(fd: posix.fd_t, addr: *const Address) !void {
     var storage: PosixAddress = undefined;
     const sa_len = toSockaddr(addr, &storage);
     try sys.connect(fd, &storage.any, sa_len);
 }
 
-/// Bind a socket to an Address (converts to sockaddr internally).
 pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
     var storage: PosixAddress = undefined;
     const sa_len = toSockaddr(addr, &storage);
@@ -443,7 +436,6 @@ test "isNonRoutableNs allows routable IPv6" {
     try testing.expect(!isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
 }
 
-/// Compare two addresses by IP only, ignoring port.
 pub fn ipEqual(a: Address, b: Address) bool {
     return switch (a) {
         .ip4 => |a4| switch (b) {

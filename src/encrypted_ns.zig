@@ -95,7 +95,6 @@ pub const EncryptedNsCache = struct {
         return entry.status;
     }
 
-    /// Return the current status for a nameserver.
     pub fn getStatus(self: *EncryptedNsCache, key: AddressKey) ServerStatus {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -288,7 +287,6 @@ test "EncryptedNsCache claim(.discover) dedup" {
 
     const key = makeKey(.{ 9, 9, 9, 9 });
 
-    // First claim succeeds
     try testing.expect(cache.claim(key, .discover));
     try testing.expectEqual(ServerStatus.probing, cache.getStatus(key));
 
@@ -358,7 +356,6 @@ test "EncryptedNsCache capable expires after persistence_sec" {
     en_test_now = 100_000 + persistence_sec;
     try testing.expectEqual(ServerStatus.unknown, cache.getStatus(key));
 
-    // Should allow re-probing
     try testing.expect(cache.claim(key, .discover));
 }
 

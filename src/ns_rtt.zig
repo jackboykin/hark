@@ -121,7 +121,6 @@ pub const RttCache = struct {
         return &self.shards[h & shard_mask];
     }
 
-    /// Return the recommended timeout in ms for this server.
     pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
         const shard = self.shardFor(key);
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
@@ -131,7 +130,6 @@ pub const RttCache = struct {
         return computeTimeout(state);
     }
 
-    /// Record a successful response with measured RTT (microseconds).
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
         const now_ms = self.now_fn();
         const shard = self.shardFor(key);
@@ -493,18 +491,15 @@ test "recordTimeout increments consecutive count and marks dead" {
 
     const key = testAddr(2);
 
-    // Prime with a success
     cache.recordSuccess(key, 100_000);
     try testing.expect(!cache.isDead(key, cache.nowMs()));
 
-    // Timeout 4 times → should be dead
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     try testing.expect(cache.isDead(key, cache.nowMs()));
 
-    // After dead_duration_ms, should recover
     test_now_ms = 1000 + dead_duration_ms + 1;
     try testing.expect(!cache.isDead(key, cache.nowMs()));
 }

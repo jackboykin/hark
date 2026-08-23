@@ -204,7 +204,6 @@ pub fn classifyDelegation(
     child_zone: dns.Name,
     budget: *ValidationBudget,
 ) SecurityStatus {
-    // Look for DS records for the child zone
     var has_ds = false;
     for (authorities) |rr| {
         if (rr.rtype == .ds and rr.name.eql(child_zone)) {
@@ -418,7 +417,6 @@ fn buildSignedData(
     var entries: [64]SortEntry = undefined;
     if (rrset.len > entries.len) return error.BufferTooSmall;
 
-    // Use remaining buffer space for individual RR wire data
     var temp_pos = pos;
 
     for (rrset, 0..) |rr, idx| {
@@ -449,11 +447,9 @@ fn buildSignedData(
         mem.writeInt(u32, buf[temp_pos..][0..4], rrsig.original_ttl, .big);
         temp_pos += 4;
 
-        // rdlength placeholder
         const rdlen_pos = temp_pos;
         temp_pos += 2;
 
-        // Canonical RDATA
         const rdata_start = temp_pos;
         temp_pos += try writeCanonicalRData(buf[temp_pos..], rr.rdata);
         const rdata_len = temp_pos - rdata_start;
@@ -617,7 +613,6 @@ fn verifyRrsig(
     if (dns.serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
     if (dns.serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
 
-    // Build the signed data
     var signed_data_buf: [65536]u8 = undefined;
     const signed_data = try buildSignedData(&signed_data_buf, rrsig, rrset);
 
@@ -1184,12 +1179,10 @@ pub fn validateNegativeProof(
         var wildcard_denied = false;
         for (authorities) |rr| {
             if (rr.rtype != .nsec) continue;
-            // Wildcard is covered by NSEC range (doesn't exist)
             if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) {
                 wildcard_denied = true;
                 break;
             }
-            // Wildcard matches NSEC owner but qtype absent (NODATA at wildcard)
             if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, wildcard, qtype)) {
                 wildcard_denied = true;
                 break;
@@ -1582,7 +1575,6 @@ pub fn verifyAuthorityProofSigs(
             rrset_count += 1;
         }
 
-        // Find a matching RRSIG and verify it
         var sig_verified = false;
         for (authorities) |sig_rr| {
             if (sig_rr.rtype != .rrsig) continue;
@@ -1652,7 +1644,6 @@ test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
     try testing.expect(!isValidZoneKey(.{ .flags = 0, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
     // SEP-only (flags=1) — no zone key bit
     try testing.expect(!isValidZoneKey(.{ .flags = 1, .protocol = 3, .algorithm = .rsasha256, .public_key = &.{} }));
-    // Wrong protocol
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 0, .algorithm = .rsasha256, .public_key = &.{} }));
     try testing.expect(!isValidZoneKey(.{ .flags = 256, .protocol = 1, .algorithm = .rsasha256, .public_key = &.{} }));
     // RFC 5011 §2.1: REVOKE bit set — must reject even with zone key + correct protocol
@@ -2154,7 +2145,6 @@ test "buildSignedData reconstructs wildcard owner name" {
 }
 
 test "ECDSA P-256 signature verification" {
-    // Generate a real key pair and sign some data
     const key_pair = EcdsaP256.KeyPair.generate(testing.io);
     const pub_bytes = key_pair.public_key.toUncompressedSec1();
     // DNSSEC key is raw 64-byte x||y (without 0x04 prefix)
@@ -2164,10 +2154,8 @@ test "ECDSA P-256 signature verification" {
     const sig = try key_pair.sign(msg, null);
     const sig_bytes = sig.toBytes();
 
-    // Should verify
     try verifyEcdsa(EcdsaP256, 32, &sig_bytes, msg, dnssec_key);
 
-    // Wrong message should fail
     try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32, &sig_bytes, "wrong data", dnssec_key));
 }
 
@@ -2421,19 +2409,12 @@ test "canonical name ordering" {
     };
     const net = dns.Name{ .labels = &.{@as([]const u8, "net")} };
 
-    // Root < everything
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(root, com));
-    // com < net
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(com, net));
-    // com < example.com
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(com, example_com));
-    // example.com < a.example.com
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(example_com, a_example_com));
-    // a.example.com < z.example.com
     try testing.expectEqual(std.math.Order.lt, canonicalNameOrder(a_example_com, z_example_com));
-    // Equal
     try testing.expectEqual(std.math.Order.eq, canonicalNameOrder(com, com));
-    // Reverse
     try testing.expectEqual(std.math.Order.gt, canonicalNameOrder(net, com));
 }
 
@@ -2445,19 +2426,16 @@ test "NSEC name non-existence" {
         .labels = &.{ @as([]const u8, "gamma"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
 
-    // NSEC: alpha.example.com -> gamma.example.com
     const nsec_data = dns.NsecData{
         .next_domain_name = gamma,
         .type_bit_maps = &.{},
     };
 
-    // beta.example.com should be between alpha and gamma
     const beta = dns.Name{
         .labels = &.{ @as([]const u8, "beta"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
     try testing.expect(nsecProvesNameNonexistence(alpha, nsec_data, beta));
 
-    // zeta.example.com is NOT between alpha and gamma (z > g)
     const zeta = dns.Name{
         .labels = &.{ @as([]const u8, "zeta"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -2479,9 +2457,7 @@ test "NSEC type non-existence" {
         .type_bit_maps = &[_]u8{ 0x00, 0x01, 0x62 },
     };
 
-    // AAAA doesn't exist at this name
     try testing.expect(nsecProvesTypeNonexistence(name, nsec_data, name, .aaaa));
-    // A does exist
     try testing.expect(!nsecProvesTypeNonexistence(name, nsec_data, name, .a));
     // Different name — not a proof
     const other = dns.Name{ .labels = &.{@as([]const u8, "other")} };
@@ -2510,7 +2486,6 @@ test "NSEC NODATA bogus when CNAME bit set (RFC 6840 §4.3)" {
         .type_bit_maps = &[_]u8{ 0x00, 0x03, 0x00, 0x00, 0x80 },
     };
     try testing.expect(nsecProvesTypeNonexistence(name, cname_absent, name, .aaaa));
-    // Direct CNAME query against a name without CNAME passes.
     try testing.expect(nsecProvesTypeNonexistence(name, cname_absent, name, .cname));
 }
 
@@ -2527,11 +2502,9 @@ test "NSEC3 hash computation - RFC 5155 Appendix B" {
     const hash = try nsec3Hash(name, &salt, 12);
     try testing.expectEqual(@as(usize, 20), hash.len);
 
-    // Same input produces same hash
     const hash2 = try nsec3Hash(name, &salt, 12);
     try testing.expectEqualSlices(u8, &hash, &hash2);
 
-    // Different name produces different hash
     const other = dns.Name{
         .labels = &.{@as([]const u8, "other")},
     };
@@ -2543,15 +2516,12 @@ test "NSEC3 hash range check" {
     const owner = [_]u8{ 0x10, 0x20, 0x30 };
     const next = [_]u8{ 0x50, 0x60, 0x70 };
 
-    // In range
     const target_in = [_]u8{ 0x30, 0x40, 0x50 };
     try testing.expect(nsec3HashInRange(&owner, &next, &target_in));
 
-    // Before range
     const target_before = [_]u8{ 0x05, 0x06, 0x07 };
     try testing.expect(!nsec3HashInRange(&owner, &next, &target_before));
 
-    // After range
     const target_after = [_]u8{ 0x80, 0x90, 0xA0 };
     try testing.expect(!nsec3HashInRange(&owner, &next, &target_after));
 }
@@ -2625,7 +2595,6 @@ test "validateNegativeProof NSEC NODATA" {
         },
     }};
 
-    // NODATA for AAAA should be proven secure
     var b: ValidationBudget = .{};
     const status = validateNegativeProof(&authorities, name, .aaaa, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.secure, status);
@@ -2999,7 +2968,6 @@ test "base32hex decode/encode roundtrip" {
     // RFC 5155 Appendix B known-answer: covers nsec3Hash and base32HexEncode.
     try testing.expectEqualStrings("0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM", encoded);
 
-    // Decode back
     var dec_buf: [20]u8 = undefined;
     const n = try dns.base32HexDecode(&dec_buf, encoded);
     try testing.expectEqual(@as(usize, 20), n);
@@ -3035,11 +3003,9 @@ test "nsec3OwnerHash extraction" {
     const extracted = nsec3OwnerHash(owner_name).?;
     try testing.expectEqualSlices(u8, &hash, &extracted);
 
-    // Wrong length label
     const bad_name = dns.Name{ .labels = &.{@as([]const u8, "tooshort")} };
     try testing.expect(nsec3OwnerHash(bad_name) == null);
 
-    // Empty name
     const empty_name = dns.Name{ .labels = &.{} };
     try testing.expect(nsec3OwnerHash(empty_name) == null);
 }
