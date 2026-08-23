@@ -65,14 +65,19 @@ const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_
 const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
 
+/// `align` sets where a field starts, not how much it reserves, and auto-layout
+/// sorts by descending alignment — a bare aligned atomic lands at offset 0 with
+/// the rwlock behind it. Wrapping rounds `@sizeOf` to a full line, which works.
+const DeathGate = struct {
+    v: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0),
+};
+
 const Shard = struct {
     entries: EntryMap,
     rwlock: ?std.Io.RwLock,
-    /// High-water mark of any `dead_until_ms` ever written in this shard.
-    /// Read atomically without the rwlock by `isDead`'s fast path; cache-line
-    /// aligned so the reads don't pull in the rwlock's reader-count line.
-    latest_dead_until_ms: std.atomic.Value(i64) align(std.atomic.cache_line) =
-        std.atomic.Value(i64).init(0),
+    /// High-water mark of any `dead_until_ms` in this shard, read without the
+    /// rwlock by `isDead`'s fast path — hence a line of its own.
+    latest_dead_until_ms: DeathGate = .{},
 };
 
 pub const RttCache = struct {
@@ -208,8 +213,8 @@ pub const RttCache = struct {
                 // rwlock so no other writer can interleave; .release pairs with
                 // the .acquire in isDead so a fast-path reader that sees the
                 // new high-water also sees the dead_until_ms write above.
-                const cur = shard.latest_dead_until_ms.load(.monotonic);
-                if (new_deadline > cur) shard.latest_dead_until_ms.store(new_deadline, .release);
+                const cur = shard.latest_dead_until_ms.v.load(.monotonic);
+                if (new_deadline > cur) shard.latest_dead_until_ms.v.store(new_deadline, .release);
             }
         }
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
@@ -242,7 +247,7 @@ pub const RttCache = struct {
     /// skipped — the dominant case under healthy upstream.
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardFor(key);
-        if (now_ms >= shard.latest_dead_until_ms.load(.acquire)) return false;
+        if (now_ms >= shard.latest_dead_until_ms.v.load(.acquire)) return false;
 
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
