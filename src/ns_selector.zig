@@ -74,10 +74,9 @@ const ArmKey = struct {
 /// picking up the randomized seed AddressKey.HashCtx already applies.
 const ArmKeyContext = struct {
     pub fn hash(_: @This(), key: ArmKey) u64 {
-        var h = AddressKey.HashCtx.hash(.{}, key.addr_key);
-        h ^= key.zone_hash;
-        h *%= 0x100000001b3;
-        return h;
+        // The zone fold leaves the composed hash unavalanched, and both halves
+        // carry a consumer: shardIndex the top, ArmMap's probe the bottom.
+        return na.fmix64(AddressKey.HashCtx.hash(.{}, key.addr_key) ^ key.zone_hash);
     }
 
     pub fn eql(_: @This(), a: ArmKey, b: ArmKey) bool {
@@ -100,6 +99,12 @@ const ArmMap = std.HashMap(ArmKey, ArmState, ArmKeyContext, std.hash_map.default
 /// so total capacity remains bounded by `max_arms` (modulo per-shard rounding).
 const shard_count: u32 = 16;
 const shard_mask: u32 = shard_count - 1;
+
+/// Shard from the top half, matching `ns_rtt`: `std.HashMap` probes from the
+/// low bits of the same hash, so sharing them clusters every shard's index.
+inline fn shardIndex(h: u64) u32 {
+    return @as(u32, @truncate(h >> 32)) & shard_mask;
+}
 
 const Shard = struct {
     arms: ArmMap,
@@ -150,8 +155,7 @@ pub const NsSelector = struct {
     }
 
     inline fn shardFor(self: *NsSelector, key: ArmKey) *Shard {
-        const h = ArmKeyContext.hash(.{}, key);
-        return &self.shards[@as(u32, @truncate(h)) & shard_mask];
+        return &self.shards[shardIndex(ArmKeyContext.hash(.{}, key))];
     }
 
     /// Returned ordering: live servers (sorted by Thompson sample, descending)
@@ -410,47 +414,29 @@ test "zone hash different zones differ" {
     try testing.expect(zoneHash(a) != zoneHash(b));
 }
 
-test "ArmKeyContext: 16-shard distribution in the LOW bits" {
-    // shardFor truncates the LOW bits of ArmKeyContext.hash — safe only
-    // because the composed AddressKey hash is fmix64-finalized before the
-    // zone xor/multiply. ns_rtt's sibling test (net_address.zig) pins the
-    // HIGH bits; this pins the low-bit floor so a hash tweak that breaks
-    // low-bit diffusion single-shards loudly instead of silently.
+test "ArmKeyContext: 16-shard distribution in both halves" {
+    // Both halves carry a consumer: shardIndex subsets the top, ArmMap probes
+    // the bottom. Pin both so a tweak that kills either single-shards loudly.
+    // Axis 0: sequential addresses, one zone. Axis 1: sequential zones, one address.
     const zone = zoneHash(dns.Name{ .labels = &.{ "example", "com" } });
     const addr_key = AddressKey.fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 53));
-
-    // Axis 1: sequential addresses, fixed zone.
-    var counts: [16]u32 = @splat(0);
-    var i: u32 = 0;
-    while (i < 4096) : (i += 1) {
-        const k = ArmKey{
-            .zone_hash = zone,
-            .addr_key = AddressKey.fromAddress(na.initIp4(.{
-                @intCast((i >> 16) & 0xff),
-                @intCast((i >> 8) & 0xff),
-                @intCast(i & 0xff),
-                1,
-            }, 53)),
-        };
-        counts[@as(u32, @truncate(ArmKeyContext.hash(.{}, k))) & shard_mask] += 1;
-    }
-    // Uniform expectation 256/bucket; same ±60%-class floor/ceiling as the
-    // net_address sibling test.
-    for (counts) |c| {
-        try testing.expect(c >= 100);
-        try testing.expect(c <= 700);
-    }
-
-    // Axis 2: sequential zone hashes, fixed address (many zones, one server).
-    counts = @splat(0);
-    var z: u64 = 0;
-    while (z < 4096) : (z += 1) {
-        const k = ArmKey{ .zone_hash = z, .addr_key = addr_key };
-        counts[@as(u32, @truncate(ArmKeyContext.hash(.{}, k))) & shard_mask] += 1;
-    }
-    for (counts) |c| {
-        try testing.expect(c >= 100);
-        try testing.expect(c <= 700);
+    for (0..2) |axis| {
+        var hi: [16]u32 = @splat(0);
+        var lo: [16]u32 = @splat(0);
+        for (0..4096) |n| {
+            const k: ArmKey = if (axis == 0) .{
+                .zone_hash = zone,
+                .addr_key = AddressKey.fromAddress(na.initIp4(.{
+                    @intCast((n >> 16) & 0xff), @intCast((n >> 8) & 0xff), @intCast(n & 0xff), 1,
+                }, 53)),
+            } else .{ .zone_hash = @intCast(n), .addr_key = addr_key };
+            const h = ArmKeyContext.hash(.{}, k);
+            hi[shardIndex(h)] += 1;
+            lo[@as(u32, @truncate(h)) & shard_mask] += 1;
+        }
+        // Uniform expectation 256/bucket; ±60%-class bounds, as net_address's sibling.
+        for (hi) |c| try testing.expect(c >= 100 and c <= 700);
+        for (lo) |c| try testing.expect(c >= 100 and c <= 700);
     }
 }
 

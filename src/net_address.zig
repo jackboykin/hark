@@ -37,6 +37,19 @@ pub fn wildcardFor(peer: Address) Address {
     };
 }
 
+/// Canonical Murmur3 fmix64. FNV-1a's multiply only propagates leftward, so
+/// without it the bottom bits stay invariant when inputs share theirs (IPv4
+/// keys with addr[0]=0). Shard selectors subset both halves. Not cryptographic.
+pub fn fmix64(h0: u64) u64 {
+    var h = h0;
+    h ^= h >> 33;
+    h *%= 0xff51afd7ed558ccd;
+    h ^= h >> 33;
+    h *%= 0xc4ceb9fe1a85ec53;
+    h ^= h >> 33;
+    return h;
+}
+
 /// Hashable, equality-comparable address-with-port. Used as a key in caches
 /// (RTT, NS-selector, encrypted_ns, connection pools).
 pub const AddressKey = struct {
@@ -88,19 +101,7 @@ pub const AddressKey = struct {
             h *%= 0x100000001b3;
             h ^= tag;
             h *%= 0x100000001b3;
-            // FNV-1a's multiply only propagates input bits leftward — without
-            // a finalizer, the bottom bits stay invariant whenever inputs
-            // share their low bits (e.g. IPv4 keys with addr[0]=0).
-            // Consumers (RttCache shard selector) subset these bits, so we
-            // run the canonical Murmur3 fmix64 to break that structure.
-            // This is collision-mitigation, not cryptographic — the input
-            // is small and `hash_seed` is the only randomness.
-            h ^= h >> 33;
-            h *%= 0xff51afd7ed558ccd;
-            h ^= h >> 33;
-            h *%= 0xc4ceb9fe1a85ec53;
-            h ^= h >> 33;
-            return h;
+            return fmix64(h);
         }
 
         pub fn eql(_: @This(), a: AddressKey, b: AddressKey) bool {
