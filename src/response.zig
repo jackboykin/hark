@@ -341,37 +341,29 @@ pub fn buildResponseWire(
         .opt = opt,
     };
 
-    // Try full response
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
+    var ends: dns.SectionEnds = .{};
+    if (dns.serializeMessageEnds(wire_buf, msg, &ends)) |wire| {
         if (wire.len <= ctx.max_udp_payload) return wire;
     } else |_| {}
 
-    // Drop additionals (RFC 1035 §4.2.1: additionals are advisory; their
-    // omission alone does not require TC=1).
-    msg.additionals = &.{};
-    msg.header.ar_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_udp_payload) return wire;
-    } else |_| {}
-
-    // Drop authorities — TC=1 from this point on. RFC 1035 §4.2.1 / 2181 §9:
-    // when an authoritative section that the client may need (negative SOA,
-    // referral NS) is omitted, the truncation flag MUST be set so the client
-    // knows to retry over TCP.
-    msg.header.flags.tc = true;
-    msg.authorities = &.{};
-    msg.header.ns_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        if (wire.len <= ctx.max_udp_payload) return wire;
-    } else |_| {}
-
-    // Last resort: drop answers, keep TC=1.
-    msg.answers = &.{};
-    msg.header.an_count = 0;
-    if (dns.serializeMessage(wire_buf, msg)) |wire| {
-        return wire[0..@min(wire.len, ctx.max_udp_payload)];
-    } else |_| {}
-
+    // Sections are laid down in order and a name pointer only reaches
+    // backward (RFC 1035 §4.1.4), so a response minus its tail sections is a
+    // prefix of the full wire plus a fresh OPT: rewind to a section boundary
+    // instead of re-serializing. Dropping additionals alone needs no TC
+    // (RFC 1035 §4.2.1: advisory); dropping authority (negative SOA, referral
+    // NS) sets TC=1 so the client retries over TCP (RFC 1035 §4.2.1, RFC 2181
+    // §9). Last resort drops answers too and hard-clips the bytes.
+    for ([_]usize{ ends.authorities, ends.answers, ends.questions }, 1..) |end, dropped| {
+        if (end == 0) continue;
+        var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
+        if (msg.opt) |o| ser.writeOpt(o) catch continue;
+        msg.header.flags.tc = dropped >= 2;
+        msg.header.ar_count = @intFromBool(msg.opt != null);
+        if (dropped >= 2) msg.header.ns_count = 0;
+        if (dropped >= 3) msg.header.an_count = 0;
+        msg.header.serialize(wire_buf[0..12]);
+        if (ser.pos <= ctx.max_udp_payload or dropped == 3) return wire_buf[0..@min(ser.pos, ctx.max_udp_payload)];
+    }
     return null;
 }
 
@@ -729,7 +721,7 @@ test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
     try testing.expectEqual(dns.RCode.not_implemented, parsed.header.flags.rcode);
 }
 
-test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.2.1)" {
+test "buildResponseWire truncation cascade: additionals drop silently, authority/answers drop with TC=1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -737,9 +729,6 @@ test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.
     const name = try dns.parseDottedName(a, "example.com");
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
-    // Build a response whose authority section forces a payload between
-    // (additionals-dropped fits) and (answers fits but authorities don't).
-    // 12 NS records overflow the small payload but the answers alone fit.
     var ns_authorities: [12]dns.ResourceRecord = undefined;
     for (&ns_authorities, 0..) |*rr, i| {
         const ns_label = try std.fmt.allocPrint(a, "ns{d}.long.example.com.", .{i});
@@ -778,34 +767,46 @@ test "buildResponseWire sets TC=1 when dropping authority section (RFC 1035 §4.
             .qd_count = 0,
             .an_count = 1,
             .ns_count = ns_authorities.len,
-            .ar_count = 0,
+            .ar_count = 3,
         },
         .questions = &.{},
         .answers = &.{a_record},
         .authorities = &ns_authorities,
+        .additionals = &.{ a_record, a_record, a_record },
     };
 
-    // Tight payload — answers fit, authorities don't. `minimal_responses
-    // = false` keeps the authority NS records through shaping so the
-    // truncation cascade is what actually drops them.
-    var buf: [120]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 0x4242,
-        .opcode = .query,
-        .rd = false,
-        .cd = false,
-        .questions = questions,
-        .client_edns = false,
-        .client_do = false,
-        .client_wants_ad = false,
-        .max_udp_payload = buf.len,
-        .minimal_responses = false,
-    }, response, a).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(true, parsed.header.flags.tc);
-    try testing.expectEqual(@as(u16, 0), parsed.header.ns_count);
-    try testing.expectEqual(@as(u16, 1), parsed.header.an_count);
+    // Header+question+OPT is 40 bytes; answer 27; authorities ~540; additionals 81.
+    // `minimal_responses = false` keeps authority/additional through shaping
+    // so the cascade is what actually drops them.
+    const rows = [_]struct { max: u16, tc: bool, an: u16, ns: u16 }{
+        .{ .max = 640, .tc = false, .an = 1, .ns = 12 },
+        .{ .max = 120, .tc = true, .an = 1, .ns = 0 },
+        .{ .max = 40, .tc = true, .an = 0, .ns = 0 },
+    };
+    // 620 overflows the buffer mid-additionals; 1024 serializes whole but over max.
+    var buf: [1024]u8 = undefined;
+    for ([_]usize{ 620, 1024 }) |cap| for (rows) |row| {
+        const wire = buildResponseWire(buf[0..cap], .{
+            .query_id = 0x4242,
+            .opcode = .query,
+            .rd = false,
+            .cd = false,
+            .questions = questions,
+            .client_edns = true,
+            .client_do = false,
+            .client_wants_ad = false,
+            .max_udp_payload = row.max,
+            .minimal_responses = false,
+        }, response, a).?;
+        try testing.expect(wire.len <= row.max);
+        const parsed = try dns.parseMessage(a, wire);
+        try testing.expectEqual(row.tc, parsed.header.flags.tc);
+        try testing.expectEqual(row.an, parsed.header.an_count);
+        try testing.expectEqual(row.ns, parsed.header.ns_count);
+        try testing.expectEqual(@as(u16, 1), parsed.header.ar_count);
+        try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
+        try testing.expectEqual(row.max, parsed.opt.?.udp_payload_size);
+    };
 }
 
 test "serializeErrorResponse emits BADVERS OPT when extended_rcode != 0" {

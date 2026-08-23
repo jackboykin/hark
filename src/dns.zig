@@ -1480,6 +1480,50 @@ pub const Serializer = struct {
             .unknown => |data| try self.writeSlice(data),
         }
     }
+
+    pub fn writeOpt(self: *Serializer, opt: OptRecord) Error!void {
+        try self.writeU8(0); // root name
+        try self.writeU16(41); // type OPT
+        try self.writeU16(opt.udp_payload_size); // class = UDP payload size
+        // TTL = extended_rcode(8) | version(8) | DO(1) | Z(15)
+        const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
+            (@as(u32, opt.version) << 16) |
+            (@as(u32, @intFromBool(opt.do_bit)) << 15);
+        try self.writeU32(ttl);
+
+        // Compute RDLENGTH: existing options + optional padding
+        var rdlength: u16 = 0;
+        for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
+
+        // EDNS0 padding (RFC 7830, option code 12): pad total message up to
+        // the next multiple of padding_block (RFC 8467 §4.1 client policy).
+        var padding_len: u16 = 0;
+        if (opt.padding_block > 0) {
+            // self.pos already includes name(1) + type(2) + class(2) + ttl(4) = 9
+            // bytes of OPT. Only the rdlength (2) and the padding option header
+            // (4) remain unwritten, so the predicted final size is self.pos + 6
+            // + rdlength + padding_len.
+            const msg_size_before_padding = self.pos + 2 + rdlength + 4;
+            const rem = msg_size_before_padding % opt.padding_block;
+            if (rem != 0) padding_len = @intCast(opt.padding_block - rem);
+            rdlength += 4 + padding_len; // code(2) + length(2) + padding data
+        }
+
+        try self.writeU16(rdlength);
+        for (opt.options) |o| {
+            try self.writeU16(o.code);
+            try self.writeU16(@intCast(o.data.len));
+            try self.writeSlice(o.data);
+        }
+
+        if (opt.padding_block > 0) {
+            try self.writeU16(edns_opt_padding);
+            try self.writeU16(padding_len);
+            try self.ensureSpace(padding_len);
+            @memset(self.buf[self.pos..][0..padding_len], 0);
+            self.pos += padding_len;
+        }
+    }
 };
 
 /// Overwrite the 2-byte query id in a serialized DNS message. Used by
@@ -1501,7 +1545,17 @@ pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
     return .{ .bytes = ser.buf[0..ser.pos], .ttl_offset = ttl_offset };
 }
 
+/// Where each section ended, filled progressively by `serializeMessageEnds`
+/// so a caller can rewind to a completed boundary after an overflow.
+/// 0 = never reached.
+pub const SectionEnds = struct { questions: usize = 0, answers: usize = 0, authorities: usize = 0 };
+
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
+    var ends: SectionEnds = .{};
+    return serializeMessageEnds(buf, msg, &ends);
+}
+
+pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
     var ser = Serializer.init(buf);
 
     var hdr = msg.header;
@@ -1509,54 +1563,13 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     try ser.writeHeader(hdr);
 
     for (msg.questions) |q| try ser.writeQuestion(q);
+    ends.questions = ser.pos;
     for (msg.answers) |rr| try ser.writeResourceRecord(rr);
+    ends.answers = ser.pos;
     for (msg.authorities) |rr| try ser.writeResourceRecord(rr);
+    ends.authorities = ser.pos;
     for (msg.additionals) |rr| try ser.writeResourceRecord(rr);
-
-    // Append OPT pseudo-record
-    if (msg.opt) |opt| {
-        try ser.writeU8(0); // root name
-        try ser.writeU16(41); // type OPT
-        try ser.writeU16(opt.udp_payload_size); // class = UDP payload size
-        // TTL = extended_rcode(8) | version(8) | DO(1) | Z(15)
-        const ttl: u32 = (@as(u32, opt.extended_rcode) << 24) |
-            (@as(u32, opt.version) << 16) |
-            (@as(u32, @intFromBool(opt.do_bit)) << 15);
-        try ser.writeU32(ttl);
-
-        // Compute RDLENGTH: existing options + optional padding
-        var rdlength: u16 = 0;
-        for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
-
-        // EDNS0 padding (RFC 7830, option code 12): pad total message up to
-        // the next multiple of padding_block (RFC 8467 §4.1 client policy).
-        var padding_len: u16 = 0;
-        if (opt.padding_block > 0) {
-            // ser.pos already includes name(1) + type(2) + class(2) + ttl(4) = 9
-            // bytes of OPT. Only the rdlength (2) and the padding option header
-            // (4) remain unwritten, so the predicted final size is ser.pos + 6
-            // + rdlength + padding_len.
-            const msg_size_before_padding = ser.pos + 2 + rdlength + 4;
-            const rem = msg_size_before_padding % opt.padding_block;
-            if (rem != 0) padding_len = @intCast(opt.padding_block - rem);
-            rdlength += 4 + padding_len; // code(2) + length(2) + padding data
-        }
-
-        try ser.writeU16(rdlength);
-        for (opt.options) |o| {
-            try ser.writeU16(o.code);
-            try ser.writeU16(@intCast(o.data.len));
-            try ser.writeSlice(o.data);
-        }
-
-        if (opt.padding_block > 0) {
-            try ser.writeU16(edns_opt_padding);
-            try ser.writeU16(padding_len);
-            try ser.ensureSpace(padding_len);
-            @memset(ser.buf[ser.pos..][0..padding_len], 0);
-            ser.pos += padding_len;
-        }
-    }
+    if (msg.opt) |opt| try ser.writeOpt(opt);
 
     return buf[0..ser.pos];
 }
