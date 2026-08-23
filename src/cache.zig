@@ -424,6 +424,13 @@ const min_shards: u32 = 16;
 /// 64) and byte budget stay meaningful; this caps shard count on small caches.
 const min_entries_per_shard: u32 = 128;
 
+/// Shard from the top bits: the same hash goes to `getIndexAdapted`, which
+/// probes from the low ones, so sharing them clusters every shard's index.
+const shard_shift = 32 - @as(u6, std.math.log2_int(u32, max_shards));
+inline fn shardIndex(h: u32, mask: u32) u32 {
+    return (h >> shard_shift) & mask;
+}
+
 /// Active shard count: a power of two in [min_shards, max_shards], rounded up
 /// toward `reader_concurrency` but capped by the per-shard entry budget.
 fn deriveShardCount(reader_concurrency: u32, max_entries: u32) u32 {
@@ -579,7 +586,7 @@ pub const RRsetCache = struct {
     /// `getIndexAdapted` to avoid recomputing it inside the map.
     fn shardWithHash(self: *RRsetCache, key: CacheKey) struct { *Shard, u32 } {
         const h = CacheKeyContext.hash(.{}, key);
-        return .{ &self.shards[h & self.shard_mask], h };
+        return .{ &self.shards[shardIndex(h, self.shard_mask)], h };
     }
 
     /// Aggregated across shards. Not a consistent snapshot — a put racing
@@ -2969,7 +2976,7 @@ test "eviction stays within shard" {
     defer cache.deinit();
 
     const victim = "victim.test";
-    const victim_shard = CacheKeyContext.hash(.{}, .{ .name = victim, .rtype = .a, .rclass = .in }) & cache.shard_mask;
+    const victim_shard = shardIndex(CacheKeyContext.hash(.{}, .{ .name = victim, .rtype = .a, .rclass = .in }), cache.shard_mask);
     const target_shard = (victim_shard +% 1) & cache.shard_mask;
 
     try storeTestA(&cache, alloc, &.{ "victim", "test" }, 300, .{ 1, 2, 3, 4 });
@@ -2979,7 +2986,7 @@ test "eviction stays within shard" {
     while (stored < 4) : (probe += 1) {
         var nb: [16]u8 = undefined;
         const dotted = try std.fmt.bufPrint(&nb, "x{d}.com", .{probe});
-        const sh = CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }) & cache.shard_mask;
+        const sh = shardIndex(CacheKeyContext.hash(.{}, .{ .name = dotted, .rtype = .a, .rclass = .in }), cache.shard_mask);
         if (sh != target_shard) continue;
         const parsed = try dns.parseDottedName(alloc, dotted);
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
