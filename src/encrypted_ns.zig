@@ -63,10 +63,10 @@ pub const EncryptedNsCache = struct {
     /// Caps + joins in-flight probes; see `BumpGatedGroup`.
     probes: BumpGatedGroup = .init(max_probes),
     now_fn: *const fn () i64 = &monotonic.nowSec,
-    /// Upstream answers by transport (RFC 9539 §8 asks deployments to
-    /// report encrypted-egress share).
-    dot_answers: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
-    do53_answers: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
+    /// Upstream answers by transport (RFC 9539 §8 asks deployments to report
+    /// encrypted-egress share). Once per upstream answer — no line worth it.
+    dot_answers: std.atomic.Value(u64) = .init(0),
+    do53_answers: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: Allocator, io: std.Io) EncryptedNsCache {
         return .{
