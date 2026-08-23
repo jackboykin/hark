@@ -1502,6 +1502,22 @@ pub fn validateRrset(
     budget: *ValidationBudget,
     ttl_cap: ?*u32,
 ) SecurityStatus {
+    // Refuse rather than truncate: the caller sets AD on the *unpruned*
+    // response, so verifying a signature over records[0..64] while
+    // shipping 70 records launders the 6 attacker-appended RRs into an
+    // authenticated answer. buildSignedData refuses >64 anyway,
+    // so a genuine oversized RRset was already unvalidatable here —
+    // this only makes the refusal explicit instead of silent.
+    var filtered: [64]dns.ResourceRecord = undefined;
+    var count: usize = 0;
+    for (records) |rr| {
+        if (rr.rtype != covered_type or !rr.name.eql(owner)) continue;
+        if (count == filtered.len) return .bogus;
+        filtered[count] = rr;
+        count += 1;
+    }
+    if (count == 0) return .bogus;
+
     for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
         const rrsig = sig_rr.rdata.rrsig;
@@ -1509,23 +1525,6 @@ pub fn validateRrset(
         if (!sig_rr.name.eql(owner)) continue;
         if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
-        // Refuse rather than truncate: the caller sets AD on the *unpruned*
-        // response, so verifying a signature over records[0..64] while
-        // shipping 70 records launders the 6 attacker-appended RRs into an
-        // authenticated answer. buildSignedData refuses >64 anyway,
-        // so a genuine oversized RRset was already unvalidatable here —
-        // this only makes the refusal explicit instead of silent.
-        var filtered: [64]dns.ResourceRecord = undefined;
-        var count: usize = 0;
-        for (records) |rr| {
-            if (rr.rtype != covered_type or !rr.name.eql(owner)) continue;
-            if (count == filtered.len) return .bogus;
-            filtered[count] = rr;
-            count += 1;
-        }
-        if (count == 0) continue;
-
-        // Try ALL matching DNSKEYs (key_tag + algorithm)
         if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return .bogus) {
             if (ttl_cap) |cap| cap.* = @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
             return .secure;
