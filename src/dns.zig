@@ -191,6 +191,15 @@ pub const Name = struct {
     /// output is safe as a cache/dedup key, not just for display. Returns the
     /// written slice.
     pub fn formatInto(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
+        return self.formatImpl(buf, false);
+    }
+
+    /// Like `formatInto` but lowercased (DNS is case-insensitive).
+    pub fn formatLower(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
+        return self.formatImpl(buf, true);
+    }
+
+    fn formatImpl(self: Name, buf: *[max_dotted_len + 1]u8, comptime lower: bool) []const u8 {
         var pos: usize = 0;
         for (self.labels) |label| {
             if (pos > 0) {
@@ -204,7 +213,7 @@ pub const Name = struct {
                     pos += 2;
                 },
                 0x21...0x2d, 0x2f...0x5b, 0x5d...0x7e => {
-                    buf[pos] = byte;
+                    buf[pos] = if (lower) std.ascii.toLower(byte) else byte;
                     pos += 1;
                 },
                 else => {
@@ -217,13 +226,6 @@ pub const Name = struct {
             };
         }
         return buf[0..pos];
-    }
-
-    /// Like `formatInto` but lowercased (DNS is case-insensitive).
-    pub fn formatLower(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
-        const dotted = self.formatInto(buf);
-        for (buf[0..dotted.len]) |*b| b.* = std.ascii.toLower(b.*);
-        return buf[0..dotted.len];
     }
 
     pub fn eql(a: Name, b: Name) bool {
