@@ -150,8 +150,13 @@ const UdpBufRing = struct {
         };
     }
 
-    fn deinit(self: *UdpBufRing, ring_fd: linux.fd_t, allocator: std.mem.Allocator) void {
-        linux.IoUring.free_buf_ring(ring_fd, self.br, self.buffers_count, self.group_id);
+    fn deinit(self: *UdpBufRing, allocator: std.mem.Allocator) void {
+        // Not std.free_buf_ring: its unregister is denied post-restriction
+        // and unexpectedErrno dumps a trace in Debug. Ring teardown frees it.
+        var mmap: []align(std.heap.page_size_min) u8 = undefined;
+        mmap.ptr = @ptrCast(self.br);
+        mmap.len = self.buffers_count * @sizeOf(linux.io_uring_buf);
+        posix.munmap(mmap);
         allocator.free(self.buffers);
     }
 
@@ -202,7 +207,7 @@ pub const EventLoop = struct {
         params.cq_entries = max_operations * 4;
         self.ring = linux.IoUring.init_params(max_operations, &params) catch |err| {
             log.err(
-                "failed to create io_uring ({s}); hark requires Linux 6.1+",
+                "failed to create io_uring ({s}); hark requires Linux 6.1+ with io_uring permitted (kernel.io_uring_disabled, seccomp)",
                 .{@errorName(err)},
             );
             return err;
@@ -221,7 +226,30 @@ pub const EventLoop = struct {
             );
             return err;
         };
+        errdefer self.udp_buf_ring.deinit(allocator);
+        try restrict(self.ring.fd);
         return self;
+    }
+
+    /// Irreversible from `enable`. std's io_uring_restriction is 24 B, the
+    /// kernel's 16, hence the local struct.
+    fn restrict(fd: linux.fd_t) !void {
+        const R = extern struct { opcode: linux.IORING_RESTRICTION, arg: u8, resv: u8 = 0, resv2: [3]u32 = .{ 0, 0, 0 } };
+        const rs = [_]R{
+            .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.RECVMSG) },
+            .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.ACCEPT) },
+            .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.READ) },
+            .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.ASYNC_CANCEL) },
+            .{ .opcode = .SQE_FLAGS_ALLOWED, .arg = linux.IOSQE_BUFFER_SELECT },
+            // Activates the register allowlist (tracked apart from SQE ops on
+            // 7.0+) permitting only ENABLE_RINGS, which EBADFDs post-enable.
+            .{ .opcode = .REGISTER_OP, .arg = @backingInt(linux.IORING_REGISTER.REGISTER_ENABLE_RINGS) },
+        };
+        const rc = linux.io_uring_register(fd, .REGISTER_RESTRICTIONS, &rs, rs.len);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("failed to restrict io_uring ({t})", .{linux.errno(rc)});
+            return error.RestrictFailed;
+        }
     }
 
     /// Binds the ring to the calling thread; must precede the first submit.
@@ -232,7 +260,7 @@ pub const EventLoop = struct {
 
     pub fn destroy(self: *EventLoop) void {
         const allocator = self.allocator;
-        self.udp_buf_ring.deinit(self.ring.fd, allocator);
+        self.udp_buf_ring.deinit(allocator);
         self.ring.deinit();
         allocator.destroy(self);
     }
@@ -489,6 +517,22 @@ test "EventLoop create/destroy" {
     defer loop.destroy();
 
     try testing.expectEqual(@as(u16, max_operations), loop.free_count);
+}
+
+test "ring refuses opcodes outside the allowlist" {
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    var sqe = try loop.ring.get_sqe();
+    sqe.prep_nop();
+    sqe.user_data = 7;
+    _ = try loop.ring.submit_and_wait(1);
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    try testing.expectEqual(@as(u32, 1), try loop.ring.copy_cqes(&cqes, 1));
+    try testing.expectEqual(@as(u64, 7), cqes[0].user_data);
+    try testing.expectEqual(@as(i32, -@as(i32, @backingInt(linux.E.ACCES))), cqes[0].res);
+    const rc = linux.io_uring_register(loop.ring.fd, .REGISTER_PROBE, null, 0);
+    try testing.expectEqual(linux.E.ACCES, linux.errno(rc));
 }
 
 test "EventLoop recvFromMulti receives multiple packets on one SQE" {
