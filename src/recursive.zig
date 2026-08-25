@@ -1210,7 +1210,7 @@ pub const RecursiveResolver = struct {
             }
         }
         if (!has_proof) return;
-        if (self.verifyAuthoritySigs(allocator, authorities, servers, null) != .secure) return;
+        if (self.verifyAuthoritySigs(allocator, authorities, null, servers, null) != .secure) return;
         for (authorities) |auth_rr| {
             if (dns.isNsecProofMaterial(auth_rr))
                 try cname_auth_aggregate.append(allocator, auth_rr);
@@ -1424,7 +1424,7 @@ pub const RecursiveResolver = struct {
     ) dnssec.SecurityStatus {
         if (authorities.len > 0) {
             var proof_ttl_cap: u32 = std.math.maxInt(u32);
-            const auth_status = self.verifyAuthoritySigs(allocator, authorities, parent_servers, &proof_ttl_cap);
+            const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap);
             if (auth_status == .secure) {
                 const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget());
                 cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
@@ -2535,7 +2535,7 @@ pub const RecursiveResolver = struct {
         // and glue are still useful for resolution, so cache them.
         if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
         var proof_ttl_cap: u32 = std.math.maxInt(u32);
-        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, parent_servers, &proof_ttl_cap);
+        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, zone, parent_servers, &proof_ttl_cap);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget());
             if (status == .insecure) {
@@ -2721,10 +2721,15 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         authorities: []const dns.ResourceRecord,
+        delegation_cut: ?dns.Name,
         parent_servers: []const na.Address,
         ttl_cap: ?*u32,
     ) dnssec.SecurityStatus {
         const signer = dnssec.authoritySigner(authorities) orelse return .unchecked;
+        // A no-DS proof is the parent's to make: signer strictly above the cut,
+        // checked before its DNSKEY is fetched. `.unchecked` so the caller falls
+        // through to a direct DS probe rather than refusing a stale cut.
+        if (delegation_cut) |cut| if (!dnssec.isProperAncestor(signer, cut)) return .unchecked;
 
         // RFC 4034 §3.1.3: verify authority record owners are under the signer zone
         for (authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
@@ -2753,7 +2758,7 @@ pub const RecursiveResolver = struct {
     ) NegativeValidation {
         if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
 
-        const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_servers, ttl_cap);
+        const auth_status = self.verifyAuthoritySigs(allocator, authorities, null, zone_servers, ttl_cap);
         if (auth_status == .bogus) return .bogus;
         if (auth_status != .secure) return .skip_cache;
 

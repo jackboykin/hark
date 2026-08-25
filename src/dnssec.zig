@@ -199,6 +199,10 @@ fn isInsecureDelegationProof(type_bit_maps: []const u8) bool {
 /// proceed to DNSKEY/DS validation" — and an unsigned-but-unproven delegation
 /// also returns `.secure`, so the validator (recursive.zig) fails closed to
 /// SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation.
+pub fn isProperAncestor(zone: dns.Name, name: dns.Name) bool {
+    return zone.labels.len < name.labels.len and name.isSubdomainOf(zone);
+}
+
 pub fn classifyDelegation(
     authorities: []const dns.ResourceRecord,
     child_zone: dns.Name,
@@ -245,6 +249,10 @@ pub fn classifyDelegation(
             // so one high-iteration record taints the whole proof.
             if (nsec3.iterations > max_nsec3_iterations) return .insecure;
             const owner_hash = nsec3OwnerHash(rr.name) orelse continue;
+            // A no-DS proof lives in the parent, so the owner minus its hash
+            // label must sit strictly above the cut. The hash alone binds
+            // nothing: any signed zone can mint `<H(child)>.<its apex>`.
+            if (!isProperAncestor(.{ .labels = rr.name.labels[1..] }, child_zone)) continue;
 
             // Reuse cached hash if salt/iterations match; cache misses charge
             // the per-resolution budget (the salt-cache-defeat surface).
@@ -1022,8 +1030,8 @@ fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
 /// Decode a record's owner name as a SHA-1 NSEC3 hash. Skips records that
 /// aren't NSEC3 or use an unsupported hash algorithm — defence-in-depth so
 /// an unknown-algo NSEC3 can't contribute to a SHA-1 negative proof.
-fn supportedNsec3OwnerHash(rr: dns.ResourceRecord) ?[Sha1.digest_length]u8 {
-    if (rr.rtype != .nsec3) return null;
+fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest_length]u8 {
+    if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) return null;
     if (rr.rdata.nsec3.hash_algorithm != .sha1) return null;
     if (nsec3FlagsReserved(rr.rdata.nsec3)) return null;
     return nsec3OwnerHash(rr.name);
@@ -1193,7 +1201,7 @@ pub fn validateNegativeProof(
     }
 
     // Try NSEC3 proofs
-    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, budget);
+    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
 }
 
 /// The zone whose keys an authority section's proofs rest on: the signer of
@@ -1213,6 +1221,7 @@ fn validateNsec3NegativeProof(
     qname: dns.Name,
     qtype: dns.RType,
     is_nxdomain: bool,
+    zone: dns.Name,
     budget: *ValidationBudget,
 ) SecurityStatus {
     if (nsec3Flood(authorities)) return .bogus;
@@ -1223,7 +1232,7 @@ fn validateNsec3NegativeProof(
     var found_nsec3 = false;
     var saw_unknown_algo = false;
     for (authorities) |rr| {
-        if (rr.rtype != .nsec3) continue;
+        if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
         const nsec3 = rr.rdata.nsec3;
         // RFC 5155 §10.2 / RFC 6840 §5.11: skip NSEC3 records using unknown
         // hash algorithms; do not treat as bogus.
@@ -1255,7 +1264,7 @@ fn validateNsec3NegativeProof(
     // a record owns that name, because some `next` equals it exactly and ranges
     // are open at both ends. A second chain forges next-closer coverage.
     for (authorities) |rr| {
-        if (rr.rtype != .nsec3) continue;
+        if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
         const n3 = rr.rdata.nsec3;
         if (n3.hash_algorithm != .sha1 or nsec3FlagsReserved(n3)) continue; // §8.1/§8.2: ignored
         if (n3.iterations != iterations or !mem.eql(u8, n3.salt, salt)) return .bogus;
@@ -1269,7 +1278,7 @@ fn validateNsec3NegativeProof(
     // NODATA → .bogus (mirrors NSEC arm).
     if (!is_nxdomain) {
         for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
+            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             if (mem.eql(u8, &owner_hash, &qname_hash)) {
                 const nsec3 = rr.rdata.nsec3;
                 // Same side-of-cut rule as the NSEC arm (RFC 6840 §4.1/§4.4).
@@ -1298,7 +1307,7 @@ fn validateNsec3NegativeProof(
             break :blk budgetedNsec3Hash(ancestor, salt, iterations, budget) catch return .bogus;
         };
         for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
+            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             if (mem.eql(u8, &owner_hash, &ancestor_hash)) {
                 // RFC 6840 §4.1: a closest encloser is by construction a
                 // proper ancestor of qname (ce_offset == 0 is rejected just
@@ -1338,7 +1347,7 @@ fn validateNsec3NegativeProof(
         var ds_nc_covered = false;
         var ds_nc_optout = false;
         for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
+            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             const nsec3 = rr.rdata.nsec3;
             if (!nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) continue;
             ds_nc_covered = true;
@@ -1363,7 +1372,7 @@ fn validateNsec3NegativeProof(
     var wc_proven = false;
     var wc_contradicted = false;
     for (authorities) |rr| {
-        const owner_hash = supportedNsec3OwnerHash(rr) orelse continue;
+        const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
         const nsec3 = rr.rdata.nsec3;
 
         if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) {
@@ -3565,6 +3574,27 @@ test "classifyDelegation NSEC3 match" {
 
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone, &b));
+}
+
+test "classifyDelegation NSEC3 owned by a foreign zone proves nothing" {
+    const child_zone = dns.Name{ .labels = &.{ "bank", "com" } };
+    const salt: []const u8 = &.{ 0xAA, 0xBB };
+    var lo = try nsec3Hash(child_zone, salt, 0);
+    lo[19] -%= 1;
+    var hi = lo;
+    hi[19] +%= 2;
+
+    var b: ValidationBudget = .{};
+    for ([_]struct { []const []const u8, SecurityStatus }{
+        .{ &.{"com"}, .insecure },
+        .{ &.{ "evil", "com" }, .secure },
+        .{ &.{ "bank", "com" }, .secure },
+    }) |case| {
+        var bufs: Nsec3OwnerBufs = .{};
+        var rr = makeNsec3Rr(makeNsec3OwnerName(lo, case[0], &bufs.enc, &bufs.labels), salt, &hi, &.{});
+        rr.rdata.nsec3.flags = nsec3_opt_out;
+        try testing.expectEqual(case[1], classifyDelegation(&.{rr}, child_zone, &b));
+    }
 }
 
 test "classifyDelegation NSEC3 non-match" {
