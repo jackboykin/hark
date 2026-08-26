@@ -18,3 +18,7 @@ entries = 10000
 
 [logging]
 queries = false
+
+# The zones answer with 127/8; exempt them from the rebinding scrub.
+[rebinding]
+allow-zones = ["bench"]
