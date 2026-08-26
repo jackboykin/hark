@@ -123,10 +123,19 @@ const CnameChain = struct {
     /// chains too.
     all_secure: bool = true,
 
-    fn hop(self: *CnameChain, allocator: mem.Allocator, redirect: Redirect, status: cache_mod.SecurityStatus) !void {
+    /// Append a hop. `false` when the target revisits the chain (a loop);
+    /// `where` names the source for the debug log.
+    fn push(self: *CnameChain, allocator: mem.Allocator, redirect: Redirect, status: cache_mod.SecurityStatus, where: []const u8) !bool {
+        if (self.hops >= max_cname_chain) return error.CnameChainTooLong;
+        if (cnameTargetRevisitsChain(self.records.items, redirect.target)) {
+            var buf: [dns.max_dotted_len + 1]u8 = undefined;
+            log.debug("cname loop detected ({s}): target {s} already in chain", .{ where, redirect.target.formatInto(&buf) });
+            return false;
+        }
         try self.records.appendSlice(allocator, redirect.records);
         self.hops += 1;
         self.all_secure = self.all_secure and status == .secure;
+        return true;
     }
 
     fn deinit(self: *CnameChain, allocator: mem.Allocator) void {
@@ -513,6 +522,47 @@ pub const RecursiveResolver = struct {
 
     const max_resolve_depth = 3;
 
+    /// Iteration state for one name's descent through the delegation tree.
+    /// Same-zone CNAME hops keep the zone and servers and only restart
+    /// QNAME minimization; cross-zone hops start a fresh Walk.
+    const Walk = struct {
+        name: []const u8,
+        target: dns.Name,
+        zone: dns.Name = .{ .labels = &.{} },
+        addrs: [max_servers_per_level]na.Address = undefined,
+        addr_count: usize = 0,
+        seen_zones: [max_delegations]dns.Name = undefined,
+        seen_zone_count: usize = 0,
+        /// RFC 9156 probe depth: labels of `target` sent in the next query.
+        /// Equal to `target.labels.len` means the full name goes out.
+        probe_labels: usize = 0,
+
+        fn init(allocator: mem.Allocator, name: []const u8) !Walk {
+            return .{ .name = name, .target = try dns.parseDottedName(allocator, name) };
+        }
+
+        fn servers(w: *const Walk) []const na.Address {
+            return w.addrs[0..w.addr_count];
+        }
+
+        fn setServers(w: *Walk, list: []const na.Address) void {
+            w.addr_count = list.len;
+            @memcpy(w.addrs[0..list.len], list);
+        }
+
+        fn stopProbing(w: *Walk) void {
+            w.probe_labels = w.target.labels.len;
+        }
+
+        fn restartProbing(w: *Walk, qmin: bool) void {
+            w.probe_labels = if (qmin) w.zone.labels.len + 1 else w.target.labels.len;
+        }
+
+        fn probeName(w: *const Walk) dns.Name {
+            return .{ .labels = w.target.labels[w.target.labels.len - w.probe_labels ..] };
+        }
+    };
+
     fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
         var current_name: []const u8 = name;
         // Counts queryAuthoritativeServers calls only; total_probes
@@ -522,7 +572,6 @@ pub const RecursiveResolver = struct {
         var cname_chain: CnameChain = .{};
         defer cname_chain.deinit(allocator);
 
-        // DNSSEC chain of trust state — starts as secure at root
         var security_state: dnssec.SecurityStatus = if (self.dnssec_enabled) .secure else .unchecked;
 
         cname_loop: while (true) {
@@ -544,198 +593,67 @@ pub const RecursiveResolver = struct {
                 return .{ .message = try withCnameChain(allocator, &cname_chain, synth) };
             }
 
-            // CACHE CHECK 1: Do we already have a cached answer?
             switch (try self.tryServeFromCache(allocator, name, current_name, qtype, depth, &cname_chain)) {
                 .none => {},
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
-                    if (cname_chain.hops >= max_cname_chain) return error.CnameChainTooLong;
-                    if (cnameTargetRevisitsChain(cname_chain.records.items, dispatch.redirect.target)) {
-                        logCnameLoop(dispatch.redirect.target, "cache-served");
+                    if (!try cname_chain.push(allocator, dispatch.redirect, dispatch.security_status, "cache-served"))
                         return self.bogusServfail(current_name, qtype);
-                    }
-                    try cname_chain.hop(allocator, dispatch.redirect, dispatch.security_status);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.redirect.target);
-                    // Mirror the upstream CNAME branch: re-resolve the
-                    // target with fresh security state, but preserve
-                    // .insecure so an unauthenticated cached CNAME can't
-                    // launder AD onto downstream answers.
-                    if (security_state != .insecure) {
-                        security_state = if (self.dnssec_enabled) .secure else .unchecked;
-                    }
+                    security_state = self.securityStateAfterCname(security_state);
                     continue :cname_loop;
                 },
             }
 
             if (try self.tryServeFromNxdomainAncestor(allocator, current_name, qtype, &cname_chain)) |result| return result;
 
-            var target_name = try dns.parseDottedName(allocator, current_name);
+            var walk = try Walk.init(allocator, current_name);
 
-            if (try self.tryServeFromAggressiveNsec(allocator, target_name, current_name, qtype, &cname_chain)) |result| return result;
+            if (try self.tryServeFromAggressiveNsec(allocator, walk.target, walk.name, qtype, &cname_chain)) |result| return result;
 
-            var servers: [max_servers_per_level]na.Address = undefined;
-            var server_count: usize = undefined;
-            var parent_zone: dns.Name = undefined;
-            try self.seedServersForQuery(allocator, current_name, qtype, &servers, &server_count, &parent_zone, &security_state);
-
-            var seen_zones: [max_delegations]dns.Name = undefined;
-            var seen_zone_count: usize = 0;
-
-            // QNAME minimization (RFC 9156): start probing one label past the
-            // current zone cut and advance toward the full target name.
-            var minimize_label_count: usize = if (self.qname_minimization)
-                parent_zone.labels.len + 1
-            else
-                target_name.labels.len; // disabled: always send full name
+            try self.seedServersForQuery(allocator, qtype, &walk, &security_state);
+            walk.restartProbing(self.qname_minimization);
 
             while (true) {
-                // Determine if this iteration sends the full (final) query or a probe.
-                const is_final = minimize_label_count >= target_name.labels.len or
+                const is_final = walk.probe_labels >= walk.target.labels.len or
                     !self.qname_minimization or total_probes >= max_minimize_count;
 
-                // Build probe name from target's trailing labels, or use the full name.
-                const query_name: []const u8 = if (is_final) current_name else blk: {
-                    const child_view = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
+                const query_name: []const u8 = if (is_final) walk.name else blk: {
                     var child_buf: [dns.max_dotted_len + 1]u8 = undefined;
-                    break :blk try allocator.dupe(u8, child_view.formatInto(&child_buf));
+                    break :blk try allocator.dupe(u8, walk.probeName().formatInto(&child_buf));
                 };
                 const query_type: dns.RType = if (is_final) qtype else .a;
 
-                if (!is_final) total_probes += 1;
-
-                // QMIN cache check: see if the probe answer is already cached.
                 if (!is_final) {
-                    if (self.cache) |c| {
-                        if (c.lookup(allocator, query_name, query_type, .in)) |result| {
-                            switch (result) {
-                                .hit => {
-                                    minimize_label_count += 1;
-                                    continue;
-                                },
-                                .negative => |n| {
-                                    if (n.rcode == .name_error) {
-                                        // Cached NXDOMAIN — relaxed mode: stop minimizing
-                                        minimize_label_count = target_name.labels.len;
-                                        continue;
-                                    }
-                                    // Cached NODATA — name exists, advance
-                                    minimize_label_count += 1;
-                                    continue;
-                                },
-                            }
-                        }
-                    }
+                    total_probes += 1;
+                    if (self.probeAnsweredFromCache(allocator, &walk, query_name, query_type)) continue;
                 }
 
                 if (upstream_queries >= max_upstream_queries) return error.MaxQueriesExceeded;
                 try self.consumeQuery();
                 upstream_queries += 1;
-                const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, &servers, server_count, parent_zone);
+                const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone);
                 var response = sqr.message;
                 const responding_server = sqr.responding_server;
 
-                // ── Probe response handling (non-final queries) ──
                 if (!is_final) {
-                    const probe_name = dns.Name{ .labels = target_name.labels[target_name.labels.len - minimize_label_count ..] };
-                    // Check for referral — only from successful responses (error responses
-                    // may contain NS records in authority that are not valid delegations)
-                    if (response.header.flags.rcode == .no_error) {
-                        if (extractReferral(response, target_name, parent_zone, self.referralPolicy())) |referral| {
-                            if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
-                            try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
-                            // Flood/exhaustion classifies the delegation .bogus; fail
-                            // closed here — a later CNAME hop would re-elevate it to
-                            // .secure and serve unsigned.
-                            if (security_state == .bogus) return self.bogusServfail(current_name, qtype);
-                            minimize_label_count = parent_zone.labels.len + 1;
-                            continue;
-                        }
-                    }
-
-                    if (response.header.flags.rcode == .name_error) {
-                        // RFC 9156 §4 + RFC 8020 interaction: an unsigned-zone
-                        // probe NXDOMAIN from an RFC 8020 violator (e.g.,
-                        // dynect.net returning NXDOMAIN at empty non-terminals
-                        // like p07.dynect.net) would otherwise poison the
-                        // NX-cut consumer at cache.lookupNxdomainAncestor —
-                        // it returns negatives when security_status != .secure,
-                        // so an .insecure or .unchecked probe-NX entry there
-                        // makes every child name appear non-existent, bricking
-                        // e.g. ns1.p07.dynect.net under x.com's delegation for
-                        // the negative TTL window (up to 3 hours).
-                        //
-                        // Stop minimizing (relaxed mode) but only cache when
-                        // DNSSEC NSEC has proved the cut. Secure-cached entries
-                        // are then doubly inert: the NX-cut path's `!= .secure`
-                        // filter routes them through the dedicated NSEC
-                        // aggressive-use cache instead, so this branch caches
-                        // *only* entries the NX-cut will skip by design.
-                        var neg_ttl_cap: u32 = std.math.maxInt(u32);
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, true, parent_zone, servers[0..server_count], &neg_ttl_cap)) {
-                            .proceed => |status| {
-                                // .secure here means verifiedNegativeResponse
-                                // ran NSEC and accepted it; AA is redundant
-                                // (cryptographic proof supersedes the bit).
-                                // `.insecure` is excluded: an Opt-Out denial
-                                // leaves the intermediate name possibly existing
-                                // as an unsigned delegation, too thin to cache
-                                // against the full query name (RFC 8020).
-                                if (status == .secure) {
-                                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, parent_zone, status, neg_ttl_cap);
-                                }
-                            },
-                            // .bogus falls through to the same stop-minimizing
-                            // epilogue as .proceed/.skip_cache — one home for it.
-                            .skip_cache, .bogus => {},
-                        }
-                        minimize_label_count = target_name.labels.len;
-                        continue;
-                    }
-
-                    if (response.header.flags.rcode != .no_error and response.header.flags.rcode != .name_error) {
-                        // Probe error (SERVFAIL, REFUSED, FORMERR, etc.) — stop minimizing, send full QNAME
-                        minimize_label_count = target_name.labels.len;
-                        continue;
-                    }
-
-                    if (response.answers.len > 0) {
-                        minimize_label_count += 1;
-                        continue;
-                    }
-
-                    // NODATA (no answers, no referral) — name exists, cache negative, advance
-                    {
-                        var neg_ttl_cap: u32 = std.math.maxInt(u32);
-                        switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, probe_name, query_type, false, parent_zone, servers[0..server_count], &neg_ttl_cap)) {
-                            .proceed => |status| {
-                                if (response.header.flags.aa) {
-                                    if (self.cache) |c| {
-                                        c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
-                                        c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
-                                    }
-                                }
-                            },
-                            .skip_cache => {},
-                            .bogus => {
-                                minimize_label_count = target_name.labels.len;
-                                continue;
-                            },
-                        }
-                    }
-                    minimize_label_count += 1;
+                    try self.handleProbeResponse(allocator, &walk, &security_state, response, query_name, query_type, depth);
+                    // Flood or exhaustion classifies the delegation .bogus; fail
+                    // closed here — a later CNAME hop would re-elevate it to
+                    // .secure and serve unsigned.
+                    if (security_state == .bogus) return self.bogusServfail(walk.name, qtype);
                     continue;
                 }
 
-                // ── Scrub out-of-bailiwick answer records ──
                 // Authoritative servers may include cross-zone records in answers
                 // (e.g., CNAME target's A/AAAA from a different zone). Discard
                 // them so validation only sees records from the queried zone.
-                if (parent_zone.labels.len > 0 and response.answers.len > 0) {
+                if (walk.zone.labels.len > 0 and response.answers.len > 0) {
                     const filtered = try allocator.alloc(dns.ResourceRecord, response.answers.len);
                     var filtered_count: usize = 0;
                     for (response.answers) |rr| {
-                        if (rr.name.isSubdomainOf(parent_zone)) {
+                        if (rr.name.isSubdomainOf(walk.zone)) {
                             filtered[filtered_count] = rr;
                             filtered_count += 1;
                         }
@@ -743,102 +661,180 @@ pub const RecursiveResolver = struct {
                     response.answers = filtered[0..filtered_count];
                 }
 
-                // ── Final query response handling ──
-
-                self.probeParentChildCut(allocator, target_name, parent_zone, &response, servers[0..server_count], &security_state);
+                self.probeParentChildCut(allocator, &walk, &response, &security_state);
 
                 if (response.header.flags.rcode != .no_error)
-                    return self.handleErrorResponse(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
+                    return self.handleErrorResponse(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
                 if (response.answers.len > 0) {
-                    // Follow CNAME if the answer doesn't contain the queried type
-                    if (qtype != .cname) {
-                        var has_target_type = false;
-                        for (response.answers) |rr| {
-                            if (rr.rtype == qtype) {
-                                has_target_type = true;
-                                break;
-                            }
-                        }
-
-                        if (!has_target_type) {
-                            // Validate CNAME RRset before following in secure zones.
-                            // RFC 4035 §3.1: every authoritative RRset in a secure zone
-                            // must carry an RRSIG. validateAnswer returns .bogus when no
-                            // RRSIG is present, which closes the strip-RRSIG downgrade.
-                            var cname_status: cache_mod.SecurityStatus = .unchecked;
-                            var cname_ttl_cap: u32 = std.math.maxInt(u32);
-                            if (self.dnssec_enabled and security_state == .secure) {
-                                switch (try self.validateAnswer(allocator, &response, .cname, security_state, parent_zone, servers[0..server_count])) {
-                                    .bogus => {
-                                        self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
-                                        return self.bogusServfail(current_name, qtype);
-                                    },
-                                    .valid => |cap| {
-                                        cname_status = .secure;
-                                        cname_ttl_cap = cap;
-                                    },
-                                    .skip => {},
-                                }
-                            }
-                            if (try redirectFor(allocator, response.answers, target_name, parent_zone)) |redirect| {
-                                const is_same_zone = parent_zone.labels.len > 0 and
-                                    redirect.target.isSubdomainOf(parent_zone);
-
-                                // Store before following CNAME — won't reach final answer validation
-                                if (self.cache) |c| c.storeResponse(response, parent_zone, cname_status, cname_ttl_cap);
-                                if (cname_chain.hops >= max_cname_chain) return error.CnameChainTooLong;
-                                if (cnameTargetRevisitsChain(cname_chain.records.items, redirect.target)) {
-                                    logCnameLoop(redirect.target, "upstream-served");
-                                    return self.bogusServfail(current_name, qtype);
-                                }
-                                try cname_chain.hop(allocator, redirect, cname_status);
-
-                                try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, parent_zone, servers[0..server_count], &cname_chain.wildcard_proofs);
-
-                                // Same-zone CNAME: keep current auth servers, delegation,
-                                // and security_state. The DNSSEC chain of trust is
-                                // unchanged within a zone, so re-walking from root would
-                                // only redo cache lookups. Skip back to the inner
-                                // referral loop with the new target.
-                                if (is_same_zone) {
-                                    current_name = try nameToDotted(allocator, redirect.target);
-                                    target_name = try dns.cloneName(allocator, redirect.target);
-                                    minimize_label_count = if (self.qname_minimization)
-                                        parent_zone.labels.len + 1
-                                    else
-                                        target_name.labels.len;
-                                    continue;
-                                }
-
-                                current_name = try nameToDotted(allocator, redirect.target);
-                                // Re-resolve CNAME target from root with fresh security state.
-                                // Preserve .insecure: an unauthenticated CNAME could redirect
-                                // anywhere, so the answer must not carry AD (RFC 4035 §3.2.3).
-                                if (security_state != .insecure) {
-                                    security_state = if (self.dnssec_enabled) .secure else .unchecked;
-                                }
-                                continue :cname_loop;
-                            }
-                            // No CNAME found — fall through to final answer validation
-                        }
+                    switch (try self.followUpstreamCname(allocator, &walk, &response, qtype, security_state, responding_server, &cname_chain)) {
+                        .none => {},
+                        .bogus => return self.bogusServfail(walk.name, qtype),
+                        .same_zone => continue,
+                        .cross_zone => {
+                            current_name = walk.name;
+                            security_state = self.securityStateAfterCname(security_state);
+                            continue :cname_loop;
+                        },
                     }
-
-                    return self.finalizeAnswer(allocator, &response, current_name, qtype, security_state, parent_zone, servers[0..server_count], responding_server, &cname_chain);
+                    return self.finalizeAnswer(allocator, &response, &walk, qtype, security_state, responding_server, &cname_chain);
                 }
 
-                const referral = extractReferral(response, target_name, parent_zone, self.referralPolicy()) orelse
-                    return self.finalizeNodata(allocator, &response, current_name, name, qtype, depth, security_state, target_name, parent_zone, servers[0..server_count], &cname_chain);
+                const referral = extractReferral(response, walk.target, walk.zone, self.referralPolicy()) orelse
+                    return self.finalizeNodata(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
-                if (self.cache) |c| c.storeResponse(response, parent_zone, .unchecked, std.math.maxInt(u32));
-                try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &parent_zone, &servers, &server_count, &seen_zones, &seen_zone_count);
-                // Flood/exhaustion → .bogus delegation; fail closed (see above).
-                if (security_state == .bogus) return self.bogusServfail(current_name, qtype);
-                minimize_label_count = parent_zone.labels.len + 1;
+                if (self.cache) |c| c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
+                try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &walk);
+                if (security_state == .bogus) return self.bogusServfail(walk.name, qtype);
+                walk.restartProbing(self.qname_minimization);
             }
-
-            unreachable; // while(true) only exits via inner returns / continue :cname_loop
         }
+    }
+
+    /// Re-resolving a CNAME target starts a fresh chain of trust, but
+    /// `.insecure` sticks: an unauthenticated CNAME could redirect anywhere,
+    /// so downstream answers must not carry AD (RFC 4035 §3.2.3).
+    fn securityStateAfterCname(self: *RecursiveResolver, state: dnssec.SecurityStatus) dnssec.SecurityStatus {
+        if (state == .insecure) return .insecure;
+        return if (self.dnssec_enabled) .secure else .unchecked;
+    }
+
+    // ── QNAME minimization probes ───────────────────────────────────────
+
+    /// Advance the probe from a cached answer, if any. Cached NXDOMAIN
+    /// stops minimizing (relaxed mode); a hit or NODATA steps one label.
+    fn probeAnsweredFromCache(self: *RecursiveResolver, allocator: mem.Allocator, walk: *Walk, query_name: []const u8, query_type: dns.RType) bool {
+        const c = self.cache orelse return false;
+        const result = c.lookup(allocator, query_name, query_type, .in) orelse return false;
+        if (result == .negative and result.negative.rcode == .name_error) walk.stopProbing() else walk.probe_labels += 1;
+        return true;
+    }
+
+    /// Steer the walk from a probe (non-final) response: follow referrals,
+    /// stop minimizing on NXDOMAIN or errors, otherwise step one label.
+    fn handleProbeResponse(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        walk: *Walk,
+        security_state: *dnssec.SecurityStatus,
+        response: dns.Message,
+        query_name: []const u8,
+        query_type: dns.RType,
+        depth: usize,
+    ) !void {
+        const rcode = response.header.flags.rcode;
+        // Referrals only from successful responses: error responses can
+        // carry NS records in authority that are not valid delegations.
+        if (rcode == .no_error) {
+            if (extractReferral(response, walk.target, walk.zone, self.referralPolicy())) |referral| {
+                if (self.cache) |c| c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
+                try self.followReferral(allocator, referral, response.authorities, depth, security_state, walk);
+                walk.restartProbing(self.qname_minimization);
+                return;
+            }
+        }
+
+        if (rcode == .name_error) {
+            // Stop minimizing (relaxed mode) but cache only a `.secure` NXDOMAIN:
+            // `lookupNxdomainAncestor` serves any non-secure negative as an RFC
+            // 8020 NX-cut, so an unsigned RFC 8020 violator's ENT-NXDOMAIN
+            // (dynect.net) would make every child name unresolvable for the
+            // negative TTL.
+            // `.insecure` is excluded too: Opt-Out leaves the name possibly an
+            // unsigned delegation, too thin to cache against the full name.
+            var neg_ttl_cap: u32 = std.math.maxInt(u32);
+            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), query_type, true, walk.zone, walk.servers(), &neg_ttl_cap)) {
+                .proceed => |status| if (status == .secure) {
+                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                },
+                .skip_cache, .bogus => {},
+            }
+            walk.stopProbing();
+            return;
+        }
+
+        if (rcode != .no_error) return walk.stopProbing();
+
+        if (response.answers.len > 0) {
+            walk.probe_labels += 1;
+            return;
+        }
+
+        // NODATA: the name exists; cache the negative and advance.
+        var neg_ttl_cap: u32 = std.math.maxInt(u32);
+        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), query_type, false, walk.zone, walk.servers(), &neg_ttl_cap)) {
+            .proceed => |status| if (response.header.flags.aa) {
+                if (self.cache) |c| {
+                    c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
+                    c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                }
+            },
+            .skip_cache => {},
+            .bogus => return walk.stopProbing(),
+        }
+        walk.probe_labels += 1;
+    }
+
+    // ── Upstream CNAME following ────────────────────────────────────────
+
+    const CnameHop = enum {
+        /// Answer holds the queried type (or no CNAME): finalize it.
+        none,
+        bogus,
+        /// Target under the current zone: keep servers, restart probing.
+        same_zone,
+        /// Target elsewhere: re-walk from the root with `walk.name`.
+        cross_zone,
+    };
+
+    /// When a final answer lacks the queried type, validate and follow its
+    /// CNAME. RFC 4035 §3.1: every authoritative RRset in a secure zone must
+    /// carry an RRSIG; `validateAnswer` returns .bogus when none is present,
+    /// which closes the strip-RRSIG downgrade.
+    fn followUpstreamCname(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        walk: *Walk,
+        response: *dns.Message,
+        qtype: dns.RType,
+        security_state: dnssec.SecurityStatus,
+        responding_server: ?na.Address,
+        cname_chain: *CnameChain,
+    ) !CnameHop {
+        if (qtype == .cname) return .none;
+        for (response.answers) |rr| if (rr.rtype == qtype) return .none;
+
+        var cname_status: cache_mod.SecurityStatus = .unchecked;
+        var cname_ttl_cap: u32 = std.math.maxInt(u32);
+        if (self.dnssec_enabled and security_state == .secure) {
+            switch (try self.validateAnswer(allocator, response, .cname, security_state, walk.zone, walk.servers())) {
+                .bogus => {
+                    self.recordNsOutcome(walk.zone, responding_server, .validation_failure, 0);
+                    return .bogus;
+                },
+                .valid => |cap| {
+                    cname_status = .secure;
+                    cname_ttl_cap = cap;
+                },
+                .skip => {},
+            }
+        }
+        const redirect = (try redirectFor(allocator, response.answers, walk.target, walk.zone)) orelse return .none;
+
+        // Store before following: this response never reaches final answer validation.
+        if (self.cache) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
+        if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .bogus;
+        try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, walk.zone, walk.servers(), &cname_chain.wildcard_proofs);
+
+        walk.name = try nameToDotted(allocator, redirect.target);
+        // Same-zone: the chain of trust is unchanged within a zone, so
+        // re-walking from root would only redo cache lookups.
+        if (walk.zone.labels.len > 0 and redirect.target.isSubdomainOf(walk.zone)) {
+            walk.target = try dns.cloneName(allocator, redirect.target);
+            walk.restartProbing(self.qname_minimization);
+            return .same_zone;
+        }
+        return .cross_zone;
     }
 
     // ── Initial server seeding ──────────────────────────────────────────
@@ -853,14 +849,10 @@ pub const RecursiveResolver = struct {
     fn seedServersForQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
-        current_name: []const u8,
         qtype: dns.RType,
-        servers: *[max_servers_per_level]na.Address,
-        server_count: *usize,
-        parent_zone: *dns.Name,
+        walk: *Walk,
         security_state: *dnssec.SecurityStatus,
     ) !void {
-        parent_zone.* = dns.Name{ .labels = &.{} };
 
         // RFC 4035 §5: DS lives in the *parent*. Seeding from the closest
         // cached delegation for the name itself sends a client's DS query to
@@ -874,12 +866,11 @@ pub const RecursiveResolver = struct {
         // at or above the parent is found, ENT gaps included. parentZoneOf here
         // is a plain leftmost-label strip picking the walk's starting point —
         // never a claim about where a cut is; keep it dumb.
-        const seed_name = if (qtype == .ds) parentZoneOf(current_name) else current_name;
+        const seed_name = if (qtype == .ds) parentZoneOf(walk.name) else walk.name;
 
         if (try self.findClosestCachedDelegation(allocator, seed_name)) |deleg| {
-            server_count.* = deleg.count;
-            @memcpy(servers[0..deleg.count], deleg.addrs[0..deleg.count]);
-            parent_zone.* = deleg.zone;
+            walk.setServers(deleg.addrs[0..deleg.count]);
+            walk.zone = deleg.zone;
 
             if (security_state.* == .secure and self.dnssec_enabled) {
                 if (hasCachedInsecureDelegation(self.keyCache(), allocator, deleg.zone))
@@ -888,10 +879,8 @@ pub const RecursiveResolver = struct {
             return;
         }
 
-        const hints = self.root_hints;
-        std.debug.assert(hints.len <= max_servers_per_level);
-        server_count.* = hints.len;
-        @memcpy(servers[0..hints.len], hints);
+        std.debug.assert(self.root_hints.len <= max_servers_per_level);
+        walk.setServers(self.root_hints);
     }
 
     // ── Cache-served short-circuits ─────────────────────────────────────
@@ -1140,23 +1129,21 @@ pub const RecursiveResolver = struct {
     fn probeParentChildCut(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
-        target_name: dns.Name,
-        parent_zone: dns.Name,
+        walk: *const Walk,
         response: *const dns.Message,
-        servers: []const na.Address,
         security_state: *dnssec.SecurityStatus,
     ) void {
         if (!self.dnssec_enabled or security_state.* != .secure) return;
-        if (target_name.labels.len <= parent_zone.labels.len) return;
+        if (walk.target.labels.len <= walk.zone.labels.len) return;
         if (!response.header.flags.aa or hasSignedRecords(response.*)) return;
 
-        var probe_depth: usize = parent_zone.labels.len + 1;
-        while (probe_depth <= target_name.labels.len) : (probe_depth += 1) {
-            const cut_labels = target_name.labels[target_name.labels.len - probe_depth ..];
+        var probe_depth: usize = walk.zone.labels.len + 1;
+        while (probe_depth <= walk.target.labels.len) : (probe_depth += 1) {
+            const cut_labels = walk.target.labels[walk.target.labels.len - probe_depth ..];
             const candidate_cut = dns.Name{ .labels = cut_labels };
             var cut_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const cut_name = candidate_cut.formatInto(&cut_buf);
-            if (self.reproveDelegationSecurity(allocator, cut_name, servers) == null and
+            if (self.reproveDelegationSecurity(allocator, cut_name, walk.servers()) == null and
                 hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
             {
                 security_state.* = .insecure;
@@ -1208,11 +1195,7 @@ pub const RecursiveResolver = struct {
         authorities: []const dns.ResourceRecord,
         depth: usize,
         security_state: *dnssec.SecurityStatus,
-        parent_zone: *dns.Name,
-        servers: *[max_servers_per_level]na.Address,
-        server_count: *usize,
-        seen_zones: *[max_delegations]dns.Name,
-        seen_zone_count: *usize,
+        walk: *Walk,
     ) !void {
         const zone_cut = switch (referral) {
             .referral => |ref| ref.zone_cut,
@@ -1221,7 +1204,7 @@ pub const RecursiveResolver = struct {
 
         // DNSSEC: classify delegation security (RFC 4035 §5.2)
         if (security_state.* == .secure) {
-            security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, servers.*[0..server_count.*]);
+            security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, walk.servers());
         }
 
         const addrs: NsAddrResult = switch (referral) {
@@ -1235,16 +1218,15 @@ pub const RecursiveResolver = struct {
 
         // Depth cap first: cheaper than the dup-scan and prevents the
         // OOB write at the bottom (seen_zones is sized to max_delegations).
-        if (seen_zone_count.* >= max_delegations) return error.MaxDelegationsExceeded;
-        for (seen_zones.*[0..seen_zone_count.*]) |sz| {
+        if (walk.seen_zone_count >= max_delegations) return error.MaxDelegationsExceeded;
+        for (walk.seen_zones[0..walk.seen_zone_count]) |sz| {
             if (sz.eql(zone_cut)) return error.ReferralLoop;
         }
-        seen_zones.*[seen_zone_count.*] = zone_cut;
-        seen_zone_count.* += 1;
+        walk.seen_zones[walk.seen_zone_count] = zone_cut;
+        walk.seen_zone_count += 1;
 
-        parent_zone.* = zone_cut;
-        server_count.* = addrs.count;
-        @memcpy(servers.*[0..addrs.count], addrs.addrs[0..addrs.count]);
+        walk.zone = zone_cut;
+        walk.setServers(addrs.addrs[0..addrs.count]);
     }
 
     // ── Final response handling ─────────────────────────────────────────
@@ -1277,16 +1259,14 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
-        current_name: []const u8,
+        walk: *const Walk,
         name: []const u8,
         qtype: dns.RType,
         depth: usize,
         security_state: dnssec.SecurityStatus,
-        target_name: dns.Name,
-        parent_zone: dns.Name,
-        servers: []const na.Address,
         chain: *const CnameChain,
     ) !ResolveResult {
+        const current_name, const target_name, const parent_zone, const servers = .{ walk.name, walk.target, walk.zone, walk.servers() };
         if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers, &neg_ttl_cap)) {
@@ -1316,14 +1296,13 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
-        current_name: []const u8,
+        walk: *const Walk,
         qtype: dns.RType,
         security_state: dnssec.SecurityStatus,
-        parent_zone: dns.Name,
-        servers: []const na.Address,
         responding_server: ?na.Address,
         chain: *const CnameChain,
     ) !ResolveResult {
+        const current_name, const parent_zone, const servers = .{ walk.name, walk.zone, walk.servers() };
         var answer_status: cache_mod.SecurityStatus = .unchecked;
         var answer_ttl_cap: u32 = std.math.maxInt(u32);
         if (self.dnssec_enabled) {
@@ -1357,16 +1336,14 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
-        current_name: []const u8,
+        walk: *const Walk,
         name: []const u8,
         qtype: dns.RType,
         depth: usize,
         security_state: dnssec.SecurityStatus,
-        target_name: dns.Name,
-        parent_zone: dns.Name,
-        servers: []const na.Address,
         chain: *const CnameChain,
     ) !ResolveResult {
+        const current_name, const target_name, const parent_zone, const servers = .{ walk.name, walk.target, walk.zone, walk.servers() };
         if (response.header.flags.aa) {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers, &neg_ttl_cap)) {
@@ -1783,7 +1760,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         query_name: []const u8,
         query_type: dns.RType,
-        servers: *[max_servers_per_level]na.Address,
+        servers: []const na.Address,
         sel: NsSelector.Selection,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
@@ -1947,8 +1924,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         query_name: []const u8,
         query_type: dns.RType,
-        servers: *[max_servers_per_level]na.Address,
-        server_count: usize,
+        servers: []na.Address,
         parent_zone: dns.Name,
     ) anyerror!ServerQueryResult {
         if (self.cache_only) return error.CacheOnlyMiss;
@@ -1956,13 +1932,13 @@ pub const RecursiveResolver = struct {
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
         var order_buf: [max_servers_per_level]usize = undefined;
         const sel = if (self.ns_selector) |ns|
-            ns.selectServers(parent_zone, servers[0..server_count], self.rtt_cache, &order_buf)
+            ns.selectServers(parent_zone, servers, self.rtt_cache, &order_buf)
         else blk: {
-            rand.fastShuffle(na.Address, self.io, servers[0..server_count]);
-            for (0..server_count) |idx| order_buf[idx] = idx;
+            rand.fastShuffle(na.Address, self.io, servers);
+            for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk NsSelector.Selection{
-                .order = order_buf[0..server_count],
-                .live_count = server_count,
+                .order = order_buf[0..servers.len],
+                .live_count = servers.len,
             };
         };
 
@@ -3472,11 +3448,6 @@ fn cnameTargetRevisitsChain(chain: []const dns.ResourceRecord, next_target: dns.
 /// Shared debug-log shape for the upstream-served and cache-served
 /// CNAME loop-detection branches. Single format string keeps both
 /// branches reading the same telemetry.
-fn logCnameLoop(target: dns.Name, where: []const u8) void {
-    var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    log.debug("cname loop detected ({s}): target {s} already in chain", .{ where, target.formatInto(&buf) });
-}
-
 /// Concatenate two RR slices. Returns the input slice unchanged when one
 /// side is empty (zero-alloc fast path for the dominant non-DNSSEC case).
 fn concatRRs(allocator: mem.Allocator, a: []const dns.ResourceRecord, b: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
@@ -4859,18 +4830,19 @@ test "withCnameChain clears AD when any hop was not proven secure" {
 
     var insecure_hop: CnameChain = .{};
     defer insecure_hop.deinit(a);
-    try insecure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .unchecked);
+    try testing.expect(try insecure_hop.push(a, .{ .records = &.{cname_rr}, .target = cname_target }, .unchecked, "test"));
     try testing.expectEqual(false, (try withCnameChain(a, &insecure_hop, validated_tail)).header.flags.ad);
 
     // A fully-proven chain keeps it.
     var secure_hop: CnameChain = .{};
     defer secure_hop.deinit(a);
-    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure);
+    try testing.expect(try secure_hop.push(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure, "test"));
     try testing.expectEqual(true, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 
     // One bad hop anywhere in the chain poisons the whole answer.
-    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .insecure);
-    try secure_hop.hop(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure);
+    const tgt2 = dns.Name{ .labels = &.{ "tgt2", "signed", "example" } };
+    const cname2 = dns.ResourceRecord{ .name = cname_target, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = tgt2 } };
+    try testing.expect(try secure_hop.push(a, .{ .records = &.{cname2}, .target = tgt2 }, .insecure, "test"));
     try testing.expectEqual(false, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 }
 
@@ -4901,7 +4873,7 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     var servers: [max_servers_per_level]na.Address = undefined;
     servers[0] = na.initIp4(.{ 192, 0, 2, 1 }, 53);
     const parent_zone = dns.Name{ .labels = &.{} };
-    const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, &servers, 1, parent_zone);
+    const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, servers[0..1], parent_zone);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
