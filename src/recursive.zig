@@ -190,28 +190,25 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 
 // ── RecursiveResolver ──────────────────────────────────────────────────
 
-/// Tree-wide outbound-query budget for one client-facing resolution.
+/// Tree-wide budgets for one client-facing resolution. Lives on `resolve()`'s
+/// stack and is shared *by pointer* across the whole tree — `cloneForThread`
+/// copies the pointer and never resets it, so concurrent NS-address fan-out
+/// helpers draw from the same counters; the atomics make that race-free.
 ///
-/// Lives on the stack of `resolve()` and is shared *by pointer* across the
-/// entire resolution tree — `cloneForThread` copies the pointer and never
-/// resets it (exactly as it now treats `validation_budget`), so the concurrent
-/// NS-address fan-out helpers all draw from the same counter. The atomic makes
-/// that race-free.
-///
-/// This is the structural defense against NXNSAttack (CVE-2020-12667): the
-/// per-call `max_upstream_queries` counter resets on every `resolveImpl`
+/// `queries` is the structural defense against NXNSAttack (CVE-2020-12667):
+/// the per-call `max_upstream_queries` counter resets on every `resolveImpl`
 /// sub-call, so glueless-NS fan-out would otherwise grant unbounded total
 /// work. Mirrors Unbound's refcounted `target_count[GLOBAL_QUOTA]` and BIND's
 /// `max-query-count`. Never reset mid-resolution (BIND's bug #4741 was a
 /// per-name counter that reset on CNAME — useless against a redirect chain).
-pub const QueryBudget = struct {
-    spent: std.atomic.Value(u32) = .init(0),
-    max: u32 = max_global_queries,
+const Budget = struct {
+    queries: std.atomic.Value(u32) = .init(0),
+    max_queries: u32 = max_global_queries,
+    validation: dnssec.ValidationBudget = .{},
 
-    /// Reserve one upstream query. Returns the error once the ceiling is hit;
-    /// callers propagate it and the server maps it to SERVFAIL.
-    fn consume(self: *QueryBudget) error{GlobalQueryBudgetExhausted}!void {
-        if (self.spent.fetchAdd(1, .monotonic) >= self.max)
+    /// Callers propagate the error; the server maps it to SERVFAIL.
+    fn consumeQuery(self: *Budget) error{GlobalQueryBudgetExhausted}!void {
+        if (self.queries.fetchAdd(1, .monotonic) >= self.max_queries)
             return error.GlobalQueryBudgetExhausted;
     }
 };
@@ -274,38 +271,32 @@ pub const RecursiveResolver = struct {
     /// disabled.
     case_state: ?*CaseState = null,
 
-    /// Re-entrancy guard: prevents fetchDsFromParent → resolveNsAddresses →
-    /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent loops.
-    resolving_ds: bool = false,
-
-    /// DNSKEY zone needing proactive refresh — stored in fixed buffer (set
-    /// deep in recursion, far from any caller allocator), duped into the
-    /// query arena at `resolve()`'s tail.
-    pending_dnskey_prefetch: ?[]const u8 = null,
-    pending_dnskey_buf: [dns.max_dotted_len + 1]u8 = undefined,
-
     /// Mirrors config `prefetch-cousin`; gates SVCB cousin extraction.
     prefetch_cousin: bool = true,
 
-    /// A CNAME-chain member (head redirect or a mid-chain/tail RRset) was
-    /// served from cache inside its prefetch window. Consumed in `resolve()`:
-    /// the prefetch targets (head name, qtype) — a bg re-walk of the whole
-    /// chain refreshes whichever member is aging. Chain members can't flow
-    /// through `prefetch_name` at the hit site because mid-chain hits happen
-    /// before the final result exists; the head name is the stable handle.
-    pending_chain_prefetch: bool = false,
+    /// In-flight query state private to this thread. `cloneForThread`
+    /// zeroes it wholesale, so adding a field here can't leak across a clone.
+    scratch: Scratch = .{},
 
-    /// Tree-wide DNSSEC CPU budget for the in-flight query — a `dnssec.ValidationBudget`
-    /// on `resolve()`'s stack, shared (not reset) across `cloneForThread` so the fan-out
-    /// can't multiply the KeyTrap/NSEC3 ceilings. null outside `resolve()` (cache-only +
-    /// unit tests, both crypto-free). Mirrors `query_budget`.
-    validation_budget: ?*dnssec.ValidationBudget = null,
+    /// null outside an active `resolve()`: cache-only paths and unit tests
+    /// never go upstream.
+    budget: ?*Budget = null,
 
-    /// Tree-wide upstream-query budget for the in-flight client query. Points
-    /// at a `QueryBudget` on `resolve()`'s stack; shared (not reset) across
-    /// `cloneForThread` so fan-out helpers draw from the same ceiling. null
-    /// outside an active `resolve()` (e.g. cache-only unit tests).
-    query_budget: ?*QueryBudget = null,
+    const Scratch = struct {
+        /// Re-entrancy guard: fetchDsFromParent → resolveNsAddresses →
+        /// resolveImpl → validateAnswer → fetchDnskey → fetchDsFromParent.
+        resolving_ds: bool = false,
+        /// DNSKEY zone needing proactive refresh (0 = none) — set deep in
+        /// recursion, far from any caller allocator, so it lives in a fixed
+        /// buffer until `resolve()` dupes it into the query arena.
+        dnskey_prefetch_len: u8 = 0,
+        dnskey_prefetch_buf: [dns.max_dotted_len + 1]u8 = undefined,
+        /// A CNAME-chain member was served from cache inside its prefetch
+        /// window. `resolve()` targets the head (name, qtype) so the background
+        /// re-walk refreshes whichever member is aging; mid-chain hits happen
+        /// before the final result exists, so they can't set `prefetch_name`.
+        chain_prefetch: bool = false,
+    };
 
     /// Stable inputs that come from the surrounding Server / WorkerState.
     /// Both server-side construction sites build one of these and call
@@ -376,27 +367,21 @@ pub const RecursiveResolver = struct {
         var resolver = self.*;
         resolver.transports = transports;
         resolver.gpa = null;
-        resolver.resolving_ds = false;
-        resolver.pending_dnskey_prefetch = null;
-        resolver.pending_chain_prefetch = false;
-        // Neither budget is reset: `self.*` copies the pointers, so clones share the
-        // parent's counters. Resetting either re-opens fan-out amplification (NXNS /
-        // KeyTrap). Both are atomic, so concurrent draws are safe.
+        resolver.scratch = .{};
+        // `budget` is deliberately not reset: clones share the parent's counters.
+        // A per-clone reset reopens fan-out amplification (NXNS, KeyTrap).
         return resolver;
     }
 
-    /// Charge one upstream query against the tree-wide budget. No-op when
-    /// unset (cache-only paths and unit tests run without a budget).
     fn consumeQuery(self: *RecursiveResolver) error{GlobalQueryBudgetExhausted}!void {
-        if (self.query_budget) |qb| try qb.consume();
+        if (self.budget) |b| try b.consumeQuery();
     }
 
-    /// The in-flight query's DNSSEC CPU budget. Set wherever crypto runs
-    /// (every validation site is downstream of an upstream response, impossible
-    /// under cache-only); the unwrap enforces that invariant — dnssec verify
-    /// functions take a non-optional budget so no verify site can fail open.
+    /// Crypto only runs downstream of an upstream response, never cache-only;
+    /// the unwrap is that invariant. Verify functions take a non-optional
+    /// budget so no site can fail open.
     fn validationBudget(self: *RecursiveResolver) *dnssec.ValidationBudget {
-        return self.validation_budget.?;
+        return &self.budget.?.validation;
     }
 
     /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
@@ -442,30 +427,25 @@ pub const RecursiveResolver = struct {
     };
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
-        // Both per-query budgets are stack locals here, shared by pointer through
-        // the whole tree (incl. clones). Helpers join before this frame returns, so
-        // the pointers stay live.
-        var query_budget: QueryBudget = .{};
-        self.query_budget = &query_budget;
-        defer self.query_budget = null;
-        var validation_budget: dnssec.ValidationBudget = .{};
-        self.validation_budget = &validation_budget;
-        defer self.validation_budget = null;
+        // Helpers join before this frame returns, so the pointer stays live.
+        var budget: Budget = .{};
+        self.budget = &budget;
+        defer self.budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
         // ResolveResult names are caller- or arena-owned, never resolver-owned:
         // dupe out of the stack-local pending buffer before returning.
-        if (self.pending_dnskey_prefetch) |z| {
-            result.prefetch_dnskey_zone = allocator.dupe(u8, z) catch null;
+        if (self.scratch.dnskey_prefetch_len > 0) {
+            result.prefetch_dnskey_zone = allocator.dupe(u8, self.scratch.dnskey_prefetch_buf[0..self.scratch.dnskey_prefetch_len]) catch null;
         }
         // Chain-member prefetch window: refresh via the head so the bg
         // resolve re-walks the whole chain. `name` is caller-owned and
         // outlives the result — same lifetime contract as the head-hit
         // prefetch_name set in tryServeFromCache.
-        if (self.pending_chain_prefetch and result.prefetch_name == null) {
+        if (self.scratch.chain_prefetch and result.prefetch_name == null) {
             result.prefetch_name = name;
             result.prefetch_qtype = qtype;
         }
-        result.from_cache = query_budget.spent.load(.monotonic) == 0;
+        result.from_cache = budget.queries.load(.monotonic) == 0;
         // Non-NOERROR answers never earn a cousin: NXDOMAIN is
         // qtype-independent (RFC 8020) and SERVFAIL would re-walk a
         // path that just failed.
@@ -975,7 +955,7 @@ pub const RecursiveResolver = struct {
             // head instead. Covers stale mid-chain hits too (needs_prefetch
             // is always set on stale), so a silently-followed stale link
             // at least triggers a bg refresh.
-            if (meta.needs_prefetch and !at_chain_head) self.pending_chain_prefetch = true;
+            if (meta.needs_prefetch and !at_chain_head) self.scratch.chain_prefetch = true;
 
             // RFC 8767 §6: a stale cache entry must not be the first answer
             // when fresh resolution is achievable. Try fresh once with
@@ -1035,7 +1015,7 @@ pub const RecursiveResolver = struct {
                 // on the floor — the CNAME RRset near expiry never triggered
                 // a refresh from the follow path, only from a direct
                 // (name, .cname) hit, which stub queries never produce.
-                if (h.needs_prefetch) self.pending_chain_prefetch = true;
+                if (h.needs_prefetch) self.scratch.chain_prefetch = true;
                 return .{ .follow_cname = .{
                     .redirect = .{
                         .records = try concatRRs(allocator, h.records[0..1], h.sigs),
@@ -1080,7 +1060,7 @@ pub const RecursiveResolver = struct {
                 .negative => continue,
             };
             if (h.records.len == 0 or h.security_status != .secure) continue;
-            if (h.needs_prefetch) self.pending_chain_prefetch = true;
+            if (h.needs_prefetch) self.scratch.chain_prefetch = true;
 
             const owner = try dns.parseDottedName(allocator, current_name);
             const synth = try synthesizeCname(allocator, owner, h.records[0]) orelse return null;
@@ -2186,9 +2166,9 @@ pub const RecursiveResolver = struct {
         if (self.keyCache()) |c| {
             if (c.lookup(allocator, zone_name, .dnskey, .in)) |result| switch (result) {
                 .hit => |h| {
-                    if (h.needs_prefetch and self.pending_dnskey_prefetch == null) {
-                        @memcpy(self.pending_dnskey_buf[0..zone_name.len], zone_name);
-                        self.pending_dnskey_prefetch = self.pending_dnskey_buf[0..zone_name.len];
+                    if (h.needs_prefetch and self.scratch.dnskey_prefetch_len == 0) {
+                        @memcpy(self.scratch.dnskey_prefetch_buf[0..zone_name.len], zone_name);
+                        self.scratch.dnskey_prefetch_len = @intCast(zone_name.len);
                     }
                     return h.records;
                 },
@@ -2346,7 +2326,7 @@ pub const RecursiveResolver = struct {
     /// TTL expiry). Returns the DS records on signed delegation, null on
     /// insecure (negative cached) or failure.
     fn fetchDsFromParent(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) ?[]const dns.ResourceRecord {
-        if (self.resolving_ds) return null; // re-entrancy guard
+        if (self.scratch.resolving_ds) return null;
 
         // Nearest ancestor with a cached NS RRset — the true parent zone can
         // be several labels up when ENTs sit between cuts (ip6.arpa's nibble
@@ -2372,8 +2352,8 @@ pub const RecursiveResolver = struct {
         // Try cached addresses first; fall back to network resolution when
         // addresses have expired alongside DS/DNSKEY (common with equal TTLs).
         const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch null) orelse blk: {
-            self.resolving_ds = true;
-            defer self.resolving_ds = false;
+            self.scratch.resolving_ds = true;
+            defer self.scratch.resolving_ds = false;
             break :blk (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return null;
         };
         return self.reproveDelegationSecurity(allocator, zone_name, addrs.addrs[0..addrs.count]);
@@ -4925,18 +4905,18 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
-// ── QueryBudget: tree-wide NXNS guard ─────────────────────────────────
+// ── Budget: tree-wide NXNS guard ──────────────────────────────────────
 
-test "QueryBudget.consume permits exactly max draws then refuses" {
-    var budget: QueryBudget = .{ .max = 5 };
-    for (0..5) |_| try budget.consume();
-    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consume());
+test "Budget.consumeQuery permits exactly max draws then refuses" {
+    var budget: Budget = .{ .max_queries = 5 };
+    for (0..5) |_| try budget.consumeQuery();
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
     // Stays refused once exhausted — the counter never resets mid-resolution
     // (the property that makes it NXNS-proof; cf. BIND #4741). The shared-by-
     // pointer-across-cloneForThread invariant is guarded end-to-end by
     // test/harness/test_nxns_amplification.py, not here — a unit test can only
     // restate Zig's value-copy semantics, which is not the thing that breaks.
-    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consume());
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
 }
 
 test "validation budget stays tree-wide across cloneForThread under concurrent fan-out" {
@@ -4947,11 +4927,11 @@ test "validation budget stays tree-wide across cloneForThread under concurrent f
     // the total jumps to K*ceiling, turning this RED.
     const K = 6;
     const ceiling: u32 = 40;
-    var shared: dnssec.ValidationBudget = .{ .max_sig_verify = ceiling };
+    var shared: Budget = .{ .validation = .{ .max_sig_verify = ceiling } };
     var parent: RecursiveResolver = .{
         .transports = null,
         .io = testing.io,
-        .validation_budget = &shared,
+        .budget = &shared,
     };
 
     const Worker = struct {

@@ -38,7 +38,7 @@ const max_sig_verify_per_resolution: u32 = 96;
 const max_nsec3_hashes_per_resolution: u32 = 96;
 
 /// Per-query DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes), shared tree-wide
-/// by pointer across `cloneForThread` like `recursive.QueryBudget`. Atomic
+/// by pointer across `cloneForThread` like `recursive.Budget`. Atomic
 /// spent-up against a fixed ceiling: exactly `max` draws succeed then refuse
 /// forever — never re-arms (a `fetchSub` down-counter would wrap u32 and silently
 /// re-grant). Two separate counters so sig and NSEC3-hash exhaustion are independent.
