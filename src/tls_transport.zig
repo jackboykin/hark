@@ -5,6 +5,7 @@ const Io = std.Io;
 const File = Io.File;
 const Allocator = mem.Allocator;
 const testing = std.testing;
+const assert = std.debug.assert;
 const dns = @import("dns.zig");
 const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
@@ -127,7 +128,7 @@ pub const TlsTransport = struct {
             .ca = .no_verification,
             .alpn = .{ .protocols = &.{alpn_dot}, .selected_protocol = &selected },
             .read_buffer = &conn.tls_read_buf,
-            .write_buffer = &conn.tls_write_buf,
+            .write_buffer = &.{},
             .entropy = &entropy,
             .realtime_now = monotonic.wallclockTimestamp(self.io),
             // DNS frames carry their own length prefix, so a bare FIN before
@@ -225,30 +226,27 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// `sys.readExactDeadline`. The TLS layer buffers records rather than exposing
 /// raw syscalls, so the read loop needs a per-syscall deadline hook first.
 fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator: Allocator, deadline_ns: i128) ![]u8 {
-    // Stage into a single buffer so the TLS layer emits one record + one
-    // syscall per query.
+    // One staged frame → one TLS record → one syscall: the unbuffered TLS
+    // writer encrypts straight into the socket writer, and only the flush
+    // touches the wire.
     var staging: [2 + dns.edns_udp_payload]u8 = undefined;
+    comptime assert(staging.len <= std.crypto.tls.max_ciphertext_inner_record_len);
     const framed = try dns.stageLengthPrefixed(&staging, wire_query);
 
     // Dead-on-arrival (see queryPooled): an idle-closed conn is caught on
-    // the read side — the write succeeds under half-close, then the buffered
-    // close_notify returns EOF without touching the wire. A peer that RSTs
-    // idle conns instead fails the write; the std File path maps that to
-    // BrokenPipe (EPIPE) or Unexpected (ECONNRESET → errnoBug), never a
-    // distinct reset error. Any transport-level write failure means the
-    // query never reached the server, so it is a cold-pool signal — report
-    // DeadOnArrival and let the dial path judge real deadness, rather than
-    // demoting a healthy server and sawtoothing the capable gauge.
+    // the read side — the flush succeeds under half-close, then the read
+    // sees the peer's close_notify or bare FIN before any response byte. A
+    // peer that RSTs idle conns instead fails the flush; the std File path
+    // maps that to BrokenPipe (EPIPE) or Unexpected (ECONNRESET → errnoBug),
+    // never a distinct reset error. Either way the query never reached the
+    // server, so it is a cold-pool signal — report DeadOnArrival and let the
+    // dial path judge real deadness, rather than demoting a healthy server
+    // and sawtoothing the capable gauge.
     const handle = conn.stream.socket.handle;
     try sys.updateTimeout(handle, posix.SO.SNDTIMEO, deadline_ns);
+    assert(conn.net_writer.interface.buffered().len == 0);
     conn.tls.writer.writeAll(framed) catch return error.TlsSendFailed;
-    flushTls(conn) catch {
-        // net_writer.err is null at entry: errored conns are destroyed,
-        // never re-pooled. Non-null ⇒ the transport killed the write; null
-        // ⇒ a TLS-layer failure, which is a genuine .broken.
-        if (conn.net_writer.err != null) return error.DeadOnArrival;
-        return error.TlsSendFailed;
-    };
+    conn.net_writer.interface.flush() catch return error.DeadOnArrival;
 
     try sys.updateTimeout(handle, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
@@ -269,12 +267,6 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
 
     sys.setQuickAck(handle);
     return response_buf;
-}
-
-/// The TLS writer's flush only encrypts into the socket writer's buffer.
-fn flushTls(conn: *PooledConnection) Io.Writer.Error!void {
-    try conn.tls.writer.flush();
-    try conn.net_writer.interface.flush();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

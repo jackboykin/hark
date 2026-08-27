@@ -93,7 +93,6 @@ pub const PooledConnection = struct {
     net_read_buf: [TlsClient.min_buffer_len]u8,
     net_write_buf: [TlsClient.min_buffer_len]u8,
     tls_read_buf: [TlsClient.min_buffer_len]u8,
-    tls_write_buf: [2 + dns.edns_udp_payload]u8,
 
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
@@ -473,7 +472,6 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
         .net_read_buf = undefined,
         .net_write_buf = undefined,
         .tls_read_buf = undefined,
-        .tls_write_buf = undefined,
     };
     return conn;
 }
