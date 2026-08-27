@@ -86,6 +86,8 @@ const max_upstream_queries = 32;
 // because hark already caps delegation depth at 3 and NS fan-out at 3/2/1,
 // so a legitimate cold-cache DNSSEC + QMIN resolution stays well under this.
 const max_global_queries = 100;
+// PowerDNS max-total-msec; Knot/BIND 10s.
+const max_resolve_ms: u32 = 7_000;
 // Sizes `seen_zones` and bounds the per-cross-zone-walk delegation count.
 // Real DNS depth tops out around 5; 16 covers QMIN-with-referrals stacks
 // without giving up loop-detection.
@@ -213,10 +215,13 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 const Budget = struct {
     queries: std.atomic.Value(u32) = .init(0),
     max_queries: u32 = max_global_queries,
+    deadline_ns: i128 = std.math.maxInt(i128),
     validation: dnssec.ValidationBudget = .{},
 
     /// Callers propagate the error; the server maps it to SERVFAIL.
-    fn consumeQuery(self: *Budget) error{GlobalQueryBudgetExhausted}!void {
+    fn consumeQuery(self: *Budget) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
+        if (monotonic.nowNs() >= self.deadline_ns)
+            return error.ResolveDeadline;
         if (self.queries.fetchAdd(1, .monotonic) >= self.max_queries)
             return error.GlobalQueryBudgetExhausted;
     }
@@ -382,8 +387,14 @@ pub const RecursiveResolver = struct {
         return resolver;
     }
 
-    fn consumeQuery(self: *RecursiveResolver) error{GlobalQueryBudgetExhausted}!void {
+    fn consumeQuery(self: *RecursiveResolver) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
         if (self.budget) |b| try b.consumeQuery();
+    }
+
+    fn remainingMs(self: *const RecursiveResolver) u32 {
+        const b = self.budget orelse return max_resolve_ms;
+        const ns = b.deadline_ns - monotonic.nowNs();
+        return if (ns <= 0) 0 else @intCast(@min(@divTrunc(ns, std.time.ns_per_ms), max_resolve_ms));
     }
 
     /// Crypto only runs downstream of an upstream response, never cache-only;
@@ -412,7 +423,8 @@ pub const RecursiveResolver = struct {
 
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
         const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.?.udp.config.timeout_ms;
-        return if (is_last) base else @min(base, failover_timeout_cap);
+        const want = if (is_last) base else @min(base, failover_timeout_cap);
+        return @min(want, self.remainingMs());
     }
 
     pub const ResolveResult = struct {
@@ -437,7 +449,7 @@ pub const RecursiveResolver = struct {
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         // Helpers join before this frame returns, so the pointer stays live.
-        var budget: Budget = .{};
+        var budget: Budget = .{ .deadline_ns = monotonic.nowNs() + @as(i128, max_resolve_ms) * std.time.ns_per_ms };
         self.budget = &budget;
         defer self.budget = null;
         var result = try self.resolveImpl(allocator, name, qtype, 0);
@@ -1583,7 +1595,7 @@ pub const RecursiveResolver = struct {
     ) error{OutOfMemory}!?dns.Message {
         if (!self.transports.?.tcp_enabled) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.tcp_pool) catch |err| {
+        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.tcp_pool, self.remainingMs()) catch |err| {
             var addr_buf: [64]u8 = undefined;
             log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
@@ -1700,8 +1712,7 @@ pub const RecursiveResolver = struct {
         var padded_buf: [dns.edns_udp_payload]u8 = undefined;
         const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-        // Fixed 4s: encryption may cost more than Do53 — accepted trade.
-        const deadline_ns = monotonic.nowNs() + 4000 * std.time.ns_per_ms;
+        const deadline_ns = monotonic.nowNs() + @as(i128, @min(4000, self.remainingMs())) * std.time.ns_per_ms;
         const tls_data = switch (tls_t.queryPooled(allocator, padded_query, server, deadline_ns)) {
             .data => |data| data,
             .none => {
@@ -1787,7 +1798,7 @@ pub const RecursiveResolver = struct {
         else
             self.stagger_ms;
 
-        const overall_timeout = self.transports.?.udp.config.timeout_ms;
+        const overall_timeout = @min(self.transports.?.udp.config.timeout_ms, self.remainingMs());
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
         // per leg because each socket's send holds the wire bytes past the
@@ -4889,6 +4900,11 @@ test "Budget.consumeQuery permits exactly max draws then refuses" {
     // test/harness/test_nxns_amplification.py, not here — a unit test can only
     // restate Zig's value-copy semantics, which is not the thing that breaks.
     try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
+}
+
+test "Budget.consumeQuery refuses past the wall-clock deadline" {
+    var budget: Budget = .{ .deadline_ns = monotonic.nowNs() - 1 };
+    try testing.expectError(error.ResolveDeadline, budget.consumeQuery());
 }
 
 test "validation budget stays tree-wide across cloneForThread under concurrent fan-out" {

@@ -288,7 +288,6 @@ pub const BlockingUdpTransport = struct {
 // loop polls with the remaining deadline before issuing a read/write.
 
 const tcp_connect_timeout_ms: u32 = 5000;
-const tcp_response_timeout_ms: u32 = 10000;
 
 /// Send a DNS query over TCP. With pool != null, tries an idle pooled
 /// connection first and stores a fresh one on success.
@@ -298,8 +297,9 @@ pub fn queryTcp(
     server: na.Address,
     response_buf: []u8,
     pool: ?*TcpConnectionPool,
+    timeout_ms: u32,
 ) ![]const u8 {
-    const deadline_ns = monotonic.nowNs() + @as(i128, tcp_response_timeout_ms) * 1_000_000;
+    const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
 
     if (pool) |p| {
         const key = AddressKey.fromAddress(server);
@@ -314,7 +314,7 @@ pub fn queryTcp(
         }
     }
 
-    const stream = try connectTcp(server);
+    const stream = try connectTcp(server, @min(timeout_ms, tcp_connect_timeout_ms));
     const data = sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns) catch |err| {
         stream.close(io);
         return err;
@@ -368,8 +368,8 @@ pub fn connectTcpRaw(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream
 /// don't surface EAGAIN through netRead/netWrite, which `netReadPosix`/
 /// `netWritePosix` treat as a programmer bug — deadlines here are
 /// enforced in userspace (`sendAndReceiveTcp`).
-pub fn connectTcp(server: na.Address) !Io.net.Stream {
-    const stream = try connectTcpRaw(server, tcp_connect_timeout_ms);
+pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
+    const stream = try connectTcpRaw(server, connect_timeout_ms);
     sys.clearSocketTimeout(stream.socket.handle, posix.SO.SNDTIMEO);
     return stream;
 }
@@ -584,7 +584,7 @@ test "queryTcp loopback query" {
     const thread = try std.Thread.spawn(.{}, tcpEchoServerThread, .{ &server, io });
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
-    const response = try queryTcp(io, wire_query, server_addr, &response_buf, null);
+    const response = try queryTcp(io, wire_query, server_addr, &response_buf, null, 10_000);
     thread.join();
 
     try testing.expect(response.len >= 12);
@@ -611,7 +611,7 @@ test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" 
     var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
     defer server.deinit(io);
 
-    const stream = try connectTcp(server.socket.address);
+    const stream = try connectTcp(server.socket.address, tcp_connect_timeout_ms);
     defer sys.close(stream.socket.handle);
 
     var tv: posix.timeval = undefined;
