@@ -241,7 +241,8 @@ const PerThreadArena = struct {
 
 const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
 
-const Protocol = enum { udp, tcp };
+/// .bg payload: [qtype u16 BE][BgKind u8][name]
+const Protocol = enum { udp, tcp, bg };
 
 // No field defaults: a defaulted Slot inside `slots: ... = @splat(.{})`
 // once made Zig emit all 256 copies (1 MiB, mostly zeros) into .rodata as
@@ -410,8 +411,6 @@ const max_signal_misfires: u32 = 16;
 
 // ── Background task bookkeeping ────────────────────────────────────────
 
-/// Cap concurrent background tasks (prefetch + CD=1 validation). Conservative
-/// — DNSSEC cold-cache bursts can otherwise deadlock on over-fanout.
 const max_bg_tasks: u32 = 16;
 
 /// Dedup flag value for background CD=1 revalidation tasks. Distinct
@@ -450,10 +449,10 @@ pub const Server = struct {
     /// reported rate far below the truth.
     client_cache_hits: std.atomic.Value(u64) align(std.atomic.cache_line),
     client_cache_misses: std.atomic.Value(u64) align(std.atomic.cache_line),
-    /// TTL-refresh prefetches dropped: bg pool full and the caller had no
-    /// inline fallback (recv-thread fast path — exactly where prefetch
-    /// flags originate). Nonzero here means near-expiry refreshes are
-    /// silently lost under load.
+    /// TTL-refresh prefetches dropped: bg cap or work queue full and the
+    /// caller had no inline fallback (recv-thread fast path — exactly where
+    /// prefetch flags originate). Nonzero here means near-expiry refreshes
+    /// are silently lost under load.
     prefetch_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
@@ -463,7 +462,7 @@ pub const Server = struct {
     /// `. NS` recursive query so subsequent resolutions hit a warm cache
     /// with the live root NS RRset (not just the in-source root_hints).
     primed: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
-    bg_tasks: BumpGatedGroup = .init(max_bg_tasks),
+    bg_tasks: BumpGatedGroup,
     /// Hot-set refresh tracker (`prefetch-hot`); heap-owned so the
     /// cache's remiss hook holds a stable pointer.
     hot_set: ?*HotSet = null,
@@ -567,6 +566,7 @@ pub const Server = struct {
             .client_cache_hits = std.atomic.Value(u64).init(0),
             .client_cache_misses = std.atomic.Value(u64).init(0),
             .prefetch_drops = std.atomic.Value(u64).init(0),
+            .bg_tasks = .init(@min(max_bg_tasks, @max(1, @as(u32, cfg.workers) * cfg.resolution_threads / 2))),
             .work_queue = work_queue,
             .hot_set = hot_set,
         };
@@ -606,9 +606,6 @@ pub const Server = struct {
         }
     };
 
-    /// Build a resolver Context from the server-level (background) state.
-    /// The bg-prefetch path always passes `tcp_pool = null` (it creates
-    /// fresh transports per task; no shared pool semantics).
     pub fn resolverContext(self: *Server) recursive.RecursiveResolver.Context {
         return .{
             .config = &self.config,
@@ -639,10 +636,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        // awaitProbes/awaitAll MUST precede pool + cache teardown: each probe
-        // holds a by-value TlsTransport that stores into self.enc_pool and the
-        // encrypted-NS cache.
-        self.bg_tasks.awaitAll(self.io);
+        // Probes store into enc_pool and the cache; await them before teardown.
         if (self.encrypted_ns_cache) |*oc| {
             oc.awaitProbes();
             oc.deinit();
@@ -882,26 +876,22 @@ pub const Server = struct {
         }
     }
 
-    /// Attempt to hand off a prefetch or CD=1 revalidation to a background
-    /// task. Returns true if spawned; false means the caller should fall
-    /// back (run inline or drop — caller's choice). The task owns the
-    /// heap-allocated context and releases the bg_tasks slot on exit.
+    /// Queue a prefetch or CD=1 revalidation on the resolution pool.
+    /// Returns true if queued; false means the caller should fall back
+    /// (run inline or drop — caller's choice). The pool thread that runs
+    /// it releases the bg_tasks slot.
     fn trySpawnBgPrefetch(self: *Server, name: []const u8, qtype: dns.RType, kind: BgKind) bool {
         if (name.len == 0 or name.len > dns.max_name_len + 1) return false;
         if (!self.bg_tasks.tryClaim()) return false;
 
-        const ctx = self.allocator.create(BgPrefetchCtx) catch {
+        var payload: [3 + dns.max_name_len + 1]u8 = undefined;
+        mem.writeInt(u16, payload[0..2], @backingInt(qtype), .big);
+        payload[2] = @backingInt(kind);
+        @memcpy(payload[3..][0..name.len], name);
+        if (!self.work_queue.push(payload[0 .. 3 + name.len], na.initIp4(.{ 0, 0, 0, 0 }, 0), -1, .bg)) {
             self.bg_tasks.release();
             return false;
-        };
-        ctx.* = .{ .server = self, .qtype = qtype, .kind = kind, .name_len = @intCast(name.len) };
-        @memcpy(ctx.name_buf[0..name.len], name);
-
-        self.bg_tasks.spawn(self.io, bgPrefetchThread, .{ctx}) catch {
-            self.allocator.destroy(ctx);
-            self.bg_tasks.release();
-            return false;
-        };
+        }
         return true;
     }
 };
@@ -1140,53 +1130,13 @@ const BgKind = enum {
     revalidate,
 };
 
-const BgPrefetchCtx = struct {
-    server: *Server,
-    name_buf: [dns.max_name_len + 1]u8 = undefined,
-    name_len: u8 = 0,
-    qtype: dns.RType,
-    kind: BgKind,
-};
+/// Errors are expected and ignored; runs for cache side effects.
+fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, kind: BgKind) void {
+    const dedup_flag: u8 = if (kind == .revalidate) bg_revalidate_flag else 0;
+    if (ctx.dedup) |d| if (!d.tryAcquireLeader(name, qtype, dedup_flag)) return;
+    defer if (ctx.dedup) |d| d.releaseLeader(name, qtype, dedup_flag);
 
-fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
-    const server = ctx.server;
-    defer server.allocator.destroy(ctx);
-    defer server.bg_tasks.release();
-
-    const name = ctx.name_buf[0..ctx.name_len];
-    const qtype = ctx.qtype;
-
-    // Coalesce bursts of near-expiry client queries that would otherwise
-    // fan out into N upstream refreshes for the same (name, qtype, kind).
-    const dedup_flag: u8 = switch (ctx.kind) {
-        .prefetch, .cousin => 0,
-        .revalidate => bg_revalidate_flag,
-    };
-    const dedup_opt: ?*InFlightTable = if (server.dedup) |*d| d else null;
-    if (dedup_opt) |dedup| {
-        if (!dedup.tryAcquireLeader(name, qtype, dedup_flag)) return;
-    }
-    defer if (dedup_opt) |dedup| dedup.releaseLeader(name, qtype, dedup_flag);
-
-    // Fresh per-thread transports (mirrors the resolveNsAddressesFanout
-    // pattern). BG threads never reuse per-worker TCP pools — a rare
-    // refresh doesn't need amortized pooling.
-    var upstream = Server.UpstreamTransports.init(server);
-    defer upstream.deinit();
-
-    var cap = CountingAllocator.init(server.allocator, server.config.query_memory_limit);
-    var arena = std.heap.ArenaAllocator.init(cap.allocator());
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var resolver = recursive.RecursiveResolver.fromContext(
-        server.resolverContext(),
-        upstream.transports(),
-        .{ .bypass_cache = ctx.kind != .cousin },
-    );
-
-    // Errors are common (network flakiness, upstream SERVFAIL) and not
-    // actionable here — the task runs for cache side effects only.
+    var resolver = recursive.RecursiveResolver.fromContext(ctx, transports, .{ .bypass_cache = kind != .cousin });
     _ = resolver.resolve(alloc, name, qtype) catch |err| {
         var qtype_buf: [24]u8 = undefined;
         log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(qtype, &qtype_buf), @errorName(err) });
@@ -1194,9 +1144,7 @@ fn bgPrefetchThread(ctx: *BgPrefetchCtx) void {
         // to refresh, so a SERVFAIL would clobber it. cacheServfail refuses
         // fresh entries under the shard write lock, which closes the race
         // with a concurrent successful resolve.
-        if (ctx.kind == .cousin) {
-            server.cache.cacheServfail(name, qtype);
-        }
+        if (kind == .cousin) ctx.cache.cacheServfail(name, qtype);
     };
 }
 
@@ -1757,6 +1705,13 @@ const WorkerState = struct {
                         &prefetch_pta,
                     );
                 },
+                .bg => {
+                    defer self.server.work_queue.release(item.reservation);
+                    defer self.server.bg_tasks.release();
+                    const qtype: dns.RType = @fromBackingInt(mem.readInt(u16, item.payload[0..2], .big));
+                    const kind: BgKind = @fromBackingInt(@intCast(item.payload[2]));
+                    runBgTask(self.resolverContext(), transports, query_pta.reset(), item.payload[3..], qtype, kind);
+                },
                 .tcp => {
                     // Release before processTcpClient: the TCP connection
                     // can live for seconds and the slot is just an fd
@@ -2172,18 +2127,6 @@ test "createSocket UDP reuseport allows multiple binds" {
     defer sys.close(sock2);
 }
 
-test "bg_tasks.tryClaim caps concurrent tasks" {
-    var bg = BumpGatedGroup.init(max_bg_tasks);
-    for (0..max_bg_tasks) |_| {
-        try testing.expect(bg.tryClaim());
-    }
-    try testing.expect(!bg.tryClaim());
-    bg.release();
-    try testing.expect(bg.tryClaim());
-    for (0..max_bg_tasks) |_| bg.release();
-    try testing.expectEqual(@as(u32, 0), bg.inFlight());
-}
-
 test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // RFC 6840 §5.9 / RFC 4035 §3.2.2: AD MUST NOT be set unless the
     // resolver verified. A cache entry stored as .unchecked (e.g. by the
@@ -2302,9 +2245,6 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     var too_long: [dns.max_name_len + 2]u8 = undefined;
     @memset(&too_long, 'a');
     try testing.expect(!server.trySpawnBgPrefetch(&too_long, .a, .prefetch));
-
-    // Drain: no thread should have been spawned for the rejected inputs.
-    server.bg_tasks.awaitAll(server.io);
     try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());
 }
 
@@ -2313,17 +2253,19 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
-    // Starve the bg resolve arena: every resolve fails before upstream I/O.
-    cfg.query_memory_limit = 1;
 
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
+    var upstream = Server.UpstreamTransports.init(&server);
+    defer upstream.deinit();
+    const run = struct {
+        fn f(srv: *Server, t: Transports, name: []const u8, kind: BgKind) void {
+            runBgTask(srv.resolverContext(), t, testing.failing_allocator, name, .aaaa, kind);
+        }
+    }.f;
 
     // Cousin failure on an absent key → RFC 9520 SERVFAIL marker.
-    // cacheServfail happens before the task's release, so awaitAll
-    // returning implies the cache write is visible.
-    try testing.expect(server.trySpawnBgPrefetch("brk.example.com", .aaaa, .cousin));
-    server.bg_tasks.awaitAll(server.io);
+    run(&server, upstream.transports(), "brk.example.com", .cousin);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -2335,8 +2277,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     }
 
     // Same failure under a refresh kind → nothing recorded.
-    try testing.expect(server.trySpawnBgPrefetch("brk2.example.com", .aaaa, .prefetch));
-    server.bg_tasks.awaitAll(server.io);
+    run(&server, upstream.transports(), "brk2.example.com", .prefetch);
     try testing.expect(!server.cache.containsFresh("brk2.example.com", .aaaa, .in));
 
     // Cousin failure with a fresh entry present → guard keeps the entry.
@@ -2354,8 +2295,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
         };
         server.cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
-    try testing.expect(server.trySpawnBgPrefetch("fresh.example.com", .aaaa, .cousin));
-    server.bg_tasks.awaitAll(server.io);
+    run(&server, upstream.transports(), "fresh.example.com", .cousin);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
