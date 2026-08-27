@@ -3028,7 +3028,7 @@ pub const RecursiveResolver = struct {
             // page_allocator: a fresh thread's frees would warm a new smp slot's slabs for good.
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            var cap = CountingAllocator.init(arena.allocator(), ctx.mem_limit);
+            var cap = CountingAllocator.init(arena.allocator(), ctx.mem_limit, .payload);
 
             resolver.resolveNsNameOne(
                 cap.allocator(),

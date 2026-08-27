@@ -190,6 +190,7 @@ const PerThreadArena = struct {
         self.cap = CountingAllocator.init(
             self.arena.allocator(),
             if (max_bytes > 0) max_bytes else std.math.maxInt(usize),
+            .payload,
         );
     }
 

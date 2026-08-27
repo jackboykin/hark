@@ -572,7 +572,7 @@ pub const RRsetCache = struct {
                 break :blk v;
             } else |_| null;
             shard.* = .{
-                .counting = CountingAllocator.init(cfg.backing, per_shard_bytes),
+                .counting = CountingAllocator.init(cfg.backing, per_shard_bytes, .slot),
                 .map = .empty,
                 .visited = visited,
                 .max_entries = per_shard_entries,
