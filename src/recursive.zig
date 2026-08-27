@@ -18,7 +18,8 @@ const encrypted_ns = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
 const AddressKey = @import("net_address.zig").AddressKey;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
-const RttCache = @import("ns_rtt.zig").RttCache;
+const ns_rtt = @import("ns_rtt.zig");
+const RttCache = ns_rtt.RttCache;
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
 const na = @import("net_address.zig");
@@ -227,6 +228,11 @@ const Budget = struct {
     }
 };
 
+pub const PoolOccupancy = struct {
+    busy: std.atomic.Value(u32) = .init(0),
+    size: u32,
+};
+
 pub const RecursiveResolver = struct {
     /// `null` IFF `cache_only` — the type-level invariant lets the resolver
     /// short-circuit before any transport access on the recv-thread fast path.
@@ -261,6 +267,7 @@ pub const RecursiveResolver = struct {
     dnssec_aware: bool = false,
     encrypted_ns_cache: ?*EncryptedNsCache = null,
     rtt_cache: ?*RttCache = null,
+    pool: ?*const PoolOccupancy = null,
     ns_selector: ?*NsSelector = null,
     bypass_cache: bool = false,
     /// When set, any upstream attempt returns `error.CacheOnlyMiss`.
@@ -328,6 +335,7 @@ pub const RecursiveResolver = struct {
         nsec_cache: ?*NsecCache,
         key_cache: ?*RRsetCache,
         tcp_pool: ?*TcpConnectionPool,
+        pool: ?*const PoolOccupancy = null,
     };
 
     /// Per-query knobs that vary across calls within the same Context.
@@ -367,6 +375,7 @@ pub const RecursiveResolver = struct {
             .case_state = ctx.case_state,
             .dedup = ctx.dedup,
             .tcp_pool = ctx.tcp_pool,
+            .pool = ctx.pool,
             .gpa = ctx.gpa,
             .query_memory_limit = ctx.config.query_memory_limit,
             .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
@@ -424,7 +433,14 @@ pub const RecursiveResolver = struct {
     fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
         const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.?.udp.config.timeout_ms;
         const want = if (is_last) base else @min(base, failover_timeout_cap);
-        return @min(want, self.remainingMs());
+        const scaled = if (self.pool) |p| scaleByOccupancy(want, p.busy.load(.monotonic), p.size) else want;
+        return @min(@max(ns_rtt.min_timeout_ms, scaled), self.remainingMs());
+    }
+
+    // PowerDNS authWaitTimeMSec.
+    fn scaleByOccupancy(want: u32, busy: u32, size: u32) u32 {
+        const scaled = @as(u64, want) * (size -| (busy -| 1)) / (size - size / 10);
+        return @intCast(std.math.clamp(scaled, want / 10, want));
     }
 
     pub const ResolveResult = struct {
@@ -4900,6 +4916,14 @@ test "Budget.consumeQuery permits exactly max draws then refuses" {
     // test/harness/test_nxns_amplification.py, not here — a unit test can only
     // restate Zig's value-copy semantics, which is not the thing that breaks.
     try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
+}
+
+test "scaleByOccupancy: pdns curve" {
+    const S = RecursiveResolver.scaleByOccupancy;
+    try testing.expectEqual(2000, S(2000, 1, 6));
+    try testing.expectEqual(2000, S(2000, 3, 40));
+    try testing.expectEqual(1000, S(2000, 4, 6));
+    try testing.expectEqual(200, S(2000, 24, 24));
 }
 
 test "Budget.consumeQuery refuses past the wall-clock deadline" {

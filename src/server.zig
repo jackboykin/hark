@@ -846,6 +846,7 @@ pub const Server = struct {
             .loop = rig.loop,
             .tcp_pool = &do53_tcp_pool,
             .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
+            .pool = .{ .size = self.config.resolution_threads },
         };
 
         var spawned: usize = 0;
@@ -1208,6 +1209,7 @@ const WorkerState = struct {
     tcp_pool: ?*TcpConnectionPool = null,
     active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     max_tcp_clients: u32 = 0,
+    pool: recursive.PoolOccupancy,
     recv_pta: PerThreadArena = undefined,
 
     /// Build a resolver Context: the server-level one plus this worker's
@@ -1216,6 +1218,7 @@ const WorkerState = struct {
     fn resolverContext(self: *WorkerState) recursive.RecursiveResolver.Context {
         var ctx = self.server.resolverContext();
         ctx.tcp_pool = self.tcp_pool;
+        ctx.pool = &self.pool;
         return ctx;
     }
 
@@ -1890,6 +1893,8 @@ const WorkerState = struct {
         cd: bool,
         transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
+        _ = self.pool.busy.fetchAdd(1, .monotonic);
+        defer _ = self.pool.busy.fetchSub(1, .monotonic);
         // Dedup only prevents duplicate upstream queries. On a cache hit no
         // upstream I/O happens, so the InFlightTable mutex pair is pure
         // overhead; a shared-lock existence probe skips it. On miss we fall

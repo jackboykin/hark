@@ -12,7 +12,7 @@ const initial_timeout_ms: u32 = 400;
 
 /// Minimum RTO floor. With the rttvar floor (srtt/4) guaranteeing
 /// jitter headroom, this only catches degenerate sub-millisecond RTTs.
-const min_timeout_ms: u32 = 50;
+pub const min_timeout_ms: u32 = 50;
 
 /// Maximum RTO cap (Knot).
 const max_timeout_ms: u32 = 10_000;
