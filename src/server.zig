@@ -181,28 +181,9 @@ const QInstrTimer = struct {
 // `init` takes *PerThreadArena (unlike most struct inits in this file) because
 // cap.backing stores &self.arena — the struct is self-referential and cannot
 // be returned by value without risking a dangling pointer if NRVO doesn't fire.
-//
-// Adaptive shrink: reset() is monotonic by default, so a single spike query
-// pins retained pages until thread exit. To bound that, we sample
-// cap.current_bytes before each reset; once the sample stays below
-// max_bytes/4 for LOW_STREAK_THRESHOLD consecutive resets, we use
-// ArenaAllocator's retain_with_limit to shrink back to SHRINK_LIMIT_BYTES.
-// Hysteresis (a streak counter, not the last sample) avoids thrashing on a
-// bursty workload that alternates spike/decay every few queries.
-
 const PerThreadArena = struct {
     arena: std.heap.ArenaAllocator,
     cap: CountingAllocator,
-    low_streak: u32 = 0,
-
-    /// After this many consecutive low-usage resets, shrink the retained
-    /// arena down to SHRINK_LIMIT_BYTES. Sized to span a comfortable burst
-    /// of cache-hit queries before any one spike has its memory released.
-    const LOW_STREAK_THRESHOLD: u32 = 64;
-    /// Capacity floor preserved across a shrink — keeps the common-case
-    /// fast-path query allocation-free without holding onto worst-case
-    /// resolution pages forever.
-    const SHRINK_LIMIT_BYTES: usize = 256 * 1024;
 
     fn init(self: *PerThreadArena, gpa: mem.Allocator, max_bytes: usize) void {
         self.arena = std.heap.ArenaAllocator.init(gpa);
@@ -210,25 +191,11 @@ const PerThreadArena = struct {
             self.arena.allocator(),
             if (max_bytes > 0) max_bytes else std.math.maxInt(usize),
         );
-        self.low_streak = 0;
     }
 
     fn reset(self: *PerThreadArena) mem.Allocator {
-        const sample = self.cap.current_bytes.load(.monotonic);
-        const low_threshold = self.cap.max_bytes / 4;
         self.cap.current_bytes.store(0, .monotonic);
-        if (sample > low_threshold) {
-            self.low_streak = 0;
-            _ = self.arena.reset(.retain_capacity);
-        } else {
-            self.low_streak +%= 1;
-            if (self.low_streak >= LOW_STREAK_THRESHOLD) {
-                _ = self.arena.reset(.{ .retain_with_limit = SHRINK_LIMIT_BYTES });
-                self.low_streak = 0;
-            } else {
-                _ = self.arena.reset(.retain_capacity);
-            }
-        }
+        _ = self.arena.reset(.retain_capacity);
         return self.cap.allocator();
     }
 
@@ -449,10 +416,6 @@ pub const Server = struct {
     /// reported rate far below the truth.
     client_cache_hits: std.atomic.Value(u64) align(std.atomic.cache_line),
     client_cache_misses: std.atomic.Value(u64) align(std.atomic.cache_line),
-    /// TTL-refresh prefetches dropped: bg cap or work queue full and the
-    /// caller had no inline fallback (recv-thread fast path — exactly where
-    /// prefetch flags originate). Nonzero here means near-expiry refreshes
-    /// are silently lost under load.
     prefetch_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
@@ -806,7 +769,7 @@ pub const Server = struct {
         }
         logCounterIfNonzero("UDP send-buffer drops", self.udp_send_drops.load(.monotonic));
         logCounterIfNonzero("fast-path resolver errors (fell through to slow path)", self.fast_path_errors.load(.monotonic));
-        logCounterIfNonzero("prefetches dropped (bg pool full, no inline fallback)", self.prefetch_drops.load(.monotonic));
+        logCounterIfNonzero("prefetches dropped (bg cap or work queue full)", self.prefetch_drops.load(.monotonic));
         if (self.hot_set) |hs| {
             logCounterIfNonzero("hot-set promotions", hs.promotions.load(.monotonic));
             logCounterIfNonzero("hot-set refreshes fired", hs.fired.load(.monotonic));
@@ -876,10 +839,6 @@ pub const Server = struct {
         }
     }
 
-    /// Queue a prefetch or CD=1 revalidation on the resolution pool.
-    /// Returns true if queued; false means the caller should fall back
-    /// (run inline or drop — caller's choice). The pool thread that runs
-    /// it releases the bg_tasks slot.
     fn trySpawnBgPrefetch(self: *Server, name: []const u8, qtype: dns.RType, kind: BgKind) bool {
         if (name.len == 0 or name.len > dns.max_name_len + 1) return false;
         if (!self.bg_tasks.tryClaim()) return false;
@@ -1501,7 +1460,7 @@ const WorkerState = struct {
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
         self.recordClientOutcome(result.from_cache); // cache_only ⇒ always a hit
-        self.dispatchPrefetches(result, name_str, null);
+        self.dispatchPrefetches(result, name_str);
         if (query_msg.header.flags.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
         return true;
     }
@@ -1511,7 +1470,6 @@ const WorkerState = struct {
         client_fd: posix.fd_t,
         transports: Transports,
         query_pta: *PerThreadArena,
-        prefetch_pta: *PerThreadArena,
     ) void {
         defer sys.close(client_fd);
 
@@ -1601,7 +1559,7 @@ const WorkerState = struct {
             tcpWriteMessage(self.server.io, client_fd, wire, write_deadline_ns) orelse return;
 
             self.recordClientOutcome(result.from_cache);
-            self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
+            self.dispatchPrefetches(result, name_str);
             if (query.header.flags.cd) {
                 self.scheduleCd1Revalidate(name_str, question.qtype);
             }
@@ -1646,11 +1604,6 @@ const WorkerState = struct {
         return resolver.resolve(alloc, name, qtype);
     }
 
-    fn doPrefetchWith(self: *WorkerState, prefetch_name: []const u8, prefetch_qtype: dns.RType, transports: Transports, prefetch_pta: *PerThreadArena) void {
-        const alloc = prefetch_pta.reset();
-        _ = self.resolveQueryWith(alloc, prefetch_name, prefetch_qtype, false, true, transports) catch {};
-    }
-
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) noreturn {
         var upstream = Server.UpstreamTransports.init(self.server);
@@ -1658,9 +1611,6 @@ const WorkerState = struct {
 
         var query_pta: PerThreadArena = undefined;
         query_pta.init(self.server.allocator, self.server.config.query_memory_limit);
-
-        var prefetch_pta: PerThreadArena = undefined;
-        prefetch_pta.init(self.server.allocator, self.server.config.query_memory_limit);
 
         // RFC 8109: first pool thread anywhere on this Server primes the
         // cache with a live "." NS lookup. Single CAS gates the work, so
@@ -1702,7 +1652,6 @@ const WorkerState = struct {
                         item.client_addr,
                         transports,
                         &query_pta,
-                        &prefetch_pta,
                     );
                 },
                 .bg => {
@@ -1720,7 +1669,7 @@ const WorkerState = struct {
                     self.server.work_queue.release(item.reservation);
                     if (self.claimTcpSlot()) {
                         defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
-                        self.processTcpClient(item.sock_fd, transports, &query_pta, &prefetch_pta);
+                        self.processTcpClient(item.sock_fd, transports, &query_pta);
                     } else {
                         // Drop silently for the same reason as the queue-full path above.
                         log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
@@ -1738,7 +1687,6 @@ const WorkerState = struct {
         client_addr: na.Address,
         transports: Transports,
         query_pta: *PerThreadArena,
-        prefetch_pta: *PerThreadArena,
     ) void {
         const alloc = query_pta.reset();
 
@@ -1783,27 +1731,21 @@ const WorkerState = struct {
         self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
 
         self.recordClientOutcome(result.from_cache);
-        self.dispatchPrefetches(result, name_str, .{ .transports = transports, .prefetch_pta = prefetch_pta });
+        self.dispatchPrefetches(result, name_str);
 
         if (query_msg.header.flags.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
         }
     }
 
-    const PrefetchInlineFallback = struct { transports: Transports, prefetch_pta: *PerThreadArena };
-
     fn dispatchPrefetches(
         self: *WorkerState,
         result: recursive.RecursiveResolver.ResolveResult,
         query_name: []const u8,
-        inline_fallback: ?PrefetchInlineFallback,
     ) void {
-        // TTL-refresh: bg thread; inline fallback (slow path only) prevents
-        // dropping a refresh when the bg cap is hit.
-        if (result.prefetch_name) |n| self.spawnPrefetch(n, result.prefetch_qtype, inline_fallback);
-        if (result.prefetch_dnskey_zone) |z| self.spawnPrefetch(z, .dnskey, inline_fallback);
+        if (result.prefetch_name) |n| self.spawnPrefetch(n, result.prefetch_qtype);
+        if (result.prefetch_dnskey_zone) |z| self.spawnPrefetch(z, .dnskey);
 
-        // Cousin co-prefetches: fire-and-forget, bg-only on both paths.
         if (!self.server.config.prefetch_cousin) return;
         // RFC 8305 A↔AAAA pairing.
         if (result.cousin_prefetch_qtype) |qt| {
@@ -1822,9 +1764,8 @@ const WorkerState = struct {
         }
     }
 
-    fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType, inline_fallback: ?PrefetchInlineFallback) void {
+    fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
         if (self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) return;
-        if (inline_fallback) |f| return self.doPrefetchWith(name, qtype, f.transports, f.prefetch_pta);
         _ = self.server.prefetch_drops.fetchAdd(1, .monotonic);
     }
 
@@ -2413,62 +2354,6 @@ test "HotSet remiss on a leased name renews the lease" {
     try testing.expect(hs.findSlotLocked(tag).?.lease_until > first_lease);
     // Renewal must not consume a registry slot or count as a promotion.
     try testing.expectEqual(@as(u64, 1), hs.promotions.load(.monotonic));
-}
-
-test "PerThreadArena adaptive reset shrinks retained pages after low-streak" {
-    // Spike-then-decay. reset() samples the PREVIOUS query's allocation
-    // (cap.current_bytes reflects what the just-finished query used), so the
-    // bookkeeping fields advance one reset behind the query that produced
-    // the bytes. The shrink fires on the LOW_STREAK_THRESHOLD-th consecutive
-    // reset whose sample was low.
-    const max_bytes: usize = 2 * 1024 * 1024;
-    const spike_bytes: usize = max_bytes - 64 * 1024; // ~1.94 MiB
-    const low_alloc_bytes: usize = 1024; // far below max_bytes / 4
-
-    var pta: PerThreadArena = undefined;
-    pta.init(testing.allocator, max_bytes);
-    defer pta.deinit();
-
-    // Spike first so subsequent resets have a high-water mark to shrink from.
-    {
-        const a = pta.reset(); // samples 0 → low_streak = 1
-        const big = try a.alloc(u8, spike_bytes);
-        std.mem.doNotOptimizeAway(big.ptr);
-    }
-
-    // Next reset samples the spike → low_streak resets.
-    {
-        const a = pta.reset();
-        const buf = try a.alloc(u8, low_alloc_bytes);
-        std.mem.doNotOptimizeAway(buf.ptr);
-    }
-    try testing.expectEqual(@as(u32, 0), pta.low_streak);
-    try testing.expect(pta.arena.queryCapacity() >= spike_bytes);
-
-    // Now K consecutive low queries. Each reset samples the prior query's
-    // (low) bytes and ticks low_streak. The reset that increments to
-    // LOW_STREAK_THRESHOLD performs the shrink.
-    const k = PerThreadArena.LOW_STREAK_THRESHOLD;
-    var fired_at: ?u32 = null;
-    var capacity_after_fire: usize = 0;
-    for (0..k + 8) |i| {
-        const pre_capacity = pta.arena.queryCapacity();
-        const a = pta.reset();
-        if (fired_at == null and pta.low_streak == 0 and pre_capacity > PerThreadArena.SHRINK_LIMIT_BYTES * 2) {
-            fired_at = @intCast(i);
-            capacity_after_fire = pta.arena.queryCapacity();
-        }
-        const buf = try a.alloc(u8, low_alloc_bytes);
-        std.mem.doNotOptimizeAway(buf.ptr);
-    }
-
-    try testing.expect(fired_at != null);
-    // The shrink fires when low_streak crosses LOW_STREAK_THRESHOLD. The
-    // first low reset after the spike ticks low_streak 0 → 1 (sampling the
-    // spike bytes is the gate), so the shrink lands on iteration k-1.
-    try testing.expectEqual(@as(u32, k - 1), fired_at.?);
-    const slack: usize = 64 * 1024;
-    try testing.expect(capacity_after_fire <= PerThreadArena.SHRINK_LIMIT_BYTES + slack);
 }
 
 // ── classifySignalRead ─────────────────────────────────────────────────
