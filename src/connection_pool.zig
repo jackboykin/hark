@@ -8,7 +8,7 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const tls = @import("tls");
+const TlsClient = @import("tls_client.zig");
 
 const AddressKey = na.AddressKey;
 
@@ -77,7 +77,7 @@ pub const PooledConnection = struct {
     io: Io,
     net_reader: File.Reader,
     net_writer: File.Writer,
-    tls: tls.Connection,
+    tls: TlsClient,
     last_used: i64,
     /// Bound queries on a single TLS session (RFC 7766 reuse hygiene). Matches the
     /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
@@ -90,12 +90,15 @@ pub const PooledConnection = struct {
     // Inline buffers; net_reader/net_writer and (later) `tls` alias them by
     // pointer, so a live connection MUST NOT be moved or copied by value — it
     // is heap-allocated and held only via *PooledConnection, else those dangle.
-    net_read_buf: [tls.input_buffer_len]u8,
-    net_write_buf: [tls.output_buffer_len]u8,
+    net_read_buf: [TlsClient.min_buffer_len]u8,
+    net_write_buf: [TlsClient.min_buffer_len]u8,
+    tls_read_buf: [TlsClient.min_buffer_len]u8,
+    tls_write_buf: [2 + dns.edns_udp_payload]u8,
 
     /// Close TLS session and underlying socket.
     pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
-        self.tls.close() catch {};
+        self.tls.end() catch {};
+        self.net_writer.interface.flush() catch {};
         self.stream.close(self.io);
         allocator.destroy(self);
     }
@@ -455,8 +458,8 @@ fn createTestStream() !Io.net.Stream {
 ///
 /// Note: `tls` is `undefined`. Pool tests reach the connection only via
 /// `destroyBroken` (which doesn't touch `.tls`), never `closeAndDestroy`
-/// (which calls `tls.close()`). If the pool's release path ever switches
-/// to `closeAndDestroy`, this helper must populate a real `tls.Connection`.
+/// (which calls `tls.end()`). If the pool's release path ever switches
+/// to `closeAndDestroy`, this helper must populate a real `TlsClient`.
 fn createTestConnection(allocator: Allocator) !*PooledConnection {
     const stream = try createTestStream();
     const conn = try allocator.create(PooledConnection);
@@ -469,6 +472,8 @@ fn createTestConnection(allocator: Allocator) !*PooledConnection {
         .last_used = 0,
         .net_read_buf = undefined,
         .net_write_buf = undefined,
+        .tls_read_buf = undefined,
+        .tls_write_buf = undefined,
     };
     return conn;
 }

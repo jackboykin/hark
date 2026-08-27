@@ -31,8 +31,3 @@ For debugging:
 hark query example.com AAAA --dnssec       # resolve one name
 hark dump < packet.bin                     # decode a raw packet
 ```
-
-## Credits
-
-DoT uses [ianic/tls.zig](https://github.com/ianic/tls.zig) (MIT, Igor Anić),
-vendored under `src/vendor/tls-ianic/`.

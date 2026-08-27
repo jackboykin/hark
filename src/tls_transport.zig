@@ -9,7 +9,7 @@ const dns = @import("dns.zig");
 const pool_mod = @import("connection_pool.zig");
 const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
 const PooledConnection = pool_mod.PooledConnection;
-const tls = @import("tls");
+const TlsClient = @import("tls_client.zig");
 const encrypted_ns_mod = @import("encrypted_ns.zig");
 const EncryptedNsCache = encrypted_ns_mod.EncryptedNsCache;
 const na = @import("net_address.zig");
@@ -113,32 +113,31 @@ pub const TlsTransport = struct {
         return conn;
     }
 
-    /// Run the TLS handshake on `conn` (RFC 9539): no SNI (the
-    /// vendored ianic patch elides the extension for host=""), no cert
-    /// verification. ALPN advertises "dot" per §4.4. A peer omitting the echo
-    /// is tolerated (Cloudflare / Google do this in violation of RFC 7301
-    /// §3.2); a non-"dot" echo is rejected — sending a length-prefixed DNS
-    /// frame to e.g. an h2 endpoint would corrupt state.
+    /// Run the TLS handshake on `conn` (RFC 9539): no SNI, no cert
+    /// verification, ALPN "dot" per §4.4. A peer omitting the echo is
+    /// tolerated (Cloudflare / Google do this in violation of RFC 7301
+    /// §3.2); a non-"dot" echo fails the handshake — sending a
+    /// length-prefixed DNS frame to e.g. an h2 endpoint would corrupt state.
     fn handshake(self: *TlsTransport, conn: *PooledConnection, tls_server: na.Address) !void {
-        var addr_buf: [64]u8 = undefined;
-        const rng_impl: std.Random.IoSource = .{ .io = self.io };
-        conn.tls = tls.client(&conn.net_reader.interface, &conn.net_writer.interface, .{
-            .rng = rng_impl.interface(),
-            .now = monotonic.wallclockTimestamp(self.io),
-            .host = "",
-            .root_ca = .empty,
-            .insecure_skip_verify = true,
-            .alpn_protocols = &.{alpn_dot},
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
+        self.io.random(&entropy);
+        var selected: ?usize = null;
+        conn.tls = TlsClient.init(&conn.net_reader.interface, &conn.net_writer.interface, .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .alpn = .{ .protocols = &.{alpn_dot}, .selected_protocol = &selected },
+            .read_buffer = &conn.tls_read_buf,
+            .write_buffer = &conn.tls_write_buf,
+            .entropy = &entropy,
+            .realtime_now = monotonic.wallclockTimestamp(self.io),
+            // DNS frames carry their own length prefix, so a bare FIN before
+            // a record is an idle close (DeadOnArrival), not a truncation.
+            .allow_truncation_attacks = true,
         }) catch |err| {
+            var addr_buf: [64]u8 = undefined;
             log.debug("TLS handshake failed: {s} server={s}", .{ @errorName(err), na.format(tls_server, &addr_buf) });
             return error.TlsHandshakeFailed;
         };
-        if (conn.tls.alpn_protocol) |proto| {
-            if (!std.mem.eql(u8, proto, alpn_dot)) {
-                log.warn("TLS ALPN mismatch: peer echoed {s} server={s}", .{ proto, na.format(tls_server, &addr_buf) });
-                return error.TlsHandshakeFailed;
-            }
-        }
     }
 
     pub const ProbeKind = encrypted_ns_mod.ProbeKind;
@@ -227,8 +226,7 @@ fn toPort(addr: na.Address, port: u16) na.Address {
 /// raw syscalls, so the read loop needs a per-syscall deadline hook first.
 fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator: Allocator, deadline_ns: i128) ![]u8 {
     // Stage into a single buffer so the TLS layer emits one record + one
-    // syscall per query — two writeAll calls would flush twice (ianic
-    // flushes per record).
+    // syscall per query.
     var staging: [2 + dns.edns_udp_payload]u8 = undefined;
     const framed = try dns.stageLengthPrefixed(&staging, wire_query);
 
@@ -243,7 +241,8 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
     // demoting a healthy server and sawtoothing the capable gauge.
     const handle = conn.stream.socket.handle;
     try sys.updateTimeout(handle, posix.SO.SNDTIMEO, deadline_ns);
-    conn.tls.writeAll(framed) catch {
+    conn.tls.writer.writeAll(framed) catch return error.TlsSendFailed;
+    flushTls(conn) catch {
         // net_writer.err is null at entry: errored conns are destroyed,
         // never re-pooled. Non-null ⇒ the transport killed the write; null
         // ⇒ a TLS-layer failure, which is a genuine .broken.
@@ -253,13 +252,12 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
 
     try sys.updateTimeout(handle, posix.SO.RCVTIMEO, deadline_ns);
     var resp_len_buf: [2]u8 = undefined;
-    const n_len = conn.tls.readAtLeast(&resp_len_buf, 2) catch {
+    conn.tls.reader.readSliceAll(&resp_len_buf) catch |err| {
+        if (err == error.EndOfStream) return error.DeadOnArrival;
         // err is null at entry: errored conns are destroyed, never re-pooled.
         if (conn.net_reader.err) |e| if (e == error.ConnectionResetByPeer) return error.DeadOnArrival;
         return error.TlsRecvFailed;
     };
-    if (n_len == 0) return error.DeadOnArrival;
-    if (n_len < 2) return error.TlsRecvFailed;
     const resp_len = mem.readInt(u16, &resp_len_buf, .big);
     if (resp_len == 0) return error.InvalidLength;
 
@@ -267,34 +265,22 @@ fn queryOnConnection(conn: *PooledConnection, wire_query: []const u8, allocator:
     const response_buf = try allocator.alloc(u8, resp_len);
     errdefer allocator.free(response_buf);
 
-    const n_body = conn.tls.readAtLeast(response_buf, resp_len) catch return error.TlsRecvFailed;
-    if (n_body < resp_len) return error.TlsRecvFailed;
+    conn.tls.reader.readSliceAll(response_buf) catch return error.TlsRecvFailed;
 
     sys.setQuickAck(handle);
     return response_buf;
+}
+
+/// The TLS writer's flush only encrypts into the socket writer's buffer.
+fn flushTls(conn: *PooledConnection) Io.Writer.Error!void {
+    try conn.tls.writer.flush();
+    try conn.net_writer.interface.flush();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
 fn skipIfNotLinux() !void {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-}
-
-/// Drive a single ClientHello from `tls.nonblock.Client` with the given host
-/// and return its raw bytes (writes into `out`). Used by the SNI patch tests.
-fn captureClientHello(io: Io, host: []const u8, out: []u8) !usize {
-    const rng_impl: std.Random.IoSource = .{ .io = io };
-    var sc_buf: [tls.max_ciphertext_record_len]u8 = undefined;
-    var cli = tls.nonblock.Client.init(.{
-        .rng = rng_impl.interface(),
-        .now = monotonic.wallclockTimestamp(io),
-        .root_ca = .empty,
-        .host = host,
-        .insecure_skip_verify = true,
-        .alpn_protocols = &.{alpn_dot},
-    });
-    const cr = try cli.run(&sc_buf, out);
-    return cr.send_pos;
 }
 
 test "TlsTransport queryPooled never dials" {
@@ -354,47 +340,6 @@ test "TlsTransport dialAndPool then queryPooled against 1.1.1.1:853" {
     try testing.expect(response.header.flags.qr);
     try testing.expectEqual(dns.RCode.no_error, response.header.flags.rcode);
     try testing.expect(response.answers.len > 0);
-}
-
-/// Walk a captured ClientHello and return true if it contains a
-/// `server_name` (SNI) extension. Used by the SNI-patch regression tests.
-fn clientHelloHasSni(ch: []const u8) bool {
-    // record header (5) + handshake header (4) + legacy_version (2) + random (32)
-    var p: usize = 5 + 4 + 2 + 32;
-    if (p >= ch.len) return false;
-    p += 1 + ch[p]; // session_id
-    if (p + 2 > ch.len) return false;
-    p += 2 + mem.readInt(u16, ch[p..][0..2], .big); // cipher_suites
-    if (p >= ch.len) return false;
-    p += 1 + ch[p]; // compression_methods
-    if (p + 2 > ch.len) return false;
-    const ext_end = p + 2 + mem.readInt(u16, ch[p..][0..2], .big);
-    p += 2;
-    while (p + 4 <= ext_end and p + 4 <= ch.len) {
-        const ext_type = mem.readInt(u16, ch[p..][0..2], .big);
-        const ext_len = mem.readInt(u16, ch[p + 2 ..][0..2], .big);
-        if (ext_type == 0x0000) return true;
-        p += 4 + ext_len;
-    }
-    return false;
-}
-
-// Catches a refresh of src/vendor/tls-ianic/ that drops PATCHES.md's SNI guard:
-// without the patch, host="" produces a malformed zero-length SNI extension on
-// the wire, violating RFC 6066 §3 and our RFC 9539 §4.6.3.3 obligation.
-test "ianic SNI patch: host=\"\" elides server_name extension" {
-    var buf: [tls.max_ciphertext_record_len]u8 = undefined;
-    const n = try captureClientHello(testing.io, "", &buf);
-    try testing.expect(n > 0);
-    try testing.expect(!clientHelloHasSni(buf[0..n]));
-}
-
-// Positive control: confirms clientHelloHasSni actually detects the extension
-// when present, so a parser bug cannot silently mask the patch test above.
-test "ianic SNI sanity: host=\"example.com\" includes server_name" {
-    var buf: [tls.max_ciphertext_record_len]u8 = undefined;
-    const n = try captureClientHello(testing.io, "example.com", &buf);
-    try testing.expect(clientHelloHasSni(buf[0..n]));
 }
 
 test "probeInBackground reverts .probing when max_probes hit" {

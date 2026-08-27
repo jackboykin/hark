@@ -23,20 +23,12 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption([]const u8, "version", zon.version);
     const build_options_mod = build_opts.createModule();
 
-    const tls_mod = b.createModule(.{
-        .root_source_file = b.path("src/vendor/tls-ianic/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = tsan,
-    });
-
     const mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = tsan,
         .imports = &.{
-            .{ .name = "tls", .module = tls_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
