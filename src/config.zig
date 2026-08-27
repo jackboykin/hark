@@ -167,7 +167,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .root_hints = &.{},
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
-        .cache_size = 16 * 1024 * 1024,
+        .cache_size = 12 * 1024 * 1024,
         .cache_entries = 10_000,
         .key_cache_size = 4 * 1024 * 1024,
         .key_cache_entries = 2_000,
@@ -680,7 +680,7 @@ test "default config" {
     defer cfg.deinit();
 
     try testing.expectEqual(@as(usize, 2), cfg.listen.len);
-    try testing.expectEqual(@as(usize, 16 * 1024 * 1024), cfg.cache_size);
+    try testing.expectEqual(@as(usize, 12 * 1024 * 1024), cfg.cache_size);
     try testing.expectEqual(@as(u32, 10_000), cfg.cache_entries);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(true, cfg.qname_minimization);

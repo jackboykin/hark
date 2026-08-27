@@ -25,7 +25,7 @@ root-hints = []               # override IANA roots ("ip" or "ip:port");
                               # empty = compiled-in defaults
 
 [cache]
-size = 16777216               # answer cache, bytes
+size = 12582912               # answer cache, bytes
 entries = 10000               # answer cache, max entries
 key-cache-size = 4194304      # DNSSEC key cache, bytes
 key-cache-entries = 2000      # DNSSEC key cache, max entries
