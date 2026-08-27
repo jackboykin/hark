@@ -2932,10 +2932,7 @@ pub const RecursiveResolver = struct {
             dotted_names[ni] = try nameToDotted(allocator, ns_names[ni]);
         }
 
-        // Each helper builds its OWN per-resolution cap in run() (gpa+mem_limit).
-        // A shared cap split query_memory_limit across the concurrent helpers,
-        // starving each to limit/task_n and SERVFAIL'ing ordinary signed domains.
-        // Caps are transient — each freed at its thread's join.
+        // Per-helper cap: a shared one starved helpers and SERVFAIL'd signed domains.
         var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
         var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
 
@@ -2957,7 +2954,6 @@ pub const RecursiveResolver = struct {
                 .ns_dotted = dotted_names[ni],
                 .rtype = address_rtypes[ri],
                 .depth = depth,
-                .gpa = self.gpa.?,
                 .mem_limit = self.query_memory_limit,
             };
             threads[i] = std.Thread.spawn(.{ .stack_size = 1 << 20 }, NsTaskCtx.run, .{&task_ctxs[i]}) catch null;
@@ -3015,7 +3011,6 @@ pub const RecursiveResolver = struct {
         ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
-        gpa: mem.Allocator,
         mem_limit: usize,
         addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
@@ -3030,12 +3025,13 @@ pub const RecursiveResolver = struct {
                 .tls = ctx.parent.transports.?.tls,
             });
 
-            var cap = CountingAllocator.init(ctx.gpa, ctx.mem_limit);
-            var arena = std.heap.ArenaAllocator.init(cap.allocator());
+            // page_allocator: a fresh thread's frees would warm a new smp slot's slabs for good.
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
+            var cap = CountingAllocator.init(arena.allocator(), ctx.mem_limit);
 
             resolver.resolveNsNameOne(
-                arena.allocator(),
+                cap.allocator(),
                 ctx.ns_dotted,
                 ctx.rtype,
                 ctx.depth,
