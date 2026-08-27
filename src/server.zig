@@ -587,6 +587,23 @@ pub const Server = struct {
         };
     }
 
+    fn logFootprint(self: *Server) void {
+        var buf: [512]u8 = undefined;
+        const statm = Io.Dir.cwd().readFile(self.io, "/proc/self/statm", &buf) catch return;
+        var it = mem.tokenizeScalar(u8, statm, ' ');
+        _ = it.next();
+        const rss_pages = std.fmt.parseInt(u64, it.next() orelse return, 10) catch return;
+        const stat = Io.Dir.cwd().readFile(self.io, "/proc/self/stat", &buf) catch return;
+        const after_comm = stat[(mem.lastIndexOfScalar(u8, stat, ')') orelse return) + 2 ..];
+        var fields = mem.tokenizeScalar(u8, after_comm, ' ');
+        const num_threads_field = 18;
+        var threads: []const u8 = "?";
+        for (0..num_threads_field) |_| threads = fields.next() orelse "?";
+        log.info("footprint: rss {d} MiB, {s} threads, {d}/{d} bg tasks", .{
+            rss_pages * std.heap.pageSize() / (1024 * 1024), threads, self.bg_tasks.inFlight(), self.bg_tasks.max,
+        });
+    }
+
     /// `0% while capable > 0` is the signature of capability knowledge
     /// going unused — the failure shape this line exists to catch.
     fn logOteStats(self: *Server) void {
@@ -1148,6 +1165,7 @@ const WorkerState = struct {
             stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, hit_pct, stats.evictions,
         });
         self.server.logOteStats();
+        self.server.logFootprint();
     }
 
     /// Logs a failed arm; the repair loop at the bottom of each tick
@@ -1200,6 +1218,7 @@ const WorkerState = struct {
         // stats. Only the main worker (the one holding the signalfd) emits the
         // periodic line, keeping it to one entry per interval.
         const log_stats = sig_fd >= 0;
+        if (log_stats) self.server.logFootprint();
 
         while (true) {
             const results = self.loop.tick(&completions) catch |err| {
