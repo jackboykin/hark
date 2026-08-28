@@ -1537,6 +1537,14 @@ pub const BuiltRR = struct {
     ttl_offset: u16,
 };
 
+/// `ttl_offset` skips the owner name; result views into `wire`.
+pub fn parseRDataWire(allocator: Allocator, wire: []const u8, rtype: RType, ttl_offset: u16) Error!RData {
+    var parser = Parser{ .msg = wire, .pos = @as(usize, ttl_offset) + 4 };
+    const rdlength: usize = try parser.readU16();
+    if (parser.pos + rdlength > wire.len) return error.EndOfData;
+    return parser.parseRData(rtype, rdlength, allocator);
+}
+
 pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
     var ser = Serializer.init(buf);
     const ttl_offset = try ser.writeRecordFields(rr);

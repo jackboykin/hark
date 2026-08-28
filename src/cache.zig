@@ -89,18 +89,17 @@ pub const SecurityStatus = enum {
 
 // ── Cache entry types ─────────────────────────────────────────────────
 
+/// The wire is the record; RDATA is reparsed on hit.
 const CachedRecord = struct {
     name: dns.Name,
     rtype: dns.RType,
     rclass: dns.RClass,
-    rdata: dns.RData,
     wire: []const u8,
     wire_ttl_offset: u16,
 };
 
 fn freeCachedRecord(alloc: Allocator, cr: CachedRecord) void {
     dns.freeName(alloc, cr.name);
-    dns.freeRData(alloc, cr.rdata);
     alloc.free(cr.wire);
 }
 
@@ -121,13 +120,10 @@ fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_
     var wire_stage: [rr_wire_stage_len]u8 = undefined;
     const built = try dns.buildResourceRecordWire(&wire_stage, rr);
     const wire_owned = try alloc.dupe(u8, built.bytes);
-    errdefer alloc.free(wire_owned);
-    const cloned_rdata = try dns.cloneRData(alloc, rr.rdata);
     return .{
         .name = shared_name,
         .rtype = rr.rtype,
         .rclass = rr.rclass,
-        .rdata = cloned_rdata,
         .wire = wire_owned,
         .wire_ttl_offset = built.ttl_offset,
     };
@@ -137,7 +133,6 @@ fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_
 /// in `CachedRRset.records`). Skips `dns.freeName` — the name's backing
 /// is owned by the parent RRset and freed once via `shared_name_backing`.
 fn freeBorrowedRecord(alloc: Allocator, cr: CachedRecord) void {
-    dns.freeRData(alloc, cr.rdata);
     alloc.free(cr.wire);
 }
 
@@ -178,10 +173,11 @@ const NegativeEntry = struct {
 };
 
 /// Positive is the common case (≥90% of real-workload entries) and stays
-/// inline. Negative is rare and boxed so the union is sized by CachedRRset
-/// (~72 B) instead of NegativeEntry (~152 B). Saves ~80 B per slot, ~720 KiB
-/// at 10k entries / 90% positive. Negative pointer lives on the same counting
-/// allocator as the rest of the entry, so it still counts against byte budget.
+/// inline; negative is rare and boxed so the union is sized by CachedRRset.
+/// Both are 88 B since CachedRecord lost its parsed rdata, so the box now
+/// only keeps NegativeEntry from setting the slot size if it grows again.
+/// Negative pointer lives on the same counting allocator as the rest of the
+/// entry, so it still counts against byte budget.
 const CacheEntry = union(enum) {
     positive: CachedRRset,
     negative: *NegativeEntry,
@@ -261,14 +257,15 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.R
 
     var offset: usize = 0;
     for (cached, 0..) |cr, i| {
-        @memcpy(wire_area[offset..][0..cr.wire.len], cr.wire);
+        const wire = wire_area[offset..][0..cr.wire.len];
+        @memcpy(wire, cr.wire);
         records[i] = .{
             .name = shared_name,
             .rtype = cr.rtype,
             .rclass = cr.rclass,
             .ttl = ttl,
-            .rdata = try dns.cloneRData(alloc, cr.rdata),
-            .wire = wire_area[offset..][0..cr.wire.len],
+            .rdata = try dns.parseRDataWire(alloc, wire, cr.rtype, cr.wire_ttl_offset),
+            .wire = wire,
             .wire_ttl_offset = cr.wire_ttl_offset,
         };
         offset += cr.wire.len;
@@ -295,8 +292,8 @@ fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) 
     const out = try alloc.alloc(dns.ResourceRecord, cached.len);
     for (cached, 0..) |cr, i| {
         const name = try cloneName(alloc, cr.name);
-        const rdata = try dns.cloneRData(alloc, cr.rdata);
         const wire = try alloc.dupe(u8, cr.wire);
+        const rdata = try dns.parseRDataWire(alloc, wire, cr.rtype, cr.wire_ttl_offset);
         out[i] = .{
             .name = name,
             .rtype = cr.rtype,
@@ -3298,7 +3295,6 @@ test "CacheEntry size shrinks with boxed negative variant" {
     // Negative pointer is 8B + tag + alignment; union body must equal
     // sizeof(CachedRRset) since CachedRRset is the larger variant now.
     try testing.expect(entry_size <= positive_size + @sizeOf(usize));
-    try testing.expect(@sizeOf(NegativeEntry) > positive_size); // sanity
 }
 
 test "storeOneRRset handles backing-allocator OOM without leaking" {
