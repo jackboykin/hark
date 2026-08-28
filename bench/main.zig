@@ -19,6 +19,7 @@ const self_test = @import("bench_self_test.zig");
 const arena = @import("bench_arena.zig");
 const sieve = @import("bench_sieve.zig");
 const cache_hit = @import("bench_cache_hit.zig");
+const cache_mem = @import("bench_cache_mem.zig");
 const dedup = @import("bench_dedup.zig");
 const upstream = @import("bench_upstream.zig");
 const delegation = @import("bench_delegation.zig");
@@ -31,6 +32,7 @@ const benchmarks = [_]Benchmark{
     .{ .name = "arena_reset", .run = arena.runResetArena },
     .{ .name = "sieve_worst", .run = sieve.runWorstCase },
     .{ .name = "cache_hit", .run = cache_hit.run },
+    .{ .name = "cache_mem", .run = cache_mem.run },
     .{ .name = "dedup_with", .run = dedup.runWithDedup },
     .{ .name = "dedup_without", .run = dedup.runWithoutDedup },
     .{ .name = "dedup_f01", .run = dedup.runF01 },

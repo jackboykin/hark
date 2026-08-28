@@ -90,7 +90,7 @@ pub const SecurityStatus = enum {
 // ── Cache entry types ─────────────────────────────────────────────────
 
 /// The wire at `wire_off` is the record; RDATA is reparsed on hit.
-const CachedRecord = struct {
+pub const CachedRecord = struct {
     name: dns.Name,
     rtype: dns.RType,
     rclass: dns.RClass,
@@ -100,7 +100,7 @@ const CachedRecord = struct {
 };
 
 /// `[CachedRecord × n][flat names][wire]`; records, sigs, proofs.
-const Pack = struct {
+pub const Pack = struct {
     blob: []align(pack_align) u8 = &.{},
     n_records: u16 = 0,
     n_sigs: u16 = 0,
@@ -208,7 +208,7 @@ const NegativeEntry = struct {
     security_status: SecurityStatus = .unchecked,
 };
 
-const CacheEntry = union(enum) {
+pub const CacheEntry = union(enum) {
     positive: CachedRRset,
     negative: NegativeEntry,
 
