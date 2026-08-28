@@ -1541,7 +1541,6 @@ pub const BuiltRR = struct {
 pub fn parseRDataWire(allocator: Allocator, wire: []const u8, rtype: RType, ttl_offset: u16) Error!RData {
     var parser = Parser{ .msg = wire, .pos = @as(usize, ttl_offset) + 4 };
     const rdlength: usize = try parser.readU16();
-    if (parser.pos + rdlength > wire.len) return error.EndOfData;
     return parser.parseRData(rtype, rdlength, allocator);
 }
 
@@ -2318,35 +2317,18 @@ pub const NameFlat = struct {
     }
 };
 
-/// Owner-backing pair for `cloneNameFlatOwned`: caller frees `backing`
-/// when ready (root names allocate nothing, so the slice can be empty).
-pub const OwnedFlatName = struct {
-    backing: []align(@alignOf([]const u8)) u8,
-    name: Name,
-};
-
 /// Single-allocation variant of cloneName: the returned `NameFlat`'s
 /// labels slice and every label byte live in one contiguous buffer. Use
 /// only with arena allocators. Designed for the cache read path where
 /// the caller's arena owns lifetime.
 pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
-    const owned = try cloneNameFlatImpl(allocator, name, false);
-    return .{ .labels = owned.name.labels };
-}
-
-/// Like `cloneNameFlat` but also returns the raw backing slice so the
-/// caller can free it later. Used by callers that own the allocation
-/// across a non-arena boundary (e.g. the cache, which frees a single
-/// shared-owner buffer when evicting an RRset).
-pub fn cloneNameFlatOwned(allocator: Allocator, name: Name) !OwnedFlatName {
     return cloneNameFlatImpl(allocator, name, false);
 }
 
 /// Like `cloneNameFlat` but lowercases ASCII letters in-flight. Used to
 /// scrub 0x20-randomized case off upstream RR owner names.
 fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
-    const owned = try cloneNameFlatImpl(allocator, name, true);
-    return .{ .labels = owned.name.labels };
+    return cloneNameFlatImpl(allocator, name, true);
 }
 
 /// `cloneNameFlatLower` + `toUnownedName` — for scrub sites that don't keep the owned form.
@@ -2354,18 +2336,26 @@ pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
     return (try cloneNameFlatLower(allocator, name)).toUnownedName();
 }
 
-fn cloneNameFlatImpl(allocator: Allocator, name: Name, comptime lower: bool) !OwnedFlatName {
-    const n = name.labels.len;
-    if (n == 0) return .{ .backing = &.{}, .name = .{ .labels = &.{} } };
-    const slice_bytes = @sizeOf([]const u8) * n;
-    var total_bytes: usize = 0;
-    for (name.labels) |label| total_bytes += label.len;
+fn cloneNameFlatImpl(allocator: Allocator, name: Name, comptime lower: bool) !NameFlat {
+    const buf = try allocator.alignedAlloc(u8, name_flat_align, nameFlatSize(name));
+    return .{ .labels = writeNameFlat(buf, name, lower).labels };
+}
 
-    const alignment: std.mem.Alignment = comptime .fromByteUnits(@alignOf([]const u8));
-    const buf = try allocator.alignedAlloc(u8, alignment, slice_bytes + total_bytes);
+pub const name_flat_align: std.mem.Alignment = .fromByteUnits(@alignOf([]const u8));
+
+pub fn nameFlatSize(name: Name) usize {
+    var total: usize = @sizeOf([]const u8) * name.labels.len;
+    for (name.labels) |label| total += label.len;
+    return total;
+}
+
+/// `buf` must hold `nameFlatSize(name)` bytes.
+pub fn writeNameFlat(buf: []align(name_flat_align.toByteUnits()) u8, name: Name, comptime lower: bool) Name {
+    const n = name.labels.len;
+    if (n == 0) return .{ .labels = &.{} };
     const labels_ptr: [*]([]const u8) = @ptrCast(buf.ptr);
     const labels: [][]const u8 = labels_ptr[0..n];
-    var offset: usize = slice_bytes;
+    var offset: usize = @sizeOf([]const u8) * n;
     for (name.labels, 0..) |label, i| {
         if (comptime lower) {
             for (label, 0..) |b, j| buf[offset + j] = std.ascii.toLower(b);
@@ -2375,7 +2365,7 @@ fn cloneNameFlatImpl(allocator: Allocator, name: Name, comptime lower: bool) !Ow
         labels[i] = buf[offset..][0..label.len];
         offset += label.len;
     }
-    return .{ .backing = buf, .name = .{ .labels = labels } };
+    return .{ .labels = labels };
 }
 
 /// Build a wildcard name (*.closest-encloser) from a closest encloser name

@@ -89,72 +89,109 @@ pub const SecurityStatus = enum {
 
 // ── Cache entry types ─────────────────────────────────────────────────
 
-/// The wire is the record; RDATA is reparsed on hit.
+/// The wire at `wire_off` is the record; RDATA is reparsed on hit.
 const CachedRecord = struct {
     name: dns.Name,
     rtype: dns.RType,
     rclass: dns.RClass,
-    wire: []const u8,
+    wire_off: u32,
+    wire_len: u16,
     wire_ttl_offset: u16,
 };
 
-fn freeCachedRecord(alloc: Allocator, cr: CachedRecord) void {
-    dns.freeName(alloc, cr.name);
-    alloc.free(cr.wire);
-}
+/// `[CachedRecord × n][flat names][wire]`; records, sigs, proofs.
+const Pack = struct {
+    blob: []align(pack_align) u8 = &.{},
+    n_records: u16 = 0,
+    n_sigs: u16 = 0,
+    n_proofs: u16 = 0,
 
-/// Stack staging buffer for serializing one RR at store time. Covers typical
-/// DNSKEY/RRSIG (<2KB) with headroom; oversized RRs fail to cache.
+    const pack_align = @alignOf(CachedRecord);
+    comptime {
+        std.debug.assert(pack_align >= dns.name_flat_align.toByteUnits());
+    }
+
+    fn all(self: Pack) []const CachedRecord {
+        const ptr: [*]const CachedRecord = @ptrCast(self.blob.ptr);
+        return ptr[0 .. @as(usize, self.n_records) + self.n_sigs + self.n_proofs];
+    }
+    fn records(self: Pack) []const CachedRecord {
+        return self.all()[0..self.n_records];
+    }
+    fn sigs(self: Pack) []const CachedRecord {
+        return self.all()[self.n_records..][0..self.n_sigs];
+    }
+    fn proofs(self: Pack) []const CachedRecord {
+        return self.all()[@as(usize, self.n_records) + self.n_sigs ..][0..self.n_proofs];
+    }
+    fn wire(self: Pack, cr: CachedRecord) []const u8 {
+        return self.blob[cr.wire_off..][0..cr.wire_len];
+    }
+};
+
+/// Covers typical DNSKEY/RRSIG (<2KB) with headroom; oversized RRs fail to cache.
 const rr_wire_stage_len: usize = 4096;
 
-fn buildCachedRecord(alloc: Allocator, rr: dns.ResourceRecord) !CachedRecord {
-    const cloned_name = try cloneName(alloc, rr.name);
-    errdefer dns.freeName(alloc, cloned_name);
-    return buildCachedRecordSharedName(alloc, rr, cloned_name);
+fn placeName(blob: []align(Pack.pack_align) u8, at: *usize, name: dns.Name) dns.Name {
+    const out = dns.writeNameFlat(@alignCast(blob[at.*..]), name, false);
+    at.* += std.mem.alignForward(usize, dns.nameFlatSize(name), Pack.pack_align);
+    return out;
 }
 
-/// Uses `shared_name` as-is — no per-record clone; name ownership stays with
-/// the caller. On the RRset main-records path the name is borrowed from
-/// `CachedRRset.shared_name_backing` and MUST NOT be freed via `dns.freeName`.
-fn buildCachedRecordSharedName(alloc: Allocator, rr: dns.ResourceRecord, shared_name: dns.Name) !CachedRecord {
-    var wire_stage: [rr_wire_stage_len]u8 = undefined;
-    const built = try dns.buildResourceRecordWire(&wire_stage, rr);
-    const wire_owned = try alloc.dupe(u8, built.bytes);
+/// All-or-nothing: sigs and proofs must travel with what they cover (RFC 4035 §3.2.3).
+fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []const dns.ResourceRecord, proofs: []const dns.ResourceRecord) !Pack {
+    std.debug.assert(records.len > 0);
+    const groups = [_][]const dns.ResourceRecord{ records, sigs, proofs };
+    const n_all = records.len + sigs.len + proofs.len;
+    if (n_all > std.math.maxInt(u16)) return error.TooManyRecords;
+
+    const owner = records[0].name;
+    var names_bytes = std.mem.alignForward(usize, dns.nameFlatSize(owner), Pack.pack_align);
+    for (proofs) |rr| names_bytes += std.mem.alignForward(usize, dns.nameFlatSize(rr.name), Pack.pack_align);
+
+    var wire_bytes: usize = 0;
+    var stage: [rr_wire_stage_len]u8 = undefined;
+    for (groups) |g| for (g) |rr| {
+        wire_bytes += (try dns.buildResourceRecordWire(&stage, rr)).bytes.len;
+    };
+
+    const rec_bytes = @sizeOf(CachedRecord) * n_all;
+    const blob = try alloc.alignedAlloc(u8, .fromByteUnits(Pack.pack_align), rec_bytes + names_bytes + wire_bytes);
+    errdefer alloc.free(blob);
+    if (blob.len > std.math.maxInt(u32)) return error.RRsetTooLarge;
+
+    var names_at = rec_bytes;
+    const shared_name = placeName(blob, &names_at, owner);
+    const group_owner = [_]?dns.Name{ shared_name, shared_name, null };
+
+    const recs: [*]CachedRecord = @ptrCast(blob.ptr);
+    var idx: usize = 0;
+    var wire_at = rec_bytes + names_bytes;
+    for (groups, group_owner) |g, owner_name| for (g) |rr| {
+        const built = try dns.buildResourceRecordWire(blob[wire_at..], rr);
+        recs[idx] = .{
+            .name = owner_name orelse placeName(blob, &names_at, rr.name),
+            .rtype = rr.rtype,
+            .rclass = rr.rclass,
+            .wire_off = @intCast(wire_at),
+            .wire_len = @intCast(built.bytes.len),
+            .wire_ttl_offset = built.ttl_offset,
+        };
+        idx += 1;
+        wire_at += built.bytes.len;
+    };
+    std.debug.assert(wire_at == blob.len);
+
     return .{
-        .name = shared_name,
-        .rtype = rr.rtype,
-        .rclass = rr.rclass,
-        .wire = wire_owned,
-        .wire_ttl_offset = built.ttl_offset,
+        .blob = blob,
+        .n_records = @intCast(records.len),
+        .n_sigs = @intCast(sigs.len),
+        .n_proofs = @intCast(proofs.len),
     };
 }
 
-/// Free a CachedRecord whose `.name` is a borrowed view (e.g. one stored
-/// in `CachedRRset.records`). Skips `dns.freeName` — the name's backing
-/// is owned by the parent RRset and freed once via `shared_name_backing`.
-fn freeBorrowedRecord(alloc: Allocator, cr: CachedRecord) void {
-    alloc.free(cr.wire);
-}
-
 const CachedRRset = struct {
-    records: []CachedRecord,
-    /// RRSIGs covering `records` (same name, RRSIG.type_covered == records'
-    /// rtype). Stored alongside the covered RRset because RFC 4035 §5.3.1
-    /// says they travel together — an RRset without RRSIG is unvalidable,
-    /// an RRSIG without its covered RRset is useless. Empty when the zone
-    /// is unsigned or hark stripped DNSSEC for any reason. The wire shaper
-    /// at response-build time decides whether to ship sigs to the client
-    /// (kept for DO=1 / CD=1; stripped for DO=0).
-    sigs: []CachedRecord = &.{},
-    /// RFC 4035 §3.1.3.4 wildcard-expansion proof. Captured when the
-    /// covering RRSIG's labels < owner labels — without it a DO=1 client
-    /// served from cache would lack the "no closer match" denial and
-    /// reject the response as bogus.
-    nsec_proofs: []CachedRecord = &.{},
-    /// Single allocation backing the owner name shared by every entry in
-    /// `records`. `records[i].name` labels view into this buffer — never
-    /// free them via `dns.freeName`. Empty for root-name RRsets.
-    shared_name_backing: []align(@alignOf([]const u8)) u8 = &.{},
+    pack: Pack,
     expires_at: i64,
     original_ttl: u32,
     stored_at: i64,
@@ -166,26 +203,26 @@ const NegativeEntry = struct {
     expires_at: i64,
     original_ttl: u32,
     stored_at: i64,
-    soa: ?CachedRecord,
-    /// RFC 4035 §3.1.3.2 / §3.1.3.3 negative-existence proof.
-    nsec_proofs: []CachedRecord = &.{},
+    /// SOA as records[0] when present.
+    pack: Pack = .{},
     security_status: SecurityStatus = .unchecked,
 };
 
-/// Positive is the common case (≥90% of real-workload entries) and stays
-/// inline; negative is rare and boxed so the union is sized by CachedRRset.
-/// Both are 88 B since CachedRecord lost its parsed rdata, so the box now
-/// only keeps NegativeEntry from setting the slot size if it grows again.
-/// Negative pointer lives on the same counting allocator as the rest of the
-/// entry, so it still counts against byte budget.
 const CacheEntry = union(enum) {
     positive: CachedRRset,
-    negative: *NegativeEntry,
+    negative: NegativeEntry,
 
     fn expiresAt(self: CacheEntry) i64 {
         return switch (self) {
             .positive => |p| p.expires_at,
             .negative => |n| n.expires_at,
+        };
+    }
+
+    fn pack(self: CacheEntry) Pack {
+        return switch (self) {
+            .positive => |p| p.pack,
+            .negative => |n| n.pack,
         };
     }
 };
@@ -230,35 +267,30 @@ fn clampTtl(min_ttl: u32, ttl: u32) u32 {
     return @min(@max(ttl, min_ttl), max_cache_ttl);
 }
 
-/// Clone cached records into caller-owned ResourceRecords with a given TTL.
-/// The caller's allocator MUST be an arena (or otherwise free-resilient):
-/// records share an inline wire-bytes region packed alongside the records
-/// array, and an out-of-line shared owner name from `cloneNameFlat` —
-/// neither can be freed individually. Today every caller uses a per-query
-/// arena.
-fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
+/// One arena allocation; `rdata` views into it. Arena callers only.
+fn cloneRRset(alloc: Allocator, pack: Pack, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     if (cached.len == 0) return &.{};
 
     const RR = dns.ResourceRecord;
     const records_bytes = @sizeOf(RR) * cached.len;
+    const name_bytes = std.mem.alignForward(usize, dns.nameFlatSize(cached[0].name), @alignOf(RR));
     var total_wire: usize = 0;
-    for (cached) |cr| total_wire += cr.wire.len;
+    for (cached) |cr| total_wire += cr.wire_len;
 
     const buf = try alloc.alignedAlloc(
         u8,
         comptime std.mem.Alignment.fromByteUnits(@alignOf(RR)),
-        records_bytes + total_wire,
+        records_bytes + name_bytes + total_wire,
     );
     const records_ptr: [*]RR = @ptrCast(buf.ptr);
     const records: []RR = records_ptr[0..cached.len];
-    const wire_area = buf[records_bytes..];
-
-    const shared_name = (try dns.cloneNameFlat(alloc, cached[0].name)).toUnownedName();
+    const shared_name = dns.writeNameFlat(@alignCast(buf[records_bytes..]), cached[0].name, false);
+    const wire_area = buf[records_bytes + name_bytes ..];
 
     var offset: usize = 0;
     for (cached, 0..) |cr, i| {
-        const wire = wire_area[offset..][0..cr.wire.len];
-        @memcpy(wire, cr.wire);
+        const wire = wire_area[offset..][0..cr.wire_len];
+        @memcpy(wire, pack.wire(cr));
         records[i] = .{
             .name = shared_name,
             .rtype = cr.rtype,
@@ -268,31 +300,22 @@ fn cloneRRset(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.R
             .wire = wire,
             .wire_ttl_offset = cr.wire_ttl_offset,
         };
-        offset += cr.wire.len;
+        offset += cr.wire_len;
     }
     return records;
-}
-
-/// Clone an optional CachedRecord into a ResourceRecord with a given TTL.
-/// Thin wrapper over `cloneCachedRecords` for the single-record SOA case.
-fn cloneCachedRecord(alloc: Allocator, cached: ?CachedRecord, ttl: u32) ?dns.ResourceRecord {
-    const s = cached orelse return null;
-    const out = cloneCachedRecords(alloc, &.{s}, ttl) catch return null;
-    return out[0];
 }
 
 /// Clone NSEC/NSEC3 proof records (and their covering RRSIGs) out of the
 /// cache into the caller's allocator. Unlike `cloneRRset`, proofs carry
 /// heterogenous owner names — an NSEC at `b.example` may sit alongside an
 /// NSEC at `d.example` proving qname's nonexistence — so allocations
-/// happen per-record. Caller is expected to use an arena (no individual
-/// cleanup on partial-failure).
-fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
+/// happen per-record. `rdata` views into `wire`; arena only.
+fn cloneCachedRecords(alloc: Allocator, pack: Pack, cached: []const CachedRecord, ttl: u32) ![]dns.ResourceRecord {
     if (cached.len == 0) return &.{};
     const out = try alloc.alloc(dns.ResourceRecord, cached.len);
     for (cached, 0..) |cr, i| {
         const name = try cloneName(alloc, cr.name);
-        const wire = try alloc.dupe(u8, cr.wire);
+        const wire = try alloc.dupe(u8, pack.wire(cr));
         const rdata = try dns.parseRDataWire(alloc, wire, cr.rtype, cr.wire_ttl_offset);
         out[i] = .{
             .name = name,
@@ -305,56 +328,6 @@ fn cloneCachedRecords(alloc: Allocator, cached: []const CachedRecord, ttl: u32) 
         };
     }
     return out;
-}
-
-/// Build a `[]CachedRecord` from caller-side records, allocating into the
-/// shard. Empty input yields an empty slice; a mid-clone OOM yields
-/// error.OutOfMemory so callers refuse the store rather than silently cache a
-/// truncated set — these carry DNSSEC material (sigs, NSEC proofs) that, when
-/// present, must travel with the RRset they cover (RFC 4035 §3.2.3).
-fn cloneRecords(alloc: Allocator, records: []const dns.ResourceRecord) ![]CachedRecord {
-    if (records.len == 0) return &.{};
-    const arr = try alloc.alloc(CachedRecord, records.len);
-    var idx: usize = 0;
-    errdefer {
-        for (arr[0..idx]) |cr| freeCachedRecord(alloc, cr);
-        alloc.free(arr);
-    }
-    for (records) |rr| {
-        arr[idx] = try buildCachedRecord(alloc, rr);
-        idx += 1;
-    }
-    return arr;
-}
-
-/// Free a positive RRset staged for insertion but not yet handed to the map.
-/// `records` are borrowed (share the flat name backing); sigs/proofs own their
-/// names. Empty slices free as no-ops, so partial stages pass `&.{}`.
-fn freeStagedPositive(
-    alloc: Allocator,
-    records: []CachedRecord,
-    sigs: []CachedRecord,
-    proofs: []CachedRecord,
-    shared_name_backing: []align(@alignOf([]const u8)) u8,
-    key_name: []const u8,
-) void {
-    for (records) |cr| freeBorrowedRecord(alloc, cr);
-    alloc.free(records);
-    alloc.free(shared_name_backing);
-    for (sigs) |cr| freeCachedRecord(alloc, cr);
-    alloc.free(sigs);
-    for (proofs) |cr| freeCachedRecord(alloc, cr);
-    alloc.free(proofs);
-    alloc.free(key_name);
-}
-
-/// Free a negative entry's components staged before (or rolled back after) map
-/// insertion. The boxed NegativeEntry itself is the caller's to destroy.
-fn freeStagedNegative(alloc: Allocator, soa: CachedRecord, proofs: []CachedRecord, key_name: []const u8) void {
-    freeCachedRecord(alloc, soa);
-    for (proofs) |cr| freeCachedRecord(alloc, cr);
-    alloc.free(proofs);
-    alloc.free(key_name);
 }
 
 /// Collect NSEC/NSEC3 + covering RRSIGs from `records`, bailiwick-filtered.
@@ -751,14 +724,14 @@ pub const RRsetCache = struct {
                     self.notifyRemiss(lower_name, rtype);
                     return null;
                 };
-                const records = cloneRRset(caller_alloc, rrset.records, hit.remaining_ttl) catch return null;
+                const records = cloneRRset(caller_alloc, rrset.pack, rrset.pack.records(), hit.remaining_ttl) catch return null;
                 // Read path: degrade sigs/proofs to empty on OOM rather than
                 // drop the answer. The records themselves are complete (the
                 // store path skips any RRset that overflows its collect
                 // buffer), so a transient clone failure here only costs a DO
                 // client its proofs.
-                const sigs: []dns.ResourceRecord = if (rrset.sigs.len == 0) &.{} else cloneRRset(caller_alloc, rrset.sigs, hit.remaining_ttl) catch &.{};
-                const nsec_proofs: []dns.ResourceRecord = if (rrset.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, rrset.nsec_proofs, hit.remaining_ttl) catch &.{};
+                const sigs: []dns.ResourceRecord = cloneRRset(caller_alloc, rrset.pack, rrset.pack.sigs(), hit.remaining_ttl) catch &.{};
+                const nsec_proofs: []dns.ResourceRecord = cloneCachedRecords(caller_alloc, rrset.pack, rrset.pack.proofs(), hit.remaining_ttl) catch &.{};
                 return .{ .hit = .{
                     .records = records,
                     .sigs = sigs,
@@ -778,8 +751,9 @@ pub const RRsetCache = struct {
                     self.notifyRemiss(lower_name, rtype);
                     return null;
                 };
-                const soa = cloneCachedRecord(caller_alloc, neg.soa, hit.remaining_ttl);
-                const nsec_proofs: []dns.ResourceRecord = if (neg.nsec_proofs.len == 0) &.{} else cloneCachedRecords(caller_alloc, neg.nsec_proofs, hit.remaining_ttl) catch &.{};
+                const soa_rrs = cloneRRset(caller_alloc, neg.pack, neg.pack.records(), hit.remaining_ttl) catch return null;
+                const soa: ?dns.ResourceRecord = if (soa_rrs.len == 0) null else soa_rrs[0];
+                const nsec_proofs: []dns.ResourceRecord = cloneCachedRecords(caller_alloc, neg.pack, neg.pack.proofs(), hit.remaining_ttl) catch &.{};
                 return .{ .negative = .{
                     .rcode = neg.rcode,
                     .remaining_ttl = hit.remaining_ttl,
@@ -979,36 +953,25 @@ pub const RRsetCache = struct {
         const slot = self.prepareSlot(lower_view, key_rtype, rclass, security_status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
-        const cached_soa = buildCachedRecord(slot.alloc, soa) catch {
-            slot.alloc.free(slot.key.name);
-            return;
-        };
-
         // Refuse rather than cache a negative whose NSEC proofs were truncated
         // under OOM — a denial a DO client couldn't validate (RFC 4035 §3.1.3.2/.3).
-        const cached_proofs = cloneRecords(slot.alloc, proofs) catch {
-            freeStagedNegative(slot.alloc, cached_soa, &.{}, slot.key.name);
+        const pack = buildPack(slot.alloc, &.{soa}, &.{}, proofs) catch {
+            slot.alloc.free(slot.key.name);
             return;
         };
 
         // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
         const life = self.lifetime(@min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl), authenticated_ttl_max);
-        const neg = slot.alloc.create(NegativeEntry) catch {
-            freeStagedNegative(slot.alloc, cached_soa, cached_proofs, slot.key.name);
-            return;
-        };
-        neg.* = .{
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = life.expires_at,
             .original_ttl = life.ttl,
             .stored_at = life.stored_at,
-            .soa = cached_soa,
-            .nsec_proofs = cached_proofs,
+            .pack = pack,
             .security_status = security_status,
-        };
-        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = neg }) catch {
-            slot.alloc.destroy(neg);
-            freeStagedNegative(slot.alloc, cached_soa, cached_proofs, slot.key.name);
+        } }) catch {
+            slot.alloc.free(pack.blob);
+            slot.alloc.free(slot.key.name);
             return;
         };
         markLastVisited(slot.shard);
@@ -1040,20 +1003,13 @@ pub const RRsetCache = struct {
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         // Caller-chosen TTL on a record-less entry: nothing to bound it by.
         const life = self.lifetime(@min(ttl, ceiling), std.math.maxInt(u32));
-        const neg = slot.alloc.create(NegativeEntry) catch {
-            slot.alloc.free(slot.key.name);
-            return;
-        };
-        neg.* = .{
+        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = life.expires_at,
             .original_ttl = life.ttl,
             .stored_at = life.stored_at,
-            .soa = null,
             .security_status = security_status,
-        };
-        slot.shard.map.put(slot.alloc, slot.key, .{ .negative = neg }) catch {
-            slot.alloc.destroy(neg);
+        } }) catch {
             slot.alloc.free(slot.key.name);
             return;
         };
@@ -1293,59 +1249,21 @@ pub const RRsetCache = struct {
         const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
-        const cached_records = slot.alloc.alloc(CachedRecord, matches.len) catch {
+        const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
             slot.alloc.free(slot.key.name);
-            return;
-        };
-
-        // One shared owner-name backing for the whole RRset (mirrors the
-        // read path's cloneRRset). All records' `.name` views into this.
-        const shared = dns.cloneNameFlatOwned(slot.alloc, matches[0].name) catch {
-            slot.alloc.free(cached_records);
-            slot.alloc.free(slot.key.name);
-            return;
-        };
-        const shared_name_backing = shared.backing;
-        const shared_name = shared.name;
-
-        var idx: usize = 0;
-        for (matches) |other| {
-            cached_records[idx] = buildCachedRecordSharedName(slot.alloc, other, shared_name) catch break;
-            idx += 1;
-        }
-        if (idx == 0 or idx < matches.len) {
-            // Partial clone failure — don't cache an incomplete RRset.
-            for (cached_records[0..idx]) |cr| freeBorrowedRecord(slot.alloc, cr);
-            slot.alloc.free(cached_records);
-            if (shared_name_backing.len > 0) slot.alloc.free(shared_name_backing);
-            slot.alloc.free(slot.key.name);
-            return;
-        }
-
-        // Refuse the store if a clone fails — a .secure entry stripped of its
-        // signatures is unprovable to a DO client. See cloneRecords; mirrors
-        // the records partial-clone guard above.
-        const cached_sigs = cloneRecords(slot.alloc, sigs) catch {
-            freeStagedPositive(slot.alloc, cached_records, &.{}, &.{}, shared_name_backing, slot.key.name);
-            return;
-        };
-        const cached_proofs = cloneRecords(slot.alloc, nsec_proofs) catch {
-            freeStagedPositive(slot.alloc, cached_records, cached_sigs, &.{}, shared_name_backing, slot.key.name);
             return;
         };
 
         const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), authenticated_ttl_max);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
-            .records = cached_records,
-            .sigs = cached_sigs,
-            .nsec_proofs = cached_proofs,
-            .shared_name_backing = shared_name_backing,
+            .pack = pack,
             .expires_at = life.expires_at,
             .original_ttl = life.ttl,
             .stored_at = life.stored_at,
             .security_status = status,
         } }) catch {
-            freeStagedPositive(slot.alloc, cached_records, cached_sigs, cached_proofs, shared_name_backing, slot.key.name);
+            slot.alloc.free(pack.blob);
+            slot.alloc.free(slot.key.name);
             return;
         };
         markLastVisited(slot.shard);
@@ -1483,25 +1401,7 @@ fn freeKey(alloc: Allocator, key: CacheKey) void {
 }
 
 fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
-    switch (entry) {
-        .positive => |rrset| {
-            // records[] borrow .name from shared_name_backing — free rdata
-            // and wire only, then the records slice, then the shared backing.
-            for (rrset.records) |cr| freeBorrowedRecord(alloc, cr);
-            alloc.free(rrset.records);
-            if (rrset.shared_name_backing.len > 0) alloc.free(rrset.shared_name_backing);
-            for (rrset.sigs) |cr| freeCachedRecord(alloc, cr);
-            if (rrset.sigs.len > 0) alloc.free(rrset.sigs);
-            for (rrset.nsec_proofs) |cr| freeCachedRecord(alloc, cr);
-            if (rrset.nsec_proofs.len > 0) alloc.free(rrset.nsec_proofs);
-        },
-        .negative => |neg| {
-            if (neg.soa) |soa| freeCachedRecord(alloc, soa);
-            for (neg.nsec_proofs) |cr| freeCachedRecord(alloc, cr);
-            if (neg.nsec_proofs.len > 0) alloc.free(neg.nsec_proofs);
-            alloc.destroy(neg);
-        },
-    }
+    alloc.free(entry.pack().blob);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -3285,16 +3185,6 @@ test "multi-record RRset round-trip preserves shared owner name" {
         },
         .negative => return error.TestExpectedHit,
     }
-}
-
-test "CacheEntry size shrinks with boxed negative variant" {
-    // Sanity check that boxing actually saved bytes. CachedRRset is the
-    // expected payload size; the union should not balloon past that + tag.
-    const positive_size = @sizeOf(CachedRRset);
-    const entry_size = @sizeOf(CacheEntry);
-    // Negative pointer is 8B + tag + alignment; union body must equal
-    // sizeof(CachedRRset) since CachedRRset is the larger variant now.
-    try testing.expect(entry_size <= positive_size + @sizeOf(usize));
 }
 
 test "storeOneRRset handles backing-allocator OOM without leaking" {
