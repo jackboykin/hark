@@ -151,6 +151,7 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
 
     var wire_bytes: usize = 0;
     var stage: [rr_wire_stage_len]u8 = undefined;
+    var parse_scratch: [rr_wire_stage_len * @sizeOf([]const u8)]u8 = undefined;
     for (groups) |g| for (g) |rr| {
         wire_bytes += (try dns.buildResourceRecordWire(&stage, rr)).bytes.len;
     };
@@ -169,6 +170,9 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
     var wire_at = rec_bytes + names_bytes;
     for (groups, group_owner) |g, owner_name| for (g) |rr| {
         const built = try dns.buildResourceRecordWire(blob[wire_at..], rr);
+        // Refuse now, not a miss on every hit; scratch fits a TXT of one-byte strings.
+        var fba = std.heap.FixedBufferAllocator.init(&parse_scratch);
+        _ = try dns.parseRDataWire(fba.allocator(), built.bytes, rr.rtype, built.ttl_offset);
         recs[idx] = .{
             .name = owner_name orelse placeName(blob, &names_at, rr.name),
             .rtype = rr.rtype,
