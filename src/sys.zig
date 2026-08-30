@@ -245,16 +245,17 @@ pub fn netRead(io: std.Io, handle: posix.fd_t, buf: []u8) std.Io.net.Stream.Read
     return stream.read(io, &iovec);
 }
 
-/// Write adapter for a single contiguous buffer, through `io.operate(.net_write)`
-/// — the 0.17 replacement for the removed `io.vtable.netWrite` method. `data`
-/// must be non-empty (its last element is the splat pattern), so the
-/// empty-string sentinel with `splat=0` elides into a header-only iovec.
 pub fn netWrite(io: std.Io, handle: posix.fd_t, buf: []const u8) std.Io.net.Stream.Writer.Error!usize {
+    return netWriteVec(io, handle, buf, &.{""}, 0);
+}
+
+/// `data` must be non-empty: `""` with `splat=0` is a header-only iovec.
+pub fn netWriteVec(io: std.Io, handle: posix.fd_t, header: []const u8, data: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
     return (try io.operate(.{ .net_write = .{
         .socket_handle = handle,
-        .header = buf,
-        .data = &.{""},
-        .splat = 0,
+        .header = header,
+        .data = data,
+        .splat = splat,
     } })).net_write;
 }
 
@@ -295,7 +296,7 @@ pub fn writeAllDeadline(io: std.Io, handle: posix.fd_t, data: []const u8, deadli
 /// `netReadPosix`/`netWritePosix` treat `EAGAIN` as a programmer bug,
 /// so `SO_RCVTIMEO`/`SO_SNDTIMEO` can't be used to bound those calls.
 /// Polling first puts the deadline in userspace where it belongs.
-fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, PollFailed }!void {
+pub fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout, PollFailed }!void {
     const remaining_ns = deadline_ns - monotonic.nowNs();
     if (remaining_ns <= 0) return error.Timeout;
     const wait_ms: i32 = @intCast(@min(@divFloor(remaining_ns, 1_000_000), std.math.maxInt(i32)));
@@ -311,7 +312,7 @@ fn pollReady(handle: posix.fd_t, events: i16, deadline_ns: i128) error{ Timeout,
 
 /// Milliseconds left until `deadline_ns`, for arming a kernel socket timeout.
 /// Sub-millisecond residue is `error.Timeout`, not zero: the budget is spent.
-fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
+pub fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
     const remaining_ns = deadline_ns - monotonic.nowNs();
     if (remaining_ns < std.time.ns_per_ms) return error.Timeout;
     return @intCast(@min(
