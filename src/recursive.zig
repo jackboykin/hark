@@ -7,15 +7,13 @@ const special_use = @import("special_use.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
 const blocking_transport = @import("blocking_transport.zig");
 const BlockingUdpTransport = blocking_transport.BlockingUdpTransport;
-const TlsTransport = @import("tls_transport.zig").TlsTransport;
+const tls_transport = @import("tls_transport.zig");
 
 pub const Transports = struct {
     udp: *BlockingUdpTransport,
     tcp_enabled: bool,
-    tls: ?*TlsTransport = null,
 };
-const encrypted_ns = @import("encrypted_ns.zig");
-const EncryptedNsCache = encrypted_ns.EncryptedNsCache;
+const EncryptedNs = @import("encrypted_ns.zig").EncryptedNs;
 const AddressKey = @import("net_address.zig").AddressKey;
 const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const ns_rtt = @import("ns_rtt.zig");
@@ -265,7 +263,7 @@ pub const RecursiveResolver = struct {
     /// Whether to request DNSSEC data (DO bit) — always true if server is DNSSEC-capable.
     /// RFC 4035 §3.2.1: MUST set DO regardless of CD bit or per-query validation.
     dnssec_aware: bool = false,
-    encrypted_ns_cache: ?*EncryptedNsCache = null,
+    encrypted_ns: ?*EncryptedNs = null,
     rtt_cache: ?*RttCache = null,
     pool: ?*const PoolOccupancy = null,
     ns_selector: ?*NsSelector = null,
@@ -329,7 +327,7 @@ pub const RecursiveResolver = struct {
         cache: *RRsetCache,
         rtt_cache: *RttCache,
         ns_selector: *NsSelector,
-        encrypted_ns_cache: ?*EncryptedNsCache,
+        encrypted_ns: ?*EncryptedNs,
         case_state: ?*CaseState,
         dedup: ?*InFlightTable,
         nsec_cache: ?*NsecCache,
@@ -365,7 +363,7 @@ pub const RecursiveResolver = struct {
             .dnssec_aware = ctx.config.dnssec,
             // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours.
             .dnssec_enabled = ctx.config.dnssec and !opts.cd,
-            .encrypted_ns_cache = ctx.encrypted_ns_cache,
+            .encrypted_ns = ctx.encrypted_ns,
             .rtt_cache = ctx.rtt_cache,
             .ns_selector = ctx.ns_selector,
             .bypass_cache = opts.bypass_cache,
@@ -1713,13 +1711,8 @@ pub const RecursiveResolver = struct {
         name: []const u8,
         qtype: dns.RType,
         server: na.Address,
+        oc: *EncryptedNs,
     ) !?dns.Message {
-        // Caller gates on `.capable`; a stale read costs at worst one
-        // wasted pooled attempt.
-        const tls_t = self.transports.?.tls orelse return null;
-        const oc = self.encrypted_ns_cache orelse return null;
-        const tls_key = AddressKey.fromAddressWithPort(server, TlsTransport.port);
-
         const query_id = rand.queryId(self.io);
         const padded_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
             .rd = false,
@@ -1728,39 +1721,27 @@ pub const RecursiveResolver = struct {
         var padded_buf: [dns.edns_udp_payload]u8 = undefined;
         const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-        const deadline_ns = monotonic.nowNs() + @as(i128, @min(4000, self.remainingMs())) * std.time.ns_per_ms;
-        const tls_data = switch (tls_t.queryPooled(allocator, padded_query, server, deadline_ns)) {
-            .data => |data| data,
-            .none => {
-                // Cold pool: serve over Do53 now, re-dial in background.
-                tls_t.probeInBackground(server, oc, .rewarm);
-                return null;
-            },
-            // RFC 9539 §4.3: transport failure on a known-capable server
-            // is soft (timeout, RST, transient).
-            .broken => {
-                oc.setStatus(tls_key, .soft_failed);
-                return null;
-            },
+        // Three round-trips cold; the Do53 timeout is ≥2×srtt.
+        const full_ms = 4 * self.serverTimeout(AddressKey.fromAddress(server), false);
+        const budget_ms = @min(self.remainingMs(), full_ms);
+        const deadline_ns = monotonic.nowNs() + @as(i128, budget_ms) * std.time.ns_per_ms;
+        const verdict: ?dns.Message = blk: {
+            const tls_data = try tls_transport.query(&oc.pool, allocator, padded_query, server, deadline_ns) orelse {
+                // A clipped-budget miss is ours.
+                if (budget_ms < full_ms or budget_ms == 0) return null;
+                break :blk null;
+            };
+            const r = try tryParseMessage(allocator, tls_data, server) orelse break :blk null;
+            if (r.header.flags.rcode == .format_error) break :blk null;
+            if (!dns.validateQuestionMatch(r, padded_msg.questions[0].name, qtype)) {
+                // RFC 9619: error replies may omit the question; no demotion.
+                if (r.questions.len == 0 and r.header.flags.rcode.isServerError()) return null;
+                break :blk null;
+            }
+            break :blk r;
         };
-        // Semantic rejection over a healthy transport (bad parse, FORMERR
-        // — likely the padding option — question mismatch) is deterministic
-        // per-server: hard band.
-        const response = try tryParseMessage(allocator, tls_data, server) orelse {
-            oc.setStatus(tls_key, .failed);
-            return null;
-        };
-        if (response.header.flags.rcode == .format_error) {
-            oc.setStatus(tls_key, .failed);
-            return null;
-        }
-        if (!dns.validateQuestionMatch(response, padded_msg.questions[0].name, qtype)) {
-            // RFC 9619: error replies may omit the question section, as on
-            // the Do53 path — no demotion for that shape.
-            if (response.questions.len == 0 and response.header.flags.rcode.isServerError()) return null;
-            oc.setStatus(tls_key, .failed);
-            return null;
-        }
+        oc.record(server, verdict != null);
+        const response = verdict orelse return null;
         // Clear the Do53 death ratchet; RTT estimates stay untouched.
         if (self.rtt_cache) |rc| rc.recordAlive(AddressKey.fromAddress(server));
         _ = oc.dot_answers.fetchAdd(1, .monotonic);
@@ -1971,39 +1952,30 @@ pub const RecursiveResolver = struct {
 
         var last_server_failure: ?dns.Message = null;
 
-        // ── RFC 9539: capability discovery + encrypted-first ──
-        // Probe the top-ranked candidates (not just responders — a capable
-        // server can lose the race forever), then spend one TLS attempt on
-        // the best-ranked capable one; the race below is UDP-only. Any
-        // failure falls through to Do53. Probe surface to attacker-chosen
-        // IPs is bounded by the special-use egress filter, per-IP claim
-        // damping, and max_probes. All-Do53-dead zones get no discovery
-        // until a server revives.
-        if (self.encrypted_ns_cache) |oc| {
-            if (self.transports.?.tls) |tls_t| {
-                for (sel.order[0..@min(sel.live_count, max_staggered_legs)]) |idx|
-                    tls_t.probeInBackground(servers[idx], oc, .discover);
-                for (sel.order[0..sel.live_count]) |idx| {
-                    const tls_key = AddressKey.fromAddressWithPort(servers[idx], TlsTransport.port);
-                    if (oc.getStatus(tls_key) != .capable) continue;
-                    if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx])) |tls_response| {
-                        if (tls_response.header.flags.rcode.isServerError()) {
-                            recordFailure(&last_server_failure, tls_response);
-                        } else {
-                            // No RTT/selector feedback from TLS: its latency
-                            // would poison the Do53 estimates.
-                            return .{ .message = tls_response, .responding_server = null };
-                        }
+        // RFC 9539 is per-address; steering to any live capable server over a
+        // faster Do53 one is hark's policy: encryption beats RTT. Discover on
+        // top candidates, not just responders (a capable one can lose the race
+        // forever). Surface: egress filter, damping, max_probes.
+        if (self.encrypted_ns) |oc| {
+            for (sel.order[0..@min(sel.live_count, max_staggered_legs)]) |idx| oc.discover(servers[idx]);
+            for (sel.order[0..sel.live_count]) |idx| {
+                if (oc.getStatus(servers[idx]) != .capable) continue;
+                if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |tls_response| {
+                    if (tls_response.header.flags.rcode.isServerError()) {
+                        recordFailure(&last_server_failure, tls_response);
+                    } else {
+                        // TLS latency would poison the Do53 RTT estimates.
+                        return .{ .message = tls_response, .responding_server = null };
                     }
-                    break;
                 }
+                break;
             }
         }
 
         // ── Staggered NS racing ──
         if (sel.order.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
-                if (self.encrypted_ns_cache) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
+                if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
                 return .{ .message = stag.message, .responding_server = stag.server };
             }
         }
@@ -2045,7 +2017,7 @@ pub const RecursiveResolver = struct {
             }
 
             self.recordNsOutcome(parent_zone, server, .success, exchange.elapsed_us);
-            if (self.encrypted_ns_cache) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
+            if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
             return .{ .message = response, .responding_server = server };
         }
 
@@ -3022,7 +2994,6 @@ pub const RecursiveResolver = struct {
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp_enabled = ctx.parent.transports.?.tcp_enabled,
-                .tls = ctx.parent.transports.?.tls,
             });
 
             // page_allocator: a fresh thread's frees would warm a new smp slot's slabs for good.
@@ -4948,7 +4919,7 @@ test "validation budget stays tree-wide across cloneForThread under concurrent f
         fn run(w: *@This()) void {
             var udp_t = BlockingUdpTransport.init(.{}, w.parent.io);
             defer udp_t.deinit();
-            var clone = w.parent.cloneForThread(.{ .udp = &udp_t, .tcp_enabled = false, .tls = null });
+            var clone = w.parent.cloneForThread(.{ .udp = &udp_t, .tcp_enabled = false });
             const vb = clone.validationBudget();
             while (true) {
                 vb.consumeVerify() catch break;

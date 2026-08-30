@@ -3,12 +3,10 @@ const monotonic = @import("monotonic.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
-const File = Io.File;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const sys = @import("sys.zig");
-const TlsClient = @import("tls_client.zig");
 
 const AddressKey = na.AddressKey;
 
@@ -23,8 +21,7 @@ const max_keepalive_sec: i64 = 300;
 
 /// Apply the upstream's RFC 7828 edns-tcp-keepalive TIMEOUT (if present in
 /// `response`) as a per-connection idle bound, overriding the pool default
-/// on the next acquire/sweep. Works for both `TcpPooledConnection` and
-/// `PooledConnection` (TLS) — both expose `idle_timeout_sec: ?i64`.
+/// on the next acquire/sweep.
 pub fn applyKeepaliveHint(conn: anytype, response: []const u8) void {
     if (dns.extractKeepaliveTimeout(response)) |ka| {
         const raw = dns.keepaliveToSeconds(ka);
@@ -41,8 +38,8 @@ pub const TcpPooledConnection = struct {
     /// pointer per conn; the alternative — threading io through every
     /// pool callsite — touches both TCP and TLS for no semantic gain.
     io: Io,
-    last_used: i64,
-    query_count: u16,
+    last_used: i64 = 0,
+    query_count: u16 = 0,
     max_queries: u16 = 200,
     /// RFC 7828 edns-tcp-keepalive TIMEOUT advertised by the upstream, in
     /// seconds, clamped to [min_keepalive_sec, max_keepalive_sec] by
@@ -53,73 +50,9 @@ pub const TcpPooledConnection = struct {
         self.stream.close(self.io);
         allocator.destroy(self);
     }
-
-    pub fn isExpired(self: *const TcpPooledConnection) bool {
-        return self.query_count >= self.max_queries;
-    }
-
-    pub fn recordUse(self: *TcpPooledConnection) void {
-        self.query_count +|= 1;
-    }
-
-    pub fn initCounters(self: *TcpPooledConnection) void {
-        self.query_count = 1;
-    }
 };
 
 pub const TcpConnectionPool = ConnectionPool(TcpPooledConnection);
-
-// ── PooledConnection (TLS) ──────────────────────────────────────────
-
-pub const PooledConnection = struct {
-    stream: Io.net.Stream,
-    /// See `TcpPooledConnection.io`.
-    io: Io,
-    net_reader: File.Reader,
-    net_writer: File.Writer,
-    tls: TlsClient,
-    last_used: i64,
-    /// Bound queries on a single TLS session (RFC 7766 reuse hygiene). Matches the
-    /// Do53 TCP pool cap so DoT and Do53 connection lifetimes are symmetric.
-    query_count: u16 = 0,
-    max_queries: u16 = 200,
-    /// RFC 7828 edns-tcp-keepalive TIMEOUT advertised by the upstream, in
-    /// seconds. null falls back to the pool's `max_idle_sec`.
-    idle_timeout_sec: ?i64 = null,
-
-    // Inline buffers; net_reader/net_writer and (later) `tls` alias them by
-    // pointer, so a live connection MUST NOT be moved or copied by value — it
-    // is heap-allocated and held only via *PooledConnection, else those dangle.
-    net_read_buf: [TlsClient.min_buffer_len]u8,
-    net_write_buf: [TlsClient.min_buffer_len]u8,
-    tls_read_buf: [TlsClient.min_buffer_len]u8,
-
-    /// Close TLS session and underlying socket.
-    pub fn closeAndDestroy(self: *PooledConnection, allocator: Allocator) void {
-        self.tls.end() catch {};
-        self.net_writer.interface.flush() catch {};
-        self.stream.close(self.io);
-        allocator.destroy(self);
-    }
-
-    /// Close socket without TLS shutdown (for error paths).
-    pub fn destroyBroken(self: *PooledConnection, allocator: Allocator) void {
-        self.stream.close(self.io);
-        allocator.destroy(self);
-    }
-
-    pub fn isExpired(self: *const PooledConnection) bool {
-        return self.query_count >= self.max_queries;
-    }
-
-    pub fn recordUse(self: *PooledConnection) void {
-        self.query_count +|= 1;
-    }
-
-    pub fn initCounters(self: *PooledConnection) void {
-        self.query_count = 1;
-    }
-};
 
 // ── ConnectionPool (comptime generic) ───────────────────────────────
 
@@ -219,7 +152,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
                 self.total_conns -= 1;
                 const limit = conn.idle_timeout_sec orelse self.max_idle_sec;
                 const is_stale = now - conn.last_used > limit;
-                if (is_stale or conn.isExpired()) {
+                if (is_stale or conn.query_count >= conn.max_queries) {
                     conn.destroyBroken(self.allocator);
                     continue;
                 }
@@ -239,16 +172,7 @@ pub fn ConnectionPool(comptime Conn: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             conn.last_used = self.now_fn();
-            conn.recordUse();
-            self.insertLocked(key, conn);
-        }
-
-        /// Store a newly established connection in the pool.
-        pub fn store(self: *Self, key: AddressKey, conn: *Conn) void {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            conn.last_used = self.now_fn();
-            conn.initCounters();
+            conn.query_count +|= 1;
             self.insertLocked(key, conn);
         }
 
@@ -345,8 +269,6 @@ pub fn ConnectionPool(comptime Conn: type) type {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-const TlsPool = ConnectionPool(PooledConnection);
-
 // Injectable test clock; each test resets it at entry (cf. cache.zig testNowSeconds).
 var cp_test_now: i64 = 1000;
 fn cpTestNow() i64 {
@@ -356,7 +278,7 @@ fn cpTestNow() i64 {
 test "ConnectionPool idle eviction with injectable now_fn" {
     cp_test_now = 1000;
 
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &cpTestNow;
     pool.max_idle_sec = 10;
     defer pool.deinit();
@@ -364,8 +286,8 @@ test "ConnectionPool idle eviction with injectable now_fn" {
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
     // Create a fake pooled connection (just for pool mechanics testing)
-    const conn = try createTestConnection(testing.allocator);
-    pool.store(key, conn);
+    const conn = try createTestTcpConnection(testing.allocator);
+    pool.release(key, conn, true);
 
     // Should be acquirable immediately
     try testing.expect(pool.entries.count() == 1);
@@ -382,14 +304,14 @@ test "ConnectionPool idle eviction with injectable now_fn" {
 test "ConnectionPool store and acquire" {
     cp_test_now = 1000;
 
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
-    const conn = try createTestConnection(testing.allocator);
-    pool.store(key, conn);
+    const conn = try createTestTcpConnection(testing.allocator);
+    pool.release(key, conn, true);
 
     // Advance time slightly (within idle window)
     cp_test_now = 1005;
@@ -403,11 +325,11 @@ test "ConnectionPool store and acquire" {
 }
 
 test "ConnectionPool release not alive frees connection" {
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
-    const conn = try createTestConnection(testing.allocator);
+    const conn = try createTestTcpConnection(testing.allocator);
 
     // Release with alive=false should free
     pool.release(key, conn, false);
@@ -417,28 +339,28 @@ test "ConnectionPool release not alive frees connection" {
 test "ConnectionPool max entries eviction" {
     cp_test_now = 1000;
 
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &cpTestNow;
     pool.max_entries = 2;
     defer pool.deinit();
 
     // Store 2 connections
-    const conn1 = try createTestConnection(testing.allocator);
+    const conn1 = try createTestTcpConnection(testing.allocator);
     const key1 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
-    pool.store(key1, conn1);
+    pool.release(key1, conn1, true);
 
     cp_test_now = 1001;
-    const conn2 = try createTestConnection(testing.allocator);
+    const conn2 = try createTestTcpConnection(testing.allocator);
     const key2 = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 853));
-    pool.store(key2, conn2);
+    pool.release(key2, conn2, true);
 
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
 
     // Store a 3rd — should evict the oldest (conn1)
     cp_test_now = 1002;
-    const conn3 = try createTestConnection(testing.allocator);
+    const conn3 = try createTestTcpConnection(testing.allocator);
     const key3 = AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 853));
-    pool.store(key3, conn3);
+    pool.release(key3, conn3, true);
 
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
     // conn1's key should be gone
@@ -451,29 +373,6 @@ fn createTestStream() !Io.net.Stream {
     const sock = try sys.dup(dev_null);
     sys.close(dev_null);
     return .{ .socket = .{ .handle = sock, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
-}
-
-/// Minimal PooledConnection for unit testing pool mechanics.
-///
-/// Note: `tls` is `undefined`. Pool tests reach the connection only via
-/// `destroyBroken` (which doesn't touch `.tls`), never `closeAndDestroy`
-/// (which calls `tls.end()`). If the pool's release path ever switches
-/// to `closeAndDestroy`, this helper must populate a real `TlsClient`.
-fn createTestConnection(allocator: Allocator) !*PooledConnection {
-    const stream = try createTestStream();
-    const conn = try allocator.create(PooledConnection);
-    conn.* = .{
-        .stream = stream,
-        .io = testing.io,
-        .net_reader = undefined,
-        .net_writer = undefined,
-        .tls = undefined,
-        .last_used = 0,
-        .net_read_buf = undefined,
-        .net_write_buf = undefined,
-        .tls_read_buf = undefined,
-    };
-    return conn;
 }
 
 fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
@@ -491,20 +390,20 @@ fn createTestTcpConnection(allocator: Allocator) !*TcpPooledConnection {
 test "ConnectionPool multi-entry per key (LIFO)" {
     cp_test_now = 1000;
 
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
-    const c1 = try createTestConnection(testing.allocator);
-    pool.store(key, c1);
+    const c1 = try createTestTcpConnection(testing.allocator);
+    pool.release(key, c1, true);
     cp_test_now = 1001;
-    const c2 = try createTestConnection(testing.allocator);
-    pool.store(key, c2);
+    const c2 = try createTestTcpConnection(testing.allocator);
+    pool.release(key, c2, true);
     cp_test_now = 1002;
-    const c3 = try createTestConnection(testing.allocator);
-    pool.store(key, c3);
+    const c3 = try createTestTcpConnection(testing.allocator);
+    pool.release(key, c3, true);
 
     try testing.expectEqual(@as(usize, 3), pool.total_conns);
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
@@ -528,7 +427,7 @@ test "ConnectionPool multi-entry per key (LIFO)" {
 test "ConnectionPool per-key cap evicts oldest within key" {
     cp_test_now = 1000;
 
-    var pool = TlsPool.init(testing.allocator, undefined);
+    var pool = TcpConnectionPool.init(testing.allocator, undefined);
     pool.now_fn = &cpTestNow;
     defer pool.deinit();
 
@@ -536,44 +435,21 @@ test "ConnectionPool per-key cap evicts oldest within key" {
 
     // Fill to per-key cap
     for (0..per_key_cap) |_| {
-        const c = try createTestConnection(testing.allocator);
-        pool.store(key, c);
+        const c = try createTestTcpConnection(testing.allocator);
+        pool.release(key, c, true);
         cp_test_now += 1;
     }
     try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
 
     // One more — triggers appendEvictingOldest, total_conns unchanged
-    const c_new = try createTestConnection(testing.allocator);
-    pool.store(key, c_new);
+    const c_new = try createTestTcpConnection(testing.allocator);
+    pool.release(key, c_new, true);
     try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
 
     // LIFO: c_new is on top
     const got = pool.acquire(key).?;
     try testing.expectEqual(c_new, got);
     pool.release(key, got, true);
-}
-
-test "TlsPool max queries eviction" {
-    cp_test_now = 1000;
-
-    var pool = TlsPool.init(testing.allocator, undefined);
-    pool.now_fn = &cpTestNow;
-    defer pool.deinit();
-
-    const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
-    const conn = try createTestConnection(testing.allocator);
-    conn.max_queries = 3;
-    pool.store(key, conn); // initCounters → query_count = 1
-
-    const a1 = pool.acquire(key).?;
-    pool.release(key, a1, true); // recordUse → query_count = 2
-    const a2 = pool.acquire(key).?;
-    pool.release(key, a2, true); // recordUse → query_count = 3
-
-    // Cap reached: acquire detects isExpired and discards.
-    const result = pool.acquire(key);
-    try testing.expect(result == null);
-    try testing.expect(pool.entries.count() == 0);
 }
 
 test "applyKeepaliveHint clamps weaponized values" {
@@ -620,7 +496,7 @@ test "TcpConnectionPool per-connection idle_timeout_sec overrides pool default" 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestTcpConnection(testing.allocator);
     conn.idle_timeout_sec = 5; // RFC 7828 advertised: 5s
-    pool.store(key, conn);
+    pool.release(key, conn, true);
 
     cp_test_now = 1010; // 10s later: past per-conn limit, under pool default
     try testing.expect(pool.acquire(key) == null);
@@ -640,11 +516,11 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
     const key_short = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const short_conn = try createTestTcpConnection(testing.allocator);
     short_conn.idle_timeout_sec = 3;
-    pool.store(key_short, short_conn);
+    pool.release(key_short, short_conn, true);
 
     const key_long = AddressKey.fromAddress(na.initIp4(.{ 8, 8, 8, 8 }, 53));
     const long_conn = try createTestTcpConnection(testing.allocator);
-    pool.store(key_long, long_conn);
+    pool.release(key_long, long_conn, true);
 
     try testing.expectEqual(@as(usize, 2), pool.total_conns);
 
@@ -652,7 +528,7 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
     cp_test_now = 1010; // short_conn expired, long_conn still fine
     // Fill above max_entries/2 to ensure evictIdleLocked actually runs.
     const filler_conn = try createTestTcpConnection(testing.allocator);
-    pool.store(key_long, filler_conn);
+    pool.release(key_long, filler_conn, true);
     _ = pool.acquire(AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 53))); // triggers sweep
 
     // short_conn evicted, long_conn + filler retained.
@@ -674,7 +550,7 @@ test "TcpConnectionPool max queries eviction" {
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestTcpConnection(testing.allocator);
     conn.max_queries = 3;
-    pool.store(key, conn);
+    pool.release(key, conn, true);
 
     // Simulate repeated releases to bump query_count
     const a1 = pool.acquire(key).?;

@@ -6,6 +6,7 @@ const dns_print = hark.dns_print;
 const RecursiveResolver = hark.recursive.RecursiveResolver;
 const Io = std.Io;
 const Server = hark.server.Server;
+const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
 
 var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -209,15 +210,15 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
 
     // Fresh transports for this single resolve (mirrors the bg-prefetch
     // path). `opportunistic` rides in via cfg, set above before init.
-    var upstream = Server.UpstreamTransports.init(&server);
-    defer upstream.deinit();
+    var udp = BlockingUdpTransport.init(.{}, server.io);
+    defer udp.deinit();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     var resolver = RecursiveResolver.fromContext(
         server.resolverContext(),
-        upstream.transports(),
+        .{ .udp = &udp, .tcp_enabled = true },
         .{},
     );
     const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {

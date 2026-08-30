@@ -321,12 +321,6 @@ pub fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
     ));
 }
 
-/// Recompute remaining timeout from absolute deadline (slow-trickle mitigation).
-/// `opt` is SO_RCVTIMEO or SO_SNDTIMEO — set only the direction the next syscall uses.
-pub fn updateTimeout(sock: posix.fd_t, opt: u32, deadline_ns: i128) error{Timeout}!void {
-    setSocketTimeout(sock, opt, try remainingTimeoutMs(deadline_ns));
-}
-
 test "setNoDelay and setQuickAck flip the kernel TCP options" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 

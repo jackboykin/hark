@@ -58,7 +58,7 @@ class HarkConfig:
         # path lifts them; the upstream-port knob covers glue records, which
         # have no port.
         # `opportunistic` is explicitly off: hark's TLS transport hardcodes
-        # port 853 (src/tls_transport.zig:32) and would bypass `upstream_port`,
+        # port 853 (src/tls_transport.zig) and would bypass `upstream_port`,
         # silently mis-targeting the responder. Future scenarios needing
         # encrypted upstreams will require threading a `tls_port` knob first.
         lines = [

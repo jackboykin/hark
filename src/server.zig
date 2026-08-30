@@ -11,11 +11,8 @@ const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const recursive = @import("recursive.zig");
 const acl = @import("acl.zig");
-const TlsTransport = @import("tls_transport.zig").TlsTransport;
-const EncryptedNsCache = @import("encrypted_ns.zig").EncryptedNsCache;
+const EncryptedNs = @import("encrypted_ns.zig").EncryptedNs;
 const CaseState = @import("case_state.zig").CaseState;
-const pool_mod = @import("connection_pool.zig");
-const ConnectionPool = pool_mod.ConnectionPool(pool_mod.PooledConnection);
 const RttCache = @import("ns_rtt.zig").RttCache;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
@@ -396,9 +393,8 @@ pub const Server = struct {
     rtt_cache: RttCache,
     ns_selector: NsSelector,
     dedup: ?InFlightTable,
-    encrypted_ns_cache: ?EncryptedNsCache,
+    encrypted_ns: ?EncryptedNs,
     case_state: ?CaseState,
-    enc_pool: ?ConnectionPool,
     nsec_cache: ?NsecCache,
     key_cache: ?RRsetCache,
     udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
@@ -507,9 +503,8 @@ pub const Server = struct {
             .rtt_cache = rtt_cache,
             .ns_selector = ns_selector,
             .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
-            .encrypted_ns_cache = if (cfg.opportunistic) EncryptedNsCache.init(allocator, io) else null,
+            .encrypted_ns = if (cfg.opportunistic) EncryptedNs.init(allocator, io, cfg.upstream_tcp_idle_sec) else null,
             .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
-            .enc_pool = if (cfg.opportunistic) ConnectionPool.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
                 .backing = allocator,
                 .max_bytes = NsecCache.default_max_bytes,
@@ -536,40 +531,6 @@ pub const Server = struct {
         };
     }
 
-    /// The per-thread upstream transport pair: a fresh blocking UDP
-    /// transport plus (when `opportunistic`) a TLS transport wired to the
-    /// server's DoT pool. Lives by value on the owning thread's stack
-    /// frame; `transports()` hands out pointers into it, so don't move it
-    /// after that.
-    pub const UpstreamTransports = struct {
-        udp: BlockingUdpTransport,
-        tls: ?TlsTransport,
-
-        pub fn init(server: *Server) UpstreamTransports {
-            return .{
-                .udp = BlockingUdpTransport.init(.{}, server.io),
-                // enc_pool exists iff `opportunistic` — its presence IS the
-                // "encrypted upstream enabled" predicate.
-                .tls = if (server.enc_pool) |*pool|
-                    TlsTransport.init(server.allocator, server.io, pool)
-                else
-                    null,
-            };
-        }
-
-        pub fn deinit(self: *UpstreamTransports) void {
-            self.udp.deinit();
-        }
-
-        pub fn transports(self: *UpstreamTransports) Transports {
-            return .{
-                .udp = &self.udp,
-                .tcp_enabled = true,
-                .tls = if (self.tls) |*t| t else null,
-            };
-        }
-    };
-
     pub fn resolverContext(self: *Server) recursive.RecursiveResolver.Context {
         return .{
             .config = &self.config,
@@ -578,7 +539,7 @@ pub const Server = struct {
             .cache = &self.cache,
             .rtt_cache = &self.rtt_cache,
             .ns_selector = &self.ns_selector,
-            .encrypted_ns_cache = if (self.encrypted_ns_cache) |*oc| oc else null,
+            .encrypted_ns = if (self.encrypted_ns) |*oc| oc else null,
             .case_state = if (self.case_state) |*cs| cs else null,
             .dedup = if (self.dedup) |*d| d else null,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
@@ -607,23 +568,18 @@ pub const Server = struct {
     /// `0% while capable > 0` is the signature of capability knowledge
     /// going unused — the failure shape this line exists to catch.
     fn logOteStats(self: *Server) void {
-        const oc = if (self.encrypted_ns_cache) |*o| o else return;
+        const oc = if (self.encrypted_ns) |*o| o else return;
         const s = oc.getStats();
         const total = s.dot_answers + s.do53_answers;
         const pct: u64 = if (total > 0) s.dot_answers * 100 / total else 0;
-        log.info("ote: {d}/{d} upstream answers over DoT ({d}%), {d} servers capable", .{
-            s.dot_answers, total, pct, s.capable,
+        log.info("ote: {d}/{d} upstream answers over DoT ({d}%), {d} servers capable, {d} evicted", .{
+            s.dot_answers, total, pct, s.capable, s.evictions,
         });
     }
 
     pub fn deinit(self: *Server) void {
-        // Probes store into enc_pool and the cache; await them before teardown.
-        if (self.encrypted_ns_cache) |*oc| {
-            oc.awaitProbes();
-            oc.deinit();
-        }
+        if (self.encrypted_ns) |*oc| oc.deinit();
         if (self.case_state) |*cs| cs.deinit();
-        if (self.enc_pool) |*pool| pool.deinit();
         if (self.dedup) |*d| d.deinit();
         if (self.nsec_cache) |*nc| nc.deinit();
         if (self.key_cache) |*kc| kc.deinit();
@@ -811,10 +767,6 @@ pub const Server = struct {
         // Per-worker Do53 TCP connection pool (RFC 7766)
         var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
         do53_tcp_pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
-        // DoT pool lives on Server (per-process) but the idle timeout is
-        // a runtime knob; honour the config here too so the docstring
-        // ("Upstream TCP / DoT") matches reality.
-        if (self.enc_pool) |*pool| pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
 
         var ws = WorkerState{
             .server = self,
@@ -1626,8 +1578,8 @@ const WorkerState = struct {
 
     /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) noreturn {
-        var upstream = Server.UpstreamTransports.init(self.server);
-        const transports = upstream.transports();
+        var udp = BlockingUdpTransport.init(.{}, self.server.io);
+        const transports: Transports = .{ .udp = &udp, .tcp_enabled = true };
 
         var query_pta: PerThreadArena = undefined;
         query_pta.init(self.server.allocator, self.server.config.query_memory_limit);
@@ -2217,8 +2169,9 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
 
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
-    var upstream = Server.UpstreamTransports.init(&server);
-    defer upstream.deinit();
+    var udp = BlockingUdpTransport.init(.{}, server.io);
+    defer udp.deinit();
+    const transports: Transports = .{ .udp = &udp, .tcp_enabled = true };
     const run = struct {
         fn f(srv: *Server, t: Transports, name: []const u8, kind: BgKind) void {
             runBgTask(srv.resolverContext(), t, testing.failing_allocator, name, .aaaa, kind);
@@ -2226,7 +2179,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     }.f;
 
     // Cousin failure on an absent key → RFC 9520 SERVFAIL marker.
-    run(&server, upstream.transports(), "brk.example.com", .cousin);
+    run(&server, transports, "brk.example.com", .cousin);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -2238,7 +2191,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     }
 
     // Same failure under a refresh kind → nothing recorded.
-    run(&server, upstream.transports(), "brk2.example.com", .prefetch);
+    run(&server, transports, "brk2.example.com", .prefetch);
     try testing.expect(!server.cache.containsFresh("brk2.example.com", .aaaa, .in));
 
     // Cousin failure with a fresh entry present → guard keeps the entry.
@@ -2256,7 +2209,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
         };
         server.cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
-    run(&server, upstream.transports(), "fresh.example.com", .cousin);
+    run(&server, transports, "fresh.example.com", .cousin);
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();

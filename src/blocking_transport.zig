@@ -327,9 +327,9 @@ pub fn queryTcp(
             stream.close(io);
             return data;
         };
-        new_conn.* = .{ .stream = stream, .io = io, .last_used = undefined, .query_count = undefined };
+        new_conn.* = .{ .stream = stream, .io = io };
         pool_mod.applyKeepaliveHint(new_conn, data);
-        p.store(key, new_conn);
+        p.release(key, new_conn, true);
         return data;
     }
 
@@ -337,14 +337,8 @@ pub fn queryTcp(
     return data;
 }
 
-/// Open a connected TCP stream — the raw connect kernel shared by Do53
-/// (`connectTcp`) and DoT (`tls_transport.dialAndPool`). The fd is
-/// opened via raw posix so we can apply SO_SNDTIMEO for the connect
-/// itself — Zig's `IpAddress.connect` accepts a timeout option but its
-/// Io.Threaded backend panics on it. SNDTIMEO is left set to
-/// `connect_timeout_ms`; each caller resets or re-arms it for its data
-/// phase. Once the stdlib grows working connect timeouts, this collapses
-/// to one line.
+/// SNDTIMEO bounds the connect (std's connect timeout panics under
+/// Io.Threaded), then is disarmed: the data path treats EAGAIN as a bug.
 ///
 /// `.address` is intentionally zero (not populated via getsockname).
 /// CONTRACT: no caller reads `Stream.socket.address` on a client-side
@@ -353,25 +347,15 @@ pub fn queryTcp(
 /// the peer's family (zero is ip4 here, even on ip6 connects); a
 /// future `Stream.peerAddress()` or address-formatting code would
 /// silently lie. Populate via `na.getSockName` if that ever matters.
-pub fn connectTcpRaw(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
+pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
     const af: u32 = na.afU32(server);
     const sock_fd = try sys.socket(af, posix.SOCK.STREAM, 0);
     errdefer sys.close(sock_fd);
     sys.setSocketTimeout(sock_fd, posix.SO.SNDTIMEO, connect_timeout_ms);
     sys.setNoDelay(sock_fd);
-    na.connectTo(sock_fd, &server) catch |e|
-        return if (e == error.ConnectionRefused) error.ConnectRefused else error.ConnectFailed;
+    try na.connectTo(sock_fd, &server);
+    sys.clearSocketTimeout(sock_fd, posix.SO.SNDTIMEO);
     return .{ .socket = .{ .handle = sock_fd, .address = na.initIp4(.{ 0, 0, 0, 0 }, 0) } };
-}
-
-/// Do53 connect: clear SNDTIMEO after connect so subsequent data ops
-/// don't surface EAGAIN through netRead/netWrite, which `netReadPosix`/
-/// `netWritePosix` treat as a programmer bug — deadlines here are
-/// enforced in userspace (`sendAndReceiveTcp`).
-pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
-    const stream = try connectTcpRaw(server, connect_timeout_ms);
-    sys.clearSocketTimeout(stream.socket.handle, posix.SO.SNDTIMEO);
-    return stream;
 }
 
 /// Length-prefixed DNS query/response on a connected TCP stream, via the
@@ -594,11 +578,6 @@ test "queryTcp loopback query" {
 }
 
 test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" {
-    // The Do53 TCP data path enforces deadlines in userspace and relies on
-    // the kernel timeout being *off*: Io.Threaded's netWritePosix treats
-    // EAGAIN as a programmer bug and panics. connectTcpRaw arms SNDTIMEO for
-    // the connect itself, so connectTcp must disarm it afterwards.
-    //
     // This used to be spelled setSocketTimeout(fd, SNDTIMEO, 0), relying on
     // timeval{0,0} meaning "no timeout"; it is now clearSocketTimeout, since
     // setSocketTimeout floors at 1 ms. Without this test that conversion had
@@ -620,21 +599,4 @@ test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" 
     try testing.expectEqual(@as(std.os.linux.E, .SUCCESS), std.os.linux.errno(rc));
     try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
     try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
-}
-
-test "connectTcpRaw surfaces a refused port as ConnectRefused, not ConnectFailed" {
-    // The encrypted-NS demotion path hard-bands a refused :853 for an hour
-    // and soft-bands a transient failure for 60 s. That split is only
-    // possible if the refusal errno survives the connect wrapper instead of
-    // collapsing to a generic ConnectFailed.
-    try skipIfNotLinux();
-    const io = testing.io;
-
-    // Grab an ephemeral port, then close the listener so the port refuses.
-    const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
-    const refused = server.socket.address;
-    server.deinit(io);
-
-    try testing.expectError(error.ConnectRefused, connectTcpRaw(refused, tcp_connect_timeout_ms));
 }
