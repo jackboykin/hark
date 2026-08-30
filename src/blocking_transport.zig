@@ -396,10 +396,6 @@ pub fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, 
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-fn skipIfNotLinux() !void {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
-}
-
 test "mapUdpSendErr classifies the Socket.SendError surface" {
     // PeerUnreachable bucket: any "this peer can't be reached" signal so the
     // resolver can fail over to a sibling NS without spending the timeout.
@@ -419,7 +415,6 @@ test "mapUdpSendErr classifies the Socket.SendError surface" {
 }
 
 test "BlockingUdpTransport loopback query" {
-    try skipIfNotLinux();
     const io = testing.io;
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
@@ -447,7 +442,6 @@ test "BlockingUdpTransport loopback query" {
 }
 
 test "BlockingUdpTransport timeout" {
-    try skipIfNotLinux();
     const io = testing.io;
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 100, .retransmit_count = 0 }, io);
@@ -469,7 +463,6 @@ test "BlockingUdpTransport timeout" {
 }
 
 test "BlockingUdpTransport IPv6 loopback query" {
-    try skipIfNotLinux();
     const io = testing.io;
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000 }, io);
@@ -552,7 +545,6 @@ fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
 }
 
 test "queryTcp loopback query" {
-    try skipIfNotLinux();
     const io = testing.io;
 
     const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
@@ -583,7 +575,6 @@ test "connectTcp leaves SNDTIMEO disarmed for the userspace-deadline data path" 
     // setSocketTimeout floors at 1 ms. Without this test that conversion had
     // no coverage — reverting it broke nothing, while arming a 1 ms write
     // timeout on the data path.
-    try skipIfNotLinux();
     const io = testing.io;
 
     const listen_addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);

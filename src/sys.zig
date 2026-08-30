@@ -322,8 +322,6 @@ pub fn remainingTimeoutMs(deadline_ns: i128) error{Timeout}!u32 {
 }
 
 test "setNoDelay and setQuickAck flip the kernel TCP options" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-
     const sock = try socket(linux.AF.INET, posix.SOCK.STREAM, 0);
     defer close(sock);
 
@@ -358,8 +356,6 @@ test "setNoDelay and setQuickAck flip the kernel TCP options" {
 }
 
 test "setSocketTimeout never disarms the timeout; clearSocketTimeout is how you mean it" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-
     const sock = try socket(linux.AF.INET, posix.SOCK.STREAM, 0);
     defer close(sock);
 

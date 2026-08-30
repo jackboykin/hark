@@ -1973,7 +1973,6 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "server init and deinit" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
@@ -2045,7 +2044,6 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // resolver verified. A cache entry stored as .unchecked (e.g. by the
     // CD=1 early-serve path before background validation upgrades it)
     // must not produce AD=1 responses to CD=0 clients.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2107,7 +2105,6 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
     // repeated CD=1 queries to an already-validated name. A steady CD=1
     // workload would otherwise pay a bg spawn + upstream round-trip per
     // query even after the cache entry is .secure.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator,
         \\[server]
@@ -2146,7 +2143,6 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     // Input validation before the expensive heap+spawn path. Protects against
     // a malformed name slipping through and the thread getting a truncated
     // or empty buffer.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
@@ -2162,7 +2158,6 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
 }
 
 test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh entries survive" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
     defer cfg.deinit();
@@ -2386,7 +2381,6 @@ test "Server.init does not leak when a late allocation fails" {
     // Regression: the HotSet allocation sat inside the return literal, which
     // Zig evaluates in field order — after every cache, with no errdefer in
     // reach.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator,
         \\[cache]

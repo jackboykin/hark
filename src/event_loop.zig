@@ -495,7 +495,6 @@ pub const EventLoop = struct {
 // ── Tests ───────────────────────────────────────────────────────────────
 
 fn createTestLoop() !*EventLoop {
-    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
         error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
