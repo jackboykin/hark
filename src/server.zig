@@ -716,16 +716,16 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, stats.memory_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats (rrset lookups, incl. internal): {d}/{d} entries, {d}/{d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted, {d} byte-pressure), {d} prefetch-eligible, {d} stale", .{
+            stats.entries, stats.max_entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.byte_pressure_evictions, stats.prefetch_eligible, stats.stale_hits,
         });
         self.logOteStats();
         if (self.key_cache) |*kc| {
             const ks = kc.getStats();
             const k_total = ks.hits + ks.misses;
             const k_pct: u64 = if (k_total > 0) ks.hits * 100 / k_total else 0;
-            log.info("key cache: {d} entries, {d} bytes, {d} hits, {d} misses ({d}% hit rate)", .{
-                ks.entries, ks.memory_bytes, ks.hits, ks.misses, k_pct,
+            log.info("key cache: {d} entries, {d}/{d} KiB, {d} hits, {d} misses ({d}% hit rate)", .{
+                ks.entries, ks.memory_bytes / 1024, ks.max_bytes / 1024, ks.hits, ks.misses, k_pct,
             });
         }
         if (self.nsec_cache) |*nc| {
@@ -1113,8 +1113,8 @@ const WorkerState = struct {
         const stats = self.server.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache: {d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
-            stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, hit_pct, stats.evictions,
+        log.info("cache: {d}/{d} entries, {d}/{d} KiB, {d}% hit, {d} evictions", .{
+            stats.entries, stats.max_entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, hit_pct, stats.evictions,
         });
         self.server.logOteStats();
         self.server.logFootprint();
