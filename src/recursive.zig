@@ -4125,7 +4125,7 @@ test "redirectFor substitutes a DNAME the server left unsynthesized" {
 test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAAA short-circuit upstream" {
     const alloc = testing.allocator;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
 
     // Pre-warm the cache: (alias.example.com CNAME → target.example.com)
@@ -4183,7 +4183,7 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
 test "cousin prefetch: set on NOERROR A/AAAA, suppressed on NXDOMAIN" {
     const alloc = testing.allocator;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
     {
         const owner = try makeName(alloc, &.{ "host", "example", "com" });
@@ -4249,7 +4249,7 @@ test "svcb cousin target: extraction, coverage skips, strict parse" {
 test "cousin prefetch: https answer carries target name through resolve" {
     const alloc = testing.allocator;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
     {
         const owner = try makeName(alloc, &.{ "www", "example", "com" });
@@ -4312,7 +4312,7 @@ test "chain tail in prefetch window flags head prefetch (mid-chain hit)" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .prefetch = true });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -4345,7 +4345,7 @@ test "aging CNAME redirect on follow path flags head prefetch" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .prefetch = true });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -4376,7 +4376,7 @@ test "fresh chain sets no prefetch and reports from_cache" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .prefetch = true });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -4400,7 +4400,7 @@ test "fresh chain sets no prefetch and reports from_cache" {
 test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache-served path" {
     const alloc = testing.allocator;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
 
     // Build a deliberately cyclic pair of CNAMEs in the cache: an
@@ -5066,7 +5066,7 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
         .answers = rrs,
     };
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
     cache.storeResponse(store_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
@@ -5259,7 +5259,7 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
 
     // n = A records; the covering RRSIG is dominated too, so dominated = n+1.
     for ([_]usize{ 16, 15 }) |n| {
-        var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+        var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
         defer cache.deinit();
         var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache };
 
@@ -5316,7 +5316,7 @@ test "storeWildcardRRsets bounds the synthesized entry by the validator's ttl ca
     // the signatures that verified the expansion would let aggressive
     // synthesis serve AD=1 answers from a dead proof.
     const alloc = testing.allocator;
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
     var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache };
 
@@ -5349,7 +5349,7 @@ test "cacheInsecureDelegation bounds the negative DS by the proof's ttl cap" {
     // An insecure-delegation verdict rests on a verified proof (no-DS NSEC or
     // a parent-signed unsupported-algorithm DS RRset); it must not outlive it.
     const alloc = testing.allocator;
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     defer cache.deinit();
 
     const zone = dns.Name{ .labels = &.{ "example", "com" } };

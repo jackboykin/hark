@@ -13,7 +13,9 @@ const RRsetCache = hark.cache.RRsetCache;
 const BenchResult = @import("main.zig").BenchResult;
 const bench_common = @import("bench_common.zig");
 
-const cache_size: u32 = 512;
+/// ~500 entries; fill to first eviction so every measured store evicts.
+const max_bytes: usize = 256 * 1024;
+const fill_max: u32 = 1024;
 const bench_iters: usize = 2000;
 const warmup: usize = 100;
 const labels_spec = [_][]const u8{ "k{d}", "test" };
@@ -32,13 +34,12 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     var cache = RRsetCache.init(.{
         .backing = backing,
-        .max_bytes = 64 * 1024 * 1024,
-        .max_entries = cache_size,
+        .max_bytes = max_bytes,
         .io = io,
     });
     defer cache.deinit();
 
-    const total_msgs = cache_size + bench_iters + warmup;
+    const total_msgs = fill_max + bench_iters + warmup;
     var msg_arena = std.heap.ArenaAllocator.init(backing);
     defer msg_arena.deinit();
     const msg_alloc = msg_arena.allocator();
@@ -52,23 +53,27 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     const root_zone = dns.Name{ .labels = &.{} };
 
-    // Fill cache
-    for (0..cache_size) |i| cache.storeResponse(messages[i], root_zone, .unchecked, std.math.maxInt(u32));
+    var next: usize = 0;
+    while (next < fill_max and cache.getStats().evictions == 0) : (next += 1) {
+        cache.storeResponse(messages[next], root_zone, .unchecked, std.math.maxInt(u32));
+    }
 
     var mark_arena = std.heap.ArenaAllocator.init(backing);
     defer mark_arena.deinit();
 
     // Warmup
-    for (0..warmup) |i| {
+    for (0..warmup) |_| {
         markAllVisited(&cache, &mark_arena);
-        cache.storeResponse(messages[cache_size + i], root_zone, .unchecked, std.math.maxInt(u32));
+        cache.storeResponse(messages[next], root_zone, .unchecked, std.math.maxInt(u32));
+        next += 1;
     }
 
     const samples = try allocator.alloc(i64, bench_iters);
     for (0..bench_iters) |i| {
         markAllVisited(&cache, &mark_arena);
         const t0 = monotonic.nowNs();
-        cache.storeResponse(messages[cache_size + warmup + i], root_zone, .unchecked, std.math.maxInt(u32));
+        cache.storeResponse(messages[next], root_zone, .unchecked, std.math.maxInt(u32));
+        next += 1;
         const t1 = monotonic.nowNs();
         samples[i] = @intCast(t1 - t0);
     }

@@ -393,9 +393,9 @@ fn lowerNameBuf(buf: *[dns.max_dotted_len + 1]u8, name: []const u8) ?[]const u8 
 /// `& mask`; `max_shards` is the inline array size (raise for >64-core hosts).
 const max_shards: u32 = 64;
 const min_shards: u32 = 16;
-/// Keep expected entries per shard above this so the SIEVE second-chance ring
-/// (scan cap 64) stays meaningful; this caps shard count on small caches.
-const min_entries_per_shard: u32 = 128;
+/// ~512 B/entry (cache_mem: 422 unsigned, 678 P-256, 775 RSA); 128 keeps
+/// SIEVE's 64-probe scan meaningful.
+const min_bytes_per_shard: usize = 128 * 512;
 
 /// Shard from the top bits: the same hash goes to `getIndexAdapted`, which
 /// probes from the low ones, so sharing them clusters every shard's index.
@@ -405,10 +405,11 @@ inline fn shardIndex(h: u32, mask: u32) u32 {
 }
 
 /// Active shard count: a power of two in [min_shards, max_shards], rounded up
-/// toward `reader_concurrency` but capped by the per-shard entry budget.
-fn deriveShardCount(reader_concurrency: u32, max_entries: u32) u32 {
+/// toward `reader_concurrency` but capped by the per-shard byte budget.
+fn deriveShardCount(reader_concurrency: u32, max_bytes: usize) u32 {
     const by_concurrency = std.math.ceilPowerOfTwo(u32, @max(reader_concurrency, 1)) catch max_shards;
-    const by_budget = std.math.floorPowerOfTwo(u32, @max(max_entries / min_entries_per_shard, 1));
+    const shards_in_budget: u32 = @intCast(@min(max_bytes / min_bytes_per_shard, max_shards));
+    const by_budget = std.math.floorPowerOfTwo(u32, @max(shards_in_budget, 1));
     return std.math.clamp(@min(by_concurrency, by_budget), min_shards, max_shards);
 }
 
@@ -464,21 +465,16 @@ const Shard = struct {
     // (they were contending one line per shard); write-path counters below run
     // under the exclusive lock and are rare.
     stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// SIEVE only, not expired sweeps.
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
     cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Subset of `evictions` triggered by byte-budget pressure rather than entry-count pressure.
-    byte_pressure_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
-/// The configured caps, enforced as configured: one byte counter and one entry
-/// counter for the whole cache, so what `getStats` reports is what eviction
-/// compares against. Every shard's write path hits both counters
-/// concurrently, hence the atomics; the wrapper keeps them on their own line,
-/// away from the read-only config fields below.
+/// Cache-wide, so stats report what eviction compares against. Shards write
+/// it concurrently; the wrapper isolates its line.
 const Budget = struct {
     counting: CountingAllocator align(std.atomic.cache_line),
-    max_entries: u32,
     entries: std.atomic.Value(u32) = .init(0),
 };
 
@@ -507,12 +503,9 @@ pub const RRsetCache = struct {
         call: *const fn (ctx: *anyopaque, name: []const u8, rtype: dns.RType) void,
     };
 
-    /// `max_bytes` and `max_entries` bound the whole cache; see evictIfNeeded
-    /// for how a shard enforces them.
     pub const Config = struct {
         backing: Allocator,
         max_bytes: usize,
-        max_entries: u32,
         io: std.Io,
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
@@ -524,21 +517,18 @@ pub const RRsetCache = struct {
         reader_concurrency: u32 = 1,
         /// Explicit shard-count override (power of 2, <= max_shards). The
         /// contention bench pins this for a fixed-config regression gate; null
-        /// derives from reader_concurrency + the entry budget.
+        /// derives from reader_concurrency + the byte budget.
         shards: ?u32 = null,
     };
 
     pub fn init(cfg: Config) RRsetCache {
-        const sc = cfg.shards orelse deriveShardCount(cfg.reader_concurrency, cfg.max_entries);
+        const sc = cfg.shards orelse deriveShardCount(cfg.reader_concurrency, cfg.max_bytes);
         std.debug.assert(sc >= 1 and sc <= max_shards and std.math.isPowerOfTwo(sc));
         var cache: RRsetCache = .{
             .shards = undefined,
             .shard_count = sc,
             .shard_mask = sc - 1,
-            .budget = .{
-                .counting = CountingAllocator.init(cfg.backing, cfg.max_bytes, .slot),
-                .max_entries = cfg.max_entries,
-            },
+            .budget = .{ .counting = CountingAllocator.init(cfg.backing, cfg.max_bytes, .slot) },
             .io = cfg.io,
             .now_fn = &monotonic.nowSec,
             .serve_stale_ttl = cfg.serve_stale_ttl,
@@ -564,7 +554,6 @@ pub const RRsetCache = struct {
     /// `stores == entries + evictions` on these values.
     pub const Stats = struct {
         entries: u32 = 0,
-        max_entries: u32 = 0,
         memory_bytes: usize = 0,
         max_bytes: usize = 0,
         hits: u64 = 0,
@@ -573,8 +562,6 @@ pub const RRsetCache = struct {
         evictions: u64 = 0,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
         cap_exhausted_evictions: u64 = 0,
-        /// Subset of `evictions` triggered by byte-budget pressure.
-        byte_pressure_evictions: u64 = 0,
         prefetch_eligible: u64 = 0,
         stale_hits: u64 = 0,
         /// Subset of `misses` where the entry existed but had expired. See
@@ -585,7 +572,6 @@ pub const RRsetCache = struct {
     pub fn getStats(self: *RRsetCache) Stats {
         var stats: Stats = .{
             .entries = self.budget.entries.load(.monotonic),
-            .max_entries = self.budget.max_entries,
             .memory_bytes = self.budget.counting.current_bytes.load(.monotonic),
             .max_bytes = self.budget.counting.max_bytes,
         };
@@ -593,7 +579,6 @@ pub const RRsetCache = struct {
             stats.stores += shard.stores.load(.monotonic);
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
-            stats.byte_pressure_evictions += shard.byte_pressure_evictions.load(.monotonic);
         }
         // Read-path counters are striped per-thread (see ReadCounters); sum them.
         for (&self.read_counters) |*rc| {
@@ -1271,28 +1256,20 @@ pub const RRsetCache = struct {
         _ = slot.shard.stores.fetchAdd(1, .monotonic);
     }
 
-    /// Caps are cache-wide; the shard being written evicts on their behalf,
-    /// under the lock it already holds. Hash placement makes a shard's write
-    /// rate track its size, so eviction lands where the entries are. An
-    /// insert into an empty shard has nothing to evict and lands anyway, so
-    /// `entries` can exceed `max_entries` by up to shard_count - 1; the byte
-    /// budget is the hard bound.
+    /// The writing shard evicts for the whole cache; hash placement makes its
+    /// write rate track its size. An empty shard can't evict, so bytes can hit
+    /// 100%: the allocator's refusal is the hard bound, 87.5% keeps slack
+    /// ahead of it.
     fn evictIfNeeded(self: *RRsetCache, shard: *Shard) void {
         const count: u32 = @intCast(shard.map.count());
         if (count == 0) return;
-        const total = self.budget.entries.load(.monotonic);
-        // Byte pressure: the counting allocator silently refuses writes once the
-        // byte budget fills, latching the cache closed. Trigger SIEVE eviction
-        // pre-emptively at 87.5% so the next allocation has slack to land.
         const bytes = self.budget.counting.current_bytes.load(.monotonic);
-        const byte_pressure = bytes > self.budget.counting.max_bytes / 8 * 7;
-
-        if (total >= self.budget.max_entries or byte_pressure) {
-            if (byte_pressure) _ = shard.byte_pressure_evictions.fetchAdd(1, .monotonic);
+        const max = self.budget.counting.max_bytes;
+        if (bytes > max / 8 * 7) {
             self.sieveEvict(shard, count);
             return;
         }
-        if (total < self.budget.max_entries / 4 * 3) return;
+        if (bytes < max / 4 * 3) return;
         self.sweepExpired(shard, count);
     }
 
@@ -1300,7 +1277,7 @@ pub const RRsetCache = struct {
     /// expired one. Clears visited flags as it goes for gradual SIEVE decay.
     /// Note: shares `shard.hand` with sieveEvict, so each call advances the SIEVE
     /// cursor (1-8 positions) — visited-bit decay is coupled to write rate, not
-    /// access rate. Hand-wrap takes at least max_entries / (8 × calls_per_sec).
+    /// access rate. Hand-wrap takes at least shard entries / (8 × calls_per_sec).
     fn sweepExpired(self: *RRsetCache, shard: *Shard, count: u32) void {
         if (count == 0) return;
         const now = self.now_fn();
@@ -1313,7 +1290,6 @@ pub const RRsetCache = struct {
             const expired = now >= shard.map.values()[i].expiresAt();
             if (expired) {
                 self.removeAtIndex(shard, i);
-                _ = shard.evictions.fetchAdd(1, .monotonic);
                 shard.hand = if (i < shard.map.count()) i else 0;
                 return;
             }
@@ -1423,7 +1399,7 @@ fn testNowSeconds() i64 {
 }
 
 fn makeTestCache(alloc: Allocator) RRsetCache {
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     return cache;
 }
@@ -1554,7 +1530,6 @@ test "an RRset with a 0-TTL member is never cached, floor or no floor" {
     var cache = RRsetCache.init(.{
         .backing = alloc,
         .max_bytes = 1024 * 1024,
-        .max_entries = 100,
         .io = testing.io,
         .min_ttl = 60,
         .serve_stale_ttl = 30,
@@ -2225,18 +2200,16 @@ test "cache eviction when full" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    // Well past the cap so every shard has been touched by the time it binds
-    // (an insert into an empty shard is the one way past it).
-    const cap: u32 = 128;
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = cap, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 64 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
+    var name_buf: [32]u8 = undefined;
+    var last: []const u8 = "";
     var i: u32 = 0;
-    while (i < cap * 4) : (i += 1) {
-        var name_buf: [32]u8 = undefined;
-        const dotted = try std.fmt.bufPrint(&name_buf, "n{d}.com", .{i});
-        const parsed = try dns.parseDottedName(alloc, dotted);
+    while (i < 1024) : (i += 1) {
+        last = try std.fmt.bufPrint(&name_buf, "n{d}.com", .{i});
+        const parsed = try dns.parseDottedName(alloc, last);
         const answers = try alloc.alloc(dns.ResourceRecord, 1);
         answers[0] = .{ .name = parsed, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
         const response = makeTestResponse(answers);
@@ -2244,10 +2217,15 @@ test "cache eviction when full" {
         dns.freeMessage(alloc, response);
     }
 
-    try testing.expect(cache.getStats().entries <= cap);
+    const stats = cache.getStats();
+    try testing.expect(stats.evictions > 0);
     var summed: u32 = 0;
     for (cache.shards[0..cache.shard_count]) |*shard| summed += @intCast(shard.map.count());
-    try testing.expectEqual(summed, cache.getStats().entries);
+    try testing.expectEqual(summed, stats.entries);
+    // eviction made room; the allocator didn't refuse
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expect(cache.lookup(arena.allocator(), last, .a, .in) != null);
 }
 
 test "cache deep copy independence" {
@@ -2320,7 +2298,7 @@ test "cache prefetch flag at 10 percent TTL" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .prefetch = true });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .prefetch = true });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2470,7 +2448,7 @@ test "cache serve stale within window" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2500,7 +2478,7 @@ test "cache lookup is_stale flag set on stale hit, clear on fresh (RFC 8767 §6)
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2531,7 +2509,7 @@ test "cache serve stale beyond window returns null" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2555,7 +2533,7 @@ test "SERVFAIL never serves stale" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .serve_stale_ttl = 3600 });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2599,7 +2577,7 @@ test "RFC 9520: SERVFAIL TTL clamped to 5 minutes" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2617,7 +2595,7 @@ test "cacheServfail caches with sub-5-minute TTL" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2639,7 +2617,7 @@ test "cache min TTL floor" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 100, .io = testing.io, .min_ttl = 300 });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .min_ttl = 300 });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2827,7 +2805,7 @@ test "shard distribution is reasonable for random names" {
     test_time = 1000;
 
     const n_keys: u32 = 1024;
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 16 * 1024 * 1024, .max_entries = n_keys * 2, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 16 * 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2854,24 +2832,24 @@ test "shard distribution is reasonable for random names" {
 }
 
 test "deriveShardCount tracks concurrency, floored and budget-capped" {
+    const mib = 1024 * 1024;
     // Floor: low concurrency / tiny cache still gets min_shards.
-    try testing.expectEqual(min_shards, deriveShardCount(1, 100));
+    try testing.expectEqual(min_shards, deriveShardCount(1, 64 * 1024));
     // Default server concurrency: workers=2 * (1 + resolution_threads=4) = 10 -> 16.
-    try testing.expectEqual(@as(u32, 16), deriveShardCount(10, 10_000));
+    try testing.expectEqual(@as(u32, 16), deriveShardCount(10, 12 * mib));
     // High concurrency on a healthy cache scales up, capped at max_shards.
-    try testing.expectEqual(max_shards, deriveShardCount(160, 10_000));
-    try testing.expectEqual(max_shards, deriveShardCount(1000, 1_000_000));
-    // Budget cap: a tight cache (2000/128=15 -> 8) is lifted back to the floor.
-    try testing.expectEqual(min_shards, deriveShardCount(160, 2000));
+    try testing.expectEqual(max_shards, deriveShardCount(160, 12 * mib));
+    try testing.expectEqual(max_shards, deriveShardCount(1000, 1024 * mib));
+    try testing.expectEqual(@as(u32, 16), deriveShardCount(160, mib));
+    try testing.expectEqual(@as(u32, 32), deriveShardCount(160, 2 * mib));
+    try testing.expectEqual(min_shards, deriveShardCount(160, mib / 2));
 }
 
 test "eviction stays within shard" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    // Cache-wide cap of 4. Hammer one shard past it; the shard being written
-    // does the evicting, so a victim on a different shard must survive.
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 4, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2880,6 +2858,7 @@ test "eviction stays within shard" {
     const target_shard = (victim_shard +% 1) & cache.shard_mask;
 
     try storeTestA(&cache, alloc, &.{ "victim", "test" }, 300, .{ 1, 2, 3, 4 });
+    cache.budget.counting.max_bytes = cache.budget.counting.current_bytes.load(.monotonic) * 4;
 
     var stored: u32 = 0;
     var probe: u32 = 0;
@@ -2911,7 +2890,6 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
     var cache = RRsetCache.init(.{
         .backing = failing_alloc,
         .max_bytes = 1024 * 1024,
-        .max_entries = 64,
         .io = testing.io,
     });
     cache.now_fn = &testNowSeconds;
@@ -2947,7 +2925,7 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
 
 test "evictIfNeeded triggers SIEVE on byte pressure" {
     // Regression: previously evictIfNeeded only checked entry count. When the
-    // byte budget filled at fewer entries than max_entries, the key-name dupe
+    // byte budget filled before the (then separate) entry cap, the key-name dupe
     // in prepareSlot started failing and the shard latched closed — silent
     // capacity loss with zero evictions recorded. The fix adds byte pressure
     // (≥87.5% full) as an eviction trigger.
@@ -2958,7 +2936,7 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -2994,7 +2972,6 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
     // Release synthetic bytes so deinit accounting checks out.
     _ = cache.budget.counting.current_bytes.fetchSub(bump, .monotonic);
 
-    try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) == 1);
     try testing.expect(shard0.evictions.load(.monotonic) == 1);
     try testing.expect(shard0.map.count() == 3);
 }
@@ -3010,7 +2987,7 @@ test "byte-pressure check happens before key-name dupe" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
@@ -3057,7 +3034,7 @@ test "byte-pressure check happens before key-name dupe" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), newname, .a, .in) != null);
-    try testing.expect(shard0.byte_pressure_evictions.load(.monotonic) >= 1);
+    try testing.expect(shard0.evictions.load(.monotonic) >= 1);
 }
 
 fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
@@ -3067,7 +3044,6 @@ fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
     var cache = RRsetCache.init(.{
         .backing = failing_alloc,
         .max_bytes = 1024 * 1024,
-        .max_entries = 64,
         .io = testing.io,
     });
     cache.now_fn = &testNowSeconds;
@@ -3135,7 +3111,7 @@ test "anti-downgrade holds under byte pressure" {
     const alloc = testing.allocator;
     test_time = 1000;
 
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .max_entries = 10_000, .io = testing.io });
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 

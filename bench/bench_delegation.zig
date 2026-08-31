@@ -30,7 +30,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     var cache = RRsetCache.init(.{
         .backing = backing,
         .max_bytes = 64 * 1024 * 1024,
-        .max_entries = n_zones * 8,
         .io = io,
     });
     defer cache.deinit();

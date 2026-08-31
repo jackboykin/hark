@@ -39,9 +39,7 @@ pub const ServerConfig = struct {
     /// behind `-Dtesting=true`; production binaries reject the key.
     allow_loopback_upstreams: bool,
     cache_size: usize,
-    cache_entries: u32,
     key_cache_size: usize,
-    key_cache_entries: u32,
     prefetch: bool,
     prefetch_cousin: bool,
     /// Hot-set expiry refresh: names re-demanded after death earn a
@@ -168,9 +166,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
         .cache_size = 12 * 1024 * 1024,
-        .cache_entries = 10_000,
         .key_cache_size = 4 * 1024 * 1024,
-        .key_cache_entries = 2_000,
         .prefetch = false,
         .prefetch_cousin = true,
         .prefetch_hot = false,
@@ -245,9 +241,7 @@ const config_schema = [_]SectionSpec{
     } },
     .{ .name = "cache", .keys = &.{
         .{ .name = "size", .kind = .integer },
-        .{ .name = "entries", .kind = .integer },
         .{ .name = "key-cache-size", .kind = .integer },
-        .{ .name = "key-cache-entries", .kind = .integer },
         .{ .name = "prefetch", .kind = .boolean },
         .{ .name = "prefetch-cousin", .kind = .boolean },
         .{ .name = "prefetch-hot", .kind = .boolean },
@@ -457,9 +451,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
         if (try nonNegative(usize, cache, "size")) |v| cfg.cache_size = v;
-        if (try nonNegative(u32, cache, "entries")) |v| cfg.cache_entries = v;
         if (try nonNegative(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
-        if (try nonNegative(u32, cache, "key-cache-entries")) |v| cfg.key_cache_entries = v;
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (cache.getBool("prefetch-cousin")) |p| cfg.prefetch_cousin = p;
         if (cache.getBool("prefetch-hot")) |p| cfg.prefetch_hot = p;
@@ -681,7 +673,6 @@ test "default config" {
 
     try testing.expectEqual(@as(usize, 2), cfg.listen.len);
     try testing.expectEqual(@as(usize, 12 * 1024 * 1024), cfg.cache_size);
-    try testing.expectEqual(@as(u32, 10_000), cfg.cache_entries);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(true, cfg.qname_minimization);
     try testing.expect(cfg.workers >= 1);
@@ -699,7 +690,6 @@ test "parse full config" {
         \\
         \\[cache]
         \\size = 8388608
-        \\entries = 5000
     );
     defer cfg.deinit();
 
@@ -709,7 +699,6 @@ test "parse full config" {
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(false, cfg.qname_minimization);
     try testing.expectEqual(@as(usize, 8388608), cfg.cache_size);
-    try testing.expectEqual(@as(u32, 5000), cfg.cache_entries);
 }
 
 test "empty config uses defaults" {
@@ -1031,7 +1020,7 @@ test "an out-of-range integer is rejected, never clamped" {
     // everywhere, so every nonNegative caller rejects too.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[cache]
-        \\entries = 99999999999
+        \\serve-stale-ttl = 99999999999
     ));
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[cache]

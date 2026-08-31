@@ -255,7 +255,6 @@ fn run(
     var cache = RRsetCache.init(.{
         .backing = counted_backing,
         .max_bytes = 256 * 1024 * 1024,
-        .max_entries = (m_rrsets + warmup_rrsets) * 4,
         .io = io,
     });
     defer cache.deinit();

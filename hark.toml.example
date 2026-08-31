@@ -26,9 +26,7 @@ root-hints = []               # override IANA roots ("ip" or "ip:port");
 
 [cache]
 size = 12582912               # answer cache, bytes
-entries = 10000               # answer cache, max entries
 key-cache-size = 4194304      # DNSSEC key cache, bytes
-key-cache-entries = 2000      # DNSSEC key cache, max entries
 prefetch = false              # refresh popular entries before they expire
 prefetch-cousin = true        # fetch the matching A/AAAA alongside
 prefetch-hot = false          # keep re-demanded names fresh past expiry

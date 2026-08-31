@@ -132,7 +132,6 @@ fn runSweep(
     var cache = RRsetCache.init(.{
         .backing = backing,
         .max_bytes = 64 * 1024 * 1024,
-        .max_entries = n_entries * 2,
         .io = io,
         // Pin the max shard count: this bench is the fixed-config regression
         // gate, not a per-deployment derivation (which the server does from

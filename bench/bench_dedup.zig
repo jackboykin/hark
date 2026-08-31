@@ -37,7 +37,6 @@ fn populateCache(allocator: std.mem.Allocator, io: std.Io) !CacheSetup {
     var cache = RRsetCache.init(.{
         .backing = backing,
         .max_bytes = 64 * 1024 * 1024,
-        .max_entries = n_entries * 2,
         .io = io,
     });
     errdefer cache.deinit();

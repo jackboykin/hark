@@ -26,7 +26,7 @@ const Signing = enum {
 
 fn bytesPerEntry(io: std.Io, signing: Signing) !usize {
     const backing = std.heap.page_allocator;
-    var cache = RRsetCache.init(.{ .backing = backing, .max_bytes = 64 * 1024 * 1024, .max_entries = n * 2, .io = io });
+    var cache = RRsetCache.init(.{ .backing = backing, .max_bytes = 64 * 1024 * 1024, .io = io });
     defer cache.deinit();
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
