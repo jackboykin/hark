@@ -20,7 +20,7 @@ const labels_spec = [_][]const u8{ "k{d}", "test" };
 
 fn markAllVisited(cache: *RRsetCache, mark_arena: *std.heap.ArenaAllocator) void {
     _ = mark_arena.reset(.retain_capacity);
-    for (&cache.shards) |*shard| {
+    for (cache.shards[0..cache.shard_count]) |*shard| {
         for (shard.map.keys()) |k| {
             _ = cache.lookup(mark_arena.allocator(), k.name, k.rtype, k.rclass);
         }
