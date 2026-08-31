@@ -1,3 +1,6 @@
+//! B/entry unsigned and signed with the two signature sizes that dominate
+//! public DNS; signed is what dnssec=true sees.
+
 const std = @import("std");
 const hark = @import("hark");
 const dns = hark.dns;
@@ -7,7 +10,21 @@ const BenchResult = @import("main.zig").BenchResult;
 
 const n: u32 = 10_000;
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
+const Signing = enum {
+    none,
+    p256,
+    rsa2048,
+
+    fn sigLen(self: Signing) usize {
+        return switch (self) {
+            .none => 0,
+            .p256 => 64,
+            .rsa2048 => 256,
+        };
+    }
+};
+
+fn bytesPerEntry(io: std.Io, signing: Signing) !usize {
     const backing = std.heap.page_allocator;
     var cache = RRsetCache.init(.{ .backing = backing, .max_bytes = 64 * 1024 * 1024, .max_entries = n * 2, .io = io });
     defer cache.deinit();
@@ -15,6 +32,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     defer arena.deinit();
     const a = arena.allocator();
     const root = dns.Name{ .labels = &.{} };
+    const signer = dns.Name{ .labels = &.{ "example", "com" } };
+    const signature = try a.alloc(u8, signing.sigLen());
+    @memset(signature, 0xAB);
     for (0..n) |i| {
         const idx: u32 = @intCast(i);
         const labels = try a.alloc([]const u8, 3);
@@ -40,10 +60,37 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
             strs[0] = try std.fmt.allocPrint(a, "v=spf1 include:_spf.example.com ~all {d}", .{idx});
             break :blk .{ .name = name, .rtype = .txt, .rclass = .in, .ttl = 3600, .rdata = .{ .txt = .{ .strings = strs } } };
         };
-        cache.storeResponse(try bench_common.singleAnswerMessage(a, rr), root, .unchecked, std.math.maxInt(u32));
+        if (signing == .none) {
+            cache.storeResponse(try bench_common.singleAnswerMessage(a, rr), root, .unchecked, std.math.maxInt(u32));
+            continue;
+        }
+        const answers = try a.alloc(dns.ResourceRecord, 2);
+        answers[0] = rr;
+        answers[1] = .{ .name = name, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = .{
+            .type_covered = rr.rtype,
+            .algorithm = if (signing == .p256) .ecdsap256sha256 else .rsasha256,
+            .labels = 3,
+            .original_ttl = 3600,
+            .sig_expiration = std.math.maxInt(u32),
+            .sig_inception = 0,
+            .key_tag = 12345,
+            .signer_name = signer,
+            .signature = signature,
+        } } };
+        var msg = bench_common.single_answer_header;
+        msg.an_count = 2;
+        cache.storeResponse(.{ .header = msg, .questions = &.{}, .answers = answers }, root, .secure, std.math.maxInt(u32));
     }
     const st = cache.getStats();
-    std.debug.print("  entries={d} memory_bytes={d} B/entry={d} sizeof CachedRecord={d} Pack={d} CacheEntry={d}\n", .{ st.entries, st.memory_bytes, st.memory_bytes / st.entries, @sizeOf(hark.cache.CachedRecord), @sizeOf(hark.cache.Pack), @sizeOf(hark.cache.CacheEntry) });
+    if (st.entries != n) return error.StoreRefused;
+    return st.memory_bytes / st.entries;
+}
+
+pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
+    std.debug.print("  sizeof CachedRecord={d} Pack={d} CacheEntry={d}\n", .{ @sizeOf(hark.cache.CachedRecord), @sizeOf(hark.cache.Pack), @sizeOf(hark.cache.CacheEntry) });
+    inline for (std.meta.tags(Signing)) |signing| {
+        std.debug.print("  {s}: {d} B/entry\n", .{ @tagName(signing), try bytesPerEntry(io, signing) });
+    }
     const samples = try allocator.alloc(i64, 1);
     samples[0] = 0;
     return .{ .samples_ns = samples, .label = "memory probe" };
