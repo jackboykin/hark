@@ -67,6 +67,11 @@ pub fn close(fd: posix.fd_t) void {
     _ = linux.close(fd);
 }
 
+/// A pending io_uring read then completes with EOF.
+pub fn shutdown(fd: posix.fd_t) void {
+    _ = linux.shutdown(fd, linux.SHUT.RDWR);
+}
+
 pub fn listen(fd: posix.fd_t, backlog: u31) !void {
     return switch (linux.errno(linux.listen(fd, backlog))) {
         .SUCCESS => {},

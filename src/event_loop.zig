@@ -49,6 +49,9 @@ pub const Result = union(enum) {
     recv: RecvResult,
     accept: AcceptResult,
     read: ReadResult,
+    /// 0 on close or error.
+    stream: usize,
+    timer: void,
 };
 
 pub const RecvResult = struct {
@@ -103,6 +106,9 @@ const Slot = struct {
         accept: struct { addr: na.PosixAddress, addr_len: posix.socklen_t },
         /// read owns a small buffer — signalfd/eventfd payloads only.
         read: [read_buf_size]u8,
+        /// Caller's buffer outlives the op.
+        stream: void,
+        timer: linux.kernel_timespec,
     };
 
     fn init() Slot {
@@ -239,6 +245,7 @@ pub const EventLoop = struct {
             .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.RECVMSG) },
             .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.ACCEPT) },
             .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.READ) },
+            .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.TIMEOUT) },
             .{ .opcode = .SQE_OP, .arg = @backingInt(linux.IORING_OP.ASYNC_CANCEL) },
             .{ .opcode = .SQE_FLAGS_ALLOWED, .arg = linux.IOSQE_BUFFER_SELECT },
             // Activates the register allowlist (tracked apart from SQE ops on
@@ -345,6 +352,27 @@ pub const EventLoop = struct {
         return id;
     }
 
+    pub fn readStream(self: *EventLoop, fd: posix.fd_t, buf: []u8, context: *anyopaque) !OperationId {
+        const id = try self.initOp(.{ .stream = {} }, context);
+        errdefer self.freeSlot(id);
+        var sqe = try self.ring.get_sqe();
+        sqe.prep_read(fd, buf, 0);
+        sqe.user_data = id;
+        return id;
+    }
+
+    pub fn timer(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
+        const id = try self.initOp(.{ .timer = .{
+            .sec = ms / 1000,
+            .nsec = @as(i64, ms % 1000) * std.time.ns_per_ms,
+        } }, context);
+        errdefer self.freeSlot(id);
+        var sqe = try self.ring.get_sqe();
+        sqe.prep_timeout(&self.slots[id].state.timer, 0, 0);
+        sqe.user_data = id;
+        return id;
+    }
+
     /// Test-only: the one way to force a multishot termination on demand.
     /// Production never cancels; the process exits with its ops armed.
     fn cancel(self: *EventLoop, target_id: OperationId) !void {
@@ -436,6 +464,8 @@ pub const EventLoop = struct {
                     }
                     completion.result = .{ .read = res };
                 },
+                .stream => completion.result = .{ .stream = @intCast(@max(cqe.res, 0)) },
+                .timer => completion.result = .{ .timer = {} },
             }
 
             completion.terminated = free_after;
@@ -509,6 +539,49 @@ test "Slot stays lean — read ops must not drag packet-sized buffers back in" {
     // read buffer plus header change. If this fires, some variant grew a
     // packet-sized payload — packets belong in the multishot buffer ring.
     try testing.expect(@sizeOf(Slot) <= read_buf_size + 64);
+}
+
+test "readStream fills the caller's buffer, EOFs on shutdown; timer ticks" {
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    var fds: [2]i32 = undefined;
+    try testing.expectEqual(@as(usize, 0), linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds));
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    var buf: [16]u8 = undefined;
+    var rctx: u8 = 1;
+    var tctx: u8 = 2;
+    _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
+    _ = try loop.timer(5, @ptrCast(&tctx));
+    _ = try sys.write(fds[1], "hello");
+
+    var got: ?usize = null;
+    var ticked = false;
+    var completions: [max_operations]Completion = undefined;
+    for (0..20) |_| {
+        for (try loop.tick(&completions)) |c| switch (c.result) {
+            .stream => |s| got = s,
+            .timer => ticked = true,
+            else => {},
+        };
+        if (got != null and ticked) break;
+    }
+    try testing.expectEqualStrings("hello", buf[0..got.?]);
+    try testing.expect(ticked);
+
+    _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
+    sys.shutdown(fds[1]);
+    var eof = false;
+    for (0..20) |_| {
+        for (try loop.tick(&completions)) |c| switch (c.result) {
+            .stream => |s| eof = s == 0,
+            else => {},
+        };
+        if (eof) break;
+    }
+    try testing.expect(eof);
 }
 
 test "EventLoop create/destroy" {

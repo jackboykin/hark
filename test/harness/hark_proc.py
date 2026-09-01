@@ -44,6 +44,8 @@ class HarkConfig:
     rebinding_allow_zones: list[str] = dataclasses.field(default_factory=list)
     rebinding_extra_block: list[str] = dataclasses.field(default_factory=list)
     rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
+    # None = hark default (5000).
+    tcp_idle_timeout_ms: int | None = None
     # Pass `--verbose` so per-query debug lines reach the test log.
     # Cheap; failing-scenario triage is impossible without them.
     verbose: bool = True
@@ -66,6 +68,10 @@ class HarkConfig:
             f'listen = ["{self.listen_ip}:{self.listen_port}"]',
             f"workers = {self.workers}",
             f"minimal-responses = {str(self.minimal_responses).lower()}",
+        ]
+        if self.tcp_idle_timeout_ms is not None:
+            lines.append(f"tcp-idle-timeout-ms = {self.tcp_idle_timeout_ms}")
+        lines += [
             "",
             "[resolver]",
             f"qname-minimization = {str(self.qname_minimization).lower()}",

@@ -207,6 +207,7 @@ const PerThreadArena = struct {
 const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
 
 /// .bg payload: [qtype u16 BE][BgKind u8][name]
+/// .tcp payload: [*TcpClient usize LE][query wire]
 const Protocol = enum { udp, tcp, bg };
 
 // No field defaults: a defaulted Slot inside `slots: ... = @splat(.{})`
@@ -361,7 +362,7 @@ const WorkQueue = struct {
 
 // ── Context tags for the event loop ────────────────────────────────────
 
-const CtxTag = enum { udp_recv, tcp_accept, signal };
+const CtxTag = enum { udp_recv, tcp_accept, tcp_read, tick, signal };
 
 const Ctx = struct {
     tag: CtxTag,
@@ -369,6 +370,10 @@ const Ctx = struct {
 };
 
 const max_listen_addrs = 8;
+
+/// Ring slots left by listeners, signalfd, tick.
+const max_tcp_clients_per_worker = max_operations - 2 * max_listen_addrs - 2;
+const tick_ms = 1000;
 
 /// Consecutive unreadable signalfd completions tolerated before the worker
 /// stops trying. Only a genuinely broken fd reaches this.
@@ -770,7 +775,6 @@ pub const Server = struct {
             .server = self,
             .loop = rig.loop,
             .tcp_pool = &do53_tcp_pool,
-            .max_tcp_clients = @max(1, self.config.resolution_threads / 2),
             .pool = .{ .size = self.config.resolution_threads },
         };
 
@@ -1075,6 +1079,51 @@ fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, a
     };
 }
 
+// ── TCP clients ────────────────────────────────────────────────────────
+
+const TcpClient = struct {
+    fd: posix.fd_t,
+    peer: na.Address,
+    ctx: Ctx,
+    last_activity_ns: i128,
+    buf: [2 + max_frame]u8 = undefined,
+    len: usize = 0,
+    served: u32 = 0,
+    refs: std.atomic.Value(u32) = .init(1),
+    write_mutex: Io.Mutex = .init,
+
+    const max_frame = max_work_query_bytes - @sizeOf(usize);
+
+    fn ref(self: *TcpClient) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn unref(self: *TcpClient, allocator: mem.Allocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        sys.close(self.fd);
+        allocator.destroy(self);
+    }
+
+    fn write(self: *TcpClient, io: Io, data: []const u8, timeout_ms: u32) void {
+        self.write_mutex.lockUncancelable(io);
+        defer self.write_mutex.unlock(io);
+        const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        tcpWriteMessage(io, self.fd, data, deadline_ns) orelse {};
+    }
+};
+
+const Reply = union(enum) {
+    udp: struct { sock: posix.fd_t, addr: na.Address },
+    tcp: *TcpClient,
+
+    fn peer(self: Reply) na.Address {
+        return switch (self) {
+            .udp => |u| u.addr,
+            .tcp => |c| c.peer,
+        };
+    }
+};
+
 // ── WorkerState ────────────────────────────────────────────────────────
 // Per-thread state that handles the actual serve loop.
 
@@ -1082,8 +1131,8 @@ const WorkerState = struct {
     server: *Server,
     loop: *EventLoop,
     tcp_pool: ?*TcpConnectionPool = null,
-    active_tcp_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    max_tcp_clients: u32 = 0,
+    tcp_clients: [max_tcp_clients_per_worker]*TcpClient = undefined,
+    tcp_count: usize = 0,
     pool: recursive.PoolOccupancy,
     recv_pta: PerThreadArena = undefined,
 
@@ -1095,16 +1144,6 @@ const WorkerState = struct {
         ctx.tcp_pool = self.tcp_pool;
         ctx.pool = &self.pool;
         return ctx;
-    }
-
-    /// Try to claim a TCP client slot. Returns true on success (caller
-    /// must fetchSub when done). CAS loop prevents overcount.
-    fn claimTcpSlot(self: *WorkerState) bool {
-        while (true) {
-            const current = self.active_tcp_clients.load(.monotonic);
-            if (current >= self.max_tcp_clients) return false;
-            if (self.active_tcp_clients.cmpxchgStrong(current, current + 1, .monotonic, .monotonic) == null) return true;
-        }
     }
 
     fn logCacheStats(self: *const WorkerState) void {
@@ -1126,6 +1165,79 @@ const WorkerState = struct {
             return false;
         };
         return true;
+    }
+
+    fn acceptTcp(self: *WorkerState, fd: posix.fd_t, peer: na.Address) void {
+        // BCP 140.
+        if (self.server.config.allow_from.len > 0 and !acl.allow(self.server.config.allow_from, peer)) return sys.close(fd);
+        if (self.tcp_count == max_tcp_clients_per_worker) {
+            log.debug("TCP client limit reached ({d}), dropping connection", .{max_tcp_clients_per_worker});
+            return sys.close(fd);
+        }
+        const client = self.server.allocator.create(TcpClient) catch return sys.close(fd);
+        client.* = .{ .fd = fd, .peer = peer, .ctx = .{ .tag = .tcp_read, .fd = fd }, .last_activity_ns = monotonic.nowNs() };
+        self.tcp_clients[self.tcp_count] = client;
+        self.tcp_count += 1;
+        sys.setNoDelay(fd);
+        if (!armed(self.loop.readStream(fd, &client.buf, @ptrCast(&client.ctx)), "TCP read")) self.dropTcpClient(client);
+    }
+
+    /// False: close.
+    fn feedTcp(self: *WorkerState, client: *TcpClient, n: usize) bool {
+        client.len += n;
+        client.last_activity_ns = monotonic.nowNs();
+        var start: usize = 0;
+        while (client.len - start >= 2) {
+            const frame_len: usize = mem.readInt(u16, client.buf[start..][0..2], .big);
+            if (frame_len == 0 or frame_len > TcpClient.max_frame) return false;
+            if (client.len - start < 2 + frame_len) break;
+            if (client.served >= self.server.config.tcp_queries_per_conn) return false;
+            client.served += 1;
+            if (!self.dispatchTcp(client, client.buf[start + 2 ..][0..frame_len])) return false;
+            start += 2 + frame_len;
+        }
+        if (start > 0) {
+            mem.copyForwards(u8, &client.buf, client.buf[start..client.len]);
+            client.len -= start;
+        }
+        return true;
+    }
+
+    fn dispatchTcp(self: *WorkerState, client: *TcpClient, wire: []const u8) bool {
+        var payload: [max_work_query_bytes]u8 = undefined;
+        mem.writeInt(usize, payload[0..@sizeOf(usize)], @intFromPtr(client), .little);
+        @memcpy(payload[@sizeOf(usize)..][0..wire.len], wire);
+        client.ref();
+        if (self.server.work_queue.push(payload[0 .. @sizeOf(usize) + wire.len], client.peer, client.fd, .tcp)) return true;
+        client.unref(self.server.allocator);
+        _ = self.server.tcp_queue_drops.fetchAdd(1, .monotonic);
+        log.debug("resolution queue full, dropping TCP client", .{});
+        return false;
+    }
+
+    /// Only with no read pending on `buf`.
+    fn dropTcpClient(self: *WorkerState, client: *TcpClient) void {
+        for (self.tcp_clients[0..self.tcp_count], 0..) |c, i| {
+            if (c == client) {
+                self.tcp_count -= 1;
+                self.tcp_clients[i] = self.tcp_clients[self.tcp_count];
+                break;
+            }
+        }
+        client.unref(self.server.allocator);
+    }
+
+    /// RFC 7766 §6.2.3.
+    fn sweepTcpIdle(self: *WorkerState) void {
+        const idle_ns: i128 = @as(i128, self.server.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
+        const now = monotonic.nowNs();
+        for (self.tcp_clients[0..self.tcp_count]) |c| {
+            if (c.refs.load(.acquire) > 1) {
+                c.last_activity_ns = now;
+            } else if (now - c.last_activity_ns > idle_ns) {
+                sys.shutdown(c.fd);
+            }
+        }
     }
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) noreturn {
@@ -1156,6 +1268,8 @@ const WorkerState = struct {
         }
 
         var signal_armed = sig_fd >= 0 and !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
+        var tick_ctx = Ctx{ .tag = .tick, .fd = -1 };
+        var tick_armed = armed(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)), "tick");
 
         // Consecutive unreadable signalfd completions; see the `.signal` arm.
         var signal_misfires: u32 = 0;
@@ -1238,39 +1352,24 @@ const WorkerState = struct {
                     },
                     .tcp_accept => {
                         switch (c.result) {
-                            .accept => |acc| {
-                                if (acc.err == null and acc.fd >= 0) {
-                                    // BCP 140: drop TCP from disallowed sources by
-                                    // closing the connection without reading. ACL
-                                    // check is gated on a non-empty list to avoid
-                                    // a getpeername syscall in the open-recursive
-                                    // / loopback-only common case.
-                                    if (self.server.config.allow_from.len > 0) {
-                                        const peer = na.getPeerName(acc.fd) catch {
-                                            sys.close(acc.fd);
-                                            continue;
-                                        };
-                                        if (!acl.allow(self.server.config.allow_from, peer)) {
-                                            sys.close(acc.fd);
-                                            continue;
-                                        }
-                                    }
-                                    if (!self.server.work_queue.push(&.{}, na.initIp4(.{ 0, 0, 0, 0 }, 0), acc.fd, .tcp)) {
-                                        // Drop silently (no SERVFAIL): we haven't read the
-                                        // query yet so we don't have an ID, and reading it
-                                        // would consume the pool capacity we're protecting.
-                                        // Client sees TCP reset and should retry (typically
-                                        // over UDP).
-                                        _ = self.server.tcp_queue_drops.fetchAdd(1, .monotonic);
-                                        log.warn("resolution queue full, dropping TCP client", .{});
-                                        sys.close(acc.fd);
-                                    }
-                                }
-                            },
+                            .accept => |acc| if (acc.err == null and acc.fd >= 0) self.acceptTcp(acc.fd, acc.addr),
                             else => {},
                         }
                         const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
                         tcp_armed[idx] = armed(self.loop.accept(ctx.fd, @ptrCast(ctx)), "TCP accept");
+                    },
+                    .tcp_read => {
+                        const client: *TcpClient = @alignCast(@fieldParentPtr("ctx", ctx));
+                        const got = c.result.stream;
+                        if (got == 0 or !self.feedTcp(client, got) or
+                            !armed(self.loop.readStream(client.fd, client.buf[client.len..], @ptrCast(&client.ctx)), "TCP read"))
+                        {
+                            self.dropTcpClient(client);
+                        }
+                    },
+                    .tick => {
+                        self.sweepTcpIdle();
+                        tick_armed = armed(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)), "tick");
                     },
                 }
             }
@@ -1280,6 +1379,7 @@ const WorkerState = struct {
             if (sig_fd >= 0 and !signal_armed) {
                 signal_armed = !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
             }
+            if (!tick_armed) tick_armed = !std.meta.isError(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)));
 
             // Retry re-registration for any listeners that failed above.
             // Placed after completion processing so freshly freed slots are available.
@@ -1435,107 +1535,6 @@ const WorkerState = struct {
         return true;
     }
 
-    fn processTcpClient(
-        self: *WorkerState,
-        client_fd: posix.fd_t,
-        transports: Transports,
-        query_pta: *PerThreadArena,
-    ) void {
-        defer sys.close(client_fd);
-
-        // Switch accepted fd to blocking mode. Load-bearing for the
-        // poll-before-netRead path: with NONBLOCK + no SO_*TIMEO, netRead
-        // would return EAGAIN, which netReadPosix treats as errnoBug
-        // (panic in debug). Clearing NONBLOCK is what makes pollReady's
-        // "no other reader on this fd" + "poll guarantees readability"
-        // story actually preclude EAGAIN reaching netRead.
-        const flags = sys.fcntl(client_fd, posix.F.GETFL, 0) catch return;
-        const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-        _ = sys.fcntl(client_fd, posix.F.SETFL, flags & ~nonblock_bit) catch return;
-        sys.setNoDelay(client_fd);
-
-        // A TCP socket's remote address is fixed for its lifetime, so
-        // resolve once per connection rather than per query.
-        var peer_buf: [64]u8 = undefined;
-        const peer_str = if (na.getPeerName(client_fd)) |peer|
-            na.format(peer, &peer_buf)
-        else |_|
-            "?";
-
-        const tcp_idle_timeout_ns: i128 = @as(i128, self.server.config.tcp_idle_timeout_ms) * std.time.ns_per_ms;
-        var tcp_queries: u32 = 0;
-        while (tcp_queries < self.server.config.tcp_queries_per_conn) {
-            tcp_queries += 1;
-            const read_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-            var len_buf: [2]u8 = undefined;
-            tcpReadExactBlocking(self.server.io, client_fd, &len_buf, read_deadline_ns) orelse return;
-            const msg_len = mem.readInt(u16, &len_buf, .big);
-            if (msg_len == 0) return;
-
-            var query_buf: [dns.max_message_len]u8 = undefined;
-            tcpReadExactBlocking(self.server.io, client_fd, query_buf[0..msg_len], read_deadline_ns) orelse return;
-            sys.setQuickAck(client_fd);
-
-            const alloc = query_pta.reset();
-            var response_wire: [dns.max_message_len]u8 = undefined;
-            const data = query_buf[0..msg_len];
-
-            const query = dns.parseMessage(alloc, data) catch {
-                if (data.len >= 3) {
-                    const id = mem.readInt(u16, data[0..2], .big);
-                    const op_bits: u4 = @truncate(data[2] >> 3);
-                    const w = serializeErrorResponse(&response_wire, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{}) orelse return;
-                    tcpWriteMessage(self.server.io, client_fd, w, read_deadline_ns) orelse return;
-                    continue;
-                }
-                return;
-            };
-
-            if (validateQuery(query)) |fail| {
-                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions) orelse return;
-                tcpWriteMessage(self.server.io, client_fd, w, read_deadline_ns) orelse return;
-                continue;
-            }
-
-            const question = query.questions[0];
-            var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-            const name_str = question.name.formatInto(&name_buf);
-
-            const start_ns = monotonic.nowNs();
-            const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, transports) catch |err| {
-                const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-                var qtype_buf: [24]u8 = undefined;
-                log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms (tcp, {s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, @errorName(err) });
-                self.server.cache.cacheServfail(name_str, question.qtype);
-                self.recordClientOutcome(false);
-                const w = serializeErrorResponse(&response_wire, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions) orelse return;
-                const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-                tcpWriteMessage(self.server.io, client_fd, w, write_deadline_ns) orelse return;
-                continue;
-            };
-            const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-            var qtype_buf: [24]u8 = undefined;
-            var rcode_buf: [24]u8 = undefined;
-            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms (tcp)", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms });
-
-            // RFC 7828: advertise our TCP idle timeout so the stub can
-            // size its keepalive expectations. Units are 100 ms.
-            var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
-            ctx.tcp_keepalive = @intCast(self.server.config.tcp_idle_timeout_ms / 100);
-            ctx.minimal_responses = self.server.config.minimal_responses;
-            ctx.rebinding = &self.server.config.rebinding;
-            const wire = buildResponseWire(&response_wire, ctx, result.message, alloc) orelse return;
-            const write_deadline_ns: i128 = monotonic.nowNs() + tcp_idle_timeout_ns;
-            tcpWriteMessage(self.server.io, client_fd, wire, write_deadline_ns) orelse return;
-
-            self.recordClientOutcome(result.from_cache);
-            self.dispatchPrefetches(result, name_str);
-            if (query.header.flags.cd) {
-                self.scheduleCd1Revalidate(name_str, question.qtype);
-            }
-        }
-    }
-
     /// One bump per answered client query — see Server.client_cache_hits.
     /// SERVFAILs count as misses (the client waited on failed upstream
     /// work); malformed/refused queries are never counted.
@@ -1614,15 +1613,9 @@ const WorkerState = struct {
                 .udp => {
                     // item.payload borrows from the slot; parseMessage
                     // copies what it keeps into the per-thread arena, so
-                    // releasing right after processUdpQuery is safe.
+                    // releasing right after processQuery is safe.
                     defer self.server.work_queue.release(item.reservation);
-                    self.processUdpQuery(
-                        item.sock_fd,
-                        item.payload,
-                        item.client_addr,
-                        transports,
-                        &query_pta,
-                    );
+                    self.processQuery(.{ .udp = .{ .sock = item.sock_fd, .addr = item.client_addr } }, item.payload, transports, &query_pta);
                 },
                 .bg => {
                     defer self.server.work_queue.release(item.reservation);
@@ -1632,79 +1625,91 @@ const WorkerState = struct {
                     runBgTask(self.resolverContext(), transports, query_pta.reset(), item.payload[3..], qtype, kind);
                 },
                 .tcp => {
-                    // Release before processTcpClient: the TCP connection
-                    // can live for seconds and the slot is just an fd
-                    // courier — holding it ties up queue capacity for
-                    // nothing.
-                    self.server.work_queue.release(item.reservation);
-                    if (self.claimTcpSlot()) {
-                        defer _ = self.active_tcp_clients.fetchSub(1, .monotonic);
-                        self.processTcpClient(item.sock_fd, transports, &query_pta);
-                    } else {
-                        // Drop silently for the same reason as the queue-full path above.
-                        log.debug("TCP client limit reached ({d}), dropping connection", .{self.max_tcp_clients});
-                        sys.close(item.sock_fd);
-                    }
+                    defer self.server.work_queue.release(item.reservation);
+                    const client: *TcpClient = @ptrFromInt(mem.readInt(usize, item.payload[0..@sizeOf(usize)], .little));
+                    defer client.unref(self.server.allocator);
+                    self.processQuery(.{ .tcp = client }, item.payload[@sizeOf(usize)..], transports, &query_pta);
                 },
             }
         }
     }
 
-    fn processUdpQuery(
-        self: *WorkerState,
-        sock: posix.fd_t,
-        data: []const u8,
-        client_addr: na.Address,
-        transports: Transports,
-        query_pta: *PerThreadArena,
-    ) void {
+    fn processQuery(self: *WorkerState, reply: Reply, data: []const u8, transports: Transports, query_pta: *PerThreadArena) void {
         const alloc = query_pta.reset();
 
-        const query_msg = dns.parseMessage(alloc, data) catch {
+        const query = dns.parseMessage(alloc, data) catch {
             @branchHint(.cold);
             if (data.len >= 3) {
                 const id = mem.readInt(u16, data[0..2], .big);
                 // Best-effort opcode echo from raw header even when parse failed.
                 const op_bits: u4 = @truncate(data[2] >> 3);
-                self.sendErrorUdp(sock, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{}, client_addr);
+                self.sendError(reply, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{});
             }
             return;
         };
 
-        if (validateQuery(query_msg)) |fail| {
-            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, fail.rcode, fail.extended_rcode, query_msg.header.flags.rd, query_msg.questions, client_addr);
+        if (validateQuery(query)) |fail| {
+            self.sendError(reply, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions);
             return;
         }
 
-        const question = query_msg.questions[0];
+        const question = query.questions[0];
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name_str = question.name.formatInto(&name_buf);
+        var peer_buf: [64]u8 = undefined;
+        const peer_str = na.format(reply.peer(), &peer_buf);
+        const tag: []const u8 = if (reply == .tcp) " tcp" else "";
 
         const start_ns = monotonic.nowNs();
-        var peer_buf: [64]u8 = undefined;
-        const peer_str = na.format(client_addr, &peer_buf);
-        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query_msg.header.flags.cd, transports) catch |err| {
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, transports) catch |err| {
             @branchHint(.cold);
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-            var qtype_buf1: [24]u8 = undefined;
-            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms ({s})", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf1), elapsed_ms, @errorName(err) });
+            var qtype_buf: [24]u8 = undefined;
+            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, @errorName(err) });
             self.server.cache.cacheServfail(name_str, question.qtype);
             self.recordClientOutcome(false);
-            self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
+            self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
-        var qtype_buf2: [24]u8 = undefined;
-        var rcode_buf2: [24]u8 = undefined;
-        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ peer_str, query_msg.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf2), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf2), elapsed_ms });
+        var qtype_buf: [24]u8 = undefined;
+        var rcode_buf: [24]u8 = undefined;
+        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms{s}", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms, tag });
 
-        self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
+        self.sendResponse(reply, query, result.message, alloc);
 
         self.recordClientOutcome(result.from_cache);
         self.dispatchPrefetches(result, name_str);
-
-        if (query_msg.header.flags.cd) {
+        if (query.header.flags.cd) {
             self.scheduleCd1Revalidate(name_str, question.qtype);
+        }
+    }
+
+    fn sendError(self: *WorkerState, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question) void {
+        switch (reply) {
+            .udp => |u| self.sendErrorUdp(u.sock, id, opcode, rcode, extended_rcode, rd, questions, u.addr),
+            .tcp => |c| {
+                var buf: [dns.max_udp_payload]u8 = undefined;
+                const wire = serializeErrorResponse(&buf, id, opcode, rcode, extended_rcode, rd, questions) orelse return;
+                c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);
+            },
+        }
+    }
+
+    fn sendResponse(self: *WorkerState, reply: Reply, query: dns.Message, result: dns.Message, alloc: mem.Allocator) void {
+        switch (reply) {
+            .udp => |u| self.sendUdpResponseFromResult(u.sock, query, result, alloc, u.addr),
+            .tcp => |c| {
+                var buf: [dns.max_message_len]u8 = undefined;
+                var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
+                // RFC 7828, units of 100 ms.
+                ctx.tcp_keepalive = @intCast(self.server.config.tcp_idle_timeout_ms / 100);
+                ctx.minimal_responses = self.server.config.minimal_responses;
+                ctx.rebinding = &self.server.config.rebinding;
+                const wire = buildResponseWire(&buf, ctx, result, alloc) orelse
+                    return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions);
+                c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);
+            },
         }
     }
 
@@ -1796,20 +1801,6 @@ const WorkerState = struct {
 };
 
 // ── TCP helpers (blocking I/O) ─────────────────────────────────────────
-//
-// Thin wrappers over sys.readExactDeadline/writeAllDeadline (userspace
-// deadline enforcement — see comments there). All errors collapse to
-// `null` ("drop client, move on") because per-client recovery has no
-// useful shape; a clean FIN (`error.Closed`) is routine and stays
-// silent, everything else logs at debug for operational visibility so a
-// future shotgun-style outage doesn't have to be diagnosed blind.
-
-fn tcpReadExactBlocking(io: Io, fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?void {
-    sys.readExactDeadline(io, fd, buf, deadline_ns) catch |err| {
-        if (err != error.Closed) log.debug("tcp client read: {s}", .{@errorName(err)});
-        return null;
-    };
-}
 
 fn tcpWriteAllBlocking(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     sys.writeAllDeadline(io, fd, data, deadline_ns) catch |err| {
