@@ -158,30 +158,16 @@ pub const NsSelector = struct {
         return &self.shards[shardIndex(ArmKeyContext.hash(.{}, key))];
     }
 
-    /// Returned ordering: live servers (sorted by Thompson sample, descending)
-    /// followed by dead servers (shuffled). `live_count` tells callers where
-    /// the boundary is so they can skip the per-server `isDead` re-check on
-    /// the primary path; a final fallback can still reach `order[live_count..]`
-    /// when every live attempt has failed.
-    pub const Selection = struct {
-        order: []const usize,
-        live_count: usize,
-    };
-
-    /// Select servers using Thompson Sampling. Returns ordered indices
-    /// into `servers`: best Thompson draw first, dead servers last.
-    /// RttCache is still consulted for dead-server status.
     pub fn selectServers(
         self: *NsSelector,
         zone: dns.Name,
         servers: []const na.Address,
         rtt_cache: ?*RttCache,
         order_buf: *[max_order]usize,
-    ) Selection {
+    ) []const usize {
         const zh = zoneHash(zone);
 
         var live_count: usize = 0;
-        var dead_count: usize = 0;
         var samples: [max_order]f32 = undefined;
         const now_ms = if (rtt_cache) |rc| rc.nowMs() else 0;
 
@@ -189,13 +175,7 @@ pub const NsSelector = struct {
         // the common case. Discount + read are fused in one locked region.
         for (servers, 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
-
-            const is_dead = if (rtt_cache) |rc| rc.isDead(addr_key, now_ms) else false;
-            if (is_dead) {
-                order_buf[max_order - 1 - dead_count] = i;
-                dead_count += 1;
-                continue;
-            }
+            if (rtt_cache) |rc| if (rc.isDead(addr_key, now_ms)) continue;
 
             const arm_key = ArmKey{ .zone_hash = zh, .addr_key = addr_key };
             const state = self.discountAndRead(arm_key);
@@ -214,20 +194,7 @@ pub const NsSelector = struct {
         }
 
         sortByScoreDesc(order_buf[0..live_count], samples[0..live_count]);
-
-        if (dead_count > 0) {
-            var dead_buf: [max_order]usize = undefined;
-            for (0..dead_count) |d| {
-                dead_buf[d] = order_buf[max_order - 1 - d];
-            }
-            rand.fastShuffle(usize, self.io, dead_buf[0..dead_count]);
-            @memcpy(order_buf[live_count..][0..dead_count], dead_buf[0..dead_count]);
-        }
-
-        return .{
-            .order = order_buf[0 .. live_count + dead_count],
-            .live_count = live_count,
-        };
+        return order_buf[0..live_count];
     }
 
     pub fn recordOutcome(
@@ -464,7 +431,7 @@ test "selectServers basic ordering" {
     var order_buf: [max_order]usize = undefined;
     for (0..100) |_| {
         const order = sel.selectServers(zone, &servers, null, &order_buf);
-        if (order.order.len > 0 and order.order[0] == 1) server1_first += 1;
+        if (order.len > 0 and order[0] == 1) server1_first += 1;
     }
     // Should be first >90% of the time
     try testing.expect(server1_first > 90);
@@ -493,7 +460,7 @@ test "discount causes re-exploration" {
     var server0_first: usize = 0;
     for (0..200) |_| {
         const order = sel.selectServers(zone, &servers, null, &order_buf);
-        if (order.order.len > 0 and order.order[0] == 0) server0_first += 1;
+        if (order.len > 0 and order[0] == 0) server0_first += 1;
     }
     // After heavy discounting, server 0 should get picked sometimes (re-explored)
     try testing.expect(server0_first > 10);
@@ -549,9 +516,9 @@ test "per-zone isolation" {
     var b1_first: usize = 0;
     for (0..100) |_| {
         const oa = sel.selectServers(zone_a, &servers, null, &order_buf);
-        if (oa.order.len > 0 and oa.order[0] == 0) a0_first += 1;
+        if (oa.len > 0 and oa[0] == 0) a0_first += 1;
         const ob = sel.selectServers(zone_b, &servers, null, &order_buf);
-        if (ob.order.len > 0 and ob.order[0] == 1) b1_first += 1;
+        if (ob.len > 0 and ob[0] == 1) b1_first += 1;
     }
     try testing.expect(a0_first > 90);
     try testing.expect(b1_first > 90);

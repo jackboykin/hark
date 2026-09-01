@@ -1769,21 +1769,17 @@ pub const RecursiveResolver = struct {
         query_name: []const u8,
         query_type: dns.RType,
         servers: []const na.Address,
-        sel: NsSelector.Selection,
+        sel: []const usize,
         parent_zone: dns.Name,
     ) error{OutOfMemory}!?StaggeredResponse {
-        // Collect up to max_staggered_legs distinct-IP servers from the
-        // live prefix of `sel.order`. selectServers already classified
-        // dead-vs-live via RttCache.isDead and put live first; iterating
-        // `[0..sel.live_count]` skips the dead tail without a second
-        // lock+probe per server. Racing duplicate IPs wouldn't add
-        // birthday entropy (RFC 5452) or latency diversity — dedupe by IP.
+        // Duplicate IPs add no birthday entropy (RFC 5452).
         var leg_idxs: [max_staggered_legs]usize = undefined;
         var leg_count: usize = 0;
-        outer: for (sel.order[0..sel.live_count]) |idx| {
+        outer: for (sel) |idx| {
             for (leg_idxs[0..leg_count]) |prev| {
                 if (na.ipEqual(servers[idx], servers[prev])) continue :outer;
             }
+            if (self.rtt_cache) |rc| if (!rc.admit(AddressKey.fromAddress(servers[idx]), rc.nowMs())) continue;
             leg_idxs[leg_count] = idx;
             leg_count += 1;
             if (leg_count >= max_staggered_legs) break;
@@ -1944,10 +1940,7 @@ pub const RecursiveResolver = struct {
         else blk: {
             rand.fastShuffle(na.Address, self.io, servers);
             for (0..servers.len) |idx| order_buf[idx] = idx;
-            break :blk NsSelector.Selection{
-                .order = order_buf[0..servers.len],
-                .live_count = servers.len,
-            };
+            break :blk order_buf[0..servers.len];
         };
 
         var last_server_failure: ?dns.Message = null;
@@ -1957,8 +1950,8 @@ pub const RecursiveResolver = struct {
         // top candidates, not just responders (a capable one can lose the race
         // forever). Surface: egress filter, damping, max_probes.
         if (self.encrypted_ns) |oc| {
-            for (sel.order[0..@min(sel.live_count, max_staggered_legs)]) |idx| oc.discover(servers[idx]);
-            for (sel.order[0..sel.live_count]) |idx| {
+            for (sel[0..@min(sel.len, max_staggered_legs)]) |idx| oc.discover(servers[idx]);
+            for (sel) |idx| {
                 if (oc.getStatus(servers[idx]) != .capable) continue;
                 if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |tls_response| {
                     if (tls_response.header.flags.rcode.isServerError()) {
@@ -1973,24 +1966,18 @@ pub const RecursiveResolver = struct {
         }
 
         // ── Staggered NS racing ──
-        if (sel.order.len >= 2 and self.stagger_ms > 0) {
+        if (sel.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
                 if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
                 return .{ .message = stag.message, .responding_server = stag.server };
             }
         }
 
-        server_loop: for (sel.order, 0..) |server_idx, server_i| {
+        server_loop: for (sel, 0..) |server_idx, server_i| {
             const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
-
-            // Live servers come first; dead are appended at the tail. Skip
-            // dead servers unless we have no live ones (`live_count == 0`,
-            // partial-zone outage — every NS gets a retry shot) or this is
-            // the very last entry (always try *something*).
-            const is_last_server = (server_i + 1 >= sel.order.len);
-            const dead_skip = server_i >= sel.live_count and sel.live_count > 0 and !is_last_server;
-            if (dead_skip) continue;
+            if (self.rtt_cache) |rc| if (!rc.admit(addr_key, rc.nowMs())) continue;
+            const is_last_server = server_i + 1 == sel.len;
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
@@ -2267,14 +2254,12 @@ pub const RecursiveResolver = struct {
         const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
         const try_count = @min(servers.len, max_servers);
-        // 0 when no rtt_cache — `RttCache.isDead` returns false against now=0,
-        // which is the right "always live" fallback.
         const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
         for (servers[0..try_count], 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
             if (self.rtt_cache) |rc| {
-                if (rc.isDead(addr_key, now_ms) and i + 1 < try_count) continue;
+                if (!rc.admit(addr_key, now_ms)) continue;
             }
 
             // DS/DNSKEY fetches are upstream packets too; draw from the same

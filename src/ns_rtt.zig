@@ -20,8 +20,12 @@ const max_timeout_ms: u32 = 10_000;
 /// Consecutive timeouts before marking dead (Knot).
 const dead_threshold: u8 = 4;
 
-/// How long a dead server stays dead (Knot).
-const dead_duration_ms: i64 = 1_000;
+/// Not shorter than `dead_probe_timeout_ms`, so probes never overlap.
+const dead_duration_ms: i64 = 2_000;
+const dead_max_shifts: u8 = 4;
+
+/// Knot KR_CONN_RTT_MAX.
+const dead_probe_timeout_ms: u32 = 2_000;
 
 /// Maximum backoff doublings (Knot: cap at 256x initial).
 const max_backoff_shifts: u8 = 8;
@@ -69,15 +73,14 @@ const shard_mask: u32 = shard_count - 1;
 /// sorts by descending alignment — a bare aligned atomic lands at offset 0 with
 /// the rwlock behind it. Wrapping rounds `@sizeOf` to a full line, which works.
 const DeathGate = struct {
-    v: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0),
+    v: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
 };
 
 const Shard = struct {
     entries: EntryMap,
     rwlock: ?std.Io.RwLock,
-    /// High-water mark of any `dead_until_ms` in this shard, read without the
-    /// rwlock by `isDead`'s fast path — hence a line of its own.
-    latest_dead_until_ms: DeathGate = .{},
+    /// Lock-free gate; a count so a lapsed window still takes the lock.
+    dead_marked: DeathGate = .{},
 };
 
 pub const RttCache = struct {
@@ -152,8 +155,7 @@ pub const RttCache = struct {
             const delta: i64 = @intCast(@abs(gop.value_ptr.srtt_us - rtt_us));
             gop.value_ptr.rttvar_us = 3 * @divTrunc(gop.value_ptr.rttvar_us, 4) + @divTrunc(delta, 4);
             gop.value_ptr.srtt_us = 7 * @divTrunc(gop.value_ptr.srtt_us, 8) + @divTrunc(rtt_us, 8);
-            gop.value_ptr.consecutive_timeouts = 0;
-            gop.value_ptr.dead_until_ms = 0;
+            revive(shard, gop.value_ptr);
 
             // Min-RTT tracking: re-anchor if stale, else take the running min.
             // Re-anchoring lets the floor track upward on route changes.
@@ -201,18 +203,12 @@ pub const RttCache = struct {
                 .min_rtt_stamp_ms = 0,
             };
         } else {
-            if (gop.value_ptr.consecutive_timeouts < 255) {
-                gop.value_ptr.consecutive_timeouts += 1;
-            }
-            if (gop.value_ptr.consecutive_timeouts >= dead_threshold) {
-                const new_deadline = self.now_fn() + dead_duration_ms;
-                gop.value_ptr.dead_until_ms = new_deadline;
-                // Bump the shard's lock-free death gate. Held under exclusive
-                // rwlock so no other writer can interleave; .release pairs with
-                // the .acquire in isDead so a fast-path reader that sees the
-                // new high-water also sees the dead_until_ms write above.
-                const cur = shard.latest_dead_until_ms.v.load(.monotonic);
-                if (new_deadline > cur) shard.latest_dead_until_ms.v.store(new_deadline, .release);
+            const state = gop.value_ptr;
+            if (state.consecutive_timeouts < 255) state.consecutive_timeouts += 1;
+            if (state.consecutive_timeouts >= dead_threshold) {
+                if (state.consecutive_timeouts == dead_threshold)
+                    _ = shard.dead_marked.v.fetchAdd(1, .monotonic);
+                state.dead_until_ms = self.now_fn() + deadWindowMs(state.*);
             }
         }
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
@@ -224,9 +220,17 @@ pub const RttCache = struct {
         var it = shard.entries.iterator();
         while (it.next()) |kv| {
             if (std.meta.eql(kv.key_ptr.*, protected)) continue;
+            revive(shard, kv.value_ptr);
             shard.entries.removeByPtr(kv.key_ptr);
             return;
         }
+    }
+
+    fn revive(shard: *Shard, state: *RttState) void {
+        if (state.consecutive_timeouts >= dead_threshold)
+            _ = shard.dead_marked.v.fetchSub(1, .monotonic);
+        state.consecutive_timeouts = 0;
+        state.dead_until_ms = 0;
     }
 
     /// Clear death-tracking without an RTT sample (DoT successes must not
@@ -236,22 +240,30 @@ pub const RttCache = struct {
         if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlock(self.io);
         const state = shard.entries.getPtr(key) orelse return;
-        state.consecutive_timeouts = 0;
-        state.dead_until_ms = 0;
+        revive(shard, state);
     }
 
-    /// Check whether the server is currently marked dead. If `now_ms` is past
-    /// the shard's death high-water, no entry can be dead and the rwlock is
-    /// skipped — the dominant case under healthy upstream.
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardFor(key);
-        if (now_ms >= shard.latest_dead_until_ms.v.load(.acquire)) return false;
-
+        if (shard.dead_marked.v.load(.monotonic) == 0) return false;
         if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
         defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
-
         const state = shard.entries.get(key) orelse return false;
-        return state.dead_until_ms > now_ms;
+        return state.consecutive_timeouts >= dead_threshold and state.dead_until_ms > now_ms;
+    }
+
+    /// A dead server admits one sender per lapsed window. Ask at send
+    /// time, not ranking, or the claim is wasted on a skipped server.
+    pub fn admit(self: *RttCache, key: AddressKey, now_ms: i64) bool {
+        const shard = self.shardFor(key);
+        if (shard.dead_marked.v.load(.monotonic) == 0) return true;
+        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
+        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        const state = shard.entries.getPtr(key) orelse return true;
+        if (state.consecutive_timeouts < dead_threshold) return true;
+        if (state.dead_until_ms > now_ms) return false;
+        state.dead_until_ms = now_ms + deadWindowMs(state.*);
+        return true;
     }
 
     pub fn nowMs(self: *const RttCache) i64 {
@@ -277,7 +289,13 @@ fn computeTimeout(state: RttState) u32 {
     const shift: u5 = @intCast(@min(state.consecutive_timeouts, max_backoff_shifts));
     const backed_off = @as(u64, base_ms) << shift;
 
-    return @intCast(@max(min_timeout_ms, @min(backed_off, max_timeout_ms)));
+    const cap = if (state.consecutive_timeouts >= dead_threshold) dead_probe_timeout_ms else max_timeout_ms;
+    return @intCast(@max(min_timeout_ms, @min(backed_off, cap)));
+}
+
+fn deadWindowMs(state: RttState) i64 {
+    const shift: u5 = @intCast(@min(state.consecutive_timeouts - dead_threshold, dead_max_shifts));
+    return dead_duration_ms << shift;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -499,7 +517,40 @@ test "recordTimeout increments consecutive count and marks dead" {
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     try testing.expect(cache.isDead(key, cache.nowMs()));
+    try testing.expectEqual(dead_probe_timeout_ms, cache.getTimeout(key));
 
     test_now_ms = 1000 + dead_duration_ms + 1;
+    try testing.expect(!cache.isDead(key, cache.nowMs()));
+    try testing.expect(cache.admit(key, cache.nowMs()));
+    try testing.expect(!cache.admit(key, cache.nowMs()));
+    try testing.expect(cache.isDead(key, cache.nowMs()));
+
+    cache.recordTimeout(key);
+    test_now_ms += 2 * dead_duration_ms - 1;
+    try testing.expect(!cache.admit(key, cache.nowMs()));
+    test_now_ms += 2;
+    try testing.expect(cache.admit(key, cache.nowMs()));
+    cache.recordSuccess(key, 100_000);
+    try testing.expect(cache.admit(key, cache.nowMs()));
+    try testing.expect(cache.admit(key, cache.nowMs()));
+    try testing.expectEqual(@as(u32, 0), cache.shardFor(key).dead_marked.v.load(.monotonic));
+}
+
+test "dead window escalation caps and eviction releases the gate" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io, .max_entries = shard_count });
+    defer cache.deinit();
+    cache.now_fn = &testNowMs;
+    test_now_ms = 1000;
+
+    const key = testAddr(3);
+    for (0..dead_threshold + dead_max_shifts + 3) |_| cache.recordTimeout(key);
+    try testing.expectEqual(dead_duration_ms << dead_max_shifts, deadWindowMs(cache.shardFor(key).entries.get(key).?));
+
+    // per-shard cap 1: this insert evicts the dead entry
+    const shard = cache.shardFor(key);
+    var octet: u8 = 4;
+    while (cache.shardFor(testAddr(octet)) != shard) octet += 1;
+    cache.recordSuccess(testAddr(octet), 100_000);
+    try testing.expectEqual(@as(u32, 0), shard.dead_marked.v.load(.monotonic));
     try testing.expect(!cache.isDead(key, cache.nowMs()));
 }
