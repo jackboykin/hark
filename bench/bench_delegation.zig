@@ -40,7 +40,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
 
     const root_zone = dns.Name{ .labels = &.{} };
 
-    // Shared TLD-level fixtures: NS "com" → "a.root-servers.net" and its A record.
     {
         const com = dns.Name{ .labels = try bench_common.dupeLabels(setup, &.{"com"}) };
         const rs = dns.Name{ .labels = try bench_common.dupeLabels(setup, &.{ "a", "root-servers", "net" }) };
@@ -48,7 +47,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         try storeRecord(&cache, setup, .{ .name = rs, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 198, 41, 0, 4 } } }, root_zone);
     }
 
-    // Per-zone fixtures: NS "zoneN.com" → "nsN.com" and its A record.
     const query_names = try allocator.alloc([]const u8, n_zones);
     errdefer allocator.free(query_names);
     var filled: usize = 0;

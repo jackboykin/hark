@@ -18,8 +18,6 @@ fn errLog(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
 }
 
-// ── ServerConfig ───────────────────────────────────────────────────────
-
 pub const ServerConfig = struct {
     listen: []Address,
     /// Override IANA root hints. Empty means "use the compile-time
@@ -152,8 +150,6 @@ const ConfigError = error{
     ConfigFileTooLarge,
     OutOfMemory,
 };
-
-// ── Defaults ───────────────────────────────────────────────────────────
 
 fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
     const listen = try allocator.alloc(Address, 2);
@@ -299,8 +295,6 @@ fn validateSchema(root: toml.Table) ConfigError!void {
 /// than a second would exceed most stub resolvers' own patience.
 const max_stagger_ms: u32 = 1000;
 
-// ── Parser ─────────────────────────────────────────────────────────────
-
 /// Out-of-range is rejected, not clamped: silent folding to `maxInt(T)`
 /// contradicts the strict schema the rest of this parser enforces, and it hid
 /// a footgun — `user = <huge>` clamped to `(uid_t)-1`, setresuid's "leave
@@ -345,7 +339,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     var cfg = try defaultConfig(allocator);
     errdefer cfg.deinit();
 
-    // [server] section
     if (parsed.table.getTable("server")) |server| {
         if (server.getStringArray("listen")) |addrs| {
             const new_listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
@@ -401,7 +394,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
     }
 
-    // [resolver] section
     if (parsed.table.getTable("resolver")) |resolver| {
         if (resolver.getStringArray("root-hints")) |addrs| {
             const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
@@ -448,7 +440,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
     }
 
-    // [cache] section
     if (parsed.table.getTable("cache")) |cache| {
         if (try nonNegative(usize, cache, "size")) |v| cfg.cache_size = v;
         if (try nonNegative(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
@@ -459,12 +450,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
     }
 
-    // [logging] section
     if (parsed.table.getTable("logging")) |logging| {
         if (logging.getBool("queries")) |q| cfg.log_queries = q;
     }
 
-    // [rebinding] section
     if (parsed.table.getTable("rebinding")) |reb| {
         if (reb.getBool("enabled")) |b| cfg.rebinding.enabled = b;
         if (reb.getStringArray("allow-zones")) |entries| {
@@ -630,7 +619,6 @@ fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port
 }
 
 fn parseAddress(s: []const u8, default_port: u16) ?Address {
-    // IPv6 with brackets: [::1]:53 or [::1]
     if (s.len > 0 and s[0] == '[') {
         const close = mem.indexOfScalar(u8, s, ']') orelse return null;
         const ip6_str = s[1..close];
@@ -664,8 +652,6 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     const ip4 = std.Io.net.Ip4Address.parse(s, default_port) catch return null;
     return .{ .ip4 = ip4 };
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "default config" {
     var cfg = try defaultConfig(testing.allocator);
@@ -853,7 +839,6 @@ test "unknown key rejected, not silently ignored" {
         \\[resolver]
         \\qname_minimization = false
     ));
-    // Top-level key outside any section.
     try testing.expectError(error.UnknownConfigKey, parseConfig(testing.allocator,
         \\dnssec = true
     ));
@@ -875,12 +860,10 @@ test "wrong-typed key rejected, default must not silently win" {
 }
 
 test "logging config" {
-    // Default: log_queries is false
     var cfg1 = try parseConfig(testing.allocator, "");
     defer cfg1.deinit();
     try testing.expectEqual(false, cfg1.log_queries);
 
-    // Explicit enable
     var cfg2 = try parseConfig(testing.allocator,
         \\[logging]
         \\queries = true
@@ -904,7 +887,6 @@ test "trust-anchors override parses and round-trips" {
     try testing.expectEqual(@as(u8, 2), @backingInt(ta.digest_type));
     try testing.expectEqual(@as(usize, 32), ta.digest.len);
 
-    // Accessor returns config-supplied when non-empty.
     const eff = cfg.trustAnchors();
     try testing.expectEqual(@as(usize, 1), eff.len);
     try testing.expectEqual(@as(u16, 20326), eff[0].key_tag);
@@ -921,22 +903,18 @@ test "trust-anchors accessor falls back to IANA defaults when empty" {
 
 test "trust-anchors rejects malformed entries" {
     if (!build_options.testing_enabled) return;
-    // Odd-length hex
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\trust-anchors = ["20326 8 2 ABC"]
     ));
-    // Missing field
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\trust-anchors = ["20326 8 2"]
     ));
-    // Extra field
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\trust-anchors = ["20326 8 2 AB EXTRA"]
     ));
-    // Non-hex digest
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\trust-anchors = ["20326 8 2 ZZZZ"]
@@ -946,7 +924,6 @@ test "trust-anchors rejects malformed entries" {
         \\[resolver]
         \\trust-anchors = ["20326 255 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
     ));
-    // Unknown digest type
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[resolver]
         \\trust-anchors = ["20326 8 99 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]

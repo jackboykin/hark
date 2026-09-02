@@ -4,8 +4,6 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
 /// Safe replacement for `@tagName`, which is illegal on an unnamed value of a
 /// non-exhaustive enum.
 pub fn safeTagName(val: anytype, buf: *[24]u8) []const u8 {
@@ -23,8 +21,6 @@ pub fn hasTcBit(bytes: []const u8) bool {
     const flags: Header.Flags = @bitCast(mem.readInt(u16, bytes[2..4], .big));
     return flags.tc;
 }
-
-// ── Constants ──────────────────────────────────────────────────────────
 
 pub const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
@@ -50,8 +46,6 @@ pub fn stageLengthPrefixed(buf: *[2 + edns_udp_payload]u8, wire_query: []const u
     @memcpy(buf[2..][0..wire_query.len], wire_query);
     return buf[0 .. 2 + wire_query.len];
 }
-
-// ── Enums ──────────────────────────────────────────────────────────────
 
 pub const OpCode = enum(u4) {
     query = 0,
@@ -117,8 +111,6 @@ pub const RClass = enum(u16) {
     _,
 };
 
-// ── Error Set ──────────────────────────────────────────────────────────
-
 pub const Error = error{
     EndOfData,
     LabelTooLong,
@@ -131,8 +123,6 @@ pub const Error = error{
     MultipleOptRecords,
     OutOfMemory,
 };
-
-// ── Header ─────────────────────────────────────────────────────────────
 
 pub const Header = struct {
     id: u16,
@@ -179,8 +169,6 @@ pub const Header = struct {
     }
 };
 
-// ── Name ───────────────────────────────────────────────────────────────
-
 pub const Name = struct {
     labels: []const []const u8,
 
@@ -194,7 +182,6 @@ pub const Name = struct {
         return self.formatImpl(buf, false);
     }
 
-    /// Like `formatInto` but lowercased (DNS is case-insensitive).
     pub fn formatLower(self: Name, buf: *[max_dotted_len + 1]u8) []const u8 {
         return self.formatImpl(buf, true);
     }
@@ -246,10 +233,8 @@ pub const Name = struct {
         return true;
     }
 
-    /// Returns true if self is equal to or a subdomain of parent.
-    /// E.g. "www.example.com".isSubdomainOf("example.com") == true
     pub fn isSubdomainOf(self: Name, parent: Name) bool {
-        if (parent.labels.len == 0) return true; // everything is under root
+        if (parent.labels.len == 0) return true;
         if (self.labels.len < parent.labels.len) return false;
         const offset = self.labels.len - parent.labels.len;
         for (parent.labels, 0..) |p_label, i| {
@@ -258,8 +243,6 @@ pub const Name = struct {
         return true;
     }
 };
-
-// ── RData types ────────────────────────────────────────────────────────
 
 pub const MxData = struct {
     preference: u16,
@@ -477,8 +460,6 @@ pub fn typeBitmapContains(bitmap: []const u8, rtype: RType) bool {
     return false;
 }
 
-// ── Base32hex (RFC 4648 §7) ───────────────────────────────────────────
-
 /// Decode base32hex (RFC 4648 §7) without padding.
 /// Returns the number of bytes written to `dest`.
 pub fn base32HexDecode(dest: []u8, encoded: []const u8) error{InvalidBase32}!usize {
@@ -531,7 +512,6 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
 
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
 
-/// Well-known EDNS option codes consumed/emitted by hark.
 pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
 const edns_opt_padding: u16 = 12; // RFC 7830
 
@@ -552,15 +532,11 @@ pub const OptRecord = struct {
     padding_block: u16 = 0,
 };
 
-// ── Question ───────────────────────────────────────────────────────────
-
 pub const Question = struct {
     name: Name,
     qtype: RType,
     qclass: RClass,
 };
-
-// ── ResourceRecord ─────────────────────────────────────────────────────
 
 pub const ResourceRecord = struct {
     name: Name,
@@ -574,8 +550,6 @@ pub const ResourceRecord = struct {
     wire_ttl_offset: u16 = 0,
 };
 
-// ── Message ────────────────────────────────────────────────────────────
-
 pub const Message = struct {
     header: Header,
     questions: []const Question,
@@ -584,8 +558,6 @@ pub const Message = struct {
     additionals: []const ResourceRecord = &.{},
     opt: ?OptRecord = null,
 };
-
-// ── Name / Query builders ──────────────────────────────────────────────
 
 /// Index of the first label-separating `.` at or after `start`, skipping
 /// escaped bytes. Works on any well-formed presentation string; `\DDD`
@@ -600,14 +572,12 @@ pub fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// True when `s[i]` is preceded by an odd run of backslashes, i.e. escaped.
 pub fn isEscapedAt(s: []const u8, i: usize) bool {
     var n: usize = 0;
     while (n < i and s[i - 1 - n] == '\\') n += 1;
     return n % 2 == 1;
 }
 
-/// Strip one unescaped trailing dot (`example.com.` → `example.com`).
 pub fn stripTrailingDot(s: []const u8) []const u8 {
     if (s.len > 0 and s[s.len - 1] == '.' and !isEscapedAt(s, s.len - 1))
         return s[0 .. s.len - 1];
@@ -763,8 +733,6 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
     };
 }
 
-// ── Parser ─────────────────────────────────────────────────────────────
-
 const Parser = struct {
     msg: []const u8,
     pos: usize,
@@ -828,7 +796,6 @@ const Parser = struct {
 
             const label_type = len_byte & 0xC0;
             if (label_type == 0xC0) {
-                // Compression pointer
                 if (cursor + 1 >= self.msg.len) return error.EndOfData;
                 jumps += 1;
                 if (jumps > max_jumps) return error.CompressionPointerLoop;
@@ -838,7 +805,6 @@ const Parser = struct {
                 if (offset >= cursor) return error.FormatError;
                 cursor = offset;
             } else if (label_type == 0x00) {
-                // Normal label
                 const label_len: usize = len_byte;
                 if (label_len > max_label_len) return error.LabelTooLong;
                 if (labels_len >= max_label_count) return error.TooManyLabels;
@@ -1026,7 +992,6 @@ const Parser = struct {
                 const flags = try self.readU8();
                 const iterations = try self.readU16();
                 const salt_len: usize = try self.readU8();
-                // Validate salt + hash_len byte fit within rdlength
                 if (5 + salt_len + 1 > rdlength) return error.InvalidRDataLength;
                 const salt = try self.readSlice(salt_len);
                 const hash_len: usize = try self.readU8();
@@ -1064,7 +1029,6 @@ const Parser = struct {
         }
     }
 
-    /// Parse a single-name RDATA (NS, CNAME, DNAME, PTR) with rdlength validation.
     fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
         const rdata_end = self.pos + rdlength;
         const name = try self.parseName(allocator);
@@ -1073,8 +1037,6 @@ const Parser = struct {
         return name;
     }
 };
-
-// ── EDNS option parsing ────────────────────────────────────────────────
 
 /// Advance past one wire-format name starting at `start`. Names are either
 /// a chain of length-prefixed labels terminated by a zero byte, or a 2-byte
@@ -1180,8 +1142,6 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
     if (pos != rdata.len) return error.FormatError;
     return try options.toOwnedSlice(allocator);
 }
-
-// ── Top-level parse ────────────────────────────────────────────────────
 
 /// Free a slice of wire-parsed RRs and its backing (error-path cleanup
 /// for `parseRRSection` results; success paths hand off to the Message).
@@ -1318,8 +1278,6 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     };
 }
 
-// ── Serializer ─────────────────────────────────────────────────────────
-
 fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
     return std.math.cast(T, val) orelse error.InvalidRDataLength;
 }
@@ -1372,7 +1330,7 @@ pub const Serializer = struct {
             try self.writeU8(@intCast(label.len));
             try self.writeSlice(label);
         }
-        try self.writeU8(0); // Root label terminator
+        try self.writeU8(0);
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
@@ -1400,7 +1358,7 @@ pub const Serializer = struct {
         try self.writeU32(rr.ttl);
 
         const rdlength_pos = self.pos;
-        try self.writeU16(0); // placeholder
+        try self.writeU16(0);
         const rdata_start = self.pos;
         try self.writeRData(rr.rdata);
         const rdata_len = self.pos - rdata_start;
@@ -1579,10 +1537,6 @@ pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![
     return buf[0..ser.pos];
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Tests
-// ════════════════════════════════════════════════════════════════════════
-
 test "header roundtrip" {
     const original = Header{
         .id = 0xABCD,
@@ -1644,7 +1598,6 @@ test "header parse known bytes" {
 }
 
 test "name parsing - uncompressed" {
-    // "example.com" = \x07example\x03com\x00
     const data = "\x07example\x03com\x00";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1691,16 +1644,13 @@ test "name parsing - self pointer rejection" {
 }
 
 test "full query packet parse" {
-    // A DNS query for "example.com" type A class IN
     var pkt: [max_udp_payload]u8 = undefined;
-    // Header: id=0x0001, RD=1, qdcount=1
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x0100, .big); // RD=1
     mem.writeInt(u16, pkt[4..6], 1, .big); // qdcount
     mem.writeInt(u16, pkt[6..8], 0, .big);
     mem.writeInt(u16, pkt[8..10], 0, .big);
     mem.writeInt(u16, pkt[10..12], 0, .big);
-    // Question: example.com A IN
     const qname = "\x07example\x03com\x00";
     @memcpy(pkt[12..][0..qname.len], qname);
     var pos: usize = 12 + qname.len;
@@ -1723,7 +1673,6 @@ test "full query packet parse" {
 }
 
 test "response with A records" {
-    // Build a response with 1 question + 1 A answer
     var pkt: [max_udp_payload]u8 = undefined;
     // Header: id=0x1234, QR=1, RD=1, RA=1, qdcount=1, ancount=1
     mem.writeInt(u16, pkt[0..2], 0x1234, .big);
@@ -1733,7 +1682,6 @@ test "response with A records" {
     mem.writeInt(u16, pkt[8..10], 0, .big);
     mem.writeInt(u16, pkt[10..12], 0, .big);
 
-    // Question
     const qname = "\x07example\x03com\x00";
     @memcpy(pkt[12..][0..qname.len], qname);
     var pos: usize = 12 + qname.len;
@@ -1742,7 +1690,6 @@ test "response with A records" {
     mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
     pos += 2;
 
-    // Answer: example.com (via pointer to offset 12), A, IN, TTL=300, 93.184.216.34
     pkt[pos] = 0xC0;
     pkt[pos + 1] = 0x0C; // pointer to offset 12
     pos += 2;
@@ -1773,7 +1720,6 @@ test "response with A records" {
 
 test "SOA record parsing" {
     var pkt: [max_udp_payload]u8 = undefined;
-    // Header: ancount=1
     mem.writeInt(u16, pkt[0..2], 0x0001, .big);
     mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1
     mem.writeInt(u16, pkt[4..6], 0, .big);
@@ -1782,7 +1728,6 @@ test "SOA record parsing" {
     mem.writeInt(u16, pkt[10..12], 0, .big);
 
     var pos: usize = 12;
-    // RR name: example.com
     const rrname = "\x07example\x03com\x00";
     @memcpy(pkt[pos..][0..rrname.len], rrname);
     pos += rrname.len;
@@ -1793,7 +1738,6 @@ test "SOA record parsing" {
     mem.writeInt(u32, pkt[pos..][0..4], 3600, .big); // TTL
     pos += 4;
 
-    // Build rdata
     const mname = "\x02ns\x07example\x03com\x00";
     const rname_data = "\x05admin\x07example\x03com\x00";
     const rdlen = mname.len + rname_data.len + 20; // 5 x u32
@@ -1977,7 +1921,6 @@ test "writeResourceRecord fast-path matches field path with TTL patch" {
     var stage: [128]u8 = undefined;
     const built = try buildResourceRecordWire(&stage, base);
 
-    // Slow path with remaining TTL = 100.
     var slow: [128]u8 = undefined;
     var ser_slow = Serializer.init(&slow);
     try ser_slow.writeResourceRecord(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 100, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
@@ -2022,8 +1965,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     // to fail with EndOfData. hasTcBit must detect TC on the raw wire data so
     // the resolver can fall back to TCP before attempting to parse.
 
-    // Build a response with qdcount=1, ancount=1, TC=1, but truncate the
-    // answer record mid-way so parseMessage cannot succeed.
     var pkt: [32]u8 = undefined;
     mem.writeInt(u16, pkt[0..2], 0x1234, .big); // id
     mem.writeInt(u16, pkt[2..4], 0x8200, .big); // QR=1, TC=1
@@ -2032,7 +1973,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     mem.writeInt(u16, pkt[8..10], 0, .big);
     mem.writeInt(u16, pkt[10..12], 0, .big);
 
-    // Question: \x07example\x03com\x00, type A, class IN
     const qname = "\x07example\x03com\x00";
     @memcpy(pkt[12..][0..qname.len], qname);
     const qend = 12 + qname.len;
@@ -2044,7 +1984,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     pkt[ans_start] = 0xC0; // compressed name pointer...
     pkt[ans_start + 1] = 0x0C; // ...to offset 12
 
-    // Slice to just past the pointer — no type/class/ttl/rdlength/rdata
     const truncated = pkt[0 .. ans_start + 2];
 
     try testing.expect(hasTcBit(truncated));
@@ -2058,7 +1997,6 @@ test "hasTcBit detects truncation on mid-record truncated response" {
     mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1, TC=0
     try testing.expect(!hasTcBit(truncated));
 
-    // Too short for header → false
     try testing.expect(!hasTcBit(pkt[0..4]));
     try testing.expect(!hasTcBit(&[_]u8{}));
 }
@@ -2072,7 +2010,6 @@ test "edge case: max-length label" {
     mem.writeInt(u16, pkt[8..10], 0, .big);
     mem.writeInt(u16, pkt[10..12], 0, .big);
 
-    // 63-byte label (max allowed)
     pkt[12] = 63;
     @memset(pkt[13..][0..63], 'a');
     pkt[76] = 0; // root
@@ -2096,7 +2033,6 @@ test "edge case: oversized label" {
     mem.writeInt(u16, pkt[8..10], 0, .big);
     mem.writeInt(u16, pkt[10..12], 0, .big);
 
-    // 64-byte label (exceeds max)
     pkt[12] = 64;
     @memset(pkt[13..][0..64], 'a');
 
@@ -2111,12 +2047,9 @@ test "fuzz: random bytes must not panic" {
             var buf: [4096]u8 = undefined;
             const len = smith.slice(&buf);
             const input = buf[0..len];
-            // parseMessage should either return a valid result or an error, never panic
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
-            if (parseMessage(arena.allocator(), input)) |_| {} else |_| {
-                // Any error is fine — just must not panic
-            }
+            if (parseMessage(arena.allocator(), input)) |_| {} else |_| {}
         }
     };
     try testing.fuzz(Context{}, Context.testOne, .{});
@@ -2147,7 +2080,6 @@ test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
     try testing.expectEqual(@as(u8, 0), parsed_opt.version);
     try testing.expectEqual(@as(u8, 0), parsed_opt.extended_rcode);
 
-    // OPT should not appear in additionals
     try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
 }
 
@@ -2226,7 +2158,6 @@ test "EDNS0: padding_block pads to the next multiple (RFC 8467 §4.1)" {
     try testing.expect(wire2.len > dot_padding_block);
     try testing.expectEqual(@as(usize, 0), wire2.len % dot_padding_block);
 
-    // And it should still parse cleanly with the OPT carrying a padding option.
     const parsed = try parseMessage(alloc, wire);
     try testing.expect(parsed.opt != null);
 }
@@ -2242,7 +2173,6 @@ test "EDNS0: buildQuery without edns has no opt" {
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
-    // ar_count should be 0
     const ar_count = mem.readInt(u16, wire[10..12], .big);
     try testing.expectEqual(@as(u16, 0), ar_count);
 }
@@ -2275,17 +2205,11 @@ test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     try testing.expectError(error.FormatError, parseMessage(alloc, &wire));
 }
 
-// ── Name helpers ──────────────────────────────────────────────────────
-
-/// Lowercase a DNS name string into a caller-provided buffer.
-/// Asserts name.len <= buf.len (caller must ensure sufficient space).
 pub fn lowerNameIntoBuf(buf: []u8, name: []const u8) []const u8 {
     std.debug.assert(name.len <= buf.len);
     for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
     return buf[0..name.len];
 }
-
-// ── Name memory management ─────────────────────────────────────────────
 
 pub fn cloneName(allocator: Allocator, name: Name) !Name {
     const labels = try allocator.alloc([]const u8, name.labels.len);
@@ -2340,8 +2264,6 @@ pub fn writeNameFlat(buf: []align(name_flat_align.toByteUnits()) u8, name: Name,
     return .{ .labels = labels };
 }
 
-/// Build a wildcard name (*.closest-encloser) from a closest encloser name
-/// into a caller-provided label buffer. Returns null if CE has too many labels.
 pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser: Name) ?Name {
     if (closest_encloser.labels.len >= buf.len) return null;
     buf[0] = "*";
@@ -2480,8 +2402,6 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
     }
 }
 
-/// Deep-copy an `RData`, allocating owned copies of every heap-backed field.
-/// The clone counterpart to `freeRData`.
 pub fn cloneRData(allocator: Allocator, rdata: RData) !RData {
     return switch (rdata) {
         .a => |v| .{ .a = v },
@@ -2786,8 +2706,6 @@ test "buildQuery rd=false roundtrip" {
     try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
-
 fn testHeader(pkt: *[max_udp_payload]u8, opts: struct {
     id: u16 = 0x0001,
     flags: u16 = 0x8000,
@@ -2856,8 +2774,6 @@ fn testBuildAnswer(pkt: *[max_udp_payload]u8, rrname: []const u8, rtype_int: u16
     return pos;
 }
 
-// ── DNSSEC record type tests ────────────────────────────────────────
-
 test "DNSKEY record parse/serialize roundtrip" {
     // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
     const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
@@ -2923,7 +2839,7 @@ test "DS record parse/serialize roundtrip" {
 }
 
 test "RRSIG record parse/serialize roundtrip" {
-    const signer_wire = "\x07example\x03com\x00"; // example.com
+    const signer_wire = "\x07example\x03com\x00";
     const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
     var rd = TestRdata{};
     rd.putU16(1); // type_covered = A
@@ -3113,7 +3029,6 @@ test "safeTagName handles known and unknown enum values" {
     const caa: RType = @fromBackingInt(@intCast(257));
     try testing.expectEqualStrings("257", safeTagName(caa, &buf));
 
-    // Unknown RCode
     const rcode7: RCode = @fromBackingInt(@intCast(7));
     try testing.expectEqualStrings("7", safeTagName(rcode7, &buf));
 }
@@ -3140,7 +3055,6 @@ test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     const rdlen: u16 = 20; // too small: 18 + signer_wire.len = 31
     mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
     pos += 2;
-    // Write the 18-byte fixed fields
     mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // type_covered = A
     pos += 2;
     pkt[pos] = 13; // algorithm
@@ -3155,7 +3069,6 @@ test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
     pos += 4;
     mem.writeInt(u16, pkt[pos..][0..2], 12345, .big); // key_tag
     pos += 2;
-    // Signer name extends past rdlength boundary
     @memcpy(pkt[pos..][0..signer_wire.len], signer_wire);
     pos += signer_wire.len;
 
@@ -3167,7 +3080,6 @@ test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
 }
 
 test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" {
-    // Craft a packet where the NSEC next domain name extends past the declared rdlength.
     var pkt: [max_udp_payload]u8 = undefined;
     testHeader(&pkt, .{});
 
@@ -3184,7 +3096,7 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
 
     // next domain "host.example.com." = 22 bytes, but set rdlength = 5
     const next_domain_wire = "\x04host\x07example\x03com\x00";
-    const rdlen: u16 = 5; // too small for the domain name
+    const rdlen: u16 = 5;
     mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
     pos += 2;
     @memcpy(pkt[pos..][0..next_domain_wire.len], next_domain_wire);
@@ -3195,8 +3107,6 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
     const result = parseMessage(arena.allocator(), pkt[0..pos]);
     try testing.expectError(error.InvalidRDataLength, result);
 }
-
-// ── 0x20 case randomization ───────────────────────────────────────────
 
 test "applyCase0x20 only flips ASCII letters; round-trips eql" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3287,8 +3197,6 @@ test "buildQuery with case_rng" {
     try testing.expect(lower.questions[0].name.eql(randomized.questions[0].name));
 }
 
-/// Serialize a minimal "1-question, optional A answer, OPT-with-one-option"
-/// response for `extractKeepaliveTimeout` tests.
 pub fn serializeOptOptionResponse(
     arena: Allocator,
     buf: []u8,
@@ -3541,7 +3449,6 @@ test "parseMessage handles OOM at every allocation without leaking" {
     var wire_buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&wire_buf, msg);
 
-    // Sanity: the wire parses successfully under an arena.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const parsed = try parseMessage(arena.allocator(), wire);

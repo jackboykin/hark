@@ -85,7 +85,6 @@ fn setup(allocator: std.mem.Allocator, io: Io) !Setup {
     };
 }
 
-/// Single persistent socket reused across all queries.
 pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator, io);
     defer s.deinit();
@@ -114,7 +113,6 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     return .{ .samples_ns = samples, .label = "persistent socket" };
 }
 
-/// Fresh transport (and thus fresh socket) per query.
 pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator, io);
     defer s.deinit();

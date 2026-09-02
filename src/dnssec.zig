@@ -26,8 +26,6 @@ const VerifyError = error{
     ValidationBudgetExhausted,
 };
 
-// ── Per-Resolution CPU Budgets ───────────────────────────────────────
-
 /// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per query. Sized for a
 /// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
 /// zones SERVFAIL during rollover windows.
@@ -58,8 +56,6 @@ pub const ValidationBudget = struct {
             return error.ValidationBudgetExhausted;
     }
 };
-
-// ── Security Status ──────────────────────────────────────────────────
 
 pub const SecurityStatus = enum {
     /// Not yet checked (DNSSEC disabled or initial state)
@@ -101,8 +97,6 @@ pub const root_ds_records = [_]dns.DsData{
     },
 };
 
-// ── DNSKEY Validation Helpers ────────────────────────────────────────
-
 /// RFC 4034 §2.1.1–2: a DNSKEY is usable for RRSIG verification only if
 /// the Zone Key flag (bit 7) is set and the protocol field is 3.
 /// RFC 5011 §2.1 additionally bars revoked keys (bit 8) from validating.
@@ -120,8 +114,6 @@ fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
     return true;
 }
 
-/// Validate a DNSKEY RRset using a trust anchor DS record.
-/// Returns the validated zone-signing keys (ZSKs) on success.
 pub fn validateDnskeyRrset(
     dnskey_records: []const dns.ResourceRecord,
     ds_records: []const dns.DsData,
@@ -277,7 +269,6 @@ pub fn classifyDelegation(
                 // NSEC3 matches but doesn't prove insecure delegation (RFC 6840 §4.4).
                 return .secure;
             }
-            // Opt-Out cover: child_hash in range and Opt-Out flag set
             if (nsec3.flags & nsec3_opt_out != 0) {
                 if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &child_hash)) {
                     return .insecure;
@@ -289,8 +280,6 @@ pub fn classifyDelegation(
     // No DS and no valid proof of absence — fail closed to SERVFAIL.
     return .secure;
 }
-
-// ── Key Tag (RFC 4034 Appendix B) ────────────────────────────────────
 
 /// Compute the key tag for a DNSKEY record per RFC 4034 Appendix B.
 /// The key tag is a checksum over the DNSKEY RDATA wire format.
@@ -317,8 +306,6 @@ fn keyTag(dnskey: dns.DnskeyData) u16 {
 
 // ── Canonical Name Wire Format (RFC 4034 §6.1) ──────────────────────
 
-/// Write a name in canonical (lowercase, uncompressed) wire format.
-/// Returns the number of bytes written.
 fn writeCanonicalNameWire(buf: []u8, name: dns.Name) error{BufferTooSmall}!usize {
     return writeNameWire(buf, name, true);
 }
@@ -349,16 +336,10 @@ fn writeNameWire(buf: []u8, name: dns.Name, comptime lower: bool) error{BufferTo
     return pos;
 }
 
-// ── DS Hash Verification ─────────────────────────────────────────────
-
-/// Verify a DS record against a DNSKEY record.
-/// Computes hash(canonical_owner_wire || DNSKEY_RDATA) and compares to DS digest.
 fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) VerifyError!void {
-    // Build: canonical_owner_wire || DNSKEY_RDATA
     var wire_buf: [1024]u8 = undefined;
     const name_len = try writeCanonicalNameWire(&wire_buf, owner_name);
 
-    // DNSKEY RDATA: flags(2) + protocol(1) + algorithm(1) + public_key
     var pos = name_len;
     if (pos + 4 + dnskey.public_key.len > wire_buf.len) return error.BufferTooSmall;
     mem.writeInt(u16, wire_buf[pos..][0..2], dnskey.flags, .big);
@@ -416,7 +397,6 @@ fn buildSignedData(
     rrsig: dns.RrsigData,
     rrset: []const dns.ResourceRecord,
 ) error{BufferTooSmall}![]const u8 {
-    // 1. RRSIG RDATA fields (sans signature)
     const pos: usize = try writeRrsigHeaderWire(buf, rrsig);
 
     // 2. Build canonical RRset entries, sorted by RDATA (RFC 4034 §6.3)
@@ -545,15 +525,12 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
             return pos;
         },
         else => {
-            // For types without embedded names, serialize via the standard serializer
             var ser = dns.Serializer.init(buf);
             ser.writeRData(rdata) catch return error.BufferTooSmall;
             return ser.pos;
         },
     }
 }
-
-// ── RRSIG Verification ───────────────────────────────────────────────
 
 // RFC 4035 §5.3.1 mandates zero grace; deviate minimally and asymmetrically.
 // Inception grace forgives a signer with a slightly-ahead clock (misconfig, no
@@ -577,7 +554,6 @@ fn tryVerifyRrsig(
     return true;
 }
 
-/// Verify an RRSIG signature against a DNSKEY and RRset.
 fn verifyRrsig(
     rrsig: dns.RrsigData,
     dnskey: dns.DnskeyData,
@@ -635,8 +611,6 @@ fn verifyRrsig(
     }
 }
 
-// ── Algorithm-specific verification ──────────────────────────────────
-
 /// Parse an RFC 3110 RSA public key and verify a PKCS#1 v1.5 signature.
 fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, comptime Hash: type) VerifyError!void {
     // RFC 3110: first byte is exponent length (if < 256), then exponent, then modulus
@@ -657,8 +631,8 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
 
     // Strip leading zeros: `[00 00 00 01]` would read as e=1 and forge sig=EM.
     while (exponent.len > 1 and exponent[0] == 0) exponent = exponent[1..];
-    if (exponent[exponent.len - 1] & 1 == 0) return error.InvalidKey; // even
-    if (exponent.len == 1 and exponent[0] <= 1) return error.InvalidKey; // 0, 1
+    if (exponent[exponent.len - 1] & 1 == 0) return error.InvalidKey;
+    if (exponent.len == 1 and exponent[0] <= 1) return error.InvalidKey;
 
     // powPublic is square-and-multiply, so its cost is linear in the exponent's
     // bit length. Measured on a 4096-bit modulus: e=65537 costs 0.8 ms and a
@@ -755,7 +729,6 @@ fn verifyEcdsa(comptime Curve: type, comptime coord_len: comptime_int, signature
     sig.verify(msg, pub_key) catch return error.InvalidSignature;
 }
 
-/// Verify an Ed25519 signature.
 fn verifyEd25519(signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
     if (key_data.len != 32) return error.InvalidKey;
     if (signature.len != 64) return error.InvalidSignature;
@@ -765,13 +738,10 @@ fn verifyEd25519(signature: []const u8, msg: []const u8, key_data: []const u8) V
     sig.verify(msg, pub_key) catch return error.InvalidSignature;
 }
 
-// ── Canonical Name Ordering (RFC 4034 §6.1) ──────────────────────────
-
 /// Compare two DNS names in canonical ordering (RFC 4034 §6.1).
 /// Labels are compared case-insensitively from rightmost to leftmost.
 /// Returns .lt, .eq, or .gt.
 pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
-    // Compare from the rightmost label
     const min_labels = @min(a.labels.len, b.labels.len);
     for (0..min_labels) |i| {
         const a_idx = a.labels.len - 1 - i;
@@ -779,7 +749,6 @@ pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
         const cmp = cmpLabelsCI(a.labels[a_idx], b.labels[b_idx]);
         if (cmp != .eq) return cmp;
     }
-    // All compared labels equal — shorter name comes first
     return std.math.order(a.labels.len, b.labels.len);
 }
 
@@ -825,7 +794,6 @@ test closestEncloser {
     try t.expectEqual(null, closestEncloser(.{ .labels = &.{} }, owner, next));
 }
 
-/// Case-insensitive label comparison, byte-by-byte.
 fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     const min_len = @min(a.len, b.len);
     for (a[0..min_len], b[0..min_len]) |ac, bc| {
@@ -837,8 +805,6 @@ fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(a.len, b.len);
 }
 
-// ── Range Checks ─────────────────────────────────────────────────────
-
 /// Check if `target` falls in the open range (low, high) with wrap-around.
 /// Works for both NSEC canonical name ordering and NSEC3 hash ordering.
 fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_high: std.math.Order) bool {
@@ -849,8 +815,6 @@ fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_h
     }
     return false;
 }
-
-// ── NSEC Proofs ──────────────────────────────────────────────────────
 
 /// RFC 6840 §4.1: an "ancestor delegation" NSEC/NSEC3 — NS bit set, SOA bit
 /// clear — sits on the *parent* side of a zone cut. (The RFC's third
@@ -925,7 +889,6 @@ pub fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool
         dns.typeBitmapContains(type_bit_maps, .cname);
 }
 
-/// Check if an NSEC record proves that `qtype` does not exist at `qname`.
 fn nsecProvesTypeNonexistence(
     nsec_owner: dns.Name,
     nsec: dns.NsecData,
@@ -936,8 +899,6 @@ fn nsecProvesTypeNonexistence(
     if (wrongSideOfCut(nsec.type_bit_maps, qname, qtype)) return false;
     return !bitmapContradictsNodata(nsec.type_bit_maps, qtype);
 }
-
-// ── NSEC3 Hashing (RFC 5155) ─────────────────────────────────────────
 
 /// Max NSEC3 iterations per record. >50 → .insecure (fail-open) rather than
 /// burning hash budget — the post-CVE-2023-50868 consensus (Knot/BIND/PowerDNS);
@@ -971,8 +932,6 @@ fn nsec3Flood(authorities: []const dns.ResourceRecord) bool {
     return n > max_nsec3_records_per_proof;
 }
 
-/// Compute NSEC3 hash: iterated SHA-1 over canonical_name_wire || salt.
-/// Returns the raw hash bytes (20 bytes for SHA-1).
 fn nsec3Hash(
     name: dns.Name,
     salt: []const u8,
@@ -1000,7 +959,6 @@ fn nsec3Hash(
     return hash;
 }
 
-/// Check if hash falls within the NSEC3 range (owner_hash, next_hashed_owner).
 fn nsec3HashInRange(
     owner_hash: []const u8,
     next_hash: []const u8,
@@ -1013,10 +971,6 @@ fn nsec3HashInRange(
     );
 }
 
-// ── NSEC3 Owner Hash + Budgeted Hashing ──────────────────────────────
-
-/// Extract the raw hash from an NSEC3 owner name by base32hex-decoding its first label.
-/// Returns null if the label length is wrong or contains invalid characters.
 fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     if (name.labels.len == 0) return null;
     const label = name.labels[0];
@@ -1051,8 +1005,6 @@ fn budgetedNsec3Hash(
     return nsec3Hash(name, salt, iterations) catch return error.HashFailed;
 }
 
-// ── Mixed NSEC/NSEC3 Detection ───────────────────────────────────────
-
 /// Check if a response mixes NSEC and NSEC3.
 /// Returns true if mixed (should reject the proof).
 fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
@@ -1064,8 +1016,6 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
     }
     return has_nsec and has_nsec3;
 }
-
-// ── Negative Proof Validation ────────────────────────────────────────
 
 /// Validate an NXDOMAIN or NODATA response using NSEC/NSEC3 proofs.
 /// Returns the security status of the negative proof.
@@ -1091,7 +1041,6 @@ pub fn validateNegativeProof(
     // A proof signed by some other zone says nothing about this name.
     if (!qname.isSubdomainOf(zone)) return .bogus;
 
-    // Reject mixed NSEC/NSEC3
     if (hasMixedNsecNsec3(authorities)) return .bogus;
 
     // One scan for both shapes: matching_nsec (owner == qname) → direct NODATA;
@@ -1200,7 +1149,6 @@ pub fn validateNegativeProof(
         return .unchecked;
     }
 
-    // Try NSEC3 proofs
     return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
 }
 
@@ -1226,7 +1174,6 @@ fn validateNsec3NegativeProof(
 ) SecurityStatus {
     if (nsec3Flood(authorities)) return .bogus;
 
-    // Extract NSEC3 parameters from first NSEC3 record
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
     var found_nsec3 = false;
@@ -1403,8 +1350,6 @@ fn validateNsec3NegativeProof(
     return .unchecked;
 }
 
-// ── Answer RRset Validation ──────────────────────────────────────────
-
 /// RFC 8624 §3.1: MUST validate RSASHA1/RSASHA1-NSEC3 even though they
 /// are NOT RECOMMENDED for signing — signing-not-recommended is not
 /// validation-unsupported.
@@ -1540,8 +1485,6 @@ pub fn validateRrset(
     return .bogus;
 }
 
-// ── Authority NSEC/NSEC3 Signature Verification ──────────────────────
-
 /// Verify that every piece of negative-answer material in the authority
 /// section — NSEC/NSEC3 proofs *and* the RFC 2308 SOA — has a valid RRSIG
 /// signed by one of the provided DNSKEYs. The SOA is what a `.secure`
@@ -1605,10 +1548,6 @@ pub fn verifyAuthorityProofSigs(
     return .secure;
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Tests
-// ════════════════════════════════════════════════════════════════════════
-
 test "keyTag computation" {
     // Test with a known DNSKEY. The root KSK-2017 has key tag 20326.
     // We'll use a synthetic key and verify the algorithm matches RFC 4034 Appendix B.
@@ -1616,7 +1555,7 @@ test "keyTag computation" {
         .flags = 256, // ZSK
         .protocol = 3,
         .algorithm = .rsasha256,
-        .public_key = &.{ 0x03, 0x01, 0x00, 0x01 }, // minimal test key
+        .public_key = &.{ 0x03, 0x01, 0x00, 0x01 },
     };
     const tag = keyTag(dnskey);
     // Manually compute: ac = 256 + (3<<8|8) + (0x03<<8) + (0x01) + (0x00<<8) + (0x01)
@@ -1663,7 +1602,6 @@ test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
 test "canonical name wire format" {
     var buf: [256]u8 = undefined;
 
-    // "Example.COM" => lowercase uncompressed wire: \x07example\x03com\x00
     const name = dns.Name{
         .labels = &.{
             @as([]const u8, "Example"),
@@ -1673,14 +1611,12 @@ test "canonical name wire format" {
     const len = try writeCanonicalNameWire(&buf, name);
     try testing.expectEqualSlices(u8, "\x07example\x03com\x00", buf[0..len]);
 
-    // Root zone => \x00
     const root = dns.Name{ .labels = &.{} };
     const root_len = try writeCanonicalNameWire(&buf, root);
     try testing.expectEqual(@as(usize, 1), root_len);
     try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
-/// Compute SHA-256 DS digest for a DNSKEY: SHA-256(canonical_owner_wire || DNSKEY_RDATA).
 fn testDsDigest(owner: dns.Name, dnskey: dns.DnskeyData) ![Sha256.digest_length]u8 {
     return testDsDigestWith(Sha256, owner, dnskey);
 }
@@ -2043,7 +1979,6 @@ test "DS hash verification - wrong digest fails" {
 }
 
 test "buildSignedData produces correct header" {
-    // Verify the RRSIG header portion of signed data
     const signer_name = dns.Name{
         .labels = &.{
             @as([]const u8, "example"),
@@ -2081,7 +2016,6 @@ test "buildSignedData produces correct header" {
     var buf: [4096]u8 = undefined;
     const signed = try buildSignedData(&buf, rrsig, &rrset);
 
-    // Verify first 18 bytes of RRSIG header
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
     try testing.expectEqual(@as(u8, 13), signed[2]); // algorithm
     try testing.expectEqual(@as(u8, 3), signed[3]); // labels
@@ -2355,7 +2289,6 @@ test "classifyDelegation with no DS and no proof" {
         },
     };
 
-    // NS only, no DS, no NSEC/NSEC3 — indeterminate, treated as insecure
     const ns_name = dns.Name{
         .labels = &.{
             @as([]const u8, "ns1"),
@@ -2401,8 +2334,6 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
         try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, child_zone, &b));
     }
 }
-
-// ── Canonical ordering and NSEC/NSEC3 tests ─────────────────────────
 
 test "canonical name ordering" {
     const root = dns.Name{ .labels = &.{} };
@@ -2450,7 +2381,6 @@ test "NSEC name non-existence" {
     };
     try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, zeta));
 
-    // alpha itself should NOT be proved non-existent
     try testing.expect(!nsecProvesNameNonexistence(alpha, nsec_data, alpha));
 }
 
@@ -2468,7 +2398,6 @@ test "NSEC type non-existence" {
 
     try testing.expect(nsecProvesTypeNonexistence(name, nsec_data, name, .aaaa));
     try testing.expect(!nsecProvesTypeNonexistence(name, nsec_data, name, .a));
-    // Different name — not a proof
     const other = dns.Name{ .labels = &.{@as([]const u8, "other")} };
     try testing.expect(!nsecProvesTypeNonexistence(name, nsec_data, other, .aaaa));
 }
@@ -2540,15 +2469,12 @@ test "NSEC3 hash range wrap-around" {
     const owner = [_]u8{ 0xF0, 0xF0, 0xF0 };
     const next = [_]u8{ 0x10, 0x10, 0x10 };
 
-    // After owner (wraps around)
     const target_after = [_]u8{ 0xF5, 0xF5, 0xF5 };
     try testing.expect(nsec3HashInRange(&owner, &next, &target_after));
 
-    // Before next (wraps around)
     const target_before_next = [_]u8{ 0x05, 0x05, 0x05 };
     try testing.expect(nsec3HashInRange(&owner, &next, &target_before_next));
 
-    // Between next and owner (not in range)
     const target_between = [_]u8{ 0x50, 0x50, 0x50 };
     try testing.expect(!nsec3HashInRange(&owner, &next, &target_between));
 }
@@ -2573,7 +2499,6 @@ test "mixed NSEC/NSEC3 detection" {
     const nsec3_only = [_]dns.ResourceRecord{makeNsec3Rr(name, &.{}, &@as([20]u8, @splat(0)), &.{})};
     try testing.expect(!hasMixedNsecNsec3(&nsec3_only));
 
-    // Mixed — should be detected
     const mixed = [_]dns.ResourceRecord{
         nsec_only[0],
         nsec3_only[0],
@@ -2670,7 +2595,6 @@ test "validateNegativeProof NSEC NXDOMAIN without wildcard denial" {
     const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
     const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
 
-    // Only one NSEC covering qname, no wildcard denial
     const authorities = [_]dns.ResourceRecord{nsecRr(alpha, gamma)};
 
     const beta = dns.Name{ .labels = &.{ "beta", "example", "com" } };
@@ -2787,7 +2711,6 @@ test "validateNegativeProof NSEC NXDOMAIN single NSEC covers both" {
     try testing.expectEqual(SecurityStatus.secure, status);
 }
 
-// Helper for NSEC tests with explicit bitmaps. nsecRr builds with empty bitmap.
 fn nsecRrWithBitmap(owner: dns.Name, next: dns.Name, bitmap: []const u8) dns.ResourceRecord {
     return .{
         .name = owner,
@@ -2901,8 +2824,6 @@ test "validateNegativeProof NSEC NODATA covering but no wildcard proof is .unche
     try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 }
 
-// ── NSEC3 Helper Tests ───────────────────────────────────────────────
-
 /// Build an NSEC3 owner name by base32hex-encoding a hash and appending zone labels.
 /// Returns the label slices and Name referencing them. Caller must keep returned
 /// struct alive for as long as the Name is used.
@@ -2971,7 +2892,6 @@ test "base32hex decode/encode roundtrip" {
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const hash = try nsec3Hash(name, &salt, 12);
 
-    // Encode to base32hex
     var enc_buf: [32]u8 = undefined;
     const encoded = dns.base32HexEncode(&enc_buf, &hash);
     // RFC 5155 Appendix B known-answer: covers nsec3Hash and base32HexEncode.
@@ -3002,7 +2922,6 @@ test "nsec3OwnerHash extraction" {
     const salt = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const hash = try nsec3Hash(name, &salt, 12);
 
-    // Encode to build a proper NSEC3 owner
     var enc_buf: [32]u8 = undefined;
     const encoded = dns.base32HexEncode(&enc_buf, &hash);
 
@@ -3211,7 +3130,6 @@ test "NSEC3 NXDOMAIN - missing wildcard cover" {
     var nc_high: [20]u8 = undefined;
     const nc_rr = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs2, &nc_low, &nc_high);
 
-    // Only CE match + NC cover, NO wildcard cover
     const authorities = [_]dns.ResourceRecord{
         makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{}),
         nc_rr,
@@ -3604,7 +3522,6 @@ test "classifyDelegation NSEC3 non-match" {
     const zone_labels: []const []const u8 = &.{ @as([]const u8, "example"), @as([]const u8, "com") };
     const salt: []const u8 = &.{};
 
-    // Use a different name's hash — doesn't match child_zone
     const other_name = dns.Name{
         .labels = &.{ @as([]const u8, "other"), @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -3655,7 +3572,6 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
     const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
     const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_labels, &bufs.enc, &bufs.labels);
 
-    // NSEC3 with iterations=200 (exceeds max_nsec3_iterations=50)
     const authorities = [_]dns.ResourceRecord{.{
         .name = owner_name,
         .rtype = .nsec3,
@@ -3671,12 +3587,10 @@ test "NSEC3 high-iteration returns insecure (RFC 9276 §3.2)" {
         } },
     }};
 
-    // Both NXDOMAIN and NODATA negative-proof paths return .insecure
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
     try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
 
-    // classifyDelegation matches: high-iteration NSEC3 → insecure delegation
     const child_zone = dns.Name{ .labels = zone_labels };
     try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, child_zone, &b));
 }
@@ -3765,8 +3679,6 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     try testing.expectEqual(SecurityStatus.bogus, second);
 }
 
-// ── RRSIG expiration tests ──────────────────────────────────────────
-
 // Shared fixture for the verifyRrsig time-window tests. Empty key/signature
 // means the ECDSA path always returns InvalidSignature — anything before
 // it (the time check) is what gates the assertion.
@@ -3797,7 +3709,6 @@ test "verifyRrsig rejects expired signature" {
 
 test "verifyRrsig rejects not-yet-valid signature" {
     var budget: ValidationBudget = .{};
-    // now is before inception by more than the inception-skew tolerance
     try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, &budget));
 }
 
@@ -4257,17 +4168,15 @@ test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
     );
 }
 
-// ── RSA key validation tests ────────────────────────────────────────
-
 test "verifyRsa accepts 1024-bit (128-byte) modulus key parsing" {
     // Build a minimal RSA key with 128-byte modulus (1024-bit)
     // Many TLDs still use RSA-1024 ZSKs — validators must accept them
     var key_data: [1 + 3 + 128]u8 = undefined;
-    key_data[0] = 3; // exponent length
+    key_data[0] = 3;
     key_data[1] = 0x01; // exponent = 65537 (0x010001)
     key_data[2] = 0x00;
     key_data[3] = 0x01;
-    @memset(key_data[4..], 0xAA); // 128-byte modulus
+    @memset(key_data[4..], 0xAA);
 
     var sig: [128]u8 = undefined;
     @memset(&sig, 0xBB);
@@ -4280,11 +4189,11 @@ test "verifyRsa accepts 2048-bit (256-byte) modulus key parsing" {
     // Build a key with 256-byte modulus — should pass key parsing
     // (will fail at signature verification, not key validation)
     var key_data: [1 + 3 + 256]u8 = undefined;
-    key_data[0] = 3; // exponent length
+    key_data[0] = 3;
     key_data[1] = 0x01; // exponent = 65537
     key_data[2] = 0x00;
     key_data[3] = 0x01;
-    @memset(key_data[4..], 0xAA); // 256-byte modulus
+    @memset(key_data[4..], 0xAA);
 
     var sig: [256]u8 = undefined;
     @memset(&sig, 0xBB);

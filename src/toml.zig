@@ -3,8 +3,6 @@ const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 
-// ── Types ──────────────────────────────────────────────────────────────
-
 pub const Value = union(enum) {
     string: []const u8,
     integer: i64,
@@ -90,8 +88,6 @@ fn freeTable(allocator: Allocator, table: *Table) void {
     table.map.deinit(allocator);
 }
 
-// ── Parser ─────────────────────────────────────────────────────────────
-
 pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
     var root = Table{ .map = .empty };
     errdefer freeTable(allocator, &root);
@@ -140,7 +136,6 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             const duped_key = try allocator.dupe(u8, raw_key);
             errdefer allocator.free(duped_key);
 
-            // Insert into current section or root
             const target = if (current_section) |sec| blk: {
                 const entry = root.map.getPtr(sec).?;
                 break :blk &entry.table.map;
@@ -155,7 +150,6 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
 }
 
 fn stripComment(line: []const u8) []const u8 {
-    // Find # that's not inside a string
     var in_string = false;
     var escaped = false;
     for (line, 0..) |c, i| {
@@ -188,17 +182,13 @@ fn isValidBareKey(key: []const u8) bool {
 fn parseValue(allocator: Allocator, raw: []const u8) ParseError!Value {
     if (raw.len == 0) return error.InvalidSyntax;
 
-    // String
     if (raw[0] == '"') return .{ .string = try parseString(allocator, raw) };
 
-    // Array
     if (raw[0] == '[') return parseArray(allocator, raw);
 
-    // Boolean
     if (mem.eql(u8, raw, "true")) return .{ .boolean = true };
     if (mem.eql(u8, raw, "false")) return .{ .boolean = false };
 
-    // Integer
     return .{ .integer = parseInteger(raw) orelse return error.InvalidInteger };
 }
 
@@ -212,7 +202,6 @@ fn parseString(allocator: Allocator, raw: []const u8) ParseError![]const u8 {
     while (i < raw.len) {
         const c = raw[i];
         if (c == '"') {
-            // Found closing quote — check nothing follows
             const after = mem.trim(u8, raw[i + 1 ..], &std.ascii.whitespace);
             if (after.len > 0) return error.InvalidSyntax;
             return try allocator.dupe(u8, result.items);
@@ -266,7 +255,6 @@ fn parseInteger(raw: []const u8) ?i64 {
 fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
     if (raw.len < 2 or raw[0] != '[') return error.InvalidSyntax;
 
-    // Find closing bracket
     const close = mem.lastIndexOfScalar(u8, raw, ']') orelse return error.InvalidSyntax;
     // Reject trailing garbage so a typo like `key = ["x"] junk` surfaces as
     // an error instead of silently dropping the trailing characters.
@@ -284,12 +272,10 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
 
     var pos: usize = 0;
     while (pos < inner.len) {
-        // Skip whitespace
         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
         if (pos >= inner.len) break;
 
         if (inner[pos] == '"') {
-            // Find end of quoted string
             var end = pos + 1;
             while (end < inner.len) {
                 if (inner[end] == '\\') {
@@ -314,7 +300,6 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
             return error.InvalidSyntax; // Only string arrays supported
         }
 
-        // Skip whitespace and comma
         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
         if (pos < inner.len and inner[pos] == ',') pos += 1;
     }
@@ -323,8 +308,6 @@ fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
     // untouched on failure so the `defer` above still frees every element.
     return .{ .string_array = try items.toOwnedSlice(allocator) };
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "parse empty input" {
     var result = try parse(testing.allocator, "");

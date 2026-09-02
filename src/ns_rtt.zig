@@ -5,8 +5,6 @@ const Allocator = mem.Allocator;
 const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 
-// ── Constants (Unbound/Knot consensus) ───────────────────────────────
-
 /// Initial timeout for unknown servers (Unbound 376, Knot 400).
 const initial_timeout_ms: u32 = 400;
 
@@ -42,23 +40,17 @@ const hedge_multiplier: u32 = 3;
 /// track upward on route changes that move the path's true floor.
 const hedge_decay_ms: i64 = 30_000;
 
-/// Cold-start hedge stagger used when no min_rtt sample exists yet.
 const hedge_cold_default_ms: u32 = initial_timeout_ms / 4;
-/// Absolute ceiling on the hedge stagger.
 const max_hedge_stagger_ms: u32 = 300;
 
-// ── RttState ─────────────────────────────────────────────────────────
-
 const RttState = struct {
-    srtt_us: i64, // Smoothed RTT (microseconds)
-    rttvar_us: i64, // RTT variance
+    srtt_us: i64,
+    rttvar_us: i64,
     consecutive_timeouts: u8,
-    dead_until_ms: i64, // Timestamp when dead period ends
+    dead_until_ms: i64,
     min_rtt_us: i64, // Windowed minimum RTT (re-anchored after hedge_decay_ms)
-    min_rtt_stamp_ms: i64, // Timestamp of last min_rtt update
+    min_rtt_stamp_ms: i64,
 };
-
-// ── RttCache ─────────────────────────────────────────────────────────
 
 const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
 
@@ -141,7 +133,6 @@ pub const RttCache = struct {
 
         const gop = shard.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
-            // First sample: srtt = R, rttvar = R/2
             gop.value_ptr.* = .{
                 .srtt_us = rtt_us,
                 .rttvar_us = @divTrunc(rtt_us, 2),
@@ -186,7 +177,6 @@ pub const RttCache = struct {
         return @max(min_timeout_ms, @min(stagger_ms, max_hedge_stagger_ms));
     }
 
-    /// Record a timeout for this server (exponential backoff + dead marking).
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
         const shard = self.shardFor(key);
         if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
@@ -285,7 +275,6 @@ fn computeTimeout(state: RttState) u32 {
     const base_us = @max(state.srtt_us + 4 * state.rttvar_us, 2 * state.srtt_us);
     const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
 
-    // Exponential backoff: double per consecutive timeout, capped
     const shift: u5 = @intCast(@min(state.consecutive_timeouts, max_backoff_shifts));
     const backed_off = @as(u64, base_ms) << shift;
 
@@ -297,8 +286,6 @@ fn deadWindowMs(state: RttState) i64 {
     const shift: u5 = @intCast(@min(state.consecutive_timeouts - dead_threshold, dead_max_shifts));
     return dead_duration_ms << shift;
 }
-
-// ── Tests ────────────────────────────────────────────────────────────
 
 var test_now_ms: i64 = 1000;
 
@@ -450,7 +437,6 @@ test "min_rtt re-anchors after hedge_decay_ms" {
 
     const key = testAddr(1);
 
-    // Anchor at 20ms.
     cache.recordSuccess(key, 20_000);
     try testing.expectEqual(@as(u32, 60), cache.getHedgeStagger(key));
 
@@ -479,8 +465,8 @@ test "hedge stagger survives transient timeouts that inflate RTO" {
 
     cache.recordTimeout(key);
 
-    try testing.expect(cache.getTimeout(key) > rto_clean); // RTO backs off
-    try testing.expectEqual(hedge, cache.getHedgeStagger(key)); // hedge unchanged
+    try testing.expect(cache.getTimeout(key) > rto_clean);
+    try testing.expectEqual(hedge, cache.getHedgeStagger(key));
 }
 
 test "recordTimeout does not disturb min_rtt" {

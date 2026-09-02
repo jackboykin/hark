@@ -23,8 +23,6 @@ const max_rrset_collect: usize = 64;
 
 const monotonic = @import("monotonic.zig");
 
-// ── Cache key ─────────────────────────────────────────────────────────
-
 const CacheKey = struct {
     /// Lowercased dotted name, owned by the cache.
     name: []const u8,
@@ -75,8 +73,6 @@ const PrecomputedCtx = struct {
     }
 };
 
-// ── Security status ───────────────────────────────────────────────────
-
 /// DNSSEC validation status for cached RRsets.
 /// Intentionally a subset of dnssec.SecurityStatus: the cache only stores
 /// .secure (validated) or .insecure (provably unsigned); validation
@@ -86,8 +82,6 @@ pub const SecurityStatus = enum {
     secure,
     insecure,
 };
-
-// ── Cache entry types ─────────────────────────────────────────────────
 
 /// The wire at `wire_off` is the record; RDATA is reparsed on hit.
 pub const CachedRecord = struct {
@@ -231,8 +225,6 @@ pub const CacheEntry = union(enum) {
     }
 };
 
-// ── Lookup result ─────────────────────────────────────────────────────
-
 pub const CacheLookupResult = union(enum) {
     hit: struct {
         records: []dns.ResourceRecord,
@@ -262,8 +254,6 @@ pub const CacheLookupResult = union(enum) {
         is_stale: bool = false,
     },
 };
-
-// ── Deep copy helpers ─────────────────────────────────────────────────
 
 const cloneName = dns.cloneName;
 
@@ -377,13 +367,10 @@ fn answersAreWildcardExpanded(answers: []const dns.ResourceRecord) bool {
     return false;
 }
 
-/// Lowercase a name into a stack buffer for lookup. Returns null if name too long.
 fn lowerNameBuf(buf: *[dns.max_dotted_len + 1]u8, name: []const u8) ?[]const u8 {
     if (name.len > dns.max_dotted_len) return null;
     return dns.lowerNameIntoBuf(buf, name);
 }
-
-// ── RRsetCache ────────────────────────────────────────────────────────
 
 /// Cache shards: each is an independent rwlock + map, so lookups on different
 /// names run concurrently. The active count is derived per cache from
@@ -580,7 +567,6 @@ pub const RRsetCache = struct {
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
         }
-        // Read-path counters are striped per-thread (see ReadCounters); sum them.
         for (&self.read_counters) |*rc| {
             stats.hits += rc.hits.load(.monotonic);
             stats.misses += rc.misses.load(.monotonic);
@@ -604,8 +590,6 @@ pub const RRsetCache = struct {
             self.budget.counting.backing.free(shard.visited);
         }
     }
-
-    // ── Lookup ────────────────────────────────────────────────────────
 
     /// Cheap existence probe: returns true iff a fresh (non-expired)
     /// positive or negative entry is present for (name, rtype, rclass).
@@ -821,8 +805,6 @@ pub const RRsetCache = struct {
         return .{ .remaining_ttl = 30, .needs_prefetch = true, .force_unchecked = true, .is_stale = true };
     }
 
-    // ── Store ─────────────────────────────────────────────────────────
-
     const Lifetime = struct { ttl: u32, expires_at: i64, stored_at: i64 };
 
     /// `ttl` arrives floored and capped by config; `authenticated_ttl_max` is
@@ -895,7 +877,7 @@ pub const RRsetCache = struct {
                 break;
             }
         }
-        const soa = soa_record orelse return; // No SOA = don't cache
+        const soa = soa_record orelse return;
 
         // Validate SOA is from a parent zone of the queried name (RFC 2308 §3).
         // Reject cross-zone SOA injection (e.g., SOA for "other.net." in response
@@ -1035,8 +1017,6 @@ pub const RRsetCache = struct {
         };
     }
 
-    // ── Internal ──────────────────────────────────────────────────────
-
     /// Displacement policy for a store finding a live entry in its slot.
     /// `.unless_fresh` is for failure markers, which never displace a fresh
     /// entry of any status; checked under the shard write lock so a
@@ -1091,7 +1071,6 @@ pub const RRsetCache = struct {
         var processed_count: usize = 0;
 
         record_loop: for (records) |rr| {
-            // Skip records we shouldn't cache
             if (rr.ttl == 0) continue;
             if (!rr.name.isSubdomainOf(authority_zone)) continue;
 
@@ -1317,7 +1296,6 @@ pub const RRsetCache = struct {
         self.removeAtIndex(shard, idx);
     }
 
-    /// Swap-remove entry at index: fixup visited flag, free key/value, clamp hand.
     fn removeAtIndex(self: *RRsetCache, shard: *Shard, i: usize) void {
         const alloc = self.budget.counting.allocator();
         const key = shard.map.keys()[i];
@@ -1355,7 +1333,6 @@ pub const RRsetCache = struct {
                 return;
             }
         }
-        // Budget exhausted (or all visited) — evict at hand.
         if (shard.hand >= count) shard.hand = 0;
         self.removeAtIndex(shard, shard.hand);
         _ = shard.evictions.fetchAdd(1, .monotonic);
@@ -1387,10 +1364,6 @@ fn freeKey(alloc: Allocator, key: CacheKey) void {
 fn freeEntry(alloc: Allocator, entry: CacheEntry) void {
     alloc.free(entry.pack().blob);
 }
-
-// ════════════════════════════════════════════════════════════════════════
-// Tests
-// ════════════════════════════════════════════════════════════════════════
 
 var test_time: i64 = 1000;
 
@@ -1584,7 +1557,6 @@ test "cache lookup expired entry returns null" {
 
     try storeTestA(&cache, alloc, &.{ "example", "com" }, 60, .{ 1, 2, 3, 4 });
 
-    // Advance time past TTL
     test_time = 1061;
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1602,7 +1574,6 @@ test "cache TTL adjustment" {
 
     try storeTestA(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 });
 
-    // Advance 100 seconds
     test_time = 1100;
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1755,7 +1726,6 @@ test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // Cache NXDOMAIN at "missing.example.com" for qtype A.
     const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
     defer freeTestAuthorities(alloc, authorities);
     cache.storeNegative("missing.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
@@ -1763,7 +1733,6 @@ test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    // Looking up the *parent* directly returns the NXDOMAIN.
     const direct = cache.lookup(arena.allocator(), "missing.example.com", .a, .in);
     try testing.expect(direct != null);
 
@@ -1776,7 +1745,6 @@ test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
         .hit => return error.TestUnexpectedResult,
     }
 
-    // A query for an unrelated parent miss returns null.
     const miss = cache.lookupNxdomainAncestor(arena.allocator(), "child.exists.example.com", .a, .in);
     try testing.expect(miss == null);
 }
@@ -2235,7 +2203,6 @@ test "cache deep copy independence" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // Store using an arena, then destroy the arena
     {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -2249,7 +2216,6 @@ test "cache deep copy independence" {
         // arena destroyed here — cache must still work
     }
 
-    // Lookup after source arena is freed
     var arena2 = std.heap.ArenaAllocator.init(alloc);
     defer arena2.deinit();
     const result = cache.lookup(arena2.allocator(), "deep.test", .a, .in);
@@ -2285,7 +2251,6 @@ test "cache negative without SOA is not stored" {
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    // No SOA in authority
     cache.storeNegative("no-soa.example.com", .a, .in, .name_error, &.{}, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2487,7 +2452,6 @@ test "cache lookup is_stale flag set on stale hit, clear on fresh (RFC 8767 §6)
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    // Fresh hit must clear is_stale.
     const fresh = cache.lookup(arena.allocator(), "fresh.test", .a, .in);
     try testing.expect(fresh != null);
     switch (fresh.?) {
@@ -2991,7 +2955,6 @@ test "byte-pressure check happens before key-name dupe" {
     cache.now_fn = &testNowSeconds;
     defer cache.deinit();
 
-    // Seed shard 0 with one entry.
     var name_buf: [32]u8 = undefined;
     var seeded: ?[]const u8 = null;
     var i: u32 = 0;
@@ -3005,14 +2968,12 @@ test "byte-pressure check happens before key-name dupe" {
     }
     try testing.expect(seeded != null);
 
-    // Push shard 0 over the byte-pressure threshold.
     const shard0 = &cache.shards[0];
     const threshold = cache.budget.counting.max_bytes / 8 * 7;
     const cur = cache.budget.counting.current_bytes.load(.monotonic);
     const bump: usize = if (cur >= threshold) 1 else threshold - cur + 1;
     _ = cache.budget.counting.current_bytes.fetchAdd(bump, .monotonic);
 
-    // Find a different name that also hashes to shard 0.
     var newname_buf: [32]u8 = undefined;
     var newname: []const u8 = "";
     var j: u32 = 1000;
@@ -3119,7 +3080,6 @@ test "anti-downgrade holds under byte pressure" {
     // dotted string, so the labels must format back to that string.
     try storeTestAWithStatus(&cache, alloc, &.{ "protected", "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
 
-    // Push the cache over the 87.5% byte-pressure threshold.
     const threshold = cache.budget.counting.max_bytes / 8 * 7;
     const cur = cache.budget.counting.current_bytes.load(.monotonic);
     const bump: usize = if (cur >= threshold) 1 else threshold - cur + 1;
@@ -3131,7 +3091,6 @@ test "anti-downgrade holds under byte pressure" {
     // Release synthetic bytes so the deinit accounting checks out.
     _ = cache.budget.counting.current_bytes.fetchSub(bump, .monotonic);
 
-    // Original .secure must survive.
     try expectCachedHitStatus(alloc, &cache, "protected.example.com", .secure);
 }
 

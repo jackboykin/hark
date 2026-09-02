@@ -202,8 +202,6 @@ const PerThreadArena = struct {
     }
 };
 
-// ── Work Queue for resolution thread pool ─────────────────────────────
-
 const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
 
 /// .bg payload: [qtype u16 BE][BgKind u8][name]
@@ -278,7 +276,6 @@ const WorkQueue = struct {
         return .{ .idx = idx, .slot = &self.slots[idx] };
     }
 
-    /// Publish a populated slot to the FIFO and wake one waiter.
     fn enqueueLocked(self: *WorkQueue, idx: u16) void {
         self.order[self.tail] = idx;
         self.tail = (self.tail + 1) % work_queue_capacity;
@@ -360,8 +357,6 @@ const WorkQueue = struct {
     }
 };
 
-// ── Context tags for the event loop ────────────────────────────────────
-
 const CtxTag = enum { udp_recv, tcp_accept, tcp_read, tick, signal };
 
 const Ctx = struct {
@@ -379,16 +374,12 @@ const tick_ms = 1000;
 /// stops trying. Only a genuinely broken fd reaches this.
 const max_signal_misfires: u32 = 16;
 
-// ── Background task bookkeeping ────────────────────────────────────────
-
 const max_bg_tasks: u32 = 16;
 
 /// Dedup flag value for background CD=1 revalidation tasks. Distinct
 /// from CD=0 (flag=0) and CD=1-client (flag=1) so a client-facing query
 /// and a background revalidation of the same (name, qtype) don't coalesce.
 const bg_revalidate_flag: u8 = 2;
-
-// ── Server ─────────────────────────────────────────────────────────────
 
 pub const Server = struct {
     config: ServerConfig,
@@ -936,7 +927,6 @@ const HotSet = struct {
     }
 
     fn insertLocked(self: *HotSet, tag: u64, name: []const u8, qtype: dns.RType, now: i64) void {
-        // First empty slot, else evict the earliest lease.
         var victim: *Lease = &self.registry[0];
         for (&self.registry) |*s| {
             if (s.tag == 0) {
@@ -994,10 +984,8 @@ const HotSet = struct {
             var healthy = true;
             if (cache.entryExpiry(name, d.qtype, .in)) |expires_at| {
                 if (expires_at - now > fire_lead) {
-                    // Healthy and young: sleep until the fire window.
                     next_check = expires_at - fire_lead;
                 } else if (expires_at > now) {
-                    // In the window: refresh before it dies.
                     firer.fire(name, d.qtype);
                     _ = self.fired.fetchAdd(1, .monotonic);
                     next_check = now + post_fire_delay;
@@ -1079,8 +1067,6 @@ fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, a
     };
 }
 
-// ── TCP clients ────────────────────────────────────────────────────────
-
 const TcpClient = struct {
     fd: posix.fd_t,
     peer: na.Address,
@@ -1123,9 +1109,6 @@ const Reply = union(enum) {
         };
     }
 };
-
-// ── WorkerState ────────────────────────────────────────────────────────
-// Per-thread state that handles the actual serve loop.
 
 const WorkerState = struct {
     server: *Server,
@@ -1260,7 +1243,6 @@ const WorkerState = struct {
             udp_armed[i] = armed(self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i])), "UDP recvmsg");
         }
 
-        // Register accept for each TCP socket
         for (tcp_socks, 0..) |fd, i| {
             if (fd < 0) continue;
             tcp_ctxs[i] = .{ .tag = .tcp_accept, .fd = fd };
@@ -1271,7 +1253,6 @@ const WorkerState = struct {
         var tick_ctx = Ctx{ .tag = .tick, .fd = -1 };
         var tick_armed = armed(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)), "tick");
 
-        // Consecutive unreadable signalfd completions; see the `.signal` arm.
         var signal_misfires: u32 = 0;
 
         var completions: [max_operations]Completion = undefined;
@@ -1466,7 +1447,7 @@ const WorkerState = struct {
         // on garbage: opcode (bits 1-4 of byte 2), qdcount (bytes 4-5).
         const opcode_bits: u4 = @truncate(data[2] >> 3);
         const client_opcode: dns.OpCode = @fromBackingInt(@intCast(opcode_bits));
-        if (opcode_bits != 0) { // Only QUERY (0) supported
+        if (opcode_bits != 0) {
             @branchHint(.cold);
             self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, client_addr);
             return;
@@ -1573,7 +1554,6 @@ const WorkerState = struct {
         return resolver.resolve(alloc, name, qtype);
     }
 
-    /// Resolution thread pool entry point.
     fn poolThread(self: *WorkerState) noreturn {
         var udp = BlockingUdpTransport.init(.{}, self.server.io);
         const transports: Transports = .{ .udp = &udp, .tcp_enabled = true };
@@ -1800,8 +1780,6 @@ const WorkerState = struct {
     }
 };
 
-// ── TCP helpers (blocking I/O) ─────────────────────────────────────────
-
 fn tcpWriteAllBlocking(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) ?void {
     sys.writeAllDeadline(io, fd, data, deadline_ns) catch |err| {
         if (err != error.Closed) log.debug("tcp client write: {s}", .{@errorName(err)});
@@ -1815,8 +1793,6 @@ fn tcpWriteMessage(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) 
     tcpWriteAllBlocking(io, fd, &len_prefix, deadline_ns) orelse return null;
     tcpWriteAllBlocking(io, fd, data, deadline_ns) orelse return null;
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────
 
 fn ctxIndex(ctxs: *const [max_listen_addrs]Ctx, n: usize, target: *const Ctx) ?usize {
     for (0..n) |i| {
@@ -1838,8 +1814,6 @@ fn isNonLoopback(a: na.Address) bool {
         },
     }
 }
-
-// ── Socket creation ────────────────────────────────────────────────────
 
 fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: bool) !posix.fd_t {
     const af = na.afU32(addr);
@@ -1959,8 +1933,6 @@ fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
-
 test "server init and deinit" {
     const config = @import("config.zig");
     var cfg = config.parseConfig(testing.allocator, "") catch return error.SkipZigTest;
@@ -1974,7 +1946,6 @@ test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    // Build a query, then manually append a second OPT to additionals.
     var query = try dns.buildQuery(arena.allocator(), 0, "example.com", .a, .{});
     query.opt = .{
         .udp_payload_size = 4096,
@@ -1987,7 +1958,6 @@ test "parseMessage rejects multiple OPT records (RFC 6891 §6.1.1)" {
     // first via msg.opt; we hand-craft an extra OPT at the end of the wire.
     var buf: [dns.max_udp_payload]u8 = undefined;
     const base = try dns.serializeMessage(&buf, query);
-    // Bump ar_count by 1 in the header (offset 10, big-endian u16).
     const ar_count_before = std.mem.readInt(u16, buf[10..12], .big);
     std.mem.writeInt(u16, buf[10..12], ar_count_before + 1, .big);
     // Append a minimal OPT: root name (0), type=41, class=4096, ttl=0, rdlen=0.
@@ -2019,10 +1989,8 @@ test "createSocket UDP reuseport allows multiple binds" {
     const sock1 = createSocket(addr, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
     defer sys.close(sock1);
 
-    // Get the actual port
     const port = (try na.getSockName(sock1)).getPort();
 
-    // Second socket on same port should succeed with SO_REUSEPORT
     const addr2 = na.initIp4(.{ 127, 0, 0, 1 }, port);
     const sock2 = createSocket(addr2, posix.SOCK.DGRAM, true, false) catch return error.SkipZigTest;
     defer sys.close(sock2);
@@ -2205,8 +2173,6 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     }
 }
 
-// ── HotSet unit tests ──────────────────────────────────────────────────
-
 const HotSetStubCache = struct {
     expiry: ?i64,
     pub fn entryExpiry(self: *@This(), name: []const u8, rtype: dns.RType, rclass: dns.RClass) ?i64 {
@@ -2261,23 +2227,19 @@ test "HotSet tick: healthy entry waits, in-window entry fires, dead entry backs 
 
     var fires = HotSetFireLog{};
 
-    // Fresh and young: no fire, next_check parked at expiry - lead.
     var cache = HotSetStubCache{ .expiry = 1300 };
     hs.tick(1011, &cache, &fires);
     try testing.expectEqual(@as(usize, 0), fires.count);
     try testing.expectEqual(@as(i64, 1300 - HotSet.fire_lead), hs.findSlotLocked(tag).?.next_check);
 
-    // In the fire window (expiry - now <= lead, still alive): refresh.
     hs.tick(1299, &cache, &fires);
     try testing.expectEqual(@as(usize, 1), fires.count);
 
-    // Dead and lingering: fires again, backoff shift grows.
-    cache.expiry = 1200; // past
+    cache.expiry = 1200;
     hs.tick(1305, &cache, &fires);
     try testing.expectEqual(@as(usize, 2), fires.count);
     try testing.expectEqual(@as(u6, 1), hs.findSlotLocked(tag).?.fail_shift);
 
-    // Recovery: fresh entry resets the backoff.
     cache.expiry = 1700;
     hs.tick(1320, &cache, &fires);
     try testing.expectEqual(@as(u6, 0), hs.findSlotLocked(tag).?.fail_shift);
@@ -2313,8 +2275,6 @@ test "HotSet remiss on a leased name renews the lease" {
     try testing.expectEqual(@as(u64, 1), hs.promotions.load(.monotonic));
 }
 
-// ── classifySignalRead ─────────────────────────────────────────────────
-
 const ELResult = @import("event_loop.zig").Result;
 const ELReadResult = @import("event_loop.zig").ReadResult;
 
@@ -2339,7 +2299,6 @@ test "classifySignalRead: only a real TERM/INT record may stop the process" {
     try testing.expectEqual(SignalAction.stats, classifySignalRead(signalReadOf(&.{usr1})));
     try testing.expectEqual(SignalAction.stats, classifySignalRead(signalReadOf(&.{hup})));
 
-    // Shutdown still wins when packed alongside stats, in either order.
     try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{ usr1, term })));
     try testing.expectEqual(SignalAction.shutdown, classifySignalRead(signalReadOf(&.{ term, usr1 })));
 }
@@ -2361,7 +2320,6 @@ test "classifySignalRead: an unreadable or unrecognised completion is ignored, n
     // A signo outside setupSignalFd's mask.
     try testing.expectEqual(SignalAction.ignore, classifySignalRead(signalReadOf(&.{@backingInt(linux.SIG.CHLD)})));
 
-    // A completion that is not a read at all.
     const not_a_read = ELResult{ .accept = .{ .fd = -1, .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0), .err = error.AcceptFailed } };
     try testing.expectEqual(SignalAction.ignore, classifySignalRead(not_a_read));
 }

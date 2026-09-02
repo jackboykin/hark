@@ -22,15 +22,11 @@ const dns = @import("dns.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
 
 pub const Action = enum {
-    /// Not a special-use name — fall through to normal resolution.
     none,
     /// RFC 1035 §4.1.1 NXDOMAIN. No SOA synthesized; client gets RA-only.
     nxdomain,
-    /// Synthesize an A record for 127.0.0.1.
     localhost_a,
-    /// Synthesize an AAAA record for ::1.
     localhost_aaaa,
-    /// Synthesize a PTR record pointing at localhost.
     localhost_ptr,
     /// NOERROR with empty answer (the name exists but the qtype does not).
     nodata,

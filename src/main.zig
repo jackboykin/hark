@@ -29,7 +29,6 @@ fn logFn(
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
-    // Timestamp
     const secs: u64 = @intCast(hark.monotonic.wallclockSec());
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
     const ds = es.getDaySeconds();
@@ -42,7 +41,6 @@ fn logFn(
     }) catch return;
     pos = ts.len;
 
-    // Level + scope prefix
     if (pos + level_prefix.len >= buf.len) return;
     @memcpy(buf[pos..][0..level_prefix.len], level_prefix);
     pos += level_prefix.len;
@@ -258,7 +256,6 @@ fn parseRType(s: []const u8) ?dns.RType {
 }
 
 fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
-    // Parse serve flags
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
     var i: usize = 0;
@@ -288,7 +285,6 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     else
         loadDefaultConfig(allocator, io) catch std.process.exit(1);
 
-    // Enable verbose logging from CLI flag or config
     if (cli_verbose or cfg.log_queries) {
         log_verbose.store(true, .release);
     }

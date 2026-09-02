@@ -75,8 +75,6 @@ pub const CaseState = struct {
     }
 };
 
-// ── Tests ─────────────────────────────────────────────────────────────
-
 var test_now: i64 = 0;
 fn frozenNow() i64 {
     return test_now;
@@ -116,7 +114,6 @@ test "eviction at cap" {
     defer s.deinit();
     s.now_fn = &frozenNow;
 
-    // Fill to capacity
     var i: usize = 0;
     while (i < max_entries) : (i += 1) {
         test_now = @intCast(i);
@@ -130,7 +127,6 @@ test "eviction at cap" {
     }
     try testing.expectEqual(@as(u32, max_entries), s.entries.count());
 
-    // One more triggers eviction
     test_now = @intCast(max_entries + 1);
     const new_key = AddressKey.fromAddress(na.initIp4(.{ 11, 0, 0, 0 }, 53));
     s.markBroken(new_key);

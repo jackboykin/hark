@@ -38,7 +38,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     var tally = TallyAllocator.init(arena.allocator());
     const lookup_alloc = tally.allocator();
 
-    // Warmup
     for (0..warmup) |i| {
         _ = arena.reset(.retain_capacity);
         const name = lookup_names[i % n_entries];

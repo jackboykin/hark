@@ -25,8 +25,6 @@ pub const multishot_payload_max: u32 = 4096;
 /// io_uring_recvmsg_out header + reserved name + payload.
 const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + multishot_payload_max;
 
-// ── Public types ────────────────────────────────────────────────────────
-
 pub const OperationId = u16;
 
 pub const Completion = struct {
@@ -87,8 +85,6 @@ pub const ReadResult = struct {
     }
 };
 
-// ── Operation slot ──────────────────────────────────────────────────────
-
 const Slot = struct {
     context: *anyopaque,
     active: bool,
@@ -119,8 +115,6 @@ const Slot = struct {
         };
     }
 };
-
-// ── EventLoop ───────────────────────────────────────────────────────────
 
 /// Non-incremental buffer ring for multishot recvmsg. Each CQE consumes
 /// one buffer fully; we reset and re-add it to the ring in `releaseBuf`.
@@ -323,8 +317,6 @@ pub const EventLoop = struct {
         return id;
     }
 
-    /// Release a multishot recv buffer back to the buffer ring so the
-    /// kernel can reuse it for a subsequent packet.
     pub fn releaseBuf(self: *EventLoop, buf_id: u16) void {
         self.udp_buf_ring.release(buf_id);
     }
@@ -521,8 +513,6 @@ pub const EventLoop = struct {
         };
     }
 };
-
-// ── Tests ───────────────────────────────────────────────────────────────
 
 fn createTestLoop() !*EventLoop {
     const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {

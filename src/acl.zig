@@ -43,7 +43,6 @@ pub fn parse(s: []const u8) ?Cidr {
     const addr_str = if (slash) |i| s[0..i] else s;
     const prefix_str = if (slash) |i| s[i + 1 ..] else null;
 
-    // v6 addresses contain ':'.
     if (mem.indexOfScalar(u8, addr_str, ':') != null) {
         const ip6 = std.Io.net.Ip6Address.parse(addr_str, 0) catch return null;
         const default_prefix: u8 = 128;
@@ -160,14 +159,12 @@ test "matchesBytes accepts bare rdata bytes" {
     const v4 = parse("10.0.0.0/8") orelse return error.ParseFailed;
     try testing.expect(v4.matchesBytes(&[_]u8{ 10, 1, 2, 3 }));
     try testing.expect(!v4.matchesBytes(&[_]u8{ 11, 1, 2, 3 }));
-    // Length mismatch — v4 cidr against 16 bytes
     try testing.expect(!v4.matchesBytes(&@as([16]u8, @splat(0))));
 
     const v6 = parse("fc00::/7") orelse return error.ParseFailed;
     try testing.expect(v6.matchesBytes(&([_]u8{0xfc} ++ @as([15]u8, @splat(0)))));
     try testing.expect(v6.matchesBytes(&([_]u8{0xfd} ++ @as([15]u8, @splat(0)))));
     try testing.expect(!v6.matchesBytes(&([_]u8{0xfe} ++ @as([15]u8, @splat(0)))));
-    // Length mismatch — v6 cidr against 4 bytes
     try testing.expect(!v6.matchesBytes(&[_]u8{ 1, 2, 3, 4 }));
 }
 

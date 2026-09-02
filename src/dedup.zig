@@ -3,7 +3,6 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 
-// ── Dedup key ──────────────────────────────────────────────────────────
 // Fixed-size stack key — no allocations in the hot path.
 
 const DedupKey = struct {
@@ -46,8 +45,6 @@ const DedupKeyContext = struct {
             mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]);
     }
 };
-
-// ── In-flight table ────────────────────────────────────────────────────
 
 const AcquireResult = enum { leader, follower };
 
@@ -180,8 +177,6 @@ pub const InFlightTable = struct {
     }
 };
 
-// ── Tests ──────────────────────────────────────────────────────────────
-
 test "leader for new key" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
@@ -276,7 +271,6 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
     defer table.deinit();
 
     _ = table.acquireOrWait("example.com", .a, 0);
-    // Same-thread follower with already-expired deadline: returns immediately.
     const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, monotonic.nowNs());
     try testing.expectEqual(.follower, r);
     table.releaseLeader("example.com", .a, 0);
@@ -309,7 +303,6 @@ test "CD bit partitions dedup groups" {
     const leader_cd0 = table.acquireOrWait("example.com", .a, cd0);
     try testing.expectEqual(.leader, leader_cd0);
 
-    // CD=1 for the same (name, qtype) must become its own leader, not wait.
     const leader_cd1 = table.acquireOrWait("example.com", .a, cd1);
     try testing.expectEqual(.leader, leader_cd1);
 
@@ -392,12 +385,10 @@ test "tryAcquireLeader coalesces without enqueueing followers" {
     defer table.deinit();
 
     try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
-    // Second attempt returns false immediately (no wait), does not add an entry.
     try testing.expect(!table.tryAcquireLeader("example.com", .dnskey, 0));
     table.releaseLeader("example.com", .dnskey, 0);
     try testing.expectEqual(@as(u32, 0), table.count());
 
-    // Freed — next claim succeeds again.
     try testing.expect(table.tryAcquireLeader("example.com", .dnskey, 0));
     table.releaseLeader("example.com", .dnskey, 0);
 }

@@ -32,12 +32,10 @@ const CaseState = @import("case_state.zig").CaseState;
 const ServerConfig = @import("config.zig").ServerConfig;
 const log = std.log.scoped(.resolver);
 
-// ── Root Hints ─────────────────────────────────────────────────────────
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
 // Source: https://www.internic.net/domain/named.root
 
 pub const root_hints_default: [26]na.Address = .{
-    // IPv4
     na.initIp4(.{ 198, 41, 0, 4 }, 53), // a
     na.initIp4(.{ 170, 247, 170, 2 }, 53), // b
     na.initIp4(.{ 192, 33, 4, 12 }, 53), // c
@@ -51,7 +49,6 @@ pub const root_hints_default: [26]na.Address = .{
     na.initIp4(.{ 193, 0, 14, 129 }, 53), // k
     na.initIp4(.{ 199, 7, 83, 42 }, 53), // l
     na.initIp4(.{ 202, 12, 27, 33 }, 53), // m
-    // IPv6
     na.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
     na.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
     na.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
@@ -197,8 +194,6 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 
     return msg;
 }
-
-// ── RecursiveResolver ──────────────────────────────────────────────────
 
 /// Tree-wide budgets for one client-facing resolution. Lives on `resolve()`'s
 /// stack and is shared *by pointer* across the whole tree — `cloneForThread`
@@ -411,7 +406,6 @@ pub const RecursiveResolver = struct {
         return &self.budget.?.validation;
     }
 
-    /// Return the dedicated key cache for DNSKEY/DS, falling back to the main cache.
     fn keyCache(self: *RecursiveResolver) ?*RRsetCache {
         if (self.key_cache) |kc| return kc;
         std.debug.assert(!self.dnssec_enabled or self.cache != null);
@@ -725,8 +719,6 @@ pub const RecursiveResolver = struct {
         return if (self.dnssec_enabled) .secure else .unchecked;
     }
 
-    // ── QNAME minimization probes ───────────────────────────────────────
-
     /// Advance the probe from a cached answer, if any. Cached NXDOMAIN
     /// stops minimizing (relaxed mode); a hit or NODATA steps one label.
     fn probeAnsweredFromCache(self: *RecursiveResolver, allocator: mem.Allocator, walk: *Walk, query_name: []const u8, query_type: dns.RType) bool {
@@ -736,8 +728,6 @@ pub const RecursiveResolver = struct {
         return true;
     }
 
-    /// Steer the walk from a probe (non-final) response: follow referrals,
-    /// stop minimizing on NXDOMAIN or errors, otherwise step one label.
     fn handleProbeResponse(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -801,8 +791,6 @@ pub const RecursiveResolver = struct {
         walk.probe_labels += 1;
     }
 
-    // ── Upstream CNAME following ────────────────────────────────────────
-
     const CnameHop = enum {
         /// Answer holds the queried type (or no CNAME): finalize it.
         none,
@@ -863,8 +851,6 @@ pub const RecursiveResolver = struct {
         return .cross_zone;
     }
 
-    // ── Initial server seeding ──────────────────────────────────────────
-
     /// Seed the per-query authority server set from the closest cached
     /// delegation, or root hints if none. Starts `parent_zone` at root
     /// (empty labels = `.`). Demotes `security_state` to `.insecure`
@@ -908,8 +894,6 @@ pub const RecursiveResolver = struct {
         std.debug.assert(self.root_hints.len <= max_servers_per_level);
         walk.setServers(self.root_hints);
     }
-
-    // ── Cache-served short-circuits ─────────────────────────────────────
 
     /// Dispatch from `tryServeFromCache`: either a terminal answer, a
     /// CNAME follow-up the outer loop drives, or no usable cache hit.
@@ -984,9 +968,7 @@ pub const RecursiveResolver = struct {
                 defer self.bypass_cache = prev_bypass;
                 if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
                     return .{ .served = fresh };
-                } else |_| {
-                    // Fresh attempt failed; fall through to the stale return below.
-                }
+                } else |_| {}
             }
 
             switch (result) {
@@ -1210,10 +1192,6 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    // ── Referral following ──────────────────────────────────────────────
-
-    /// Process a referral: classify DNSSEC delegation, detect loops,
-    /// resolve glueless NS if needed, and update iteration state.
     fn followReferral(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1254,8 +1232,6 @@ pub const RecursiveResolver = struct {
         walk.zone = zone_cut;
         walk.setServers(addrs.addrs[0..addrs.count]);
     }
-
-    // ── Final response handling ─────────────────────────────────────────
 
     /// RFC 9520 §3: cache a resolution failure so the next stub retry
     /// doesn't re-walk the whole upstream chain. Pinned against the
@@ -1393,8 +1369,6 @@ pub const RecursiveResolver = struct {
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
 
-    // ── Delegation security ────────────────────────────────────────────
-
     /// Determine delegation security for a zone cut (RFC 4035 §5.2).
     /// Tries verified NSEC/NSEC3 from referral authorities first, then
     /// falls back to cached/fetched DS status from parent servers.
@@ -1422,8 +1396,6 @@ pub const RecursiveResolver = struct {
         return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
     }
 
-    /// Try to synthesize a wildcard answer from the main RRset cache.
-    /// Returns a synthesized message on success, or null to fall through to upstream.
     fn tryWildcardSynth(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1435,7 +1407,6 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !?dns.Message {
         if (ce_label_count == 0 or target_name.labels.len < ce_label_count) return null;
-        // Build *.CE from qname labels and format as dotted string for cache lookup
         const ce = dns.Name{ .labels = target_name.labels[target_name.labels.len - ce_label_count ..] };
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         const wc_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return null;
@@ -1473,15 +1444,12 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    /// Store validated NSEC records in the aggressive NSEC cache.
     fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name, ttl_cap: u32) void {
         if (self.nsec_cache) |nc| {
             nc.storeFromAuthority(authorities, zone, ttl_cap);
         }
     }
 
-    /// Null-guard wrapper: report an exchange outcome to the NS selector,
-    /// tolerating both a missing selector and an unknown responding server.
     fn recordNsOutcome(self: *RecursiveResolver, zone: dns.Name, server: ?na.Address, outcome: NsOutcome, elapsed_us: i64) void {
         const ns = self.ns_selector orelse return;
         ns.recordOutcome(zone, server orelse return, outcome, elapsed_us);
@@ -1511,8 +1479,6 @@ pub const RecursiveResolver = struct {
         }
         const sig = rrsig orelse return;
 
-        // Single pass: detect wildcard expansion from the first expanded answer record,
-        // then collect all qtype records + covering RRSIGs with wildcard owner name.
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         var wildcard_owner: ?dns.Name = null;
         // Typical wildcard RRsets are 1-3 records. Overflow abandons the store
@@ -1550,10 +1516,6 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    // ── UDP+TCP query helper ──────────────────────────────────────────
-
-    /// Send a UDP query to a single server with TC-bit TCP fallback and RTT tracking.
-    /// Returns the parsed response, or null on failure (timeout, parse error, etc.).
     fn queryServerUdp(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1617,8 +1579,6 @@ pub const RecursiveResolver = struct {
         return try tryParseMessage(allocator, tcp_data, server);
     }
 
-    /// Returns the RNG to randomize an outgoing query to `addr_key`, or
-    /// null if 0x20 is disabled or this server has been marked mangling.
     fn caseRng(self: *RecursiveResolver, addr_key: AddressKey) ?std.Io {
         const cs = self.case_state orelse return null;
         return if (cs.shouldRandomize(addr_key)) self.io else null;
@@ -1644,7 +1604,6 @@ pub const RecursiveResolver = struct {
             !query_name.eqlExact(response.questions[0].name);
     }
 
-    /// Result of one case-hardened Do53 exchange with a single server.
     const Do53Result = union(enum) {
         /// Question echo verified; rcode policy stays with the caller.
         response: struct { message: dns.Message, elapsed_us: i64 },
@@ -1747,8 +1706,6 @@ pub const RecursiveResolver = struct {
         _ = oc.dot_answers.fetchAdd(1, .monotonic);
         return response;
     }
-
-    // ── Staggered NS Racing ─────────────────────────────────────────────
 
     const StaggeredResponse = struct {
         message: dns.Message,
@@ -1891,8 +1848,6 @@ pub const RecursiveResolver = struct {
         return .{ .message = resp, .server = responding_addr };
     }
 
-    // ── Authoritative Server Query ────────────────────────────────────
-
     const ServerQueryResult = struct {
         message: dns.Message,
         responding_server: ?na.Address,
@@ -1921,8 +1876,6 @@ pub const RecursiveResolver = struct {
             held.* = response;
     }
 
-    /// Query authoritative nameservers in selection order, with staggered
-    /// racing and opportunistic TLS. Returns the first useful response.
     fn queryAuthoritativeServers(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1965,7 +1918,6 @@ pub const RecursiveResolver = struct {
             }
         }
 
-        // ── Staggered NS racing ──
         if (sel.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
                 if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
@@ -1981,7 +1933,6 @@ pub const RecursiveResolver = struct {
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
-            // ── Do53: UDP with TCP fallback, 0x20-hardened ──
             const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware)) {
                 .timeout => {
                     self.recordNsOutcome(parent_zone, server, .timeout, 0);
@@ -2008,14 +1959,11 @@ pub const RecursiveResolver = struct {
             return .{ .message = response, .responding_server = server };
         }
 
-        // Every sibling failed: surface the highest-precedence error kept.
         if (last_server_failure) |sf| {
             return .{ .message = sf, .responding_server = null };
         }
         return error.Timeout;
     }
-
-    // ── DNSSEC Answer Validation ───────────────────────────────────────
 
     /// RFC 9520 §3.2: minimum negative-cache TTL for DNSSEC validation failures.
     const dnssec_bogus_ttl: u32 = 1;
@@ -2683,7 +2631,6 @@ pub const RecursiveResolver = struct {
         return dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, now_u32, self.validationBudget(), ttl_cap);
     }
 
-    /// Verify authority NSEC/NSEC3 signatures, then validate the negative proof.
     fn verifiedNegativeResponse(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -2773,8 +2720,6 @@ pub const RecursiveResolver = struct {
     const max_ns_fetch_limit: usize = 3;
     const max_ns_parallel_tasks: usize = max_ns_fetch_limit * address_rtypes.len;
 
-    /// Append A+AAAA addresses from `records` to `addrs`, skipping non-routable.
-    /// Returns true if at least one address was appended.
     fn appendAddressesFromRecords(
         self: *RecursiveResolver,
         records: []const dns.ResourceRecord,
@@ -2825,7 +2770,6 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    /// Resolve A + AAAA for a single NS name serially.
     fn resolveNsName(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -2927,7 +2871,6 @@ pub const RecursiveResolver = struct {
         var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
 
-        // Task 0 = (NS[0], A) on caller thread.
         try self.resolveNsNameOne(allocator, dotted_names[0], address_rtypes[0], depth, &addrs, &count);
 
         // Thread-spawn fallbacks: run the task on the caller so we don't drop
@@ -3072,8 +3015,6 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    /// Walk the domain name from TLD to find the closest cached delegation.
-    /// E.g., for "www.example.com", check NS records for "com" then "example.com".
     pub fn findClosestCachedDelegation(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -3172,8 +3113,6 @@ pub const RecursiveResolver = struct {
     }
 };
 
-// ── Insecure delegation caching ───────────────────────────────────────
-
 fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zone: dns.Name) bool {
     const c = cache orelse return false;
     var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
@@ -3237,7 +3176,6 @@ fn validateDnskeyAgainstDs(
     }
 }
 
-/// Map dnssec validation status to the cache-tier subset (no .bogus).
 fn cacheSecurityStatus(state: dnssec.SecurityStatus) cache_mod.SecurityStatus {
     return switch (state) {
         .secure => .secure,
@@ -3245,8 +3183,6 @@ fn cacheSecurityStatus(state: dnssec.SecurityStatus) cache_mod.SecurityStatus {
         .unchecked, .bogus => .unchecked,
     };
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────
 
 /// RFC 8482 §6 example uses 3789s; matches BIND's default and signals to
 /// debuggers that the answer is a synthetic HINFO and not a real RRset.
@@ -3277,14 +3213,12 @@ fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
     return synthesizedMessage(arr, &.{}, .no_error, false);
 }
 
-/// Parent zone name of `zone_name`. Returns "" (root) for TLDs and root.
 fn parentZoneOf(zone_name: []const u8) []const u8 {
     const pos = dns.indexOfUnescapedDot(zone_name, 0) orelse return "";
     if (pos + 1 >= zone_name.len) return "";
     return zone_name[pos + 1 ..];
 }
 
-/// Strip authority/additional sections from a message for targeted cache stores.
 fn answersOnly(msg: dns.Message) dns.Message {
     var m = msg;
     m.authorities = &.{};
@@ -3385,7 +3319,6 @@ fn cnameDerivesFrom(cname_rr: dns.ResourceRecord, dname_rr: dns.ResourceRecord) 
     return dtarget.eql(.{ .labels = target[prefix.len..] });
 }
 
-/// The DNAME in `answers` that produced `cname_rr`, if one did.
 fn synthesizingDname(answers: []const dns.ResourceRecord, cname_rr: dns.ResourceRecord, zone: dns.Name) ?dns.ResourceRecord {
     for (answers) |rr| {
         if (rr.rtype == .dname and rr.name.isSubdomainOf(zone) and cnameDerivesFrom(cname_rr, rr)) return rr;
@@ -3424,9 +3357,6 @@ fn cnameTargetRevisitsChain(chain: []const dns.ResourceRecord, next_target: dns.
     return false;
 }
 
-/// Shared debug-log shape for the upstream-served and cache-served
-/// CNAME loop-detection branches. Single format string keeps both
-/// branches reading the same telemetry.
 /// Concatenate two RR slices. Returns the input slice unchanged when one
 /// side is empty (zero-alloc fast path for the dominant non-DNSSEC case).
 fn concatRRs(allocator: mem.Allocator, a: []const dns.ResourceRecord, b: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
@@ -3512,10 +3442,6 @@ fn aggregateCachedCnameWildcardProofs(
     }
 }
 
-/// Assemble a `ResolveResult` for a negative response: SOA + NSEC
-/// proofs in the authority section, empty answer section, threaded
-/// through any active CNAME chain. Used by all cache-served negative
-/// paths.
 fn negativeResolveResult(
     allocator: mem.Allocator,
     soa: ?dns.ResourceRecord,
@@ -3534,8 +3460,6 @@ fn negativeResolveResult(
     };
 }
 
-// ── Referral extraction ────────────────────────────────────────────────
-
 const ReferralResult = union(enum) {
     referral: struct {
         addrs: [max_servers_per_level]na.Address,
@@ -3549,7 +3473,6 @@ const ReferralResult = union(enum) {
     },
 };
 
-/// Returns true if the response contains any RRSIG records (signed zone).
 fn hasSignedRecords(response: dns.Message) bool {
     for (response.answers) |rr| if (rr.rtype == .rrsig) return true;
     for (response.authorities) |rr| if (rr.rtype == .rrsig) return true;
@@ -3570,7 +3493,6 @@ fn extractReferral(
     parent_zone: dns.Name,
     policy: ReferralAddrPolicy,
 ) ?ReferralResult {
-    // Find the most specific zone cut: NS owner where target is a subdomain
     var zone_cut: ?dns.Name = null;
     var zone_cut_depth: usize = 0;
     for (response.authorities) |rr| {
@@ -3590,7 +3512,6 @@ fn extractReferral(
     // a CNAME answer).  RFC 1034 §4.2.1, RFC 8499 §7.
     if (zc.labels.len <= parent_zone.labels.len) return null;
 
-    // Collect NS names at the zone cut
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;
     for (response.authorities) |rr| {
@@ -3602,7 +3523,6 @@ fn extractReferral(
         }
     }
 
-    // Match glue A/AAAA records with bailiwick check
     var glue_addrs: [max_servers_per_level]na.Address = undefined;
     var glue_count: usize = 0;
     for (response.additionals) |rr| {
@@ -3642,8 +3562,6 @@ fn extractReferral(
         .zone_cut = zc,
     } };
 }
-
-// ── Negative proof validation ──────────────────────────────────────────
 
 /// `proceed` carries the *proof's* verdict, not the zone's, so AD and the cached
 /// rank come from one source. Deriving both from `security_state` left an
@@ -3692,12 +3610,6 @@ fn validateNegativeResponse(
         },
     };
 }
-
-// ════════════════════════════════════════════════════════════════════════
-// Tests
-// ════════════════════════════════════════════════════════════════════════
-
-// ── Test helpers ──────────────────────────────────────────────────────
 
 fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {
     return .{
@@ -3752,8 +3664,6 @@ fn makeResponse(alloc: mem.Allocator, authorities: []const dns.ResourceRecord, a
     };
 }
 
-// ── 0x20 echo tests ───────────────────────────────────────────────────
-
 test "caseMangledEcho: only a same-name case mismatch marks mangling" {
     const query_name = dns.Name{ .labels = &.{ "eXaMpLe", "cOm" } };
     const question = struct {
@@ -3767,12 +3677,10 @@ test "caseMangledEcho: only a same-name case mismatch marks mangling" {
         }
     }.make;
 
-    // Same name, different byte case: genuine mangle.
     try std.testing.expect(RecursiveResolver.caseMangledEcho(
         query_name,
         question(.{ .labels = &.{ "example", "com" } }),
     ));
-    // Exact echo: clean.
     try std.testing.expect(!RecursiveResolver.caseMangledEcho(query_name, question(query_name)));
     // Unrelated question (error rcodes are exempt from question-match,
     // RFC 9619): must NOT mark the server case-broken.
@@ -3786,8 +3694,6 @@ test "caseMangledEcho: only a same-name case mismatch marks mangling" {
         .questions = &.{},
     }));
 }
-
-// ── extractReferral tests ─────────────────────────────────────────────
 
 test "extractReferral with NS and glue A records" {
     const alloc = testing.allocator;
@@ -3857,12 +3763,10 @@ test "extractReferral rejects private IP glue (DNS rebinding defense)" {
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    // Glue pointing to loopback — must be rejected
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    // Private glue is dropped, so we should get no_glue (triggers glueless resolution)
     try testing.expect(result == .no_glue);
 }
 
@@ -3885,7 +3789,6 @@ test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
     ) orelse return error.TestUnexpectedResult;
     try testing.expect(result == .referral);
     try testing.expectEqual(@as(usize, 1), result.referral.count);
-    // Confirm the policy-supplied port is what gets stamped onto the address.
     try testing.expectEqual(@as(u16, 5353), result.referral.addrs[0].getPort());
 }
 
@@ -3894,7 +3797,6 @@ test "extractReferral rejects out-of-zone glue" {
     const ns_name = try makeName(alloc, &.{ "ns1", "evil", "org" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
     const glue_name = try makeName(alloc, &.{ "ns1", "evil", "org" });
-    // Glue for ns1.evil.org — out of bailiwick for parent zone "com"
     const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 6, 6, 6, 6 })});
     defer dns.freeMessage(alloc, response);
 
@@ -3967,12 +3869,9 @@ test "extractReferral rejects same-zone NS as non-referral" {
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "api", "example", "com" } };
-    // parent_zone == zone_cut → same zone, must return null
     const parent_zone = dns.Name{ .labels = &.{ "example", "com" } };
     try testing.expect(extractReferral(response, target, parent_zone, .{}) == null);
 }
-
-// ── findCnameRecord / nameToDotted tests ──────────────────────────────
 
 test "nameToDotted round-trips correctly" {
     const alloc = testing.allocator;
@@ -4006,7 +3905,6 @@ test "cnameTargetRevisitsChain detects 2-name A→B→A cycle in ≤2 hops" {
     defer dns.freeName(alloc, a_name);
     defer dns.freeName(alloc, b_name);
 
-    // Hop 1: A → B
     const cname_ab = dns.ResourceRecord{
         .name = a_name,
         .rtype = .cname,
@@ -4014,13 +3912,10 @@ test "cnameTargetRevisitsChain detects 2-name A→B→A cycle in ≤2 hops" {
         .ttl = 300,
         .rdata = .{ .cname = b_name },
     };
-    // Empty chain accepts anything.
     try testing.expect(!cnameTargetRevisitsChain(&.{}, b_name));
 
-    // After hop 1, chain holds {A→B}. Hop 2 target = A revisits A.
     const chain_one = [_]dns.ResourceRecord{cname_ab};
     try testing.expect(cnameTargetRevisitsChain(&chain_one, a_name));
-    // Sanity: a non-revisiting third name is fine.
     const c_name = try makeName(alloc, &.{ "c", "example", "com" });
     defer dns.freeName(alloc, c_name);
     try testing.expect(!cnameTargetRevisitsChain(&chain_one, c_name));
@@ -4152,14 +4047,13 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
         .transports = null,
         .io = testing.io,
         .cache = &cache,
-        .cache_only = true, // any upstream attempt → error.CacheOnlyMiss
+        .cache_only = true,
     };
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
 
-    // Two answers: synthesized CNAME from the chain + target AAAA.
     try testing.expectEqual(@as(usize, 2), result.message.answers.len);
     try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
     try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
@@ -4449,14 +4343,12 @@ test "aggregateCachedCnameWildcardProofs appends only when status is .secure" {
         try aggregateCachedCnameWildcardProofs(alloc, .unchecked, &.{nsec_rr}, &agg);
         try testing.expectEqual(@as(usize, 0), agg.items.len);
     }
-    // .insecure → no-op.
     {
         var agg: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
         defer agg.deinit(alloc);
         try aggregateCachedCnameWildcardProofs(alloc, .insecure, &.{nsec_rr}, &agg);
         try testing.expectEqual(@as(usize, 0), agg.items.len);
     }
-    // .secure → proof material flows through.
     {
         var agg: std.ArrayListUnmanaged(dns.ResourceRecord) = .empty;
         defer agg.deinit(alloc);
@@ -4466,12 +4358,9 @@ test "aggregateCachedCnameWildcardProofs appends only when status is .secure" {
     }
 }
 
-// ── validateNegativeResponse tests ─────────────────────────────────────
-
 test "validateNegativeResponse returns proceed when security_state is not secure" {
     const name = dns.Name{ .labels = &.{ "example", "com" } };
     var b: dnssec.ValidationBudget = .{};
-    // unchecked/insecure → proceed regardless of authorities
     try testing.expectEqual(NegativeValidation{ .proceed = .unchecked }, validateNegativeResponse(.unchecked, &.{}, name, .a, true, test_root, &b));
     try testing.expectEqual(NegativeValidation{ .proceed = .insecure }, validateNegativeResponse(.insecure, &.{}, name, .a, false, test_root, &b));
 }
@@ -4566,7 +4455,6 @@ test "validateNegativeResponse binds a proof to the zone that signed it" {
 test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
     testing.log_level = .err; // silence the fail-closed diagnostic warn
     const name = dns.Name{ .labels = &.{ "example", "com" } };
-    // Build authorities with both NSEC and NSEC3 records
     const authorities = [_]dns.ResourceRecord{
         .{
             .name = dns.Name{ .labels = &.{ "example", "com" } },
@@ -4780,10 +4668,10 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
     try cc.wildcard_proofs.append(a, nsec_rr);
     const stitched = try withCnameChain(a, &cc, terminal_response);
 
-    try testing.expectEqual(@as(usize, 2), stitched.answers.len); // CNAME + A
+    try testing.expectEqual(@as(usize, 2), stitched.answers.len);
     try testing.expectEqual(dns.RType.cname, stitched.answers[0].rtype);
     try testing.expectEqual(dns.RType.a, stitched.answers[1].rtype);
-    try testing.expectEqual(@as(usize, 1), stitched.authorities.len); // NSEC aggregated
+    try testing.expectEqual(@as(usize, 1), stitched.authorities.len);
     try testing.expectEqual(dns.RType.nsec, stitched.authorities[0].rtype);
 }
 
@@ -4812,20 +4700,17 @@ test "withCnameChain clears AD when any hop was not proven secure" {
     try testing.expect(try insecure_hop.push(a, .{ .records = &.{cname_rr}, .target = cname_target }, .unchecked, "test"));
     try testing.expectEqual(false, (try withCnameChain(a, &insecure_hop, validated_tail)).header.flags.ad);
 
-    // A fully-proven chain keeps it.
     var secure_hop: CnameChain = .{};
     defer secure_hop.deinit(a);
     try testing.expect(try secure_hop.push(a, .{ .records = &.{cname_rr}, .target = cname_target }, .secure, "test"));
     try testing.expectEqual(true, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 
-    // One bad hop anywhere in the chain poisons the whole answer.
     const tgt2 = dns.Name{ .labels = &.{ "tgt2", "signed", "example" } };
     const cname2 = dns.ResourceRecord{ .name = cname_target, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = tgt2 } };
     try testing.expect(try secure_hop.push(a, .{ .records = &.{cname2}, .target = tgt2 }, .insecure, "test"));
     try testing.expectEqual(false, (try withCnameChain(a, &secure_hop, validated_tail)).header.flags.ad);
 }
 
-// ── cache_only guard tests ────────────────────────────────────────────
 // Pin the recv-thread fast-path invariant: every upstream-reaching entry
 // must short-circuit before any `transports.?` access. Two guards cover
 // the surface: `queryAuthoritativeServers` (the main recursion entry) and
@@ -4855,8 +4740,6 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, servers[0..1], parent_zone);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
-
-// ── Budget: tree-wide NXNS guard ──────────────────────────────────────
 
 test "Budget.consumeQuery permits exactly max draws then refuses" {
     var budget: Budget = .{ .max_queries = 5 };
@@ -4950,8 +4833,6 @@ test "concatRRs handles OOM without leaking" {
     try testing.checkAllAllocationFailures(testing.allocator, concatRRsOomProbe, .{{}});
 }
 
-// ── tryParseMessage 0x20-case scrub tests ──────────────────────────────
-//
 // These cover the bug where 0x20-randomized case in upstream replies
 // leaked into client responses via answer/authority/additional owner
 // names — visible as `PING x.cOm` for a `ping x.com` query. The scrub
@@ -5023,7 +4904,6 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    // Store a wildcard A RRset under `*.example.com`.
     const star_labels = try aa.alloc([]const u8, 3);
     star_labels[0] = try aa.dupe(u8, "*");
     star_labels[1] = try aa.dupe(u8, "example");
@@ -5055,7 +4935,6 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
     defer cache.deinit();
     cache.storeResponse(store_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
 
-    // Build a target name with mixed case: `WhAtEvEr.example.com`.
     const tgt_labels = try aa.alloc([]const u8, 3);
     tgt_labels[0] = try aa.dupe(u8, "WhAtEvEr");
     tgt_labels[1] = try aa.dupe(u8, "example");
@@ -5097,8 +4976,6 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
     try testing.expectEqual(@as(u16, 0), ans.wire_ttl_offset);
 }
 
-// ── tryParseMessage 0x20 RDATA-name scrub tests ────────────────────────
-//
 // Worst case: a compression pointer in RDATA aliasing back to the
 // mixed-case question name, so the parser hands us label slices that
 // point straight at the upstream-chosen bytes.

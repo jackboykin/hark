@@ -9,8 +9,6 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 /// Maximum effective TTL for synthesized responses (RFC 9077 §3).
 const max_aggressive_ttl: u32 = 10800;
 
-// ── NsecEntry ─────────────────────────────────────────────────────────
-
 const NsecEntry = struct {
     owner: dns.Name,
     next_domain: dns.Name,
@@ -38,7 +36,6 @@ fn freeRecord(alloc: Allocator, rr: *dns.ResourceRecord) void {
     dns.freeRData(alloc, rr.rdata);
 }
 
-// ── Zone NSEC list ────────────────────────────────────────────────────
 // Sorted by canonical name order for binary search.
 
 const ZoneNsecList = struct {
@@ -57,7 +54,6 @@ const ZoneNsecList = struct {
         if (self.soa) |*s| freeRecord(alloc, s);
     }
 
-    /// Insert maintaining sorted order. Replaces existing entry with same owner.
     fn insert(self: *ZoneNsecList, alloc: Allocator, entry: NsecEntry, now: i64) void {
         var pos = self.findInsertPos(entry.owner);
 
@@ -68,7 +64,6 @@ const ZoneNsecList = struct {
         }
 
         if (self.len >= self.entries.len) {
-            // Try expiring stale entries first; fall back to evicting oldest
             self.evictExpired(alloc, now);
             if (self.len >= self.entries.len) {
                 self.evictOldest(alloc);
@@ -161,7 +156,6 @@ const ZoneNsecList = struct {
         return null;
     }
 
-    /// Find NSEC whose owner matches qname exactly.
     fn findExact(self: *const ZoneNsecList, qname: dns.Name, now: i64) ?*const NsecEntry {
         const pos = self.findInsertPos(qname);
         if (pos < self.len and self.entries[pos].owner.eql(qname) and self.entries[pos].expires_at > now) {
@@ -260,8 +254,6 @@ fn isParentSideNsec(nsec: *const NsecEntry, target: dns.Name, qtype: dns.RType) 
     return dnssec.commonSuffixLabels(target, nsec.owner) == nsec.owner.labels.len;
 }
 
-// ── NsecCache ─────────────────────────────────────────────────────────
-
 /// Result of an aggressive NSEC lookup (RFC 8198).
 pub const SynthResult = struct {
     kind: Kind,
@@ -288,7 +280,7 @@ pub const NsecCache = struct {
     hits: std.atomic.Value(u64),
     misses: std.atomic.Value(u64),
 
-    pub const default_max_bytes: usize = 1024 * 1024; // 1MB
+    pub const default_max_bytes: usize = 1024 * 1024;
     const entries_per_zone: usize = 64;
     const max_zones: usize = 256;
     const max_store_batch: usize = 8;
@@ -322,8 +314,6 @@ pub const NsecCache = struct {
         }
         self.zones.deinit(alloc);
     }
-
-    // ── Store ─────────────────────────────────────────────────────────
 
     /// Extract NSEC records from authority section and store them.
     /// Only stores NSEC (not NSEC3 — marginal effectiveness per DNS-OARC research).
@@ -376,7 +366,6 @@ pub const NsecCache = struct {
         // Clone SOA outside lock for synthesized responses (RFC 2308 §3)
         var cached_soa: ?dns.ResourceRecord = if (soa_rr) |sr| cloneRecord(alloc, sr) catch null else null;
 
-        // Take write lock only for zone lookup + sorted insert
         if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
         defer if (self.rwlock) |*rw| rw.unlock(self.io);
 
@@ -397,7 +386,6 @@ pub const NsecCache = struct {
 
     fn getOrCreateZone(self: *NsecCache, alloc: Allocator, zone: []const u8) ?*ZoneNsecList {
         if (self.zones.getPtr(zone)) |list| return list;
-        // Evict smallest zone if at capacity
         if (self.zones.count() >= max_zones) self.evictSmallestZone(alloc);
         const key = alloc.dupe(u8, zone) catch return null;
         const list = ZoneNsecList.init(alloc, entries_per_zone) catch {
@@ -430,8 +418,6 @@ pub const NsecCache = struct {
         }
     }
 
-    // ── Lookup ────────────────────────────────────────────────────────
-
     /// Walk suffix zones of a dotted name and try NSEC synthesis under a
     /// single shared lock. SOA is cloned into `caller_alloc` before releasing.
     pub fn lookupSuffixes(self: *NsecCache, caller_alloc: Allocator, qname: dns.Name, qtype: dns.RType, dotted_name: []const u8) ?SynthResult {
@@ -448,7 +434,6 @@ pub const NsecCache = struct {
         // for example.com when zone "example.com" has a matching NSEC).
         if (self.tryZone(caller_alloc, name_lower, qname, qtype, now)) |r| return r;
 
-        // Walk parent suffixes (most-specific first)
         var pos: usize = 0;
         while (dns.indexOfUnescapedDot(name_lower, pos)) |dot| {
             pos = dot + 1;
@@ -634,7 +619,6 @@ const NameNonExistence = union(enum) {
 };
 
 fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RType, now: i64) NameNonExistence {
-    // (a) Find NSEC covering qname
     const qname_cover = list.findCovering(qname, now) orelse return .unknown;
     if (isParentSideNsec(qname_cover, qname, qtype)) return .unknown;
 
@@ -648,14 +632,12 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
     // exactly the traffic that motivated 39c5540, instead of forfeiting it.
     if (qname_cover.next_domain.isSubdomainOf(qname)) return .unknown;
 
-    // (b) Derive closest encloser from cover, then check wildcard
     const ce = dnssec.closestEncloser(qname, qname_cover.owner, qname_cover.next_domain) orelse
         return .unknown;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const wildcard_name = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unknown;
 
-    // Check if wildcard exists
     if (list.findExact(wildcard_name, now)) |wc_nsec| {
         if (isParentSideNsec(wc_nsec, wildcard_name, qtype)) return .unknown;
         // Wildcard exists. NODATA synthesis is eligible only when nothing
@@ -670,13 +652,10 @@ fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RT
         return .{ .wildcard_match = .{ .qname_cover = qname_cover, .ce_label_count = @intCast(ce.labels.len) } };
     }
 
-    // Prove wildcard name is covered by an NSEC (doesn't exist)
     const wildcard_cover = list.findCovering(wildcard_name, now) orelse return .unknown;
     if (isParentSideNsec(wildcard_cover, wildcard_name, qtype)) return .unknown;
     return .{ .nxdomain = .{ .qname_cover = qname_cover, .wildcard_cover = wildcard_cover } };
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────
 
 var test_time: i64 = 1000000;
 fn testNowSeconds() i64 {
@@ -1125,7 +1104,6 @@ test "NSEC cache: wrap-around NSEC chain" {
 
     nc.storeFromAuthority(&.{
         soa_rr,
-        // apex → beta
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = beta_name, .type_bit_maps = bitmap } } },
         // beta → apex (wrap-around)
         .{ .name = beta_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex_owner2, .type_bit_maps = bitmap_host } } },

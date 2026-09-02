@@ -364,8 +364,8 @@ test "scrub drops RRSIG when its rrset is partially scrubbed (sig invalidated by
     // even one member invalidates the signature for the survivors.
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const answers: []const dns.ResourceRecord = &.{
-        rrA(public_name, .{ 192, 168, 1, 1 }), // scrubbed
-        rrA(public_name, .{ 8, 8, 8, 8 }), // kept
+        rrA(public_name, .{ 192, 168, 1, 1 }),
+        rrA(public_name, .{ 8, 8, 8, 8 }),
         rrsigOver(.a), // must drop — orphan after partial scrub
     };
     const scrubbed = try scrub(testing.allocator, answers, cfg);

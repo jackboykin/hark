@@ -9,8 +9,6 @@ const RttCache = @import("ns_rtt.zig").RttCache;
 const dns = @import("dns.zig");
 const rand = @import("rand.zig");
 
-// ── Constants ────────────────────────────────────────────────────────
-
 /// Discount factor: γ = 0.995 → half-life ≈ 138 observations.
 const default_gamma: f32 = 0.995;
 
@@ -25,8 +23,6 @@ const max_order = 26;
 /// load. Lost arms reset to the Beta(1,1) prior on next observation.
 const default_max_arms: u32 = 16_384;
 
-// ── Outcome ──────────────────────────────────────────────────────────
-
 pub const Outcome = enum {
     /// Valid answer received (may be referral, NODATA, NXDOMAIN — all are
     /// legitimate authoritative behavior).
@@ -35,9 +31,7 @@ pub const Outcome = enum {
     truncated,
     /// SERVFAIL, REFUSED, or other server error rcode.
     server_error,
-    /// No response within timeout.
     timeout,
-    /// Response failed DNSSEC validation.
     validation_failure,
 };
 
@@ -57,8 +51,6 @@ fn latencyFactor(elapsed_us: i64) f32 {
     const ms: f32 = @floatFromInt(@divTrunc(@max(elapsed_us, 0), 1000));
     return @max(0.5, 1.0 - ms / 2000.0);
 }
-
-// ── Arm Key & State ──────────────────────────────────────────────────
 
 /// Compound key: (zone, nameserver address). Per-zone keying prevents
 /// the Disablance Attack (IETF draft-zhang-dnsop-ns-selection V1) and
@@ -89,8 +81,6 @@ const ArmState = struct {
     alpha: f32 = alpha_prior,
     beta: f32 = beta_prior,
 };
-
-// ── NsSelector ───────────────────────────────────────────────────────
 
 const ArmMap = std.HashMap(ArmKey, ArmState, ArmKeyContext, std.hash_map.default_max_load_percentage);
 
@@ -234,8 +224,6 @@ pub const NsSelector = struct {
         }
     }
 
-    // ── Internal ─────────────────────────────────────────────────────
-
     /// Apply discount γ if the arm exists, then return its (possibly updated)
     /// state. Single-shard lock; caller must not hold any other shard.
     fn discountAndRead(self: *NsSelector, key: ArmKey) ArmState {
@@ -252,9 +240,6 @@ pub const NsSelector = struct {
     }
 };
 
-// ── Zone Hashing ─────────────────────────────────────────────────────
-
-/// Hash a dns.Name into a u64 for use as zone key. Case-insensitive.
 fn zoneHash(name: dns.Name) u64 {
     var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
     for (name.labels) |label| {
@@ -318,8 +303,6 @@ fn normalSample(io: std.Io) f32 {
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);
 }
 
-// ── Sorting ──────────────────────────────────────────────────────────
-
 /// Sort indices by corresponding scores (descending). Insertion sort
 /// is fine for N ≤ 26.
 fn sortByScoreDesc(indices: []usize, scores: []f32) void {
@@ -338,8 +321,6 @@ fn sortByScoreDesc(indices: []usize, scores: []f32) void {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
-
 test "reward mapping" {
     try testing.expectEqual(@as(f32, 0.0), reward(.timeout, 0));
     try testing.expectEqual(@as(f32, 0.0), reward(.validation_failure, 100_000));
@@ -353,7 +334,6 @@ test "latency factor" {
     try testing.expectEqual(@as(f32, 1.0), latencyFactor(0));
     try testing.expectEqual(@as(f32, 0.75), latencyFactor(500_000));
     try testing.expectEqual(@as(f32, 0.5), latencyFactor(1_000_000));
-    // Clamped at 0.5 for very slow
     try testing.expectEqual(@as(f32, 0.5), latencyFactor(5_000_000));
 }
 
@@ -420,20 +400,17 @@ test "selectServers basic ordering" {
         na.initIp4(.{ 10, 0, 0, 2 }, 53),
     };
 
-    // Record: server 0 is terrible, server 1 is great
     for (0..50) |_| {
         sel.recordOutcome(zone, servers[0], .timeout, 0);
-        sel.recordOutcome(zone, servers[1], .success, 10_000); // 10ms
+        sel.recordOutcome(zone, servers[1], .success, 10_000);
     }
 
-    // Over many trials, server 1 should usually be picked first
     var server1_first: usize = 0;
     var order_buf: [max_order]usize = undefined;
     for (0..100) |_| {
         const order = sel.selectServers(zone, &servers, null, &order_buf);
         if (order.len > 0 and order[0] == 1) server1_first += 1;
     }
-    // Should be first >90% of the time
     try testing.expect(server1_first > 90);
 }
 
@@ -448,7 +425,6 @@ test "discount causes re-exploration" {
         na.initIp4(.{ 10, 0, 0, 2 }, 53),
     };
 
-    // Make server 0 look bad initially
     for (0..20) |_| {
         sel.recordOutcome(zone, servers[0], .timeout, 0);
         sel.recordOutcome(zone, servers[1], .success, 10_000);

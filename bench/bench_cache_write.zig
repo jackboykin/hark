@@ -30,9 +30,6 @@ const bench_common = @import("bench_common.zig");
 const m_rrsets: u32 = 1000;
 const warmup_rrsets: u32 = 32;
 
-// ── Record builders ───────────────────────────────────────────────────
-
-/// Build a 3-label name `hostN.example.com` into the arena.
 fn buildHostName(alloc: std.mem.Allocator, idx: u32) !dns.Name {
     const labels = try alloc.alloc([]const u8, 3);
     labels[0] = try std.fmt.allocPrint(alloc, "host{d}", .{idx});
@@ -41,7 +38,6 @@ fn buildHostName(alloc: std.mem.Allocator, idx: u32) !dns.Name {
     return .{ .labels = labels };
 }
 
-/// A: 4-byte rdata, no children.
 fn buildAGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecord {
     const name = try buildHostName(alloc, idx);
     const recs = try alloc.alloc(dns.ResourceRecord, n);
@@ -58,7 +54,6 @@ fn buildAGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecord
     return recs;
 }
 
-/// AAAA: 16-byte rdata, no children.
 fn buildAAAAGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecord {
     const name = try buildHostName(alloc, idx);
     const recs = try alloc.alloc(dns.ResourceRecord, n);
@@ -100,7 +95,6 @@ fn buildCnameGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRe
     return recs;
 }
 
-/// MX: preference + name child.
 fn buildMxGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecord {
     const name = try buildHostName(alloc, idx);
     const recs = try alloc.alloc(dns.ResourceRecord, n);
@@ -121,7 +115,6 @@ fn buildMxGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecor
     return recs;
 }
 
-/// NSEC: next-domain name child + 32-byte type bitmap.
 fn buildNsecGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRecord {
     const name = try buildHostName(alloc, idx);
     const recs = try alloc.alloc(dns.ResourceRecord, n);
@@ -134,9 +127,9 @@ fn buildNsecGroup(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.ResourceRec
         const bitmap = try alloc.alloc(u8, 6);
         // Window 0, length 4, bits for A(1), NS(2), CNAME(5) — bytes form a
         // valid NSEC type-bitmap, sufficient for serialization.
-        bitmap[0] = 0; // window
-        bitmap[1] = 4; // length
-        bitmap[2] = 0b01100010; // A=1 set, NS=2 set, CNAME=5 set, etc
+        bitmap[0] = 0;
+        bitmap[1] = 4;
+        bitmap[2] = 0b01100010;
         bitmap[3] = 0;
         bitmap[4] = 0;
         bitmap[5] = 0;
@@ -162,7 +155,6 @@ fn buildDnskeyAndSigs(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.Resourc
     const name = try buildHostName(alloc, idx);
     const recs = try alloc.alloc(dns.ResourceRecord, 2 * n);
 
-    // First N: DNSKEY records.
     var k: u32 = 0;
     while (k < n) : (k += 1) {
         const pub_key = try alloc.alloc(u8, 256);
@@ -181,7 +173,6 @@ fn buildDnskeyAndSigs(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.Resourc
         };
     }
 
-    // Next N: RRSIGs covering DNSKEY.
     var s: u32 = 0;
     while (s < n) : (s += 1) {
         const signer_labels = try alloc.alloc([]const u8, 2);
@@ -209,8 +200,6 @@ fn buildDnskeyAndSigs(alloc: std.mem.Allocator, idx: u32, n: u32) ![]dns.Resourc
     }
     return recs;
 }
-
-// ── Workload kinds ────────────────────────────────────────────────────
 
 const RtypeKind = enum { a, aaaa, cname, mx, nsec, dnskey };
 

@@ -156,8 +156,6 @@ fn exchangeOn(conn: *Connection, allocator: Allocator, wire_query: []const u8) !
     return response;
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
-
 test "reads give up at the deadline on a peer that never speaks" {
     // Backlog connects; peer stays mute.
     const io = testing.io;

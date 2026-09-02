@@ -100,7 +100,7 @@ fn shapeAnswers(
             if (rr.rtype == self.qtype) return true;
             return switch (rr.rtype) {
                 .rrsig, .nsec, .nsec3 => self.keep_dnssec,
-                else => true, // CNAME, DNAME, qtype payload, etc.
+                else => true,
             };
         }
     }{ .qtype = qtype, .keep_dnssec = keep_dnssec });
@@ -216,8 +216,6 @@ fn filterRecords(
     }
     return out;
 }
-
-// ── Response building ──────────────────────────────────────────────────
 
 pub const ResponseContext = struct {
     query_id: u16,
@@ -412,8 +410,6 @@ pub fn serializeErrorResponse(
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
 
-// ── Synthesized messages ───────────────────────────────────────────────
-
 /// Build a `dns.Message` value for a cached or synthesized response. The
 /// header is the canonical recursive-resolver shape: aa=false (we are not
 /// authoritative for any zone), ra=true (recursion available), no question
@@ -453,8 +449,6 @@ pub fn synthesizedMessage(
     };
 }
 
-// ── Query validation ───────────────────────────────────────────────────
-
 pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful
@@ -468,8 +462,6 @@ pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rc
     if (query.opt) |opt| if (opt.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
     return null;
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "buildResponseWire sets correct header fields" {
     const alloc = testing.allocator;

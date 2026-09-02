@@ -7,7 +7,6 @@ const RRsetCache = hark.cache.RRsetCache;
 
 pub const host_labels_spec = [_][]const u8{ "host{d}", "example", "com" };
 
-/// Header for a one-record authoritative answer.
 pub const single_answer_header: dns.Header = .{
     .id = 0,
     .flags = .{
@@ -28,14 +27,12 @@ pub const single_answer_header: dns.Header = .{
     .ar_count = 0,
 };
 
-/// Wrap a single resource record into a minimal authoritative message.
 pub fn singleAnswerMessage(alloc: std.mem.Allocator, rr: dns.ResourceRecord) !dns.Message {
     const recs = try alloc.alloc(dns.ResourceRecord, 1);
     recs[0] = rr;
     return .{ .header = single_answer_header, .questions = &.{}, .answers = recs };
 }
 
-/// Duplicate a slice of string literals into an owned labels slice.
 pub fn dupeLabels(alloc: std.mem.Allocator, parts: []const []const u8) ![][]const u8 {
     const labels = try alloc.alloc([]const u8, parts.len);
     for (parts, 0..) |p, i| labels[i] = try alloc.dupe(u8, p);
@@ -53,7 +50,6 @@ pub fn makeAResponse(
 ) !dns.Message {
     std.debug.assert(labels_spec.len >= 2);
     const labels = try alloc.alloc([]const u8, labels_spec.len);
-    // First label is parameterized by idx; the rest are literal.
     labels[0] = try std.fmt.allocPrint(alloc, labels_spec[0], .{idx});
     inline for (labels_spec[1..], 1..) |lit, i| {
         labels[i] = try alloc.dupe(u8, lit);

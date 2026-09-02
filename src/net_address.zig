@@ -147,7 +147,6 @@ pub fn fromSockaddr(sa: *const PosixAddress) Address {
     };
 }
 
-/// Address family as u32 for socket() calls.
 pub fn afU32(addr: Address) u32 {
     return switch (addr) {
         .ip4 => posix.AF.INET,
@@ -245,8 +244,6 @@ pub fn isSpecialUseIp6(b: [16]u8) bool {
 pub fn isIp4Mapped(bytes: []const u8) bool {
     return bytes.len == 16 and mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and bytes[10] == 0xff and bytes[11] == 0xff;
 }
-
-// ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -369,7 +366,6 @@ test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv4" {
-    // Special-use (shared table)
     try testing.expect(isNonRoutableNs(initIp4(.{ 127, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 10, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 192, 168, 1, 1 }, 53)));
@@ -390,7 +386,6 @@ test "isNonRoutableNs blocks special-use + multicast IPv4" {
 test "isNonRoutableNs allows routable IPv4" {
     try testing.expect(!isNonRoutableNs(initIp4(.{ 1, 1, 1, 1 }, 53)));
     try testing.expect(!isNonRoutableNs(initIp4(.{ 8, 8, 8, 8 }, 53)));
-    // 172.15.x and 172.32.x are routable
     try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 15, 255, 255 }, 53)));
     try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 32, 0, 1 }, 53)));
 }

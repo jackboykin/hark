@@ -61,7 +61,6 @@ pub fn runWorstCase(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     var mark_arena = std.heap.ArenaAllocator.init(backing);
     defer mark_arena.deinit();
 
-    // Warmup
     for (0..warmup) |_| {
         markAllVisited(&cache, &mark_arena);
         cache.storeResponse(messages[next], root_zone, .unchecked, std.math.maxInt(u32));

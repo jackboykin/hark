@@ -29,8 +29,6 @@ pub fn applyKeepaliveHint(conn: anytype, response: []const u8) void {
     }
 }
 
-// ── TcpPooledConnection ─────────────────────────────────────────────
-
 pub const TcpPooledConnection = struct {
     stream: Io.net.Stream,
     /// Io is carried per-connection so `destroyBroken` matches the generic
@@ -53,8 +51,6 @@ pub const TcpPooledConnection = struct {
 };
 
 pub const TcpConnectionPool = ConnectionPool(TcpPooledConnection);
-
-// ── ConnectionPool (comptime generic) ───────────────────────────────
 
 const max_entries_default: usize = 32;
 /// Per-upstream warm-connection cap (RFC 7766 §6.2.2). Bounds concurrent
@@ -135,14 +131,10 @@ pub fn ConnectionPool(comptime Conn: type) type {
             self.total_conns = 0;
         }
 
-        /// Retrieve a cached connection for the given key. Returns null if
-        /// no idle connection exists or all cached entries for the key
-        /// have expired.
         pub fn acquire(self: *Self, key: AddressKey) ?*Conn {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            // Opportunistic idle sweep only when pool is above half capacity
             if (self.total_conns >= self.max_entries / 2) self.evictIdleLocked();
 
             const slots = self.entries.getPtr(key) orelse return null;
@@ -163,7 +155,6 @@ pub fn ConnectionPool(comptime Conn: type) type {
             return null;
         }
 
-        /// Return a connection to the pool (alive=true) or discard it (alive=false).
         pub fn release(self: *Self, key: AddressKey, conn: *Conn, alive: bool) void {
             if (!alive) {
                 conn.destroyBroken(self.allocator);
@@ -267,8 +258,6 @@ pub fn ConnectionPool(comptime Conn: type) type {
     };
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
-
 // Injectable test clock; each test resets it at entry (cf. cache.zig testNowSeconds).
 var cp_test_now: i64 = 1000;
 fn cpTestNow() i64 {
@@ -285,17 +274,13 @@ test "ConnectionPool idle eviction with injectable now_fn" {
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
-    // Create a fake pooled connection (just for pool mechanics testing)
     const conn = try createTestTcpConnection(testing.allocator);
     pool.release(key, conn, true);
 
-    // Should be acquirable immediately
     try testing.expect(pool.entries.count() == 1);
 
-    // Advance time past idle threshold
     cp_test_now = 1020; // 20 seconds later, past max_idle_sec=10
 
-    // acquire should evict the stale entry
     const result = pool.acquire(key);
     try testing.expect(result == null);
     try testing.expect(pool.entries.count() == 0);
@@ -313,13 +298,11 @@ test "ConnectionPool store and acquire" {
     const conn = try createTestTcpConnection(testing.allocator);
     pool.release(key, conn, true);
 
-    // Advance time slightly (within idle window)
     cp_test_now = 1005;
     const acquired = pool.acquire(key);
     try testing.expect(acquired != null);
     try testing.expect(pool.entries.count() == 0); // removed from pool on acquire
 
-    // Release back
     pool.release(key, acquired.?, true);
     try testing.expect(pool.entries.count() == 1);
 }
@@ -331,7 +314,6 @@ test "ConnectionPool release not alive frees connection" {
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
     const conn = try createTestTcpConnection(testing.allocator);
 
-    // Release with alive=false should free
     pool.release(key, conn, false);
     // No leak = success (testing.allocator detects leaks)
 }
@@ -344,7 +326,6 @@ test "ConnectionPool max entries eviction" {
     pool.max_entries = 2;
     defer pool.deinit();
 
-    // Store 2 connections
     const conn1 = try createTestTcpConnection(testing.allocator);
     const key1 = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
     pool.release(key1, conn1, true);
@@ -356,14 +337,12 @@ test "ConnectionPool max entries eviction" {
 
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
 
-    // Store a 3rd — should evict the oldest (conn1)
     cp_test_now = 1002;
     const conn3 = try createTestTcpConnection(testing.allocator);
     const key3 = AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 853));
     pool.release(key3, conn3, true);
 
     try testing.expectEqual(@as(usize, 2), pool.entries.count());
-    // conn1's key should be gone
     try testing.expect(pool.entries.get(key1) == null);
 }
 
@@ -408,7 +387,6 @@ test "ConnectionPool multi-entry per key (LIFO)" {
     try testing.expectEqual(@as(usize, 3), pool.total_conns);
     try testing.expectEqual(@as(usize, 1), pool.entries.count());
 
-    // LIFO: acquire returns the most recently stored
     const a1 = pool.acquire(key).?;
     try testing.expectEqual(c3, a1);
     const a2 = pool.acquire(key).?;
@@ -433,7 +411,6 @@ test "ConnectionPool per-key cap evicts oldest within key" {
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 853));
 
-    // Fill to per-key cap
     for (0..per_key_cap) |_| {
         const c = try createTestTcpConnection(testing.allocator);
         pool.release(key, c, true);
@@ -446,7 +423,6 @@ test "ConnectionPool per-key cap evicts oldest within key" {
     pool.release(key, c_new, true);
     try testing.expectEqual(@as(usize, per_key_cap), pool.total_conns);
 
-    // LIFO: c_new is on top
     const got = pool.acquire(key).?;
     try testing.expectEqual(c_new, got);
     pool.release(key, got, true);
@@ -495,7 +471,7 @@ test "TcpConnectionPool per-connection idle_timeout_sec overrides pool default" 
 
     const key = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const conn = try createTestTcpConnection(testing.allocator);
-    conn.idle_timeout_sec = 5; // RFC 7828 advertised: 5s
+    conn.idle_timeout_sec = 5;
     pool.release(key, conn, true);
 
     cp_test_now = 1010; // 10s later: past per-conn limit, under pool default
@@ -512,7 +488,6 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
     pool.max_entries = 4;
     defer pool.deinit();
 
-    // Two distinct keys: short-lived (per-conn = 3s) and pool-default.
     const key_short = AddressKey.fromAddress(na.initIp4(.{ 1, 1, 1, 1 }, 53));
     const short_conn = try createTestTcpConnection(testing.allocator);
     short_conn.idle_timeout_sec = 3;
@@ -529,9 +504,8 @@ test "TcpConnectionPool per-connection idle_timeout_sec applied by evictIdleLock
     // Fill above max_entries/2 to ensure evictIdleLocked actually runs.
     const filler_conn = try createTestTcpConnection(testing.allocator);
     pool.release(key_long, filler_conn, true);
-    _ = pool.acquire(AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 53))); // triggers sweep
+    _ = pool.acquire(AddressKey.fromAddress(na.initIp4(.{ 9, 9, 9, 9 }, 53)));
 
-    // short_conn evicted, long_conn + filler retained.
     try testing.expect(pool.entries.get(key_short) == null);
     const remaining = pool.entries.getPtr(key_long).?;
     try testing.expectEqual(@as(u8, 2), remaining.len);
@@ -552,13 +526,11 @@ test "TcpConnectionPool max queries eviction" {
     conn.max_queries = 3;
     pool.release(key, conn, true);
 
-    // Simulate repeated releases to bump query_count
     const a1 = pool.acquire(key).?;
-    pool.release(key, a1, true); // query_count = 2
+    pool.release(key, a1, true);
     const a2 = pool.acquire(key).?;
-    pool.release(key, a2, true); // query_count = 3
+    pool.release(key, a2, true);
 
-    // acquire should reject it due to max_queries (>= 3)
     const result = pool.acquire(key);
     try testing.expect(result == null);
     try testing.expect(pool.entries.count() == 0);

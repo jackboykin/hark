@@ -146,8 +146,6 @@ pub const EncryptedNs = struct {
     }
 };
 
-// ── Tests ───────────────────────────────────────────────────────────────
-
 var en_test_now: i64 = 100_000;
 fn enTestNow() i64 {
     return en_test_now;

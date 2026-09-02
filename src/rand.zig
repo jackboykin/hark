@@ -9,14 +9,12 @@ const std = @import("std");
 const mem = std.mem;
 const Io = std.Io;
 
-/// Generate a random DNS query ID.
 pub fn queryId(io: Io) u16 {
     var buf: [2]u8 = undefined;
     io.random(&buf);
     return mem.readInt(u16, &buf, .big);
 }
 
-/// Generate a random u64 hash seed.
 pub fn hashSeed(io: Io) u64 {
     var buf: [8]u8 = undefined;
     io.random(&buf);

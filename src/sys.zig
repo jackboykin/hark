@@ -297,7 +297,6 @@ test "setNoDelay and setQuickAck flip the kernel TCP options" {
     var val: c_int = -1;
     var len: posix.socklen_t = @sizeOf(c_int);
 
-    // NODELAY default is 0 (Nagle on); confirm the helper flips it to 1.
     {
         const rc = linux.getsockopt(sock, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&val), &len);
         try std.testing.expectEqual(@as(linux.E, .SUCCESS), linux.errno(rc));
@@ -354,13 +353,11 @@ test "setSocketTimeout never disarms the timeout; clearSocketTimeout is how you 
     try std.testing.expectEqual(@as(@TypeOf(floored.sec), 0), floored.sec);
     try std.testing.expect(floored.usec > 0 and floored.usec <= 10_000);
 
-    // Ordinary values are not meaningfully altered by the floor.
     setSocketTimeout(sock, posix.SO.RCVTIMEO, 2500);
     const normal = try readTimeout(sock);
     const normal_us = @as(i64, normal.sec) * 1_000_000 + normal.usec;
     try std.testing.expect(normal_us >= 2_500_000 and normal_us < 2_510_000);
 
-    // Infinite is still reachable, but only by asking for it by name.
     clearSocketTimeout(sock, posix.SO.RCVTIMEO);
     const cleared = try readTimeout(sock);
     try std.testing.expectEqual(@as(@TypeOf(cleared.sec), 0), cleared.sec);

@@ -149,7 +149,6 @@ pub const BlockingUdpTransport = struct {
             if (resp_id == query_id) {
                 return msg.data;
             }
-            // Wrong ID — keep waiting.
         }
     }
 
@@ -212,7 +211,6 @@ pub const BlockingUdpTransport = struct {
             const now_ns = monotonic.nowNs();
             if (now_ns >= deadline_ns) return error.Timeout;
 
-            // Fire any legs whose stagger interval has elapsed.
             while (sock_count < leg_n and now_ns >= next_launch_ns) {
                 const idx = sock_count;
                 const s = openUdpSocket(servers[idx], self.io) catch {
@@ -230,8 +228,6 @@ pub const BlockingUdpTransport = struct {
                 next_launch_ns = monotonic.nowNs() + stagger_ns;
             }
 
-            // Poll until the deadline or the next scheduled launch, whichever
-            // comes first.
             const wait_until_ns = if (sock_count < leg_n)
                 @min(deadline_ns, next_launch_ns)
             else
@@ -367,7 +363,6 @@ pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
 fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
     const handle = stream.socket.handle;
 
-    // ── Send length-prefixed query ──
     var send_buf: [2 + dns.edns_udp_payload]u8 = undefined;
     const framed = try dns.stageLengthPrefixed(&send_buf, wire_query);
     sys.writeAllDeadline(io, handle, framed, deadline_ns) catch |err| switch (err) {
@@ -375,7 +370,6 @@ fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, resp
         else => return error.SendFailed,
     };
 
-    // ── Receive length-prefixed response ──
     var len_buf: [2]u8 = undefined;
     sys.readExactDeadline(io, handle, &len_buf, deadline_ns) catch |err| switch (err) {
         error.Timeout => return error.Timeout,
@@ -394,8 +388,6 @@ fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, resp
     return response_buf[0..body_len];
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
-
 test "mapUdpSendErr classifies the Socket.SendError surface" {
     // PeerUnreachable bucket: any "this peer can't be reached" signal so the
     // resolver can fail over to a sibling NS without spending the timeout.
@@ -407,7 +399,6 @@ test "mapUdpSendErr classifies the Socket.SendError surface" {
     // network problem — retrying or failing over won't help.
     try testing.expectEqual(error.MessageTooBig, mapUdpSendErr(error.MessageOversize));
 
-    // Everything else collapses to SendFailed.
     try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.NetworkDown));
     try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.SystemResources));
     try testing.expectEqual(error.SendFailed, mapUdpSendErr(error.SocketUnconnected));
@@ -494,7 +485,6 @@ test "BlockingUdpTransport IPv6 loopback query" {
     try testing.expect(response[2] & 0x80 != 0);
 }
 
-/// Mock UDP echo server for tests: reads one query, echoes it back with QR bit set.
 fn echoServerThread(sock: Io.net.Socket, io: Io) void {
     var recv_buf: [dns.max_udp_payload]u8 = undefined;
     const msg = sock.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } }) catch return;
@@ -506,8 +496,6 @@ fn echoServerThread(sock: Io.net.Socket, io: Io) void {
     sock.send(io, &msg.from, resp[0..msg.data.len]) catch return;
 }
 
-/// Mock TCP echo server for tests: accepts one connection, reads one
-/// length-prefixed DNS query, echoes it back with the QR bit set, closes.
 fn tcpEchoServerThread(server: *Io.net.Server, io: Io) void {
     const stream = server.accept(io) catch return;
     defer stream.close(io);
