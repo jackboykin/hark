@@ -1,6 +1,5 @@
 const std = @import("std");
 const hark = @import("hark");
-const monotonic = hark.monotonic;
 
 pub const BenchResult = struct {
     samples_ns: []i64,

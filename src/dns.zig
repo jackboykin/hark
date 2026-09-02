@@ -2299,46 +2299,18 @@ pub fn cloneName(allocator: Allocator, name: Name) !Name {
     return .{ .labels = labels };
 }
 
-/// Arena-only DNS name: labels slice and every label byte share one
-/// contiguous buffer. Distinct from `Name` by type so the compiler
-/// rejects `freeName(NameFlat)` — that call would invoke `allocator.free`
-/// on each mid-buffer label pointer (UAF). Produced by `cloneNameFlat`,
-/// consumed by `.toUnownedName()` when handing off to a `ResourceRecord`
-/// (whose surrounding arena owns the lifetime).
-pub const NameFlat = struct {
-    labels: []const []const u8,
-
-    /// Reinterpret as a plain `Name` for placement in fields whose source
-    /// is mixed (e.g. `ResourceRecord.name`). The caller asserts the
-    /// surrounding arena will outlive every consumer — `freeName` MUST
-    /// NOT be called on the result.
-    pub fn toUnownedName(self: NameFlat) Name {
-        return .{ .labels = self.labels };
-    }
-};
-
-/// Single-allocation variant of cloneName: the returned `NameFlat`'s
-/// labels slice and every label byte live in one contiguous buffer. Use
-/// only with arena allocators. Designed for the cache read path where
-/// the caller's arena owns lifetime.
-pub fn cloneNameFlat(allocator: Allocator, name: Name) !NameFlat {
-    return cloneNameFlatImpl(allocator, name, false);
-}
-
-/// Like `cloneNameFlat` but lowercases ASCII letters in-flight. Used to
-/// scrub 0x20-randomized case off upstream RR owner names.
-fn cloneNameFlatLower(allocator: Allocator, name: Name) !NameFlat {
-    return cloneNameFlatImpl(allocator, name, true);
-}
-
-/// `cloneNameFlatLower` + `toUnownedName` — for scrub sites that don't keep the owned form.
-pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
-    return (try cloneNameFlatLower(allocator, name)).toUnownedName();
-}
-
-fn cloneNameFlatImpl(allocator: Allocator, name: Name, comptime lower: bool) !NameFlat {
+/// Single-allocation clone: labels slice and every label byte share one
+/// contiguous buffer, so the result is arena-only — `freeName` on it would
+/// free mid-buffer pointers.
+pub fn cloneNameFlat(allocator: Allocator, name: Name, comptime lower: bool) !Name {
     const buf = try allocator.alignedAlloc(u8, name_flat_align, nameFlatSize(name));
-    return .{ .labels = writeNameFlat(buf, name, lower).labels };
+    return writeNameFlat(buf, name, lower);
+}
+
+/// `cloneNameFlat` that lowercases ASCII letters in-flight. Used to scrub
+/// 0x20-randomized case off upstream RR owner names.
+pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
+    return cloneNameFlat(allocator, name, true);
 }
 
 pub const name_flat_align: std.mem.Alignment = .fromByteUnits(@alignOf([]const u8));
@@ -2664,7 +2636,7 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         // a signer-chosen next_domain, and range comparisons use
         // case-insensitive cmpLabelsCI regardless. `cloneNameFlat`, not
         // `cloneName`: per-label would be N+1 allocs per NSEC on the parse path.
-        .nsec => |*n| n.next_domain_name = (try cloneNameFlat(allocator, n.next_domain_name)).toUnownedName(),
+        .nsec => |*n| n.next_domain_name = try cloneNameFlat(allocator, n.next_domain_name, false),
     }
 }
 
@@ -2694,26 +2666,6 @@ pub fn freeMessage(allocator: Allocator, msg: Message) void {
     freeResourceRecords(allocator, msg.authorities);
     freeResourceRecords(allocator, msg.additionals);
     if (msg.opt) |opt| freeOpt(allocator, opt);
-}
-
-test "cloneNameFlat returns NameFlat; freeName(NameFlat) does not compile" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const src = Name{ .labels = &.{ "example", "com" } };
-    const flat: NameFlat = try cloneNameFlat(alloc, src);
-    try testing.expectEqual(@as(usize, 2), flat.labels.len);
-    try testing.expectEqualStrings("example", flat.labels[0]);
-    try testing.expectEqualStrings("com", flat.labels[1]);
-
-    // Compile-error proof (uncomment to verify): `freeName` takes `Name`,
-    // not `NameFlat`, so the next line fails to compile.
-    //   freeName(alloc, flat);
-
-    // The intentional bridge: explicit conversion when the surrounding
-    // arena owns lifetime. Result is a plain `Name` — must NOT be freed.
-    const as_name = flat.toUnownedName();
-    try testing.expect(as_name.eql(src));
 }
 
 test "parseDottedName basic" {

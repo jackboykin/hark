@@ -57,12 +57,6 @@ pub const AddressKey = struct {
     addr: [16]u8,
     port: u16,
 
-    pub fn fromAddressWithPort(address: Address, port: u16) AddressKey {
-        var key = fromAddress(address);
-        key.port = port;
-        return key;
-    }
-
     pub fn eql(a: AddressKey, b: AddressKey) bool {
         return a.family == b.family and a.port == b.port and mem.eql(u8, &a.addr, &b.addr);
     }
@@ -165,13 +159,6 @@ pub fn getSockName(fd: posix.fd_t) !Address {
     var pa: PosixAddress = undefined;
     var len: posix.socklen_t = @sizeOf(PosixAddress);
     try sys.getsockname(fd, @ptrCast(&pa), &len);
-    return fromSockaddr(&pa);
-}
-
-pub fn getPeerName(fd: posix.fd_t) !Address {
-    var pa: PosixAddress = undefined;
-    var len: posix.socklen_t = @sizeOf(PosixAddress);
-    try sys.getpeername(fd, @ptrCast(&pa), &len);
     return fromSockaddr(&pa);
 }
 

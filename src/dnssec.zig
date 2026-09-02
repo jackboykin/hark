@@ -53,7 +53,7 @@ pub const ValidationBudget = struct {
             return error.ValidationBudgetExhausted;
     }
 
-    pub fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
+    fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.nsec3_hash_spent.fetchAdd(1, .monotonic) >= self.max_nsec3_hash)
             return error.ValidationBudgetExhausted;
     }
@@ -135,7 +135,7 @@ pub fn validateDnskeyRrset(
     // Overflow refuses instead of truncating: a signature that verifies over
     // dnskey_only[0..64] would authenticate a *subset* while the caller keeps
     // and caches every key in the message — appended forged keys would ride in
-    // as trusted. Same rule as validateRrsetForType and verifyAuthorityProofSigs.
+    // as trusted. Same rule as validateRrset and verifyAuthorityProofSigs.
     var dnskey_only: [64]dns.ResourceRecord = undefined;
     var dnskey_count: usize = 0;
     for (dnskey_records) |rr| {

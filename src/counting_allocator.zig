@@ -27,7 +27,7 @@ pub const CountingAllocator = struct {
         .remap = countingRemap,
     };
 
-    pub fn slotSize(len: usize) usize {
+    fn slotSize(len: usize) usize {
         if (len >= 64 * 1024) return mem.alignForward(usize, len, std.heap.pageSize());
         return std.math.ceilPowerOfTwoAssert(usize, @max(len, @sizeOf(usize)));
     }

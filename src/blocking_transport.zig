@@ -364,7 +364,7 @@ pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
 /// netRead/netWrite treat EAGAIN as a bug). Timeout passes through;
 /// every other failure collapses to SendFailed on the write side,
 /// ConnectionClosed on the read side.
-pub fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
+fn sendAndReceiveTcp(stream: Io.net.Stream, io: Io, wire_query: []const u8, response_buf: []u8, deadline_ns: i128) ![]const u8 {
     const handle = stream.socket.handle;
 
     // ── Send length-prefixed query ──

@@ -6,7 +6,7 @@
 /// Outbound UDP uses std.Io.net.Socket directly; do not add new callers
 /// here for paths that have an Io alternative.
 ///
-/// sendto/write/read retry on EINTR internally. SIGINT/SIGTERM are blocked
+/// sendto/write retry on EINTR internally. SIGINT/SIGTERM are blocked
 /// and delivered via signalfd, but other unblocked signals (SIGPIPE,
 /// profilers, etc.) can still interrupt blocking syscalls; looping avoids
 /// dropping in-flight queries. connect/accept surface Interrupted because
@@ -109,17 +109,6 @@ pub fn getsockname(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t)
     };
 }
 
-pub fn getpeername(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
-    return switch (linux.errno(linux.getpeername(fd, addr, len))) {
-        .SUCCESS => {},
-        .BADF, .NOTSOCK => unreachable,
-        .FAULT => unreachable,
-        .NOTCONN => error.NotConnected,
-        .INVAL => error.AddressNotAvailable,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
 pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     while (true) {
         const rc = linux.write(fd, buf.ptr, buf.len);
@@ -131,21 +120,6 @@ pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
             .IO => error.InputOutput,
             .NOSPC => error.NoSpaceLeft,
             .PIPE => error.BrokenPipe,
-            .NOMEM => error.SystemResources,
-            else => |e| posix.unexpectedErrno(e),
-        };
-    }
-}
-
-pub fn read(fd: posix.fd_t, buf: []u8) !usize {
-    while (true) {
-        const rc = linux.read(fd, buf.ptr, buf.len);
-        return switch (linux.errno(rc)) {
-            .SUCCESS => rc,
-            .AGAIN => error.WouldBlock,
-            .BADF => unreachable,
-            .INTR => continue,
-            .IO => error.InputOutput,
             .NOMEM => error.SystemResources,
             else => |e| posix.unexpectedErrno(e),
         };
@@ -172,16 +146,6 @@ pub fn dup(fd: posix.fd_t) !posix.fd_t {
         .SUCCESS => @intCast(rc),
         .BADF => unreachable,
         .MFILE => error.ProcessFdQuotaExceeded,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
-pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) !usize {
-    const rc = linux.fcntl(fd, cmd, arg);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => rc,
-        .BADF => unreachable,
-        .INVAL => error.InvalidArgument,
         else => |e| posix.unexpectedErrno(e),
     };
 }
