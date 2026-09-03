@@ -52,19 +52,12 @@ const DedupKeyContext = struct {
     }
 };
 
-const AcquireResult = enum { leader, follower };
+const AcquireResult = enum { leader, follower, uncoordinated };
 
 /// One mutex + condvar per shard; broadcast wakes only that shard's
 /// followers. Power of two so modulo compiles to a mask.
 const shard_count = 64;
 const shard_mask: u64 = shard_count - 1;
-
-/// Per-shard cap = 2 × (max_entries / shard_count). The 2× headroom keeps
-/// uniform-hashing variance well below the cap (max-shard load goes as
-/// `N/k + sqrt(2·(N/k)·ln k)` ≈ 170 here); saturation requires a real
-/// flood, not a fortunate distribution. Worst-case memory ≈ 8.5 MiB.
-const max_entries: u32 = 8192;
-const per_shard_cap: u32 = 2 * max_entries / shard_count;
 
 const Shard = struct {
     map: std.HashMapUnmanaged(DedupKey, void, DedupKeyContext, 80) = .empty,
@@ -105,9 +98,11 @@ pub const InFlightTable = struct {
         return &self.shards[DedupKeyContext.hash(.{}, key) & shard_mask];
     }
 
-    /// Try to become the leader for this (name, qtype, flags) key.
+    /// Join the in-flight group for `(name, qtype, flags)`.
     /// Returns `.leader` if this is the first request — caller must call `releaseLeader` when done.
     /// Returns `.follower` if another worker is already resolving — blocks until the leader finishes.
+    /// Returns `.uncoordinated` if the entry could not be allocated: resolve, don't release
+    /// (that would evict a real leader and wake its followers early).
     ///
     /// The default 2s budget bounds how long a follower waits on the leader.
     /// It's shorter than typical recursive-resolver client timeouts (5-10s);
@@ -119,14 +114,13 @@ pub const InFlightTable = struct {
 
     /// Like `acquireOrWait` but takes an absolute monotonic deadline. Callers
     /// pass `monotonic.nowNs() + relative_ns` so the wait honors the real
-    /// remaining budget. DNSKEY fetches use a longer (6s) deadline because
-    /// cold-cache DNSSEC chains (root → TLD → SLD → DNSKEY) can take 3-5s.
+    /// remaining budget.
     pub fn acquireOrWaitWithTimeout(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns: i128) AcquireResult {
         return self.acquireOrWaitImpl(name, qtype, flags, deadline_ns);
     }
 
     fn acquireOrWaitImpl(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns_opt: ?i128) AcquireResult {
-        const key = DedupKey.init(name, qtype, flags) orelse return .leader;
+        const key = DedupKey.init(name, qtype, flags) orelse return .uncoordinated;
         const shard = self.shardFor(key);
 
         shard.mutex.lockUncancelable(self.io);
@@ -146,11 +140,7 @@ pub const InFlightTable = struct {
             return .follower;
         }
 
-        // Cap-hit returns .leader uncoordinated (no insert, no bookkeeping).
-        // Eviction-on-cap would wake real queries' followers and double
-        // upstream amplification — uncoordinated is the lesser evil.
-        if (shard.map.count() >= per_shard_cap) return .leader;
-        shard.map.put(self.allocator, key, {}) catch return .leader;
+        shard.map.put(self.allocator, key, {}) catch return .uncoordinated;
         return .leader;
     }
 
@@ -164,7 +154,6 @@ pub const InFlightTable = struct {
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
         if (shard.map.contains(key)) return false;
-        if (shard.map.count() >= per_shard_cap) return false;
         shard.map.put(self.allocator, key, {}) catch return false;
         return true;
     }
@@ -315,38 +304,6 @@ test "CD bit partitions dedup groups" {
     table.releaseLeader("example.com", .a, cd0);
     table.releaseLeader("example.com", .a, cd1);
     try testing.expectEqual(@as(u32, 0), table.count());
-}
-
-test "table caps entries at max_entries" {
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    // Natural fill: per_shard_cap's headroom absorbs uniform variance, so
-    // every entry lands. A regression to a stingier cap would drop some.
-    var name_buf: [32]u8 = undefined;
-    for (0..max_entries) |i| {
-        const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
-        try testing.expectEqual(.leader, table.acquireOrWait(name, .a, 0));
-    }
-    try testing.expectEqual(@as(u32, max_entries), table.count());
-
-    // Overflow: 2× more names so some shards reliably hit cap. Refused
-    // inserts still return .leader (uncoordinated) — graceful degradation.
-    var caps_observed: usize = 0;
-    for (0..2 * max_entries) |i| {
-        const name = std.fmt.bufPrint(&name_buf, "overflow{d}.example.com", .{i}) catch unreachable;
-        if (!table.tryAcquireLeader(name, .a, 0)) caps_observed += 1;
-    }
-    try testing.expect(caps_observed > 0);
-
-    for (0..max_entries) |i| {
-        const name = std.fmt.bufPrint(&name_buf, "n{d}.example.com", .{i}) catch unreachable;
-        table.releaseLeader(name, .a, 0);
-    }
-    for (0..2 * max_entries) |i| {
-        const name = std.fmt.bufPrint(&name_buf, "overflow{d}.example.com", .{i}) catch unreachable;
-        table.releaseLeader(name, .a, 0);
-    }
 }
 
 test "leader fail; follower retry becomes new leader" {

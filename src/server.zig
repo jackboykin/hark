@@ -1750,27 +1750,13 @@ const WorkerState = struct {
         }
 
         const cd_flag: u8 = if (cd) dedup_mod.flag_cd else 0;
-        var is_leader = true;
-        if (self.server.dedup) |*dedup| {
-            switch (dedup.acquireOrWait(name, qtype, cd_flag)) {
-                .leader => {},
-                .follower => {
-                    is_leader = false;
-                },
-            }
-        }
-        errdefer if (is_leader) {
-            if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
-        };
+        const role = if (self.server.dedup) |*d| d.acquireOrWait(name, qtype, cd_flag) else .uncoordinated;
+        defer if (role == .leader) self.server.dedup.?.releaseLeader(name, qtype, cd_flag);
         var result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
-        if (is_leader) {
-            if (self.server.dedup) |*dedup| dedup.releaseLeader(name, qtype, cd_flag);
-        } else {
-            // A follower's own resolve is a cache hit by construction (the
-            // leader populated it), but the client still waited on the
-            // leader's upstream round-trip — that's a miss experientially.
-            result.from_cache = false;
-        }
+        // A follower's own resolve is a cache hit by construction (the
+        // leader populated it), but the client still waited on the
+        // leader's upstream round-trip — that's a miss experientially.
+        if (role == .follower) result.from_cache = false;
         return result;
     }
 };

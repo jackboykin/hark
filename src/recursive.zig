@@ -1990,21 +1990,14 @@ pub const RecursiveResolver = struct {
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
-    /// Sliced cache result the dedup helper hands back to its follower
-    /// paths. `hit` carries the records, `negative` is the cached
-    /// NXDOMAIN/NODATA sentinel — both come from a `CacheLookupResult`
-    /// whose extra fields the dedup gate doesn't care about.
-    const DedupCacheResult = union(enum) {
-        hit: []const dns.ResourceRecord,
-        negative,
-
-        fn from(result: ?cache_mod.CacheLookupResult) ?DedupCacheResult {
-            return switch (result orelse return null) {
-                .hit => |h| .{ .hit = h.records },
-                .negative => .negative,
-            };
-        }
-    };
+    /// Outer null = cache miss, inner null = cached negative.
+    fn recheckKeyCache(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, rtype: dns.RType) ??[]const dns.ResourceRecord {
+        const cache = self.keyCache() orelse return null;
+        return switch (cache.lookup(allocator, name, rtype, .in) orelse return null) {
+            .hit => |h| h.records,
+            .negative => @as(?[]const dns.ResourceRecord, null),
+        };
+    }
 
     /// Coalesce concurrent fetches for the same `(name, rtype)` through the
     /// dedup table. Leader runs `ctx.fetch`; followers wait, re-check the
@@ -2028,37 +2021,19 @@ pub const RecursiveResolver = struct {
         ctx: anytype,
     ) @TypeOf(ctx.fetch()) {
         const dedup = self.dedup orelse return ctx.fetch();
-        // Follower re-check of the key cache: same `(name, rtype)` the
-        // leader just ran. Pulled into a closure so both follower hops
-        // share one body.
-        const recheck = struct {
-            fn call(r: *RecursiveResolver, a: mem.Allocator, n: []const u8, t: dns.RType) ?DedupCacheResult {
-                const cache = r.keyCache() orelse return null;
-                return DedupCacheResult.from(cache.lookup(a, n, t, .in));
+        var budget = timeout_ns;
+        for (0..2) |_| {
+            switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + budget)) {
+                .leader => {
+                    defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
+                    return ctx.fetch();
+                },
+                .uncoordinated => return ctx.fetch(),
+                .follower => if (self.recheckKeyCache(allocator, name, rtype)) |r| return r,
             }
-        }.call;
-        switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + timeout_ns)) {
-            .leader => {
-                defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
-                return ctx.fetch();
-            },
-            .follower => {
-                if (recheck(self, allocator, name, rtype)) |r| return switch (r) {
-                    .hit => |rr| rr,
-                    .negative => null,
-                };
-                switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + timeout_ns / 2)) {
-                    .leader => {
-                        defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
-                        return ctx.fetch();
-                    },
-                    .follower => return switch (recheck(self, allocator, name, rtype) orelse return null) {
-                        .hit => |rr| rr,
-                        .negative => null,
-                    },
-                }
-            },
+            budget /= 2;
         }
+        return null;
     }
 
     /// Fetch DNSKEY records for a zone, checking cache first.
