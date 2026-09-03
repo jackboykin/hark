@@ -3085,6 +3085,7 @@ pub const RecursiveResolver = struct {
             if (self.dnssec_enabled) {
                 const ds_cache = self.keyCache() orelse break;
                 if (!ds_cache.containsFresh(zone_str, .ds, .in)) {
+                    if (self.cache_only) break;
                     const records = if (best) |parent_deleg|
                         self.reproveDelegationSecurity(
                             allocator,
