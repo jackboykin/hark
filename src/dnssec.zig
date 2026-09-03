@@ -565,6 +565,9 @@ fn verifyRrsig(
     // count even when the cheap pre-checks below would reject.
     try budget.consumeVerify();
 
+    // RFC 4035 §5.3.1; else an RRSIG naming a weaker algorithm hands the key to that verifier.
+    if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
+
     // RFC 4034 §3.1.3: signer name MUST be a (non-strict) ancestor of every
     // RRset owner, and `labels` MUST NOT exceed the owner's non-root label
     // count. Owner-vs-signer is also checked at the resolver layer (bailiwick
@@ -1380,9 +1383,6 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     return false;
 }
 
-/// Try every DNSKEY whose tag and algorithm match `rrsig`; true if any verifies
-/// `rrset`. Shared by the answer-side and authority-side validators so the
-/// key-matching rule has one home.
 fn rrsetVerifiesWithAnyKey(
     rrsig: dns.RrsigData,
     dnskey_records: []const dns.ResourceRecord,
@@ -1395,7 +1395,6 @@ fn rrsetVerifiesWithAnyKey(
         const dk = dk_rr.rdata.dnskey;
         if (!isValidZoneKey(dk)) continue;
         if (keyTag(dk) != rrsig.key_tag) continue;
-        if (@backingInt(dk.algorithm) != @backingInt(rrsig.algorithm)) continue;
         if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
     }
     return false;
@@ -1840,12 +1839,12 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
 
     var sig_bytes: [64]u8 = undefined;
     var signer_pub: [32]u8 = undefined;
-    const signed = try testSignRrset(recs[0..64], .dnskey, test_owner, &sig_bytes, &signer_pub);
+    const signed = try testSignRrset(recs[0..64], .dnskey, test_owner, .ed25519, &sig_bytes, &signer_pub);
     // The signing key must itself be in the RRset and DS-anchored, or the
     // refusal could be blamed on anchoring rather than on size.
     recs[0] = dnskeyRr(test_owner, signed.dnskey);
     var sig2: [64]u8 = undefined;
-    const resigned = try testSignRrset(recs[0..64], .dnskey, test_owner, &sig2, &signer_pub);
+    const resigned = try testSignRrset(recs[0..64], .dnskey, test_owner, .ed25519, &sig2, &signer_pub);
     recs[0] = dnskeyRr(test_owner, resigned.dnskey);
 
     var digest = try testDsDigest(test_owner, resigned.dnskey);
@@ -3988,7 +3987,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         const below = [_]dns.ResourceRecord{
             .{ .name = child, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
         };
-        const signed = try testSignRrset(&below, rtype, parent, &sig_buf, &pub_buf);
+        const signed = try testSignRrset(&below, rtype, parent, .ed25519, &sig_buf, &pub_buf);
         try testing.expectError(
             error.InvalidSignature,
             verifyRrsig(signed.rrsig, signed.dnskey, &below, 1_700_000_000, &budget),
@@ -4001,7 +4000,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         const at_apex = [_]dns.ResourceRecord{
             .{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
         };
-        const apex = try testSignRrset(&at_apex, rtype, parent, &apex_sig_buf, &apex_pub_buf);
+        const apex = try testSignRrset(&at_apex, rtype, parent, .ed25519, &apex_sig_buf, &apex_pub_buf);
         try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget);
     }
 }
@@ -4012,6 +4011,7 @@ fn testSignRrset(
     rrset: []const dns.ResourceRecord,
     covered: dns.RType,
     signer: dns.Name,
+    key_algo: dns.DnssecAlgorithm,
     sig_buf: *[64]u8,
     pub_buf: *[32]u8,
 ) !struct { rrsig: dns.RrsigData, dnskey: dns.DnskeyData } {
@@ -4020,7 +4020,7 @@ fn testSignRrset(
     const dnskey = dns.DnskeyData{
         .flags = 256, // ZONE, not SEP
         .protocol = 3,
-        .algorithm = .ed25519,
+        .algorithm = key_algo,
         .public_key = pub_buf,
     };
     var rrsig = dns.RrsigData{
@@ -4040,6 +4040,31 @@ fn testSignRrset(
     return .{ .rrsig = rrsig, .dnskey = dnskey };
 }
 
+test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
+    // Ed25519 key labelled `.rsasha256`; the RRSIG says .ed25519 and carries the
+    // key's tag, so only the algorithm comparison can refuse it.
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    // recs[0] aliases pub_bytes, which testSignRrset fills before signing.
+    var recs: [2]dns.ResourceRecord = undefined;
+    recs[0] = dnskeyRr(test_owner, .{ .flags = 256, .protocol = 3, .algorithm = .rsasha256, .public_key = &pub_bytes });
+    const signed = try testSignRrset(recs[0..1], .dnskey, test_owner, .rsasha256, &sig_bytes, &pub_bytes);
+    recs[1] = .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+
+    var digest = try testDsDigest(test_owner, signed.dnskey);
+    const ds = dns.DsData{
+        .key_tag = keyTag(signed.dnskey),
+        .algorithm = .rsasha256,
+        .digest_type = .sha256,
+        .digest = &digest,
+    };
+    var budget: ValidationBudget = .{};
+    try testing.expectError(
+        error.InvalidSignature,
+        validateDnskeyRrset(&recs, &.{ds}, test_owner, 1_700_000_000, &budget),
+    );
+}
+
 test "validateRrset: the TTL cap comes from the signature that verified" {
     // Regression: the cap used to be derived in the cache by reducing over
     // every RRSIG present in the entry. The cache cannot tell which signature
@@ -4057,7 +4082,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
-    const signed = try testSignRrset(&recs, .a, test_owner, &sig_bytes, &pub_bytes);
+    const signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_bytes, &pub_bytes);
 
     // Appended, unverifiable, and expiring in one second. Placed FIRST so a
     // naive scan would reach it before the real one.
@@ -4091,7 +4116,7 @@ test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the sh
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
-    const signed = try testSignRrset(&recs, .a, test_owner, &sig_bytes, &pub_bytes);
+    const signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_bytes, &pub_bytes);
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, signed.dnskey)};
     const answers = [_]dns.ResourceRecord{
         recs[0],
@@ -4122,7 +4147,7 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     };
     var sig_bytes: [64]u8 = undefined;
     var pub_bytes: [32]u8 = undefined;
-    const signed = try testSignRrset(recs[0..64], .a, test_owner, &sig_bytes, &pub_bytes);
+    const signed = try testSignRrset(recs[0..64], .a, test_owner, .ed25519, &sig_bytes, &pub_bytes);
     const sig_rr = dns.ResourceRecord{
         .name = test_owner,
         .rtype = .rrsig,
