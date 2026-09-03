@@ -1103,7 +1103,7 @@ pub fn validateNegativeProof(
             const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
 
             for (authorities) |rr| {
-                if (rr.rtype != .nsec) continue;
+                if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
                 if (rr.name.eql(wildcard)) {
                     // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
                     if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
@@ -1136,20 +1136,14 @@ pub fn validateNegativeProof(
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
         const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
 
+        // An NSEC owned by *.CE says the wildcard exists: NXDOMAIN was the wrong rcode.
         var wildcard_denied = false;
         for (authorities) |rr| {
-            if (rr.rtype != .nsec) continue;
-            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) {
-                wildcard_denied = true;
-                break;
-            }
-            if (nsecProvesTypeNonexistence(rr.name, rr.rdata.nsec, wildcard, qtype)) {
-                wildcard_denied = true;
-                break;
-            }
+            if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
+            if (rr.name.eql(wildcard)) return .bogus;
+            if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard)) wildcard_denied = true;
         }
-        if (wildcard_denied) return .secure;
-        return .unchecked;
+        return if (wildcard_denied) .secure else .unchecked;
     }
 
     return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
@@ -1314,9 +1308,9 @@ fn validateNsec3NegativeProof(
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
     const wc_hash = budgetedNsec3Hash(wildcard, salt, iterations, budget) catch return .bogus;
 
-    // Wildcard step: covered (denial, §8.4) OR owner-match with qtype + CNAME
-    // absent (§8.6). Owner-match with qtype/CNAME present → .bogus: the
-    // answer should have been wildcard expansion, not NXDOMAIN/NODATA.
+    // Wildcard step: covered (§8.4) or, under NOERROR only, owner-match lacking
+    // qtype and CNAME (§8.6). Any other owner-match means *.CE exists and the
+    // answer should have been an expansion or NODATA.
     var nc_covered = false;
     var nc_optout = false;
     var wc_proven = false;
@@ -1334,7 +1328,7 @@ fn validateNsec3NegativeProof(
             if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
                 wc_proven = true;
             } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
-                if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
+                if (is_nxdomain or bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
                     wc_contradicted = true;
                 } else {
                     wc_proven = true;
@@ -2750,6 +2744,8 @@ test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" 
 
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+    // Same records under NXDOMAIN: *.CE exists, contradiction.
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .https, true, test_root, &b));
 }
 
 test "validateNegativeProof NSEC NODATA NXDOMAIN-shape under NOERROR (RFC 4035 §5.4)" {
@@ -3387,6 +3383,8 @@ test "NSEC3 NODATA wildcard-expanded (RFC 5155 §8.7)" {
 
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .https, false, test_root, &b));
+    // Same records under NXDOMAIN: *.CE exists, contradiction.
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .https, true, test_root, &b));
 }
 
 test "NSEC3 NODATA NXDOMAIN-shape under NOERROR (RFC 5155 §8.4)" {
