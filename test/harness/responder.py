@@ -288,7 +288,8 @@ class Responder:
                 cuts = _delegation_cuts(entry)
                 for section in (entry.answer, entry.authority, entry.additional):
                     self._materialize_ds_inplace(section)
-                    self._sign_section_inplace(section, cuts, forced, rng.address)
+                    wildcard = dns.name.from_text(entry.wildcard) if entry.wildcard and section is entry.answer else None
+                    self._sign_section_inplace(section, cuts, forced, rng.address, wildcard)
 
     def _materialize_ds_inplace(self, rrsets: list[dns.rrset.RRset]) -> None:
         """Replace placeholder DS rdata (key tag 0) with the real digest.
@@ -318,6 +319,7 @@ class Responder:
         cuts: list[dns.name.Name],
         forced: harness_dnssec.KeyMaterial | None,
         address: str,
+        wildcard: dns.name.Name | None = None,
     ) -> None:
         # Snapshot original RRsets first — appending RRSIGs while iterating
         # would re-feed signatures back into the signer.
@@ -355,6 +357,11 @@ class Responder:
                     served.append(signer)
             if _has_covering_rrsig(rrsets, rrset):
                 continue  # scenario declared its own — don't double-sign
+            if wildcard is not None:
+                # dnspython derives the labels count from the `*` owner.
+                sig = signer.sign(dns.rrset.from_rdata_list(wildcard, rrset.ttl, list(rrset)))
+                rrsets.append(dns.rrset.from_rdata_list(rrset.name, rrset.ttl, list(sig)))
+                continue
             rrsets.append(signer.sign(rrset))
 
     def _signer_for(

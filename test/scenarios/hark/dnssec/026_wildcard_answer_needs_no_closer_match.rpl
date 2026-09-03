@@ -1,0 +1,100 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = sub.
+
+SCENARIO_BEGIN wildcard-expanded answer is AD only with the no-closer-match proof
+
+; RFC 4035 §5.3.4: an RRSIG whose labels count is below the owner's label
+; count verified `*.CE`, not the owner. The answer is proven for qname only
+; if the authority section also proves qname itself does not exist — else a
+; captured `*.` answer replays as any name in the zone.
+;
+; Signed root with `*.` A, `a.` A, `zz.` A. Canonical order:
+;   . < *. < a. < foo. < qux. < sub. < z.sub. < zz.
+; Every entry below is signed by the harness as the expansion of `*.`
+; (WILDCARD); only the authority differs.
+;
+;   foo.    `a. NSEC zz.` covers foo. and its closest encloser is `.`   → AD
+;   qux.    `z.sub. NSEC sub.` is the signed child sub.'s apex wrap. It
+;           covers qux. in canonical order with closest encloser `.`, but
+;           sub.'s keys say nothing about names in the parent; the proof
+;           must verify under the keys that signed the answer            → SERVFAIL
+;
+; Missing and wrong-encloser proofs are unit tests on proveNoCloserMatch.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      foo. IN A
+    SECTION ANSWER
+      foo. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      a. 3600 IN NSEC zz. A RRSIG NSEC
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      qux. IN A
+    SECTION ANSWER
+      qux. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      z.sub. 3600 IN NSEC sub. A RRSIG NSEC
+  ENTRY_END
+
+  ; Lets sub.'s DNSKEY chain to the root, so the child signature is
+  ; verifiable and only its authority is in question.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sub. IN DS
+    SECTION ANSWER
+      sub. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    foo. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    foo. IN A
+  SECTION ANSWER
+    foo. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    qux. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    qux. IN A
+ENTRY_END
+
+SCENARIO_END

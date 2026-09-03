@@ -2362,17 +2362,16 @@ pub const RecursiveResolver = struct {
             var signer_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
-            var ds_ttl_cap: u32 = std.math.maxInt(u32);
-            const ds_status = dnssec.validateRrset(
+            const now_u32 = epochNowU32();
+            const ds_sig = dnssec.validateRrset(
                 zone_ds,
                 zone,
                 .ds,
                 parent_dnskeys,
-                epochNowU32(),
+                now_u32,
                 self.validationBudget(),
-                &ds_ttl_cap,
-            );
-            if (ds_status != .secure) return null;
+            ) orelse return null;
+            const ds_ttl_cap = dnssec.rrsigTtlCap(ds_sig, now_u32);
 
             // RFC 4035 §5.2: authenticated DS RRset, but no member hark can
             // use — same as a proven no-DS delegation. Cache the negative so
@@ -2465,8 +2464,12 @@ pub const RecursiveResolver = struct {
             }
 
             const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .bogus;
-            var group_cap: u32 = std.math.maxInt(u32);
-            const verdict = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget(), &group_cap);
+            const sig = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget()) orelse return .bogus;
+            var group_cap = dnssec.rrsigTtlCap(sig, now_u32);
+            const verdict: dnssec.SecurityStatus = if (sig.labels < rr.name.labels.len)
+                try self.proveWildcard(allocator, &keys, response.authorities, rr.name, sig, servers, now_u32, &group_cap)
+            else
+                .secure;
             if (verdict == .bogus) return .bogus;
             status = dnssec.weakest(status, verdict);
             ttl_cap = @min(ttl_cap, group_cap);
@@ -2484,6 +2487,27 @@ pub const RecursiveResolver = struct {
             .bogus => return .bogus,
             .unchecked, .insecure => return .skip,
         }
+    }
+
+    /// `sig` verified `*.CE`, not `qname`; the authority section owes proof nothing
+    /// closer exists, under the keys that signed the answer. A child zone's
+    /// apex-wrap NSEC covers parent-side names in canonical order, so a proof
+    /// verified under its own signer would let one vouch for names it has no
+    /// authority over.
+    fn proveWildcard(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        keys: *SignerKeys,
+        authorities: []const dns.ResourceRecord,
+        qname: dns.Name,
+        sig: dns.RrsigData,
+        servers: []const na.Address,
+        now_u32: u32,
+        ttl_cap: *u32,
+    ) !dnssec.SecurityStatus {
+        const proof_keys = (try keys.forSigner(self, allocator, sig.signer_name, servers)) orelse return .bogus;
+        if (dnssec.verifyAuthorityProofSigs(authorities, proof_keys, now_u32, self.validationBudget(), ttl_cap) != .secure) return .bogus;
+        return dnssec.proveNoCloserMatch(authorities, qname, sig.labels, sig.signer_name, self.validationBudget());
     }
 
     /// Keysets resolved so far in one answer, by signer; a chain inside one
@@ -2517,14 +2541,23 @@ pub const RecursiveResolver = struct {
             // RRSIGs. Cuts *below* `zone` stay undetected by design — scenario
             // 901.
             if (!rrsig.signer_name.isSubdomainOf(zone)) return null;
+            return self.forSigner(resolver, allocator, rrsig.signer_name, servers);
+        }
 
-            for (self.signers[0..self.len], self.sets[0..self.len]) |signer, set| {
-                if (signer.eql(rrsig.signer_name)) return set;
+        fn forSigner(
+            self: *SignerKeys,
+            resolver: *RecursiveResolver,
+            allocator: mem.Allocator,
+            signer: dns.Name,
+            servers: []const na.Address,
+        ) !?[]const dns.ResourceRecord {
+            for (self.signers[0..self.len], self.sets[0..self.len]) |s, set| {
+                if (s.eql(signer)) return set;
             }
-            const signer_dotted = try nameToDotted(allocator, rrsig.signer_name);
+            const signer_dotted = try nameToDotted(allocator, signer);
             const set = (try resolver.fetchDnskey(allocator, signer_dotted, servers)) orelse return null;
             if (self.len < capacity) {
-                self.signers[self.len] = rrsig.signer_name;
+                self.signers[self.len] = signer;
                 self.sets[self.len] = set;
                 self.len += 1;
             }

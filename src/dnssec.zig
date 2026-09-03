@@ -1159,16 +1159,13 @@ pub fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
     return null;
 }
 
-/// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5/§8.6/§8.7).
-fn validateNsec3NegativeProof(
-    authorities: []const dns.ResourceRecord,
-    qname: dns.Name,
-    qtype: dns.RType,
-    is_nxdomain: bool,
-    zone: dns.Name,
-    budget: *ValidationBudget,
-) SecurityStatus {
-    if (nsec3Flood(authorities)) return .bogus;
+const Nsec3ChainParams = union(enum) {
+    params: struct { salt: []const u8, iterations: u16 },
+    verdict: SecurityStatus,
+};
+
+fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3ChainParams {
+    if (nsec3Flood(authorities)) return .{ .verdict = .bogus };
 
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
@@ -1187,7 +1184,7 @@ fn validateNsec3NegativeProof(
         if (nsec3FlagsReserved(nsec3)) continue;
         // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Mirrors
         // classifyDelegation — both paths share one policy.
-        if (nsec3.iterations > max_nsec3_iterations) return .insecure;
+        if (nsec3.iterations > max_nsec3_iterations) return .{ .verdict = .insecure };
         salt = nsec3.salt;
         iterations = nsec3.iterations;
         found_nsec3 = true;
@@ -1197,8 +1194,8 @@ fn validateNsec3NegativeProof(
         // Only unknown-algorithm NSEC3 records present — validator can't
         // verify; treat as insecure so a future SHA-256/SHA-3 transition
         // doesn't SERVFAIL.
-        if (saw_unknown_algo) return .insecure;
-        return .unchecked;
+        if (saw_unknown_algo) return .{ .verdict = .insecure };
+        return .{ .verdict = .unchecked };
     }
 
     // RFC 5155 §8.2: MAY treat disagreeing hash/iterations/salt as bogus, as
@@ -1210,8 +1207,67 @@ fn validateNsec3NegativeProof(
         if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
         const n3 = rr.rdata.nsec3;
         if (n3.hash_algorithm != .sha1 or nsec3FlagsReserved(n3)) continue; // §8.1/§8.2: ignored
-        if (n3.iterations != iterations or !mem.eql(u8, n3.salt, salt)) return .bogus;
+        if (n3.iterations != iterations or !mem.eql(u8, n3.salt, salt)) return .{ .verdict = .bogus };
     }
+    return .{ .params = .{ .salt = salt, .iterations = iterations } };
+}
+
+/// RFC 4035 §5.3.4: without proof that nothing exists between `qname` and the
+/// closest encloser the RRSIG's `labels` names, a captured `*.zone` answer
+/// replays as any name in the zone. Cf. Unbound `nsec3_prove_wildcard`.
+pub fn proveNoCloserMatch(
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    labels: u8,
+    zone: dns.Name,
+    budget: *ValidationBudget,
+) SecurityStatus {
+    if (labels >= qname.labels.len) return .bogus;
+    const ce = dns.Name{ .labels = qname.labels[qname.labels.len - labels ..] };
+    if (!ce.isSubdomainOf(zone)) return .bogus;
+    for (authorities) |rr| {
+        if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
+        if (!nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) continue;
+        // §5.3.4 asks for a cover of the next closer name; a cover of `qname`
+        // whose closest encloser is `ce` is the same fact (both bounds fall
+        // outside `ce`'s subtree on `qname`'s side, so the next closer sits
+        // between them too). A cover bounded below `ce` instead proves a
+        // deeper name exists: wrong wildcard.
+        const nsec_ce = closestEncloser(qname, rr.name, rr.rdata.nsec.next_domain_name) orelse continue;
+        if (nsec_ce.eql(ce)) return .secure;
+    }
+
+    // No NSEC3 chain either: the owed proof is absent.
+    const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
+        .params => |p| .{ p.salt, p.iterations },
+        .verdict => |v| return if (v == .unchecked) .bogus else v,
+    };
+    const next_closer = dns.Name{ .labels = qname.labels[qname.labels.len - labels - 1 ..] };
+    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
+    var covered = false;
+    var optout = false;
+    for (authorities) |rr| {
+        const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
+        if (!nsec3HashInRange(&owner_hash, rr.rdata.nsec3.next_hashed_owner, &nc_hash)) continue;
+        covered = true;
+        if (rr.rdata.nsec3.flags & nsec3_opt_out != 0) optout = true;
+    }
+    return if (!covered) .bogus else if (optout) .insecure else .secure;
+}
+
+/// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5/§8.6/§8.7).
+fn validateNsec3NegativeProof(
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    qtype: dns.RType,
+    is_nxdomain: bool,
+    zone: dns.Name,
+    budget: *ValidationBudget,
+) SecurityStatus {
+    const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
+        .params => |p| .{ p.salt, p.iterations },
+        .verdict => |v| return v,
+    };
 
     // hash(qname) is needed by both the NODATA direct-match check and the CE
     // walk's label_offset==0 iteration; compute once.
@@ -1428,10 +1484,9 @@ pub fn findRrsigAt(
 /// `dnskey_records` must be *this* RRset's signer's keyset, which in a chain
 /// crossing a zone cut differs between hops.
 ///
-/// On `.secure`, `ttl_cap` receives how long this RRset may be held: RFC 4034
-/// §3.1.2's Original TTL and RFC 4035 §5.3.3's remaining window, read from the
-/// signature that verified and nowhere else — deriving it from the RRSIGs
-/// present would let an appended unverifiable one drive the number.
+/// Returns the signature that verified, or null for bogus. TTL and wildcard
+/// facts are read from that signature and nowhere else: deriving them from
+/// the RRSIGs present would let an appended unverifiable one drive them.
 pub fn validateRrset(
     records: []const dns.ResourceRecord,
     owner: dns.Name,
@@ -1439,8 +1494,7 @@ pub fn validateRrset(
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
-    ttl_cap: ?*u32,
-) SecurityStatus {
+) ?dns.RrsigData {
     // Refuse rather than truncate: the caller sets AD on the *unpruned*
     // response, so verifying a signature over records[0..64] while
     // shipping 70 records launders the 6 attacker-appended RRs into an
@@ -1451,11 +1505,11 @@ pub fn validateRrset(
     var count: usize = 0;
     for (records) |rr| {
         if (rr.rtype != covered_type or !rr.name.eql(owner)) continue;
-        if (count == filtered.len) return .bogus;
+        if (count == filtered.len) return null;
         filtered[count] = rr;
         count += 1;
     }
-    if (count == 0) return .bogus;
+    if (count == 0) return null;
 
     for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
@@ -1464,17 +1518,20 @@ pub fn validateRrset(
         if (!sig_rr.name.eql(owner)) continue;
         if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
-        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return .bogus) {
-            if (ttl_cap) |cap| cap.* = @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
-            return .secure;
-        }
+        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return null) return rrsig;
     }
     // Nothing verified on a zone already proven secure — bogus, even when
     // every candidate RRSIG used an unsupported algorithm: real supported
     // signatures existed (the zone's DS says so, RFC 4035 §5.2 filtered the
     // all-unsupported case to .insecure at the delegation) and were stripped.
     // A softer verdict here is a keyless downgrade; Unbound and BIND agree.
-    return .bogus;
+    return null;
+}
+
+/// How long an RRset this signature verified may be held: RFC 4034 §3.1.2
+/// Original TTL or RFC 4035 §5.3.3 remaining window, whichever is shorter.
+pub fn rrsigTtlCap(rrsig: dns.RrsigData, now_u32: u32) u32 {
+    return @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
 }
 
 /// Verify that every piece of negative-answer material in the authority
@@ -1527,7 +1584,7 @@ pub fn verifyAuthorityProofSigs(
             if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
             if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
-                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
+                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
                 sig_verified = true;
                 break;
             }
@@ -1938,8 +1995,7 @@ test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     };
     const records = [_]dns.ResourceRecord{ds_record}; // No RRSIG present.
     var b: ValidationBudget = .{};
-    const status = validateRrset(&records, owner, .ds, &.{}, 1700000000, &b, null);
-    try testing.expectEqual(SecurityStatus.bogus, status);
+    try testing.expect(validateRrset(&records, owner, .ds, &.{}, 1700000000, &b) == null);
 }
 
 test "DS hash verification - wrong digest fails" {
@@ -3797,8 +3853,7 @@ test "validateRrset propagates budget exhaustion as bogus" {
         .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
     };
     var budget: ValidationBudget = .{ .max_sig_verify = 0 };
-    const status = validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, null);
-    try testing.expectEqual(SecurityStatus.bogus, status);
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget) == null);
 }
 
 // ── verifyAuthorityProofSigs: validation-bypass guards ────────────────
@@ -3930,10 +3985,8 @@ test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict"
 
     var b1: ValidationBudget = .{};
     var b2: ValidationBudget = .{};
-    const a = validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1, null);
-    const b = validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2, null);
-    try testing.expectEqual(SecurityStatus.bogus, a);
-    try testing.expectEqual(a, b);
+    try testing.expect(validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1) == null);
+    try testing.expect(validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2) == null);
 }
 
 test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
@@ -3946,10 +3999,7 @@ test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
     var budget: ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.bogus,
-        validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, null),
-    );
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget) == null);
 }
 
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
@@ -4095,14 +4145,10 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
     };
     var budget: ValidationBudget = .{};
-    var cap: u32 = std.math.maxInt(u32);
-    try testing.expectEqual(
-        SecurityStatus.secure,
-        validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &cap),
-    );
+    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget).?;
     // The verifying signature's own bounds: original_ttl 300 against a
     // remaining window of 100_000_000 s. Never the junk record's 1.
-    try testing.expectEqual(@as(u32, 300), cap);
+    try testing.expectEqual(@as(u32, 300), rrsigTtlCap(sig, now));
 }
 
 test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the shorter bound" {
@@ -4122,12 +4168,8 @@ test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the sh
     // 60 s before the signature dies.
     const now: u32 = 1_800_000_000 - 60;
     var budget: ValidationBudget = .{};
-    var cap: u32 = std.math.maxInt(u32);
-    try testing.expectEqual(
-        SecurityStatus.secure,
-        validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &cap),
-    );
-    try testing.expectEqual(@as(u32, 60), cap);
+    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget).?;
+    try testing.expectEqual(@as(u32, 60), rrsigTtlCap(sig, now));
 }
 
 test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
@@ -4158,20 +4200,14 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     @memcpy(answers[0..70], &recs);
     answers[70] = sig_rr;
     var budget: ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.bogus,
-        validateRrset(&answers, test_owner, .a, &dnskeys, 1_700_000_000, &budget, null),
-    );
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1_700_000_000, &budget) == null);
 
     // Control: the signed 64 on their own still validate.
     var exact: [65]dns.ResourceRecord = undefined;
     @memcpy(exact[0..64], recs[0..64]);
     exact[64] = sig_rr;
     var budget2: ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.secure,
-        validateRrset(&exact, test_owner, .a, &dnskeys, 1_700_000_000, &budget2, null),
-    );
+    try testing.expect(validateRrset(&exact, test_owner, .a, &dnskeys, 1_700_000_000, &budget2) != null);
 }
 
 test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
@@ -4184,10 +4220,7 @@ test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
         rrsigRr(test_owner, .a, .dsasha1, 0, test_owner),
     };
     var budget: ValidationBudget = .{};
-    try testing.expectEqual(
-        SecurityStatus.bogus,
-        validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget, null),
-    );
+    try testing.expect(validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget) == null);
 }
 
 test "verifyRsa accepts 1024-bit (128-byte) modulus key parsing" {
@@ -4290,4 +4323,46 @@ test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
             try testing.expectError(error.InvalidSignature, res);
         }
     }
+}
+
+test "proveNoCloserMatch NSEC" {
+    // `*.example.com` (labels=2) answered `foo.example.com`.
+    const foo = dns.Name{ .labels = &.{ "foo", "example", "com" } };
+    const zone = dns.Name{ .labels = &.{ "example", "com" } };
+    const cover = [_]dns.ResourceRecord{nsecRr(.{ .labels = &.{ "bar", "example", "com" } }, .{ .labels = &.{ "zzz", "example", "com" } })};
+    const elsewhere = [_]dns.ResourceRecord{nsecRr(.{ .labels = &.{ "aaa", "example", "com" } }, .{ .labels = &.{ "bbb", "example", "com" } })};
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&cover, foo, 2, zone, &b));
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&.{}, foo, 2, zone, &b));
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&elsewhere, foo, 2, zone, &b));
+    // Signed by `*.com`: closest encloser above the zone.
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&cover, foo, 1, zone, &b));
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&cover, foo, 3, zone, &b));
+
+    // Cover bounded inside `b.example.com` proves that name exists, so
+    // `*.example.com` never matched (RFC 4592 §3.3.1); `*.b.example.com` did.
+    const a_b = dns.Name{ .labels = &.{ "a", "b", "example", "com" } };
+    const deep = [_]dns.ResourceRecord{nsecRr(.{ .labels = &.{ "0", "b", "example", "com" } }, .{ .labels = &.{ "z", "b", "example", "com" } })};
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&deep, a_b, 2, zone, &b));
+    try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&deep, a_b, 3, zone, &b));
+}
+
+test "proveNoCloserMatch NSEC3" {
+    const qname = dns.Name{ .labels = &.{ "foo", "example", "com" } };
+    const ce = dns.Name{ .labels = &.{ "example", "com" } };
+    const zone_labels: []const []const u8 = &.{ "example", "com" };
+    const salt: []const u8 = &.{};
+    var bufs: Nsec3OwnerBufs = .{};
+    var lo: [20]u8 = undefined;
+    var hi: [20]u8 = undefined;
+    var nc = makeCoveringNsec3(try nsec3Hash(qname, salt, 0), zone_labels, salt, &bufs, &lo, &hi);
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
+    nc.rdata.nsec3.flags = nsec3_opt_out;
+    try testing.expectEqual(SecurityStatus.insecure, proveNoCloserMatch(&.{nc}, qname, 2, ce, &b));
+    // The CE's own record names the wildcard's parent and denies nothing.
+    var ce_bufs: Nsec3OwnerBufs = .{};
+    const ce_owner = makeNsec3OwnerName(try nsec3Hash(ce, salt, 0), zone_labels, &ce_bufs.enc, &ce_bufs.labels);
+    const ce_only = [_]dns.ResourceRecord{makeNsec3Rr(ce_owner, salt, &@as([20]u8, @splat(0xFF)), &.{})};
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&ce_only, qname, 2, ce, &b));
 }

@@ -20,6 +20,7 @@ Hark-only extensions:
   - ; hark: workers = <n>                   header directive (optional; >1 enables dedup)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
+  - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>
   - <child> <ttl> IN DS PLACEHOLDER         real digest substituted at load
   - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
   - STEP n CHECK_OUT_QUERY                  positional upstream-query check
@@ -133,6 +134,9 @@ class Entry:
     # scenario can express a *wrong* signer — a parent forging data for a
     # delegated child — which is otherwise unconstructible.
     sign_as: str | None = None
+    # WILDCARD <owner>: sign answer RRsets as expansions of that wildcard
+    # (RFC 4035 §3.1.3.3).
+    wildcard: str | None = None
 
 
 @dataclasses.dataclass
@@ -414,6 +418,10 @@ class _Parser:
                 if len(tokens) != 2:
                     raise self.err(f"SIGN_AS takes one zone name: {line!r}")
                 entry.sign_as = tokens[1]
+            elif head == "WILDCARD":
+                if len(tokens) != 2 or not tokens[1].startswith("*."):
+                    raise self.err(f"WILDCARD takes one wildcard owner: {line!r}")
+                entry.wildcard = tokens[1]
             elif head == "REPLY":
                 self._parse_reply(entry, tokens[1:])
             elif head == "SECTION":
