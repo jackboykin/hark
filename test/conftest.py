@@ -137,6 +137,8 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.minimal_responses = scenario.minimal_responses
     if scenario.stagger_ms is not None:
         cfg.stagger_ms = scenario.stagger_ms
+    if scenario.workers is not None:
+        cfg.workers = scenario.workers
     if scenario.rebinding_enabled is not None:
         cfg.rebinding_enabled = scenario.rebinding_enabled
     if scenario.rebinding_allow_zones:

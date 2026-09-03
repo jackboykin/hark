@@ -26,7 +26,8 @@ const NsSelector = @import("ns_selector.zig").NsSelector;
 const NsOutcome = @import("ns_selector.zig").Outcome;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
-const InFlightTable = @import("dedup.zig").InFlightTable;
+const dedup_mod = @import("dedup.zig");
+const InFlightTable = dedup_mod.InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
 const CaseState = @import("case_state.zig").CaseState;
 const ServerConfig = @import("config.zig").ServerConfig;
@@ -2036,9 +2037,9 @@ pub const RecursiveResolver = struct {
                 return DedupCacheResult.from(cache.lookup(a, n, t, .in));
             }
         }.call;
-        switch (dedup.acquireOrWaitWithTimeout(name, rtype, 0, monotonic.nowNs() + timeout_ns)) {
+        switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + timeout_ns)) {
             .leader => {
-                defer dedup.releaseLeader(name, rtype, 0);
+                defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
                 return ctx.fetch();
             },
             .follower => {
@@ -2046,9 +2047,9 @@ pub const RecursiveResolver = struct {
                     .hit => |rr| rr,
                     .negative => null,
                 };
-                switch (dedup.acquireOrWaitWithTimeout(name, rtype, 0, monotonic.nowNs() + timeout_ns / 2)) {
+                switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + timeout_ns / 2)) {
                     .leader => {
-                        defer dedup.releaseLeader(name, rtype, 0);
+                        defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
                         return ctx.fetch();
                     },
                     .follower => return switch (recheck(self, allocator, name, rtype) orelse return null) {
@@ -2758,10 +2759,10 @@ pub const RecursiveResolver = struct {
         count: *usize,
     ) error{OutOfMemory}!void {
         const leader = if (self.dedup) |dedup|
-            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, 0, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
+            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, dedup_mod.flag_internal, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
         else
             false;
-        defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, 0);
+        defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, dedup_mod.flag_internal);
 
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
             _ = self.appendAddressesFromRecords(r.message.answers, addrs, count);

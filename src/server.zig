@@ -376,11 +376,6 @@ const max_signal_misfires: u32 = 16;
 
 const max_bg_tasks: u32 = 16;
 
-/// Dedup flag value for background CD=1 revalidation tasks. Distinct
-/// from CD=0 (flag=0) and CD=1-client (flag=1) so a client-facing query
-/// and a background revalidation of the same (name, qtype) don't coalesce.
-const bg_revalidate_flag: u8 = 2;
-
 pub const Server = struct {
     config: ServerConfig,
     allocator: mem.Allocator,
@@ -1051,7 +1046,7 @@ const BgKind = enum {
 
 /// Errors are expected and ignored; runs for cache side effects.
 fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, kind: BgKind) void {
-    const dedup_flag: u8 = if (kind == .revalidate) bg_revalidate_flag else 0;
+    const dedup_flag: u8 = if (kind == .revalidate) dedup_mod.flag_revalidate else 0;
     if (ctx.dedup) |d| if (!d.tryAcquireLeader(name, qtype, dedup_flag)) return;
     defer if (ctx.dedup) |d| d.releaseLeader(name, qtype, dedup_flag);
 
@@ -1754,7 +1749,7 @@ const WorkerState = struct {
             return self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         }
 
-        const cd_flag: u8 = @intFromBool(cd);
+        const cd_flag: u8 = if (cd) dedup_mod.flag_cd else 0;
         var is_leader = true;
         if (self.server.dedup) |*dedup| {
             switch (dedup.acquireOrWait(name, qtype, cd_flag)) {

@@ -17,6 +17,7 @@ a "drop the next incoming query" on the responder before the QUERY fires.
 Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
+  - ; hark: workers = <n>                   header directive (optional; >1 enables dedup)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - <child> <ttl> IN DS PLACEHOLDER         real digest substituted at load
@@ -190,6 +191,7 @@ class Scenario:
     # deterministic sequential server loop so a fallthrough scenario can pin a
     # specific NS-failure order. None = harness/hark default.
     stagger_ms: int | None = None
+    workers: int | None = None
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -259,6 +261,8 @@ class _Parser:
             self.scenario.rebinding_extra_allow.append(val.strip())
         elif key == "stagger-ms":
             self.scenario.stagger_ms = int(val.strip())
+        elif key == "workers":
+            self.scenario.workers = int(val.strip())
         elif key == "dnssec-zone":
             # Canonicalize: lowercase, ensure trailing dot. Multiple
             # directives accumulate; same value collapses (idempotent).

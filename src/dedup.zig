@@ -5,6 +5,12 @@ const dns = @import("dns.zig");
 
 // Fixed-size stack key — no allocations in the hot path.
 
+/// Populations that must not coalesce; `internal` keeps the resolver's own
+/// DNSKEY/DS/NS fetches off the client query that triggered them.
+pub const flag_cd: u8 = 1;
+pub const flag_revalidate: u8 = 2;
+pub const flag_internal: u8 = 4;
+
 const DedupKey = struct {
     name_buf: [dns.max_name_len + 1]u8 = undefined,
     name_len: u8 = 0,
@@ -99,7 +105,7 @@ pub const InFlightTable = struct {
         return &self.shards[DedupKeyContext.hash(.{}, key) & shard_mask];
     }
 
-    /// Try to become the leader for this (name, qtype) pair.
+    /// Try to become the leader for this (name, qtype, flags) key.
     /// Returns `.leader` if this is the first request — caller must call `releaseLeader` when done.
     /// Returns `.follower` if another worker is already resolving — blocks until the leader finishes.
     ///
@@ -281,12 +287,12 @@ test "different flags are independent" {
     defer table.deinit();
 
     const r1 = table.acquireOrWait("example.com", .a, 0);
-    const r2 = table.acquireOrWait("example.com", .a, 1);
+    const r2 = table.acquireOrWait("example.com", .a, flag_internal);
     try testing.expectEqual(.leader, r1);
     try testing.expectEqual(.leader, r2);
 
     table.releaseLeader("example.com", .a, 0);
-    table.releaseLeader("example.com", .a, 1);
+    table.releaseLeader("example.com", .a, flag_internal);
 }
 
 test "CD bit partitions dedup groups" {
@@ -298,7 +304,7 @@ test "CD bit partitions dedup groups" {
     defer table.deinit();
 
     const cd0: u8 = 0;
-    const cd1: u8 = 1;
+    const cd1: u8 = flag_cd;
 
     const leader_cd0 = table.acquireOrWait("example.com", .a, cd0);
     try testing.expectEqual(.leader, leader_cd0);
