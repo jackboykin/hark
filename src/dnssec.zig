@@ -575,7 +575,6 @@ fn verifyRrsig(
     for (rrset) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.labels.len) return error.InvalidSignature;
-        if (rrsig.labels == 0 and rr.name.labels.len != 0) return error.InvalidSignature;
     }
 
     // An SOA or NS RRset *defines* the name it sits at: SOA marks an apex, and
