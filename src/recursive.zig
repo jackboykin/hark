@@ -2052,7 +2052,7 @@ pub const RecursiveResolver = struct {
         // Indeterminate, not Bogus; retry once so a single transient failure
         // doesn't collapse into a caller-cached SERVFAIL.
         const resp = for (0..2) |_| {
-            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true, false)) |r| {
+            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true)) |r| {
                 if (r.answers.len != 0) break r;
             }
         } else return null;
@@ -2113,7 +2113,6 @@ pub const RecursiveResolver = struct {
         servers: []const na.Address,
         max_servers: usize,
         do_bit: bool,
-        store_response: bool,
     ) !?dns.Message {
         // Second upstream-touching entry alongside queryAuthoritativeServers.
         // findClosestCachedDelegation → reproveDelegationSecurity → here
@@ -2122,8 +2121,6 @@ pub const RecursiveResolver = struct {
         // delegation needs DS/DNSKEY re-prove.
         if (self.cache_only) return error.CacheOnlyMiss;
         if (servers.len == 0) return null;
-
-        const authority_zone = try dns.parseDottedName(allocator, zone_name);
 
         const try_count = @min(servers.len, max_servers);
         const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
@@ -2144,9 +2141,6 @@ pub const RecursiveResolver = struct {
                 .response => |r| r.message,
             };
             if (response.header.flags.rcode != .no_error) continue;
-            if (store_response) {
-                if (self.cache) |c| c.storeResponse(response, authority_zone, .unchecked, std.math.maxInt(u32));
-            }
             return response;
         }
         return null;
@@ -2244,7 +2238,7 @@ pub const RecursiveResolver = struct {
         // Root has no parent to reprove DS against — caller chose root_hints
         // anchor, not this path. parentZoneOf("") returns "" and would loop.
         std.debug.assert(zone_name.len > 0);
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware, false) catch return null) orelse return null;
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware) catch return null) orelse return null;
         const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
         // Locate the section that carries the DS RRset (RFC 4035 §5.2: DS
@@ -4680,7 +4674,7 @@ test "fetchRRset returns CacheOnlyMiss when cache_only=true" {
         .cache_only = true,
     };
     const servers: []const na.Address = &.{na.initIp4(.{ 192, 0, 2, 1 }, 53)};
-    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1, false, false);
+    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1, false);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
