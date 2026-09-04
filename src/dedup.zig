@@ -40,8 +40,8 @@ pub fn randomizeHashSeed(io: std.Io) void {
 
 const DedupKeyContext = struct {
     pub fn hash(_: @This(), key: DedupKey) u64 {
-        const tag = (@as(u32, @backingInt(key.qtype)) << 8) | key.flags;
-        return std.hash.Wyhash.hash(dedup_hash_seed ^ tag, key.name_buf[0..key.name_len]);
+        const salt = (@as(u32, @backingInt(key.qtype)) << 8) | key.flags;
+        return std.hash.Wyhash.hash(dedup_hash_seed ^ salt, key.name_buf[0..key.name_len]);
     }
 
     pub fn eql(_: @This(), a: DedupKey, b: DedupKey) bool {
@@ -53,6 +53,13 @@ const DedupKeyContext = struct {
 };
 
 const AcquireResult = enum { leader, follower, uncoordinated };
+
+/// The table's hash for `(name, qtype, flags)`; callers use it as a compact
+/// stand-in for the key. Never 0.
+pub fn tag(name: []const u8, qtype: dns.RType, flags: u8) u64 {
+    const key = DedupKey.init(name, qtype, flags) orelse return 1;
+    return DedupKeyContext.hash(.{}, key) | 1;
+}
 
 /// One mutex + condvar per shard; broadcast wakes only that shard's
 /// followers. Power of two so modulo compiles to a mask.

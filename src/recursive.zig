@@ -202,6 +202,26 @@ const Budget = struct {
     max_queries: u32 = max_global_queries,
     deadline_ns: i128 = std.math.maxInt(i128),
     validation: dnssec.ValidationBudget = .{},
+    /// Internal dedup tags this tree currently leads. A nested resolution
+    /// that meets one skips dedup rather than waiting on its own ancestor:
+    /// a delegation cycle otherwise stacks follower timeouts past the
+    /// client's patience.
+    held: [max_held]std.atomic.Value(u64) = @splat(.init(0)),
+
+    const max_held = 32;
+
+    fn holds(self: *Budget, t: u64) bool {
+        for (&self.held) |*h| if (h.load(.acquire) == t) return true;
+        return false;
+    }
+
+    fn hold(self: *Budget, t: u64) void {
+        for (&self.held) |*h| if (h.cmpxchgStrong(0, t, .acq_rel, .acquire) == null) return;
+    }
+
+    fn unhold(self: *Budget, t: u64) void {
+        for (&self.held) |*h| if (h.cmpxchgStrong(t, 0, .acq_rel, .acquire) == null) return;
+    }
 
     /// Callers propagate the error; the server maps it to SERVFAIL.
     fn consumeQuery(self: *Budget) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
@@ -2678,8 +2698,9 @@ pub const RecursiveResolver = struct {
 
     /// Resolve one (ns_name, rtype) pair and append any resulting addresses
     /// to `addrs[count..]`. Non-OOM resolution failures are swallowed.
-    /// Wrapped in dedup so concurrent recursions hitting the same NS collapse;
-    /// bounded timeout prevents follower-deadlock under cross-NS dependencies.
+    /// Wrapped in dedup so concurrent recursions hitting the same NS collapse.
+    /// The tree's own leads are skipped (Budget.held); the timeout only bounds
+    /// cross-tree dependency cycles.
     fn resolveNsNameOne(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -2689,11 +2710,18 @@ pub const RecursiveResolver = struct {
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
     ) error{OutOfMemory}!void {
+        const budget = self.budget.?;
+        const tag = dedup_mod.tag(ns_dotted, rtype, dedup_mod.flag_internal);
         const leader = if (self.dedup) |dedup|
-            dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, dedup_mod.flag_internal, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
+            !budget.holds(tag) and
+                dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, dedup_mod.flag_internal, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
         else
             false;
-        defer if (leader) self.dedup.?.releaseLeader(ns_dotted, rtype, dedup_mod.flag_internal);
+        if (leader) budget.hold(tag);
+        defer if (leader) {
+            budget.unhold(tag);
+            self.dedup.?.releaseLeader(ns_dotted, rtype, dedup_mod.flag_internal);
+        };
 
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
             _ = self.appendAddressesFromRecords(r.message.answers, addrs, count);
