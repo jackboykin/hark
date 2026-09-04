@@ -1583,6 +1583,10 @@ pub fn verifyAuthorityProofSigs(
             const rrsig = sig_rr.rdata.rrsig;
             if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
             if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
+            // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
+            // the `*.CE` NSEC under its own owner), and the proofs read the owner
+            // as served: a real `*.zone NSEC` signature would verify under any.
+            if (rrsig.labels != rr.name.labels.len) return .bogus;
 
             if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
                 if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
@@ -4017,6 +4021,31 @@ test "verifyRrsig rejects labels below the signer's label count" {
     try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
     signed.rrsig.labels = 1;
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
+}
+
+test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
+    // The zone's real `*.example.com NSEC a.example.com`, replayed under owner
+    // `v.example.com`: labels 2 < 3 reconstructs `*.example.com` for the
+    // signature, which verifies. As `v NSEC a` it is an apex wrap covering
+    // every name after `v`, including ones that exist.
+    const star = dns.Name{ .labels = &.{ "*", "example", "com" } };
+    const a = dns.Name{ .labels = &.{ "a", "example", "com" } };
+    const v = dns.Name{ .labels = &.{ "v", "example", "com" } };
+    const real = [_]dns.ResourceRecord{nsecRr(star, a)};
+    var sig_buf: [64]u8 = undefined;
+    var pub_buf: [32]u8 = undefined;
+    const signed = try testSignRrset(&real, .nsec, test_owner, .ed25519, &sig_buf, &pub_buf);
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, signed.dnskey)};
+    const sig_rr = dns.ResourceRecord{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+    const replayed = [_]dns.ResourceRecord{ nsecRr(v, a), sig_rr };
+    var budget: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, null));
+
+    // Control: under its own owner the same signature is fine.
+    const own_sig = dns.ResourceRecord{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
+    const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
+    var budget2: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, null));
 }
 
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
