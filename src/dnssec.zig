@@ -569,9 +569,11 @@ fn verifyRrsig(
     if (rrsig.algorithm != dnskey.algorithm) return error.InvalidSignature;
 
     // RFC 4034 §3.1.3: signer name MUST be a (non-strict) ancestor of every
-    // RRset owner, and `labels` MUST NOT exceed the owner's non-root label
-    // count. Owner-vs-signer is also checked at the resolver layer (bailiwick
+    // RRset owner, and `labels` MUST NOT exceed the owner's label count nor
+    // fall below the signer's: fewer means the wildcard that signed sits above
+    // the zone. Owner-vs-signer is also checked at the resolver layer (bailiwick
     // scrubbing); enforcing here defends future callers from missing it.
+    if (rrsig.labels < rrsig.signer_name.labels.len) return error.InvalidSignature;
     for (rrset) |rr| {
         if (!rr.name.isSubdomainOf(rrsig.signer_name)) return error.InvalidSignature;
         if (rrsig.labels > rr.name.labels.len) return error.InvalidSignature;
@@ -1224,7 +1226,6 @@ pub fn proveNoCloserMatch(
 ) SecurityStatus {
     if (labels >= qname.labels.len) return .bogus;
     const ce = dns.Name{ .labels = qname.labels[qname.labels.len - labels ..] };
-    if (!ce.isSubdomainOf(zone)) return .bogus;
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
         if (!nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname)) continue;
@@ -4002,6 +4003,22 @@ test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget) == null);
 }
 
+test "verifyRrsig rejects labels below the signer's label count" {
+    // `*.com` cannot sign inside example.com: the wildcard that generated the
+    // owner would sit above the zone. Unbound: "RRSIG label count too low for signer".
+    const owner = dns.Name{ .labels = &.{ "foo", "example", "com" } };
+    const recs = [_]dns.ResourceRecord{
+        .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
+    };
+    var sig_buf: [64]u8 = undefined;
+    var pub_buf: [32]u8 = undefined;
+    var signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_buf, &pub_buf);
+    var budget: ValidationBudget = .{};
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
+    signed.rrsig.labels = 1;
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
+}
+
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
     // The signature is genuine and every other rule passes — RFC 4034 §3.1.3
     // is satisfied because the signer *is* an ancestor of the owner, which is
@@ -4335,7 +4352,7 @@ test "proveNoCloserMatch NSEC" {
     try testing.expectEqual(SecurityStatus.secure, proveNoCloserMatch(&cover, foo, 2, zone, &b));
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&.{}, foo, 2, zone, &b));
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&elsewhere, foo, 2, zone, &b));
-    // Signed by `*.com`: closest encloser above the zone.
+    // Signed by `*.com`: the cover's closest encloser is example.com, not com.
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&cover, foo, 1, zone, &b));
     try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&cover, foo, 3, zone, &b));
 
