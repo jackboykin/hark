@@ -1,0 +1,161 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN extra sections steer the walk and are never answers
+
+; A referral's extra sections are only trustworthy for the delegation they
+; carry: the NS RRset at the cut and A/AAAA for those NS names (RFC 2181
+; §5.4.1). Anything else under the parent's bailiwick is unsolicited, and
+; on a spoofed reply it is the Kaminsky payload: race one referral, plant
+; `mail.example.com A` for the whole TTL. Glue itself is parent-side data —
+; a client asking for the NS name gets the child's answer, not glue. And a
+; positive answer's extras are the same vector one hop later.
+;
+; The .com referral below carries glue `ns.example.com. A 127.0.10.3` and a
+; planted `mail.example.com. A 6.6.6.6`; the authoritative www answer
+; carries a planted `example.com. MX 0 evil.example.com.`. The first query
+; walks to the real authority; the next three must too: neither plant nor
+; the glue is served from cache. The NS name goes last: its authoritative
+; answer rightly replaces the glue the walk was using.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      mail.example.com. 86400 IN A 6.6.6.6
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 3600 IN A 93.184.216.34
+    SECTION ADDITIONAL
+      example.com. 3600 IN MX 0 evil.example.com.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.example.com. IN A
+    SECTION ANSWER
+      mail.example.com. 3600 IN A 10.0.0.25
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.example.com. IN A
+    SECTION ANSWER
+      ns.example.com. 3600 IN A 10.0.0.53
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN MX
+    SECTION ANSWER
+      example.com. 3600 IN MX 10 mail.example.com.
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.example.com. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.example.com. IN A
+  SECTION ANSWER
+    mail.example.com. 3600 IN A 10.0.0.25
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN MX
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN MX
+  SECTION ANSWER
+    example.com. 3600 IN MX 10 mail.example.com.
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ns.example.com. IN A
+  SECTION ANSWER
+    ns.example.com. 3600 IN A 10.0.0.53
+ENTRY_END
+
+SCENARIO_END
