@@ -9,7 +9,6 @@ pub fn build(b: *std.Build) void {
     // when this is true. Default false keeps production builds clean; the
     // pytest harness runs `zig build -Dtesting=true`.
     const testing_enabled = b.option(bool, "testing", "Enable test-only config knobs") orelse false;
-    const queue_instr = b.option(bool, "queue_instr", "Instrument WorkQueue mutex (acq count, hold/wait histograms)") orelse false;
     // TSan pulls in libc, which reshapes std.posix.sigset_t — see sys.signalfd.
     // It cannot model io_uring's kernel-shared rings, so the signal is in the
     // cache/resolver/DNSSEC layers, not the client plane. `?bool` matches
@@ -19,7 +18,6 @@ pub fn build(b: *std.Build) void {
         (optimize != .debug);
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "testing_enabled", testing_enabled);
-    build_opts.addOption(bool, "queue_instr", queue_instr);
     build_opts.addOption([]const u8, "version", zon.version);
     const build_options_mod = build_opts.createModule();
 
