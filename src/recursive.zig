@@ -704,7 +704,7 @@ pub const RecursiveResolver = struct {
                 const referral = extractReferral(response, walk.target, walk.zone, self.referralPolicy()) orelse
                     return self.finalizeNodata(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
-                if (self.cache) |c| c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
+                if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &walk);
                 if (security_state == .bogus) return self.bogusServfail(walk.name, qtype);
                 walk.restartProbing(self.qname_minimization);
@@ -744,7 +744,7 @@ pub const RecursiveResolver = struct {
         // carry NS records in authority that are not valid delegations.
         if (rcode == .no_error) {
             if (extractReferral(response, walk.target, walk.zone, self.referralPolicy())) |referral| {
-                if (self.cache) |c| c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
+                if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
                 try self.followReferral(allocator, referral, response.authorities, depth, security_state, walk);
                 walk.restartProbing(self.qname_minimization);
                 return;
@@ -781,10 +781,7 @@ pub const RecursiveResolver = struct {
         var neg_ttl_cap: u32 = std.math.maxInt(u32);
         switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), query_type, false, walk.zone, walk.servers(), &neg_ttl_cap)) {
             .proceed => |status| if (response.header.flags.aa) {
-                if (self.cache) |c| {
-                    c.storeResponse(response, walk.zone, .unchecked, std.math.maxInt(u32));
-                    c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
-                }
+                if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
             },
             .skip_cache => {},
             .bogus => return walk.stopProbing(),
@@ -1176,24 +1173,19 @@ pub const RecursiveResolver = struct {
         security_state: *dnssec.SecurityStatus,
         walk: *Walk,
     ) !void {
-        const zone_cut = switch (referral) {
-            .referral => |ref| ref.zone_cut,
-            .no_glue => |ng| ng.zone_cut,
-        };
+        const zone_cut = referral.zone_cut;
 
         // DNSSEC: classify delegation security (RFC 4035 §5.2)
         if (security_state.* == .secure) {
             security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, walk.servers());
         }
 
-        const addrs: NsAddrResult = switch (referral) {
-            .referral => |ref| .{ .addrs = ref.addrs, .count = ref.count },
-            .no_glue => |ng| blk: {
-                if (try self.lookupCachedNsAddresses(allocator, ng.ns_names[0..ng.ns_count])) |res| break :blk res;
-                const resolved = try self.resolveNsAddresses(allocator, ng.ns_names[0..ng.ns_count], depth);
-                break :blk resolved orelse return error.NoGlueRecords;
-            },
-        };
+        const addrs: NsAddrResult = if (referral.addr_count > 0)
+            .{ .addrs = referral.addrs, .count = referral.addr_count }
+        else if (try self.lookupCachedNsAddresses(allocator, referral.nsNames())) |res|
+            res
+        else
+            (try self.resolveNsAddresses(allocator, referral.nsNames(), depth)) orelse return error.NoGlueRecords;
 
         // Depth cap first: cheaper than the dup-scan and prevents the
         // OOB write at the bottom (seen_zones is sized to max_delegations).
@@ -1325,10 +1317,7 @@ pub const RecursiveResolver = struct {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
-                    if (self.cache) |c| {
-                        c.storeResponse(response.*, parent_zone, .unchecked, std.math.maxInt(u32));
-                        c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
-                    }
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, neg_ttl_cap);
@@ -3410,17 +3399,18 @@ fn negativeResolveResult(
     };
 }
 
-const ReferralResult = union(enum) {
-    referral: struct {
-        addrs: [max_servers_per_level]na.Address,
-        count: usize,
-        zone_cut: dns.Name, // borrows from response (valid for caller's scope)
-    },
-    no_glue: struct {
-        ns_names: [max_servers_per_level]dns.Name,
-        ns_count: usize,
-        zone_cut: dns.Name,
-    },
+/// Names and addresses borrow from the response.
+const ReferralResult = struct {
+    zone_cut: dns.Name,
+    ns_names: [max_servers_per_level]dns.Name,
+    ns_count: usize,
+    /// Glue; `addr_count == 0` means the NS names must be resolved.
+    addrs: [max_servers_per_level]na.Address,
+    addr_count: usize,
+
+    fn nsNames(r: *const ReferralResult) []const dns.Name {
+        return r.ns_names[0..r.ns_count];
+    }
 };
 
 fn hasSignedRecords(response: dns.Message) bool {
@@ -3500,17 +3490,13 @@ fn extractReferral(
             }
         }
     }
-    if (glue_count == 0) return .{ .no_glue = .{
+    return .{
+        .zone_cut = zc,
         .ns_names = ns_names,
         .ns_count = ns_count,
-        .zone_cut = zc,
-    } };
-
-    return .{ .referral = .{
         .addrs = glue_addrs,
-        .count = glue_count,
-        .zone_cut = zc,
-    } };
+        .addr_count = glue_count,
+    };
 }
 
 /// `proceed` carries the *proof's* verdict, not the zone's, so AD and the cached
@@ -3655,16 +3641,11 @@ test "extractReferral with NS and glue A records" {
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
     const result = extractReferral(response, target, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    switch (result) {
-        .referral => |ref| {
-            try testing.expectEqual(@as(usize, 1), ref.count);
-            const expected = na.initIp4(.{ 1, 2, 3, 4 }, 53);
-            try testing.expectEqual(expected.ip4.bytes, ref.addrs[0].ip4.bytes);
-            try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
-            try testing.expect(ref.zone_cut.eql(zone_name));
-        },
-        .no_glue => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqual(@as(usize, 1), result.addr_count);
+    const expected = na.initIp4(.{ 1, 2, 3, 4 }, 53);
+    try testing.expectEqual(expected.ip4.bytes, result.addrs[0].ip4.bytes);
+    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
+    try testing.expect(result.zone_cut.eql(zone_name));
 }
 
 test "extractReferral with no NS records returns null" {
@@ -3675,7 +3656,7 @@ test "extractReferral with no NS records returns null" {
     try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) == null);
 }
 
-test "extractReferral with NS but no glue returns no_glue" {
+test "extractReferral with NS but no glue returns zero addrs" {
     const alloc = testing.allocator;
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
     const zone_name = try makeName(alloc, &.{ "example", "com" });
@@ -3683,16 +3664,12 @@ test "extractReferral with NS but no glue returns no_glue" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    switch (result) {
-        .no_glue => |ng| {
-            try testing.expectEqual(@as(usize, 1), ng.ns_count);
-            try testing.expect(ng.zone_cut.eql(zone_name));
-            const ns_dotted = try nameToDotted(alloc, ng.ns_names[0]);
-            defer alloc.free(ns_dotted);
-            try testing.expectEqualStrings("ns1.example.com", ns_dotted);
-        },
-        .referral => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqual(@as(usize, 0), result.addr_count);
+    try testing.expectEqual(@as(usize, 1), result.ns_count);
+    try testing.expect(result.zone_cut.eql(zone_name));
+    const ns_dotted = try nameToDotted(alloc, result.ns_names[0]);
+    defer alloc.free(ns_dotted);
+    try testing.expectEqualStrings("ns1.example.com", ns_dotted);
 }
 
 test "extractReferral case-insensitive glue matching" {
@@ -3704,8 +3681,7 @@ test "extractReferral case-insensitive glue matching" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expect(result == .referral);
-    try testing.expectEqual(@as(usize, 1), result.referral.count);
+    try testing.expectEqual(@as(usize, 1), result.addr_count);
 }
 
 test "extractReferral rejects private IP glue (DNS rebinding defense)" {
@@ -3717,7 +3693,7 @@ test "extractReferral rejects private IP glue (DNS rebinding defense)" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expect(result == .no_glue);
+    try testing.expectEqual(@as(usize, 0), result.addr_count);
 }
 
 test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
@@ -3737,9 +3713,8 @@ test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
         dns.Name{ .labels = &.{} },
         .{ .allow_loopback = true, .upstream_port = 5353 },
     ) orelse return error.TestUnexpectedResult;
-    try testing.expect(result == .referral);
-    try testing.expectEqual(@as(usize, 1), result.referral.count);
-    try testing.expectEqual(@as(u16, 5353), result.referral.addrs[0].getPort());
+    try testing.expectEqual(@as(usize, 1), result.addr_count);
+    try testing.expectEqual(@as(u16, 5353), result.addrs[0].getPort());
 }
 
 test "extractReferral rejects out-of-zone glue" {
@@ -3751,10 +3726,10 @@ test "extractReferral rejects out-of-zone glue" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{"com"} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expect(result == .no_glue);
+    try testing.expectEqual(@as(usize, 0), result.addr_count);
 }
 
-test "extractReferral no_glue carries multiple NS names" {
+test "extractReferral without glue carries multiple NS names" {
     const alloc = testing.allocator;
     const ns1 = try makeName(alloc, &.{ "ns1", "other", "net" });
     const ns2 = try makeName(alloc, &.{ "ns2", "other", "net" });
@@ -3764,13 +3739,9 @@ test "extractReferral no_glue carries multiple NS names" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    switch (result) {
-        .no_glue => |ng| {
-            try testing.expectEqual(@as(usize, 2), ng.ns_count);
-            try testing.expect(ng.zone_cut.eql(zone1));
-        },
-        .referral => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqual(@as(usize, 0), result.addr_count);
+    try testing.expectEqual(@as(usize, 2), result.ns_count);
+    try testing.expect(result.zone_cut.eql(zone1));
 }
 
 test "extractReferral accepts in-zone glue" {
@@ -3782,8 +3753,7 @@ test "extractReferral accepts in-zone glue" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expect(result == .referral);
-    try testing.expectEqual(@as(usize, 1), result.referral.count);
+    try testing.expectEqual(@as(usize, 1), result.addr_count);
 }
 
 test "extractReferral with AAAA glue returns IPv6 address" {
@@ -3796,15 +3766,10 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     defer dns.freeMessage(alloc, response);
 
     const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    switch (result) {
-        .referral => |ref| {
-            try testing.expectEqual(@as(usize, 1), ref.count);
-            try testing.expectEqual(@as(u16, 53), ref.addrs[0].getPort());
-            const expected = na.initIp6(ipv6, 53, 0, 0);
-            try testing.expectEqual(expected.ip6.bytes, ref.addrs[0].ip6.bytes);
-        },
-        .no_glue => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqual(@as(usize, 1), result.addr_count);
+    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
+    const expected = na.initIp6(ipv6, 53, 0, 0);
+    try testing.expectEqual(expected.ip6.bytes, result.addrs[0].ip6.bytes);
 }
 
 test "extractReferral rejects same-zone NS as non-referral" {

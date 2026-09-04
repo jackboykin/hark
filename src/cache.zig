@@ -497,7 +497,7 @@ pub const RRsetCache = struct {
         prefetch: bool = false,
         serve_stale_ttl: u32 = 0,
         min_ttl: u32 = 0,
-        /// Skip .dnskey and .ds records in storeRRsetsExcept (routed to key cache).
+        /// Skip .dnskey and .ds records in storeRRsets (routed to key cache).
         skip_key_types: bool = false,
         /// Expected concurrent cache-reader threads (recv workers + their pool
         /// threads). Drives the shard count; see deriveShardCount.
@@ -820,10 +820,8 @@ pub const RRsetCache = struct {
         return .{ .ttl = capped, .expires_at = now + @as(i64, capped), .stored_at = now };
     }
 
-    /// Cache all RRsets from a DNS response with bailiwick filtering.
-    /// Answers get `status`; authorities/additionals always get `.unchecked`
-    /// (delegation data). Validate-then-store passes the resolved status
-    /// directly to avoid an unchecked→secure race window.
+    /// Cache a positive response, bailiwick-filtered. Answers get `status`;
+    /// authority/additional always `.unchecked`.
     ///
     /// Locking is per-RRset (per shard), not per-response. A reader may
     /// observe a partial-response cache state mid-store; DNS clients
@@ -840,20 +838,23 @@ pub const RRsetCache = struct {
             proofs = proof_buf[0..n];
         }
 
-        self.storeRRsetsExcept(response.answers, authority_zone, status, &.{}, proofs, authenticated_ttl_max);
-        if (response.answers.len == 0) {
-            // Referral / NODATA-without-SOA: cache everything (bailiwick filter
-            // handles cross-zone poisoning).
-            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{}, &.{}, std.math.maxInt(u32));
-            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{}, &.{}, std.math.maxInt(u32));
-        } else {
-            // CVE-2025-11411: child auth listing parent NS in its own authority
-            // would overwrite a valid delegation. Strip NS from authority and
-            // A/AAAA glue from additional. NSEC/NSEC3 + RRSIGs survive — DO=1
-            // clients still get proof material on cache-served wildcards.
-            self.storeRRsetsExcept(response.authorities, authority_zone, .unchecked, &.{.ns}, &.{}, std.math.maxInt(u32));
-            self.storeRRsetsExcept(response.additionals, authority_zone, .unchecked, &.{ .a, .aaaa }, &.{}, std.math.maxInt(u32));
-        }
+        self.storeRRsets(response.answers, authority_zone, status, .{}, proofs, authenticated_ttl_max);
+        // CVE-2025-11411: child auth listing parent NS in its own authority
+        // would overwrite a valid delegation. Strip NS from authority and
+        // A/AAAA glue from additional. NSEC/NSEC3 + RRSIGs survive — DO=1
+        // clients still get proof material on cache-served wildcards.
+        self.storeRRsets(response.authorities, authority_zone, .unchecked, .{ .types = &.{.ns} }, &.{}, std.math.maxInt(u32));
+        self.storeRRsets(response.additionals, authority_zone, .unchecked, .{ .types = &.{ .a, .aaaa } }, &.{}, std.math.maxInt(u32));
+    }
+
+    /// Only the NS at the cut and glue for those NS names: anything else in a
+    /// referral's extra sections is unsolicited and, on a spoofed reply, is
+    /// Kaminsky's payload. RFC 2181 §5.4.1 ranks glue lowest, so it never
+    /// displaces a fresh entry.
+    pub fn storeReferral(self: *RRsetCache, authorities: []const dns.ResourceRecord, additionals: []const dns.ResourceRecord, parent_zone: dns.Name, zone_cut: dns.Name, ns_names: []const dns.Name) void {
+        const max = std.math.maxInt(u32);
+        self.storeRRsets(authorities, parent_zone, .unchecked, .{ .mode = .only, .types = &.{.ns}, .names = &.{zone_cut}, .overwrite = .unless_fresh }, &.{}, max);
+        self.storeRRsets(additionals, parent_zone, .unchecked, .{ .mode = .only, .types = &.{ .a, .aaaa }, .names = ns_names, .overwrite = .unless_fresh }, &.{}, max);
     }
 
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
@@ -1050,16 +1051,31 @@ pub const RRsetCache = struct {
         };
     }
 
-    /// Cache every (name, rtype, rclass) rrset in `records`, skipping
-    /// any whose rtype is in `skip_types`. RRSIGs are bundled with the
-    /// rrset they cover (RFC 4035 §5.3.1) — pass `skip_types = &.{}` to
-    /// admit everything (the default for unfiltered store paths).
-    fn storeRRsetsExcept(
+    const Filter = struct {
+        mode: enum { skip, only } = .skip,
+        types: []const dns.RType = &.{},
+        /// Empty admits every owner.
+        names: []const dns.Name = &.{},
+        overwrite: Overwrite = .always,
+
+        fn admits(f: Filter, rr: dns.ResourceRecord) bool {
+            const type_listed = for (f.types) |t| {
+                if (rr.rtype == t) break true;
+            } else false;
+            if (type_listed != (f.mode == .only)) return false;
+            if (f.names.len == 0) return true;
+            for (f.names) |n| if (n.eql(rr.name)) return true;
+            return false;
+        }
+    };
+
+    /// RRSIGs are bundled with the rrset they cover (RFC 4035 §5.3.1).
+    fn storeRRsets(
         self: *RRsetCache,
         records: []const dns.ResourceRecord,
         authority_zone: dns.Name,
         status: SecurityStatus,
-        skip_types: []const dns.RType,
+        filter: Filter,
         nsec_proofs: []const dns.ResourceRecord,
         authenticated_ttl_max: u32,
     ) void {
@@ -1070,7 +1086,7 @@ pub const RRsetCache = struct {
         var processed: [64]struct { name: dns.Name, rtype: dns.RType } = undefined;
         var processed_count: usize = 0;
 
-        record_loop: for (records) |rr| {
+        for (records) |rr| {
             if (rr.ttl == 0) continue;
             if (!rr.name.isSubdomainOf(authority_zone)) continue;
 
@@ -1083,11 +1099,7 @@ pub const RRsetCache = struct {
             if (rr.rtype == .rrsig) continue;
             // Skip DNSKEY/DS when configured (routed to dedicated key cache)
             if (self.skip_key_types and (rr.rtype == .dnskey or rr.rtype == .ds)) continue;
-            // Caller-supplied type filter (e.g. surgical NS strip for
-            // CVE-2025-11411 from positive-response authority).
-            for (skip_types) |st| {
-                if (rr.rtype == st) continue :record_loop;
-            }
+            if (!filter.admits(rr)) continue;
 
             // Check if we already processed this (name, type) group. `eql`
             // folds case, matching the collection loop below.
@@ -1133,7 +1145,7 @@ pub const RRsetCache = struct {
             // uncached beats wrong-and-cached.
             if (match_count > match_buf.len or sig_count > sig_buf.len) continue;
 
-            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, nsec_proofs, authenticated_ttl_max);
+            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, filter.overwrite, nsec_proofs, authenticated_ttl_max);
         }
     }
 
@@ -1185,6 +1197,7 @@ pub const RRsetCache = struct {
         matches: []const dns.ResourceRecord,
         sigs: []const dns.ResourceRecord,
         status: SecurityStatus,
+        overwrite: Overwrite,
         nsec_proofs: []const dns.ResourceRecord,
         authenticated_ttl_max: u32,
     ) void {
@@ -1211,7 +1224,7 @@ pub const RRsetCache = struct {
         // where neither the min-ttl floor nor serve-stale can resurrect it.
         if (min_ttl == 0) return;
 
-        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
+        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, overwrite) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
@@ -3188,7 +3201,7 @@ test "storeResponse skips an RRset that overflows the collect buffer" {
 test "cache key: read-side and write-side name lowering agree byte-for-byte" {
     // Reads key the cache via lowerNameBuf over a formatInto-dotted string;
     // writes key it via Name.formatLower over the label array
-    // (storeRRsetsExcept). One byte of disagreement lands stores under a
+    // (storeRRsets). One byte of disagreement lands stores under a
     // key reads never hit — a silent cache miss, not a crash. Pin the
     // agreement across the shapes that could plausibly diverge.
     const names = [_]dns.Name{
