@@ -944,6 +944,7 @@ pub const RecursiveResolver = struct {
         if (self.bypass_cache) return .none;
         const c = self.cache orelse return .none;
         if (c.lookup(allocator, current_name, qtype, .in)) |result| {
+            if (result == .hit and !result.hit.security_status.answerable()) return .none;
             const meta = switch (result) {
                 inline .hit, .negative => |entry| .{
                     .needs_prefetch = entry.needs_prefetch,
@@ -1011,7 +1012,7 @@ pub const RecursiveResolver = struct {
                 // already a degraded answer — the chain head was fresh
                 // when we entered — so following is acceptable there.
                 if (h.is_stale and chain.hops == 0) return .none;
-                if (h.records.len == 0) return .none;
+                if (h.records.len == 0 or !h.security_status.answerable()) return .none;
                 // The redirect itself is aging. This was previously dropped
                 // on the floor — the CNAME RRset near expiry never triggered
                 // a refresh from the follow path, only from a direct

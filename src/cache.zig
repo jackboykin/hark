@@ -73,14 +73,22 @@ const PrecomputedCtx = struct {
     }
 };
 
-/// DNSSEC validation status for cached RRsets.
+/// DNSSEC validation status for cached RRsets, least trusted first: a store
+/// never displaces a fresh entry of higher rank (RFC 9520 §3.4).
 /// Intentionally a subset of dnssec.SecurityStatus: the cache only stores
 /// .secure (validated) or .insecure (provably unsigned); validation
 /// failures (.bogus) are never cached — they produce immediate SERVFAIL.
 pub const SecurityStatus = enum {
+    /// Parent-side referral data (RFC 2181 §5.4.1): steers the walk, is
+    /// never an answer, and any real answer displaces it.
+    glue,
     unchecked,
-    secure,
     insecure,
+    secure,
+
+    pub fn answerable(s: SecurityStatus) bool {
+        return s != .glue;
+    }
 };
 
 /// The wire at `wire_off` is the record; RDATA is reparsed on hit.
@@ -214,6 +222,13 @@ pub const CacheEntry = union(enum) {
         return switch (self) {
             .positive => |p| p.expires_at,
             .negative => |n| n.expires_at,
+        };
+    }
+
+    fn status(self: CacheEntry) SecurityStatus {
+        return switch (self) {
+            .positive => |p| p.security_status,
+            .negative => |n| n.security_status,
         };
     }
 
@@ -612,7 +627,8 @@ pub const RRsetCache = struct {
         defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const now = self.now_fn();
-        const fresh = now < shard.map.values()[idx].expiresAt();
+        const entry = shard.map.values()[idx];
+        const fresh = now < entry.expiresAt() and entry.status().answerable();
         if (fresh) markVisited(shard, idx);
         return fresh;
     }
@@ -708,7 +724,7 @@ pub const RRsetCache = struct {
                     .nsec_proofs = nsec_proofs,
                     .remaining_ttl = hit.remaining_ttl,
                     .needs_prefetch = hit.needs_prefetch,
-                    .security_status = if (hit.force_unchecked) .unchecked else rrset.security_status,
+                    .security_status = servedStatus(rrset.security_status, hit.force_unchecked),
                     .is_stale = hit.is_stale,
                 } };
             },
@@ -730,7 +746,7 @@ pub const RRsetCache = struct {
                     .soa = soa,
                     .nsec_proofs = nsec_proofs,
                     .needs_prefetch = hit.needs_prefetch,
-                    .security_status = if (hit.force_unchecked) .unchecked else neg.security_status,
+                    .security_status = servedStatus(neg.security_status, hit.force_unchecked),
                     .is_stale = hit.is_stale,
                 } };
             },
@@ -849,12 +865,11 @@ pub const RRsetCache = struct {
 
     /// Only the NS at the cut and glue for those NS names: anything else in a
     /// referral's extra sections is unsolicited and, on a spoofed reply, is
-    /// Kaminsky's payload. RFC 2181 §5.4.1 ranks glue lowest, so it never
-    /// displaces a fresh entry.
+    /// Kaminsky's payload. Stored as `.glue`, the rank below everything.
     pub fn storeReferral(self: *RRsetCache, authorities: []const dns.ResourceRecord, additionals: []const dns.ResourceRecord, parent_zone: dns.Name, zone_cut: dns.Name, ns_names: []const dns.Name) void {
         const max = std.math.maxInt(u32);
-        self.storeRRsets(authorities, parent_zone, .unchecked, .{ .mode = .only, .types = &.{.ns}, .names = &.{zone_cut}, .overwrite = .unless_fresh }, &.{}, max);
-        self.storeRRsets(additionals, parent_zone, .unchecked, .{ .mode = .only, .types = &.{ .a, .aaaa }, .names = ns_names, .overwrite = .unless_fresh }, &.{}, max);
+        self.storeRRsets(authorities, parent_zone, .glue, .{ .mode = .only, .types = &.{.ns}, .names = &.{zone_cut} }, &.{}, max);
+        self.storeRRsets(additionals, parent_zone, .glue, .{ .mode = .only, .types = &.{ .a, .aaaa }, .names = ns_names }, &.{}, max);
     }
 
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
@@ -996,8 +1011,8 @@ pub const RRsetCache = struct {
     }
 
     /// True if a non-expired positive entry exists for (name, rtype, rclass)
-    /// with a non-`.unchecked` security status (i.e., `.secure` or `.insecure`
-    /// — the entries RFC 9520 §3.4 considers trustworthy).
+    /// with a `.secure` or `.insecure` status — the entries RFC 9520 §3.4
+    /// considers trustworthy.
     /// Takes the shared lock; safe to call without holding any other lock.
     pub fn hasValidatedPositive(
         self: *RRsetCache,
@@ -1013,7 +1028,7 @@ pub const RRsetCache = struct {
         defer shard.rwlock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         return switch (shard.map.values()[idx]) {
-            .positive => |p| self.now_fn() < p.expires_at and p.security_status != .unchecked,
+            .positive => |p| self.now_fn() < p.expires_at and (p.security_status == .secure or p.security_status == .insecure),
             .negative => false,
         };
     }
@@ -1036,19 +1051,13 @@ pub const RRsetCache = struct {
         const existing = shard.map.values()[idx];
         if (self.now_fn() >= existing.expiresAt()) return false;
         if (overwrite == .unless_fresh) return true;
-        const existing_status: SecurityStatus = switch (existing) {
-            .positive => |p| p.security_status,
-            .negative => |n| n.security_status,
-        };
-        return statusRank(new_status) < statusRank(existing_status);
+        return @backingInt(new_status) < @backingInt(existing.status());
     }
 
-    fn statusRank(s: SecurityStatus) u8 {
-        return switch (s) {
-            .unchecked => 0,
-            .insecure => 1,
-            .secure => 2,
-        };
+    /// Stale hits degrade to `.unchecked`: their RRSIGs may have expired
+    /// (RFC 8767). Glue stays glue — it must not climb into answers by aging.
+    fn servedStatus(stored: SecurityStatus, force_unchecked: bool) SecurityStatus {
+        return if (force_unchecked and stored != .glue) .unchecked else stored;
     }
 
     const Filter = struct {
@@ -1056,7 +1065,6 @@ pub const RRsetCache = struct {
         types: []const dns.RType = &.{},
         /// Empty admits every owner.
         names: []const dns.Name = &.{},
-        overwrite: Overwrite = .always,
 
         fn admits(f: Filter, rr: dns.ResourceRecord) bool {
             const type_listed = for (f.types) |t| {
@@ -1145,7 +1153,7 @@ pub const RRsetCache = struct {
             // uncached beats wrong-and-cached.
             if (match_count > match_buf.len or sig_count > sig_buf.len) continue;
 
-            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, filter.overwrite, nsec_proofs, authenticated_ttl_max);
+            self.storeOneRRset(lower_name, rr, match_buf[0..match_count], sig_buf[0..sig_count], status, nsec_proofs, authenticated_ttl_max);
         }
     }
 
@@ -1197,7 +1205,6 @@ pub const RRsetCache = struct {
         matches: []const dns.ResourceRecord,
         sigs: []const dns.ResourceRecord,
         status: SecurityStatus,
-        overwrite: Overwrite,
         nsec_proofs: []const dns.ResourceRecord,
         authenticated_ttl_max: u32,
     ) void {
@@ -1224,7 +1231,7 @@ pub const RRsetCache = struct {
         // where neither the min-ttl floor nor serve-stale can resurrect it.
         if (min_ttl == 0) return;
 
-        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, overwrite) orelse return;
+        const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
         defer slot.shard.rwlock.unlock(self.io);
 
         const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
@@ -2744,6 +2751,21 @@ test ".unchecked store does not downgrade fresh .secure positive" {
     try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .secure);
     try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 9, 9, 9, 9 }, .unchecked);
     try expectCachedHitStatus(alloc, &cache, "example.com", .secure);
+}
+
+test ".glue sits below .unchecked in both directions" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+
+    try storeTestAWithStatus(&cache, alloc, &.{ "ns", "example", "com" }, 300, .{ 6, 6, 6, 6 }, .glue);
+    try expectCachedHitStatus(alloc, &cache, "ns.example.com", .glue);
+    try testing.expect(!cache.containsFresh("ns.example.com", .a, .in));
+    try storeTestAWithStatus(&cache, alloc, &.{ "ns", "example", "com" }, 300, .{ 1, 2, 3, 4 }, .unchecked);
+    try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
+    try storeTestAWithStatus(&cache, alloc, &.{ "ns", "example", "com" }, 300, .{ 6, 6, 6, 6 }, .glue);
+    try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
 }
 
 test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
