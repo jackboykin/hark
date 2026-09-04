@@ -390,20 +390,38 @@ fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!u
     return 18 + name_len;
 }
 
-/// Build the signed data for RRSIG verification.
-/// Returns a slice of the buffer containing: RRSIG_RDATA(sans signature) || sorted_canonical_RRset
+/// RFC 4034 §3.1.8.1 signed data: RRSIG_RDATA (sans signature) followed by
+/// the RRset in canonical form sorted by RDATA. Held as parts so verifiers
+/// stream it into their hash; nothing needs it contiguous.
+const SignedData = struct {
+    const Entry = struct { wire: []const u8, rdata: []const u8 };
+    const max_entries = 64;
+
+    header: []const u8,
+    entries: [max_entries]Entry = undefined,
+    len: usize = 0,
+
+    fn raw(bytes: []const u8) SignedData {
+        return .{ .header = bytes };
+    }
+
+    fn feed(self: *const SignedData, hasher: anytype) void {
+        hasher.update(self.header);
+        for (self.entries[0..self.len]) |e| hasher.update(e.wire);
+    }
+};
+
+/// Canonical entries are written into `buf` in RRset order and sorted by
+/// slice, so the buffer only ever holds one copy.
 fn buildSignedData(
     buf: []u8,
     rrsig: dns.RrsigData,
     rrset: []const dns.ResourceRecord,
-) error{BufferTooSmall}![]const u8 {
+) error{BufferTooSmall}!SignedData {
     const pos: usize = try writeRrsigHeaderWire(buf, rrsig);
-
-    // 2. Build canonical RRset entries, sorted by RDATA (RFC 4034 §6.3)
-    // Each entry: canonical_owner_wire || type(2) || class(2) || original_ttl(4) || rdlength(2) || canonical_rdata
-    const SortEntry = struct { wire: []const u8, rdata: []const u8 };
-    var entries: [64]SortEntry = undefined;
-    if (rrset.len > entries.len) return error.BufferTooSmall;
+    var out = SignedData{ .header = buf[0..pos], .len = rrset.len };
+    if (rrset.len > out.entries.len) return error.BufferTooSmall;
+    const entries = &out.entries;
 
     var temp_pos = pos;
 
@@ -449,26 +467,12 @@ fn buildSignedData(
     // RFC 4034 §6.3: within an RRset, sort by RDATA (owner/type/class/TTL
     // are identical). Must not include rdlength — it would mis-order records
     // of different sizes (e.g. mixed 1024/2048-bit DNSKEY).
-    mem.sortUnstable(SortEntry, entries[0..rrset.len], {}, struct {
-        fn lessThan(_: void, a: SortEntry, b: SortEntry) bool {
+    mem.sortUnstable(SignedData.Entry, entries[0..rrset.len], {}, struct {
+        fn lessThan(_: void, a: SignedData.Entry, b: SignedData.Entry) bool {
             return mem.order(u8, a.rdata, b.rdata) == .lt;
         }
     }.lessThan);
-
-    // The sorted entries reference slices of buf[pos..temp_pos].
-    // Compacting them in-place would corrupt source data (earlier copies
-    // overwrite source positions of later entries). Copy to a temp buffer first.
-    var temp_buf: [65536]u8 = undefined;
-    var out_pos: usize = 0;
-    for (entries[0..rrset.len]) |entry| {
-        if (out_pos + entry.wire.len > temp_buf.len) return error.BufferTooSmall;
-        @memcpy(temp_buf[out_pos..][0..entry.wire.len], entry.wire);
-        out_pos += entry.wire.len;
-    }
-    if (pos + out_pos > buf.len) return error.BufferTooSmall;
-    @memcpy(buf[pos..][0..out_pos], temp_buf[0..out_pos]);
-
-    return buf[0 .. pos + out_pos];
+    return out;
 }
 
 /// Write canonical RDATA per RFC 4034 §6.2. Each name-bearing arm carries
@@ -601,22 +605,22 @@ fn verifyRrsig(
     if (dns.serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
     if (dns.serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
 
-    var signed_data_buf: [65536]u8 = undefined;
-    const signed_data = try buildSignedData(&signed_data_buf, rrsig, rrset);
+    var canonical_buf: [65536]u8 = undefined;
+    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
 
     switch (rrsig.algorithm) {
-        .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha1),
-        .rsasha256 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha256),
-        .rsasha512 => try verifyRsa(rrsig.signature, signed_data, dnskey.public_key, Sha512),
-        .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, 32, rrsig.signature, signed_data, dnskey.public_key),
-        .ecdsap384sha384 => try verifyEcdsa(EcdsaP384, 48, rrsig.signature, signed_data, dnskey.public_key),
-        .ed25519 => try verifyEd25519(rrsig.signature, signed_data, dnskey.public_key),
+        .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha1),
+        .rsasha256 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha256),
+        .rsasha512 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha512),
+        .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, 32, rrsig.signature, &data, dnskey.public_key),
+        .ecdsap384sha384 => try verifyEcdsa(EcdsaP384, 48, rrsig.signature, &data, dnskey.public_key),
+        .ed25519 => try verifyEd25519(rrsig.signature, &data, dnskey.public_key),
         else => return error.UnsupportedAlgorithm,
     }
 }
 
 /// Parse an RFC 3110 RSA public key and verify a PKCS#1 v1.5 signature.
-fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, comptime Hash: type) VerifyError!void {
+fn verifyRsa(signature: []const u8, data: *const SignedData, key_data: []const u8, comptime Hash: type) VerifyError!void {
     // RFC 3110: first byte is exponent length (if < 256), then exponent, then modulus
     // If first byte is 0, next 2 bytes are exponent length
     if (key_data.len < 3) return error.InvalidKey;
@@ -671,8 +675,12 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
 
     var em_dec: [512]u8 = undefined;
     decoded_fe.toBytes(em_dec[0..modulus.len], .big) catch return error.InvalidSignature;
+    var hasher = Hash.init(.{});
+    data.feed(&hasher);
+    var digest: [Hash.digest_length]u8 = undefined;
+    hasher.final(&digest);
     var em_expected: [512]u8 = undefined;
-    pkcs1v15Encode(em_expected[0..modulus.len], Hash, msg);
+    pkcs1v15Encode(em_expected[0..modulus.len], Hash, &digest);
 
     // Xor-fold compare: no data-dependent branch, so still constant-time —
     // though EM in signature *verification* is public data anyway.
@@ -683,7 +691,7 @@ fn verifyRsa(signature: []const u8, msg: []const u8, key_data: []const u8, compt
 
 /// EMSA-PKCS1-v1_5 (RFC 8017 §9.2). Inlined because the stdlib's equivalent
 /// in Certificate.rsa is private and we no longer route through it.
-fn pkcs1v15Encode(em: []u8, comptime Hash: type, msg: []const u8) void {
+fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_length]u8) void {
     const hash_der: []const u8 = &switch (Hash) {
         Sha1 => .{
             0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
@@ -707,7 +715,7 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, msg: []const u8) void {
 
     var idx: usize = em.len;
     idx -= Hash.digest_length;
-    Hash.hash(msg, em[idx..][0..Hash.digest_length], .{});
+    @memcpy(em[idx..][0..Hash.digest_length], digest);
     idx -= hash_der.len;
     @memcpy(em[idx..][0..hash_der.len], hash_der);
     idx -= 1;
@@ -718,7 +726,7 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, msg: []const u8) void {
 }
 
 /// Verify an ECDSA signature (P-256 or P-384) given raw x||y key and r||s signature.
-fn verifyEcdsa(comptime Curve: type, comptime coord_len: comptime_int, signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
+fn verifyEcdsa(comptime Curve: type, comptime coord_len: comptime_int, signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
     const key_len = coord_len * 2;
     if (key_data.len != key_len) return error.InvalidKey;
     if (signature.len != key_len) return error.InvalidSignature;
@@ -730,16 +738,20 @@ fn verifyEcdsa(comptime Curve: type, comptime coord_len: comptime_int, signature
 
     const pub_key = Curve.PublicKey.fromSec1(&sec1_key) catch return error.InvalidKey;
     const sig = Curve.Signature.fromBytes(signature[0..key_len].*);
-    sig.verify(msg, pub_key) catch return error.InvalidSignature;
+    var verifier = sig.verifier(pub_key) catch return error.InvalidSignature;
+    data.feed(&verifier);
+    verifier.verify() catch return error.InvalidSignature;
 }
 
-fn verifyEd25519(signature: []const u8, msg: []const u8, key_data: []const u8) VerifyError!void {
+fn verifyEd25519(signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
     if (key_data.len != 32) return error.InvalidKey;
     if (signature.len != 64) return error.InvalidSignature;
 
     const pub_key = Ed25519.PublicKey.fromBytes(key_data[0..32].*) catch return error.InvalidKey;
     const sig = Ed25519.Signature.fromBytes(signature[0..64].*);
-    sig.verify(msg, pub_key) catch return error.InvalidSignature;
+    var verifier = sig.verifier(pub_key) catch return error.InvalidSignature;
+    data.feed(&verifier);
+    verifier.verify() catch return error.InvalidSignature;
 }
 
 /// Compare two DNS names in canonical ordering (RFC 4034 §6.1).
@@ -2031,6 +2043,15 @@ test "DS hash verification - wrong digest fails" {
     try testing.expectError(error.InvalidSignature, verifyDs(ds, dnskey, owner));
 }
 
+const TestFlatten = struct {
+    buf: [4096]u8 = undefined,
+    len: usize = 0,
+    fn update(self: *TestFlatten, b: []const u8) void {
+        @memcpy(self.buf[self.len..][0..b.len], b);
+        self.len += b.len;
+    }
+};
+
 test "buildSignedData produces correct header" {
     const signer_name = dns.Name{
         .labels = &.{
@@ -2067,7 +2088,9 @@ test "buildSignedData produces correct header" {
     }};
 
     var buf: [4096]u8 = undefined;
-    const signed = try buildSignedData(&buf, rrsig, &rrset);
+    var flat = TestFlatten{};
+    (try buildSignedData(&buf, rrsig, &rrset)).feed(&flat);
+    const signed = flat.buf[0..flat.len];
 
     try testing.expectEqual(@as(u16, 1), mem.readInt(u16, signed[0..2], .big)); // type_covered = A = 1
     try testing.expectEqual(@as(u8, 13), signed[2]); // algorithm
@@ -2130,7 +2153,9 @@ test "buildSignedData reconstructs wildcard owner name" {
     }};
 
     var buf: [4096]u8 = undefined;
-    const signed = try buildSignedData(&buf, rrsig, &rrset);
+    var flat = TestFlatten{};
+    (try buildSignedData(&buf, rrsig, &rrset)).feed(&flat);
+    const signed = flat.buf[0..flat.len];
 
     // After the RRSIG header (18 bytes) + signer name (13 bytes) = offset 31
     const rr_start = 31;
@@ -2150,9 +2175,9 @@ test "ECDSA P-256 signature verification" {
     const sig = try key_pair.sign(msg, null);
     const sig_bytes = sig.toBytes();
 
-    try verifyEcdsa(EcdsaP256, 32, &sig_bytes, msg, dnssec_key);
+    try verifyEcdsa(EcdsaP256, 32, &sig_bytes, &SignedData.raw(msg), dnssec_key);
 
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32, &sig_bytes, "wrong data", dnssec_key));
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, 32, &sig_bytes, &SignedData.raw("wrong data"), dnssec_key));
 }
 
 test "Ed25519 signature verification" {
@@ -2163,8 +2188,8 @@ test "Ed25519 signature verification" {
     const sig = try key_pair.sign(msg, null);
     const sig_bytes = sig.toBytes();
 
-    try verifyEd25519(&sig_bytes, msg, &pub_bytes);
-    try testing.expectError(error.InvalidSignature, verifyEd25519(&sig_bytes, "tampered", &pub_bytes));
+    try verifyEd25519(&sig_bytes, &SignedData.raw(msg), &pub_bytes);
+    try testing.expectError(error.InvalidSignature, verifyEd25519(&sig_bytes, &SignedData.raw("tampered"), &pub_bytes));
 }
 
 test "invalid key sizes are rejected" {
@@ -2173,11 +2198,11 @@ test "invalid key sizes are rejected" {
     const sig96: [96]u8 = @splat(0);
 
     // ECDSA P-256: key must be 64 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, 32, &sig64, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, 32, &sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
     // ECDSA P-384: key must be 96 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48, &sig96, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, 48, &sig96, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
-    try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, msg, &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
 }
 
 test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
@@ -2186,8 +2211,8 @@ test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK
     var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     key_data[6] = 0x80;
     const signature: [128]u8 = @splat(0xaa);
-    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, "x", &key_data, Sha1));
-    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, "x", &key_data, Sha256));
+    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, &SignedData.raw("x"), &key_data, Sha1));
+    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, &SignedData.raw("x"), &key_data, Sha256));
 }
 
 test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
@@ -2195,12 +2220,12 @@ test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
     var k1 = [_]u8{ 4, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     k1[5] = 0x80;
     const sig: [128]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "x", &k1, Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("x"), &k1, Sha256));
 
     // 2-byte exp_len encoding with 8-byte padded exponent.
     var k2 = [_]u8{ 0, 0, 8 } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x01} ++ @as([128]u8, @splat(0x55));
     k2[11] = 0x80;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "x", &k2, Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("x"), &k2, Sha256));
 }
 
 test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
@@ -2266,7 +2291,7 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
         },
     }) |c| {
         var em: [128]u8 = undefined;
-        pkcs1v15Encode(&em, c.Hash, "abc");
+        pkcs1v15Encode(&em, c.Hash, c.hash_abc[0..c.Hash.digest_length]);
         try testing.expectEqual(@as(u8, 0x00), em[0]);
         try testing.expectEqual(@as(u8, 0x01), em[1]);
         const sep = 128 - c.digest_len - c.der.len - 1;
@@ -4127,8 +4152,11 @@ fn testSignRrset(
         .signer_name = signer,
         .signature = &.{},
     };
-    var data_buf: [65536]u8 = undefined;
-    sig_buf.* = (try kp.sign(try buildSignedData(&data_buf, rrsig, rrset), null)).toBytes();
+    var canonical_buf: [65536]u8 = undefined;
+    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
+    var sig = try kp.signer(null, testing.io);
+    data.feed(&sig);
+    sig_buf.* = sig.finalize().toBytes();
     rrsig.signature = sig_buf;
     return .{ .rrsig = rrsig, .dnskey = dnskey };
 }
@@ -4282,7 +4310,7 @@ test "verifyRsa accepts 1024-bit (128-byte) modulus key parsing" {
     var sig: [128]u8 = undefined;
     @memset(&sig, 0xBB);
     // Should get InvalidSignature (key valid, sig doesn't verify) or InvalidKey from crypto
-    const result = verifyRsa(&sig, "test", &key_data, Sha256);
+    const result = verifyRsa(&sig, &SignedData.raw("test"), &key_data, Sha256);
     try testing.expect(result == error.InvalidSignature or result == error.InvalidKey);
 }
 
@@ -4300,7 +4328,7 @@ test "verifyRsa accepts 2048-bit (256-byte) modulus key parsing" {
     @memset(&sig, 0xBB);
     // Should get InvalidSignature (key is valid but sig doesn't verify)
     // or InvalidKey from the crypto library — either is fine, not a key size error
-    const result = verifyRsa(&sig, "test", &key_data, Sha256);
+    const result = verifyRsa(&sig, &SignedData.raw("test"), &key_data, Sha256);
     // The point: it doesn't reject at the key-size check
     try testing.expect(result == error.InvalidSignature or result == error.InvalidKey);
 }
@@ -4311,7 +4339,7 @@ fn expectVerifyRsaInvalidKey(exp: []const u8) !void {
     @memcpy(key_data[1 .. 1 + exp.len], exp);
     @memset(key_data[1 + exp.len ..], 0xAA);
     const sig: [256]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, "test", key_data[0 .. 1 + exp.len + 256], Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("test"), key_data[0 .. 1 + exp.len + 256], Sha256));
 }
 
 test "verifyRsa rejects even exponent" {
@@ -4360,7 +4388,7 @@ test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
         @memset(buf[1..][0..elen], 0xFF);
         @memset(buf[1 + elen ..][0..256], 0xFF);
         const key_data = buf[0 .. 1 + elen + 256];
-        const res = verifyRsa(&sig, "hello", key_data, Sha256);
+        const res = verifyRsa(&sig, &SignedData.raw("hello"), key_data, Sha256);
         if (want_rejected) {
             // Rejected on the key, before any modular arithmetic runs.
             try testing.expectError(error.InvalidKey, res);
