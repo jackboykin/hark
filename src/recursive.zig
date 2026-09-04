@@ -821,15 +821,17 @@ pub const RecursiveResolver = struct {
 
         var cname_status: cache_mod.SecurityStatus = .unchecked;
         var cname_ttl_cap: u32 = std.math.maxInt(u32);
+        var wildcard: ?Wildcard = null;
         if (self.dnssec_enabled and security_state == .secure) {
             switch (try self.validateAnswer(allocator, response, .cname, security_state, walk.zone, walk.servers())) {
                 .bogus => {
                     self.recordNsOutcome(walk.zone, responding_server, .validation_failure, 0);
                     return .bogus;
                 },
-                .valid => |cap| {
+                .valid => |v| {
                     cname_status = .secure;
-                    cname_ttl_cap = cap;
+                    cname_ttl_cap = v.ttl_cap;
+                    wildcard = v.wildcard;
                 },
                 .skip => {},
             }
@@ -839,7 +841,11 @@ pub const RecursiveResolver = struct {
         // Store before following: this response never reaches final answer validation.
         if (self.cache) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
         if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .bogus;
-        try self.aggregateCnameWildcardProofs(allocator, cname_status, response.authorities, walk.zone, walk.servers(), &cname_chain.wildcard_proofs);
+        // Carry the expansion's proofs past this hop so the client sees them;
+        // `proveWildcard` already verified them under the answer's keys.
+        if (wildcard != null) for (response.authorities) |rr| {
+            if (dns.isNsecProofMaterial(rr)) try cname_chain.wildcard_proofs.append(allocator, rr);
+        };
 
         walk.name = try nameToDotted(allocator, redirect.target);
         // Same-zone: the chain of trust is unchanged within a zone, so
@@ -1161,38 +1167,6 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    /// Aggregate wildcard-expansion NSEC/NSEC3 proofs from this hop's
-    /// authority before moving past it. Three gates: secure CNAME
-    /// (DNSKEY warm), proof-material pre-scan with cheap bailiwick to
-    /// skip the DNSKEY fetch on the common no-proof case, then
-    /// `verifyAuthoritySigs` for crypto truth. An unverified scoop here
-    /// is an injection path — attacker stuffs forged NSEC into a
-    /// `.secure` chain and AD-trusting downstream believes it.
-    fn aggregateCnameWildcardProofs(
-        self: *RecursiveResolver,
-        allocator: mem.Allocator,
-        cname_status: cache_mod.SecurityStatus,
-        authorities: []const dns.ResourceRecord,
-        parent_zone: dns.Name,
-        servers: []const na.Address,
-        cname_auth_aggregate: *std.ArrayListUnmanaged(dns.ResourceRecord),
-    ) !void {
-        if (cname_status != .secure or authorities.len == 0) return;
-        var has_proof = false;
-        for (authorities) |auth_rr| {
-            if (dns.isNsecProofMaterial(auth_rr) and auth_rr.name.isSubdomainOf(parent_zone)) {
-                has_proof = true;
-                break;
-            }
-        }
-        if (!has_proof) return;
-        if (self.verifyAuthoritySigs(allocator, authorities, null, servers, null) != .secure) return;
-        for (authorities) |auth_rr| {
-            if (dns.isNsecProofMaterial(auth_rr))
-                try cname_auth_aggregate.append(allocator, auth_rr);
-        }
-    }
-
     fn followReferral(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1308,24 +1282,24 @@ pub const RecursiveResolver = struct {
         const current_name, const parent_zone, const servers = .{ walk.name, walk.zone, walk.servers() };
         var answer_status: cache_mod.SecurityStatus = .unchecked;
         var answer_ttl_cap: u32 = std.math.maxInt(u32);
+        var wildcard: ?Wildcard = null;
         if (self.dnssec_enabled) {
             switch (try self.validateAnswer(allocator, response, qtype, security_state, parent_zone, servers)) {
                 .bogus => {
                     self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
                     return self.bogusServfail(current_name, qtype);
                 },
-                .valid => |cap| {
+                .valid => |v| {
                     answer_status = .secure;
-                    answer_ttl_cap = cap;
+                    answer_ttl_cap = v.ttl_cap;
+                    wildcard = v.wildcard;
                 },
                 .skip => {},
             }
         }
         if (self.cache) |c| if (qtype != .any) {
             c.storeResponse(response.*, parent_zone, answer_status, answer_ttl_cap);
-            if (answer_status == .secure and self.nsec_cache != null) {
-                self.storeWildcardRRsets(response.answers, qtype, answer_ttl_cap);
-            }
+            if (wildcard) |w| if (self.nsec_cache != null) self.storeWildcardRRsets(response.answers, qtype, w, answer_ttl_cap);
         };
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
@@ -1463,25 +1437,11 @@ pub const RecursiveResolver = struct {
         self: *RecursiveResolver,
         answers: []const dns.ResourceRecord,
         qtype: dns.RType,
+        wildcard: Wildcard,
         ttl_cap: u32,
     ) void {
-        // Pick the RRSIG covering qtype with the highest `labels` count
-        // (narrowest wildcard). A smaller-labels forgery alongside the
-        // real RRSIG would otherwise widen the cached wildcard owner —
-        // e.g. forge labels=1 against real labels=2 to install *.com.
-        // Larger-labels forgeries only narrow scope (DoS on aggressive
-        // NSEC at this zone, no poisoning).
-        var rrsig: ?dns.RrsigData = null;
-        for (answers) |rr| {
-            if (dns.rrsigCovers(rr) != qtype) continue;
-            if (rrsig == null or rr.rdata.rrsig.labels > rrsig.?.labels) {
-                rrsig = rr.rdata.rrsig;
-            }
-        }
-        const sig = rrsig orelse return;
-
         var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
-        var wildcard_owner: ?dns.Name = null;
+        const wco = dns.makeWildcardName(&wc_labels_buf, wildcard.ce) orelse return;
         // Typical wildcard RRsets are 1-3 records. Overflow abandons the store
         // rather than truncating: this writes `.secure`, and tryWildcardSynth
         // serves it as an AD=1 answer with no TC=1 for the whole TTL, so a
@@ -1491,11 +1451,6 @@ pub const RecursiveResolver = struct {
         var wc_records: [16]dns.ResourceRecord = undefined;
         var wc_count: usize = 0;
         for (answers) |ans_rr| {
-            if (wildcard_owner == null and ans_rr.rtype == qtype and ans_rr.name.labels.len > sig.labels) {
-                const ce = dns.Name{ .labels = ans_rr.name.labels[ans_rr.name.labels.len - sig.labels ..] };
-                wildcard_owner = dns.makeWildcardName(&wc_labels_buf, ce);
-            }
-            const wco = wildcard_owner orelse continue;
             const dominated = ans_rr.rtype == qtype or dns.rrsigCovers(ans_rr) == qtype;
             if (dominated) {
                 // Only a record that genuinely does not fit abandons the
@@ -1509,11 +1464,10 @@ pub const RecursiveResolver = struct {
         }
         if (wc_count == 0) return;
 
-        const signer_zone = sig.signer_name;
         if (self.cache) |c| {
             // storeResponse reads only rcode + record sections, so the
             // synthesizedMessage header vehicle is as good as a bespoke one.
-            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), signer_zone, .secure, ttl_cap);
+            c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), wildcard.signer, .secure, ttl_cap);
         }
     }
 
@@ -1978,9 +1932,15 @@ pub const RecursiveResolver = struct {
     const ds_dedup_timeout_ns: u64 = 3 * std.time.ns_per_s;
 
     /// `.valid` carries the longest the answer may be cached, from the
-    /// signatures that verified. Threaded to the store so the `min_ttl` floor
-    /// cannot lift an entry back past its own proof.
-    const AnswerValidation = union(enum) { valid: u32, bogus, skip };
+    /// signatures that verified — threaded to the store so the `min_ttl` floor
+    /// cannot lift an entry back past its own proof — and, when the queried
+    /// RRset was a wildcard expansion, the `*.ce` it came from.
+    const AnswerValidation = union(enum) {
+        valid: struct { ttl_cap: u32, wildcard: ?Wildcard },
+        bogus,
+        skip,
+    };
+    const Wildcard = struct { ce: dns.Name, signer: dns.Name };
 
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
@@ -2442,6 +2402,7 @@ pub const RecursiveResolver = struct {
         var keys: SignerKeys = .{};
         var groups: usize = 0;
         var ttl_cap: u32 = std.math.maxInt(u32);
+        var wildcard: ?Wildcard = null;
         var synth: ?dns.ResourceRecord = null;
         for (response.answers, 0..) |rr, i| {
             // An RRSIG is the proof, not a thing needing one.
@@ -2466,10 +2427,14 @@ pub const RecursiveResolver = struct {
             const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .bogus;
             const sig = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget()) orelse return .bogus;
             var group_cap = dnssec.rrsigTtlCap(sig, now_u32);
-            const verdict: dnssec.SecurityStatus = if (sig.labels < rr.name.labels.len)
-                try self.proveWildcard(allocator, &keys, response.authorities, rr.name, sig, servers, now_u32, &group_cap)
-            else
-                .secure;
+            var verdict: dnssec.SecurityStatus = .secure;
+            if (sig.labels < rr.name.labels.len) {
+                verdict = try self.proveWildcard(allocator, &keys, response.authorities, rr.name, sig, servers, now_u32, &group_cap);
+                if (rr.rtype == qtype) wildcard = .{
+                    .ce = .{ .labels = rr.name.labels[rr.name.labels.len - sig.labels ..] },
+                    .signer = sig.signer_name,
+                };
+            }
             if (verdict == .bogus) return .bogus;
             status = dnssec.weakest(status, verdict);
             ttl_cap = @min(ttl_cap, group_cap);
@@ -2482,7 +2447,7 @@ pub const RecursiveResolver = struct {
             .secure => {
                 try trimSectionTtls(allocator, &response.answers, ttl_cap);
                 response.header.flags.ad = true;
-                return .{ .valid = ttl_cap };
+                return .{ .valid = .{ .ttl_cap = ttl_cap, .wildcard = wildcard } };
             },
             .bogus => return .bogus,
             .unchecked, .insecure => return .skip,
@@ -3431,7 +3396,7 @@ fn withCnameChain(
     return msg;
 }
 
-/// Cache-served sibling of `aggregateCnameWildcardProofs`: append the
+/// Cache-served sibling of the upstream CNAME-hop proof carry: append the
 /// pre-validated `nsec_proofs` from a CNAME cache entry to the running
 /// chain aggregate. Trust-at-store applies — the cache only retains
 /// `.secure` proofs for `.secure` entries, and `collectNsecProofs`
@@ -5143,8 +5108,6 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
             .ttl = 300,
             .rdata = .{ .a = .{ 192, 0, 2, @intCast(i + 1) } },
         };
-        // labels=2 (`*.example.com`) against a 3-label owner marks the answer
-        // wildcard-expanded, which is what arms this path at all.
         answers[n] = .{
             .name = expanded,
             .rtype = .rrsig,
@@ -5168,7 +5131,7 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
             },
         };
 
-        resolver.storeWildcardRRsets(answers, .a, std.math.maxInt(u32));
+        resolver.storeWildcardRRsets(answers, .a, .{ .ce = signer, .signer = signer }, std.math.maxInt(u32));
 
         var look = std.heap.ArenaAllocator.init(alloc);
         defer look.deinit();
@@ -5209,7 +5172,7 @@ test "storeWildcardRRsets bounds the synthesized entry by the validator's ttl ca
         } } },
     };
 
-    resolver.storeWildcardRRsets(&answers, .a, 7);
+    resolver.storeWildcardRRsets(&answers, .a, .{ .ce = signer, .signer = signer }, 7);
 
     var look = std.heap.ArenaAllocator.init(alloc);
     defer look.deinit();
