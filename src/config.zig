@@ -40,10 +40,6 @@ pub const ServerConfig = struct {
     key_cache_size: usize,
     prefetch: bool,
     prefetch_cousin: bool,
-    /// Hot-set expiry refresh: names re-demanded after death earn a
-    /// refresh lease (see server.zig HotSet). Covers the query-interval >
-    /// TTL demand that `prefetch`'s hit-time window structurally misses.
-    prefetch_hot: bool,
     serve_stale_ttl: u32,
     min_ttl: u32,
     dnssec: bool,
@@ -165,7 +161,6 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .key_cache_size = 4 * 1024 * 1024,
         .prefetch = false,
         .prefetch_cousin = true,
-        .prefetch_hot = false,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
         .dnssec = true,
@@ -240,7 +235,6 @@ const config_schema = [_]SectionSpec{
         .{ .name = "key-cache-size", .kind = .integer },
         .{ .name = "prefetch", .kind = .boolean },
         .{ .name = "prefetch-cousin", .kind = .boolean },
-        .{ .name = "prefetch-hot", .kind = .boolean },
         .{ .name = "serve-stale-ttl", .kind = .integer },
         .{ .name = "min-ttl", .kind = .integer },
     } },
@@ -445,7 +439,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (try nonNegative(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (cache.getBool("prefetch-cousin")) |p| cfg.prefetch_cousin = p;
-        if (cache.getBool("prefetch-hot")) |p| cfg.prefetch_hot = p;
         if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
     }
@@ -747,19 +740,6 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(true, cfg.prefetch);
     try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
-}
-
-test "prefetch-hot defaults off and parses" {
-    var cfg1 = try parseConfig(testing.allocator, "");
-    defer cfg1.deinit();
-    try testing.expectEqual(false, cfg1.prefetch_hot);
-
-    var cfg2 = try parseConfig(testing.allocator,
-        \\[cache]
-        \\prefetch-hot = true
-    );
-    defer cfg2.deinit();
-    try testing.expectEqual(true, cfg2.prefetch_hot);
 }
 
 test "tcp idle/queries/upstream knobs parse and validate" {
