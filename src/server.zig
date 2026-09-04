@@ -257,7 +257,7 @@ pub const Server = struct {
     cache: RRsetCache,
     rtt_cache: RttCache,
     ns_selector: NsSelector,
-    dedup: ?InFlightTable,
+    dedup: InFlightTable,
     encrypted_ns: ?EncryptedNs,
     case_state: ?CaseState,
     nsec_cache: ?NsecCache,
@@ -366,7 +366,7 @@ pub const Server = struct {
             .cache = cache,
             .rtt_cache = rtt_cache,
             .ns_selector = ns_selector,
-            .dedup = if (cfg.workers > 1) InFlightTable.init(allocator, io) else null,
+            .dedup = InFlightTable.init(allocator, io),
             .encrypted_ns = if (cfg.opportunistic) EncryptedNs.init(allocator, io, cfg.upstream_tcp_idle_sec) else null,
             .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
@@ -404,7 +404,7 @@ pub const Server = struct {
             .ns_selector = &self.ns_selector,
             .encrypted_ns = if (self.encrypted_ns) |*oc| oc else null,
             .case_state = if (self.case_state) |*cs| cs else null,
-            .dedup = if (self.dedup) |*d| d else null,
+            .dedup = &self.dedup,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .key_cache = if (self.key_cache) |*kc| kc else null,
             .tcp_pool = null,
@@ -443,7 +443,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         if (self.encrypted_ns) |*oc| oc.deinit();
         if (self.case_state) |*cs| cs.deinit();
-        if (self.dedup) |*d| d.deinit();
+        self.dedup.deinit();
         if (self.nsec_cache) |*nc| nc.deinit();
         if (self.key_cache) |*kc| kc.deinit();
         self.cache.deinit();
@@ -1623,8 +1623,8 @@ const WorkerState = struct {
         }
 
         const cd_flag: u8 = if (cd) dedup_mod.flag_cd else 0;
-        const role = if (self.server.dedup) |*d| d.acquireOrWait(name, qtype, cd_flag) else .uncoordinated;
-        defer if (role == .leader) self.server.dedup.?.releaseLeader(name, qtype, cd_flag);
+        const role = self.server.dedup.acquireOrWait(name, qtype, cd_flag);
+        defer if (role == .leader) self.server.dedup.releaseLeader(name, qtype, cd_flag);
         var result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         // A follower's own resolve is a cache hit by construction (the
         // leader populated it), but the client still waited on the

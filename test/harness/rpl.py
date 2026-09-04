@@ -17,7 +17,7 @@ a "drop the next incoming query" on the responder before the QUERY fires.
 Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
-  - ; hark: workers = <n>                   header directive (optional; >1 enables dedup)
+  - ; hark: workers = <n>                   header directive (optional)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>

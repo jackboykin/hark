@@ -1,13 +1,12 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
-; hark: workers = 2
 
 SCENARIO_BEGIN client DNSKEY query for a signed zone answers with AD, cold
 ;
 ; Validating the answer fetches `example. DNSKEY` internally while the
-; client holds the dedup leader for the same name/type. Needs workers > 1
-; for dedup to exist; the harness client gives up after 5s.
+; client holds the dedup leader for the same name/type; the harness
+; client gives up after 5s.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
