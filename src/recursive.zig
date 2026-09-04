@@ -65,20 +65,10 @@ pub const root_hints_default: [26]na.Address = .{
     na.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
 };
 
-// Per-resolveImpl-call ceiling on calls to queryAuthoritativeServers.
-// Fresh per call (so each sub-resolution starts over), carried across CNAME
-// hops within the frame — it bounds one call's whole chase, NOT the whole
-// tree (that is `max_global_queries`, below).
-// Analogous to BIND's `max-recursion-queries`. Same-zone CNAME continuations,
-// QMIN cache-hit advances, and other zero-I/O loop iterations cost zero
-// against this. Picked to clear an 8-hop CDN chain (`ba.dn.nexoncdn.co.kr`)
-// observed at ~9 queries with comfortable headroom for DNSSEC retries.
-const max_upstream_queries = 32;
 // Tree-wide ceiling on upstream queries for one client-facing resolution,
 // shared by pointer across every sub-resolution (glueless NS-address fetches,
-// DNSKEY/DS chases). Without it, NXNSAttack (CVE-2020-12667) glueless-NS fan-out hands
-// each depth+1 sub-resolution a fresh `max_upstream_queries` budget, amplifying
-// one client query into hundreds of upstream queries. Mirrors Unbound's
+// DNSKEY/DS chases), so NXNSAttack (CVE-2020-12667) glueless-NS fan-out
+// cannot amplify one client query into hundreds. Mirrors Unbound's
 // `max-global-quota` (200) and BIND's `max-query-count` (200); set tighter
 // because hark already caps delegation depth at 3 and NS fan-out at 3/2/1,
 // so a legitimate cold-cache DNSSEC + QMIN resolution stays well under this.
@@ -202,9 +192,9 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
 /// helpers draw from the same counters; the atomics make that race-free.
 ///
 /// `queries` is the structural defense against NXNSAttack (CVE-2020-12667):
-/// the per-call `max_upstream_queries` counter resets on every `resolveImpl`
-/// sub-call, so glueless-NS fan-out would otherwise grant unbounded total
-/// work. Mirrors Unbound's refcounted `target_count[GLOBAL_QUOTA]` and BIND's
+/// a per-call counter would reset on every `resolveImpl` sub-call, so
+/// glueless-NS fan-out would grant unbounded total work. Mirrors Unbound's
+/// refcounted `target_count[GLOBAL_QUOTA]` and BIND's
 /// `max-query-count`. Never reset mid-resolution (BIND's bug #4741 was a
 /// per-name counter that reset on CNAME — useless against a redirect chain).
 const Budget = struct {
@@ -586,9 +576,7 @@ pub const RecursiveResolver = struct {
 
     fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
         var current_name: []const u8 = name;
-        // Counts queryAuthoritativeServers calls only; total_probes
-        // bounds QMIN iterations (including cache-hit advances).
-        var upstream_queries: usize = 0;
+        // total_probes bounds QMIN iterations (including cache-hit advances).
         var total_probes: usize = 0;
         var cname_chain: CnameChain = .{};
         defer cname_chain.deinit(allocator);
@@ -651,9 +639,7 @@ pub const RecursiveResolver = struct {
                     if (self.probeAnsweredFromCache(allocator, &walk, query_name, query_type)) continue;
                 }
 
-                if (upstream_queries >= max_upstream_queries) return error.MaxQueriesExceeded;
                 try self.consumeQuery();
-                upstream_queries += 1;
                 const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone);
                 var response = sqr.message;
                 const responding_server = sqr.responding_server;
