@@ -2053,7 +2053,7 @@ pub const RecursiveResolver = struct {
         // Only .secure DS is a valid trust anchor — any other status means
         // the parent-zone RRSIG never verified, so trusting it would let
         // forged DS + forged DNSKEY self-validate.
-        const kc = self.keyCache() orelse return resp.answers;
+        const kc = self.keyCache() orelse return null;
         const now_u32 = epochNowU32();
         const budget = self.validationBudget();
         const sig: dns.RrsigData = if (kc.lookup(allocator, zone_name, .ds, .in)) |result| switch (result) {
