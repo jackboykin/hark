@@ -836,8 +836,11 @@ pub const RRsetCache = struct {
         return .{ .ttl = capped, .expires_at = now + @as(i64, capped), .stored_at = now };
     }
 
-    /// Cache a positive response, bailiwick-filtered. Answers get `status`;
-    /// authority/additional always `.unchecked`.
+    /// Cache a positive response's answer section, bailiwick-filtered.
+    /// Authority and additional are not stored: NS and glue there are a
+    /// child's claim about its own delegation (CVE-2025-11411), anything
+    /// else is unsolicited (RFC 2181 §5.4.1), and the wildcard NSEC proofs
+    /// a DO=1 client needs ride on the answer entry.
     ///
     /// Locking is per-RRset (per shard), not per-response. A reader may
     /// observe a partial-response cache state mid-store; DNS clients
@@ -855,12 +858,6 @@ pub const RRsetCache = struct {
         }
 
         self.storeRRsets(response.answers, authority_zone, status, .{}, proofs, authenticated_ttl_max);
-        // CVE-2025-11411: child auth listing parent NS in its own authority
-        // would overwrite a valid delegation. Strip NS from authority and
-        // A/AAAA glue from additional. NSEC/NSEC3 + RRSIGs survive — DO=1
-        // clients still get proof material on cache-served wildcards.
-        self.storeRRsets(response.authorities, authority_zone, .unchecked, .{ .types = &.{.ns} }, &.{}, std.math.maxInt(u32));
-        self.storeRRsets(response.additionals, authority_zone, .unchecked, .{ .types = &.{ .a, .aaaa } }, &.{}, std.math.maxInt(u32));
     }
 
     /// Only the NS at the cut and glue for those NS names: anything else in a
@@ -868,8 +865,8 @@ pub const RRsetCache = struct {
     /// Kaminsky's payload. Stored as `.glue`, the rank below everything.
     pub fn storeReferral(self: *RRsetCache, authorities: []const dns.ResourceRecord, additionals: []const dns.ResourceRecord, parent_zone: dns.Name, zone_cut: dns.Name, ns_names: []const dns.Name) void {
         const max = std.math.maxInt(u32);
-        self.storeRRsets(authorities, parent_zone, .glue, .{ .mode = .only, .types = &.{.ns}, .names = &.{zone_cut} }, &.{}, max);
-        self.storeRRsets(additionals, parent_zone, .glue, .{ .mode = .only, .types = &.{ .a, .aaaa }, .names = ns_names }, &.{}, max);
+        self.storeRRsets(authorities, parent_zone, .glue, .{ .types = &.{.ns}, .names = &.{zone_cut} }, &.{}, max);
+        self.storeRRsets(additionals, parent_zone, .glue, .{ .types = &.{ .a, .aaaa }, .names = ns_names }, &.{}, max);
     }
 
     /// Cache a negative response (NXDOMAIN or NODATA) per RFC 2308.
@@ -1060,20 +1057,19 @@ pub const RRsetCache = struct {
         return if (force_unchecked and stored != .glue) .unchecked else stored;
     }
 
+    /// An empty list admits everything.
     const Filter = struct {
-        mode: enum { skip, only } = .skip,
         types: []const dns.RType = &.{},
-        /// Empty admits every owner.
         names: []const dns.Name = &.{},
 
         fn admits(f: Filter, rr: dns.ResourceRecord) bool {
-            const type_listed = for (f.types) |t| {
-                if (rr.rtype == t) break true;
+            const type_ok = f.types.len == 0 or for (f.types) |t| {
+                if (t == rr.rtype) break true;
             } else false;
-            if (type_listed != (f.mode == .only)) return false;
-            if (f.names.len == 0) return true;
-            for (f.names) |n| if (n.eql(rr.name)) return true;
-            return false;
+            const name_ok = f.names.len == 0 or for (f.names) |n| {
+                if (n.eql(rr.name)) break true;
+            } else false;
+            return type_ok and name_ok;
         }
     };
 
