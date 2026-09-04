@@ -2063,51 +2063,41 @@ pub const RecursiveResolver = struct {
         // Only .secure DS is a valid trust anchor — any other status means
         // the parent-zone RRSIG never verified, so trusting it would let
         // forged DS + forged DNSKEY self-validate.
-        const kc = self.keyCache();
-        if (kc) |c| {
-            if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
-                switch (result) {
-                    .hit => |h| {
-                        if (h.security_status != .secure) {
-                            if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
-                                validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, self.validationBudget()) catch return null;
-                            } else return null;
-                        } else {
-                            validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, self.validationBudget()) catch return null;
-                        }
-                    },
-                    // Proven-insecure delegation: no signed DNSKEYs to anchor.
-                    // Returning the unvalidated answers would let the caller
-                    // verify forged RRSIGs against forged DNSKEYs and stamp AD.
-                    .negative => return null,
-                }
-            } else if (zone_name.len > 0) {
-                // DS not in cache. Re-fetch from parent and validate against the
-                // freshly fetched records — RFC 1035 §3.2.1 permits using TTL=0
-                // RRs "for the transaction in progress" even though they will
-                // not be retained in the cache. The negative-DS cache (with
-                // NSEC TTL, not the suppressed DS TTL) still distinguishes
-                // insecure delegations from outright failures.
-                if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
-                    validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, self.validationBudget()) catch return null;
-                } else if (c.lookup(allocator, zone_name, .ds, .in)) |result| {
-                    switch (result) {
-                        // Insecure delegation proven during fetch — see above.
-                        .negative => return null,
-                        .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, self.validationBudget()) catch return null,
-                    }
-                } else return null;
-            } else {
-                // Root zone: validate against the configured trust anchors
-                // (default IANA; test harness overrides via ServerConfig).
-                const now_u32 = epochNowU32();
-                dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, self.validationBudget()) catch return null;
+        const kc = self.keyCache() orelse return resp.answers;
+        const now_u32 = epochNowU32();
+        const budget = self.validationBudget();
+        const sig: dns.RrsigData = if (kc.lookup(allocator, zone_name, .ds, .in)) |result| switch (result) {
+            .hit => |h| blk: {
+                const ds = if (h.security_status == .secure) h.records else self.fetchDsFromParent(allocator, zone_name) orelse return null;
+                break :blk validateDnskeyAgainstDs(resp.answers, ds, zone_parsed, now_u32, budget) catch return null;
+            },
+            // Proven-insecure delegation: no signed DNSKEYs to anchor.
+            // Returning the unvalidated answers would let the caller
+            // verify forged RRSIGs against forged DNSKEYs and stamp AD.
+            .negative => return null,
+        } else if (zone_name.len > 0) blk: {
+            // DS not in cache. Re-fetch from parent and validate against the
+            // freshly fetched records — RFC 1035 §3.2.1 permits using TTL=0
+            // RRs "for the transaction in progress" even though they will
+            // not be retained in the cache. The negative-DS cache (with
+            // NSEC TTL, not the suppressed DS TTL) still distinguishes
+            // insecure delegations from outright failures.
+            if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
+                break :blk validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, now_u32, budget) catch return null;
             }
-        }
+            break :blk switch (kc.lookup(allocator, zone_name, .ds, .in) orelse return null) {
+                // Insecure delegation proven during fetch — see above.
+                .negative => return null,
+                .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, now_u32, budget) catch return null,
+            };
+        } else
+            // Root zone: validate against the configured trust anchors
+            // (default IANA; test harness overrides via ServerConfig).
+            dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, budget) catch return null;
 
         // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation.
         // Store only answers to avoid polluting the key cache with NS/glue.
-        if (kc) |c| c.storeResponse(answersOnly(resp), zone_parsed, .unchecked, std.math.maxInt(u32));
+        kc.storeResponse(answersOnly(resp), zone_parsed, .unchecked, dnssec.rrsigTtlCap(sig, now_u32));
 
         return resp.answers;
     }
@@ -3126,8 +3116,9 @@ fn validateDnskeyAgainstDs(
     dnskey_answers: []const dns.ResourceRecord,
     ds_records_rr: []const dns.ResourceRecord,
     zone_parsed: dns.Name,
+    now_u32: u32,
     budget: *dnssec.ValidationBudget,
-) !void {
+) !dns.RrsigData {
     var ds_records: [16]dns.DsData = undefined;
     var ds_count: usize = 0;
     for (ds_records_rr) |rr| {
@@ -3136,17 +3127,9 @@ fn validateDnskeyAgainstDs(
             ds_count += 1;
         }
     }
-    if (ds_count > 0) {
-        // RFC 4035 §5.2: DNSKEY RRset MUST be self-signed.
-        const now_u32 = epochNowU32();
-        try dnssec.validateDnskeyRrset(
-            dnskey_answers,
-            ds_records[0..ds_count],
-            zone_parsed,
-            now_u32,
-            budget,
-        );
-    }
+    if (ds_count == 0) return error.NoDs;
+    // RFC 4035 §5.2: DNSKEY RRset MUST be self-signed.
+    return dnssec.validateDnskeyRrset(dnskey_answers, ds_records[0..ds_count], zone_parsed, now_u32, budget);
 }
 
 fn cacheSecurityStatus(state: dnssec.SecurityStatus) cache_mod.SecurityStatus {

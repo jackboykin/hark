@@ -120,7 +120,7 @@ pub fn validateDnskeyRrset(
     zone_name: dns.Name,
     now_u32: u32,
     budget: *ValidationBudget,
-) VerifyError!void {
+) VerifyError!dns.RrsigData {
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
     // including them in buildSignedData would corrupt the verification.
@@ -169,7 +169,7 @@ pub fn validateDnskeyRrset(
         if (rrsig.type_covered != .dnskey) continue;
         for (filtered, 0..) |rr, i| {
             if (!anchored[i] or key_tags[i] != rrsig.key_tag) continue;
-            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget)) return;
+            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget)) return rrsig;
         }
     }
     return error.InvalidSignature;
@@ -1922,7 +1922,7 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
     @memcpy(ok[0..64], recs[0..64]);
     ok[64] = sig_rr;
     var budget: ValidationBudget = .{};
-    try validateDnskeyRrset(&ok, &.{ds}, test_owner, 1_700_000_000, &budget);
+    _ = try validateDnskeyRrset(&ok, &.{ds}, test_owner, 1_700_000_000, &budget);
 
     // The 65th key must not ride in on that signature.
     var laundered: [66]dns.ResourceRecord = undefined;
