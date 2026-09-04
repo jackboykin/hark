@@ -1950,21 +1950,14 @@ pub const RecursiveResolver = struct {
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
     }
 
-    /// Outer null = cache miss, inner null = cached negative.
-    fn recheckKeyCache(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, rtype: dns.RType) ??[]const dns.ResourceRecord {
-        const cache = self.keyCache() orelse return null;
-        return switch (cache.lookup(allocator, name, rtype, .in) orelse return null) {
-            .hit => |h| h.records,
-            .negative => @as(?[]const dns.ResourceRecord, null),
-        };
-    }
-
     /// Coalesce concurrent fetches for the same `(name, rtype)` through the
     /// dedup table. Leader runs `ctx.fetch`; followers wait, re-check the
     /// key cache, and if the leader produced nothing one follower retries
     /// as leader at half the timeout (the leader's partial work warmed
-    /// intermediate caches, so a full timeout would over-wait). With no
-    /// dedup table, calls `ctx.fetch` directly.
+    /// intermediate caches, so a full timeout would over-wait). A follower
+    /// still empty-handed after both waits fetches for itself: a wait
+    /// expiring is not evidence the zone has no keys. With no dedup table,
+    /// calls `ctx.fetch` directly.
     ///
     /// Return type tracks `ctx.fetch` so non-erroring callers don't pay
     /// for an `anyerror` wrap and a matching `catch` at the call site.
@@ -1988,12 +1981,15 @@ pub const RecursiveResolver = struct {
                     defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
                     return ctx.fetch();
                 },
-                .uncoordinated => return ctx.fetch(),
-                .follower => if (self.recheckKeyCache(allocator, name, rtype)) |r| return r,
+                .uncoordinated => break,
+                .follower => if (self.keyCache()) |c| if (c.lookup(allocator, name, rtype, .in)) |r| return switch (r) {
+                    .hit => |h| h.records,
+                    .negative => null,
+                },
             }
             budget /= 2;
         }
-        return null;
+        return ctx.fetch();
     }
 
     /// Fetch DNSKEY records for a zone, checking cache first.
