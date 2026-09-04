@@ -1251,7 +1251,7 @@ pub const RecursiveResolver = struct {
                     if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
-                        self.storeNsec(response.authorities, parent_zone, neg_ttl_cap);
+                        self.storeNsec(response.authorities, neg_ttl_cap);
                         try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
                     }
                 },
@@ -1331,7 +1331,7 @@ pub const RecursiveResolver = struct {
                     }
                     if (status == .secure) {
                         response.header.flags.ad = true;
-                        self.storeNsec(response.authorities, parent_zone, neg_ttl_cap);
+                        self.storeNsec(response.authorities, neg_ttl_cap);
                         try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
                     }
                 },
@@ -1419,10 +1419,12 @@ pub const RecursiveResolver = struct {
         }
     }
 
-    fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, zone: dns.Name, ttl_cap: u32) void {
-        if (self.nsec_cache) |nc| {
-            nc.storeFromAuthority(authorities, zone, ttl_cap);
-        }
+    /// Only reached on a `.secure` negative, so the signer verified and is
+    /// the zone the proofs belong to (RFC 8198 §5.1) — not the cut, which
+    /// may sit above a child the walk never tracked.
+    fn storeNsec(self: *RecursiveResolver, authorities: []const dns.ResourceRecord, ttl_cap: u32) void {
+        const nc = self.nsec_cache orelse return;
+        nc.storeFromAuthority(authorities, dnssec.authoritySigner(authorities) orelse return, ttl_cap);
     }
 
     fn recordNsOutcome(self: *RecursiveResolver, zone: dns.Name, server: ?na.Address, outcome: NsOutcome, elapsed_us: i64) void {
