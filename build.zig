@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     // main.zig has no test blocks and imports only the hark module, so a
     // second exe-rooted test binary would recompile the same graph mod_tests
     // already covers for zero added coverage. Test the module only.
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    const mod_tests = b.addTest(.{ .root_module = mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
