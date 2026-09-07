@@ -1367,22 +1367,29 @@ fn validateNsec3NegativeProof(
             }
         }
     }
-    // A signed record saying `*.CE` owns qtype (or exists under NXDOMAIN) is
-    // a lie no other record can outvote.
-    if (wc_contradicted) return .bogus;
-
     // RFC 5155 §8.6, NODATA for DS: an unsigned delegation under Opt-Out
-    // matches no NSEC3, so CE match plus an Opt-Out span over the next closer
-    // is the whole proof. Demanding a wildcard step SERVFAILed every DS query
-    // into an Opt-Out TLD. `.insecure`: the span may hold unsigned
-    // delegations, so §9.2 forbids AD (Unbound `nsec3_prove_nods`).
+    // matches no NSEC3, so CE match plus the Opt-Out span over the next
+    // closer is the whole proof, wildcard unread — a DS answer is about a
+    // name that exists (Unbound `nsec3_prove_nods`). §9.2: the span may hold
+    // unsigned delegations, so no AD.
     if (qtype == .ds and !is_nxdomain and nc_covered and nc_optout) return .insecure;
+
+    // A signed record saying `*.CE` owns qtype (or exists under NXDOMAIN) is
+    // a lie no other record can outvote: under Opt-Out it would launder a
+    // NODATA over a signed wildcard expansion.
+    if (wc_contradicted) return .bogus;
 
     // RFC 5155 §9.2: AD MUST NOT be set when the next-closer coverer has
     // Opt-Out — that span may hold insecure delegations, so the denial is not
     // fully proven. Not DS-scoped, so every qtype (Unbound `val_nsec3.c:1231`,
     // `:1386`), and the wildcard coverer for the same reason.
     if (nc_covered and wc_proven) return if (nc_optout or wc_optout) .insecure else .secure;
+
+    // Errata 3441 on §8.5: no wildcard proof, but the name sits in an
+    // Opt-Out span — an unsigned delegation or an ENT the signer left out
+    // (§7.1) — so NODATA for any qtype is insecure (Unbound
+    // `nsec3_do_prove_nodata` case 5, Knot `kr_nsec3_no_data`).
+    if (!is_nxdomain and nc_covered and nc_optout) return .insecure;
     return .unchecked;
 }
 
@@ -3277,16 +3284,15 @@ test "NSEC3 DS NODATA needs the Opt-Out flag (RFC 5155 §8.6)" {
     );
 }
 
-test "NSEC3 Opt-Out authenticates nothing but DS (RFC 5155 §8.6)" {
-    // DS-only: for any other qtype the wildcard step must still be required, or
-    // Opt-Out's "may exist as an insecure delegation" launders into a NODATA
-    // proof for arbitrary types.
+test "NSEC3 Opt-Out NODATA is insecure for any qtype, never NXDOMAIN (RFC 5155 errata 3441)" {
+    // A name in an Opt-Out span is an unsigned delegation or an omitted ENT,
+    // insecure either way. NXDOMAIN still owes the wildcard denial (§8.4).
     const qname = dns.Name{ .labels = &.{ "amazon", "com" } };
     var p: OptOutDsProof = .{};
     try p.init(qname, true);
     var b: ValidationBudget = .{};
     try testing.expectEqual(
-        SecurityStatus.unchecked,
+        SecurityStatus.insecure,
         validateNegativeProof(&p.rrs, qname, .a, false, test_root, &b),
     );
     try testing.expectEqual(
@@ -3394,6 +3400,25 @@ test "NSEC3 Opt-Out NXDOMAIN must not set AD (RFC 5155 §9.2)" {
             validateNegativeProof(&p.rrs, qname, .a, true, test_root, &b),
         );
     }
+}
+
+test "NSEC3 NODATA under Opt-Out outranks a wildcard CNAME at the encloser (RFC 5155 §8.6, errata 3441)" {
+    // `*.com CNAME` in an Opt-Out zone: DS for an omitted delegation is
+    // NODATA even with the wildcard's NSEC3 in the section. Any other qtype
+    // the wildcard would have answered, so NODATA is a lie; without the
+    // wildcard record the name may be an omitted ENT (errata 3441).
+    const qname = dns.Name{ .labels = &.{ "unsigned", "com" } };
+    var p: OptOutDsProof = .{};
+    try p.init(qname, true);
+    var bufs: Nsec3OwnerBufs = .{};
+    var wl: [dns.max_label_count + 1][]const u8 = undefined;
+    const wc = dns.makeWildcardName(&wl, test_com).?;
+    const cname_only = [_]u8{ 0x00, 0x01, 0x04 };
+    const wc_rr = makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(wc, &.{}, 0), test_com.labels, &bufs.enc, &bufs.labels), &.{}, &p.nc_high, &cname_only);
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&.{ p.rrs[0], p.rrs[1], wc_rr }, qname, .ds, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&.{ p.rrs[0], p.rrs[1], wc_rr }, qname, .a, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&.{ p.rrs[0], p.rrs[1] }, qname, .a, false, test_root, &b));
 }
 
 test "NSEC3 wildcard coverer with Opt-Out counts wherever it sits in the section" {
