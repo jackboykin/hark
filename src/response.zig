@@ -312,7 +312,7 @@ pub fn buildResponseWire(
     const authorities = shaped.authorities;
     const additionals = shaped.additionals;
 
-    var msg = dns.Message{
+    const msg = dns.Message{
         .header = .{
             .id = ctx.query_id,
             .flags = .{
@@ -327,10 +327,6 @@ pub fn buildResponseWire(
                 .cd = ctx.cd,
                 .rcode = response.header.flags.rcode,
             },
-            .qd_count = @intCast(ctx.questions.len),
-            .an_count = @intCast(answers.len),
-            .ns_count = @intCast(authorities.len),
-            .ar_count = @intCast(additionals.len),
         },
         .questions = ctx.questions,
         .answers = answers,
@@ -355,11 +351,12 @@ pub fn buildResponseWire(
         if (end == 0) continue;
         var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
         if (msg.opt) |o| ser.writeOpt(o) catch continue;
-        msg.header.flags.tc = dropped >= 2;
-        msg.header.ar_count = @intFromBool(msg.opt != null);
-        if (dropped >= 2) msg.header.ns_count = 0;
-        if (dropped >= 3) msg.header.an_count = 0;
-        msg.header.serialize(wire_buf[0..12]);
+        var hdr = msg.wireHeader();
+        hdr.flags.tc = dropped >= 2;
+        hdr.ar_count = @intFromBool(msg.opt != null);
+        if (dropped >= 2) hdr.ns_count = 0;
+        if (dropped >= 3) hdr.an_count = 0;
+        hdr.serialize(wire_buf[0..12]);
         if (ser.pos <= ctx.max_udp_payload or dropped == 3) return wire_buf[0..@min(ser.pos, ctx.max_udp_payload)];
     }
     return null;
@@ -399,10 +396,6 @@ pub fn serializeErrorResponse(
                 .cd = false,
                 .rcode = rcode,
             },
-            .qd_count = @intCast(questions.len),
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = questions,
         .opt = opt,
@@ -438,10 +431,6 @@ pub fn synthesizedMessage(
                 .cd = false,
                 .rcode = rcode,
             },
-            .qd_count = 0,
-            .an_count = @intCast(answers.len),
-            .ns_count = @intCast(authorities.len),
-            .ar_count = 0,
         },
         .questions = &.{},
         .answers = answers,
@@ -488,10 +477,6 @@ test "buildResponseWire sets correct header fields" {
                 .cd = false,
                 .rcode = .server_failure,
             },
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = &.{},
     };
@@ -543,10 +528,6 @@ test "buildResponseWire with EDNS0" {
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = &.{},
     };
@@ -611,10 +592,6 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 0,
-            .an_count = @intCast(answers.len),
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = &.{},
         .answers = answers,
@@ -756,10 +733,6 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = ns_authorities.len,
-            .ar_count = 3,
         },
         .questions = &.{},
         .answers = &.{a_record},
@@ -908,10 +881,6 @@ fn shapePositiveMessage(
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 0,
-            .an_count = @intCast(answers.len),
-            .ns_count = @intCast(authorities.len),
-            .ar_count = @intCast(additionals.len),
         },
         .questions = &.{},
         .answers = answers,
@@ -936,10 +905,6 @@ fn shapeNxdomainMessage(authorities: []const dns.ResourceRecord) dns.Message {
                 .cd = false,
                 .rcode = .name_error,
             },
-            .qd_count = 0,
-            .an_count = 0,
-            .ns_count = @intCast(authorities.len),
-            .ar_count = 0,
         },
         .questions = &.{},
         .authorities = authorities,

@@ -127,10 +127,10 @@ pub const Error = error{
 pub const Header = struct {
     id: u16,
     flags: Flags,
-    qd_count: u16,
-    an_count: u16,
-    ns_count: u16,
-    ar_count: u16,
+    qd_count: u16 = 0,
+    an_count: u16 = 0,
+    ns_count: u16 = 0,
+    ar_count: u16 = 0,
 
     /// Wire-format flag bits (RFC 1035 §4.1.1 + RFC 2535 §6.1 for AD/CD).
     /// Packed LSB→MSB so a host-order u16 (post `mem.readInt(.big)`) bitcasts
@@ -557,6 +557,18 @@ pub const Message = struct {
     authorities: []const ResourceRecord = &.{},
     additionals: []const ResourceRecord = &.{},
     opt: ?OptRecord = null,
+
+    /// The header as it goes on the wire: counts come from the sections, not
+    /// `header`, since a parsed message holds the OPT in `opt` yet counts it
+    /// in `ar_count`.
+    pub fn wireHeader(msg: Message) Header {
+        var hdr = msg.header;
+        hdr.qd_count = @intCast(msg.questions.len);
+        hdr.an_count = @intCast(msg.answers.len);
+        hdr.ns_count = @intCast(msg.authorities.len);
+        hdr.ar_count = @intCast(msg.additionals.len + @intFromBool(msg.opt != null));
+        return hdr;
+    }
 };
 
 /// Index of the first label-separating `.` at or after `start`, skipping
@@ -716,10 +728,6 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 1,
-            .an_count = 0,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = questions,
         .opt = if (options.edns) |edns| .{
@@ -1521,9 +1529,7 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
     var ser = Serializer.init(buf);
 
-    var hdr = msg.header;
-    if (msg.opt != null) hdr.ar_count += 1;
-    try ser.writeHeader(hdr);
+    try ser.writeHeader(msg.wireHeader());
 
     for (msg.questions) |q| try ser.writeQuestion(q);
     ends.questions = ser.pos;
@@ -1554,7 +1560,6 @@ test "header roundtrip" {
         },
         .qd_count = 1,
         .an_count = 2,
-        .ns_count = 0,
         .ar_count = 1,
     };
 
@@ -2083,6 +2088,16 @@ test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
     try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
 }
 
+test "EDNS0: reserializing a parsed OPT response counts it once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const wire = [_]u8{ 0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0 };
+    var buf: [64]u8 = undefined;
+    const out = try serializeMessage(&buf, try parseMessage(arena.allocator(), &wire));
+    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, out[10..12], .big));
+    _ = try parseMessage(arena.allocator(), out);
+}
+
 test "EDNS0: parse non-EDNS response has null opt" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2340,7 +2355,7 @@ test "validateResponse accepts a question-less error reply but rejects question-
     const base_flags = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .refused };
 
     const refused_no_question = Message{
-        .header = .{ .id = 0, .flags = base_flags, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = base_flags },
         .questions = &.{},
     };
     try validateResponse(refused_no_question, qname, .a);
@@ -2676,7 +2691,6 @@ test "buildQuery roundtrip" {
     try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
     try testing.expect(!msg.header.flags.qr);
     try testing.expect(msg.header.flags.rd);
-    try testing.expectEqual(@as(u16, 1), msg.header.qd_count);
     try testing.expectEqual(@as(usize, 1), msg.questions.len);
     try testing.expectEqual(RType.a, msg.questions[0].qtype);
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
@@ -3239,10 +3253,6 @@ pub fn serializeOptOptionResponse(
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 1,
-            .an_count = if (include_answer) 1 else 0,
-            .ns_count = 0,
-            .ar_count = 1,
         },
         .questions = questions,
         .answers = answers,
@@ -3421,10 +3431,6 @@ test "parseMessage handles OOM at every allocation without leaking" {
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 1,
-            .an_count = 2,
-            .ns_count = 1,
-            .ar_count = 0, // serializeMessage adds 1 for the OPT below
         },
         .questions = &.{
             .{ .name = example_com, .qtype = .a, .qclass = .in },

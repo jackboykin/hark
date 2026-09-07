@@ -1612,7 +1612,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // set ad=true (because security_status was .unchecked at lookup time —
     // recursive.zig sets `ad = security_status == .secure`).
     const response_unchecked = dns.Message{
-        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error } },
         .questions = &.{},
     };
 
@@ -1636,7 +1636,7 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // response.header.flags.ad == true upstream of buildResponseWire; confirm the
     // path then emits AD=1.
     const response_secure = dns.Message{
-        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = true, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 0, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = true, .cd = false, .rcode = .no_error } },
         .questions = &.{},
     };
     var buf2: [dns.edns_udp_payload]u8 = undefined;
@@ -1683,7 +1683,7 @@ test "hasValidatedPositive returns true only for non-.unchecked entries" {
     const answers = try a.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
     const resp = dns.Message{
-        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error } },
         .questions = &.{},
         .answers = answers,
     };
@@ -1753,7 +1753,7 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
         const rrs = try sa.alloc(dns.ResourceRecord, 1);
         rrs[0] = .{ .name = owner, .rtype = .aaaa, .rclass = .in, .ttl = 300, .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } };
         const msg = dns.Message{
-            .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error }, .qd_count = 0, .an_count = 1, .ns_count = 0, .ar_count = 0 },
+            .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error } },
             .questions = &.{},
             .answers = rrs,
         };

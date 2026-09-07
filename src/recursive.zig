@@ -3177,8 +3177,6 @@ fn answersOnly(msg: dns.Message) dns.Message {
     var m = msg;
     m.authorities = &.{};
     m.additionals = &.{};
-    m.header.ns_count = 0;
-    m.header.ar_count = 0;
     return m;
 }
 
@@ -3363,14 +3361,12 @@ fn withCnameChain(
         @memcpy(new_answers[0..chain.len], chain);
         @memcpy(new_answers[chain.len..], response.answers);
         msg.answers = new_answers;
-        msg.header.an_count = @intCast(new_answers.len);
     }
     if (auth_aggregate.len > 0) {
         const new_auths = try allocator.alloc(dns.ResourceRecord, auth_aggregate.len + response.authorities.len);
         @memcpy(new_auths[0..auth_aggregate.len], auth_aggregate);
         @memcpy(new_auths[auth_aggregate.len..], response.authorities);
         msg.authorities = new_auths;
-        msg.header.ns_count = @intCast(new_auths.len);
     }
     return msg;
 }
@@ -3562,27 +3558,10 @@ fn validateNegativeResponse(
     };
 }
 
-fn makeHeader(ns_count: u16, ar_count: u16, an_count: u16) dns.Header {
-    return .{
-        .id = 0x1234,
-        .flags = .{
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = false,
-            .ra = false,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-        },
-        .qd_count = 0,
-        .an_count = an_count,
-        .ns_count = ns_count,
-        .ar_count = ar_count,
-    };
-}
+const test_header: dns.Header = .{
+    .id = 0x1234,
+    .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error },
+};
 
 fn makeName(alloc: mem.Allocator, comptime labels: []const []const u8) !dns.Name {
     const l = try alloc.alloc([]const u8, labels.len);
@@ -3608,7 +3587,7 @@ fn makeResponse(alloc: mem.Allocator, authorities: []const dns.ResourceRecord, a
     const adds = try alloc.alloc(dns.ResourceRecord, additionals.len);
     @memcpy(adds, additionals);
     return .{
-        .header = makeHeader(@intCast(authorities.len), @intCast(additionals.len), 0),
+        .header = test_header,
         .questions = &.{},
         .authorities = auths,
         .additionals = adds,
@@ -3622,7 +3601,7 @@ test "caseMangledEcho: only a same-name case mismatch marks mangling" {
         // a runtime param would leave it dangling on this frame's stack.
         fn make(comptime name: dns.Name) dns.Message {
             return .{
-                .header = makeHeader(0, 0, 0),
+                .header = test_header,
                 .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
             };
         }
@@ -3641,7 +3620,7 @@ test "caseMangledEcho: only a same-name case mismatch marks mangling" {
     ));
     // Question-less error reply: must not index questions[0].
     try std.testing.expect(!RecursiveResolver.caseMangledEcho(query_name, .{
-        .header = makeHeader(0, 0, 0),
+        .header = test_header,
         .questions = &.{},
     }));
 }
@@ -3665,7 +3644,7 @@ test "extractReferral with NS and glue A records" {
 
 test "extractReferral with no NS records returns null" {
     const response = dns.Message{
-        .header = makeHeader(0, 0, 0),
+        .header = test_header,
         .questions = &.{},
     };
     try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) == null);
@@ -3818,7 +3797,7 @@ test "findCnameRecord finds CNAME matching target" {
 
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = cname_target } };
-    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers };
+    const response = dns.Message{ .header = test_header, .questions = &.{}, .answers = answers };
     defer dns.freeMessage(alloc, response);
 
     const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
@@ -3857,7 +3836,7 @@ test "findCnameRecord returns null when no CNAME present" {
 
     const answers = try alloc.alloc(dns.ResourceRecord, 1);
     answers[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 93, 184, 216, 34 } } };
-    const response = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = answers };
+    const response = dns.Message{ .header = test_header, .questions = &.{}, .answers = answers };
     defer dns.freeMessage(alloc, response);
 
     try testing.expect(findCnameRecord(response.answers, dns.Name{ .labels = &.{ "example", "com" } }) == null);
@@ -3947,7 +3926,7 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
         const cname_rrs = try alloc.alloc(dns.ResourceRecord, 1);
         cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = cname_target } };
         const cname_msg = dns.Message{
-            .header = makeHeader(0, 0, 1),
+            .header = test_header,
             .questions = &.{},
             .answers = cname_rrs,
         };
@@ -3965,7 +3944,7 @@ test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAA
             .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
         };
         const aaaa_msg = dns.Message{
-            .header = makeHeader(0, 0, 1),
+            .header = test_header,
             .questions = &.{},
             .answers = aaaa_rrs,
         };
@@ -3998,7 +3977,7 @@ test "cousin prefetch: set on NOERROR A/AAAA, suppressed on NXDOMAIN" {
         const owner = try makeName(alloc, &.{ "host", "example", "com" });
         const rrs = try alloc.alloc(dns.ResourceRecord, 1);
         rrs[0] = .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-        const msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = rrs };
+        const msg = dns.Message{ .header = test_header, .questions = &.{}, .answers = rrs };
         defer dns.freeMessage(alloc, msg);
         cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
@@ -4064,7 +4043,7 @@ test "cousin prefetch: https answer carries target name through resolve" {
         const owner = try makeName(alloc, &.{ "www", "example", "com" });
         const rrs = try alloc.alloc(dns.ResourceRecord, 1);
         rrs[0] = .{ .name = owner, .rtype = .https, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = try alloc.dupe(u8, "\x00\x01\x03svc\x03cdn\x07example\x00") } };
-        const msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = rrs };
+        const msg = dns.Message{ .header = test_header, .questions = &.{}, .answers = rrs };
         defer dns.freeMessage(alloc, msg);
         cache.storeResponse(msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
@@ -4097,7 +4076,7 @@ fn seedCnameChain(alloc: mem.Allocator, cache: *RRsetCache, cname_ttl: u32, tail
         const cname_target = try makeName(alloc, &.{ "target", "example", "com" });
         const cname_rrs = try alloc.alloc(dns.ResourceRecord, 1);
         cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = cname_ttl, .rdata = .{ .cname = cname_target } };
-        const cname_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = cname_rrs };
+        const cname_msg = dns.Message{ .header = test_header, .questions = &.{}, .answers = cname_rrs };
         defer dns.freeMessage(alloc, cname_msg);
         cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
@@ -4111,7 +4090,7 @@ fn seedCnameChain(alloc: mem.Allocator, cache: *RRsetCache, cname_ttl: u32, tail
             .ttl = tail_ttl,
             .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
         };
-        const aaaa_msg = dns.Message{ .header = makeHeader(0, 0, 1), .questions = &.{}, .answers = aaaa_rrs };
+        const aaaa_msg = dns.Message{ .header = test_header, .questions = &.{}, .answers = aaaa_rrs };
         defer dns.freeMessage(alloc, aaaa_msg);
         cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
     }
@@ -4225,7 +4204,7 @@ test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache
         const rrs = try alloc.alloc(dns.ResourceRecord, 1);
         rrs[0] = .{ .name = owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = target } };
         const msg = dns.Message{
-            .header = makeHeader(0, 0, 1),
+            .header = test_header,
             .questions = &.{},
             .answers = rrs,
         };
@@ -4583,10 +4562,6 @@ test "withCnameChain prepends auth_aggregate to authorities (chain wildcard-proo
                 .cd = false,
                 .rcode = .no_error,
             },
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = &.{},
         .answers = &.{a_rr},
@@ -4852,10 +4827,6 @@ test "tryWildcardSynth lowercases owner and clears wire blob on rewrite" {
         .header = .{
             .id = 0,
             .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .no_error },
-            .qd_count = 0,
-            .an_count = 1,
-            .ns_count = 0,
-            .ar_count = 0,
         },
         .questions = &.{},
         .answers = rrs,

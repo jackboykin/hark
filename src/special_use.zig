@@ -190,7 +190,7 @@ test "synthesize localhost A produces 127.0.0.1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const msg = try synthesize(arena.allocator(), "localhost.", .localhost_a);
-    try testing.expectEqual(@as(u16, 1), msg.header.an_count);
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
     try testing.expectEqual(dns.RCode.no_error, msg.header.flags.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
 }
@@ -200,5 +200,5 @@ test "synthesize nxdomain has no answers" {
     defer arena.deinit();
     const msg = try synthesize(arena.allocator(), "invalid.", .nxdomain);
     try testing.expectEqual(dns.RCode.name_error, msg.header.flags.rcode);
-    try testing.expectEqual(@as(u16, 0), msg.header.an_count);
+    try testing.expectEqual(@as(usize, 0), msg.answers.len);
 }
