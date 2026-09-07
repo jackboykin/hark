@@ -131,28 +131,22 @@ const ZoneNsecList = struct {
         return lo;
     }
 
-    /// Find NSEC that covers qname: owner < qname < next_domain (with wrap).
-    /// Binary search for insertion point, then check the entry just before it
-    /// (which has the largest owner < qname). Falls back to last entry for wrap.
     fn findCovering(self: *const ZoneNsecList, qname: dns.Name, now: i64) ?*const NsecEntry {
+        return self.findSpan(qname, now, dnssec.nsecProvesNameNonexistence);
+    }
+
+    /// The NSEC whose range holds qname, if `proves` accepts it: the strict
+    /// form refuses a next name below qname (an ENT), the geometric form
+    /// takes it. The last entry wraps to cover names before every owner.
+    fn findSpan(self: *const ZoneNsecList, qname: dns.Name, now: i64, comptime proves: fn (dns.Name, dns.NsecData, dns.Name) bool) ?*const NsecEntry {
         if (self.len == 0) return null;
         const pos = self.findInsertPos(qname);
         const primary = if (pos > 0) pos - 1 else self.len - 1;
-        if (self.checkCovering(primary, qname, now)) |e| return e;
-        // Wrap-around: last entry may cover names that sort before all owners
-        if (primary != self.len - 1) {
-            if (self.checkCovering(self.len - 1, qname, now)) |e| return e;
+        for ([_]usize{ primary, self.len - 1 }) |idx| {
+            const e = &self.entries[idx];
+            if (e.expires_at <= now) continue;
+            if (proves(e.owner, .{ .next_domain_name = e.next_domain, .type_bit_maps = e.type_bit_maps }, qname)) return e;
         }
-        return null;
-    }
-
-    fn checkCovering(self: *const ZoneNsecList, idx: usize, qname: dns.Name, now: i64) ?*const NsecEntry {
-        const e = &self.entries[idx];
-        if (e.expires_at <= now) return null;
-        if (dnssec.nsecProvesNameNonexistence(e.owner, .{
-            .next_domain_name = e.next_domain,
-            .type_bit_maps = e.type_bit_maps,
-        }, qname)) return e;
         return null;
     }
 
@@ -466,13 +460,14 @@ pub const NsecCache = struct {
         // Parent-zone depth guard: if qname is >1 label deeper than the zone,
         // a non-delegation NSEC range from this zone could falsely cover names
         // in a child zone (e.g., a .com NSEC covering nnn.example.com).
-        // Verify the direct-child ancestor is covered (proving it doesn't exist,
-        // so no delegation is possible). No DS exemption: the DS rule lives in
-        // isParentSideNsec, not here.
+        // An NSEC must speak for the direct-child ancestor: absent or an
+        // empty non-terminal, neither is a delegation (ip6.arpa's nibble tree
+        // is ENTs all the way down). No DS exemption: that lives in
+        // isParentSideNsec.
         const zone_label_count = zoneLabelsLen(zone_lower);
         if (qname.labels.len > zone_label_count + 1) {
             const direct_child = dns.Name{ .labels = qname.labels[qname.labels.len - zone_label_count - 1 ..] };
-            if (list.findCovering(direct_child, now) == null and list.findExact(direct_child, now) == null) {
+            if (list.findSpan(direct_child, now, dnssec.nsecCovers) == null and list.findExact(direct_child, now) == null) {
                 return null; // can't prove no delegation exists
             }
         }
@@ -621,16 +616,6 @@ const NameNonExistence = union(enum) {
 fn tryNameNonExistence(list: *const ZoneNsecList, qname: dns.Name, qtype: dns.RType, now: i64) NameNonExistence {
     const qname_cover = list.findCovering(qname, now) orelse return .unknown;
     if (isParentSideNsec(qname_cover, qname, qtype)) return .unknown;
-
-    // A cover whose next_domain descends below qname proves qname is an empty
-    // non-terminal (RFC 4592 §2.2.2): it exists, so NXDOMAIN is a lie and RFC
-    // 8020 consumers would deny the whole subtree for the negative TTL. The
-    // open range excludes next == qname, so isSubdomainOf is strict — same
-    // reasoning as the validator's arm (dnssec.zig, commit 39c5540). ip6.arpa's
-    // nibble tree and _tcp/_domainkey under SRV/DANE are all this shape.
-    // TODO: an ent_nodata variant would keep the aggressive-cache benefit on
-    // exactly the traffic that motivated 39c5540, instead of forfeiting it.
-    if (qname_cover.next_domain.isSubdomainOf(qname)) return .unknown;
 
     const ce = dnssec.closestEncloser(qname, qname_cover.owner, qname_cover.next_domain) orelse
         return .unknown;
@@ -1491,4 +1476,32 @@ test "NSEC cache: no NXDOMAIN synthesis at an empty non-terminal" {
     const ent = try dns.parseDottedName(alloc, "ent.example.com");
     defer dns.freeName(alloc, ent);
     try testing.expect(nc.lookupSuffixes(alloc, ent, .a, "ent.example.com") == null);
+}
+
+test "NSEC cache: NXDOMAIN synthesis below an empty non-terminal" {
+    // One label deeper: the ENT can't be a delegation, so the depth guard
+    // must let the chain deny x.ent.example.com.
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    const bitmap_apex = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
+    const bitmap_host = &[_]u8{ 0, 2, 0x40, 0x01 };
+    const soa_rr = try testSoa(alloc);
+    defer freeSoa(alloc, soa_rr);
+    const apex = try dns.parseDottedName(alloc, "example.com");
+    const deep = try dns.parseDottedName(alloc, "sub.ent.example.com");
+    defer dns.freeName(alloc, apex);
+    defer dns.freeName(alloc, deep);
+
+    nc.storeFromAuthority(&.{
+        soa_rr,
+        .{ .name = apex, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = deep, .type_bit_maps = bitmap_apex } } },
+        .{ .name = deep, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = apex, .type_bit_maps = bitmap_host } } },
+    }, example_zone, std.math.maxInt(u32));
+
+    const below = try dns.parseDottedName(alloc, "x.ent.example.com");
+    defer dns.freeName(alloc, below);
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, below, .a, "x.ent.example.com"), .nxdomain);
 }

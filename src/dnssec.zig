@@ -782,16 +782,11 @@ pub fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
 
 /// Closest encloser of qname derived from a covering NSEC's endpoints
 /// (RFC 4035 §5.4 / RFC 8198 §5.3): the longest label-suffix of qname also
-/// shared with either bound, clamped to a PROPER ancestor — an apex-wrap
-/// NSEC bound (e.g. ip6.arpa. → 3.0.0.1.0.0.2.ip6.arpa.) contains qname as
-/// a strict suffix and would otherwise saturate the CE to qname itself.
-/// Null for the root qname. The result aliases qname's labels.
+/// shared with either bound. Null when a bound sits at or below qname: then
+/// qname exists and is its own encloser. The result aliases qname's labels.
 pub fn closestEncloser(qname: dns.Name, bound_a: dns.Name, bound_b: dns.Name) ?dns.Name {
-    if (qname.labels.len == 0) return null;
-    const depth = @min(@max(
-        commonSuffixLabels(qname, bound_a),
-        commonSuffixLabels(qname, bound_b),
-    ), qname.labels.len - 1);
+    const depth = @max(commonSuffixLabels(qname, bound_a), commonSuffixLabels(qname, bound_b));
+    if (depth >= qname.labels.len) return null;
     return .{ .labels = qname.labels[qname.labels.len - depth ..] };
 }
 
@@ -802,11 +797,9 @@ test closestEncloser {
     const owner = dns.Name{ .labels = &.{ "z", "b", "example", "com" } };
     const next = dns.Name{ .labels = &.{ "example", "com" } };
     try t.expectEqual(@as(usize, 3), closestEncloser(qname, owner, next).?.labels.len);
-    // Apex-wrap bound containing qname as a strict suffix must clamp to a
-    // proper ancestor, never qname itself.
-    const wrap = dns.Name{ .labels = &.{ "x", "a", "b", "example", "com" } };
-    try t.expectEqual(@as(usize, 3), closestEncloser(qname, wrap, wrap).?.labels.len);
-    // Root qname has no proper ancestor.
+    // A bound below qname says qname exists.
+    const below = dns.Name{ .labels = &.{ "x", "a", "b", "example", "com" } };
+    try t.expectEqual(null, closestEncloser(qname, below, next));
     try t.expectEqual(null, closestEncloser(.{ .labels = &.{} }, owner, next));
 }
 
@@ -872,16 +865,10 @@ fn wrongSideOfCut(type_bit_maps: []const u8, qname: dns.Name, qtype: dns.RType) 
     return isAncestorDelegation(type_bit_maps);
 }
 
-/// Check if an NSEC record proves that `qname` does not exist.
-/// Returns true if qname falls in the range (nsec_owner, nsec_next) AND the
-/// record is allowed to speak for qname at all (RFC 6840 §4.1 — see
-/// `provesNothingBelowOwner`). `nsec_cache.checkCovering` reaches the §4.1
-/// rule through here, which is deliberate: one home for both callers.
-pub fn nsecProvesNameNonexistence(
-    nsec_owner: dns.Name,
-    nsec: dns.NsecData,
-    qname: dns.Name,
-) bool {
+/// Whether `qname` falls in the open range (owner, next) of an NSEC allowed
+/// to speak for it (RFC 6840 §4.1). Geometry only; meaning is decided below,
+/// except where geometry is the whole question (nsec_cache's depth guard).
+pub fn nsecCovers(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) bool {
     // Strictly below only: a range starting at an ancestor still legitimately
     // denies siblings in the same zone.
     if (qname.labels.len > nsec_owner.labels.len and qname.isSubdomainOf(nsec_owner) and
@@ -895,6 +882,25 @@ pub fn nsecProvesNameNonexistence(
         canonicalNameOrder(qname, nsec.next_domain_name),
         canonicalNameOrder(nsec_owner, nsec.next_domain_name),
     );
+}
+
+/// Whether an NSEC proves `qname` does not exist. One home for every consumer
+/// (NXDOMAIN, wildcard denial, no-closer-match, nsec_cache) so the ENT rule
+/// can't be missing at one of them: an ENT denied under NXDOMAIN has its
+/// whole subtree dropped by RFC 8020 caches.
+pub fn nsecProvesNameNonexistence(
+    nsec_owner: dns.Name,
+    nsec: dns.NsecData,
+    qname: dns.Name,
+) bool {
+    return nsecCovers(nsec_owner, nsec, qname) and !nsec.next_domain_name.isSubdomainOf(qname);
+}
+
+/// Whether an NSEC proves `qname` is an empty non-terminal: a next name below
+/// qname means qname exists (RFC 4592 §2.2.2) and, owning no NSEC, has no
+/// data. Existing names never match wildcards, so this settles NODATA alone.
+fn nsecProvesEnt(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) bool {
+    return nsecCovers(nsec_owner, nsec, qname) and nsec.next_domain_name.isSubdomainOf(qname);
 }
 
 /// RFC 4035 §5.4 + RFC 6840 §4.3: a NODATA proof fails if the bitmap
@@ -1064,6 +1070,7 @@ pub fn validateNegativeProof(
     // NXDOMAIN-shape-under-NOERROR (§5.4 — proof shape is signed, not rcode).
     var matching_nsec: ?dns.ResourceRecord = null;
     var covering_nsec: ?dns.ResourceRecord = null;
+    var ent = false;
     var any_nsec = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec) continue;
@@ -1077,6 +1084,7 @@ pub fn validateNegativeProof(
         {
             covering_nsec = rr;
         }
+        if (nsecProvesEnt(rr.name, rr.rdata.nsec, qname)) ent = true;
     }
 
     // NODATA arm. Bitmap contradicting NODATA → .bogus (signed, hence forgery).
@@ -1097,18 +1105,11 @@ pub fn validateNegativeProof(
         // which sorts AFTER CE, so the strict check fails on the wire shape
         // IANA and real signed zones actually emit. Owner-equality with
         // *.CE plus a verified RRSIG is the binding here.
-        if (covering_nsec) |cov| {
-            // ENT: a covering NSEC whose next name descends below qname
-            // proves qname is an empty non-terminal (RFC 4592 §2.2.2) — it
-            // exists, owns no types, and wildcards never apply to existing
-            // names, so this alone completes the proof (Unbound
-            // nsec_proves_nodata, same ENT-before-wildcard order). The open
-            // range excludes next == qname, so isSubdomainOf is strict.
-            // ip6.arpa's NSEC-signed nibble tree is mostly ENTs; every qmin
-            // step landing between delegations takes this path.
-            if (cov.rdata.nsec.next_domain_name.isSubdomainOf(qname))
-                return .secure;
+        // ENT before wildcard (Unbound nsec_proves_nodata): every qmin step
+        // through ip6.arpa's nibble tree lands here.
+        if (ent) return .secure;
 
+        if (covering_nsec) |cov| {
             const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
                 return .unchecked;
 
@@ -1119,12 +1120,18 @@ pub fn validateNegativeProof(
                 if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
                 if (rr.name.eql(wildcard)) {
                     // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
+                    // A wildcard delegation's parent-side record denies
+                    // nothing (RFC 6840 §4.1).
+                    if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
+                        return .unchecked;
                     if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
                         return .bogus;
                     return .secure;
                 }
                 // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
-                if (nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, wildcard))
+                // A wildcard that is itself an ENT matches and owns nothing:
+                // also NODATA.
+                if (nsecCovers(rr.name, rr.rdata.nsec, wildcard))
                     return .secure;
             }
             return .unchecked;
@@ -2799,16 +2806,20 @@ fn nsecRrWithBitmap(owner: dns.Name, next: dns.Name, bitmap: []const u8) dns.Res
     };
 }
 
-test "validateNegativeProof NSEC NXDOMAIN apex-NSEC shape (clamped CE)" {
-    // IANA ip6.arpa shape under NXDOMAIN rcode: next contains qname as a
-    // strict suffix → commonSuffix saturates → clamp must engage.
+test "validateNegativeProof NSEC NXDOMAIN at an empty non-terminal is refused" {
+    // IANA's genuine `ip6.arpa NSEC 3.0.0.1.0.0.2.ip6.arpa` proves 2.ip6.arpa
+    // is an ENT. Replayed under NXDOMAIN it must not verify, or the RFC 8020
+    // cache denies every 2xxx PTR with AD set.
     const apex = dns.Name{ .labels = &.{ "ip6", "arpa" } };
     const next = dns.Name{ .labels = &.{ "3", "0", "0", "1", "0", "0", "2", "ip6", "arpa" } };
     const qname = dns.Name{ .labels = &.{ "2", "ip6", "arpa" } };
     const authorities = [_]dns.ResourceRecord{nsecRr(apex, next)};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, false, test_root, &b));
+    // Nor is the ENT a wildcard expansion's "no closer match".
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&authorities, qname, 2, apex, &b));
 }
 
 test "validateNegativeProof NSEC NODATA wildcard-expanded (RFC 4035 §3.1.3.4)" {
