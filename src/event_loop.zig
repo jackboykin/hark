@@ -422,11 +422,6 @@ pub const EventLoop = struct {
                             .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .err = err,
                         } };
-                        // io_uring clears F_MORE on error CQEs, so this is
-                        // already true on ENOBUFS; force it for the
-                        // in-process parse-failure paths too, else the
-                        // slot stays active with no way to recover it.
-                        free_after = true;
                     }
                 },
                 .accept => |*a| {
@@ -502,6 +497,7 @@ pub const EventLoop = struct {
         const payload_off = name_off + multishot_name_reserve;
         if (out.namelen == 0 or out.namelen > multishot_name_reserve) return error.RecvFailed;
         if (payload_off + out.payloadlen > buf.len) return error.RecvFailed;
+        if (out.flags & linux.MSG.TRUNC != 0) return error.RecvFailed;
 
         // Reinterpret the name bytes as a sockaddr — same storage as
         // `na.PosixAddress`, populated by the kernel.
@@ -766,4 +762,41 @@ test "read payload survives an op arming into the freed slot mid-batch" {
     _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
     try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
+}
+
+test "truncated datagram is rejected without tearing down the multishot" {
+    // The kernel keeps the multishot live after MSG_TRUNC. Freeing the slot
+    // made the server re-arm on top of it: one leaked op per oversized datagram.
+    const loop = try createTestLoop();
+    defer loop.destroy();
+
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(sock);
+    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bind_pa: na.PosixAddress = undefined;
+    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
+    try sys.bind(sock, &bind_pa.any, bind_len);
+    const server_addr = try na.getSockName(sock);
+    var pa: na.PosixAddress = undefined;
+    const sa_len = na.toSockaddr(&server_addr, &pa);
+
+    var ctx: u8 = 1;
+    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+
+    const s = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(s);
+    const big: [multishot_payload_max + 1]u8 = @splat('x');
+    _ = try sys.sendto(s, &big, 0, &pa.any, sa_len);
+
+    var completions: [max_operations]Completion = undefined;
+    const trunc = try loop.tick(&completions);
+    try testing.expectEqual(@as(usize, 1), trunc.len);
+    try testing.expectEqual(@as(?anyerror, error.RecvFailed), trunc[0].result.recv.err);
+    try testing.expect(!trunc[0].terminated);
+
+    _ = try sys.sendto(s, "hello", 0, &pa.any, sa_len);
+    const next = try loop.tick(&completions);
+    try testing.expectEqual(@as(usize, 1), next.len);
+    try testing.expectEqualStrings("hello", next[0].result.recv.data);
+    loop.releaseBuf(next[0].result.recv.buf_id.?);
 }
