@@ -1330,32 +1330,6 @@ fn validateNsec3NegativeProof(
     const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
     const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
 
-    // RFC 5155 §8.6 — NODATA, QTYPE DS. No NSEC3 matched qname, which under
-    // Opt-Out is the normal shape for an unsigned delegation. §8.6 wants a
-    // closest-*provable*-encloser proof — CE match plus an Opt-Out NSEC3
-    // covering the next closer — and no wildcard, a delegation never being
-    // wildcard-generated. Demanding §8.7's wildcard step (as the shared path
-    // below does) SERVFAILed every DS query into an Opt-Out TLD.
-    //
-    // `.insecure`, never `.secure`: the span may hold unsigned delegations, so
-    // qname's own existence is unproven and §9.2 makes AD a MUST NOT. Unbound's
-    // `nsec3_prove_nods` ends on the same verdict.
-    if (qtype == .ds and !is_nxdomain) {
-        var ds_nc_covered = false;
-        var ds_nc_optout = false;
-        for (authorities) |rr| {
-            const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
-            const nsec3 = rr.rdata.nsec3;
-            if (!nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &nc_hash)) continue;
-            ds_nc_covered = true;
-            if (nsec3.flags & nsec3_opt_out != 0) ds_nc_optout = true;
-        }
-        if (!ds_nc_covered) return .unchecked;
-        // Without Opt-Out the coverer proves the name *absent*, contradicting
-        // the NOERROR it arrived under — a lie, not a gap.
-        return if (ds_nc_optout) .insecure else .bogus;
-    }
-
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
     const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;

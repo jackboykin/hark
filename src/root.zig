@@ -67,4 +67,5 @@ test {
     _ = @import("rebinding.zig");
     _ = @import("response.zig");
     _ = @import("fuzz_wire.zig");
+    _ = @import("fuzz_nsec.zig");
 }
