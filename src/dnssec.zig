@@ -1213,6 +1213,8 @@ fn nsec3ClosestEncloser(
     budget: *ValidationBudget,
 ) ClosestEncloser {
     for (0..qname.labels.len) |label_offset| {
+        // Nothing above the signer is in its chain; don't pay to hash it.
+        if (qname.labels.len - label_offset < zone.labels.len) break;
         const ancestor_hash = if (label_offset == 0) qname_hash else budgetedNsec3Hash(
             .{ .labels = qname.labels[label_offset..] },
             salt,
