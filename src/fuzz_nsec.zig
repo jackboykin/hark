@@ -76,9 +76,14 @@ const Zone = struct {
         return null;
     }
 
-    /// Opt-Out signers leave unsigned delegations out of the chain.
+    /// Opt-Out signers leave unsigned delegations out of the chain, and
+    /// (RFC 5155 §7.1) any empty non-terminal that exists only for those.
     fn omitted(z: *const Zone, e: *const Entry) bool {
-        return z.nsec3 and z.optout and e.types.delegation() and !e.types.ds;
+        if (!z.nsec3 or !z.optout) return false;
+        if (e.types.delegation()) return !e.types.ds;
+        if (@as(u8, @bitCast(e.types)) != 0) return false;
+        for (z.entries[0..z.n]) |*o| if (o != e and o.name().isSubdomainOf(e.name()) and !z.omitted(o)) return false;
+        return true;
     }
 
     fn inChain(z: *const Zone, name: dns.Name) bool {
@@ -104,16 +109,35 @@ const Zone = struct {
         return name;
     }
 
+    /// `name` or its nearest existing ancestor, in the chain or not.
+    fn realEncloser(z: *const Zone, name: dns.Name) dns.Name {
+        for (0..name.labels.len) |k| {
+            const n = dns.Name{ .labels = name.labels[k..] };
+            if (z.find(n) != null) return n;
+        }
+        unreachable;
+    }
+
     fn truth(z: *const Zone, qname: dns.Name, qtype: dns.RType) Truth {
         for (1..qname.labels.len) |k| {
             const e = z.find(.{ .labels = qname.labels[k..] }) orelse continue;
             if (e.types.dname or e.types.delegation()) return .referral;
         }
         if (z.find(qname)) |e| return answerAt(e.types, qtype);
+        // RFC 4592 §2.2.1: the wildcard sits at the real closest encloser,
+        // which an omitted ENT is even though the chain can't see it.
         var wl: [dns.max_label_count + 1][]const u8 = undefined;
-        const wc = dns.makeWildcardName(&wl, z.closestEncloser(qname)).?;
-        if (z.find(wc)) |e| return answerAt(e.types, qtype);
+        if (z.find(dns.makeWildcardName(&wl, z.realEncloser(qname)).?)) |e| return answerAt(e.types, qtype);
         return .nxdomain;
+    }
+
+    /// A signer may omit an ENT (§7.1) under a wildcard at the provable
+    /// encloser. The honest denial is then indistinguishable from a replay
+    /// over that wildcard's data, so every validator refuses it (§8.4,
+    /// Unbound "wildcard had qtype, bogus"). The signer's problem.
+    fn shadowed(z: *const Zone, qname: dns.Name) bool {
+        var wl: [dns.max_label_count + 1][]const u8 = undefined;
+        return !z.inChain(z.realEncloser(qname)) and z.find(dns.makeWildcardName(&wl, z.closestEncloser(qname)).?) != null;
     }
 
     fn answerAt(t: Types, qtype: dns.RType) Truth {
@@ -352,13 +376,14 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     switch (v1) {
         .secure => if (t == .positive or t == .referral or (is_nxdomain and t != .nxdomain)) return error.UnsoundDenial,
         .insecure => {
-            // RFC 5155 §8.6 takes an Opt-Out span over the next closer as the
-            // whole DS answer; a wildcard delegation with DS misreads, and
-            // that is the RFC's to own.
-            const ds_optout = qtype == .ds and !is_nxdomain and z.optoutCovered(nc);
-            if (!ds_optout and (t == .positive or !(z.optoutCovered(nc) or z.optoutCovered(wc)))) return error.UnsoundOptOut;
+            // The only honest source of .insecure is an Opt-Out span over the
+            // next closer or the wildcard: §12.2's concession. A name outside
+            // the chain can always be passed off as unsigned, and with it the
+            // wildcard expansion it would have had (errata 3441; Unbound
+            // `nsec3_do_prove_nodata` case 5 takes the same replay).
+            if (!(z.optoutCovered(nc) or z.optoutCovered(wc))) return error.UnsoundOptOut;
         },
-        .bogus, .unchecked => if (exact and (t == .nodata or t == .nxdomain)) return error.HonestDenialRefused,
+        .bogus, .unchecked => if (exact and (t == .nodata or t == .nxdomain) and !z.shadowed(qname)) return error.HonestDenialRefused,
     }
 
     // Wildcard expansion: no closer match below the RRSIG's encloser.
@@ -393,7 +418,10 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     switch (v3) {
         .insecure => {
             if (child.labels.len == 1 or z.cutAbove(child)) return error.UnsoundDelegation;
-            if (e != null and !insecure_delegation) return error.UnsoundDelegation;
+            // An omitted ENT hashes into an Opt-Out span: to a validator it
+            // doesn't exist, and the clause below grants those §12.2's
+            // forged-cut concession.
+            if (e != null and !insecure_delegation and !z.omitted(e.?)) return error.UnsoundDelegation;
             if (!z.inChain(child) and !z.optoutCovered(z.nextCloser(child))) return error.UnsoundDelegation;
         },
         .secure => if (exact and insecure_delegation) return error.HonestDelegationRefused,
