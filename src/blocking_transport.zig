@@ -17,7 +17,7 @@ const sys = @import("sys.zig");
 // Connect-side TCP still opens the fd via raw posix for SO_SNDTIMEO — Zig's
 // `netConnectIp` accepts a timeout option but its Io.Threaded backend panics on
 // it. queryStaggered and the TCP loops
-// drop to posix.poll on socket.handle rather than Io.select over receive
+// drop to posix.poll on socket.handle rather than Io.Select over receive
 // futures — see comments at each call site.
 
 pub const Config = struct {
@@ -177,7 +177,7 @@ pub const BlockingUdpTransport = struct {
     /// queryWithTimeout.
     ///
     /// Multi-socket wait still uses `posix.poll` over `socket.handle` because
-    /// `Io.select` over `receiveTimeout` futures is heavier than it's worth
+    /// `Io.Select` over `receiveTimeout` futures is heavier than it's worth
     /// at this scale; revisit when `Io.Evented` networking lands.
     pub fn queryStaggered(
         self: *BlockingUdpTransport,

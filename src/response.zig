@@ -193,8 +193,8 @@ fn shapeAdditional(
     });
 }
 
-/// Two-pass filter over a record slice using a `Predicate` with a
-/// `pub fn keep(self, rr) bool`. Returns the input slice unchanged
+/// Two-pass filter over a record slice; `predicate` is anything with a
+/// `keep(self, rr) bool`. Returns the input slice unchanged
 /// when no records would be filtered (zero-alloc fast path).
 fn filterRecords(
     alloc: mem.Allocator,

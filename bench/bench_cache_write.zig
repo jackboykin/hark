@@ -1,9 +1,8 @@
 //! Cache write-amplification: per-store wall time and backing-allocator
-//! call count across rtypes × records-per-RRset (N). The cache read path
-//! (`cloneRRset` in src/cache.zig) makes 2 allocator calls regardless of N
-//! via a packed alignedAlloc + flat owner name. The write path
-//! (`storeOneRRset` + `buildCachedRecord`) dupes per record + per rdata
-//! child — this bench measures that asymmetry.
+//! call count across rtypes × records-per-RRset (N). Both paths are meant
+//! to be O(1) in N: `cloneRRset` unpacks into 2 allocations, `buildPack`
+//! serializes the whole RRset into one aligned blob. This bench pins that
+//! and catches a per-record dupe creeping back in.
 //!
 //! Workload: cold-cache fill of M=1000 unique RRsets per combo. The cache's
 //! backing allocator is wrapped by a `TallyAllocator` so every call from the
