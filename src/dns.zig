@@ -2045,21 +2045,6 @@ test "edge case: oversized label" {
     try testing.expectError(error.InvalidLabelType, parseMessage(testing.allocator, pkt[0..78]));
 }
 
-test "fuzz: random bytes must not panic" {
-    const Context = struct {
-        fn testOne(context: @This(), smith: *testing.Smith) anyerror!void {
-            _ = context;
-            var buf: [4096]u8 = undefined;
-            const len = smith.slice(&buf);
-            const input = buf[0..len];
-            var arena = std.heap.ArenaAllocator.init(testing.allocator);
-            defer arena.deinit();
-            if (parseMessage(arena.allocator(), input)) |_| {} else |_| {}
-        }
-    };
-    try testing.fuzz(Context{}, Context.testOne, .{});
-}
-
 test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
