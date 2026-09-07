@@ -1354,7 +1354,7 @@ pub const RecursiveResolver = struct {
             var proof_ttl_cap: u32 = std.math.maxInt(u32);
             const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap);
             if (auth_status == .secure) {
-                const status = dnssec.classifyDelegation(authorities, zone_cut, self.validationBudget());
+                const status = dnssec.classifyDelegation(authorities, zone_cut, dnssec.authoritySigner(authorities).?, self.validationBudget());
                 cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
                 return status;
             }
@@ -2338,7 +2338,7 @@ pub const RecursiveResolver = struct {
         var proof_ttl_cap: u32 = std.math.maxInt(u32);
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, zone, parent_servers, &proof_ttl_cap);
         if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(response.authorities, zone, self.validationBudget());
+            const status = dnssec.classifyDelegation(response.authorities, zone, dnssec.authoritySigner(response.authorities).?, self.validationBudget());
             if (status == .insecure) {
                 cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
             }
