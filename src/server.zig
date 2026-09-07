@@ -627,10 +627,10 @@ pub const Server = struct {
     }
 
     fn trySpawnBgPrefetch(self: *Server, name: []const u8, qtype: dns.RType, kind: BgKind) bool {
-        if (name.len == 0 or name.len > dns.max_name_len + 1) return false;
+        if (name.len == 0 or name.len > dns.max_dotted_len + 1) return false;
         if (!self.bg_tasks.tryClaim()) return false;
 
-        var payload: [3 + dns.max_name_len + 1]u8 = undefined;
+        var payload: [3 + dns.max_dotted_len + 1]u8 = undefined;
         mem.writeInt(u16, payload[0..2], @backingInt(qtype), .big);
         payload[2] = @backingInt(kind);
         @memcpy(payload[3..][0..name.len], name);
@@ -1706,7 +1706,7 @@ test "trySpawnBgPrefetch rejects oversize and empty names" {
     defer server.deinit();
 
     try testing.expect(!server.trySpawnBgPrefetch("", .a, .prefetch));
-    var too_long: [dns.max_name_len + 2]u8 = undefined;
+    var too_long: [dns.max_dotted_len + 2]u8 = undefined;
     @memset(&too_long, 'a');
     try testing.expect(!server.trySpawnBgPrefetch(&too_long, .a, .prefetch));
     try testing.expectEqual(@as(u32, 0), server.bg_tasks.inFlight());

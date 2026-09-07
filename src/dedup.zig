@@ -3,29 +3,11 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 
-// Fixed-size stack key — no allocations in the hot path.
-
 /// Populations that must not coalesce; `internal` keeps the resolver's own
 /// DNSKEY/DS/NS fetches off the client query that triggered them.
 pub const flag_cd: u8 = 1;
 pub const flag_revalidate: u8 = 2;
 pub const flag_internal: u8 = 4;
-
-const DedupKey = struct {
-    name_buf: [dns.max_name_len + 1]u8 = undefined,
-    name_len: u8 = 0,
-    qtype: dns.RType = .a,
-    flags: u8 = 0,
-
-    fn init(name: []const u8, qtype: dns.RType, flags: u8) ?DedupKey {
-        if (name.len > dns.max_name_len + 1) return null;
-        var key = DedupKey{ .qtype = qtype, .name_len = @intCast(name.len), .flags = flags };
-        for (name, 0..) |c, i| {
-            key.name_buf[i] = std.ascii.toLower(c);
-        }
-        return key;
-    }
-};
 
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
@@ -38,27 +20,38 @@ pub fn randomizeHashSeed(io: std.Io) void {
     dedup_hash_seed = rand.hashSeed(io);
 }
 
-const DedupKeyContext = struct {
-    pub fn hash(_: @This(), key: DedupKey) u64 {
-        const salt = (@as(u32, @backingInt(key.qtype)) << 8) | key.flags;
-        return std.hash.Wyhash.hash(dedup_hash_seed ^ salt, key.name_buf[0..key.name_len]);
+/// Seeded hash of (lowercased name, qtype, flags) stands in for the name.
+/// Followers never read the leader's result — they wait, then look the cache
+/// up themselves — so a collision is one spurious wait, and the secret seed
+/// keeps collisions accidental.
+fn keyOf(name: []const u8, qtype: dns.RType, flags: u8) u64 {
+    const salt = (@as(u32, @backingInt(qtype)) << 8) | flags;
+    var h = std.hash.Wyhash.init(dedup_hash_seed ^ salt);
+    var lower: [64]u8 = undefined;
+    var rest = name;
+    while (rest.len > 0) {
+        const n = @min(rest.len, lower.len);
+        h.update(std.ascii.lowerString(&lower, rest[0..n]));
+        rest = rest[n..];
     }
+    return h.final();
+}
 
-    pub fn eql(_: @This(), a: DedupKey, b: DedupKey) bool {
-        return a.qtype == b.qtype and
-            a.flags == b.flags and
-            a.name_len == b.name_len and
-            mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]);
+const IdentityContext = struct {
+    pub fn hash(_: @This(), key: u64) u64 {
+        return key;
+    }
+    pub fn eql(_: @This(), a: u64, b: u64) bool {
+        return a == b;
     }
 };
 
 const AcquireResult = enum { leader, follower, uncoordinated };
 
-/// The table's hash for `(name, qtype, flags)`; callers use it as a compact
-/// stand-in for the key. Never 0.
+/// The table's key for `(name, qtype, flags)`; callers use it as a compact
+/// stand-in. Never 0.
 pub fn tag(name: []const u8, qtype: dns.RType, flags: u8) u64 {
-    const key = DedupKey.init(name, qtype, flags) orelse return 1;
-    return DedupKeyContext.hash(.{}, key) | 1;
+    return keyOf(name, qtype, flags) | 1;
 }
 
 /// One mutex + condvar per shard; broadcast wakes only that shard's
@@ -67,7 +60,7 @@ const shard_count = 64;
 const shard_mask: u64 = shard_count - 1;
 
 const Shard = struct {
-    map: std.HashMapUnmanaged(DedupKey, void, DedupKeyContext, 80) = .empty,
+    map: std.HashMapUnmanaged(u64, void, IdentityContext, 80) = .empty,
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     condition: std.Io.Condition = std.Io.Condition.init,
 
@@ -101,8 +94,10 @@ pub const InFlightTable = struct {
         return total;
     }
 
-    fn shardFor(self: *InFlightTable, key: DedupKey) *Shard {
-        return &self.shards[DedupKeyContext.hash(.{}, key) & shard_mask];
+    /// Middle bits: the map indexes on the low bits and fingerprints on the
+    /// top 7, so sharding on either would leave each shard's map near-empty.
+    fn shardFor(self: *InFlightTable, key: u64) *Shard {
+        return &self.shards[(key >> 32) & shard_mask];
     }
 
     /// Join the in-flight group for `(name, qtype, flags)`.
@@ -127,7 +122,7 @@ pub const InFlightTable = struct {
     }
 
     fn acquireOrWaitImpl(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8, deadline_ns_opt: ?i128) AcquireResult {
-        const key = DedupKey.init(name, qtype, flags) orelse return .uncoordinated;
+        const key = keyOf(name, qtype, flags);
         const shard = self.shardFor(key);
 
         shard.mutex.lockUncancelable(self.io);
@@ -156,7 +151,7 @@ pub const InFlightTable = struct {
     /// Used by background tasks that have nothing to return to a follower
     /// (prefetch, async validation).
     pub fn tryAcquireLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) bool {
-        const key = DedupKey.init(name, qtype, flags) orelse return false;
+        const key = keyOf(name, qtype, flags);
         const shard = self.shardFor(key);
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
@@ -168,7 +163,7 @@ pub const InFlightTable = struct {
     /// Called by the leader when resolution is complete. Wakes all waiting followers
     /// in the key's shard and removes the entry so subsequent requests start fresh.
     pub fn releaseLeader(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) void {
-        const key = DedupKey.init(name, qtype, flags) orelse return;
+        const key = keyOf(name, qtype, flags);
         const shard = self.shardFor(key);
 
         shard.mutex.lockUncancelable(self.io);
@@ -217,14 +212,8 @@ test "different names are independent" {
 }
 
 test "case insensitive dedup" {
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    const key1 = DedupKey.init("EXAMPLE.COM", .a, 0);
-    const key2 = DedupKey.init("example.com", .a, 0);
-    try testing.expect(key1 != null);
-    try testing.expect(key2 != null);
-    try testing.expect(DedupKeyContext.eql(.{}, key1.?, key2.?));
+    try testing.expectEqual(keyOf("EXAMPLE.COM", .a, 0), keyOf("example.com", .a, 0));
+    try testing.expect(keyOf("example.com", .a, 0) != keyOf("example.org", .a, 0));
 }
 
 test "follower waits for leader" {
