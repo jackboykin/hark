@@ -194,8 +194,7 @@ pub fn isProperAncestor(zone: dns.Name, name: dns.Name) bool {
 /// `.secure` here does NOT mean "validated": it means "treat as signed,
 /// proceed to DNSKEY/DS validation" — and an unsigned-but-unproven delegation
 /// also returns `.secure`, so the validator (recursive.zig) fails closed to
-/// SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation,
-/// or a chain hark cannot evaluate (unknown hash algorithm; nsec3ChainParams).
+/// SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation.
 ///
 /// `zone` is the signer the caller verified the section under. The §8.6
 /// closest-encloser walk stops a genuine Opt-Out span of `com` covering
@@ -1154,16 +1153,14 @@ fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nse
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
     var found_nsec3 = false;
-    var saw_unknown_algo = false;
     for (authorities) |rr| {
         if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
         const nsec3 = rr.rdata.nsec3;
-        if (nsec3.hash_algorithm != .sha1) {
-            saw_unknown_algo = true;
-            continue;
-        }
-        // §8.2: ignored, so not allowed to define the chain's parameters.
-        if (nsec3FlagsReserved(nsec3)) continue;
+        // §8.1 and §8.2: unknown hash algorithms and reserved flags are
+        // ignored, so they can't define the chain's parameters. A section
+        // holding only such records proves nothing and fails closed, as
+        // §8.1 expects and Unbound (filter_init) and Knot (hash_name) do.
+        if (nsec3.hash_algorithm != .sha1 or nsec3FlagsReserved(nsec3)) continue;
         // RFC 9276 §3.2: treat high-iteration NSEC3 as insecure. Mirrors
         // classifyDelegation — both paths share one policy.
         if (nsec3.iterations > max_nsec3_iterations) return .{ .verdict = .insecure };
@@ -1172,17 +1169,7 @@ fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nse
         found_nsec3 = true;
         break;
     }
-    if (!found_nsec3) {
-        // Only unknown-hash records. RFC 5155 §8.1 calls that "generally
-        // bogus" and Unbound (filter_init) and Knot (hash_name) agree; BIND
-        // (validate_nx, VALATTR_FOUNDUNKNOWN) says insecure so a zone moving
-        // to a new hash keeps resolving without AD. Hark sides with BIND: at
-        // a cut this parks .insecure for the proof TTL and the child goes
-        // unvalidated, but only the parent can mint the records, so the
-        // downgrade needs a signer that has actually moved.
-        if (saw_unknown_algo) return .{ .verdict = .insecure };
-        return .{ .verdict = .unchecked };
-    }
+    if (!found_nsec3) return .{ .verdict = .unchecked };
 
     // RFC 5155 §8.2: MAY treat disagreeing hash/iterations/salt as bogus, as
     // Unbound's `param_set_same` (`val_nsec3.c:1583`) does. One parameter set is
@@ -3003,9 +2990,7 @@ test "nsec3OwnerHash extraction" {
     try testing.expect(nsec3OwnerHash(empty_name) == null);
 }
 
-test "NSEC3 unknown hash algorithm yields .insecure (BIND validate_nx policy)" {
-    // Neither path may return .bogus/.secure: that SERVFAILs every name and
-    // child of a zone that moved to a new hash.
+test "NSEC3 unknown hash algorithm is ignored and the proof fails closed (RFC 5155 §8.1)" {
     const qname = dns.Name{
         .labels = &.{ @as([]const u8, "example"), @as([]const u8, "com") },
     };
@@ -3031,8 +3016,9 @@ test "NSEC3 unknown hash algorithm yields .insecure (BIND validate_nx policy)" {
     }};
 
     var b: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
-    try testing.expectEqual(SecurityStatus.insecure, classifyDelegation(&authorities, qname, test_com, &b));
+    try testing.expectEqual(SecurityStatus.unchecked, validateNegativeProof(&authorities, qname, .aaaa, false, test_root, &b));
+    try testing.expectEqual(SecurityStatus.secure, classifyDelegation(&authorities, qname, test_com, &b));
+    try testing.expectEqual(SecurityStatus.bogus, proveNoCloserMatch(&authorities, qname, 1, test_root, &b));
 }
 
 test "NSEC3 NODATA - secure" {

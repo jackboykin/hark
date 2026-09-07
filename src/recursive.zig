@@ -3536,7 +3536,7 @@ fn validateNegativeResponse(
     if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
     // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative response
     // must carry a complete proof; an incomplete one (.unchecked) fails closed.
-    // `.insecure` — Opt-Out (§9.2) or unevaluable (RFC 6840 §5.11) — is served
+    // `.insecure` — Opt-Out (§9.2) or RFC 9276 iterations — is served
     // and cached without AD.
     return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget)) {
         .secure => .{ .proceed = .secure },
