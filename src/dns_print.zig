@@ -181,7 +181,9 @@ fn printTypeBitmap(bitmap: []const u8, writer: anytype) !void {
         const win_len = bitmap[pos + 1];
         pos += 2;
         if (pos + win_len > bitmap.len) break;
-        for (0..win_len) |byte_idx| {
+        // RFC 4034 §4.1.2 caps a window at 32 bytes; beyond that the type
+        // number overflows u16.
+        for (0..@min(win_len, 32)) |byte_idx| {
             const byte = bitmap[pos + byte_idx];
             if (byte == 0) continue;
             for (0..8) |bit_idx| {
