@@ -615,7 +615,8 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     if (s.len > 0 and s[0] == '[') {
         const close = mem.indexOfScalar(u8, s, ']') orelse return null;
         const ip6_str = s[1..close];
-        const port = if (close + 1 < s.len and s[close + 1] == ':')
+        if (close + 1 < s.len and s[close + 1] != ':') return null;
+        const port = if (close + 1 < s.len)
             std.fmt.parseInt(u16, s[close + 2 ..], 10) catch return null
         else
             default_port;
@@ -706,6 +707,10 @@ test "parse address with default port" {
 test "parse address with explicit port" {
     const addr = parseAddress("192.168.1.1:8053", 53).?;
     try testing.expectEqual(@as(u16, 8053), addr.getPort());
+}
+
+test "bracketed address needs a colon before its port" {
+    try testing.expectEqual(@as(?Address, null), parseAddress("[::1]5353", 53));
 }
 
 test "invalid worker count" {
