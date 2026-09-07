@@ -917,7 +917,7 @@ fn nsec3Flood(authorities: []const dns.ResourceRecord) bool {
     return n > max_nsec3_records_per_proof;
 }
 
-fn nsec3Hash(
+pub fn nsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
@@ -1367,6 +1367,7 @@ fn validateNsec3NegativeProof(
     var nc_covered = false;
     var nc_optout = false;
     var wc_proven = false;
+    var wc_optout = false;
     var wc_contradicted = false;
     for (authorities) |rr| {
         const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
@@ -1377,26 +1378,37 @@ fn validateNsec3NegativeProof(
             // All coverers, not just the first: an attacker picks the order.
             if (nsec3.flags & nsec3_opt_out != 0) nc_optout = true;
         }
-        if (!wc_proven) {
-            if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
+        // Every record, not the first: spans from two chain versions can
+        // both verify, and the attacker orders them.
+        if (nsec3HashInRange(&owner_hash, nsec3.next_hashed_owner, &wc_hash)) {
+            wc_proven = true;
+            // An Opt-Out span denies signed data only: `*.CE` may still be
+            // an unsigned delegation.
+            if (nsec3.flags & nsec3_opt_out != 0) wc_optout = true;
+        } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
+            if (is_nxdomain or bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
+                wc_contradicted = true;
+            } else if (!wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) {
                 wc_proven = true;
-            } else if (mem.eql(u8, &owner_hash, &wc_hash)) {
-                if (is_nxdomain or bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
-                    wc_contradicted = true;
-                } else {
-                    wc_proven = true;
-                }
             }
         }
     }
+    // A signed record saying `*.CE` owns qtype (or exists under NXDOMAIN) is
+    // a lie no other record can outvote.
+    if (wc_contradicted) return .bogus;
+
+    // RFC 5155 §8.6, NODATA for DS: an unsigned delegation under Opt-Out
+    // matches no NSEC3, so CE match plus an Opt-Out span over the next closer
+    // is the whole proof. Demanding a wildcard step SERVFAILed every DS query
+    // into an Opt-Out TLD. `.insecure`: the span may hold unsigned
+    // delegations, so §9.2 forbids AD (Unbound `nsec3_prove_nods`).
+    if (qtype == .ds and !is_nxdomain and nc_covered and nc_optout) return .insecure;
 
     // RFC 5155 §9.2: AD MUST NOT be set when the next-closer coverer has
     // Opt-Out — that span may hold insecure delegations, so the denial is not
-    // fully proven. §9.2 is not DS-scoped, which is why it applies here and not
-    // only in the §8.6 branch above; Unbound agrees at `val_nsec3.c:1231`
-    // and `:1386`.
-    if (nc_covered and wc_proven) return if (nc_optout) .insecure else .secure;
-    if (wc_contradicted) return .bogus;
+    // fully proven. Not DS-scoped, so every qtype (Unbound `val_nsec3.c:1231`,
+    // `:1386`), and the wildcard coverer for the same reason.
+    if (nc_covered and wc_proven) return if (nc_optout or wc_optout) .insecure else .secure;
     return .unchecked;
 }
 
@@ -3233,8 +3245,8 @@ const OptOutDsProof = struct {
     nc_high: [Sha1.digest_length]u8 = undefined,
     rrs: [2]dns.ResourceRecord = undefined,
 
-    /// `opt_out = false` makes the coverer a plain name-denial, which is a
-    /// *contradiction* under NOERROR rather than a gap.
+    /// `opt_out = false` makes the coverer a plain name-denial, which without
+    /// a wildcard step proves nothing.
     fn init(self: *@This(), qname: dns.Name, opt_out: bool) !void {
         const zone_labels: []const []const u8 = &.{@as([]const u8, "com")};
         const salt: []const u8 = &.{};
@@ -3286,7 +3298,7 @@ test "NSEC3 DS NODATA needs the Opt-Out flag (RFC 5155 §8.6)" {
     try p.init(qname, false);
     var b: ValidationBudget = .{};
     try testing.expectEqual(
-        SecurityStatus.bogus,
+        SecurityStatus.unchecked,
         validateNegativeProof(&p.rrs, qname, .ds, false, test_root, &b),
     );
 }
@@ -3408,6 +3420,19 @@ test "NSEC3 Opt-Out NXDOMAIN must not set AD (RFC 5155 §9.2)" {
             validateNegativeProof(&p.rrs, qname, .a, true, test_root, &b),
         );
     }
+}
+
+test "NSEC3 wildcard coverer with Opt-Out counts wherever it sits in the section" {
+    // Two spans over hash(*.com) can both verify, from chain versions before
+    // and after the span went Opt-Out. Reading only the first let the stale
+    // one buy AD.
+    const qname = dns.Name{ .labels = &.{ "victim", "com" } };
+    var p: OptOutNxProof = .{};
+    try p.init(qname, false);
+    var stale_first = p.rrs ++ [_]dns.ResourceRecord{p.rrs[2]};
+    stale_first[3].rdata.nsec3.flags = nsec3_opt_out;
+    var b: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.insecure, validateNegativeProof(&stale_first, qname, .a, true, test_root, &b));
 }
 
 test "NSEC3 Opt-Out NODATA-by-CE-proof must not set AD (RFC 5155 §9.2)" {
