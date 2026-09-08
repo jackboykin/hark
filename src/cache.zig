@@ -595,31 +595,32 @@ pub const RRsetCache = struct {
         }
     }
 
-    /// Cheap existence probe: returns true iff a fresh (non-expired)
-    /// positive or negative entry is present for (name, rtype, rclass).
-    /// No clone, no prefetch accounting — just a short-lived shared lock
-    /// + hash probe + timestamp check. Used as a fast path to skip the
-    /// dedup table on cache hits. Marks the entry visited on hit so
-    /// SIEVE eviction sees the fast-path access (otherwise hot entries
-    /// that always take this path could be evicted as cold).
-    pub fn containsFresh(
+    pub fn containsFresh(self: *RRsetCache, name: []const u8, rtype: dns.RType, rclass: dns.RClass) bool {
+        return self.freshKind(name, rtype, rclass) != null;
+    }
+
+    /// No clone. Marks visited so SIEVE sees fast-path hits.
+    pub fn freshKind(
         self: *RRsetCache,
         name: []const u8,
         rtype: dns.RType,
         rclass: dns.RClass,
-    ) bool {
+    ) ?enum { positive, negative, failure } {
         var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
-        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return false;
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return null;
         const now = self.now_fn();
         const entry = shard.map.values()[idx];
-        const fresh = now < entry.expiresAt() and entry.status().answerable();
-        if (fresh) markVisited(shard, idx);
-        return fresh;
+        if (now >= entry.expiresAt() or !entry.status().answerable()) return null;
+        markVisited(shard, idx);
+        return switch (entry) {
+            .positive => .positive,
+            .negative => |n| if (n.rcode == .server_failure) .failure else .negative,
+        };
     }
 
     /// Look up an RRset by (name, rtype, rclass). On hit, records and sigs

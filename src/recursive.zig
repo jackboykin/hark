@@ -864,10 +864,7 @@ pub const RecursiveResolver = struct {
     /// Seed the per-query authority server set from the closest cached
     /// delegation, or root hints if none. Starts `parent_zone` at root
     /// (empty labels = `.`). Demotes `security_state` to `.insecure`
-    /// when the cached delegation has a known negative DS — the live
-    /// referral path would have caught this via `classifyDelegation`,
-    /// but a cache shortcut skips that call, so `hasCachedInsecureDelegation`
-    /// stands in.
+    /// at or below a known negative DS.
     fn seedServersForQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -894,10 +891,7 @@ pub const RecursiveResolver = struct {
             walk.setServers(deleg.addrs[0..deleg.count]);
             walk.zone = deleg.zone;
 
-            if (security_state.* == .secure and self.dnssec_enabled) {
-                if (hasCachedInsecureDelegation(self.keyCache(), allocator, deleg.zone))
-                    security_state.* = .insecure;
-            }
+            if (security_state.* == .secure and deleg.insecure) security_state.* = .insecure;
             return;
         }
 
@@ -1163,7 +1157,7 @@ pub const RecursiveResolver = struct {
             var cut_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const cut_name = candidate_cut.formatInto(&cut_buf);
             if (self.reproveDelegationSecurity(allocator, cut_name, walk.servers()) == null and
-                hasCachedInsecureDelegation(self.keyCache(), allocator, candidate_cut))
+                hasCachedInsecureDelegation(self.keyCache(), candidate_cut))
             {
                 security_state.* = .insecure;
                 break;
@@ -1364,7 +1358,7 @@ pub const RecursiveResolver = struct {
         var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
         if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
             return .secure;
-        return if (hasCachedInsecureDelegation(self.keyCache(), allocator, zone_cut)) .insecure else .secure;
+        return if (hasCachedInsecureDelegation(self.keyCache(), zone_cut)) .insecure else .secure;
     }
 
     fn tryWildcardSynth(
@@ -2195,12 +2189,12 @@ pub const RecursiveResolver = struct {
         parent_servers: []const na.Address,
     ) ?[]const dns.ResourceRecord {
         // Fast path: DS already in cache (another thread may have fetched it).
-        if (self.keyCache()) |c| {
-            if (c.lookup(allocator, zone_name, .ds, .in)) |result| return switch (result) {
-                .hit => |h| h.records,
-                .negative => null,
-            };
-        }
+        // Stale is not a verdict: callers re-read through `freshKind`, which
+        // would see nothing, so refetch instead of trusting it.
+        if (self.keyCache()) |c| if (c.lookup(allocator, zone_name, .ds, .in)) |result| switch (result) {
+            .hit => |h| if (!h.is_stale) return h.records,
+            .negative => |n| if (!n.is_stale) return null,
+        };
 
         const Ctx = struct {
             self: *RecursiveResolver,
@@ -2903,7 +2897,8 @@ pub const RecursiveResolver = struct {
     };
 
     const NsAddrResult = struct { addrs: [max_servers_per_level]na.Address, count: usize };
-    const DelegationResult = struct { addrs: [max_servers_per_level]na.Address, count: usize, zone: dns.Name };
+    /// `insecure`: negative DS at or above this cut (RFC 4035 §4.3).
+    const DelegationResult = struct { addrs: [max_servers_per_level]na.Address, count: usize, zone: dns.Name, insecure: bool };
 
     /// Check cache for A/AAAA records of NS names, avoiding network queries.
     /// Collects addresses from all cached NS names (cache lookups are free)
@@ -3006,6 +3001,7 @@ pub const RecursiveResolver = struct {
 
         var best: ?DelegationResult = null;
         var had_ns_hit = false;
+        var insecure = false;
 
         var i: usize = part_count;
         while (i > 0) {
@@ -3025,6 +3021,15 @@ pub const RecursiveResolver = struct {
             };
             had_ns_hit = true;
 
+            // RFC 4035 §4.3: nothing below a negative DS is signed, stop asking.
+            var ds_cache: ?*RRsetCache = null;
+            if (self.dnssec_enabled and !insecure) ds_cache = self.keyCache() orelse break;
+            const ds = if (ds_cache) |c| c.freshKind(zone_str, .ds, .in) else null;
+            // A cached DS SERVFAIL is not a verdict: back off to the parent
+            // cut so its live referral can replace the marker with one.
+            if (ds == .failure) break;
+            insecure = insecure or ds == .negative;
+
             var ns_names: [max_servers_per_level]dns.Name = undefined;
             var ns_count: usize = 0;
             for (hit.records) |ns_rr| {
@@ -3036,27 +3041,27 @@ pub const RecursiveResolver = struct {
 
             const res = (try self.lookupCachedNsAddresses(scratch, ns_names[0..ns_count])) orelse continue;
 
-            // DNSSEC: only use this delegation if DS status is known.
             // If DS is a cache miss, another thread may not have cached
             // the insecure delegation yet. Try a targeted DS re-probe
             // using the parent delegation's servers (like Unbound's key
             // cache refresh) before falling back to referral re-walk.
-            if (self.dnssec_enabled) {
-                const ds_cache = self.keyCache() orelse break;
-                if (!ds_cache.containsFresh(zone_str, .ds, .in)) {
-                    if (self.cache_only) break;
-                    const records = if (best) |parent_deleg|
-                        self.reproveDelegationSecurity(
-                            allocator,
-                            zone_str,
-                            parent_deleg.addrs[0..parent_deleg.count],
-                        )
-                    else
-                        null;
-                    // Records non-null = signed (may not be cached if TTL=0,
-                    // but DS status is known). Null + cache hit (negative)
-                    // = insecure. Null + cache miss = unknown, give up.
-                    if (records == null and !ds_cache.containsFresh(zone_str, .ds, .in)) break;
+            if (ds_cache != null and ds == null) {
+                if (self.cache_only) break;
+                const records = if (best) |parent_deleg|
+                    self.reproveDelegationSecurity(
+                        allocator,
+                        zone_str,
+                        parent_deleg.addrs[0..parent_deleg.count],
+                    )
+                else
+                    null;
+                // Non-null is signed even when TTL=0 kept it out of the cache.
+                if (records == null) {
+                    switch (ds_cache.?.freshKind(zone_str, .ds, .in) orelse break) {
+                        .negative => insecure = true,
+                        .positive => {},
+                        .failure => break,
+                    }
                 }
             }
 
@@ -3067,6 +3072,7 @@ pub const RecursiveResolver = struct {
                 .addrs = res.addrs,
                 .count = res.count,
                 .zone = zone_name,
+                .insecure = insecure,
             };
         }
 
@@ -3074,14 +3080,10 @@ pub const RecursiveResolver = struct {
     }
 };
 
-fn hasCachedInsecureDelegation(cache: ?*RRsetCache, allocator: mem.Allocator, zone: dns.Name) bool {
+fn hasCachedInsecureDelegation(cache: ?*RRsetCache, zone: dns.Name) bool {
     const c = cache orelse return false;
     var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const ds_result = c.lookup(allocator, zone.formatInto(&zone_buf), .ds, .in) orelse return false;
-    return switch (ds_result) {
-        .negative => true,
-        .hit => false,
-    };
+    return c.freshKind(zone.formatInto(&zone_buf), .ds, .in) == .negative;
 }
 
 /// When classifyDelegation returns .insecure, cache a negative DS entry
@@ -5128,4 +5130,75 @@ test "cacheInsecureDelegation bounds the negative DS by the proof's ttl cap" {
     var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
     const got = cache.lookup(look.allocator(), zone.formatInto(&zone_buf), .ds, .in) orelse return error.TestExpectedHit;
     try testing.expect(got.negative.remaining_ttl <= 7);
+}
+
+test "findClosestCachedDelegation uses a cut below an insecure parent without a DS probe" {
+    // cache_only turns any DS probe into a break back to the parent cut.
+    const alloc = testing.allocator;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
+    defer cache.deinit();
+
+    const parent = dns.Name{ .labels = &.{ "aaplimg", "com" } };
+    const parent_ns = dns.Name{ .labels = &.{ "ns", "aaplimg", "com" } };
+    const child = dns.Name{ .labels = &.{ "g", "aaplimg", "com" } };
+    const child_ns = dns.Name{ .labels = &.{ "ns", "g", "aaplimg", "com" } };
+    cache.storeReferral(&.{makeNsRr(parent, parent_ns)}, &.{makeGlueA(parent_ns, .{ 1, 1, 1, 1 })}, .{ .labels = &.{"com"} }, parent, &.{parent_ns});
+    cache.storeReferral(&.{makeNsRr(child, child_ns)}, &.{makeGlueA(child_ns, .{ 2, 2, 2, 2 })}, parent, child, &.{child_ns});
+
+    var resolver: RecursiveResolver = .{
+        .transports = null,
+        .io = testing.io,
+        .cache = &cache,
+        .cache_only = true,
+        .dnssec_enabled = true,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    try testing.expect(try resolver.findClosestCachedDelegation(arena.allocator(), "iphone-ld.g.aaplimg.com") == null);
+
+    cacheInsecureDelegation(&cache, .insecure, parent, &.{}, std.math.maxInt(u32));
+    const deleg = (try resolver.findClosestCachedDelegation(arena.allocator(), "iphone-ld.g.aaplimg.com")) orelse return error.TestExpectedDelegation;
+    try testing.expect(deleg.zone.eql(child));
+    try testing.expect(deleg.insecure);
+    try testing.expectEqual(@as(usize, 1), deleg.count);
+    try testing.expectEqual([4]u8{ 2, 2, 2, 2 }, deleg.addrs[0].ip4.bytes);
+}
+
+var clock_reads: usize = 0;
+var clock_jump_after: usize = std.math.maxInt(usize);
+fn countingClock() i64 {
+    clock_reads += 1;
+    return if (clock_reads > clock_jump_after) 1_000_000 else 0;
+}
+
+test "seedServersForQuery keeps the insecure verdict when the ancestor's negative DS expires mid-walk" {
+    const alloc = testing.allocator;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
+    defer cache.deinit();
+    cache.now_fn = &countingClock;
+
+    const parent = dns.Name{ .labels = &.{ "aaplimg", "com" } };
+    const parent_ns = dns.Name{ .labels = &.{ "ns", "aaplimg", "com" } };
+    const child = dns.Name{ .labels = &.{ "g", "aaplimg", "com" } };
+    const child_ns = dns.Name{ .labels = &.{ "ns", "g", "aaplimg", "com" } };
+    cache.storeReferral(&.{makeNsRr(parent, parent_ns)}, &.{makeGlueA(parent_ns, .{ 1, 1, 1, 1 })}, .{ .labels = &.{"com"} }, parent, &.{parent_ns});
+    cache.storeReferral(&.{makeNsRr(child, child_ns)}, &.{makeGlueA(child_ns, .{ 2, 2, 2, 2 })}, parent, child, &.{child_ns});
+    cacheInsecureDelegation(&cache, .insecure, parent, &.{}, 60);
+
+    var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache, .cache_only = true, .dnssec_enabled = true };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Calibrate: clock reads the walk takes while the negative DS is fresh.
+    clock_reads = 0;
+    _ = try resolver.findClosestCachedDelegation(arena.allocator(), "iphone-ld.g.aaplimg.com");
+    clock_jump_after = clock_reads;
+    clock_reads = 0;
+
+    // Every read after the walk sees the negative DS expired.
+    var walk = try RecursiveResolver.Walk.init(arena.allocator(), "iphone-ld.g.aaplimg.com");
+    var state: dnssec.SecurityStatus = .secure;
+    try resolver.seedServersForQuery(arena.allocator(), .a, &walk, &state);
+    try testing.expectEqual(dnssec.SecurityStatus.insecure, state);
 }
