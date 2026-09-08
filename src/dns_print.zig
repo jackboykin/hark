@@ -157,18 +157,6 @@ fn printResourceRecord(rr: dns.ResourceRecord, writer: anytype) !void {
             }
             try printTypeBitmap(nsec3.type_bit_maps, writer);
         },
-        .nsec3param => |nsec3p| {
-            try writer.print("{d} {d} {d} ", .{
-                @backingInt(nsec3p.hash_algorithm),
-                nsec3p.flags,
-                nsec3p.iterations,
-            });
-            if (nsec3p.salt.len == 0) {
-                try writer.print("-", .{});
-            } else {
-                for (nsec3p.salt) |b| try writer.print("{X:0>2}", .{b});
-            }
-        },
         .unknown => |data| try writer.print("<{d} bytes>", .{data.len}),
     }
     try writer.print("\n", .{});

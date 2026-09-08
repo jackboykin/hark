@@ -410,13 +410,6 @@ pub const Nsec3Data = struct {
     type_bit_maps: []const u8,
 };
 
-pub const Nsec3ParamData = struct {
-    hash_algorithm: Nsec3HashAlgorithm,
-    flags: u8,
-    iterations: u16,
-    salt: []const u8,
-};
-
 pub const RData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
@@ -432,7 +425,6 @@ pub const RData = union(enum) {
     ds: DsData,
     nsec: NsecData,
     nsec3: Nsec3Data,
-    nsec3param: Nsec3ParamData,
     unknown: []const u8,
 };
 
@@ -1016,21 +1008,7 @@ const Parser = struct {
                     .type_bit_maps = try self.readSlice(bitmap_len),
                 } };
             },
-            .nsec3param => {
-                if (rdlength < 5) return error.InvalidRDataLength;
-                const hash_algorithm: Nsec3HashAlgorithm = @fromBackingInt(@intCast(try self.readU8()));
-                const flags = try self.readU8();
-                const iterations = try self.readU16();
-                const salt_len: usize = try self.readU8();
-                if (5 + salt_len > rdlength) return error.InvalidRDataLength;
-                return .{ .nsec3param = .{
-                    .hash_algorithm = hash_algorithm,
-                    .flags = flags,
-                    .iterations = iterations,
-                    .salt = try self.readSlice(salt_len),
-                } };
-            },
-            .opt, .any, .svcb, .https, _ => {
+            .opt, .any, .svcb, .https, .nsec3param, _ => {
                 const data = try self.readSlice(rdlength);
                 return .{ .unknown = data };
             },
@@ -1434,13 +1412,6 @@ pub const Serializer = struct {
                 try self.writeU8(try castOrRDataErr(u8, nsec3.next_hashed_owner.len));
                 try self.writeSlice(nsec3.next_hashed_owner);
                 try self.writeSlice(nsec3.type_bit_maps);
-            },
-            .nsec3param => |nsec3p| {
-                try self.writeU8(@backingInt(nsec3p.hash_algorithm));
-                try self.writeU8(nsec3p.flags);
-                try self.writeU16(nsec3p.iterations);
-                try self.writeU8(try castOrRDataErr(u8, nsec3p.salt.len));
-                try self.writeSlice(nsec3p.salt);
             },
             .unknown => |data| try self.writeSlice(data),
         }
@@ -2397,7 +2368,6 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
             freeIfOwned(allocator, nsec3.next_hashed_owner);
             freeIfOwned(allocator, nsec3.type_bit_maps);
         },
-        .nsec3param => |nsec3p| freeIfOwned(allocator, nsec3p.salt),
         .unknown => |data| allocator.free(data),
     }
 }
@@ -2489,12 +2459,6 @@ pub fn cloneRData(allocator: Allocator, rdata: RData) !RData {
                 .type_bit_maps = try dupeOrEmpty(allocator, nsec3.type_bit_maps),
             } };
         },
-        .nsec3param => |nsec3p| .{ .nsec3param = .{
-            .hash_algorithm = nsec3p.hash_algorithm,
-            .flags = nsec3p.flags,
-            .iterations = nsec3p.iterations,
-            .salt = try dupeOrEmpty(allocator, nsec3p.salt),
-        } },
         .unknown => |data| .{ .unknown = try allocator.dupe(u8, data) },
     };
 }
@@ -2521,7 +2485,7 @@ fn freeWireParsedName(allocator: Allocator, name: Name) void {
 /// the wire directly and are skipped.
 fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
-        .a, .aaaa, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
+        .a, .aaaa, .dnskey, .ds, .nsec3, .unknown => {},
         .ns, .cname, .dname, .ptr => |n| freeWireParsedName(allocator, n),
         .mx => |mx| freeWireParsedName(allocator, mx.exchange),
         .soa => |s| {
@@ -2540,7 +2504,7 @@ fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
 /// not freed; only safe under an arena.
 pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
     switch (rdata.*) {
-        .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .nsec3param, .unknown => {},
+        .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .unknown => {},
         .ns, .cname, .dname, .ptr => |*n| n.* = try cloneNameLower(allocator, n.*),
         .mx => |*m| m.exchange = try cloneNameLower(allocator, m.exchange),
         .soa => |*s| {
@@ -2959,35 +2923,6 @@ test "NSEC3 record parse/serialize roundtrip" {
     try testing.expectEqualSlices(u8, nsec3.salt, n3_2.salt);
     try testing.expectEqualSlices(u8, nsec3.next_hashed_owner, n3_2.next_hashed_owner);
     try testing.expectEqualSlices(u8, nsec3.type_bit_maps, n3_2.type_bit_maps);
-}
-
-test "NSEC3PARAM record parse/serialize roundtrip" {
-    const salt = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-    var rd = TestRdata{};
-    rd.putU8(1); // hash_algorithm
-    rd.putU8(0); // flags
-    rd.putU16(0); // iterations
-    rd.putU8(@intCast(salt.len));
-    rd.putBytes(&salt);
-
-    var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 51, 0, rd.slice());
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
-
-    const nsec3p = msg.answers[0].rdata.nsec3param;
-    try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3p.hash_algorithm);
-    try testing.expectEqual(@as(u16, 0), nsec3p.iterations);
-    try testing.expectEqualSlices(u8, &salt, nsec3p.salt);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    const np2 = msg2.answers[0].rdata.nsec3param;
-    try testing.expectEqual(nsec3p.hash_algorithm, np2.hash_algorithm);
-    try testing.expectEqualSlices(u8, nsec3p.salt, np2.salt);
 }
 
 test "typeBitmapContains" {
