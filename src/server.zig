@@ -1266,7 +1266,10 @@ const WorkerState = struct {
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf: [24]u8 = undefined;
         var rcode_buf: [24]u8 = undefined;
-        log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms{s}", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms, tag });
+        if (result.message.header.flags.rcode == .server_failure)
+            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, result.servfail_why orelse if (result.from_cache) "cached" else "upstream" })
+        else
+            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms{s}", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms, tag });
 
         self.sendResponse(reply, query, result.message, alloc);
 

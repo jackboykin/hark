@@ -448,6 +448,7 @@ pub const RecursiveResolver = struct {
 
     pub const ResolveResult = struct {
         message: dns.Message,
+        servfail_why: ?[]const u8 = null,
         prefetch_name: ?[]const u8 = null,
         prefetch_qtype: dns.RType = .a,
         /// DNSKEY zone needing async refresh (TTL < 10%). Server handles after responding.
@@ -627,7 +628,7 @@ pub const RecursiveResolver = struct {
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
                     if (!try cname_chain.push(allocator, dispatch.redirect, dispatch.security_status, "cache-served"))
-                        return self.bogusServfail(current_name, qtype);
+                        return self.bogusServfail(current_name, qtype, "cname loop");
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.redirect.target);
                     security_state = self.securityStateAfterCname(security_state);
@@ -669,7 +670,7 @@ pub const RecursiveResolver = struct {
                     // Flood or exhaustion classifies the delegation .bogus; fail
                     // closed here — a later CNAME hop would re-elevate it to
                     // .secure and serve unsigned.
-                    if (security_state == .bogus) return self.bogusServfail(walk.name, qtype);
+                    if (security_state == .bogus) return self.bogusServfail(walk.name, qtype, "bogus delegation");
                     continue;
                 }
 
@@ -696,7 +697,7 @@ pub const RecursiveResolver = struct {
                 if (response.answers.len > 0) {
                     switch (try self.followUpstreamCname(allocator, &walk, &response, qtype, security_state, responding_server, &cname_chain)) {
                         .none => {},
-                        .bogus => return self.bogusServfail(walk.name, qtype),
+                        .bogus => |why| return self.bogusServfail(walk.name, qtype, why),
                         .same_zone => continue,
                         .cross_zone => {
                             current_name = walk.name;
@@ -712,7 +713,7 @@ pub const RecursiveResolver = struct {
 
                 if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &walk);
-                if (security_state == .bogus) return self.bogusServfail(walk.name, qtype);
+                if (security_state == .bogus) return self.bogusServfail(walk.name, qtype, "bogus referral");
                 walk.restartProbing(self.qname_minimization);
             }
         }
@@ -795,10 +796,10 @@ pub const RecursiveResolver = struct {
         walk.probe_labels += 1;
     }
 
-    const CnameHop = enum {
+    const CnameHop = union(enum) {
         /// Answer holds the queried type (or no CNAME): finalize it.
         none,
-        bogus,
+        bogus: []const u8,
         /// Target under the current zone: keep servers, restart probing.
         same_zone,
         /// Target elsewhere: re-walk from the root with `walk.name`.
@@ -827,9 +828,9 @@ pub const RecursiveResolver = struct {
         var wildcard: ?Wildcard = null;
         if (self.dnssec_enabled and security_state == .secure) {
             switch (try self.validateAnswer(allocator, response, .cname, security_state, walk.zone, walk.servers())) {
-                .bogus => {
+                .bogus => |why| {
                     self.recordNsOutcome(walk.zone, responding_server, .validation_failure, 0);
-                    return .bogus;
+                    return .{ .bogus = why };
                 },
                 .valid => |v| {
                     cname_status = .secure;
@@ -843,7 +844,7 @@ pub const RecursiveResolver = struct {
 
         // Store before following: this response never reaches final answer validation.
         if (self.cache) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
-        if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .bogus;
+        if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .{ .bogus = "cname loop" };
         // Carry the expansion's proofs past this hop so the client sees them;
         // `proveWildcard` already verified them under the answer's keys.
         if (wildcard != null) for (response.authorities) |rr| {
@@ -1249,7 +1250,7 @@ pub const RecursiveResolver = struct {
                     }
                 },
                 .skip_cache => {},
-                .bogus => return self.bogusServfail(current_name, qtype),
+                .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
         } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
             self.cacheResolutionFailure(name, qtype, depth);
@@ -1278,9 +1279,9 @@ pub const RecursiveResolver = struct {
         var wildcard: ?Wildcard = null;
         if (self.dnssec_enabled) {
             switch (try self.validateAnswer(allocator, response, qtype, security_state, parent_zone, servers)) {
-                .bogus => {
+                .bogus => |why| {
                     self.recordNsOutcome(parent_zone, responding_server, .validation_failure, 0);
-                    return self.bogusServfail(current_name, qtype);
+                    return self.bogusServfail(current_name, qtype, why);
                 },
                 .valid => |v| {
                     answer_status = .secure;
@@ -1326,7 +1327,7 @@ pub const RecursiveResolver = struct {
                     }
                 },
                 .skip_cache => {},
-                .bogus => return self.bogusServfail(current_name, qtype),
+                .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
         } else {
             self.cacheResolutionFailure(name, qtype, depth);
@@ -1358,7 +1359,9 @@ pub const RecursiveResolver = struct {
         var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
         if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
             return .secure;
-        return if (hasCachedInsecureDelegation(self.keyCache(), zone_cut)) .insecure else .secure;
+        if (hasCachedInsecureDelegation(self.keyCache(), zone_cut)) return .insecure;
+        log.debug("no DS proof for {s}: fail closed as signed", .{zone_cut.formatInto(&zone_buf)});
+        return .secure;
     }
 
     fn tryWildcardSynth(
@@ -1907,6 +1910,10 @@ pub const RecursiveResolver = struct {
         }
 
         if (last_server_failure) |sf| {
+            var zb: [dns.max_dotted_len + 1]u8 = undefined;
+            var tb: [24]u8 = undefined;
+            var rb: [24]u8 = undefined;
+            log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), dns.safeTagName(sf.header.flags.rcode, &rb) });
             return .{ .message = sf, .responding_server = null };
         }
         return error.Timeout;
@@ -1929,17 +1936,17 @@ pub const RecursiveResolver = struct {
     /// RRset was a wildcard expansion, the `*.ce` it came from.
     const AnswerValidation = union(enum) {
         valid: struct { ttl_cap: u32, wildcard: ?Wildcard },
-        bogus,
+        bogus: []const u8,
         skip,
     };
     const Wildcard = struct { ce: dns.Name, signer: dns.Name };
 
     /// RFC 9520 §3.4: MUST cache DNSSEC validation failures.
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
-    fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType) ResolveResult {
+    fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, why: []const u8) ResolveResult {
         @branchHint(.cold);
         if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked, .unless_fresh);
-        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false) };
+        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .servfail_why = why };
     }
 
     /// Coalesce concurrent fetches for the same `(name, rtype)` through the
@@ -2391,13 +2398,13 @@ pub const RecursiveResolver = struct {
             if (synth) |d| {
                 synth = null;
                 if (rr.rtype == .cname and rr.name.labels.len > d.name.labels.len and rr.name.isSubdomainOf(d.name)) {
-                    if (!cnameGroupDerivesFrom(response.answers, i, d)) return .bogus;
+                    if (!cnameGroupDerivesFrom(response.answers, i, d)) return .{ .bogus = "dname-synth cname does not derive" };
                     continue;
                 }
             }
 
-            const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .bogus;
-            const sig = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget()) orelse return .bogus;
+            const group_keys = (try keys.forRrset(self, allocator, response.answers, rr, zone, servers)) orelse return .{ .bogus = "no rrsig or no keys for signer" };
+            const sig = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget()) orelse return .{ .bogus = "rrsig failed to verify" };
             var group_cap = dnssec.rrsigTtlCap(sig, now_u32);
             var verdict: dnssec.SecurityStatus = .secure;
             if (sig.labels < rr.name.labels.len) {
@@ -2407,13 +2414,13 @@ pub const RecursiveResolver = struct {
                     .signer = sig.signer_name,
                 };
             }
-            if (verdict == .bogus) return .bogus;
+            if (verdict == .bogus) return .{ .bogus = "wildcard proof bogus" };
             status = dnssec.weakest(status, verdict);
             ttl_cap = @min(ttl_cap, group_cap);
             if (rr.rtype == .dname and verdict == .secure) synth = rr;
         }
         // Signatures alone: AD would be a claim about an empty set.
-        if (groups == 0) return .bogus;
+        if (groups == 0) return .{ .bogus = "answer holds only signatures" };
 
         switch (status) {
             .secure => {
@@ -2421,7 +2428,7 @@ pub const RecursiveResolver = struct {
                 response.header.flags.ad = true;
                 return .{ .valid = .{ .ttl_cap = ttl_cap, .wildcard = wildcard } };
             },
-            .bogus => return .bogus,
+            .bogus => return .{ .bogus = "an rrset failed validation" },
             .unchecked, .insecure => return .skip,
         }
     }
@@ -2592,7 +2599,7 @@ pub const RecursiveResolver = struct {
         if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
 
         const auth_status = self.verifyAuthoritySigs(allocator, authorities, null, zone_servers, ttl_cap);
-        if (auth_status == .bogus) return .bogus;
+        if (auth_status == .bogus) return .{ .bogus = "authority signatures failed" };
         if (auth_status != .secure) return .skip_cache;
 
         // `zone` is the deepest *cached* delegation, not the answering
@@ -3523,7 +3530,7 @@ const NegativeValidation = union(enum) {
     /// Serve, cache nothing: authority signatures did not verify at all, so
     /// there is no verdict worth persisting.
     skip_cache,
-    bogus,
+    bogus: []const u8,
 };
 
 fn validateNegativeResponse(
@@ -3543,20 +3550,8 @@ fn validateNegativeResponse(
     return switch (dnssec.validateNegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget)) {
         .secure => .{ .proceed = .secure },
         .insecure => .{ .proceed = .insecure },
-        .bogus => .bogus,
-        .unchecked => {
-            @branchHint(.cold);
-            // Diagnostic for the fail-closed path: a real-world broken auth
-            // (or a middlebox stripping NSEC) shows up here as SERVFAIL
-            // where other resolvers may serve unauthenticated.
-            var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-            var qtype_buf: [24]u8 = undefined;
-            log.warn(
-                "incomplete NSEC/NSEC3 proof for {s} {s} (nx={}); SERVFAIL per RFC 4035 §5.4",
-                .{ qname.formatInto(&name_buf), dns.safeTagName(qtype, &qtype_buf), is_nxdomain },
-            );
-            return .bogus;
-        },
+        .bogus => .{ .bogus = "negative proof failed" },
+        .unchecked => .{ .bogus = "incomplete nsec proof" },
     };
 }
 
@@ -4336,10 +4331,7 @@ test "validateNegativeResponse binds a proof to the zone that signed it" {
 
     // Bound to the zone that actually signed it: victim.com is not under it,
     // and neither is the NSEC owner a member of any chain covering victim.com.
-    try testing.expectEqual(
-        NegativeValidation.bogus,
-        validateNegativeResponse(.secure, &authorities, victim, .a, true, net_zone, &b),
-    );
+    try testing.expect(validateNegativeResponse(.secure, &authorities, victim, .a, true, net_zone, &b) == .bogus);
 
     // Positive control: the same zone denying one of its own names. The wrap
     // covers zzzz.example.net, and the apex NSEC covers *.example.net, so the
@@ -4395,7 +4387,7 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &authorities, name, .a, true, test_root, &b));
+    try testing.expect(validateNegativeResponse(.secure, &authorities, name, .a, true, test_root, &b) == .bogus);
 }
 
 test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
@@ -4428,8 +4420,8 @@ test "validateNegativeResponse returns bogus when no proof found in secure zone"
     // signed zones. Fail closed rather than serving the unauthenticated
     // NXDOMAIN/NODATA.
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, true, test_root, &b));
-    try testing.expectEqual(NegativeValidation.bogus, validateNegativeResponse(.secure, &.{}, name, .a, false, test_root, &b));
+    try testing.expect(validateNegativeResponse(.secure, &.{}, name, .a, true, test_root, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(.secure, &.{}, name, .a, false, test_root, &b) == .bogus);
 }
 
 test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
@@ -4449,10 +4441,7 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
         // No NSEC for *.example.com — proof is incomplete.
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(
-        NegativeValidation.bogus,
-        validateNegativeResponse(.secure, &authorities, beta, .a, true, test_root, &b),
-    );
+    try testing.expect(validateNegativeResponse(.secure, &authorities, beta, .a, true, test_root, &b) == .bogus);
 }
 
 test "dns.isNsecProofMaterial classifies the chain-aggregate keep set" {
