@@ -95,7 +95,7 @@ inline fn shardIndex(h: u64) u32 {
 
 const Shard = struct {
     arms: ArmMap,
-    mutex: ?std.Io.Mutex,
+    mutex: std.Io.Mutex,
 };
 
 pub const NsSelector = struct {
@@ -108,7 +108,6 @@ pub const NsSelector = struct {
     pub const Config = struct {
         allocator: Allocator,
         io: std.Io,
-        thread_safe: bool = false,
         max_arms: u32 = default_max_arms,
     };
 
@@ -116,7 +115,7 @@ pub const NsSelector = struct {
         var shards: [shard_count]Shard = undefined;
         for (&shards) |*s| s.* = .{
             .arms = ArmMap.init(cfg.allocator),
-            .mutex = if (cfg.thread_safe) std.Io.Mutex.init else null,
+            .mutex = .init,
         };
         return .{
             .shards = shards,
@@ -134,8 +133,8 @@ pub const NsSelector = struct {
     fn count(self: *NsSelector) usize {
         var total: usize = 0;
         for (&self.shards) |*s| {
-            if (s.mutex) |*mtx| mtx.lockUncancelable(self.io);
-            defer if (s.mutex) |*mtx| mtx.unlock(self.io);
+            s.mutex.lockUncancelable(self.io);
+            defer s.mutex.unlock(self.io);
             total += s.arms.count();
         }
         return total;
@@ -196,8 +195,8 @@ pub const NsSelector = struct {
             .addr_key = AddressKey.fromAddress(server),
         };
         const shard = self.shardFor(arm_key);
-        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
         const r = reward(outcome, elapsed_us);
 
@@ -225,8 +224,8 @@ pub const NsSelector = struct {
     /// state. Single-shard lock; caller must not hold any other shard.
     fn discountAndRead(self: *NsSelector, key: ArmKey) ArmState {
         const shard = self.shardFor(key);
-        if (shard.mutex) |*mtx| mtx.lockUncancelable(self.io);
-        defer if (shard.mutex) |*mtx| mtx.unlock(self.io);
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
         if (shard.arms.getPtr(key)) |state| {
             state.alpha = @max(alpha_prior, state.alpha * self.gamma);

@@ -70,7 +70,7 @@ const DeathGate = struct {
 
 const Shard = struct {
     entries: EntryMap,
-    rwlock: ?std.Io.RwLock,
+    rwlock: std.Io.RwLock,
     /// Lock-free gate; a count so a lapsed window still takes the lock.
     dead_marked: DeathGate = .{},
 };
@@ -88,7 +88,6 @@ pub const RttCache = struct {
     pub const Config = struct {
         allocator: Allocator,
         io: std.Io,
-        thread_safe: bool = false,
         max_entries: u32 = default_max_entries,
     };
 
@@ -96,7 +95,7 @@ pub const RttCache = struct {
         var shards: [shard_count]Shard = undefined;
         for (&shards) |*s| s.* = .{
             .entries = EntryMap.init(cfg.allocator),
-            .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
+            .rwlock = .init,
         };
         return .{
             .shards = shards,
@@ -118,8 +117,8 @@ pub const RttCache = struct {
 
     pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
         const shard = self.shardFor(key);
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
 
         const state = shard.entries.get(key) orelse return initial_timeout_ms;
         return computeTimeout(state);
@@ -128,8 +127,8 @@ pub const RttCache = struct {
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
         const now_ms = self.now_fn();
         const shard = self.shardFor(key);
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
 
         const gop = shard.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -166,8 +165,8 @@ pub const RttCache = struct {
     /// even for entries with stale samples.
     pub fn getHedgeStagger(self: *RttCache, key: AddressKey) u32 {
         const shard = self.shardFor(key);
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
 
         const state = shard.entries.get(key) orelse return hedge_cold_default_ms;
         if (state.min_rtt_us <= 0) return hedge_cold_default_ms;
@@ -179,8 +178,8 @@ pub const RttCache = struct {
 
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
         const shard = self.shardFor(key);
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
 
         const gop = shard.entries.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -227,8 +226,8 @@ pub const RttCache = struct {
     /// shape Do53 estimates, but must break the one-way timeout ratchet).
     pub fn recordAlive(self: *RttCache, key: AddressKey) void {
         const shard = self.shardFor(key);
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
         const state = shard.entries.getPtr(key) orelse return;
         revive(shard, state);
     }
@@ -236,8 +235,8 @@ pub const RttCache = struct {
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardFor(key);
         if (shard.dead_marked.v.load(.monotonic) == 0) return false;
-        if (shard.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlockShared(self.io);
+        shard.rwlock.lockSharedUncancelable(self.io);
+        defer shard.rwlock.unlockShared(self.io);
         const state = shard.entries.get(key) orelse return false;
         return state.consecutive_timeouts >= dead_threshold and state.dead_until_ms > now_ms;
     }
@@ -247,8 +246,8 @@ pub const RttCache = struct {
     pub fn admit(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardFor(key);
         if (shard.dead_marked.v.load(.monotonic) == 0) return true;
-        if (shard.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (shard.rwlock) |*rw| rw.unlock(self.io);
+        shard.rwlock.lockUncancelable(self.io);
+        defer shard.rwlock.unlock(self.io);
         const state = shard.entries.getPtr(key) orelse return true;
         if (state.consecutive_timeouts < dead_threshold) return true;
         if (state.dead_until_ms > now_ms) return false;
@@ -358,7 +357,6 @@ test "concurrent inserts under cap pressure stay bounded" {
     var cache = RttCache.init(.{
         .allocator = testing.allocator,
         .io = testing.io,
-        .thread_safe = true,
         .max_entries = 64,
     });
     defer cache.deinit();

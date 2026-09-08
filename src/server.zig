@@ -312,7 +312,6 @@ pub const Server = struct {
         // (RRsetCache's own tests always used `testing.allocator`). The shipped
         // binary is unaffected: it links no libc, so ReleaseFast resolves
         // `init.gpa` to `smp_allocator`, exactly what was hardcoded here.
-        const thread_safe = !builtin.single_threaded;
         // Cache readers = recv workers + their resolution-thread pools; both
         // caches size their shards from this.
         const reader_concurrency: u32 = @as(u32, cfg.workers) * (1 + @as(u32, cfg.resolution_threads));
@@ -331,14 +330,12 @@ pub const Server = struct {
         var rtt_cache = RttCache.init(.{
             .allocator = allocator,
             .io = io,
-            .thread_safe = thread_safe,
         });
         errdefer rtt_cache.deinit();
 
         var ns_selector = NsSelector.init(.{
             .allocator = allocator,
             .io = io,
-            .thread_safe = thread_safe,
         });
         errdefer ns_selector.deinit();
 
@@ -360,7 +357,6 @@ pub const Server = struct {
                 .backing = allocator,
                 .max_bytes = NsecCache.default_max_bytes,
                 .io = io,
-                .thread_safe = thread_safe,
             }) else null,
             .key_cache = if (cfg.dnssec) RRsetCache.init(.{
                 .backing = allocator,

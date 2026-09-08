@@ -267,7 +267,7 @@ pub const SynthResult = struct {
 
 pub const NsecCache = struct {
     zones: std.StringHashMapUnmanaged(ZoneNsecList),
-    rwlock: ?std.Io.RwLock,
+    rwlock: std.Io.RwLock,
     io: std.Io,
     counting: CountingAllocator,
     now_fn: *const fn () i64,
@@ -283,13 +283,12 @@ pub const NsecCache = struct {
         backing: Allocator,
         max_bytes: usize,
         io: std.Io,
-        thread_safe: bool = false,
     };
 
     pub fn init(cfg: Config) NsecCache {
         return .{
             .zones = .empty,
-            .rwlock = if (cfg.thread_safe) std.Io.RwLock.init else null,
+            .rwlock = .init,
             .io = cfg.io,
             .counting = CountingAllocator.init(cfg.backing, cfg.max_bytes, .slot),
             .now_fn = &@import("monotonic.zig").nowSec,
@@ -360,8 +359,8 @@ pub const NsecCache = struct {
         // Clone SOA outside lock for synthesized responses (RFC 2308 §3)
         var cached_soa: ?dns.ResourceRecord = if (soa_rr) |sr| cloneRecord(alloc, sr) catch null else null;
 
-        if (self.rwlock) |*rw| rw.lockUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlock(self.io);
+        self.rwlock.lockUncancelable(self.io);
+        defer self.rwlock.unlock(self.io);
 
         const list = self.getOrCreateZone(alloc, zone_lower) orelse {
             for (cloned[0..clone_count]) |*e| freeEntry(alloc, e);
@@ -421,8 +420,8 @@ pub const NsecCache = struct {
         var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name_lower = dns.lowerNameIntoBuf(&lower_buf, dotted_name);
 
-        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
 
         // Check the full name as a zone (handles apex NODATA, e.g. query
         // for example.com when zone "example.com" has a matching NSEC).
@@ -499,11 +498,9 @@ pub const NsecCache = struct {
                 // query must follow (RFC 1034 §3.6.2, RFC 4035 §2.5).
                 if (dnssec.bitmapContradictsNodata(nsec.type_bit_maps, qtype))
                     return null;
-                break :nodata blk: {
-                    proof_refs[0] = nsec;
-                    proof_ref_count = 1;
-                    break :blk .{ .nodata, 0 };
-                };
+                proof_refs[0] = nsec;
+                proof_ref_count = 1;
+                break :nodata .{ .nodata, 0 };
             },
         };
         var soa = cloneRecord(caller_alloc, cached_soa.*) catch return null;
@@ -518,8 +515,8 @@ pub const NsecCache = struct {
     }
 
     pub fn getStats(self: *NsecCache) struct { hits: u64, misses: u64, zones: usize, memory_bytes: usize } {
-        if (self.rwlock) |*rw| rw.lockSharedUncancelable(self.io);
-        defer if (self.rwlock) |*rw| rw.unlockShared(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
         return .{
             .hits = self.hits.load(.monotonic),
             .misses = self.misses.load(.monotonic),
@@ -715,6 +712,8 @@ test "NSEC cache: NODATA synthesis" {
     defer dns.freeName(alloc, qname);
     try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .txt, "test.example.com"), .nodata);
     try testing.expect(nc.lookupSuffixes(alloc, qname, .a, "test.example.com") == null);
+    // The apex itself.
+    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .txt, "example.com"), .nodata);
 }
 
 test "NSEC cache: NXDOMAIN synthesis" {
@@ -985,22 +984,7 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
 
     // Zone has: example.com NSEC *.example.com, *.example.com NSEC z.example.com
     // The wildcard exists, so NXDOMAIN must not be synthesized.
-    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A, MX
-    const soa_rr = try testSoa(alloc);
-    defer freeSoa(alloc, soa_rr);
-    const apex_owner = try dns.parseDottedName(alloc, "example.com");
-    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
-    const z_name = try dns.parseDottedName(alloc, "z.example.com");
-    defer dns.freeName(alloc, apex_owner);
-    defer dns.freeName(alloc, wc_name);
-    defer dns.freeName(alloc, z_name);
-
-    nc.storeFromAuthority(&.{
-        soa_rr,
-        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
-        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone, std.math.maxInt(u32));
+    try storeWildcardZone(alloc, &nc, &.{ 0, 2, 0x40, 0x01 }); // A, MX
 
     // "foo.example.com" — name doesn't exist, wildcard exists with A
     // → wildcard_match (not NXDOMAIN). Caller synthesizes from RRset cache.
@@ -1010,31 +994,6 @@ test "NSEC cache: wildcard existence blocks NXDOMAIN" {
     defer freeSynth(alloc, &result);
     try testing.expectEqual(SynthResult.Kind.wildcard_match, result.kind);
     try testing.expect(result.ce_label_count > 0);
-}
-
-test "NSEC cache: apex NODATA via full-name zone check" {
-    const alloc = testing.allocator;
-    test_time = 1000000;
-    var nc = testCache(alloc);
-    defer nc.deinit();
-
-    const bitmap = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 }; // A, NS, SOA, MX, RRSIG, NSEC, DNSKEY
-    const soa_rr = try testSoa(alloc);
-    defer freeSoa(alloc, soa_rr);
-    const nsec_owner = try dns.parseDottedName(alloc, "example.com");
-    const nsec_next = try dns.parseDottedName(alloc, "mail.example.com");
-    defer dns.freeName(alloc, nsec_owner);
-    defer dns.freeName(alloc, nsec_next);
-
-    nc.storeFromAuthority(&.{
-        soa_rr,
-        .{ .name = nsec_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = nsec_next, .type_bit_maps = bitmap } } },
-    }, example_zone, std.math.maxInt(u32));
-
-    // Query for the zone apex itself — dotted_name == zone name
-    const qname = try dns.parseDottedName(alloc, "example.com");
-    defer dns.freeName(alloc, qname);
-    try expectSynth(alloc, nc.lookupSuffixes(alloc, qname, .txt, "example.com"), .nodata);
 }
 
 test "NSEC cache: bailiwick check rejects out-of-zone NSECs" {
@@ -1168,16 +1127,9 @@ test "NSEC cache: parent-zone depth check prevents cross-zone coverage" {
     try testing.expect(nc.lookupSuffixes(alloc, deep_name, .ds, "nnn.example.com") == null);
 }
 
-test "NSEC cache: wildcard NODATA synthesis" {
-    const alloc = testing.allocator;
-    test_time = 1000000;
-    var nc = testCache(alloc);
-    defer nc.deinit();
-
-    // Zone has: example.com NSEC *.example.com, *.example.com NSEC z.example.com
-    // Wildcard exists with A and MX but NOT TXT
+/// example.com NSEC *.example.com (apex bitmap), *.example.com NSEC z.example.com (`bitmap_wc`).
+fn storeWildcardZone(alloc: Allocator, nc: *NsecCache, bitmap_wc: []const u8) !void {
     const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A, MX
     const soa_rr = try testSoa(alloc);
     defer freeSoa(alloc, soa_rr);
     const apex_owner = try dns.parseDottedName(alloc, "example.com");
@@ -1186,12 +1138,20 @@ test "NSEC cache: wildcard NODATA synthesis" {
     defer dns.freeName(alloc, apex_owner);
     defer dns.freeName(alloc, wc_name);
     defer dns.freeName(alloc, z_name);
-
     nc.storeFromAuthority(&.{
         soa_rr,
         .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
         .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
     }, example_zone, std.math.maxInt(u32));
+}
+
+test "NSEC cache: wildcard NODATA synthesis" {
+    const alloc = testing.allocator;
+    test_time = 1000000;
+    var nc = testCache(alloc);
+    defer nc.deinit();
+
+    try storeWildcardZone(alloc, &nc, &.{ 0, 2, 0x40, 0x01 }); // A, MX
 
     // "foo.example.com" doesn't exist, wildcard exists but lacks TXT → NODATA
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
@@ -1206,22 +1166,7 @@ test "NSEC cache: wildcard match returns wildcard_match" {
     defer nc.deinit();
 
     // Wildcard has A (bitmap includes type 1)
-    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 2, 0x40, 0x01 }; // A=1, MX=15 present
-    const soa_rr = try testSoa(alloc);
-    defer freeSoa(alloc, soa_rr);
-    const apex_owner = try dns.parseDottedName(alloc, "example.com");
-    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
-    const z_name = try dns.parseDottedName(alloc, "z.example.com");
-    defer dns.freeName(alloc, apex_owner);
-    defer dns.freeName(alloc, wc_name);
-    defer dns.freeName(alloc, z_name);
-
-    nc.storeFromAuthority(&.{
-        soa_rr,
-        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
-        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone, std.math.maxInt(u32));
+    try storeWildcardZone(alloc, &nc, &.{ 0, 2, 0x40, 0x01 }); // A=1, MX=15 present
 
     // "foo.example.com" A — wildcard has A → wildcard_match
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
@@ -1296,22 +1241,7 @@ test "NSEC cache: wildcard CNAME suppression" {
     defer nc.deinit();
 
     // Wildcard bitmap has CNAME(5) — query for A should return unknown (follow CNAME upstream)
-    const bitmap_zone = &[_]u8{ 0, 7, 0x62, 0x01, 0x00, 0x00, 0x00, 0x03, 0x80 };
-    const bitmap_wc = &[_]u8{ 0, 6, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03 }; // CNAME(5), RRSIG(46), NSEC(47)
-    const soa_rr = try testSoa(alloc);
-    defer freeSoa(alloc, soa_rr);
-    const apex_owner = try dns.parseDottedName(alloc, "example.com");
-    const wc_name = try dns.parseDottedName(alloc, "*.example.com");
-    const z_name = try dns.parseDottedName(alloc, "z.example.com");
-    defer dns.freeName(alloc, apex_owner);
-    defer dns.freeName(alloc, wc_name);
-    defer dns.freeName(alloc, z_name);
-
-    nc.storeFromAuthority(&.{
-        soa_rr,
-        .{ .name = apex_owner, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = wc_name, .type_bit_maps = bitmap_zone } } },
-        .{ .name = wc_name, .rtype = .nsec, .rclass = .in, .ttl = 3600, .rdata = .{ .nsec = .{ .next_domain_name = z_name, .type_bit_maps = bitmap_wc } } },
-    }, example_zone, std.math.maxInt(u32));
+    try storeWildcardZone(alloc, &nc, &.{ 0, 6, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03 }); // CNAME(5), RRSIG(46), NSEC(47)
 
     // A query when wildcard has CNAME → must NOT synthesize (follow CNAME upstream)
     const qname = try dns.parseDottedName(alloc, "foo.example.com");
