@@ -185,30 +185,18 @@ test "leader for new key" {
     try testing.expectEqual(@as(u32, 0), table.count());
 }
 
-test "different qtypes are independent" {
+test "qtype, name and flags each partition the table" {
     var table = InFlightTable.init(testing.allocator, testing.io);
     defer table.deinit();
 
-    const r1 = table.acquireOrWait("example.com", .a, 0);
-    const r2 = table.acquireOrWait("example.com", .aaaa, 0);
-    try testing.expectEqual(.leader, r1);
-    try testing.expectEqual(.leader, r2);
-
-    table.releaseLeader("example.com", .a, 0);
-    table.releaseLeader("example.com", .aaaa, 0);
-}
-
-test "different names are independent" {
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    const r1 = table.acquireOrWait("a.example.com", .a, 0);
-    const r2 = table.acquireOrWait("b.example.com", .a, 0);
-    try testing.expectEqual(.leader, r1);
-    try testing.expectEqual(.leader, r2);
-
-    table.releaseLeader("a.example.com", .a, 0);
-    table.releaseLeader("b.example.com", .a, 0);
+    const keys = [_]struct { name: []const u8, qtype: dns.RType, flags: u8 }{
+        .{ .name = "example.com", .qtype = .a, .flags = 0 },
+        .{ .name = "example.com", .qtype = .aaaa, .flags = 0 },
+        .{ .name = "b.example.com", .qtype = .a, .flags = 0 },
+        .{ .name = "example.com", .qtype = .a, .flags = flag_internal },
+    };
+    for (keys) |k| try testing.expectEqual(.leader, table.acquireOrWait(k.name, k.qtype, k.flags));
+    for (keys) |k| table.releaseLeader(k.name, k.qtype, k.flags);
 }
 
 test "case insensitive dedup" {
@@ -265,19 +253,6 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
     const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, monotonic.nowNs());
     try testing.expectEqual(.follower, r);
     table.releaseLeader("example.com", .a, 0);
-}
-
-test "different flags are independent" {
-    var table = InFlightTable.init(testing.allocator, testing.io);
-    defer table.deinit();
-
-    const r1 = table.acquireOrWait("example.com", .a, 0);
-    const r2 = table.acquireOrWait("example.com", .a, flag_internal);
-    try testing.expectEqual(.leader, r1);
-    try testing.expectEqual(.leader, r2);
-
-    table.releaseLeader("example.com", .a, 0);
-    table.releaseLeader("example.com", .a, flag_internal);
 }
 
 test "CD bit partitions dedup groups" {

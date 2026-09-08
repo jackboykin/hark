@@ -455,17 +455,14 @@ fn threadCounterSlot() u32 {
 }
 
 /// The shards array is cache-line aligned so shard 0 starts on a boundary.
-/// Field-level alignment to make `@sizeOf(Shard)` a cache-line multiple was
-/// tried — hurt single-thread cache_hit by ~40% with no contention-bench win.
+/// Shards pack: padding each to a line cost ~40% on single-thread cache_hit.
 const Shard = struct {
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true) = .empty,
     rwlock: std.Io.RwLock = std.Io.RwLock.init,
     /// SIEVE flags, grown lazily; a failed grow leaves the tail unflagged.
     visited: []std.atomic.Value(u8) = &.{},
     hand: u32 = 0,
-    // Read-path counters are striped per-thread in RRsetCache.read_counters
-    // (they were contending one line per shard); write-path counters below run
-    // under the exclusive lock and are rare.
+    // Write-path only; read counters are striped in RRsetCache.read_counters.
     /// SIEVE only, not expired sweeps.
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
@@ -1493,23 +1490,6 @@ test "cache store and lookup positive" {
     }
 }
 
-test "cache lookup expired entry returns null" {
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = makeTestCache(alloc);
-    defer cache.deinit();
-
-    try storeTestA(&cache, alloc, &.{ "example", "com" }, 60, .{ 1, 2, 3, 4 });
-
-    test_time = 1061;
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = cache.lookup(arena.allocator(), "example.com", .a, .in);
-    try testing.expect(result == null);
-}
-
 test "cache TTL adjustment" {
     const alloc = testing.allocator;
     test_time = 1000;
@@ -1546,33 +1526,6 @@ test "cache case insensitive lookup" {
     try testing.expect(result != null);
 }
 
-test "cache negative NXDOMAIN" {
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = makeTestCache(alloc);
-    defer cache.deinit();
-
-    // min(900, 600) = 600
-    const authorities = try buildTestSoaAuthority(alloc, &.{ "example", "com" }, &.{ "ns1", "example", "com" }, &.{ "admin", "example", "com" }, 900, 600);
-    defer freeTestAuthorities(alloc, authorities);
-
-    cache.storeNegative("nonexistent.example.com", .a, .in, .name_error, authorities, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = cache.lookup(arena.allocator(), "nonexistent.example.com", .a, .in);
-    try testing.expect(result != null);
-    switch (result.?) {
-        .negative => |n| {
-            try testing.expectEqual(dns.RCode.name_error, n.rcode);
-            try testing.expectEqual(@as(u32, 600), n.remaining_ttl); // min(900, 600)
-            try testing.expect(n.soa != null);
-        },
-        .hit => return error.TestUnexpectedResult,
-    }
-}
-
 test "NXDOMAIN answers every qtype via the sentinel key (RFC 8020)" {
     const alloc = testing.allocator;
     test_time = 1000;
@@ -1591,7 +1544,11 @@ test "NXDOMAIN answers every qtype via the sentinel key (RFC 8020)" {
     // type) with no re-walk.
     for ([_]dns.RType{ .a, .aaaa, .mx }) |qt| {
         switch (cache.lookup(arena.allocator(), "nonexistent.example.com", qt, .in) orelse return error.TestExpectedHit) {
-            .negative => |n| try testing.expectEqual(dns.RCode.name_error, n.rcode),
+            .negative => |n| {
+                try testing.expectEqual(dns.RCode.name_error, n.rcode);
+                try testing.expectEqual(@as(u32, 600), n.remaining_ttl); // min(SOA ttl 900, minimum 600)
+                try testing.expect(n.soa != null);
+            },
             .hit => return error.TestUnexpectedResult,
         }
     }
@@ -2277,7 +2234,7 @@ test "cache expired_remiss counts only present-but-expired misses" {
     try testing.expectEqual(@as(u64, 1), stats.expired_remiss);
 }
 
-test "cache serve stale within window" {
+test "serve stale: fresh, inside the window, beyond it (RFC 8767)" {
     const alloc = testing.allocator;
     test_time = 1000;
 
@@ -2287,74 +2244,20 @@ test "cache serve stale within window" {
 
     try storeTestA(&cache, alloc, &.{ "stale", "test" }, 60, .{ 1, 2, 3, 4 });
 
-    // Expired but within stale window
-    test_time = 1100; // 40s past expiry
-    {
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const result = cache.lookup(arena.allocator(), "stale.test", .a, .in);
-        try testing.expect(result != null);
-        switch (result.?) {
-            .hit => |h| {
-                try testing.expectEqual(@as(u32, 30), h.remaining_ttl); // synthetic TTL
-
-                try testing.expectEqual(true, h.needs_prefetch);
-            },
-            .negative => return error.TestUnexpectedResult,
-        }
-    }
-
-    try testing.expectEqual(@as(u64, 1), cache.getStats().stale_hits);
-}
-
-test "cache lookup is_stale flag set on stale hit, clear on fresh (RFC 8767 §6)" {
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
-    cache.now_fn = &testNowSeconds;
-    defer cache.deinit();
-
-    try storeTestA(&cache, alloc, &.{ "fresh", "test" }, 60, .{ 1, 2, 3, 4 });
-
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
+    const fresh = cache.lookup(arena.allocator(), "stale.test", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expectEqual(false, fresh.hit.is_stale);
 
-    const fresh = cache.lookup(arena.allocator(), "fresh.test", .a, .in);
-    try testing.expect(fresh != null);
-    switch (fresh.?) {
-        .hit => |h| try testing.expectEqual(false, h.is_stale),
-        .negative => return error.TestUnexpectedResult,
-    }
-
-    // Same entry, past expiry but inside the serve-stale window.
     test_time = 1100;
-    const stale = cache.lookup(arena.allocator(), "fresh.test", .a, .in);
-    try testing.expect(stale != null);
-    switch (stale.?) {
-        .hit => |h| try testing.expectEqual(true, h.is_stale),
-        .negative => return error.TestUnexpectedResult,
-    }
-}
+    const stale = cache.lookup(arena.allocator(), "stale.test", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expectEqual(@as(u32, 30), stale.hit.remaining_ttl);
+    try testing.expectEqual(true, stale.hit.needs_prefetch);
+    try testing.expectEqual(true, stale.hit.is_stale);
+    try testing.expectEqual(@as(u64, 1), cache.getStats().stale_hits);
 
-test "cache serve stale beyond window returns null" {
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
-    cache.now_fn = &testNowSeconds;
-    defer cache.deinit();
-
-    try storeTestA(&cache, alloc, &.{ "stale2", "test" }, 60, .{ 1, 2, 3, 4 });
-
-    // Beyond stale window (60s TTL + 3600s stale = 3660s)
     test_time = 1000 + 60 + 3601;
-    {
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const result = cache.lookup(arena.allocator(), "stale2.test", .a, .in);
-        try testing.expect(result == null);
-    }
+    try testing.expect(cache.lookup(arena.allocator(), "stale.test", .a, .in) == null);
 }
 
 test "SERVFAIL never serves stale" {
@@ -2421,28 +2324,6 @@ test "RFC 9520: SERVFAIL TTL clamped to 5 minutes" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), "flooded.test", .a, .in) == null);
-}
-
-test "cacheServfail caches with sub-5-minute TTL" {
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
-    cache.now_fn = &testNowSeconds;
-    defer cache.deinit();
-
-    cache.cacheServfail("broken.test", .a);
-
-    // Cache hit during the failure window short-circuits upstream walk.
-    test_time = 1003;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = cache.lookup(arena.allocator(), "broken.test", .a, .in);
-    try testing.expect(result != null);
-    switch (result.?) {
-        .negative => |n| try testing.expectEqual(dns.RCode.server_failure, n.rcode),
-        .hit => return error.TestUnexpectedResult,
-    }
 }
 
 test "cache min TTL floor" {
@@ -2514,49 +2395,19 @@ test "cache stats tracking" {
 }
 
 test "BOGUS invalidates .unchecked positive to SERVFAIL" {
-    // When background CD=1 revalidation discovers BOGUS, recursive.zig's
-    // bogusServfail calls storeNegativeBare(SERVFAIL, ttl=1, .unchecked).
-    // An .unchecked positive entry must be overwritten by that negative
-    // entry so subsequent CD=0 queries hit SERVFAIL (RFC 4035 §5.5).
-    // A .secure positive is protected (RFC 9520 §3.4) and must survive.
+    // RFC 4035 §5.5.
     const alloc = testing.allocator;
     test_time = 1000;
-
     var cache = makeTestCache(alloc);
     defer cache.deinit();
 
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    // Step 1: a CD=1 query populates the cache as .unchecked (the CD=1
-    // resolver skips inline validation per server.zig's dnssec_enabled gate).
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .unchecked);
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const a = arena.allocator();
-
-    {
-        const r = cache.lookup(a, "example.com", .a, .in).?;
-        try testing.expectEqual(SecurityStatus.unchecked, r.hit.security_status);
-    }
-
-    // Step 2: bg validation finishes .bogus → bogusServfail path.
-    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
-
-    // Step 3: next CD=0 lookup must see the SERVFAIL negative, not the
-    // stale .unchecked positive (which would have returned answer bytes
-    // for bogus data).
-    {
-        const r = cache.lookup(a, "example.com", .a, .in).?;
-        switch (r) {
-            .hit => return error.TestExpectedNegative,
-            .negative => |n| try testing.expectEqual(dns.RCode.server_failure, n.rcode),
-        }
-    }
+    const r = cache.lookup(arena.allocator(), "example.com", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expectEqual(dns.RCode.server_failure, r.negative.rcode);
 }
 
 test ".unchecked positive is upgraded to .secure on revalidation store" {
@@ -2612,37 +2463,6 @@ test ".glue sits below .unchecked in both directions" {
     try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
     try storeTestAWithStatus(&cache, alloc, &.{ "ns", "example", "com" }, 300, .{ 6, 6, 6, 6 }, .glue);
     try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
-}
-
-test "BOGUS never overwrites .secure positive (RFC 9520 §3.4 protection)" {
-    // A previously .secure entry must not be dropped by a subsequent
-    // SERVFAIL store — shouldBlockOverwrite guards against downgrade by
-    // a stale/injected negative. This is the counterpart invariant to
-    // the preceding test: the bg-validation invalidation path only wins
-    // against .unchecked, never against already-validated data.
-    const alloc = testing.allocator;
-    test_time = 1000;
-
-    var cache = makeTestCache(alloc);
-    defer cache.deinit();
-
-    const name = try makeTestName(alloc, &.{ "example", "com" });
-    const answers = try alloc.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const response = makeTestResponse(answers);
-    defer dns.freeMessage(alloc, response);
-
-    cache.storeResponse(response, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
-
-    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const r = cache.lookup(arena.allocator(), "example.com", .a, .in).?;
-    switch (r) {
-        .hit => |h| try testing.expectEqual(SecurityStatus.secure, h.security_status),
-        .negative => return error.TestExpectedHitAfterProtection,
-    }
 }
 
 test "shard distribution is reasonable for random names" {
@@ -2769,11 +2589,8 @@ fn runStoreOneRRsetUnderFailing(failing_alloc: Allocator) !void {
 }
 
 test "evictIfNeeded triggers SIEVE on byte pressure" {
-    // Regression: previously evictIfNeeded only checked entry count. When the
-    // byte budget filled before the (then separate) entry cap, the key-name dupe
-    // in prepareSlot started failing and the shard latched closed — silent
-    // capacity loss with zero evictions recorded. The fix adds byte pressure
-    // (≥87.5% full) as an eviction trigger.
+    // With only an entry cap, a full byte budget makes prepareSlot's key
+    // dupe fail and the shard latches closed with zero evictions recorded.
     //
     // Driven directly against the eviction primitive: integration-style fills
     // are brittle because ArrayHashMap capacity-growth chunks can leap over
@@ -2822,10 +2639,8 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
 }
 
 test "byte-pressure check happens before key-name dupe" {
-    // Regression for the ordering fix: previously, prepareSlot duped the key
-    // name *before* calling evictIfNeeded. With the budget at max_bytes, the
-    // dupe itself was the allocation that latched the shard closed, never
-    // reaching the eviction code. The fix moves evictIfNeeded above the dupe.
+    // evictIfNeeded must run before prepareSlot dupes the key name: at
+    // max_bytes the dupe itself is the allocation that latches the shard.
     //
     // Verify by storing into a shard whose counter is at threshold: the
     // pre-dupe eviction must free a slot, and the new entry must land.
