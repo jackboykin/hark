@@ -306,12 +306,6 @@ pub const Server = struct {
         dedup_mod.randomizeHashSeed(io);
         na.randomizeHashSeed(io);
 
-        // The caches used to hardcode `std.heap.smp_allocator`, so the largest
-        // region in the process escaped whatever checking allocator the caller
-        // supplied — the server tests and a ReleaseSafe soak both saw nothing
-        // (RRsetCache's own tests always used `testing.allocator`). The shipped
-        // binary is unaffected: it links no libc, so ReleaseFast resolves
-        // `init.gpa` to `smp_allocator`, exactly what was hardcoded here.
         // Cache readers = recv workers + their resolution-thread pools; both
         // caches size their shards from this.
         const reader_concurrency: u32 = @as(u32, cfg.workers) * (1 + @as(u32, cfg.resolution_threads));
@@ -1798,9 +1792,6 @@ test "classifySignalRead: only a real TERM/INT record may stop the process" {
 }
 
 test "classifySignalRead: an unreadable or unrecognised completion is ignored, not a shutdown" {
-    // Regression: every one of these returned .shutdown and the caller
-    // exited the process.
-
     // Zero-length read. reap maps cqe.res == 0 to EndOfFile, so this is
     // covered by the err check, but pin the payload shape too.
     try testing.expectEqual(SignalAction.ignore, classifySignalRead(signalReadOf(&.{})));

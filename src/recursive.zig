@@ -4789,13 +4789,9 @@ test "tryParseMessage lowercases SOA mname AND rname via compression pointers" {
 }
 
 test "tryParseMessage preserves NSEC next_domain_name case via compression pointer" {
-    // RFC 6840 §5.1: NSEC RDATA names are NOT case-folded when canonicalizing.
-    // This test used to assert the opposite, on the theory that
-    // upstream-chosen case leaking to DO=1 clients was the hazard. It is the
-    // other way round: those bytes are what the signature covers, so folding
-    // them breaks verification here *and* for any client validating the
-    // answer we forward. NSEC RDATA rides out of aggressive
-    // negative-synthesis answers verbatim via `nsecEntryToRecord`.
+    // RFC 6840 §5.1: the signature covers NSEC RDATA bytes as-is, so folding
+    // breaks verification here and downstream (`nsecEntryToRecord` forwards
+    // them verbatim).
     //
     // The compression-pointer shape is the interesting one: the name is not
     // written inline, so preserving case must not degrade into preserving the

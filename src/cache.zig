@@ -706,9 +706,8 @@ pub const RRsetCache = struct {
     }
 
     /// RFC 8020: NXDOMAIN at an ancestor proves all names beneath are also
-    /// non-existent. `lookup` folds in the sentinel key, so an ancestor
-    /// NXDOMAIN cached under any qtype cuts here regardless of `rtype` —
-    /// never false-cuts, no longer qtype-blind. Non-secure only; signed-zone
+    /// non-existent. Probes the RFC 8020 sentinel key only, so an ancestor
+    /// NXDOMAIN cached under any qtype cuts here. Non-secure only; signed-zone
     /// cuts go through the RFC 8198 NSEC aggressive-use cache.
     pub fn lookupNxdomainAncestor(
         self: *RRsetCache,
