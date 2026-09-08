@@ -384,7 +384,6 @@ pub const Server = struct {
         return .{
             .config = &self.config,
             .io = self.io,
-            .gpa = self.allocator,
             .cache = &self.cache,
             .rtt_cache = &self.rtt_cache,
             .ns_selector = &self.ns_selector,

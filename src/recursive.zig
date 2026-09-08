@@ -75,14 +75,10 @@ pub const root_hints_default: [26]na.Address = .{
 const max_global_queries = 100;
 // PowerDNS max-total-msec; Knot/BIND 10s.
 const max_resolve_ms: u32 = 7_000;
-// Sizes `seen_zones` and bounds the per-cross-zone-walk delegation count.
-// Real DNS depth tops out around 5; 16 covers QMIN-with-referrals stacks
-// without giving up loop-detection.
+// Real depth tops out near 5; 16 covers QMIN-with-referrals stacks.
 const max_delegations = 16;
 const max_servers_per_level = 26;
-// Total CNAME hops per resolveImpl call. Bumped from 8 to clear the same
-// 8-hop CDN chain (Akamai/edgesuite stacks); matches PowerDNS post-fix
-// and Hickory.
+// Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
 const max_cname_chain = 16;
 // QMIN probe ceiling; past it, queries go straight to the full qname
 // (RFC 9156's MAX_MINIMISE_COUNT).
@@ -162,14 +158,8 @@ fn tryParseMessage(allocator: mem.Allocator, data: []const u8, server: na.Addres
     // so garbage doesn't pay for name clones.
     if (!msg.header.flags.qr) return null;
 
-    // RFC 4035 §3.2.3: AD is a validator's *output*. Authoritative servers
-    // have no business setting it, but Route 53 sets it on every DO=1 reply,
-    // including for zones with no DS at all — and hark carried the bit
-    // through resolution into the client reply (response.zig only ANDs it
-    // with the client's DO/AD bit). Every unsigned domain on Route 53 was
-    // therefore answered "DNSSEC-authenticated". hark's own verdict re-sets
-    // the bit in validateAnswer and the negative-proof paths; nothing
-    // upstream may.
+    // RFC 4035 §3.2.3: AD is a validator's output, and Route 53 sets it on
+    // every DO=1 reply. Only hark's own verdict may set it.
     msg.header.flags.ad = false;
 
     // `@constCast` is sound — parseMessage returns ArrayList-backed
@@ -280,8 +270,8 @@ pub const RecursiveResolver = struct {
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
     tcp_pool: ?*TcpConnectionPool = null,
-    /// Persistent allocator for helper thread arenas (parallel NS resolution).
-    gpa: ?mem.Allocator = null,
+    /// Parallel NS-address resolution on helper threads. Off inside helpers.
+    fanout: bool = false,
     /// Per-resolution memory cap: the main query arena and each NS-fanout
     /// helper arena independently. Above legitimate signed traffic (~350 KiB),
     /// below the 2 MiB wire ceiling (32 upstream × 64 KiB) — a stuffing
@@ -329,7 +319,6 @@ pub const RecursiveResolver = struct {
     pub const Context = struct {
         config: *const ServerConfig,
         io: std.Io,
-        gpa: mem.Allocator,
         cache: *RRsetCache,
         rtt_cache: *RttCache,
         ns_selector: *NsSelector,
@@ -380,7 +369,7 @@ pub const RecursiveResolver = struct {
             .dedup = ctx.dedup,
             .tcp_pool = ctx.tcp_pool,
             .pool = ctx.pool,
-            .gpa = ctx.gpa,
+            .fanout = true,
             .query_memory_limit = ctx.config.query_memory_limit,
             .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
             .key_cache = if (ctx.config.dnssec) ctx.key_cache else null,
@@ -393,7 +382,7 @@ pub const RecursiveResolver = struct {
         std.debug.assert(!self.cache_only); // clone implies real upstream work
         var resolver = self.*;
         resolver.transports = transports;
-        resolver.gpa = null;
+        resolver.fanout = false;
         resolver.scratch = .{};
         // `budget` is deliberately not reset: clones share the parent's counters.
         // A per-clone reset reopens fan-out amplification (NXNS, KeyTrap).
@@ -563,8 +552,7 @@ pub const RecursiveResolver = struct {
         zone: dns.Name = .{ .labels = &.{} },
         addrs: [max_servers_per_level]na.Address = undefined,
         addr_count: usize = 0,
-        seen_zones: [max_delegations]dns.Name = undefined,
-        seen_zone_count: usize = 0,
+        delegations: usize = 0,
         /// RFC 9156 probe depth: labels of `target` sent in the next query.
         /// Equal to `target.labels.len` means the full name goes out.
         probe_labels: usize = 0,
@@ -657,7 +645,7 @@ pub const RecursiveResolver = struct {
 
                 if (!is_final) {
                     total_probes += 1;
-                    if (self.probeAnsweredFromCache(allocator, &walk, query_name, query_type)) continue;
+                    if (self.probeAnsweredFromCache(allocator, &walk, query_name)) continue;
                 }
 
                 try self.consumeQuery();
@@ -666,7 +654,7 @@ pub const RecursiveResolver = struct {
                 const responding_server = sqr.responding_server;
 
                 if (!is_final) {
-                    try self.handleProbeResponse(allocator, &walk, &security_state, response, query_name, query_type, depth);
+                    try self.handleProbeResponse(allocator, &walk, &security_state, response, query_name, depth);
                     // Flood or exhaustion classifies the delegation .bogus; fail
                     // closed here — a later CNAME hop would re-elevate it to
                     // .secure and serve unsigned.
@@ -692,7 +680,7 @@ pub const RecursiveResolver = struct {
                 self.probeParentChildCut(allocator, &walk, &response, &security_state);
 
                 if (response.header.flags.rcode != .no_error)
-                    return self.handleErrorResponse(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
+                    return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
                 if (response.answers.len > 0) {
                     switch (try self.followUpstreamCname(allocator, &walk, &response, qtype, security_state, responding_server, &cname_chain)) {
@@ -709,7 +697,7 @@ pub const RecursiveResolver = struct {
                 }
 
                 const referral = extractReferral(response, walk.target, walk.zone, self.referralPolicy()) orelse
-                    return self.finalizeNodata(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
+                    return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
                 if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
                 try self.followReferral(allocator, referral, response.authorities, depth, &security_state, &walk);
@@ -729,9 +717,9 @@ pub const RecursiveResolver = struct {
 
     /// Advance the probe from a cached answer, if any. Cached NXDOMAIN
     /// stops minimizing (relaxed mode); a hit or NODATA steps one label.
-    fn probeAnsweredFromCache(self: *RecursiveResolver, allocator: mem.Allocator, walk: *Walk, query_name: []const u8, query_type: dns.RType) bool {
+    fn probeAnsweredFromCache(self: *RecursiveResolver, allocator: mem.Allocator, walk: *Walk, query_name: []const u8) bool {
         const c = self.cache orelse return false;
-        const result = c.lookup(allocator, query_name, query_type, .in) orelse return false;
+        const result = c.lookup(allocator, query_name, .a, .in) orelse return false;
         if (result == .negative and result.negative.rcode == .name_error) walk.stopProbing() else walk.probe_labels += 1;
         return true;
     }
@@ -743,7 +731,6 @@ pub const RecursiveResolver = struct {
         security_state: *dnssec.SecurityStatus,
         response: dns.Message,
         query_name: []const u8,
-        query_type: dns.RType,
         depth: usize,
     ) !void {
         const rcode = response.header.flags.rcode;
@@ -767,9 +754,9 @@ pub const RecursiveResolver = struct {
             // `.insecure` is excluded too: Opt-Out leaves the name possibly an
             // unsigned delegation, too thin to cache against the full name.
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), query_type, true, walk.zone, walk.servers(), &neg_ttl_cap)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.zone, walk.servers(), &neg_ttl_cap)) {
                 .proceed => |status| if (status == .secure) {
-                    if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                    if (self.cache) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
                 },
                 .skip_cache, .bogus => {},
             }
@@ -786,9 +773,9 @@ pub const RecursiveResolver = struct {
 
         // NODATA: the name exists; cache the negative and advance.
         var neg_ttl_cap: u32 = std.math.maxInt(u32);
-        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), query_type, false, walk.zone, walk.servers(), &neg_ttl_cap)) {
+        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.zone, walk.servers(), &neg_ttl_cap)) {
             .proceed => |status| if (response.header.flags.aa) {
-                if (self.cache) |c| c.storeNegative(query_name, query_type, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                if (self.cache) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
             },
             .skip_cache => {},
             .bogus => return walk.stopProbing(),
@@ -1014,10 +1001,8 @@ pub const RecursiveResolver = struct {
                 // when we entered — so following is acceptable there.
                 if (h.is_stale and chain.hops == 0) return .none;
                 if (h.records.len == 0 or !h.security_status.answerable()) return .none;
-                // The redirect itself is aging. This was previously dropped
-                // on the floor — the CNAME RRset near expiry never triggered
-                // a refresh from the follow path, only from a direct
-                // (name, .cname) hit, which stub queries never produce.
+                // Stub queries never hit (name, .cname) directly, so this is
+                // the redirect's only refresh path.
                 if (h.needs_prefetch) self.scratch.chain_prefetch = true;
                 return .{ .follow_cname = .{
                     .redirect = .{
@@ -1186,15 +1171,9 @@ pub const RecursiveResolver = struct {
         else
             (try self.resolveNsAddresses(allocator, referral.nsNames(), depth)) orelse return error.NoGlueRecords;
 
-        // Depth cap first: cheaper than the dup-scan and prevents the
-        // OOB write at the bottom (seen_zones is sized to max_delegations).
-        if (walk.seen_zone_count >= max_delegations) return error.MaxDelegationsExceeded;
-        for (walk.seen_zones[0..walk.seen_zone_count]) |sz| {
-            if (sz.eql(zone_cut)) return error.ReferralLoop;
-        }
-        walk.seen_zones[walk.seen_zone_count] = zone_cut;
-        walk.seen_zone_count += 1;
-
+        // extractReferral only accepts strictly deeper cuts, so no loop check.
+        if (walk.delegations >= max_delegations) return error.MaxDelegationsExceeded;
+        walk.delegations += 1;
         walk.zone = zone_cut;
         walk.setServers(addrs.addrs[0..addrs.count]);
     }
@@ -1223,7 +1202,11 @@ pub const RecursiveResolver = struct {
     /// SERVFAIL/REFUSED routes through `cacheResolutionFailure`. Other
     /// rcodes (FORMERR, NOTIMP, …) fall through uncached — caller
     /// receives the raw response.
-    fn handleErrorResponse(
+    /// Any error rcode, or NOERROR with no answers and no referral. AA
+    /// NXDOMAIN/NODATA cache the proven negative; non-AA NODATA and
+    /// SERVFAIL/REFUSED go through `cacheResolutionFailure`; the rest pass
+    /// through uncached.
+    fn finalizeNegative(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         response: *dns.Message,
@@ -1235,11 +1218,12 @@ pub const RecursiveResolver = struct {
         chain: *const CnameChain,
     ) !ResolveResult {
         const current_name, const target_name, const parent_zone, const servers = .{ walk.name, walk.target, walk.zone, walk.servers() };
-        if (response.header.flags.rcode == .name_error and response.header.flags.aa) {
+        const rcode = response.header.flags.rcode;
+        if (response.header.flags.aa and (rcode == .name_error or rcode == .no_error)) {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, true, parent_zone, servers, &neg_ttl_cap)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, rcode == .name_error, parent_zone, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .name_error, response.authorities, parent_zone, status, neg_ttl_cap);
+                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, rcode, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, neg_ttl_cap);
@@ -1249,7 +1233,7 @@ pub const RecursiveResolver = struct {
                 .skip_cache => {},
                 .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
-        } else if (response.header.flags.rcode == .server_failure or response.header.flags.rcode == .refused) {
+        } else if (rcode == .no_error or rcode == .server_failure or rcode == .refused) {
             self.cacheResolutionFailure(name, qtype, depth);
         }
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
@@ -1295,43 +1279,6 @@ pub const RecursiveResolver = struct {
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
 
-    /// NODATA terminal (no answers, no referral). AA responses run the
-    /// verified-negative dance and cache the proven negative. Non-AA
-    /// responses route through `cacheResolutionFailure` — a
-    /// non-authoritative server returning empty without a referral can't
-    /// advance resolution.
-    fn finalizeNodata(
-        self: *RecursiveResolver,
-        allocator: mem.Allocator,
-        response: *dns.Message,
-        walk: *const Walk,
-        name: []const u8,
-        qtype: dns.RType,
-        depth: usize,
-        security_state: dnssec.SecurityStatus,
-        chain: *const CnameChain,
-    ) !ResolveResult {
-        const current_name, const target_name, const parent_zone, const servers = .{ walk.name, walk.target, walk.zone, walk.servers() };
-        if (response.header.flags.aa) {
-            var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, false, parent_zone, servers, &neg_ttl_cap)) {
-                .proceed => |status| {
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, .no_error, response.authorities, parent_zone, status, neg_ttl_cap);
-                    if (status == .secure) {
-                        response.header.flags.ad = true;
-                        self.storeNsec(response.authorities, neg_ttl_cap);
-                        try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
-                    }
-                },
-                .skip_cache => {},
-                .bogus => |why| return self.bogusServfail(current_name, qtype, why),
-            }
-        } else {
-            self.cacheResolutionFailure(name, qtype, depth);
-        }
-        return .{ .message = try withCnameChain(allocator, chain, response.*) };
-    }
-
     /// Determine delegation security for a zone cut (RFC 4035 §5.2).
     /// Tries verified NSEC/NSEC3 from referral authorities first, then
     /// falls back to cached/fetched DS status from parent servers.
@@ -1342,16 +1289,14 @@ pub const RecursiveResolver = struct {
         authorities: []const dns.ResourceRecord,
         parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
-        if (authorities.len > 0) {
-            var proof_ttl_cap: u32 = std.math.maxInt(u32);
-            const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap);
-            if (auth_status == .secure) {
-                const status = dnssec.classifyDelegation(authorities, zone_cut, dnssec.authoritySigner(authorities).?, self.validationBudget());
-                cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
-                return status;
-            }
-            if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
+        var proof_ttl_cap: u32 = std.math.maxInt(u32);
+        const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap);
+        if (auth_status == .secure) {
+            const status = dnssec.classifyDelegation(authorities, zone_cut, dnssec.authoritySigner(authorities).?, self.validationBudget());
+            cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
+            return status;
         }
+        if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
         // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
         var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
         if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
@@ -1654,11 +1599,6 @@ pub const RecursiveResolver = struct {
         return response;
     }
 
-    const StaggeredResponse = struct {
-        message: dns.Message,
-        server: na.Address,
-    };
-
     /// Cap on simultaneous staggered legs. Matches typical ns_fetch_limit at
     /// depth 0; must not exceed `BlockingUdpTransport.max_staggered_legs`.
     const max_staggered_legs: usize = 3;
@@ -1675,7 +1615,7 @@ pub const RecursiveResolver = struct {
         servers: []const na.Address,
         sel: []const usize,
         parent_zone: dns.Name,
-    ) error{OutOfMemory}!?StaggeredResponse {
+    ) error{OutOfMemory}!?ServerQueryResult {
         // Duplicate IPs add no birthday entropy (RFC 5452).
         var leg_idxs: [max_staggered_legs]usize = undefined;
         var leg_count: usize = 0;
@@ -1792,7 +1732,7 @@ pub const RecursiveResolver = struct {
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
         self.recordNsOutcome(parent_zone, responding_addr, .success, elapsed_us);
 
-        return .{ .message = resp, .server = responding_addr };
+        return .{ .message = resp, .responding_server = responding_addr };
     }
 
     const ServerQueryResult = struct {
@@ -1815,8 +1755,7 @@ pub const RecursiveResolver = struct {
     }
 
     /// Keep `response` as the fallback failure only if it ranks at least as
-    /// high as the one already held; ties keep the later server so behavior
-    /// matches the old last-wins path when every sibling shares an rcode.
+    /// high as the one already held; ties keep the later server.
     fn recordFailure(held: *?dns.Message, response: dns.Message) void {
         if (held.* == null or
             failurePrecedence(response.header.flags.rcode) >= failurePrecedence(held.*.?.header.flags.rcode))
@@ -1868,7 +1807,7 @@ pub const RecursiveResolver = struct {
         if (sel.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
                 if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
-                return .{ .message = stag.message, .responding_server = stag.server };
+                return stag;
             }
         }
 
@@ -2046,7 +1985,7 @@ pub const RecursiveResolver = struct {
         // Indeterminate, not Bogus; retry once so a single transient failure
         // doesn't collapse into a caller-cached SERVFAIL.
         const resp = for (0..2) |_| {
-            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, true)) |r| {
+            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3)) |r| {
                 if (r.answers.len != 0) break r;
             }
         } else return null;
@@ -2106,7 +2045,6 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         servers: []const na.Address,
         max_servers: usize,
-        do_bit: bool,
     ) !?dns.Message {
         // Second upstream-touching entry alongside queryAuthoritativeServers.
         // findClosestCachedDelegation → reproveDelegationSecurity → here
@@ -2130,7 +2068,7 @@ pub const RecursiveResolver = struct {
             try self.consumeQuery();
 
             const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
-            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, timeout, do_bit)) {
+            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, timeout, true)) {
                 .timeout, .mismatch => continue,
                 .response => |r| r.message,
             };
@@ -2232,7 +2170,7 @@ pub const RecursiveResolver = struct {
         // Root has no parent to reprove DS against — caller chose root_hints
         // anchor, not this path. parentZoneOf("") returns "" and would loop.
         std.debug.assert(zone_name.len > 0);
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, self.dnssec_aware) catch return null) orelse return null;
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2) catch return null) orelse return null;
         const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
         // Locate the section that carries the DS RRset (RFC 4035 §5.2: DS
@@ -2309,17 +2247,14 @@ pub const RecursiveResolver = struct {
             ) orelse return null;
             const ds_ttl_cap = dnssec.rrsigTtlCap(ds_sig, now_u32);
 
-            // RFC 4035 §5.2: authenticated DS RRset, but no member hark can
-            // use — same as a proven no-DS delegation. Cache the negative so
-            // every consumer of the null-plus-negative contract sees insecure.
+            // Only after the parent-signed DS verifies.
+            if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
+            // RFC 4035 §5.2: an authenticated DS RRset hark can't use is a
+            // proven no-DS delegation; cache it so every consumer sees insecure.
             if (!dnssec.anySupportedDs(zone_ds_buf[0..ds_count])) {
-                if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
                 cacheInsecureDelegation(self.keyCache(), .insecure, zone, zone_ds_buf[0..ds_count], ds_ttl_cap);
                 return null;
             }
-
-            // Cache only after the parent-signed DS verifies.
-            if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
             if (self.key_cache) |kc| {
                 // DS records alone: the key cache reads only DS and DNSKEY, so
                 // RRSIGs and any NSEC riding along would be unreachable weight.
@@ -2337,9 +2272,7 @@ pub const RecursiveResolver = struct {
         const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, zone, parent_servers, &proof_ttl_cap);
         if (auth_status == .secure) {
             const status = dnssec.classifyDelegation(response.authorities, zone, dnssec.authoritySigner(response.authorities).?, self.validationBudget());
-            if (status == .insecure) {
-                cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
-            }
+            cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
         }
         return null;
     }
@@ -2561,7 +2494,7 @@ pub const RecursiveResolver = struct {
         authorities: []const dns.ResourceRecord,
         delegation_cut: ?dns.Name,
         parent_servers: []const na.Address,
-        ttl_cap: ?*u32,
+        ttl_cap: *u32,
     ) dnssec.SecurityStatus {
         const signer = dnssec.authoritySigner(authorities) orelse return .unchecked;
         // A no-DS proof is the parent's to make: signer strictly above the cut,
@@ -2614,7 +2547,7 @@ pub const RecursiveResolver = struct {
         // Past here the signer is authenticated and at-or-below the cut, so it
         // is the authority the proof rests on — the zone geometry is judged
         // against.
-        return validateNegativeResponse(security_state, authorities, qname, qtype, is_nxdomain, signer, self.validationBudget());
+        return validateNegativeResponse(authorities, qname, qtype, is_nxdomain, signer, self.validationBudget());
     }
 
     fn resolveNsAddresses(
@@ -2653,14 +2586,10 @@ pub const RecursiveResolver = struct {
         // (not successes) at ns_fetch_limit, so on null fall back to serial
         // over the remaining NS names — matches serial's recovery behavior
         // for partially-broken delegations.
-        if (self.gpa != null) {
+        if (self.fanout) {
             if (try self.resolveNsAddressesFanout(allocator, names, depth, ns_fetch_limit)) |r| return r;
-            if (names.len > ns_fetch_limit) {
-                return self.resolveNsAddressesSerial(allocator, names[ns_fetch_limit..], depth, ns_fetch_limit);
-            }
-            return null;
+            return self.resolveNsAddressesSerial(allocator, names[@min(names.len, ns_fetch_limit)..], depth, ns_fetch_limit);
         }
-
         return self.resolveNsAddressesSerial(allocator, names, depth, ns_fetch_limit);
     }
 
@@ -2675,8 +2604,7 @@ pub const RecursiveResolver = struct {
         records: []const dns.ResourceRecord,
         addrs: *[max_servers_per_level]na.Address,
         count: *usize,
-    ) bool {
-        var added = false;
+    ) void {
         for (records) |rr| {
             if (count.* >= max_servers_per_level) break;
             const addr: na.Address = switch (rr.rtype) {
@@ -2687,9 +2615,7 @@ pub const RecursiveResolver = struct {
             if (!self.allow_loopback_upstreams and na.isNonRoutableNs(addr)) continue;
             addrs[count.*] = addr;
             count.* += 1;
-            added = true;
         }
-        return added;
     }
 
     const ns_addr_dedup_timeout_ns: u64 = 2 * std.time.ns_per_s;
@@ -2722,7 +2648,7 @@ pub const RecursiveResolver = struct {
         };
 
         if (self.resolveImpl(allocator, ns_dotted, rtype, depth + 1)) |r| {
-            _ = self.appendAddressesFromRecords(r.message.answers, addrs, count);
+            self.appendAddressesFromRecords(r.message.answers, addrs, count);
         } else |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
         }
@@ -2791,7 +2717,7 @@ pub const RecursiveResolver = struct {
             dotted_names[ni] = try nameToDotted(allocator, ns_names[ni]);
         }
 
-        // Per-helper cap: a shared one starved helpers and SERVFAIL'd signed domains.
+        // Per-helper cap: a shared one starves helpers on signed domains.
         var task_ctxs: [max_ns_parallel_tasks]NsTaskCtx = undefined;
         var threads: [max_ns_parallel_tasks]?std.Thread = @splat(null);
 
@@ -2813,7 +2739,6 @@ pub const RecursiveResolver = struct {
                 .ns_dotted = dotted_names[ni],
                 .rtype = address_rtypes[ri],
                 .depth = depth,
-                .mem_limit = self.query_memory_limit,
             };
             threads[i] = std.Thread.spawn(.{ .stack_size = 1 << 20 }, NsTaskCtx.run, .{&task_ctxs[i]}) catch null;
         }
@@ -2869,7 +2794,6 @@ pub const RecursiveResolver = struct {
         ns_dotted: []const u8,
         rtype: dns.RType,
         depth: usize,
-        mem_limit: usize,
         addrs: [max_servers_per_level]na.Address = undefined,
         count: usize = 0,
         oom: bool = false,
@@ -2885,7 +2809,7 @@ pub const RecursiveResolver = struct {
             // page_allocator: a fresh thread's frees would warm a new smp slot's slabs for good.
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            var cap = CountingAllocator.init(arena.allocator(), ctx.mem_limit, .payload);
+            var cap = CountingAllocator.init(arena.allocator(), ctx.parent.query_memory_limit, .payload);
 
             resolver.resolveNsNameOne(
                 cap.allocator(),
@@ -2953,7 +2877,7 @@ pub const RecursiveResolver = struct {
         for (address_rtypes) |qtype| {
             if (cache.lookup(allocator, ns_dotted, qtype, .in)) |result| {
                 switch (result) {
-                    .hit => |h| _ = self.appendAddressesFromRecords(h.records, addrs, count),
+                    .hit => |h| self.appendAddressesFromRecords(h.records, addrs, count),
                     .negative => {},
                 }
             }
@@ -3153,13 +3077,8 @@ const ttl_any_hinfo: u32 = 3789;
 /// Uses the RType=13 / RData.unknown path so we don't have to teach the
 /// rest of the parser/cache/printer about HINFO.
 fn synthesizeAnyHinfo(allocator: mem.Allocator, name: []const u8) !dns.Message {
-    // Lowercase the client-typed name before parsing so the synthetic
-    // HINFO owner doesn't echo back mixed case (same scrub policy as the
-    // upstream-reply path in `tryParseMessage`).
-    var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    if (name.len > lower_buf.len) return error.NameTooLong;
-    const lower = dns.lowerNameIntoBuf(&lower_buf, name);
-    const qname = try dns.parseDottedName(allocator, lower);
+    // Lowercased so the synthetic owner doesn't echo mixed case.
+    const qname = try dns.cloneNameLower(allocator, try dns.parseDottedName(allocator, name));
     // <len=7> R F C 8 4 8 2  <len=0>
     const rdata_bytes = try allocator.dupe(u8, &[_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 });
     const arr = try allocator.alloc(dns.ResourceRecord, 1);
@@ -3517,9 +3436,7 @@ fn extractReferral(
 }
 
 /// `proceed` carries the *proof's* verdict, not the zone's, so AD and the cached
-/// rank come from one source. Deriving both from `security_state` left an
-/// Opt-Out proof — valid, but §9.2 forbids AD — with nowhere to land but
-/// `skip_cache`, and a correct denial went uncached at 100 ms per repeat.
+/// rank come from one source: an Opt-Out proof is valid but §9.2 forbids AD.
 /// Unbound, BIND and Knot all cache these under an explicit insecure rank.
 const NegativeValidation = union(enum) {
     /// Serve, and cache under this status. AD only when `.secure`.
@@ -3531,7 +3448,6 @@ const NegativeValidation = union(enum) {
 };
 
 fn validateNegativeResponse(
-    security_state: dnssec.SecurityStatus,
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
     qtype: dns.RType,
@@ -3539,7 +3455,6 @@ fn validateNegativeResponse(
     zone: dns.Name,
     budget: *dnssec.ValidationBudget,
 ) NegativeValidation {
-    if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
     // RFC 4035 §5.4 + §5.5: inside a known-secure zone every negative response
     // must carry a complete proof; an incomplete one (.unchecked) fails closed.
     // `.insecure` — Opt-Out (§9.2) or RFC 9276 iterations — is served
@@ -3732,18 +3647,6 @@ test "extractReferral without glue carries multiple NS names" {
     try testing.expect(result.zone_cut.eql(zone1));
 }
 
-test "extractReferral accepts in-zone glue" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{"com"});
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-}
-
 test "extractReferral with AAAA glue returns IPv6 address" {
     const alloc = testing.allocator;
     const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
@@ -3903,63 +3806,6 @@ test "redirectFor substitutes a DNAME the server left unsynthesized" {
     try testing.expect(redirect.target.eql(.{ .labels = &.{ "www", "vault", "example" } }));
     // §2.2: the synthesized CNAME takes the DNAME's TTL, not the shallow one's.
     try testing.expectEqual(@as(u32, 60), redirect.records[redirect.records.len - 1].ttl);
-}
-
-test "tryServeFromCache follow_cname: cached A→CNAME→target lets sibling AAAA short-circuit upstream" {
-    const alloc = testing.allocator;
-
-    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
-    defer cache.deinit();
-
-    // Pre-warm the cache: (alias.example.com CNAME → target.example.com)
-    // and (target.example.com AAAA = ::1). Same shape a prior A query
-    // would have laid down on its way through this resolver.
-    {
-        const cname_owner = try makeName(alloc, &.{ "alias", "example", "com" });
-        const cname_target = try makeName(alloc, &.{ "target", "example", "com" });
-        const cname_rrs = try alloc.alloc(dns.ResourceRecord, 1);
-        cname_rrs[0] = .{ .name = cname_owner, .rtype = .cname, .rclass = .in, .ttl = 300, .rdata = .{ .cname = cname_target } };
-        const cname_msg = dns.Message{
-            .header = test_header,
-            .questions = &.{},
-            .answers = cname_rrs,
-        };
-        defer dns.freeMessage(alloc, cname_msg);
-        cache.storeResponse(cname_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
-    }
-    {
-        const aaaa_owner = try makeName(alloc, &.{ "target", "example", "com" });
-        const aaaa_rrs = try alloc.alloc(dns.ResourceRecord, 1);
-        aaaa_rrs[0] = .{
-            .name = aaaa_owner,
-            .rtype = .aaaa,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .aaaa = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
-        };
-        const aaaa_msg = dns.Message{
-            .header = test_header,
-            .questions = &.{},
-            .answers = aaaa_rrs,
-        };
-        defer dns.freeMessage(alloc, aaaa_msg);
-        cache.storeResponse(aaaa_msg, dns.Name{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
-    }
-
-    var resolver: RecursiveResolver = .{
-        .transports = null,
-        .io = testing.io,
-        .cache = &cache,
-        .cache_only = true,
-    };
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try resolver.resolve(arena.allocator(), "alias.example.com", .aaaa);
-
-    try testing.expectEqual(@as(usize, 2), result.message.answers.len);
-    try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
-    try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
 }
 
 test "cousin prefetch: set on NOERROR A/AAAA, suppressed on NXDOMAIN" {
@@ -4177,6 +4023,9 @@ test "fresh chain sets no prefetch and reports from_cache" {
 
     try testing.expect(result.from_cache);
     try testing.expect(result.prefetch_name == null);
+    try testing.expectEqual(@as(usize, 2), result.message.answers.len);
+    try testing.expectEqual(dns.RType.cname, result.message.answers[0].rtype);
+    try testing.expectEqual(dns.RType.aaaa, result.message.answers[1].rtype);
 }
 
 test "tryServeFromCache follow_cname: cycle detection catches A→B→A in cache-served path" {
@@ -4261,13 +4110,6 @@ test "aggregateCachedCnameWildcardProofs appends only when status is .secure" {
     }
 }
 
-test "validateNegativeResponse returns proceed when security_state is not secure" {
-    const name = dns.Name{ .labels = &.{ "example", "com" } };
-    var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation{ .proceed = .unchecked }, validateNegativeResponse(.unchecked, &.{}, name, .a, true, test_root, &b));
-    try testing.expectEqual(NegativeValidation{ .proceed = .insecure }, validateNegativeResponse(.insecure, &.{}, name, .a, false, test_root, &b));
-}
-
 test "validateNegativeResponse caches an .insecure proof instead of discarding it" {
     // `.insecure` in a secure zone is a valid denial that may not carry AD.
     // Mapping it to `.skip_cache` conflated it with "signatures did not verify"
@@ -4294,7 +4136,7 @@ test "validateNegativeResponse caches an .insecure proof instead of discarding i
     var b: dnssec.ValidationBudget = .{};
     try testing.expectEqual(
         NegativeValidation{ .proceed = .insecure },
-        validateNegativeResponse(.secure, &high_iteration_nsec3, qname, .a, true, test_root, &b),
+        validateNegativeResponse(&high_iteration_nsec3, qname, .a, true, test_root, &b),
     );
 }
 
@@ -4328,7 +4170,7 @@ test "validateNegativeResponse binds a proof to the zone that signed it" {
 
     // Bound to the zone that actually signed it: victim.com is not under it,
     // and neither is the NSEC owner a member of any chain covering victim.com.
-    try testing.expect(validateNegativeResponse(.secure, &authorities, victim, .a, true, net_zone, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(&authorities, victim, .a, true, net_zone, &b) == .bogus);
 
     // Positive control: the same zone denying one of its own names. The wrap
     // covers zzzz.example.net, and the apex NSEC covers *.example.net, so the
@@ -4348,7 +4190,7 @@ test "validateNegativeResponse binds a proof to the zone that signed it" {
     const in_zone = dns.Name{ .labels = &.{ "zzzz", "example", "net" } };
     try testing.expectEqual(
         NegativeValidation{ .proceed = .secure },
-        validateNegativeResponse(.secure, &in_zone_auth, in_zone, .a, true, net_zone, &b),
+        validateNegativeResponse(&in_zone_auth, in_zone, .a, true, net_zone, &b),
     );
 }
 
@@ -4384,7 +4226,7 @@ test "validateNegativeResponse returns bogus for mixed NSEC/NSEC3 authorities" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expect(validateNegativeResponse(.secure, &authorities, name, .a, true, test_root, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(&authorities, name, .a, true, test_root, &b) == .bogus);
 }
 
 test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
@@ -4406,7 +4248,7 @@ test "validateNegativeResponse returns proceed for valid NSEC NODATA proof" {
         },
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expectEqual(NegativeValidation{ .proceed = .secure }, validateNegativeResponse(.secure, &authorities, name, .a, false, test_root, &b));
+    try testing.expectEqual(NegativeValidation{ .proceed = .secure }, validateNegativeResponse(&authorities, name, .a, false, test_root, &b));
 }
 
 test "validateNegativeResponse returns bogus when no proof found in secure zone" {
@@ -4417,8 +4259,8 @@ test "validateNegativeResponse returns bogus when no proof found in secure zone"
     // signed zones. Fail closed rather than serving the unauthenticated
     // NXDOMAIN/NODATA.
     var b: dnssec.ValidationBudget = .{};
-    try testing.expect(validateNegativeResponse(.secure, &.{}, name, .a, true, test_root, &b) == .bogus);
-    try testing.expect(validateNegativeResponse(.secure, &.{}, name, .a, false, test_root, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(&.{}, name, .a, true, test_root, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(&.{}, name, .a, false, test_root, &b) == .bogus);
 }
 
 test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" {
@@ -4438,7 +4280,7 @@ test "validateNegativeResponse returns bogus on incomplete NSEC NXDOMAIN proof" 
         // No NSEC for *.example.com — proof is incomplete.
     };
     var b: dnssec.ValidationBudget = .{};
-    try testing.expect(validateNegativeResponse(.secure, &authorities, beta, .a, true, test_root, &b) == .bogus);
+    try testing.expect(validateNegativeResponse(&authorities, beta, .a, true, test_root, &b) == .bogus);
 }
 
 test "dns.isNsecProofMaterial classifies the chain-aggregate keep set" {
@@ -4608,7 +4450,7 @@ test "withCnameChain clears AD when any hop was not proven secure" {
 // must short-circuit before any `transports.?` access. Two guards cover
 // the surface: `queryAuthoritativeServers` (the main recursion entry) and
 // `fetchRRset` (reached via `findClosestCachedDelegation` →
-// `reproveDelegationSecurity`). A real crash motivated the second guard.
+// `reproveDelegationSecurity`).
 
 test "fetchRRset returns CacheOnlyMiss when cache_only=true" {
     var resolver: RecursiveResolver = .{
@@ -4617,7 +4459,7 @@ test "fetchRRset returns CacheOnlyMiss when cache_only=true" {
         .cache_only = true,
     };
     const servers: []const na.Address = &.{na.initIp4(.{ 192, 0, 2, 1 }, 53)};
-    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1, false);
+    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
