@@ -454,15 +454,21 @@ fn threadCounterSlot() u32 {
     return counter_slot_tl;
 }
 
-/// The shards array is cache-line aligned so shard 0 starts on a boundary.
-/// Shards pack: padding each to a line cost ~40% on single-thread cache_hit.
+/// Two 64-byte lines per shard (`std.atomic.cache_line` is 128 here, which
+/// doubles the footprint). `write` sorts first by alignment; `map` and
+/// `visited`, the read path's only fields, fill the second line, so a
+/// shared-lock RMW never invalidates the header every lookup reads.
 const Shard = struct {
     map: std.ArrayHashMapUnmanaged(CacheKey, CacheEntry, CacheKeyContext, true) = .empty,
-    rwlock: std.Io.RwLock = std.Io.RwLock.init,
     /// SIEVE flags, grown lazily; a failed grow leaves the tail unflagged.
     visited: []std.atomic.Value(u8) = &.{},
+    write: WriteSide = .{},
+};
+
+/// Read counters are striped in RRsetCache.read_counters.
+const WriteSide = struct {
+    lock: std.Io.RwLock align(64) = std.Io.RwLock.init,
     hand: u32 = 0,
-    // Write-path only; read counters are striped in RRsetCache.read_counters.
     /// SIEVE only, not expired sweeps.
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
@@ -560,8 +566,8 @@ pub const RRsetCache = struct {
             .max_bytes = self.budget.counting.max_bytes,
         };
         for (self.shards[0..self.shard_count]) |*shard| {
-            stats.evictions += shard.evictions.load(.monotonic);
-            stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
+            stats.evictions += shard.write.evictions.load(.monotonic);
+            stats.cap_exhausted_evictions += shard.write.cap_exhausted_evictions.load(.monotonic);
         }
         for (&self.read_counters) |*rc| {
             stats.hits += rc.hits.load(.monotonic);
@@ -602,8 +608,8 @@ pub const RRsetCache = struct {
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return null;
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
+        shard.write.lock.lockSharedUncancelable(self.io);
+        defer shard.write.lock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return null;
         const now = self.now_fn();
         const entry = shard.map.values()[idx];
@@ -648,8 +654,8 @@ pub const RRsetCache = struct {
     ) ?CacheLookupResult {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
+        shard.write.lock.lockSharedUncancelable(self.io);
+        defer shard.write.lock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse {
             // The primary probe owns this query's miss; the sentinel retry
             // rides on the same lookup and must not double-charge it.
@@ -872,7 +878,7 @@ pub const RRsetCache = struct {
         // shared sentinel key; NODATA and any other rcode stay type-scoped.
         const key_rtype = if (rcode == .name_error) nxdomain_key else rtype;
         const slot = self.prepareSlot(lower_view, key_rtype, rclass, security_status, .always) orelse return;
-        defer slot.shard.rwlock.unlock(self.io);
+        defer slot.shard.write.lock.unlock(self.io);
 
         // Refuse rather than cache a negative whose NSEC proofs were truncated
         // under OOM — a denial a DO client couldn't validate (RFC 4035 §3.1.3.2/.3).
@@ -916,7 +922,7 @@ pub const RRsetCache = struct {
         var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const lower_view = lowerNameBuf(&lower_buf, name) orelse return;
         const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, overwrite) orelse return;
-        defer slot.shard.rwlock.unlock(self.io);
+        defer slot.shard.write.lock.unlock(self.io);
 
         // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
         // DNSSEC SERVFAIL). RFC 9520 §3 caps resolution-failure caching at
@@ -961,8 +967,8 @@ pub const RRsetCache = struct {
         const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
         const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(key);
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
+        shard.write.lock.lockSharedUncancelable(self.io);
+        defer shard.write.lock.unlockShared(self.io);
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         return switch (shard.map.values()[idx]) {
             .positive => |p| self.now_fn() < p.expires_at and (p.security_status == .secure or p.security_status == .insecure),
@@ -1103,14 +1109,14 @@ pub const RRsetCache = struct {
     ) ?struct { shard: *Shard, alloc: Allocator, key: CacheKey } {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
-        shard.rwlock.lockUncancelable(self.io);
+        shard.write.lock.lockUncancelable(self.io);
         // Displacement check must run before evictIfNeeded: SIEVE is
         // security-blind, so an eviction here could silently drop the
         // existing .secure entry we're about to refuse to overwrite (RFC
         // 9520 §3.4). Probe key is fine — shouldBlockOverwrite only reads
         // .name bytes for the hash-adapted lookup.
         if (self.shouldBlockOverwrite(shard, h, probe, status, overwrite)) {
-            shard.rwlock.unlock(self.io);
+            shard.write.lock.unlock(self.io);
             return null;
         }
         // Evict before allocating: the key-name dupe itself counts against
@@ -1119,7 +1125,7 @@ pub const RRsetCache = struct {
         self.evictIfNeeded(shard);
         const alloc = self.budget.counting.allocator();
         const key_name = alloc.dupe(u8, lower_name) catch {
-            shard.rwlock.unlock(self.io);
+            shard.write.lock.unlock(self.io);
             return null;
         };
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
@@ -1159,7 +1165,7 @@ pub const RRsetCache = struct {
         if (min_ttl == 0) return;
 
         const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
-        defer slot.shard.rwlock.unlock(self.io);
+        defer slot.shard.write.lock.unlock(self.io);
 
         const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
             slot.alloc.free(slot.key.name);
@@ -1200,21 +1206,21 @@ pub const RRsetCache = struct {
 
     /// Probe a bounded number of entries from the SIEVE hand, evicting the first
     /// expired one. Clears visited flags as it goes for gradual SIEVE decay.
-    /// Note: shares `shard.hand` with sieveEvict, so each call advances the SIEVE
+    /// Note: shares `shard.write.hand` with sieveEvict, so each call advances the SIEVE
     /// cursor (1-8 positions) — visited-bit decay is coupled to write rate, not
     /// access rate. Hand-wrap takes at least shard entries / (8 × calls_per_sec).
     fn sweepExpired(self: *RRsetCache, shard: *Shard, count: u32) void {
         const now = self.now_fn();
         var probes: u32 = 0;
         while (probes < 8) : (probes += 1) {
-            if (shard.hand >= count) shard.hand = 0;
-            const i = shard.hand;
-            shard.hand += 1;
+            if (shard.write.hand >= count) shard.write.hand = 0;
+            const i = shard.write.hand;
+            shard.write.hand += 1;
             clearVisited(shard, i);
             const expired = now >= shard.map.values()[i].expiresAt();
             if (expired) {
                 self.removeAtIndex(shard, i);
-                shard.hand = if (i < shard.map.count()) i else 0;
+                shard.write.hand = if (i < shard.map.count()) i else 0;
                 return;
             }
         }
@@ -1253,7 +1259,7 @@ pub const RRsetCache = struct {
         _ = self.budget.entries.fetchSub(1, .monotonic);
         freeKey(alloc, key);
         freeEntry(alloc, val);
-        if (shard.hand >= shard.map.count()) shard.hand = 0;
+        if (shard.write.hand >= shard.map.count()) shard.write.hand = 0;
     }
 
     /// SIEVE eviction: scan from hand, give visited entries a second chance,
@@ -1267,21 +1273,21 @@ pub const RRsetCache = struct {
         const limit = @min(count, sieve_scan_cap);
         var probes: u32 = 0;
         while (probes < limit) : (probes += 1) {
-            if (shard.hand >= count) shard.hand = 0;
-            const i = shard.hand;
+            if (shard.write.hand >= count) shard.write.hand = 0;
+            const i = shard.write.hand;
             if (isVisited(shard, i)) {
                 clearVisited(shard, i);
-                shard.hand += 1;
+                shard.write.hand += 1;
             } else {
                 self.removeAtIndex(shard, i);
-                _ = shard.evictions.fetchAdd(1, .monotonic);
+                _ = shard.write.evictions.fetchAdd(1, .monotonic);
                 return;
             }
         }
-        if (shard.hand >= count) shard.hand = 0;
-        self.removeAtIndex(shard, shard.hand);
-        _ = shard.evictions.fetchAdd(1, .monotonic);
-        _ = shard.cap_exhausted_evictions.fetchAdd(1, .monotonic);
+        if (shard.write.hand >= count) shard.write.hand = 0;
+        self.removeAtIndex(shard, shard.write.hand);
+        _ = shard.write.evictions.fetchAdd(1, .monotonic);
+        _ = shard.write.cap_exhausted_evictions.fetchAdd(1, .monotonic);
     }
 };
 
@@ -2633,7 +2639,7 @@ test "evictIfNeeded triggers SIEVE on byte pressure" {
     // Release synthetic bytes so deinit accounting checks out.
     _ = cache.budget.counting.current_bytes.fetchSub(bump, .monotonic);
 
-    try testing.expect(shard0.evictions.load(.monotonic) == 1);
+    try testing.expect(shard0.write.evictions.load(.monotonic) == 1);
     try testing.expect(shard0.map.count() == 3);
 }
 
@@ -2690,7 +2696,7 @@ test "byte-pressure check happens before key-name dupe" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), newname, .a, .in) != null);
-    try testing.expect(shard0.evictions.load(.monotonic) >= 1);
+    try testing.expect(shard0.write.evictions.load(.monotonic) >= 1);
 }
 
 fn runStoreNegativeUnderFailing(failing_alloc: Allocator) !void {
