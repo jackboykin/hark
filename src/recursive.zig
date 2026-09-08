@@ -1128,11 +1128,8 @@ pub const RecursiveResolver = struct {
     ) !?ResolveResult {
         if (self.bypass_cache) return null;
         const c = self.cache orelse return null;
-        const result = c.lookupNxdomainAncestor(allocator, current_name, qtype, .in) orelse return null;
-        switch (result) {
-            .negative => |n| return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, .name_error, false, null, qtype, chain),
-            .hit => return null, // ancestor exists positively — no RFC 8020 cut applies
-        }
+        const n = (c.lookupNxdomainAncestor(allocator, current_name, .in) orelse return null).negative;
+        return try negativeResolveResult(allocator, n.soa, n.nsec_proofs, .name_error, false, null, qtype, chain);
     }
 
     /// DNSSEC: a server authoritative for both parent and child can

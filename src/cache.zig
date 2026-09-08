@@ -466,7 +466,6 @@ const Shard = struct {
     // Read-path counters are striped per-thread in RRsetCache.read_counters
     // (they were contending one line per shard); write-path counters below run
     // under the exclusive lock and are rare.
-    stores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// SIEVE only, not expired sweeps.
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
@@ -541,15 +540,12 @@ pub const RRsetCache = struct {
 
     /// Aggregated across shards. Not a consistent snapshot — a put racing
     /// `getStats` may be reflected in some counters but not others.
-    /// Acceptable for monitoring; do not assert invariants like
-    /// `stores == entries + evictions` on these values.
     pub const Stats = struct {
         entries: u32 = 0,
         memory_bytes: usize = 0,
         max_bytes: usize = 0,
         hits: u64 = 0,
         misses: u64 = 0,
-        stores: u64 = 0,
         evictions: u64 = 0,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
         cap_exhausted_evictions: u64 = 0,
@@ -567,7 +563,6 @@ pub const RRsetCache = struct {
             .max_bytes = self.budget.counting.max_bytes,
         };
         for (self.shards[0..self.shard_count]) |*shard| {
-            stats.stores += shard.stores.load(.monotonic);
             stats.evictions += shard.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.cap_exhausted_evictions.load(.monotonic);
         }
@@ -687,7 +682,7 @@ pub const RRsetCache = struct {
                     .nsec_proofs = nsec_proofs,
                     .remaining_ttl = hit.remaining_ttl,
                     .needs_prefetch = hit.needs_prefetch,
-                    .security_status = servedStatus(rrset.security_status, hit.force_unchecked),
+                    .security_status = servedStatus(rrset.security_status, hit.is_stale),
                     .is_stale = hit.is_stale,
                 } };
             },
@@ -706,7 +701,7 @@ pub const RRsetCache = struct {
                     .soa = soa,
                     .nsec_proofs = nsec_proofs,
                     .needs_prefetch = hit.needs_prefetch,
-                    .security_status = servedStatus(neg.security_status, hit.force_unchecked),
+                    .security_status = servedStatus(neg.security_status, hit.is_stale),
                     .is_stale = hit.is_stale,
                 } };
             },
@@ -722,7 +717,6 @@ pub const RRsetCache = struct {
         self: *RRsetCache,
         caller_alloc: Allocator,
         name: []const u8,
-        rtype: dns.RType,
         rclass: dns.RClass,
     ) ?CacheLookupResult {
         // Real query workloads almost never have NXDOMAIN cuts deeper than
@@ -731,22 +725,16 @@ pub const RRsetCache = struct {
         // apex + a couple of subdomain levels.
         var ancestors = dns.Ancestors.init(name, 8);
         while (ancestors.next()) |ancestor| {
-            const result = self.lookup(caller_alloc, ancestor, rtype, rclass) orelse continue;
-            switch (result) {
-                .negative => |n| {
-                    if (n.rcode == .name_error and n.security_status != .secure) return result;
-                },
-                .hit => {},
-            }
+            var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
+            const lower = lowerNameBuf(&lower_buf, ancestor) orelse continue;
+            const result = self.lookupKey(caller_alloc, lower, nxdomain_key, rclass, true) orelse continue;
+            if (result.negative.security_status != .secure) return result;
         }
         return null;
     }
 
     /// Evaluate freshness for a cache entry, bumping hit/miss/stale counters.
     /// Returns null on full miss (expired beyond stale window, or stale disabled).
-    /// On stale hit, returns force_unchecked=true: RRSIGs may have expired since
-    /// caching, so the resolver cannot vouch for authenticity (RFC 4035 §3.2.3,
-    /// RFC 8767). On fresh hit, force_unchecked=false.
     fn evalFreshness(
         self: *RRsetCache,
         expires_at: i64,
@@ -754,7 +742,7 @@ pub const RRsetCache = struct {
         original_ttl: u32,
         now: i64,
         disable_stale: bool,
-    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, force_unchecked: bool, is_stale: bool } {
+    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, is_stale: bool } {
         const cs = &self.read_counters[threadCounterSlot()];
         if (now < expires_at) {
             const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
@@ -762,7 +750,7 @@ pub const RRsetCache = struct {
             const needs_prefetch = self.prefetch and (remaining <= original_ttl / 10);
             _ = cs.hits.fetchAdd(1, .monotonic);
             if (needs_prefetch) _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
-            return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .force_unchecked = false, .is_stale = false };
+            return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .is_stale = false };
         }
         if (disable_stale or self.serve_stale_ttl == 0 or (now - expires_at) >= self.serve_stale_ttl) {
             // Deferred eviction: under shared read lock we cannot mutate the map;
@@ -774,11 +762,7 @@ pub const RRsetCache = struct {
         _ = cs.hits.fetchAdd(1, .monotonic);
         _ = cs.stale_hits.fetchAdd(1, .monotonic);
         _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
-        // is_stale is computed from now/expires_at directly (not derived from
-        // force_unchecked) so a future change that flips force_unchecked for
-        // a non-stale reason can't silently lie to the resolver's RFC 8767
-        // try-fresh-first branch.
-        return .{ .remaining_ttl = 30, .needs_prefetch = true, .force_unchecked = true, .is_stale = true };
+        return .{ .remaining_ttl = 30, .needs_prefetch = true, .is_stale = true };
     }
 
     const Lifetime = struct { ttl: u32, expires_at: i64, stored_at: i64 };
@@ -1013,8 +997,8 @@ pub const RRsetCache = struct {
 
     /// Stale hits degrade to `.unchecked`: their RRSIGs may have expired
     /// (RFC 8767). Glue stays glue — it must not climb into answers by aging.
-    fn servedStatus(stored: SecurityStatus, force_unchecked: bool) SecurityStatus {
-        return if (force_unchecked and stored != .glue) .unchecked else stored;
+    fn servedStatus(stored: SecurityStatus, is_stale: bool) SecurityStatus {
+        return if (is_stale and stored != .glue) .unchecked else stored;
     }
 
     /// An empty list admits everything.
@@ -1056,8 +1040,6 @@ pub const RRsetCache = struct {
 
             // Skip SOA in authority — these are for negative caching, handled separately
             if (rr.rtype == .soa) continue;
-            // Skip OPT pseudo-records (belt-and-suspenders; parseMessage excludes them)
-            if (rr.rtype == .opt) continue;
             // RRSIG is bundled into its covered RRset's `sigs` slot below;
             // don't drive a standalone-RRSIG cache entry.
             if (rr.rtype == .rrsig) continue;
@@ -1164,13 +1146,6 @@ pub const RRsetCache = struct {
         nsec_proofs: []const dns.ResourceRecord,
         authenticated_ttl_max: u32,
     ) void {
-        // Empty matches would leave min_ttl = maxInt(u32) and store a
-        // 1-week-pinned entry once clampTtl saturates. Belt-and-braces:
-        // the existing partial-clone guard would catch this downstream,
-        // but bailing early keeps the invariant ("matches has data")
-        // explicit at the function boundary.
-        if (matches.len == 0) return;
-
         // RFC 2181 §5.2: every RR in an RRset has the same TTL. Receivers
         // facing heterogeneous TTLs MUST treat the RRset as having a single
         // TTL — the minimum of the members. RRSIG and NSEC *TTL fields* fold
@@ -1208,7 +1183,6 @@ pub const RRsetCache = struct {
             return;
         };
         self.noteInsert(slot.shard);
-        _ = slot.shard.stores.fetchAdd(1, .monotonic);
     }
 
     /// The writing shard evicts for the whole cache; hash placement makes its
@@ -1234,7 +1208,6 @@ pub const RRsetCache = struct {
     /// cursor (1-8 positions) — visited-bit decay is coupled to write rate, not
     /// access rate. Hand-wrap takes at least shard entries / (8 × calls_per_sec).
     fn sweepExpired(self: *RRsetCache, shard: *Shard, count: u32) void {
-        if (count == 0) return;
         const now = self.now_fn();
         var probes: u32 = 0;
         while (probes < 8) : (probes += 1) {
@@ -1710,14 +1683,10 @@ test "lookupNxdomainAncestor finds parent NXDOMAIN (RFC 8020)" {
 
     // Querying a *child* of the cached NXDOMAIN should walk up via
     // lookupNxdomainAncestor and find the parent NXDOMAIN.
-    const result = cache.lookupNxdomainAncestor(arena.allocator(), "child.missing.example.com", .a, .in);
-    try testing.expect(result != null);
-    switch (result.?) {
-        .negative => |n| try testing.expectEqual(dns.RCode.name_error, n.rcode),
-        .hit => return error.TestUnexpectedResult,
-    }
+    const result = cache.lookupNxdomainAncestor(arena.allocator(), "child.missing.example.com", .in);
+    try testing.expectEqual(dns.RCode.name_error, result.?.negative.rcode);
 
-    const miss = cache.lookupNxdomainAncestor(arena.allocator(), "child.exists.example.com", .a, .in);
+    const miss = cache.lookupNxdomainAncestor(arena.allocator(), "child.exists.example.com", .in);
     try testing.expect(miss == null);
 }
 
@@ -2522,7 +2491,6 @@ test "cache stats tracking" {
     const initial = cache.getStats();
     try testing.expectEqual(@as(u64, 0), initial.hits);
     try testing.expectEqual(@as(u64, 0), initial.misses);
-    try testing.expectEqual(@as(u64, 0), initial.stores);
     try testing.expectEqual(@as(u32, 0), initial.entries);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2532,7 +2500,6 @@ test "cache stats tracking" {
     try testing.expectEqual(@as(u64, 1), cache.getStats().misses);
 
     try storeTestA(&cache, alloc, &.{ "stats", "test" }, 300, .{ 1, 2, 3, 4 });
-    try testing.expectEqual(@as(u64, 1), cache.getStats().stores);
     try testing.expectEqual(@as(u32, 1), cache.getStats().entries);
 
     _ = cache.lookup(arena.allocator(), "stats.test", .a, .in);

@@ -27,8 +27,6 @@ pub const Outcome = enum {
     /// Valid answer received (may be referral, NODATA, NXDOMAIN — all are
     /// legitimate authoritative behavior).
     success,
-    /// TC bit set, required TCP fallback (server alive but costly).
-    truncated,
     /// SERVFAIL, REFUSED, or other server error rcode.
     server_error,
     timeout,
@@ -42,7 +40,6 @@ fn reward(outcome: Outcome, elapsed_us: i64) f32 {
         .timeout => 0.0,
         .validation_failure => 0.0,
         .server_error => 0.1,
-        .truncated => 0.3 * latencyFactor(elapsed_us),
         .success => latencyFactor(elapsed_us),
     };
 }
