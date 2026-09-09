@@ -1468,6 +1468,12 @@ pub fn rrsigTtlCap(rrsig: dns.RrsigData, now_u32: u32) u32 {
     return @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
 }
 
+/// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
+fn signedLabels(name: dns.Name) usize {
+    const star = name.labels.len > 0 and mem.eql(u8, name.labels[0], "*");
+    return name.labels.len - @intFromBool(star);
+}
+
 /// Verify that every piece of negative-answer material in the authority
 /// section — NSEC/NSEC3 proofs *and* the RFC 2308 SOA — has a valid RRSIG
 /// signed by one of the provided DNSKEYs. The SOA is what a `.secure`
@@ -1519,7 +1525,7 @@ pub fn verifyAuthorityProofSigs(
             // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
             // the `*.CE` NSEC under its own owner), and the proofs read the owner
             // as served: a real `*.zone NSEC` signature would verify under any.
-            if (rrsig.labels != rr.name.labels.len) return .bogus;
+            if (rrsig.labels != signedLabels(rr.name)) return .bogus;
 
             if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
                 if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
@@ -3893,7 +3899,6 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, null));
 
-    // Control: under its own owner the same signature is fine.
     const own_sig = dns.ResourceRecord{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: ValidationBudget = .{};
@@ -3971,7 +3976,7 @@ fn testSignRrset(
     var rrsig = dns.RrsigData{
         .type_covered = covered,
         .algorithm = .ed25519,
-        .labels = @intCast(rrset[0].name.labels.len),
+        .labels = @intCast(signedLabels(rrset[0].name)),
         .original_ttl = 300,
         .sig_inception = 1_699_000_000,
         .sig_expiration = 1_800_000_000,
