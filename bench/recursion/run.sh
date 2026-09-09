@@ -90,6 +90,10 @@ if [[ ! -d "$SHOTGUN_DIR" ]]; then
     git clone --depth 1 --branch "$SHOTGUN_REF" \
         https://github.com/CZ-NIC/shotgun.git "$SHOTGUN_DIR"
 fi
+# dnsjit's realtime pacer re-syncs to the clock once per batch (default 128
+# packets) and sends the batch at full speed: a uniform 100 qps pellet arrives
+# as 1.3 s bursts. Batch of 1 replays the pellet's own timing.
+sed -i 's/delay:realtime(config.drift_s)$/delay:realtime(config.drift_s, 1)/' "$SHOTGUN_DIR/replay/shotgun.lua"
 
 SHOTGUN_INSTALL="$SHOTGUN_DIR/install"
 if [[ ! -f "$DNSSIM_LIB" ]] || [[ ! -f "$SHOTGUN_INSTALL/share/lua/5.1/shotgun/output/dnssim.lua" ]]; then
