@@ -138,10 +138,15 @@ Same pellet, same network, swap the resolver. Run hark, capture the JSON;
 run unbound on a different port, capture again; report the **delta**:
 
 ```sh
+mkdir -p /tmp/hark-unbound && unbound-anchor -a /tmp/hark-unbound/root.key
+unbound -c unbound.conf &                                  # mirrors hark.toml, port 5355
 ./run.sh udp ./pellet.pcap                                 # hark run
 OTHER_RESOLVER=127.0.0.1:5355 ./run.sh udp ./pellet.pcap   # unbound run
-# Compare outputs/*/data/UDP.json latency arrays.
+./summarize.py outputs/*/data/UDP.json                     # answered%, rcodes, percentiles
 ```
+
+Alternate the order and take at least two of each; a single pair reverses
+sign on internet weather alone.
 
 `OTHER_RESOLVER` accepts `IP:PORT` for v4 or `[V6]:PORT` for v6. Anything
 else fails fast.

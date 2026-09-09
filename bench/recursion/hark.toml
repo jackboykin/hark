@@ -17,7 +17,6 @@ case-randomization = true
 
 [cache]
 size = 268435456    # 256 MiB
-entries = 200000
 
 [logging]
 queries = false

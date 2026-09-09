@@ -42,6 +42,7 @@ pkgs.mkShell {
     # pellet preparation
     wireshark-cli # provides tshark + dumpcap
     bind.dnsutils # dig for smoke checks
+    unbound       # OTHER_RESOLVER reference
 
     # shotgun driver + plotters
     pyEnv
