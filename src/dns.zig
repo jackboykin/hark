@@ -1268,9 +1268,33 @@ fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
     return std.math.cast(T, val) orelse error.InvalidRDataLength;
 }
 
+/// RFC 1035 §4.1.4 targets. Byte-exact: a pointer must not change a name's case.
+pub const NameTable = struct {
+    const Entry = struct { labels: []const []const u8, offset: u16 };
+    entries: [64]Entry = undefined,
+    len: usize = 0,
+
+    fn find(self: *const NameTable, labels: []const []const u8) ?u16 {
+        for (self.entries[0..self.len]) |e| {
+            if (e.labels.len != labels.len) continue;
+            for (e.labels, labels) |a, b| {
+                if (!mem.eql(u8, a, b)) break;
+            } else return e.offset;
+        }
+        return null;
+    }
+
+    fn add(self: *NameTable, labels: []const []const u8, offset: usize) void {
+        if (self.len == self.entries.len or offset >= 0x4000) return;
+        self.entries[self.len] = .{ .labels = labels, .offset = @intCast(offset) };
+        self.len += 1;
+    }
+};
+
 pub const Serializer = struct {
     buf: []u8,
     pos: usize,
+    names: ?*NameTable = null,
 
     pub fn init(buf: []u8) Serializer {
         return .{ .buf = buf, .pos = 0 };
@@ -1310,9 +1334,15 @@ pub const Serializer = struct {
         self.pos += 12;
     }
 
-    fn writeName(self: *Serializer, name: Name) Error!void {
-        for (name.labels) |label| {
+    /// `compress` only for owner names and RFC 1035 rdata (RFC 3597 §4).
+    fn writeName(self: *Serializer, name: Name, compress: bool) Error!void {
+        const table = if (compress) self.names else null;
+        for (name.labels, 0..) |label, i| {
+            if (table) |t| if (t.find(name.labels[i..])) |off| {
+                return self.writeU16(0xC000 | off);
+            };
             if (label.len > max_label_len) return error.LabelTooLong;
+            if (table) |t| t.add(name.labels[i..], self.pos);
             try self.writeU8(@intCast(label.len));
             try self.writeSlice(label);
         }
@@ -1320,24 +1350,36 @@ pub const Serializer = struct {
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
-        try self.writeName(q.name);
+        try self.writeName(q.name, true);
         try self.writeU16(@backingInt(q.qtype));
         try self.writeU16(@backingInt(q.qclass));
     }
 
     pub fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
-        if (rr.wire) |blob| {
-            const start = self.pos;
-            try self.writeSlice(blob);
-            mem.writeInt(u32, self.buf[start + rr.wire_ttl_offset ..][0..4], rr.ttl, .big);
+        const blob = rr.wire orelse {
+            _ = try self.writeRecordFields(rr);
+            return;
+        };
+        if (self.names != null and rdataCompressible(rr.rtype)) {
+            _ = try self.writeRecordFields(rr);
             return;
         }
-        _ = try self.writeRecordFields(rr);
+        try self.writeName(rr.name, true);
+        const ttl_at = self.pos + 4;
+        try self.writeSlice(blob[rr.wire_ttl_offset - 4 ..]);
+        mem.writeInt(u32, self.buf[ttl_at..][0..4], rr.ttl, .big);
+    }
+
+    fn rdataCompressible(rtype: RType) bool {
+        return switch (rtype) {
+            .ns, .cname, .ptr, .mx, .soa => true,
+            else => false,
+        };
     }
 
     /// Ignores `rr.wire`. Returns the TTL byte offset for later patching.
     fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!u16 {
-        try self.writeName(rr.name);
+        try self.writeName(rr.name, true);
         try self.writeU16(@backingInt(rr.rtype));
         try self.writeU16(@backingInt(rr.rclass));
         const ttl_offset: u16 = try castOrRDataErr(u16, self.pos);
@@ -1356,14 +1398,15 @@ pub const Serializer = struct {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
-            .ns, .cname, .dname, .ptr => |name| try self.writeName(name),
+            .ns, .cname, .ptr => |name| try self.writeName(name, true),
+            .dname => |name| try self.writeName(name, false),
             .mx => |mx| {
                 try self.writeU16(mx.preference);
-                try self.writeName(mx.exchange);
+                try self.writeName(mx.exchange, true);
             },
             .soa => |soa| {
-                try self.writeName(soa.mname);
-                try self.writeName(soa.rname);
+                try self.writeName(soa.mname, true);
+                try self.writeName(soa.rname, true);
                 try self.writeU32(soa.serial);
                 try self.writeU32(soa.refresh);
                 try self.writeU32(soa.retry);
@@ -1384,7 +1427,7 @@ pub const Serializer = struct {
                 try self.writeU32(rrsig.sig_expiration);
                 try self.writeU32(rrsig.sig_inception);
                 try self.writeU16(rrsig.key_tag);
-                try self.writeName(rrsig.signer_name);
+                try self.writeName(rrsig.signer_name, false);
                 try self.writeSlice(rrsig.signature);
             },
             .dnskey => |dnskey| {
@@ -1400,7 +1443,7 @@ pub const Serializer = struct {
                 try self.writeSlice(ds_data.digest);
             },
             .nsec => |nsec_data| {
-                try self.writeName(nsec_data.next_domain_name);
+                try self.writeName(nsec_data.next_domain_name, false);
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
@@ -1498,7 +1541,8 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 }
 
 pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
-    var ser = Serializer.init(buf);
+    var names: NameTable = .{};
+    var ser = Serializer{ .buf = buf, .pos = 0, .names = &names };
 
     try ser.writeHeader(msg.wireHeader());
 
@@ -1915,6 +1959,55 @@ test "writeResourceRecord fast-path matches field path with TTL patch" {
     });
 
     try testing.expectEqualSlices(u8, slow[0..ser_slow.pos], fast[0..ser_fast.pos]);
+}
+
+test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names stay flat" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const owner = try parseDottedName(a, "www.example.com");
+    const ns1 = try parseDottedName(a, "ns1.example.com");
+    const rrsig = RrsigData{
+        .type_covered = .a,
+        .algorithm = .ecdsap256sha256,
+        .labels = 3,
+        .original_ttl = 60,
+        .sig_expiration = 2,
+        .sig_inception = 1,
+        .key_tag = 7,
+        .signer_name = try parseDottedName(a, "example.com"),
+        .signature = "sig",
+    };
+    const msg = Message{
+        .header = mem.zeroes(Header),
+        .questions = &.{.{ .name = owner, .qtype = .a, .qclass = .in }},
+        .answers = &.{
+            .{ .name = owner, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+            .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = .{ .rrsig = rrsig } },
+        },
+        .authorities = &.{.{ .name = try parseDottedName(a, "example.com"), .rtype = .ns, .rclass = .in, .ttl = 60, .rdata = .{ .ns = ns1 } }},
+    };
+
+    var buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&buf, msg);
+    // Question 21 + A(2+10+4) + RRSIG(2+10+18+13+3) + NS(2+10+4+2).
+    try testing.expectEqual(@as(usize, 12 + 21 + 16 + 46 + 18), wire.len);
+    try testing.expectEqualSlices(u8, "\x07example\x03com\x00", wire[12 + 21 + 16 + 30 ..][0..13]);
+
+    const parsed = try parseMessage(a, wire);
+    try testing.expect(parsed.answers[0].name.eqlExact(owner));
+    try testing.expect(parsed.answers[1].rdata.rrsig.signer_name.eqlExact(rrsig.signer_name));
+    try testing.expect(parsed.authorities[0].rdata.ns.eqlExact(ns1));
+
+    var stage: [128]u8 = undefined;
+    const built = try buildResourceRecordWire(&stage, msg.answers[0]);
+    var blob_rr = msg.answers[0];
+    blob_rr.wire = built.bytes;
+    blob_rr.wire_ttl_offset = built.ttl_offset;
+    var buf2: [512]u8 = undefined;
+    const wire2 = try serializeMessage(&buf2, .{ .header = msg.header, .questions = msg.questions, .answers = &.{blob_rr} });
+    try testing.expectEqualSlices(u8, wire[12 .. 12 + 21 + 16], wire2[12..]);
 }
 
 test "edge case: empty message (too short)" {

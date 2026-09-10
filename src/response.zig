@@ -740,17 +740,17 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
         .additionals = &.{ a_record, a_record, a_record },
     };
 
-    // Header+question+OPT is 40 bytes; answer 27; authorities ~540; additionals 81.
-    // `minimal_responses = false` keeps authority/additional through shaping
-    // so the cascade is what actually drops them.
+    // Compressed: header+question+OPT is 40 bytes; answer 16; authorities
+    // 223; additionals 48. `minimal_responses = false` keeps authority/
+    // additional through shaping so the cascade is what actually drops them.
     const rows = [_]struct { max: u16, tc: bool, an: u16, ns: u16 }{
-        .{ .max = 640, .tc = false, .an = 1, .ns = 12 },
-        .{ .max = 120, .tc = true, .an = 1, .ns = 0 },
+        .{ .max = 300, .tc = false, .an = 1, .ns = 12 },
+        .{ .max = 100, .tc = true, .an = 1, .ns = 0 },
         .{ .max = 40, .tc = true, .an = 0, .ns = 0 },
     };
-    // 620 overflows the buffer mid-additionals; 1024 serializes whole but over max.
+    // 300 overflows the buffer mid-additionals; 1024 serializes whole but over max.
     var buf: [1024]u8 = undefined;
-    for ([_]usize{ 620, 1024 }) |cap| for (rows) |row| {
+    for ([_]usize{ 300, 1024 }) |cap| for (rows) |row| {
         const wire = buildResponseWire(buf[0..cap], .{
             .query_id = 0x4242,
             .opcode = .query,
