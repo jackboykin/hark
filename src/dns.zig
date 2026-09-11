@@ -3475,5 +3475,7 @@ test "parseMessage handles OOM at every allocation without leaking" {
     try testing.expectEqual(@as(u16, 1), parsed.header.ns_count);
     try testing.expect(parsed.opt != null);
 
-    try testing.checkAllAllocationFailures(testing.allocator, parseMessageOomProbe, .{wire});
+    // Refusing resize makes every growth an injectable alloc and the count deterministic.
+    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), parseMessageOomProbe, .{wire});
 }

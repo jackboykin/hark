@@ -4565,7 +4565,9 @@ fn concatRRsOomProbe(allocator: mem.Allocator, _: void) !void {
 }
 
 test "concatRRs handles OOM without leaking" {
-    try testing.checkAllAllocationFailures(testing.allocator, concatRRsOomProbe, .{{}});
+    // Refusing resize makes every growth an injectable alloc and the count deterministic.
+    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), concatRRsOomProbe, .{{}});
 }
 
 // These cover the bug where 0x20-randomized case in upstream replies

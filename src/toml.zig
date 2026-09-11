@@ -528,5 +528,7 @@ test "parse handles OOM without leaking" {
         \\[cache]
         \\size = 8388608
     ;
-    try testing.checkAllAllocationFailures(testing.allocator, parseOomProbe, .{doc});
+    // Refusing resize makes every growth an injectable alloc and the count deterministic.
+    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), parseOomProbe, .{doc});
 }
