@@ -11,6 +11,7 @@ const TcpPooledConnection = pool_mod.TcpPooledConnection;
 const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
+const rand = @import("rand.zig");
 
 // UDP and TCP both flow through std.Io.net (Socket/Stream — reads via
 // `std.Io.net.Stream.read`/`io.operate(.net_read)`, writes via `io.operate(.net_write)`).
@@ -45,50 +46,57 @@ fn openUdpSocket(dest: na.Address, io: Io) !Io.net.Socket {
     return bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
 }
 
-/// Blocking UDP transport. Per-thread persistent unconnected sockets per
-/// address family, rebound every `rebind_after_queries` to refresh source-port
-/// randomness (RFC 5452 §9.1). The staggered path uses short-lived
-/// per-leg sockets.
+/// Upstream source ports (RFC 5452 §9.1): `size` sockets per family, bound
+/// once and held; each query leases one at random, so an observer learns
+/// one port in `size`, not the next. Slots open lazily; fd cap 2 × `size`.
+const PortPool = struct {
+    const size = 1024;
+    const State = enum(u8) { unopened, idle, leased };
+
+    states: [size]std.atomic.Value(State) = @splat(.init(.unopened)),
+    /// Written only by the thread holding the slot's lease.
+    socks: [size]Io.net.Socket = undefined,
+
+    var by_family: [2]PortPool = .{ .{}, .{} };
+
+    const Lease = struct {
+        sock: Io.net.Socket,
+        slot: ?usize,
+        pool: *PortPool,
+
+        fn release(self: Lease, io: Io) void {
+            const i = self.slot orelse return self.sock.close(io);
+            self.pool.states[i].store(.idle, .release);
+        }
+    };
+
+    /// Four draws, then an ephemeral socket: never block on a full pool.
+    fn lease(io: Io, dest: na.Address) !Lease {
+        const pool = &by_family[@intFromBool(dest == .ip6)];
+        for (0..4) |_| {
+            const i = rand.poolSlot(io, size);
+            switch (pool.states[i].swap(.leased, .acquire)) {
+                .leased => continue,
+                .idle => return .{ .sock = pool.socks[i], .slot = i, .pool = pool },
+                .unopened => {
+                    pool.socks[i] = openUdpSocket(dest, io) catch {
+                        pool.states[i].store(.unopened, .release);
+                        continue;
+                    };
+                    return .{ .sock = pool.socks[i], .slot = i, .pool = pool };
+                },
+            }
+        }
+        return .{ .sock = try openUdpSocket(dest, io), .slot = null, .pool = pool };
+    }
+};
+
 pub const BlockingUdpTransport = struct {
     config: Config,
     io: Io,
-    sock_v4: ?Io.net.Socket = null,
-    sock_v6: ?Io.net.Socket = null,
-    v4_queries: u32 = 0,
-    v6_queries: u32 = 0,
-
-    /// Rotate the persistent socket every N queries for defense-in-depth:
-    /// rebinding picks a fresh random source port, re-randomizing the
-    /// RFC 5452 entropy. 4096 is small enough that an attacker guessing
-    /// source-port+query-id has a narrow window per binding.
-    const rebind_after_queries: u32 = 4096;
 
     pub fn init(config: Config, io: Io) BlockingUdpTransport {
         return .{ .config = config, .io = io };
-    }
-
-    pub fn deinit(self: *BlockingUdpTransport) void {
-        if (self.sock_v4) |s| s.close(self.io);
-        if (self.sock_v6) |s| s.close(self.io);
-        self.sock_v4 = null;
-        self.sock_v6 = null;
-    }
-
-    fn persistentSocket(self: *BlockingUdpTransport, dest: na.Address) !Io.net.Socket {
-        const sock_ref, const counter_ref = switch (dest) {
-            .ip4 => .{ &self.sock_v4, &self.v4_queries },
-            .ip6 => .{ &self.sock_v6, &self.v6_queries },
-        };
-        if (sock_ref.* != null and counter_ref.* >= rebind_after_queries) {
-            sock_ref.*.?.close(self.io);
-            sock_ref.* = null;
-            counter_ref.* = 0;
-        }
-        if (sock_ref.* == null) {
-            sock_ref.* = try openUdpSocket(dest, self.io);
-        }
-        counter_ref.* += 1;
-        return sock_ref.*.?;
     }
 
     pub fn query(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, response_buf: []u8) ![]const u8 {
@@ -101,7 +109,9 @@ pub const BlockingUdpTransport = struct {
     /// allocated buffer so wire-buffer lifetime matches parsed-Message
     /// lifetime.
     pub fn queryWithTimeout(self: *BlockingUdpTransport, wire_query: []const u8, query_id: u16, upstream: na.Address, timeout_ms: u32, response_buf: []u8) ![]const u8 {
-        const sock = try self.persistentSocket(upstream);
+        const lease = try PortPool.lease(self.io, upstream);
+        defer lease.release(self.io);
+        const sock = lease.sock;
 
         const retransmit_ms = @max(50, timeout_ms / 3);
 
@@ -137,8 +147,8 @@ pub const BlockingUdpTransport = struct {
 
             if (msg.data.len < 2) continue;
 
-            // Userspace source check: the persistent socket is unconnected so
-            // it can receive responses addressed to any peer. Require full
+            // Userspace source check: the socket is unconnected so it can
+            // receive responses addressed to any peer. Require full
             // (IP, port) match to mirror the 4-tuple enforcement a connected
             // socket would get from the kernel — off-path attackers spoofing
             // the upstream IP with a random source port are otherwise
@@ -162,8 +172,7 @@ pub const BlockingUdpTransport = struct {
     pub const max_staggered_legs = 4;
 
     /// Race up to `max_staggered_legs` nameservers; return the first valid
-    /// response. Each leg gets an unconnected UDP socket with a unique
-    /// kernel-assigned ephemeral port (RFC 5452 §9.1). Callers must pass
+    /// response. Each leg leases its own `PortPool` socket. Callers must pass
     /// distinct destination IPs — racing the same IP would not increase
     /// birthday entropy.
     ///
@@ -192,17 +201,17 @@ pub const BlockingUdpTransport = struct {
         std.debug.assert(leg_n >= 2 and leg_n <= max_staggered_legs);
         std.debug.assert(leg_n == wire_queries.len and leg_n == query_ids.len);
 
-        var socks: [max_staggered_legs]Io.net.Socket = undefined;
+        var leases: [max_staggered_legs]PortPool.Lease = undefined;
         var sock_count: usize = 0;
-        defer for (socks[0..sock_count]) |s| s.close(self.io);
+        defer for (leases[0..sock_count]) |l| l.release(self.io);
 
         const deadline_ns = monotonic.nowNs() + @as(i128, overall_timeout_ms) * 1_000_000;
         const stagger_ns: i128 = @as(i128, stagger_ms) * 1_000_000;
 
         // Launch leg 0 synchronously so the caller sees send errors
         // immediately rather than spinning in the poll loop.
-        const s0 = try openUdpSocket(servers[0], self.io);
-        socks[0] = s0;
+        leases[0] = try PortPool.lease(self.io, servers[0]);
+        const s0 = leases[0].sock;
         sock_count = 1;
         s0.send(self.io, &servers[0], wire_queries[0]) catch |err| return mapUdpSendErr(err);
         var next_launch_ns: i128 = monotonic.nowNs() + stagger_ns;
@@ -213,13 +222,13 @@ pub const BlockingUdpTransport = struct {
 
             while (sock_count < leg_n and now_ns >= next_launch_ns) {
                 const idx = sock_count;
-                const s = openUdpSocket(servers[idx], self.io) catch {
-                    // Out of ephemeral ports / fd budget: stop trying to fan
-                    // out, keep polling the legs already in flight.
+                leases[idx] = PortPool.lease(self.io, servers[idx]) catch {
+                    // Out of fds: stop fanning out, keep polling the legs
+                    // already in flight.
                     next_launch_ns = deadline_ns;
                     break;
                 };
-                socks[idx] = s;
+                const s = leases[idx].sock;
                 sock_count += 1;
                 s.send(self.io, &servers[idx], wire_queries[idx]) catch {
                     next_launch_ns = deadline_ns;
@@ -238,14 +247,14 @@ pub const BlockingUdpTransport = struct {
 
             var polls: [max_staggered_legs]posix.pollfd = undefined;
             for (0..sock_count) |i| {
-                polls[i] = .{ .fd = socks[i].handle, .events = posix.POLL.IN, .revents = 0 };
+                polls[i] = .{ .fd = leases[i].sock.handle, .events = posix.POLL.IN, .revents = 0 };
             }
             const n = posix.poll(polls[0..sock_count], wait_ms) catch 0;
             if (n == 0) continue; // next launch fires, or overall deadline expires
 
             for (0..sock_count) |i| {
                 if (polls[i].revents & posix.POLL.IN != 0) {
-                    if (tryRecv(socks[i], self.io, &servers[i], query_ids[i], response_buf)) |data| {
+                    if (tryRecv(leases[i].sock, self.io, &servers[i], query_ids[i], response_buf)) |data| {
                         return .{ .response_data = data, .responding_idx = @intCast(i) };
                     }
                 }

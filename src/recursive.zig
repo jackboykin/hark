@@ -2790,7 +2790,6 @@ pub const RecursiveResolver = struct {
 
         fn run(ctx: *NsTaskCtx) void {
             var udp_t = BlockingUdpTransport.init(.{}, ctx.parent.io);
-            defer udp_t.deinit();
             var resolver = ctx.parent.cloneForThread(.{
                 .udp = &udp_t,
                 .tcp_enabled = ctx.parent.transports.?.tcp_enabled,
@@ -4511,7 +4510,6 @@ test "validation budget stays tree-wide across cloneForThread under concurrent f
         granted: u32 = 0,
         fn run(w: *@This()) void {
             var udp_t = BlockingUdpTransport.init(.{}, w.parent.io);
-            defer udp_t.deinit();
             var clone = w.parent.cloneForThread(.{ .udp = &udp_t, .tcp_enabled = false });
             const vb = clone.validationBudget();
             while (true) {

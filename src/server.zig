@@ -1693,7 +1693,6 @@ test "bg failure recording: cousin writes SERVFAIL, refresh kinds do not, fresh 
     var server = try Server.init(testing.allocator, cfg, testing.io);
     defer server.deinit();
     var udp = BlockingUdpTransport.init(.{}, server.io);
-    defer udp.deinit();
     const transports: Transports = .{ .udp = &udp, .tcp_enabled = true };
     const run = struct {
         fn f(srv: *Server, t: Transports, name: []const u8, kind: BgKind) void {

@@ -1,10 +1,4 @@
-//! Persistent per-thread UDP socket. Launches a minimal loopback echo server
-//! that flips QR bit on any query, and measures `BlockingUdpTransport.query`
-//! wall time across iterations. The syscall-count reduction shows up under
-//! `strace -c`.
-//!
-//! Two variants: one reuses a single transport (persistent socket), the
-//! other constructs a fresh transport per call (fresh socket).
+//! `BlockingUdpTransport.query` wall time against a loopback echo server.
 
 const std = @import("std");
 const Io = std.Io;
@@ -85,12 +79,11 @@ fn setup(allocator: std.mem.Allocator, io: Io) !Setup {
     };
 }
 
-pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
+pub fn run(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
     const s = try setup(allocator, io);
     defer s.deinit();
 
     var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
-    defer transport.deinit();
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
 
     for (0..warmup) |i| {
@@ -110,34 +103,5 @@ pub fn runPersistent(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
         std.mem.doNotOptimizeAway(resp.ptr);
     }
 
-    return .{ .samples_ns = samples, .label = "persistent socket" };
-}
-
-pub fn runPerQuery(allocator: std.mem.Allocator, io: std.Io) !BenchResult {
-    const s = try setup(allocator, io);
-    defer s.deinit();
-    var response_buf: [dns.edns_udp_payload]u8 = undefined;
-
-    for (0..warmup) |i| {
-        var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
-        defer transport.deinit();
-        std.mem.writeInt(u16, s.wire[0..2], @intCast(i & 0xffff), .big);
-        const resp = try transport.query(s.wire, @intCast(i & 0xffff), s.server_addr, &response_buf);
-        std.mem.doNotOptimizeAway(resp.ptr);
-    }
-
-    const samples = try allocator.alloc(i64, bench_iters);
-    for (0..bench_iters) |i| {
-        const qid: u16 = @intCast(i & 0xffff);
-        std.mem.writeInt(u16, s.wire[0..2], qid, .big);
-        const t0 = monotonic.nowNs();
-        var transport = BlockingUdpTransport.init(.{ .timeout_ms = 2000, .retransmit_count = 1 }, io);
-        const resp = try transport.query(s.wire, qid, s.server_addr, &response_buf);
-        transport.deinit();
-        const t1 = monotonic.nowNs();
-        samples[i] = @intCast(t1 - t0);
-        std.mem.doNotOptimizeAway(resp.ptr);
-    }
-
-    return .{ .samples_ns = samples, .label = "fresh transport per query" };
+    return .{ .samples_ns = samples, .label = "port-pool lease" };
 }

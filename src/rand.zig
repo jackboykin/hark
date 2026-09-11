@@ -24,6 +24,10 @@ pub fn hashSeed(io: Io) u64 {
     return rng(io).int(u64);
 }
 
+pub fn poolSlot(io: Io, n: usize) usize {
+    return rng(io).uintLessThan(usize, n);
+}
+
 pub fn uniformFloat(io: Io) f32 {
     return rng(io).float(f32);
 }

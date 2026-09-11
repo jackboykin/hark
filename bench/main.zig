@@ -35,8 +35,7 @@ const benchmarks = [_]Benchmark{
     .{ .name = "dedup_with", .run = dedup.runWithDedup },
     .{ .name = "dedup_without", .run = dedup.runWithoutDedup },
     .{ .name = "dedup_f01", .run = dedup.runF01 },
-    .{ .name = "upstream_perquery", .run = upstream.runPerQuery },
-    .{ .name = "upstream_persistent", .run = upstream.runPersistent },
+    .{ .name = "upstream", .run = upstream.run },
     .{ .name = "delegation", .run = delegation.run },
 } ++ cache_contention.benchmarks ++ cache_write.benchmarks;
 

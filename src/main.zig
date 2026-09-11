@@ -209,7 +209,6 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     // Fresh transports for this single resolve (mirrors the bg-prefetch
     // path). `opportunistic` rides in via cfg, set above before init.
     var udp = BlockingUdpTransport.init(.{}, server.io);
-    defer udp.deinit();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -288,6 +287,12 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     if (cli_verbose or cfg.log_queries) {
         log_verbose.store(true, .release);
     }
+
+    // The source-port pools alone can exceed systemd's default 1024 soft cap.
+    if (std.posix.getrlimit(.NOFILE)) |lim| {
+        if (lim.cur < lim.max) std.posix.setrlimit(.NOFILE, .{ .cur = lim.max, .max = lim.max }) catch |err|
+            log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
+    } else |_| {}
 
     var server = Server.init(allocator, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
