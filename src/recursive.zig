@@ -1197,11 +1197,6 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| c.cacheServfail(name, qtype);
     }
 
-    /// Final-query response with `rcode != no_error`. AA-NXDOMAIN runs
-    /// the verified-negative dance and caches the proven negative;
-    /// SERVFAIL/REFUSED routes through `cacheResolutionFailure`. Other
-    /// rcodes (FORMERR, NOTIMP, …) fall through uncached — caller
-    /// receives the raw response.
     /// Any error rcode, or NOERROR with no answers and no referral. AA
     /// NXDOMAIN/NODATA cache the proven negative; non-AA NODATA and
     /// SERVFAIL/REFUSED go through `cacheResolutionFailure`; the rest pass
