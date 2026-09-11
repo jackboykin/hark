@@ -889,6 +889,7 @@ pub const RRsetCache = struct {
 
         // RFC 2308 §5 SHOULD-3h cap on top of the min-TTL floor / max-TTL clamp.
         const life = self.lifetime(@min(clampTtl(self.min_ttl, neg_ttl), negative_max_ttl), authenticated_ttl_max);
+        self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = life.expires_at,
@@ -930,6 +931,7 @@ pub const RRsetCache = struct {
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         // Caller-chosen TTL on a record-less entry: nothing to bound it by.
         const life = self.lifetime(@min(ttl, ceiling), std.math.maxInt(u32));
+        self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
             .expires_at = life.expires_at,
@@ -1098,7 +1100,8 @@ pub const RRsetCache = struct {
     }
 
     /// Acquire the shard write lock and reserve a slot. Caller defers
-    /// unlock on success and frees `key.name` on later failure paths.
+    /// unlock on success, frees `key.name` on failure, and removes the old
+    /// entry only after its replacement is built — never leaving a hole.
     fn prepareSlot(
         self: *RRsetCache,
         lower_name: []const u8,
@@ -1106,7 +1109,7 @@ pub const RRsetCache = struct {
         rclass: dns.RClass,
         status: SecurityStatus,
         overwrite: Overwrite,
-    ) ?struct { shard: *Shard, alloc: Allocator, key: CacheKey } {
+    ) ?struct { shard: *Shard, alloc: Allocator, key: CacheKey, h: u32 } {
         const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
         const shard, const h = self.shardWithHash(probe);
         shard.write.lock.lockUncancelable(self.io);
@@ -1129,8 +1132,7 @@ pub const RRsetCache = struct {
             return null;
         };
         const key = CacheKey{ .name = key_name, .rtype = rtype, .rclass = rclass };
-        self.removeAndFree(shard, h, key);
-        return .{ .shard = shard, .alloc = alloc, .key = key };
+        return .{ .shard = shard, .alloc = alloc, .key = key, .h = h };
     }
 
     /// Store a single (name, rtype) RRset group. Acquires the shard's write
@@ -1173,6 +1175,7 @@ pub const RRsetCache = struct {
         };
 
         const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), authenticated_ttl_max);
+        self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .pack = pack,
             .expires_at = life.expires_at,
@@ -2085,6 +2088,34 @@ test "cache eviction when full" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     try testing.expect(cache.lookup(arena.allocator(), last, .a, .in) != null);
+}
+
+test "a store refused at the byte cap leaves the old entry in place" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 64 * 1024, .io = testing.io });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = dns.Name{ .labels = &.{} };
+    const name = try makeTestName(a, &.{ "hole", "example" });
+
+    const small = try a.alloc(dns.ResourceRecord, 1);
+    small[0] = .{ .name = name, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = &.{"old"} } } };
+    cache.storeResponse(makeTestResponse(small), root, .unchecked, std.math.maxInt(u32));
+
+    // 20 × 16 × 255 B ≈ 80 KB: the pack can never fit, so buildPack is refused.
+    const xs: [255]u8 = @splat('x');
+    const strings = try a.alloc([]const u8, 16);
+    for (strings) |*str| str.* = &xs;
+    const big = try a.alloc(dns.ResourceRecord, 20);
+    for (big) |*rr| rr.* = .{ .name = name, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = strings } } };
+    cache.storeResponse(makeTestResponse(big), root, .unchecked, std.math.maxInt(u32));
+
+    const hit = (cache.lookup(a, "hole.example", .txt, .in) orelse return error.TestUnexpectedResult).hit;
+    try testing.expectEqual(1, hit.records.len);
 }
 
 test "cache deep copy independence" {
