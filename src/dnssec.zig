@@ -104,14 +104,26 @@ fn isValidZoneKey(dk: dns.DnskeyData) bool {
     return dk.isZoneKey() and dk.protocol == 3 and !dk.isRevoked();
 }
 
-/// RFC 6840 §5.2: a SHA-1 DS MUST NOT anchor trust when a SHA-256 DS
-/// covers the same key tag. Applied uniformly to every anchoring check.
+/// RFC 4509 §3: a SHA-1 DS is ignored when the RRset also carries a SHA-256
+/// one hark can use — one for an unsupported key algorithm anchors nothing
+/// (RFC 6840 §5.2), so it must not silence the SHA-1 that does.
 fn dsEligible(ds: dns.DsData, ds_records: []const dns.DsData) bool {
     if (ds.digest_type != .sha1) return true;
-    for (ds_records) |ds2| {
-        if (ds2.digest_type == .sha256 and ds2.key_tag == ds.key_tag) return false;
-    }
+    for (ds_records) |ds2| if (ds2.digest_type == .sha256 and isSupportedAlgorithm(ds2.algorithm)) return false;
     return true;
+}
+
+test "dsEligible: SHA-1 yields to a usable SHA-256 DS anywhere in the RRset, not to an unusable one" {
+    const ds = struct {
+        fn make(tag: u16, algo: dns.DnssecAlgorithm, digest_type: dns.DigestType) dns.DsData {
+            return .{ .key_tag = tag, .algorithm = algo, .digest_type = digest_type, .digest = &.{} };
+        }
+    }.make;
+    const sha1 = ds(1, .ecdsap256sha256, .sha1);
+    try testing.expect(dsEligible(sha1, &.{sha1}));
+    try testing.expect(!dsEligible(sha1, &.{ sha1, ds(2, .ecdsap256sha256, .sha256) }));
+    try testing.expect(dsEligible(sha1, &.{ sha1, ds(2, .ed448, .sha256) }));
+    try testing.expect(dsEligible(ds(1, .ecdsap256sha256, .sha256), &.{ds(2, .ecdsap256sha256, .sha256)}));
 }
 
 pub fn validateDnskeyRrset(
