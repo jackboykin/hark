@@ -287,11 +287,11 @@ class Responder:
                 forced = self._signer_named(entry.sign_as) if entry.sign_as else None
                 cuts = _delegation_cuts(entry)
                 for section in (entry.answer, entry.authority, entry.additional):
-                    self._materialize_ds_inplace(section)
+                    self._materialize_ds_inplace(section, entry.ds_from)
                     wildcard = dns.name.from_text(entry.wildcard) if entry.wildcard and section is entry.answer else None
                     self._sign_section_inplace(section, cuts, forced, rng.address, wildcard)
 
-    def _materialize_ds_inplace(self, rrsets: list[dns.rrset.RRset]) -> None:
+    def _materialize_ds_inplace(self, rrsets: list[dns.rrset.RRset], ds_from: dict[dns.name.Name, dns.name.Name]) -> None:
         """Replace placeholder DS rdata (key tag 0) with the real digest.
 
         A .rpl record is static text, so a scenario cannot spell the digest of
@@ -305,11 +305,12 @@ class Responder:
                 continue
             if not all(rd.key_tag == 0 for rd in rrset):
                 continue  # scenario spelled a real (or deliberately wrong) DS
-            km = self._signer_named_exact(rrset.name)
+            zone = ds_from.get(rrset.name, rrset.name)
+            km = self._signer_named_exact(zone)
             if km is None:
                 raise ValueError(
                     f"placeholder DS at {rrset.name} but no `; hark: dnssec-zone = "
-                    f"{rrset.name}` declared — nothing to take a digest of"
+                    f"{zone}` declared — nothing to take a digest of"
                 )
             rrsets[i] = dns.rrset.from_rdata(rrset.name, rrset.ttl, km.ds)
 

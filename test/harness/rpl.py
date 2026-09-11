@@ -21,7 +21,7 @@ Hark-only extensions:
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>
-  - <child> <ttl> IN DS PLACEHOLDER         real digest substituted at load
+  - <child> <ttl> IN DS PLACEHOLDER [<zone>] real digest substituted at load; <zone> plants another zone's digest at this owner (one per owner)
   - STEP n CHECK_QUERY_LOG                  set-style upstream-query check
   - STEP n CHECK_OUT_QUERY                  positional upstream-query check
   - STEP n CHECK_MAX_QUERIES <N>            assert <= N total upstream queries
@@ -137,6 +137,8 @@ class Entry:
     # WILDCARD <owner>: sign answer RRsets as expansions of that wildcard
     # (RFC 4035 §3.1.3.3).
     wildcard: str | None = None
+    # DS PLACEHOLDER <zone>: owner -> zone whose digest to plant there.
+    ds_from: dict[dns.name.Name, dns.name.Name] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -490,7 +492,10 @@ class _Parser:
             return
         # Answer/authority/additional: full RR with rdata.
         try:
-            args = _split_rr_line(_expand_ds_placeholder(line))
+            line, ds_zone = _expand_ds_placeholder(line)
+            if ds_zone:
+                entry.ds_from[dns.name.from_text(line.split()[0])] = dns.name.from_text(ds_zone)
+            args = _split_rr_line(line)
             rrset = dns.rrset.from_text_list(
                 *args, origin=dns.name.root, relativize=False
             )
@@ -514,11 +519,14 @@ _DEFAULT_RR_TTL = 3600
 _DS_PLACEHOLDER_RDATA = "0 13 2 " + "00" * 32
 
 
-def _expand_ds_placeholder(line: str) -> str:
+def _expand_ds_placeholder(line: str) -> tuple[str, str | None]:
     parts = line.split()
+    zone = None
+    if len(parts) >= 3 and parts[-2].upper() == "PLACEHOLDER" and parts[-3].upper() == "DS":
+        zone = parts.pop()
     if len(parts) >= 2 and parts[-1].upper() == "PLACEHOLDER" and parts[-2].upper() == "DS":
-        return " ".join(parts[:-1]) + " " + _DS_PLACEHOLDER_RDATA
-    return line
+        return " ".join(parts[:-1]) + " " + _DS_PLACEHOLDER_RDATA, zone
+    return line, None
 
 
 def _absolutize(name: str) -> str:
