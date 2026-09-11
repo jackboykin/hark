@@ -1,0 +1,46 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a query for the wildcard name itself needs no closer-match proof
+
+; RFC 4034 §3.1.3: the RRSIG Labels field excludes a leading `*`, so the
+; signature over `*.example.` says labels=1 while the owner has two. That
+; gap is what marks a wildcard *expansion* — but here nothing was expanded:
+; the client asked for `*.example.` and got the record at that exact name.
+; Treating the gap as an expansion demands an NSEC proving no closer match,
+; which the server correctly never sent, and the answer SERVFAILs.
+;
+; Expected: NOERROR, AD=1.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      *.example. IN A
+    SECTION ANSWER
+      *.example. 3600 IN A 192.0.2.42
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    *.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    *.example. IN A
+  SECTION ANSWER
+    *.example. 3600 IN A 192.0.2.42
+ENTRY_END
+
+SCENARIO_END

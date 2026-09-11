@@ -1481,7 +1481,7 @@ pub fn rrsigTtlCap(rrsig: dns.RrsigData, now_u32: u32) u32 {
 }
 
 /// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
-fn signedLabels(name: dns.Name) usize {
+pub fn signedLabels(name: dns.Name) usize {
     const star = name.labels.len > 0 and mem.eql(u8, name.labels[0], "*");
     return name.labels.len - @intFromBool(star);
 }

@@ -2327,7 +2327,7 @@ pub const RecursiveResolver = struct {
             const sig = dnssec.validateRrset(response.answers, rr.name, rr.rtype, group_keys, now_u32, self.validationBudget()) orelse return .{ .bogus = "rrsig failed to verify" };
             var group_cap = dnssec.rrsigTtlCap(sig, now_u32);
             var verdict: dnssec.SecurityStatus = .secure;
-            if (sig.labels < rr.name.labels.len) {
+            if (sig.labels < dnssec.signedLabels(rr.name)) {
                 verdict = try self.proveWildcard(allocator, &keys, response.authorities, rr.name, sig, servers, now_u32, &group_cap);
                 if (rr.rtype == qtype) wildcard = .{
                     .ce = .{ .labels = rr.name.labels[rr.name.labels.len - sig.labels ..] },
