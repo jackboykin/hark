@@ -173,7 +173,7 @@ pub const NsSelector = struct {
             // Float == is bit-exact here because discountAndRead floors both
             // fields back to the prior via @max with the same constants.
             samples[live_count] = if (state.alpha == alpha_prior and state.beta == beta_prior)
-                rand.fastUniformFloat(self.io)
+                rand.uniformFloat(self.io)
             else
                 betaSample(self.io, state.alpha, state.beta);
             live_count += 1;
@@ -283,7 +283,7 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
         }
         v = v * v * v;
 
-        const u = rand.fastUniformFloat(io);
+        const u = rand.uniformFloat(io);
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
         if (@log(u) < 0.5 * x * x + d * (1.0 - v + @log(v))) return d * v;
@@ -292,8 +292,8 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
 
 /// Standard normal via Box-Muller transform.
 fn normalSample(io: std.Io) f32 {
-    const r1 = rand.fastUniformFloat(io);
-    const r2 = rand.fastUniformFloat(io);
+    const r1 = rand.uniformFloat(io);
+    const r2 = rand.uniformFloat(io);
     // Avoid log(0)
     const safe_r1 = @max(r1, 1e-10);
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);

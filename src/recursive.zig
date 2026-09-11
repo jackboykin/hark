@@ -1772,7 +1772,7 @@ pub const RecursiveResolver = struct {
         const sel = if (self.ns_selector) |ns|
             ns.selectServers(parent_zone, servers, self.rtt_cache, &order_buf)
         else blk: {
-            rand.fastShuffle(na.Address, self.io, servers);
+            rand.shuffle(na.Address, self.io, servers);
             for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..servers.len];
         };
@@ -2567,7 +2567,7 @@ pub const RecursiveResolver = struct {
         std.debug.assert(ns_names.len <= max_servers_per_level);
         var shuffled: [max_servers_per_level]dns.Name = undefined;
         @memcpy(shuffled[0..ns_names.len], ns_names);
-        rand.fastShuffle(dns.Name, self.io, shuffled[0..ns_names.len]);
+        rand.shuffle(dns.Name, self.io, shuffled[0..ns_names.len]);
         const names = shuffled[0..ns_names.len];
 
         // Parallel path: one helper thread per (ns_name × rtype) task beyond
