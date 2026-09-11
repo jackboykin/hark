@@ -2198,16 +2198,11 @@ pub const RecursiveResolver = struct {
             // NODATA — the whole reverse tree SERVFAILed). A lying signer
             // can't anchor: its DNSKEY must chain to the root trust anchor.
             // The proper-ancestor guard pins it to the qname chain.
-            // Narrow to *this zone's* DS RRset first. One filter closes three
-            // compounding holes: the signer below came off the first RRSIG
-            // covering any DS, the validator reports `.secure` when
-            // *some* owner-group verifies, and the cache loop copied every `.ds`
-            // in the section — so an unsigned DS for an unrelated name could ride
-            // along and be cached `.secure`. A DS is a digest commitment, so a
-            // planted one is what that name's DNSKEY is then checked against:
-            // its subtree SERVFAILs for the DS TTL, and planting needs no key at
-            // all. Scenario 903. The filter drops nothing legitimate — a DS
-            // answer's owner is the qname, a referral's is the child zone.
+            // Narrow to *this zone's* DS RRset first, or an unsigned DS for an
+            // unrelated name rides along: cached `.secure` (903), or at TTL 0
+            // anchoring the child's DNSKEY outright (904). Nothing legitimate
+            // is dropped: a DS answer's owner is the qname, a referral's the
+            // child zone.
             var zone_ds_buf: [32]dns.ResourceRecord = undefined;
             var ds_count: usize = 0;
             for (ds_section) |rr| {
@@ -2262,7 +2257,7 @@ pub const RecursiveResolver = struct {
                 // only returns .no_error, so the synthesized header is faithful.
                 kc.storeResponse(synthesizedMessage(zone_ds_buf[0..ds_count], &.{}, .no_error, false), zone, .secure, ds_ttl_cap);
             }
-            return ds_section;
+            return allocator.dupe(dns.ResourceRecord, zone_ds_buf[0..ds_count]) catch null;
         }
 
         // No DS section — verify NSEC/NSEC3 proof of insecure delegation. NS

@@ -1,0 +1,110 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a DS at the wrong owner must not anchor the child's DNSKEY
+
+; Sibling of 903. That scenario proved the key cache only keeps DS records
+; owned by the zone asked for; this one proves the same for the slice
+; `reproveDelegationSecurityImpl` hands back to the DNSKEY validator. The
+; verified, cached set was filtered, but the returned one was the raw
+; section, and `validateDnskeyAgainstDs` collects every `.ds` it is given
+; regardless of owner.
+;
+; So: example. answers `child.example. DS` with a genuine, parent-signed DS
+; whose digest matches nothing (a key the child never had) plus a stray at
+; `x.child.example.` carrying the digest of child.example.'s real key. The
+; stray needs no key of its own (the harness signs it as it signs anything
+; under a declared zone; the owner filter drops record and signature alike).
+; If the stray is consulted, child.example.'s DNSKEY anchors to it and
+; www.child.example. comes back AD=1. The only honest verdict is bogus: the
+; parent's commitment does not match the child's key.
+;
+; The genuine DS carries TTL 0 (wire TTL is not signed, so an injector picks
+; it): hark declines to cache it, so `fetchDnskey` misses the key cache and
+; validates against the returned slice instead of the filtered, cached set.
+; At any other TTL the cache masks the hole.
+;
+; No DS on the referral, which forces the explicit DS-query path.
+;
+; Topology
+;   root           127.0.10.1
+;   example        127.0.10.2  answers child.example. DS with the stray
+;   child.example  127.0.10.3
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 0 IN DS 12345 13 2 0000000000000000000000000000000000000000000000000000000000000000
+      x.child.example. 3600 IN DS PLACEHOLDER child.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 3600 IN NS ns.child.example.
+    SECTION ADDITIONAL
+      ns.child.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 3600 IN A 192.0.2.77
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+SCENARIO_END
