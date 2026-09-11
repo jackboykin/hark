@@ -238,10 +238,35 @@ const Ctx = struct {
     fd: posix.fd_t,
 };
 
+const Listener = struct {
+    ctx: Ctx,
+    armed: bool = false,
+
+    fn tryArm(l: *Listener, loop: *EventLoop) !void {
+        l.armed = false;
+        _ = try switch (l.ctx.tag) {
+            .udp_recv => loop.recvFromMulti(l.ctx.fd, &l.ctx),
+            .tcp_accept => loop.accept(l.ctx.fd, &l.ctx),
+            .signal => loop.read(l.ctx.fd, &l.ctx),
+            .tick => loop.timer(tick_ms, &l.ctx),
+            .tcp_read => unreachable,
+        };
+        l.armed = true;
+    }
+
+    fn of(ctx: *Ctx) *Listener {
+        return @alignCast(@fieldParentPtr("ctx", ctx));
+    }
+
+    fn arm(l: *Listener, loop: *EventLoop) void {
+        l.tryArm(loop) catch |err| log.err("failed to arm {s}: {s}", .{ @tagName(l.ctx.tag), @errorName(err) });
+    }
+};
+
 const max_listen_addrs = 8;
 
-/// Ring slots left by listeners, signalfd, tick.
-const max_tcp_clients_per_worker = max_operations - 2 * max_listen_addrs - 2;
+const max_listeners = 2 * max_listen_addrs + 2;
+const max_tcp_clients_per_worker = max_operations - max_listeners;
 const tick_ms = 1000;
 
 /// Consecutive unreadable signalfd completions tolerated before the worker
@@ -741,11 +766,9 @@ const WorkerState = struct {
         self.server.logFootprint();
     }
 
-    /// Logs a failed arm; the repair loop at the bottom of each tick
-    /// retries silently until it takes.
-    fn armed(result: anytype, what: []const u8) bool {
+    fn readArmed(result: anytype) bool {
         _ = result catch |err| {
-            log.err("failed to arm {s}: {s}", .{ what, @errorName(err) });
+            log.err("failed to arm TCP read: {s}", .{@errorName(err)});
             return false;
         };
         return true;
@@ -763,7 +786,7 @@ const WorkerState = struct {
         self.tcp_clients[self.tcp_count] = client;
         self.tcp_count += 1;
         sys.setNoDelay(fd);
-        if (!armed(self.loop.readStream(fd, &client.buf, @ptrCast(&client.ctx)), "TCP read")) self.dropTcpClient(client);
+        if (!readArmed(self.loop.readStream(fd, &client.buf, @ptrCast(&client.ctx)))) self.dropTcpClient(client);
     }
 
     /// False: close.
@@ -825,34 +848,17 @@ const WorkerState = struct {
     }
 
     fn serveLoop(self: *WorkerState, udp_socks: []const posix.fd_t, tcp_socks: []const posix.fd_t, sig_fd: posix.fd_t) noreturn {
-        const n = udp_socks.len;
-
         self.recv_pta.init(self.server.allocator, self.server.config.query_memory_limit);
 
-        var udp_ctxs: [max_listen_addrs]Ctx = undefined;
-        var tcp_ctxs: [max_listen_addrs]Ctx = undefined;
-        var signal_ctx = Ctx{ .tag = .signal, .fd = sig_fd };
-
-        var udp_armed: [max_listen_addrs]bool = @splat(false);
-        var tcp_armed: [max_listen_addrs]bool = @splat(false);
-
+        var listener_buf: [max_listeners]Listener = undefined;
+        var listeners = std.ArrayList(Listener).initBuffer(&listener_buf);
         // Multishot recvmsg — one SQE per socket stays armed and produces
         // CQEs for every inbound packet until the kernel terminates it.
-        for (udp_socks, 0..) |fd, i| {
-            if (fd < 0) continue;
-            udp_ctxs[i] = .{ .tag = .udp_recv, .fd = fd };
-            udp_armed[i] = armed(self.loop.recvFromMulti(fd, @ptrCast(&udp_ctxs[i])), "UDP recvmsg");
-        }
-
-        for (tcp_socks, 0..) |fd, i| {
-            if (fd < 0) continue;
-            tcp_ctxs[i] = .{ .tag = .tcp_accept, .fd = fd };
-            tcp_armed[i] = armed(self.loop.accept(fd, @ptrCast(&tcp_ctxs[i])), "TCP accept");
-        }
-
-        var signal_armed = sig_fd >= 0 and !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
-        var tick_ctx = Ctx{ .tag = .tick, .fd = -1 };
-        var tick_armed = armed(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)), "tick");
+        for (udp_socks) |fd| if (fd >= 0) listeners.appendAssumeCapacity(.{ .ctx = .{ .tag = .udp_recv, .fd = fd } });
+        for (tcp_socks) |fd| if (fd >= 0) listeners.appendAssumeCapacity(.{ .ctx = .{ .tag = .tcp_accept, .fd = fd } });
+        if (sig_fd >= 0) listeners.appendAssumeCapacity(.{ .ctx = .{ .tag = .signal, .fd = sig_fd } });
+        listeners.appendAssumeCapacity(.{ .ctx = .{ .tag = .tick, .fd = -1 } });
+        for (listeners.items) |*l| l.arm(self.loop);
 
         var signal_misfires: u32 = 0;
 
@@ -909,7 +915,7 @@ const WorkerState = struct {
                         }
                         // Both ways this can fail (slot table full, SQ full)
                         // clear on the next tick; the repair loop below retries.
-                        signal_armed = !std.meta.isError(self.loop.read(ctx.fd, @ptrCast(ctx)));
+                        Listener.of(ctx).arm(self.loop);
                         continue;
                     },
                     .udp_recv => {
@@ -922,57 +928,39 @@ const WorkerState = struct {
                             },
                             else => {},
                         }
-                        const idx = ctxIndex(&udp_ctxs, n, ctx) orelse continue;
                         // Re-arm only on kernel termination, signalled by this
                         // CQE — never the slot table (see Completion.terminated
                         // for the mid-batch id-recycle trap). ENOBUFS on the
                         // shared buffer ring is flood-triggerable; a missed
                         // re-arm leaves SO_REUSEPORT hashing traffic into a
                         // dead worker until restart.
-                        if (!c.terminated) continue;
-                        udp_armed[idx] = armed(self.loop.recvFromMulti(ctx.fd, @ptrCast(ctx)), "UDP recvmsg");
+                        if (c.terminated) Listener.of(ctx).arm(self.loop);
                     },
                     .tcp_accept => {
                         switch (c.result) {
                             .accept => |acc| if (acc.err == null and acc.fd >= 0) self.acceptTcp(acc.fd, acc.addr),
                             else => {},
                         }
-                        const idx = ctxIndex(&tcp_ctxs, n, ctx) orelse continue;
-                        tcp_armed[idx] = armed(self.loop.accept(ctx.fd, @ptrCast(ctx)), "TCP accept");
+                        Listener.of(ctx).arm(self.loop);
                     },
                     .tcp_read => {
                         const client: *TcpClient = @alignCast(@fieldParentPtr("ctx", ctx));
                         const got = c.result.stream;
                         if (got == 0 or !self.feedTcp(client, got) or
-                            !armed(self.loop.readStream(client.fd, client.buf[client.len..], @ptrCast(&client.ctx)), "TCP read"))
+                            !readArmed(self.loop.readStream(client.fd, client.buf[client.len..], @ptrCast(&client.ctx))))
                         {
                             self.dropTcpClient(client);
                         }
                     },
                     .tick => {
                         self.sweepTcpIdle();
-                        tick_armed = armed(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)), "tick");
+                        Listener.of(ctx).arm(self.loop);
                     },
                 }
             }
 
-            // The signalfd read joins the same repair loop as the listeners:
-            // a transient arm failure must not cost the daemon its signals.
-            if (sig_fd >= 0 and !signal_armed) {
-                signal_armed = !std.meta.isError(self.loop.read(sig_fd, @ptrCast(&signal_ctx)));
-            }
-            if (!tick_armed) tick_armed = !std.meta.isError(self.loop.timer(tick_ms, @ptrCast(&tick_ctx)));
-
-            // Retry re-registration for any listeners that failed above.
-            // Placed after completion processing so freshly freed slots are available.
-            for (0..n) |i| {
-                if (udp_socks[i] >= 0 and !udp_armed[i]) {
-                    udp_armed[i] = !std.meta.isError(self.loop.recvFromMulti(udp_ctxs[i].fd, @ptrCast(&udp_ctxs[i])));
-                }
-                if (tcp_socks[i] >= 0 and !tcp_armed[i]) {
-                    tcp_armed[i] = !std.meta.isError(self.loop.accept(tcp_ctxs[i].fd, @ptrCast(&tcp_ctxs[i])));
-                }
-            }
+            // Failures were logged above; slots freed this tick may now suffice.
+            for (listeners.items) |*l| if (!l.armed) l.tryArm(self.loop) catch {};
         }
     }
 
@@ -1382,13 +1370,6 @@ fn tcpWriteMessage(io: Io, fd: posix.fd_t, data: []const u8, deadline_ns: i128) 
     mem.writeInt(u16, &len_prefix, @intCast(data.len), .big);
     tcpWriteAllBlocking(io, fd, &len_prefix, deadline_ns) orelse return null;
     tcpWriteAllBlocking(io, fd, data, deadline_ns) orelse return null;
-}
-
-fn ctxIndex(ctxs: *const [max_listen_addrs]Ctx, n: usize, target: *const Ctx) ?usize {
-    for (0..n) |i| {
-        if (&ctxs[i] == target) return i;
-    }
-    return null;
 }
 
 fn logCounterIfNonzero(name: []const u8, value: u64) void {
