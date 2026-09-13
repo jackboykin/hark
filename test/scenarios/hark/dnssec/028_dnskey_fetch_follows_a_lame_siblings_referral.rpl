@@ -1,0 +1,98 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = fr.
+; hark: dnssec-zone = afnic.fr.
+
+SCENARIO_BEGIN a child answered from a shared parent server still gets its DNSKEY
+
+; .fr and afnic.fr share g.ext.nic.fr; d.nic.fr serves only .fr. When the .fr
+; step lands on the shared server it answers afnic.fr AA and the walk never
+; sees a referral, so the DNSKEY fetch runs against the .fr set. d.nic.fr
+; refers; that referral is the route to the child's servers, not an empty
+; answer. d.fr SERVFAILs the A query so the walk always lands on g, and the
+; DNSKEY fetch then asks d first in glue order.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      fr. IN A
+    SECTION AUTHORITY
+      fr. 3600 IN NS d.fr.
+      fr. 3600 IN NS g.fr.
+      fr. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      d.fr. 3600 IN A 127.0.10.2
+      g.fr. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; d.fr: .fr only. Refers everything under afnic.fr to the child's one server.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR SERVFAIL
+    SECTION QUESTION
+      afnic.fr. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      afnic.fr. IN A
+    SECTION AUTHORITY
+      afnic.fr. 3600 IN NS g.fr.
+      afnic.fr. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      g.fr. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; g.fr: .fr and afnic.fr. Answers the child's names authoritatively.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      afnic.fr. IN A
+    SECTION ANSWER
+      afnic.fr. 600 IN A 192.0.2.21
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      afnic.fr. IN DS
+    SECTION ANSWER
+      afnic.fr. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    afnic.fr. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    afnic.fr. IN A
+  SECTION ANSWER
+    afnic.fr. 600 IN A 192.0.2.21
+ENTRY_END
+
+SCENARIO_END

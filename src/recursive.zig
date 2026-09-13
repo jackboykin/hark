@@ -2040,10 +2040,26 @@ pub const RecursiveResolver = struct {
         return resp.answers;
     }
 
+    /// probeRRset, following one referral. Not for DS, which lives in the
+    /// parent: the reprove path reads it out of a referral's authority.
+    fn fetchRRset(
+        self: *RecursiveResolver,
+        allocator: mem.Allocator,
+        zone_name: []const u8,
+        qtype: dns.RType,
+        servers: []const na.Address,
+        max_servers: usize,
+    ) !?dns.Message {
+        const response = try self.probeRRset(allocator, zone_name, qtype, servers, max_servers) orelse return null;
+        if (qtype == .ds) return response;
+        const hop = try self.referralAddrs(allocator, response, zone_name) orelse return response;
+        return self.probeRRset(allocator, zone_name, qtype, hop.addrs[0..hop.count], max_servers);
+    }
+
     /// Query authoritative servers for a specific RRset, with RTT tracking
     /// and dead-server skipping.  Returns the full message so callers that
     /// need the authority section (e.g. DS probes) can use it.
-    fn fetchRRset(
+    fn probeRRset(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
@@ -2057,7 +2073,6 @@ pub const RecursiveResolver = struct {
         // thread fast path crashes on `transports.?.udp` when the cached
         // delegation needs DS/DNSKEY re-prove.
         if (self.cache_only) return error.CacheOnlyMiss;
-        if (servers.len == 0) return null;
 
         const try_count = @min(servers.len, max_servers);
         const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
@@ -2081,6 +2096,18 @@ pub const RecursiveResolver = struct {
             return response;
         }
         return null;
+    }
+
+    /// Where a lame sibling's referral points when the cut is `zone_name`
+    /// itself (parent one label up; extractReferral wants strictly deeper).
+    /// .fr and afnic.fr share g.ext.nic.fr but not d.nic.fr.
+    fn referralAddrs(self: *RecursiveResolver, allocator: mem.Allocator, response: dns.Message, zone_name: []const u8) !?NsAddrResult {
+        if (response.header.flags.aa or response.answers.len != 0) return null;
+        const zone = try dns.parseDottedName(allocator, zone_name);
+        if (zone.labels.len == 0) return null;
+        const ref = extractReferral(response, zone, .{ .labels = zone.labels[1..] }, self.referralPolicy()) orelse return null;
+        if (ref.addr_count > 0) return .{ .addrs = ref.addrs, .count = ref.addr_count };
+        return (try self.lookupCachedNsAddresses(allocator, ref.nsNames())) orelse self.resolveNsAddresses(allocator, ref.nsNames(), 1);
     }
 
     /// Re-fetch DS for a zone by finding the parent zone's NS in cache
