@@ -243,10 +243,10 @@ case "$CMD" in
         dnsperf -s 127.0.0.1 -p 5354 -d "$QFILE" -l "$DURATION" -c 1 -q "$INFLIGHT" -t "$(dnsperf_timeout)" \
             2>&1 | tee "$TMPDIR/dnsperf.out"
 
-        # Surface log activity. SERVFAIL lines (if logged) tell us *why* the
-        # resolver is failing under load. If they're not there, log level is
-        # higher than warn in this build.
+        # Exit stats say where lost queries went.
+        kill "$HARK_PID"; wait "$HARK_PID" 2>/dev/null || true; HARK_PID=""
         echo ">>> hark log: $(wc -l < "$HARK_LOG") lines"
+        grep -E 'drop' "$HARK_LOG" || true
         if grep -q SERVFAIL "$HARK_LOG"; then
             echo ">>> SERVFAIL error-name distribution (top 10):"
             grep SERVFAIL "$HARK_LOG" \
