@@ -202,7 +202,7 @@ class Scenario:
 
 # ── Parser ─────────────────────────────────────────────────────────────────
 
-_HARK_DIRECTIVE_RE = re.compile(r"^\s*;\s*hark\s*:\s*([a-z\-]+)\s*=\s*(.+?)\s*$")
+_HARK_DIRECTIVE_RE = re.compile(r"^\s*;\s*hark\s*:\s*([a-z0-9\-]+)\s*=\s*(.+?)\s*$")
 
 
 def parse(path: Path) -> Scenario:
@@ -285,6 +285,8 @@ class _Parser:
                 )
             if name not in self.scenario.dnssec_zones:
                 self.scenario.dnssec_zones.append(name)
+        else:
+            raise self.err(f"unknown hark directive {key!r}")
 
     def parse(self) -> Scenario:
         # Header may contain `; hark: x = y` directives before SCENARIO_BEGIN.
