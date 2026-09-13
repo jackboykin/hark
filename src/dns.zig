@@ -66,18 +66,6 @@ pub const RCode = enum(u4) {
     pub fn isServerError(self: RCode) bool {
         return self == .server_failure or self == .refused;
     }
-
-    /// Should the iterative resolver abandon this NS's answer and try a
-    /// sibling? Broader than isServerError: a FORMERR usually means *this*
-    /// server can't interpret the query (EDNS-hostile auth, COOKIE-mangling
-    /// middlebox), but a sibling NS for the zone may still answer (RFC 1034
-    /// §4.3.5). Both fallthrough sites deliberately score FORMERR as
-    /// .server_error too — hark always sends EDNS and never retries without
-    /// it, so a FORMERR-ing NS can't serve the zone. Only the DoT guard
-    /// keeps isServerError's narrower SERVFAIL/REFUSED meaning.
-    pub fn shouldTrySiblingNs(self: RCode) bool {
-        return self.isServerError() or self == .format_error;
-    }
 };
 
 pub const RType = enum(u16) {

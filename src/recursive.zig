@@ -1721,12 +1721,11 @@ pub const RecursiveResolver = struct {
             return null;
         }
 
-        // RFC 1034 §4.3.5 lame-NS fallthrough. The sequential server_loop
-        // handles this via `last_server_failure`, but the race path returns
-        // first-by-latency — so a fast-failing NS would propagate verbatim
-        // without this check. Score and bail to sequential. FORMERR counts
-        // (an EDNS-hostile auth shouldn't condemn the zone — try a sibling).
-        if (resp.header.flags.rcode.shouldTrySiblingNs()) {
+        // The sequential server_loop handles this via `last_server_failure`,
+        // but the race path returns first-by-latency — so a fast-failing NS
+        // would propagate verbatim without this check. Score and bail to
+        // sequential.
+        if (self.shouldTrySibling(resp, parent_zone)) {
             self.recordNsOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
             return null;
         }
@@ -1744,6 +1743,22 @@ pub const RecursiveResolver = struct {
         message: dns.Message,
         responding_server: ?na.Address,
     };
+
+    /// RFC 1034 §4.3.5: drop this reply, ask a sibling. FORMERR counts because
+    /// hark never retries without EDNS. Lame is a non-AA NOERROR with no
+    /// answer, no SOA and no cut below `parent_zone` (Unbound's
+    /// RESPONSE_TYPE_LAME). validateResponse guarantees `questions[0]`.
+    fn shouldTrySibling(self: *RecursiveResolver, response: dns.Message, parent_zone: dns.Name) bool {
+        const flags = response.header.flags;
+        switch (flags.rcode) {
+            .server_failure, .refused, .format_error => return true,
+            .no_error => {},
+            else => return false,
+        }
+        if (flags.aa or response.answers.len != 0) return false;
+        for (response.authorities) |rr| if (rr.rtype == .soa) return false;
+        return extractReferral(response, response.questions[0].name, parent_zone, self.referralPolicy()) == null;
+    }
 
     /// Which all-siblings-failed rcode a stub deserves: the most
     /// resolver-meaningful one wins, so the randomized NS order can't flip
@@ -1798,7 +1813,7 @@ pub const RecursiveResolver = struct {
             for (sel) |idx| {
                 if (oc.getStatus(servers[idx]) != .capable) continue;
                 if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |tls_response| {
-                    if (tls_response.header.flags.rcode.isServerError()) {
+                    if (self.shouldTrySibling(tls_response, parent_zone)) {
                         recordFailure(&last_server_failure, tls_response);
                     } else {
                         // TLS latency would poison the Do53 RTT estimates.
@@ -1834,12 +1849,9 @@ pub const RecursiveResolver = struct {
             };
             const response = exchange.message;
 
-            // Lame detection (RFC 4697): SERVFAIL/REFUSED → try next server.
-            // FORMERR too (RFC 1034 §4.3.5): one parse-hostile NS must not
-            // condemn a zone its siblings can still serve. recordNsOutcome
-            // is the persistent per-zone+IP penalty (Thompson arm, reward
-            // 0.1 — still selectable if siblings degrade).
-            if (response.header.flags.rcode.shouldTrySiblingNs()) {
+            // recordNsOutcome is the persistent per-zone+IP penalty (Thompson
+            // arm, reward 0.1 — still selectable if siblings degrade).
+            if (self.shouldTrySibling(response, parent_zone)) {
                 self.recordNsOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
                 recordFailure(&last_server_failure, response);
                 continue :server_loop;
@@ -2076,6 +2088,7 @@ pub const RecursiveResolver = struct {
 
         const try_count = @min(servers.len, max_servers);
         const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
+        const zone = try dns.parseDottedName(allocator, zone_name);
         for (servers[0..try_count], 0..) |server, i| {
             const addr_key = AddressKey.fromAddress(server);
 
@@ -2093,6 +2106,7 @@ pub const RecursiveResolver = struct {
                 .response => |r| r.message,
             };
             if (response.header.flags.rcode != .no_error) continue;
+            if (zone.labels.len > 0 and self.shouldTrySibling(response, .{ .labels = zone.labels[1..] })) continue;
             return response;
         }
         return null;
@@ -3527,6 +3541,32 @@ fn makeResponse(alloc: mem.Allocator, authorities: []const dns.ResourceRecord, a
         .authorities = auths,
         .additionals = adds,
     };
+}
+
+test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral" {
+    var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io };
+    const zone = dns.Name{ .labels = &.{ "example", "fake" } };
+    const www = dns.Name{ .labels = &.{ "www", "example", "fake" } };
+    const questions: []const dns.Question = &.{.{ .name = www, .qtype = .a, .qclass = .in }};
+    var msg = dns.Message{ .header = test_header, .questions = questions };
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
+
+    msg.header.flags.aa = true;
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
+    msg.header.flags.aa = false;
+
+    const soa = dns.ResourceRecord{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 600 } } };
+    msg.authorities = &.{soa};
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
+
+    msg.authorities = &.{makeNsRr(www, zone)};
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
+
+    msg.authorities = &.{};
+    msg.header.flags.rcode = .refused;
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
+    msg.header.flags.rcode = .name_error;
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
 }
 
 test "caseMangledEcho: only a same-name case mismatch marks mangling" {
