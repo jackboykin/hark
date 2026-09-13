@@ -30,7 +30,6 @@ LATENCY_MS="${LATENCY_MS:-}"
 # values for free.
 hark_toml="$BENCH_DIR/hark.toml"
 CACHE_SIZE="$(awk -F'=' '/^[[:space:]]*size[[:space:]]*=/ {gsub(/[[:space:]]/,""); print $2; exit}' "$hark_toml")"
-CACHE_ENTRIES="$(awk -F'=' '/^[[:space:]]*entries[[:space:]]*=/ {gsub(/[[:space:]]/,""); print $2; exit}' "$hark_toml")"
 
 LATENCY_TAG=""
 [[ -n "$LATENCY_MS" ]] && LATENCY_TAG="-rtt${LATENCY_MS}ms"
@@ -45,7 +44,7 @@ OUT="$BENCH_DIR/../baselines/throughput-$(date +%Y-%m-%d)${LATENCY_TAG}.txt"
 {
     echo "# hark throughput sweep — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "# build=${BUILD_MODE} duration=${DURATION}s inflight=${INFLIGHT} workers=${WORKERS} latency_ms=${LATENCY_MS:-0}"
-    echo "# cache.size=${CACHE_SIZE} cache.entries=${CACHE_ENTRIES}"
+    echo "# cache.size=${CACHE_SIZE}"
     echo "# workload  threads     totqps   noerrqps     servfail%   lost%"
 } > "$OUT"
 
@@ -64,7 +63,6 @@ case-randomization = false
 
 [cache]
 size = $CACHE_SIZE
-entries = $CACHE_ENTRIES
 EOF
 
         echo ">>> workload=$workload threads=$threads latency=${LATENCY_MS:-0}ms"
