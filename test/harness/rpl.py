@@ -501,7 +501,13 @@ class _Parser:
             )
         except Exception as e:
             raise self.err(f"bad RR ({section}): {e}")
-        getattr(entry, section.lower()).append(rrset)
+        rrsets = getattr(entry, section.lower())
+        for existing in rrsets:
+            if existing.match(rrset.name, rrset.rdclass, rrset.rdtype, rrset.covers):
+                existing.union_update(rrset)
+                break
+        else:
+            rrsets.append(rrset)
 
 
 # Unbound testbound's corpus omits TTLs on most RRs. Hark refuses to cache
