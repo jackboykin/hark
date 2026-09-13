@@ -63,6 +63,9 @@ inline fn parseAdvanceClockQname(name: []const u8) ?i64 {
 }
 
 const work_queue_capacity = 256;
+/// Past this the stub has retried elsewhere or given up: drop at
+/// dequeue, silent like the overflow path.
+const stale_query_ns: i128 = 2 * std.time.ns_per_s;
 
 // Per-thread query arena, owned by a pool thread and reused across queries
 // via reset(.retain_capacity). Layering: caller → CountingAllocator → arena.
@@ -113,6 +116,7 @@ const Slot = struct {
     client_addr: na.Address,
     sock_fd: posix.fd_t,
     protocol: Protocol,
+    enqueued_ns: i128,
 };
 
 const PopResult = struct {
@@ -120,6 +124,7 @@ const PopResult = struct {
     reservation: u16,
     client_addr: na.Address,
     sock_fd: posix.fd_t,
+    enqueued_ns: i128,
     protocol: Protocol,
 };
 
@@ -148,6 +153,7 @@ const WorkQueue = struct {
             s.client_addr = na.initIp4(.{ 0, 0, 0, 0 }, 0);
             s.sock_fd = -1;
             s.protocol = .udp;
+            s.enqueued_ns = 0;
         }
         for (0..work_queue_capacity) |i| self.free_list[i] = @intCast(work_queue_capacity - 1 - i);
         self.free_count = work_queue_capacity;
@@ -196,7 +202,7 @@ const WorkQueue = struct {
         // Slots are never read before push populates them; every field must
         // be written below (and read back in pop). Grew a field? Wire it
         // through here, pop(), and init()'s sentinels, then bump the count.
-        comptime std.debug.assert(@typeInfo(Slot).@"struct".field_names.len == 5);
+        comptime std.debug.assert(@typeInfo(Slot).@"struct".field_names.len == 6);
         if (data.len > max_work_query_bytes) return false;
         self.lock();
         defer self.unlock();
@@ -206,6 +212,7 @@ const WorkQueue = struct {
         claimed.slot.client_addr = client_addr;
         claimed.slot.sock_fd = sock_fd;
         claimed.slot.protocol = protocol;
+        claimed.slot.enqueued_ns = monotonic.nowNs();
         self.enqueueLocked(claimed.idx);
         return true;
     }
@@ -221,6 +228,7 @@ const WorkQueue = struct {
             .client_addr = taken.slot.client_addr,
             .sock_fd = taken.slot.sock_fd,
             .protocol = taken.slot.protocol,
+            .enqueued_ns = taken.slot.enqueued_ns,
         };
     }
 
@@ -304,6 +312,7 @@ pub const Server = struct {
     client_cache_hits: std.atomic.Value(u64) align(std.atomic.cache_line),
     client_cache_misses: std.atomic.Value(u64) align(std.atomic.cache_line),
     prefetch_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
+    stale_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Shared slow-path queue. Heap-allocated to keep the embedded buffers
     /// off Server's stack frame at init.
     work_queue: *WorkQueue,
@@ -390,6 +399,7 @@ pub const Server = struct {
             .client_cache_hits = std.atomic.Value(u64).init(0),
             .client_cache_misses = std.atomic.Value(u64).init(0),
             .prefetch_drops = std.atomic.Value(u64).init(0),
+            .stale_drops = std.atomic.Value(u64).init(0),
             .bg_tasks = .init(@min(max_bg_tasks, @max(1, @as(u32, cfg.workers) * cfg.resolution_threads / 2))),
             .work_queue = work_queue,
         };
@@ -597,6 +607,7 @@ pub const Server = struct {
         logCounterIfNonzero("UDP send-buffer drops", self.udp_send_drops.load(.monotonic));
         logCounterIfNonzero("fast-path resolver errors (fell through to slow path)", self.fast_path_errors.load(.monotonic));
         logCounterIfNonzero("prefetches dropped (bg cap or work queue full)", self.prefetch_drops.load(.monotonic));
+        logCounterIfNonzero("queries dropped stale at dequeue", self.stale_drops.load(.monotonic));
     }
 
     /// One worker's privileged assets, built on the main thread before
@@ -1175,12 +1186,15 @@ const WorkerState = struct {
 
         while (true) {
             const item = self.server.work_queue.pop();
+            const stale = item.protocol != .bg and monotonic.nowNs() - item.enqueued_ns > stale_query_ns;
+            if (stale) _ = self.server.stale_drops.fetchAdd(1, .monotonic);
             switch (item.protocol) {
                 .udp => {
                     // item.payload borrows from the slot; parseMessage
                     // copies what it keeps into the per-thread arena, so
                     // releasing right after processQuery is safe.
                     defer self.server.work_queue.release(item.reservation);
+                    if (stale) continue;
                     self.processQuery(.{ .udp = .{ .sock = item.sock_fd, .addr = item.client_addr } }, item.payload, transports, &query_pta);
                 },
                 .bg => {
@@ -1194,6 +1208,7 @@ const WorkerState = struct {
                     defer self.server.work_queue.release(item.reservation);
                     const client: *TcpClient = @ptrFromInt(mem.readInt(usize, item.payload[0..@sizeOf(usize)], .little));
                     defer client.unref(self.server.allocator);
+                    if (stale) continue;
                     self.processQuery(.{ .tcp = client }, item.payload[@sizeOf(usize)..], transports, &query_pta);
                 },
             }
