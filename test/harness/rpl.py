@@ -18,6 +18,7 @@ Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
   - ; hark: workers = <n>                   header directive (optional)
+  - ; hark: dns64-prefix = <pref64/n>       header directive (optional)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>
@@ -198,6 +199,7 @@ class Scenario:
     # specific NS-failure order. None = harness/hark default.
     stagger_ms: int | None = None
     workers: int | None = None
+    dns64_prefix: str | None = None
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -269,6 +271,8 @@ class _Parser:
             self.scenario.stagger_ms = int(val.strip())
         elif key == "workers":
             self.scenario.workers = int(val.strip())
+        elif key == "dns64-prefix":
+            self.scenario.dns64_prefix = val.strip()
         elif key == "dnssec-zone":
             # Canonicalize: lowercase, ensure trailing dot. Multiple
             # directives accumulate; same value collapses (idempotent).

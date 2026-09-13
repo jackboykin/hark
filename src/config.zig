@@ -8,6 +8,7 @@ const Address = net_addr.Address;
 const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
+const dns64 = @import("dns64.zig");
 const build_options = @import("build_options");
 
 /// Error variants can't carry the offending key name, so log it at rejection
@@ -47,6 +48,7 @@ pub const ServerConfig = struct {
     case_randomization: bool,
     query_memory_limit: usize,
     opportunistic: bool,
+    dns64: ?dns64.Prefix,
     workers: u16,
     resolution_threads: u16,
     stagger_ms: u32,
@@ -168,6 +170,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .case_randomization = true,
         .query_memory_limit = 1024 * 1024,
         .opportunistic = false,
+        .dns64 = null,
         // 2 workers is enough for most deployments. Each worker is one
         // io_uring ring; per-worker resolution-threads handle upstream
         // concurrency. Raise this for high-QPS edge resolvers — io_uring
@@ -227,6 +230,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "qname-minimization", .kind = .boolean },
         .{ .name = "case-randomization", .kind = .boolean },
         .{ .name = "opportunistic", .kind = .boolean },
+        .{ .name = "dns64-prefix", .kind = .string },
         .{ .name = "query-memory-limit", .kind = .integer },
         .{ .name = "stagger-ms", .kind = .integer },
     } },
@@ -416,6 +420,12 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
         if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
         if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
+        if (resolver.getString("dns64-prefix")) |s| if (s.len > 0) {
+            cfg.dns64 = dns64.Prefix.parse(s) orelse {
+                errLog("config: dns64-prefix '{s}' is not an IPv6 /32, /40, /48, /56, /64 or /96 (RFC 6052 §2.2)", .{s});
+                return error.InvalidValue;
+            };
+        };
         if (try nonNegative(usize, resolver, "query-memory-limit")) |val| {
             if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
             // 0 = unlimited. Resolve the sentinel here so every cap site (worker
@@ -469,6 +479,8 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             cfg.rebinding.extra_allow = new_allow;
         }
     }
+
+    cfg.rebinding.nat64 = cfg.dns64;
 
     // Root hints in 127/8 / private space create a self-referencing or
     // loopback-targeting recursor — a class of operator footgun that the
@@ -679,6 +691,10 @@ test "parse full config" {
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(false, cfg.qname_minimization);
     try testing.expectEqual(@as(usize, 8388608), cfg.cache_size);
+}
+
+test "a bad dns64-prefix refuses startup" {
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, "[resolver]\ndns64-prefix = \"64:ff9b::/100\"\n"));
 }
 
 test "empty config uses defaults" {

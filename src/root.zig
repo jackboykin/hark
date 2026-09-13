@@ -25,6 +25,7 @@ pub const net_address = @import("net_address.zig");
 pub const special_use = @import("special_use.zig");
 pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
+pub const dns64 = @import("dns64.zig");
 pub const response = @import("response.zig");
 
 /// This module's own optimize mode. The bench harness is pinned to ReleaseFast
@@ -65,6 +66,7 @@ test {
     _ = @import("special_use.zig");
     _ = @import("acl.zig");
     _ = @import("rebinding.zig");
+    _ = @import("dns64.zig");
     _ = @import("response.zig");
     _ = @import("fuzz_wire.zig");
     _ = @import("fuzz_nsec.zig");

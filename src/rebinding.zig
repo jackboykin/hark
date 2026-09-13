@@ -20,15 +20,9 @@
 ///   • Rewrite SVCB/HTTPS hints in place. RFC 9460 §7.3: modifying the
 ///     hints breaks DNSSEC validation. The whole RR drops instead,
 ///     matching Unbound's 1.25.0 rebinding fix.
-///   • NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) translation-prefix
-///     embedded-v4 detection. Both encode an IPv4 address in v6 bits,
-///     so an attacker AAAA pointing at `64:ff9b::c0a8:0101` translates
-///     to `192.168.1.1` on a NAT64-enabled stub. The default block set
-///     deliberately does NOT include these prefixes — blocking them by
-///     default would break legitimate NAT64/6to4 deployments. Operators
-///     running stubs *without* NAT64/6to4 can add either via `extra_block`;
-///     operators *with* NAT64/6to4 either disable rebinding scrubbing or
-///     accept that mapped-private answers can slip through this vector.
+///   • 6to4 (`2002::/16`) and NAT64 prefixes other than `dns64-prefix`.
+///     The configured prefix is unwrapped and its inner v4 judged; add any
+///     other translation prefix to `extra_block`.
 ///
 /// Owner-name allowlist matching: each RR carries its own owner name on
 /// the wire. For a CNAME chain `home.example.com → box.lan.example → A
@@ -40,6 +34,7 @@ const mem = std.mem;
 const testing = std.testing;
 const acl = @import("acl.zig");
 const dns = @import("dns.zig");
+const dns64 = @import("dns64.zig");
 const na = @import("net_address.zig");
 const special_use = @import("special_use.zig");
 
@@ -69,6 +64,7 @@ pub const Config = struct {
     /// the canonical use is `["127.0.0.0/8"]` for operators running
     /// RFC 5782 DNSBL lookups that *want* 127/8 answers.
     extra_allow: []const acl.Cidr,
+    nat64: ?dns64.Prefix = null,
 
     pub const off: Config = .{
         .enabled = false,
@@ -211,23 +207,28 @@ pub fn scrub(
 /// set or an `extra_block` entry, AND does not match an `extra_allow`
 /// entry. Allow takes precedence so DNSBL operators can carve back 127/8.
 ///
-/// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is checked against the embedded v4
-/// address for both extras — keeps `extra_allow = ["127.0.0.0/8"]` honest
-/// when an AAAA-flavoured DNSBL returns a mapped 127.0.0.x. Mirrors the
-/// recursion `matchesDefault` already does for the built-in v4 set.
+/// The embedded v4 (mapped or NAT64) is judged at every step.
 fn isPrivate(bytes: []const u8, cfg: Config) bool {
-    const mapped_v4: ?*const [4]u8 = if (na.isIp4Mapped(bytes)) bytes[12..16] else null;
+    const inner = embeddedIp4(bytes, cfg);
 
     for (cfg.extra_allow) |c| {
         if (c.matchesBytes(bytes)) return false;
-        if (mapped_v4) |v4| if (c.matchesBytes(v4)) return false;
+        if (inner) |v4| if (c.matchesBytes(&v4)) return false;
     }
     if (matchesDefault(bytes)) return true;
+    if (inner) |v4| if (matchesDefault(&v4)) return true;
     for (cfg.extra_block) |c| {
         if (c.matchesBytes(bytes)) return true;
-        if (mapped_v4) |v4| if (c.matchesBytes(v4)) return true;
+        if (inner) |v4| if (c.matchesBytes(&v4)) return true;
     }
     return false;
+}
+
+fn embeddedIp4(bytes: []const u8, cfg: Config) ?[4]u8 {
+    if (bytes.len != 16) return null;
+    if (na.isIp4Mapped(bytes)) return bytes[12..16].*;
+    if (cfg.nat64) |p| if (p.contains(bytes[0..16])) return p.extract(bytes[0..16]);
+    return null;
 }
 
 /// Default block set is the shared special-use table (net_address.zig) —
@@ -311,6 +312,23 @@ test "ipv4only.arpa addresses survive the default block; the rest of 192.0.0.0/2
     try testing.expectEqual(@as(usize, 2), kept.len);
     try testing.expectEqual(@as(u8, 170), kept[0].rdata.a[3]);
     try testing.expectEqual(@as(u8, 171), kept[1].rdata.a[3]);
+}
+
+test "nat64 prefix: synthesized AAAA is judged by its embedded v4, ipv4only.arpa included" {
+    const p = dns64.Prefix.well_known;
+    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{}, .nat64 = p };
+    const arpa = dns.Name{ .labels = &.{ "ipv4only", "arpa" } };
+    var rrs = [_]dns.ResourceRecord{
+        rrAAAA(public_name, p.embed(.{ 192, 168, 1, 1 })),
+        rrAAAA(public_name, p.embed(.{ 93, 184, 216, 34 })),
+        rrAAAA(arpa, p.embed(.{ 192, 0, 0, 170 })),
+    };
+    const kept = try scrub(testing.allocator, &rrs, cfg);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqualSlices(u8, &p.embed(.{ 93, 184, 216, 34 }), &kept[0].rdata.aaaa);
+    try testing.expectEqualSlices(u8, &p.embed(.{ 192, 0, 0, 170 }), &kept[1].rdata.aaaa);
+    try testing.expectEqual(rrs.len, (try scrub(testing.allocator, &rrs, .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} })).len);
 }
 
 test "extra_block scrubs a configured public CIDR, leaving its siblings alone" {

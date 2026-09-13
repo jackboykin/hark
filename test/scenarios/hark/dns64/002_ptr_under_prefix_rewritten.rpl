@@ -1,0 +1,60 @@
+; hark: root-hints = 127.0.10.1
+; hark: dns64-prefix = 64:ff9b::/96
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN PTR under the Pref64 answers from the in-addr.arpa tree
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      2.0.192.in-addr.arpa. IN PTR
+    SECTION AUTHORITY
+      2.0.192.in-addr.arpa. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      33.2.0.192.in-addr.arpa. IN PTR
+    SECTION ANSWER
+      33.2.0.192.in-addr.arpa. 3600 IN PTR host.example.com.
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    1.2.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa. IN PTR
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    1.2.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa. IN PTR
+  SECTION ANSWER
+    1.2.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa. 3600 IN PTR host.example.com.
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH all
+  SECTION QUERY_LOG
+    33.2.0.192.in-addr.arpa. PTR 127.0.10.1
+    33.2.0.192.in-addr.arpa. PTR 127.0.10.2
+ENTRY_END
+
+SCENARIO_END

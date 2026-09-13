@@ -4,6 +4,7 @@ const testing = std.testing;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const special_use = @import("special_use.zig");
+const dns64 = @import("dns64.zig");
 const synthesizedMessage = @import("response.zig").synthesizedMessage;
 const blocking_transport = @import("blocking_transport.zig");
 const BlockingUdpTransport = blocking_transport.BlockingUdpTransport;
@@ -259,6 +260,7 @@ pub const RecursiveResolver = struct {
     bypass_cache: bool = false,
     /// When set, any upstream attempt returns `error.CacheOnlyMiss`.
     cache_only: bool = false,
+    dns64: ?dns64.Prefix = null,
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
@@ -355,6 +357,8 @@ pub const RecursiveResolver = struct {
             .ns_selector = ctx.ns_selector,
             .bypass_cache = opts.bypass_cache,
             .cache_only = opts.cache_only,
+            // RFC 6147 §5.5: none for CD=1.
+            .dns64 = if (opts.cd) null else ctx.config.dns64,
             .stagger_ms = ctx.config.stagger_ms,
             .prefetch_cousin = ctx.config.prefetch_cousin,
             .case_state = ctx.case_state,
@@ -445,7 +449,7 @@ pub const RecursiveResolver = struct {
         var budget: Budget = .{ .deadline_ns = monotonic.nowNs() + @as(i128, max_resolve_ms) * std.time.ns_per_ms };
         self.budget = &budget;
         defer self.budget = null;
-        var result = try self.resolveImpl(allocator, name, qtype, 0);
+        var result = try self.resolveDns64(allocator, name, qtype);
         // ResolveResult names are caller- or arena-owned, never resolver-owned:
         // dupe out of the stack-local pending buffer before returning.
         if (self.scratch.dnskey_prefetch_len > 0) {
@@ -475,6 +479,28 @@ pub const RecursiveResolver = struct {
             else => {},
         };
         return result;
+    }
+
+    fn resolveDns64(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
+        const prefix = self.dns64 orelse return self.resolveImpl(allocator, name, qtype, 0);
+        if (qtype == .ptr) if (dns64.parseIp6Arpa(name)) |v6| if (prefix.contains(&v6)) {
+            // Arena: tryServeFromCache may return this as `prefetch_name`.
+            const v4 = prefix.extract(&v6);
+            const in_addr = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}.in-addr.arpa", .{ v4[3], v4[2], v4[1], v4[0] });
+            var result = try self.resolveImpl(allocator, in_addr, .ptr, 0);
+            try dns64.renamePtr(allocator, &result.message, name);
+            return result;
+        };
+        const result = try self.resolveImpl(allocator, name, qtype, 0);
+        if (qtype != .aaaa or !dns64.wantsSynthesis(result.message)) return result;
+        // §5.1.6: an A error leaves the NODATA as the answer.
+        var a = self.resolveImpl(allocator, name, .a, 0) catch |err| return if (err == error.CacheOnlyMiss or err == error.OutOfMemory) err else result;
+        a.message = try dns64.synthesizeAaaa(allocator, prefix, a.message, result.message) orelse return result;
+        if (a.prefetch_name == null) {
+            a.prefetch_name = result.prefetch_name;
+            a.prefetch_qtype = result.prefetch_qtype;
+        }
+        return a;
     }
 
     /// First SVCB/HTTPS answer whose TargetName the client must chase

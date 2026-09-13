@@ -46,6 +46,7 @@ class HarkConfig:
     rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
     # None = hark default (5000).
     tcp_idle_timeout_ms: int | None = None
+    dns64_prefix: str | None = None
     # Pass `--verbose` so per-query debug lines reach the test log.
     # Cheap; failing-scenario triage is impossible without them.
     verbose: bool = True
@@ -82,6 +83,8 @@ class HarkConfig:
         ]
         if self.stagger_ms is not None:
             lines.append(f"stagger-ms = {self.stagger_ms}")
+        if self.dns64_prefix is not None:
+            lines.append(f'dns64-prefix = "{self.dns64_prefix}"')
         if self.root_hints:
             hints = ", ".join(f'"{h}"' for h in self.root_hints)
             lines.append(f"root-hints = [{hints}]")

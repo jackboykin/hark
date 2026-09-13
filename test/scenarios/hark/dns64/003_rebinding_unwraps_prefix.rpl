@@ -1,0 +1,63 @@
+; hark: root-hints = 127.0.10.1
+; hark: dns64-prefix = 64:ff9b::/96
+; hark: qname-minimisation = no
+; hark: rebinding-enabled = yes
+
+SCENARIO_BEGIN rebinding scrub judges a synthesized AAAA by its embedded IPv4
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      attacker.com. IN A
+    SECTION AUTHORITY
+      attacker.com. 86400 IN NS ns.attacker.com.
+    SECTION ADDITIONAL
+      ns.attacker.com. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      attacker.com. IN AAAA
+    SECTION AUTHORITY
+      attacker.com. 300 IN SOA ns.attacker.com. hostmaster.attacker.com. 1 7200 3600 1209600 300
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      attacker.com. IN A
+    SECTION ANSWER
+      attacker.com. 3600 IN A 192.168.1.1
+      attacker.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    attacker.com. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    attacker.com. IN AAAA
+  SECTION ANSWER
+    attacker.com. 300 IN AAAA 64:ff9b::5db8:d822
+ENTRY_END
+
+SCENARIO_END

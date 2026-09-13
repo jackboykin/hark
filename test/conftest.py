@@ -139,6 +139,8 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.stagger_ms = scenario.stagger_ms
     if scenario.workers is not None:
         cfg.workers = scenario.workers
+    if scenario.dns64_prefix is not None:
+        cfg.dns64_prefix = scenario.dns64_prefix
     if scenario.rebinding_enabled is not None:
         cfg.rebinding_enabled = scenario.rebinding_enabled
     if scenario.rebinding_allow_zones:

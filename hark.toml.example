@@ -19,6 +19,7 @@ dnssec = true
 qname-minimization = true     # RFC 9156
 case-randomization = true     # 0x20 query-name casing
 opportunistic = false         # encrypted transport to authoritatives (RFC 9539)
+dns64-prefix = ""             # NAT64 Pref64::/n, e.g. "64:ff9b::/96" (RFC 6147); "" = off
 stagger-ms = 150              # nameserver racing delay; 0 disables
 query-memory-limit = 1048576  # per-resolution memory cap, bytes; 0 = unlimited
 root-hints = []               # override IANA roots ("ip" or "ip:port");
