@@ -30,6 +30,14 @@ pub const Table = struct {
         };
     }
 
+    pub fn getString(self: Table, key: []const u8) ?[]const u8 {
+        const val = self.map.get(key) orelse return null;
+        return switch (val) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
     pub fn getStringArray(self: Table, key: []const u8) ?[]const []const u8 {
         const val = self.map.get(key) orelse return null;
         return switch (val) {
