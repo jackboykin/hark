@@ -11,6 +11,11 @@
 ///   onion.                RFC 7686 §2     → NXDOMAIN
 ///   127.in-addr.arpa.     RFC 6761 §6.3   → PTR localhost.
 ///   <::1>.ip6.arpa.       RFC 6761 §6.3   → PTR localhost.
+///   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
+///                                           (DS real, subdomains NXDOMAIN)
+///
+/// Only forwarders must pass `ipv4only.arpa` to an upstream DNS64; hark
+/// never forwards, and NODATA for AAAA means "no NAT64" to a stub.
 ///
 /// Deliberately *not* short-circuited:
 ///   example. / example.{com,net,org}   IANA-hosted; authoritative answers
@@ -28,6 +33,7 @@ pub const Action = enum {
     localhost_a,
     localhost_aaaa,
     localhost_ptr,
+    ipv4only_a,
     /// NOERROR with empty answer (the name exists but the qtype does not).
     nodata,
 };
@@ -50,6 +56,15 @@ pub fn classify(name: []const u8, qtype: dns.RType) Action {
     if (eqlOrSubdomainOf(stripped, "test")) return .nxdomain;
     if (eqlOrSubdomainOf(stripped, "onion")) return .nxdomain;
     if (eqlOrSubdomainOf(stripped, "home.arpa")) return .nxdomain;
+
+    if (std.ascii.eqlIgnoreCase(stripped, "ipv4only.arpa")) {
+        return switch (qtype) {
+            .a => .ipv4only_a,
+            .ds => .none,
+            else => .nodata,
+        };
+    }
+    if (eqlOrSubdomainOf(stripped, "ipv4only.arpa")) return .nxdomain;
 
     // 127.0.0.0/8 reverse — RFC 6761 §6.3 says any 127/8 PTR resolves to
     // localhost. (The narrower 1.0.0.127 special case is generalised here.)
@@ -132,6 +147,17 @@ pub fn synthesize(
             };
             answers = arr;
         },
+        .ipv4only_a => {
+            const arr = try allocator.alloc(dns.ResourceRecord, ipv4only_addrs.len);
+            for (arr, ipv4only_addrs) |*rr, addr| rr.* = .{
+                .name = qname,
+                .rtype = .a,
+                .rclass = .in,
+                .ttl = ttl_localhost,
+                .rdata = .{ .a = addr },
+            };
+            answers = arr;
+        },
     }
 
     return synthesizedMessage(answers, &.{}, rcode, false);
@@ -140,6 +166,9 @@ pub fn synthesize(
 /// Synthetic responses are stable forever — RFC 6761 names cannot be
 /// re-delegated without an RFC update. Use a long TTL.
 const ttl_localhost: u32 = 86_400;
+
+/// RFC 7050 §8.
+pub const ipv4only_addrs = [2][4]u8{ .{ 192, 0, 0, 170 }, .{ 192, 0, 0, 171 } };
 
 const testing = std.testing;
 
@@ -159,6 +188,12 @@ test "classify NXDOMAIN names" {
     try testing.expectEqual(Action.nxdomain, classify("something.onion.", .a));
     try testing.expectEqual(Action.nxdomain, classify("home.arpa.", .a));
     try testing.expectEqual(Action.nxdomain, classify("foo.home.arpa", .aaaa));
+}
+
+test "classify ipv4only.arpa: DS falls through, apex is not its own subdomain" {
+    try testing.expectEqual(Action.ipv4only_a, classify("ipv4only.arpa.", .a));
+    try testing.expectEqual(Action.none, classify("ipv4only.arpa.", .ds));
+    try testing.expectEqual(Action.nxdomain, classify("foo.ipv4only.arpa.", .ds));
 }
 
 test "classify reverse 127/8 PTR → localhost" {

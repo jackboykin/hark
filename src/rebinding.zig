@@ -41,6 +41,7 @@ const testing = std.testing;
 const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
+const special_use = @import("special_use.zig");
 
 const log = std.log.scoped(.rebinding);
 
@@ -230,13 +231,19 @@ fn isPrivate(bytes: []const u8, cfg: Config) bool {
 }
 
 /// Default block set is the shared special-use table (net_address.zig) —
-/// deliberately multicast-free here, unlike NS egress.
+/// deliberately multicast-free here, unlike NS egress, and minus the two
+/// fixed `ipv4only.arpa` answers inside 192.0.0.0/24.
 fn matchesDefault(bytes: []const u8) bool {
     return switch (bytes.len) {
-        4 => na.isSpecialUseIp4(bytes[0..4].*),
+        4 => na.isSpecialUseIp4(bytes[0..4].*) and !isIpv4Only(bytes[0..4].*),
         16 => na.isSpecialUseIp6(bytes[0..16].*),
         else => false,
     };
+}
+
+fn isIpv4Only(b: [4]u8) bool {
+    for (special_use.ipv4only_addrs) |addr| if (mem.eql(u8, &b, &addr)) return true;
+    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -293,6 +300,17 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
     const mapped_rfc1918 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
     try testing.expect(!shouldDrop(rrAAAA(public_name, mapped_listed), cfg));
     try testing.expect(shouldDrop(rrAAAA(public_name, mapped_rfc1918), cfg));
+}
+
+test "ipv4only.arpa addresses survive the default block; the rest of 192.0.0.0/24 does not" {
+    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const name = dns.Name{ .labels = &.{ "ipv4only", "arpa" } };
+    var rrs = [_]dns.ResourceRecord{ rrA(name, .{ 192, 0, 0, 170 }), rrA(name, .{ 192, 0, 0, 171 }), rrA(name, .{ 192, 0, 0, 1 }) };
+    const kept = try scrub(testing.allocator, &rrs, cfg);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(u8, 170), kept[0].rdata.a[3]);
+    try testing.expectEqual(@as(u8, 171), kept[1].rdata.a[3]);
 }
 
 test "extra_block scrubs a configured public CIDR, leaving its siblings alone" {
