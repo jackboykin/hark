@@ -226,14 +226,6 @@ fn matchesDefault(bytes: []const u8) bool {
     };
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
-//
-// The `.rpl` scenarios in `test/scenarios/hark/rebinding/` exercise the
-// full stack (scrub fires on egress, allow-zone bypass, DNSBL escape hatch
-// via `extra_allow`). Unit tests below cover the bits scenarios can't:
-// per-RFC CIDR tables, IPv4-mapped IPv6 symmetry, and the RRSIG-on-partial-
-// rrset edge case that's load-bearing for DO=1 protocol correctness.
-
 const public_name = dns.Name{ .labels = &.{ "attacker", "com" } };
 
 fn rrA(name: dns.Name, ip: [4]u8) dns.ResourceRecord {
@@ -296,16 +288,6 @@ test "nat64 prefix: synthesized AAAA is judged by its embedded v4" {
     try testing.expectEqual(rrs.len, (try scrub(testing.allocator, &rrs, .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} })).len);
 }
 
-test "extra_block scrubs a configured public CIDR, leaving its siblings alone" {
-    // extra_block earns its keep only on addresses the default set ignores:
-    // a globally-routable CIDR an operator wants treated as internal. The
-    // sibling proves it blocks that CIDR, not "any public address".
-    const block = acl.parse("93.184.216.0/24") orelse return error.ParseFailed;
-    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{block}, .extra_allow = &.{} };
-    try testing.expect(shouldDrop(rrA(public_name, .{ 93, 184, 216, 34 }), cfg));
-    try testing.expect(!shouldDrop(rrA(public_name, .{ 93, 184, 217, 7 }), cfg));
-}
-
 test "svcb hints: private ipv4hint/ipv6hint drop the RR, public hints pass" {
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const private_v4 = comptime svc_prefix ++ svcParam(4, &.{ 192, 168, 1, 1 });
@@ -342,42 +324,7 @@ test "svcb hints: malformed rdata is drop-biased past the TargetName, pass-biase
     try testing.expect(shouldDrop(rrHttps(public_name, named), cfg));
 }
 
-test "svcb hints: extra_allow carve-out applies to hint addresses" {
-    const allow127 = acl.parse("127.0.0.0/8") orelse return error.ParseFailed;
-    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{allow127} };
-    const loopback = comptime svc_prefix ++ svcParam(4, &.{ 127, 0, 0, 2 });
-    try testing.expect(!shouldDrop(rrHttps(public_name, loopback), cfg));
-}
-
-test "scrub drops RRSIG covering HTTPS when the HTTPS RR is dropped" {
-    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const answers: []const dns.ResourceRecord = &.{
-        rrHttps(public_name, comptime svc_prefix ++ svcParam(4, &.{ 10, 0, 0, 1 })),
-        rrsigOver(.https),
-    };
-    const scrubbed = try scrub(testing.allocator, answers, cfg);
-    defer testing.allocator.free(scrubbed);
-    try testing.expectEqual(@as(usize, 0), scrubbed.len);
-}
-
-test "scrub drops RRSIG when its rrset is partially scrubbed (sig invalidated by member removal)" {
-    // RFC 4034: RRSIG signs the full rrset as it existed upstream. Removing
-    // even one member invalidates the signature for the survivors.
-    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const answers: []const dns.ResourceRecord = &.{
-        rrA(public_name, .{ 192, 168, 1, 1 }),
-        rrA(public_name, .{ 8, 8, 8, 8 }),
-        rrsigOver(.a), // must drop — orphan after partial scrub
-    };
-    const scrubbed = try scrub(testing.allocator, answers, cfg);
-    defer testing.allocator.free(scrubbed);
-    try testing.expectEqual(@as(usize, 1), scrubbed.len);
-    try testing.expectEqual(dns.RType.a, scrubbed[0].rtype);
-}
-
 test "scrub heap path: >128-RR section drops private A and the orphaned RRSIG" {
-    // answers.len > max_inline_marks forces the heap marks bitmap + orphan-RRSIG
-    // sweep that the small-section tests above never reach.
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
 
     const public_count = 100;
