@@ -222,16 +222,34 @@ fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         log.err("query failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    var response = result.message;
-
+    var questions: []const dns.Question = result.message.questions;
     var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    var questions: [1]dns.Question = undefined;
+    var question: [1]dns.Question = undefined;
     if (name.len <= lower_buf.len) {
         if (dns.parseDottedName(arena.allocator(), dns.lowerNameIntoBuf(&lower_buf, name))) |qname| {
-            questions[0] = .{ .name = qname, .qtype = qtype, .qclass = .in };
-            response.questions = &questions;
+            question[0] = .{ .name = qname, .qtype = qtype, .qclass = .in };
+            questions = &question;
         } else |_| {}
     }
+
+    var wire_buf: [dns.max_message_len]u8 = undefined;
+    const wire = hark.response.buildResponseWire(&wire_buf, .{
+        .query_id = 0,
+        .opcode = .query,
+        .rd = true,
+        .cd = false,
+        .questions = questions,
+        .client_edns = true,
+        .client_do = true,
+        .client_wants_ad = true,
+        .max_udp_payload = dns.max_message_len,
+        .minimal_responses = cfg.minimal_responses,
+        .rebinding = &cfg.rebinding,
+    }, result.message, arena.allocator()) orelse {
+        log.err("building response failed", .{});
+        std.process.exit(1);
+    };
+    const response = try dns.parseMessage(arena.allocator(), wire);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
