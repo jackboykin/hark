@@ -1763,19 +1763,24 @@ pub const RecursiveResolver = struct {
         responding_server: ?na.Address,
     };
 
-    /// RFC 1034 §4.3.5: drop this reply, ask a sibling. FORMERR counts because
-    /// hark never retries without EDNS. Lame is a non-AA NOERROR with no
-    /// answer, no SOA and no cut below `parent_zone` (Unbound's
-    /// RESPONSE_TYPE_LAME). validateResponse guarantees `questions[0]`.
+    /// RFC 1034 §4.3.5: drop this reply and ask a sibling. SERVFAIL, REFUSED
+    /// and FORMERR (hark never retries without EDNS); a lame reply, non-AA
+    /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
+    /// recursor's cache, RA set and AA clear, which an RD-clear query gets
+    /// only from a server that recursed on its own. A recursor's referral
+    /// is still followed. validateResponse guarantees `questions[0]`.
     fn shouldTrySibling(self: *RecursiveResolver, response: dns.Message, parent_zone: dns.Name) bool {
         const flags = response.header.flags;
+        const rec_lame = flags.ra and !flags.aa;
         switch (flags.rcode) {
             .server_failure, .refused, .format_error => return true,
+            .name_error => return rec_lame,
             .no_error => {},
             else => return false,
         }
-        if (flags.aa or response.answers.len != 0) return false;
-        for (response.authorities) |rr| if (rr.rtype == .soa) return false;
+        if (flags.aa) return false;
+        if (response.answers.len != 0) return rec_lame;
+        for (response.authorities) |rr| if (rr.rtype == .soa) return rec_lame;
         return extractReferral(response, response.questions[0].name, parent_zone, self.referralPolicy()) == null;
     }
 
@@ -1783,7 +1788,8 @@ pub const RecursiveResolver = struct {
     /// resolver-meaningful one wins, so the randomized NS order can't flip
     /// the surfaced answer. SERVFAIL ("I couldn't resolve this") outranks
     /// REFUSED (a policy stance) outranks FORMERR — a FORMERR only means an
-    /// upstream couldn't parse *hark's* query, never the stub's.
+    /// upstream couldn't parse *hark's* query, never the stub's. Rank 0 is a
+    /// lame or recursor reply and leaves as SERVFAIL.
     fn failurePrecedence(rcode: dns.RCode) u8 {
         return switch (rcode) {
             .server_failure => 3,
@@ -1886,7 +1892,8 @@ pub const RecursiveResolver = struct {
             var tb: [24]u8 = undefined;
             var rb: [24]u8 = undefined;
             log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), dns.safeTagName(sf.header.flags.rcode, &rb) });
-            return .{ .message = sf, .responding_server = null };
+            const message = if (failurePrecedence(sf.header.flags.rcode) == 0) synthesizedMessage(&.{}, &.{}, .server_failure, false) else sf;
+            return .{ .message = message, .responding_server = null };
         }
         {
             var zb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -3615,11 +3622,27 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
 
     msg.authorities = &.{makeNsRr(www, zone)};
     try testing.expect(!resolver.shouldTrySibling(msg, zone));
+    msg.authorities = &.{makeNsRr(.{ .labels = &.{"fake"} }, zone)};
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
 
     msg.authorities = &.{};
     msg.header.flags.rcode = .refused;
     try testing.expect(resolver.shouldTrySibling(msg, zone));
     msg.header.flags.rcode = .name_error;
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
+
+    msg.header.flags.ra = true;
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
+    msg.header.flags.aa = true;
+    try testing.expect(!resolver.shouldTrySibling(msg, zone));
+    msg.header.flags.aa = false;
+    msg.header.flags.rcode = .no_error;
+    msg.authorities = &.{soa};
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
+    msg.authorities = &.{};
+    msg.answers = &.{makeGlueA(www, .{ 10, 20, 30, 40 })};
+    try testing.expect(resolver.shouldTrySibling(msg, zone));
+    msg.header.flags.ra = false;
     try testing.expect(!resolver.shouldTrySibling(msg, zone));
 }
 
