@@ -1217,8 +1217,8 @@ pub const RecursiveResolver = struct {
     /// secure cut the proof decides, not AA (whoever strips the RRSIGs clears
     /// that bit too), and a validated negative is cached; RFC 2181 §5.4.1
     /// excludes only unauthenticated non-AA data. Otherwise AA NXDOMAIN/NODATA
-    /// cache the proven negative, non-AA NODATA and SERVFAIL/REFUSED go
-    /// through `cacheResolutionFailure`, and the rest pass through uncached.
+    /// cache the proven negative, SERVFAIL/REFUSED go through
+    /// `cacheResolutionFailure`, and the rest pass through uncached.
     fn finalizeNegative(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1246,7 +1246,7 @@ pub const RecursiveResolver = struct {
                 },
                 .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
-        } else if (rcode == .no_error or rcode == .server_failure or rcode == .refused) {
+        } else if (rcode == .server_failure or rcode == .refused) {
             self.cacheResolutionFailure(name, qtype, depth);
         }
         return .{ .message = try withCnameChain(allocator, chain, response.*) };

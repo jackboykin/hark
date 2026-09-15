@@ -1,0 +1,68 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a non-AA NODATA with SOA is served the same way twice
+
+; The server for example. answers NODATA with its SOA but AA and RA clear.
+; hark serves it uncached. It once also cached a 5 s SERVFAIL marker, so the
+; first asker got NOERROR and the next got SERVFAIL.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      a.example. IN MX
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. root.example. 1 3600 900 604800 3600
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.example. IN MX
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.example. IN MX
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.example. IN MX
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.example. IN MX
+ENTRY_END
+
+SCENARIO_END
