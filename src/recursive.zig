@@ -771,11 +771,11 @@ pub const RecursiveResolver = struct {
             // `.insecure` is excluded too: Opt-Out leaves the name possibly an
             // unsigned delegation, too thin to cache against the full name.
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.zone, walk.servers(), &neg_ttl_cap)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.servers(), &neg_ttl_cap)) {
                 .proceed => |status| if (status == .secure) {
                     if (self.cache) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
                 },
-                .skip_cache, .bogus => {},
+                .bogus => {},
             }
             walk.stopProbing();
             return;
@@ -790,11 +790,10 @@ pub const RecursiveResolver = struct {
 
         // NODATA: the name exists; cache the negative and advance.
         var neg_ttl_cap: u32 = std.math.maxInt(u32);
-        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.zone, walk.servers(), &neg_ttl_cap)) {
+        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.servers(), &neg_ttl_cap)) {
             .proceed => |status| if (response.header.flags.aa) {
                 if (self.cache) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
             },
-            .skip_cache => {},
             .bogus => return walk.stopProbing(),
         }
         walk.probe_labels += 1;
@@ -1214,10 +1213,12 @@ pub const RecursiveResolver = struct {
         if (self.cache) |c| c.cacheServfail(name, qtype);
     }
 
-    /// Any error rcode, or NOERROR with no answers and no referral. AA
-    /// NXDOMAIN/NODATA cache the proven negative; non-AA NODATA and
-    /// SERVFAIL/REFUSED go through `cacheResolutionFailure`; the rest pass
-    /// through uncached.
+    /// Any error rcode, or NOERROR with no answers and no referral. Under a
+    /// secure cut the proof decides, not AA (whoever strips the RRSIGs clears
+    /// that bit too), and a validated negative is cached; RFC 2181 §5.4.1
+    /// excludes only unauthenticated non-AA data. Otherwise AA NXDOMAIN/NODATA
+    /// cache the proven negative, non-AA NODATA and SERVFAIL/REFUSED go
+    /// through `cacheResolutionFailure`, and the rest pass through uncached.
     fn finalizeNegative(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1231,18 +1232,18 @@ pub const RecursiveResolver = struct {
     ) !ResolveResult {
         const current_name, const target_name, const parent_zone, const servers = .{ walk.name, walk.target, walk.zone, walk.servers() };
         const rcode = response.header.flags.rcode;
-        if (response.header.flags.aa and (rcode == .name_error or rcode == .no_error)) {
+        const aa = response.header.flags.aa;
+        if ((rcode == .name_error or rcode == .no_error) and (aa or security_state == .secure)) {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, rcode == .name_error, parent_zone, servers, &neg_ttl_cap)) {
+            switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, rcode == .name_error, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
-                    if (self.cache) |c| c.storeNegative(current_name, qtype, .in, rcode, response.authorities, parent_zone, status, neg_ttl_cap);
+                    if (aa or status == .secure) if (self.cache) |c| c.storeNegative(current_name, qtype, .in, rcode, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, neg_ttl_cap);
                         try trimSectionTtls(allocator, &response.authorities, neg_ttl_cap);
                     }
                 },
-                .skip_cache => {},
                 .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
         } else if (rcode == .no_error or rcode == .server_failure or rcode == .refused) {
@@ -1293,7 +1294,8 @@ pub const RecursiveResolver = struct {
 
     /// Determine delegation security for a zone cut (RFC 4035 §5.2).
     /// Tries verified NSEC/NSEC3 from referral authorities first, then
-    /// falls back to cached/fetched DS status from parent servers.
+    /// falls back to cached/fetched DS status from parent servers. A bogus
+    /// proof keeps the cut `.secure`: a forged NSEC must not downgrade it.
     fn ensureDelegationSecurity(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1302,13 +1304,15 @@ pub const RecursiveResolver = struct {
         parent_servers: []const na.Address,
     ) dnssec.SecurityStatus {
         var proof_ttl_cap: u32 = std.math.maxInt(u32);
-        const auth_status = self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap);
-        if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(authorities, zone_cut, dnssec.authoritySigner(authorities).?, self.validationBudget());
-            cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
-            return status;
+        switch (self.verifyAuthoritySigs(allocator, authorities, zone_cut, parent_servers, &proof_ttl_cap)) {
+            .secure => |signer| {
+                const status = dnssec.classifyDelegation(authorities, zone_cut, signer, self.validationBudget());
+                cacheInsecureDelegation(self.keyCache(), status, zone_cut, authorities, proof_ttl_cap);
+                return status;
+            },
+            .bogus => return .secure,
+            .unchecked => {},
         }
-        if (auth_status == .bogus) return .secure; // forged NSEC — don't downgrade
         // No verified NSEC — check/fetch DS from parent (RFC 4035 §5.2).
         var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
         if (self.reproveDelegationSecurity(allocator, zone_cut.formatInto(&zone_buf), parent_servers) != null)
@@ -2334,10 +2338,12 @@ pub const RecursiveResolver = struct {
         // and glue are still useful for resolution, so cache them.
         if (self.cache) |c| c.storeResponse(response, zone, .unchecked, std.math.maxInt(u32));
         var proof_ttl_cap: u32 = std.math.maxInt(u32);
-        const auth_status = self.verifyAuthoritySigs(allocator, response.authorities, zone, parent_servers, &proof_ttl_cap);
-        if (auth_status == .secure) {
-            const status = dnssec.classifyDelegation(response.authorities, zone, dnssec.authoritySigner(response.authorities).?, self.validationBudget());
-            cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
+        switch (self.verifyAuthoritySigs(allocator, response.authorities, zone, parent_servers, &proof_ttl_cap)) {
+            .secure => |signer| {
+                const status = dnssec.classifyDelegation(response.authorities, zone, signer, self.validationBudget());
+                cacheInsecureDelegation(self.keyCache(), status, zone, response.authorities, proof_ttl_cap);
+            },
+            else => {},
         }
         return null;
     }
@@ -2560,7 +2566,7 @@ pub const RecursiveResolver = struct {
         delegation_cut: ?dns.Name,
         parent_servers: []const na.Address,
         ttl_cap: *u32,
-    ) dnssec.SecurityStatus {
+    ) AuthorityProof {
         const signer = dnssec.authoritySigner(authorities) orelse return .unchecked;
         // A no-DS proof is the parent's to make: signer strictly above the cut,
         // checked before its DNSKEY is fetched. `.unchecked` so the caller falls
@@ -2575,10 +2581,28 @@ pub const RecursiveResolver = struct {
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
-        const now_u32 = epochNowU32();
-        return dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, now_u32, self.validationBudget(), ttl_cap);
+        return switch (dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, epochNowU32(), self.validationBudget(), ttl_cap)) {
+            .secure => .{ .secure = signer },
+            .bogus => .bogus,
+            .unchecked, .insecure => .unchecked,
+        };
     }
 
+    /// `secure` carries the signer whose keys verified every SOA/NSEC owner.
+    /// `unchecked` is nothing verifiable: no signer, signer off the cut or
+    /// without keys, no NSEC.
+    const AuthorityProof = union(enum) {
+        secure: dns.Name,
+        bogus,
+        unchecked,
+    };
+
+    /// Under a secure cut, missing RRSIGs, missing NSEC or an unchained
+    /// signer is bogus (RFC 4035 §5.5), as `validateAnswer` treats an
+    /// unsigned positive. The proof is judged against the verified signer,
+    /// whatever cut the walk tracks: `validateNegativeProof` binds qname to
+    /// it, so a signer above the cut is a folded child and any other is
+    /// bogus.
     fn verifiedNegativeResponse(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -2587,31 +2611,16 @@ pub const RecursiveResolver = struct {
         qname: dns.Name,
         qtype: dns.RType,
         is_nxdomain: bool,
-        zone: dns.Name,
         zone_servers: []const na.Address,
         ttl_cap: *u32,
     ) NegativeValidation {
         if (security_state != .secure) return .{ .proceed = cacheSecurityStatus(security_state) };
 
-        const auth_status = self.verifyAuthoritySigs(allocator, authorities, null, zone_servers, ttl_cap);
-        if (auth_status == .bogus) return .{ .bogus = "authority signatures failed" };
-        if (auth_status != .secure) return .skip_cache;
-
-        // `zone` is the deepest *cached* delegation, not the answering
-        // server's real apex. A child folded back into its parent while hark
-        // still holds the cut leaves a server legitimately signing as the
-        // parent — above our tracked zone. That is a lame-cut condition, not
-        // a forgery, so it degrades to unauthenticated-and-uncached rather
-        // than SERVFAIL. Refusing here would be perverse in the other
-        // direction too: an attacker who simply strips the RRSIGs lands on
-        // `.unchecked` above and gets the answer *served*, so the verified
-        // path must not be harsher than the absent one.
-        const signer = dnssec.authoritySigner(authorities) orelse return .skip_cache;
-        if (!signer.isSubdomainOf(zone)) return .skip_cache;
-
-        // Past here the signer is authenticated and at-or-below the cut, so it
-        // is the authority the proof rests on — the zone geometry is judged
-        // against.
+        const signer = switch (self.verifyAuthoritySigs(allocator, authorities, null, zone_servers, ttl_cap)) {
+            .secure => |signer| signer,
+            .bogus => return .{ .bogus = "authority signatures failed" },
+            .unchecked => return .{ .bogus = "unverifiable negative in secure zone" },
+        };
         return validateNegativeResponse(authorities, qname, qtype, is_nxdomain, signer, self.validationBudget());
     }
 
@@ -3529,9 +3538,6 @@ fn extractReferral(
 const NegativeValidation = union(enum) {
     /// Serve, and cache under this status. AD only when `.secure`.
     proceed: cache_mod.SecurityStatus,
-    /// Serve, cache nothing: authority signatures did not verify at all, so
-    /// there is no verdict worth persisting.
-    skip_cache,
     bogus: []const u8,
 };
 

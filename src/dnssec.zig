@@ -1494,7 +1494,8 @@ pub fn signedLabels(name: dns.Name) usize {
 /// authority section). NS and glue stay exempt: at a zone cut they are
 /// legitimately unsigned delegation data. On `.secure`, `ttl_cap` is lowered
 /// to the tightest verified signature's bound — a proof-derived verdict must
-/// not be cached past the signatures that justify it.
+/// not be cached past the signatures that justify it. No NSEC/NSEC3 at all
+/// is `.unchecked`.
 pub fn verifyAuthorityProofSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
@@ -1502,10 +1503,6 @@ pub fn verifyAuthorityProofSigs(
     budget: *ValidationBudget,
     ttl_cap: ?*u32,
 ) SecurityStatus {
-    // No proof material at all is `.unchecked` regardless of the SOA: the
-    // stripped-everything response already degrades to unauthenticated-and-
-    // uncached, and an unsigned bare SOA must not land *harsher* than that —
-    // the attacker would simply strip the SOA too.
     for (authorities) |rr| {
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
     } else return .unchecked;
