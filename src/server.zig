@@ -948,9 +948,9 @@ const WorkerState = struct {
         }
     }
 
-    fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_addr: na.Address) void {
+    fn sendErrorUdp(self: *WorkerState, sock: posix.fd_t, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_opt: ?dns.OptRecord, client_addr: na.Address) void {
         var wire_buf: [dns.max_udp_payload]u8 = undefined;
-        if (serializeErrorResponse(&wire_buf, id, opcode, rcode, extended_rcode, rd, questions)) |wire| {
+        if (serializeErrorResponse(&wire_buf, id, opcode, rcode, extended_rcode, rd, questions, client_opt)) |wire| {
             self.sendUdpResponse(sock, wire, client_addr);
         }
     }
@@ -1000,7 +1000,7 @@ const WorkerState = struct {
                 return;
             }
         }
-        self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, client_addr);
+        self.sendErrorUdp(sock, query_msg.header.id, query_msg.header.flags.opcode, .server_failure, 0, query_msg.header.flags.rd, query_msg.questions, query_msg.opt, client_addr);
     }
 
     fn handleUdpQuery(self: *WorkerState, sock: posix.fd_t, data: []const u8, client_addr: na.Address) void {
@@ -1022,13 +1022,13 @@ const WorkerState = struct {
         const client_opcode: dns.OpCode = @fromBackingInt(@intCast(opcode_bits));
         if (opcode_bits != 0) {
             @branchHint(.cold);
-            self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, client_opcode, .not_implemented, 0, rd, &.{}, null, client_addr);
             return;
         }
         const qdcount = mem.readInt(u16, data[4..6], .big);
         if (qdcount != 1) {
             @branchHint(.cold);
-            self.sendErrorUdp(sock, id, .query, .format_error, 0, rd, &.{}, client_addr);
+            self.sendErrorUdp(sock, id, .query, .format_error, 0, rd, &.{}, null, client_addr);
             return;
         }
 
@@ -1199,13 +1199,13 @@ const WorkerState = struct {
                 const id = mem.readInt(u16, data[0..2], .big);
                 // Best-effort opcode echo from raw header even when parse failed.
                 const op_bits: u4 = @truncate(data[2] >> 3);
-                self.sendError(reply, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{});
+                self.sendError(reply, id, @fromBackingInt(@intCast(op_bits)), .format_error, 0, false, &.{}, null);
             }
             return;
         };
 
         if (validateQuery(query)) |fail| {
-            self.sendError(reply, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions);
+            self.sendError(reply, query.header.id, query.header.flags.opcode, fail.rcode, fail.extended_rcode, query.header.flags.rd, query.questions, query.opt);
             return;
         }
 
@@ -1224,7 +1224,7 @@ const WorkerState = struct {
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, @errorName(err) });
             self.server.cache.cacheServfail(name_str, question.qtype);
             self.recordClientOutcome(false);
-            self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions);
+            self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
@@ -1241,12 +1241,12 @@ const WorkerState = struct {
         self.dispatchPrefetches(result, name_str);
     }
 
-    fn sendError(self: *WorkerState, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question) void {
+    fn sendError(self: *WorkerState, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question, client_opt: ?dns.OptRecord) void {
         switch (reply) {
-            .udp => |u| self.sendErrorUdp(u.sock, id, opcode, rcode, extended_rcode, rd, questions, u.addr),
+            .udp => |u| self.sendErrorUdp(u.sock, id, opcode, rcode, extended_rcode, rd, questions, client_opt, u.addr),
             .tcp => |c| {
                 var buf: [dns.max_udp_payload]u8 = undefined;
-                const wire = serializeErrorResponse(&buf, id, opcode, rcode, extended_rcode, rd, questions) orelse return;
+                const wire = serializeErrorResponse(&buf, id, opcode, rcode, extended_rcode, rd, questions, client_opt) orelse return;
                 c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);
             },
         }
@@ -1263,7 +1263,7 @@ const WorkerState = struct {
                 ctx.minimal_responses = self.server.config.minimal_responses;
                 ctx.rebinding = &self.server.config.rebinding;
                 const wire = buildResponseWire(&buf, ctx, result, alloc) orelse
-                    return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions);
+                    return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
                 c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);
             },
         }
