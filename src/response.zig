@@ -34,6 +34,7 @@ const ShapedSections = struct {
     answers: []const dns.ResourceRecord,
     authorities: []const dns.ResourceRecord,
     additionals: []const dns.ResourceRecord,
+    scrubbed: bool,
 };
 
 /// Pure shaper: applies the per-section keep/strip matrix to `response`
@@ -75,10 +76,13 @@ fn shapeResponse(
     // Scrubbing after shaping means minimised (near-empty) sections cost
     // nothing to scan — the security boundary is what reaches the wire.
     const rb = rebind_cfg.*;
+    const scrubbed_answers = try rebinding.scrub(alloc, answers, rb);
+    const scrubbed_authorities = try rebinding.scrub(alloc, authorities, rb);
     return .{
-        .answers = try rebinding.scrub(alloc, answers, rb),
-        .authorities = try rebinding.scrub(alloc, authorities, rb),
+        .answers = scrubbed_answers,
+        .authorities = scrubbed_authorities,
         .additionals = try rebinding.scrub(alloc, additionals, rb),
+        .scrubbed = scrubbed_answers.len != answers.len or scrubbed_authorities.len != authorities.len,
     };
 }
 
@@ -299,7 +303,6 @@ pub fn buildResponseWire(
     else
         ctx.rebinding;
 
-
     // Apply the unified response-shaping matrix. See `shapeResponse` for the
     // per-section keep/strip rules. OOM returns null — the I/O caller
     // surfaces it as SERVFAIL rather than emitting a half-shaped response.
@@ -327,7 +330,7 @@ pub fn buildResponseWire(
                 .rd = ctx.rd,
                 .ra = true,
                 .z = 0,
-                .ad = response.header.flags.ad and ctx.client_wants_ad,
+                .ad = response.header.flags.ad and ctx.client_wants_ad and !shaped.scrubbed,
                 .cd = ctx.cd,
                 .rcode = response.header.flags.rcode,
             },
@@ -975,6 +978,32 @@ test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME
         const parsed = try dns.parseMessage(a, wire);
         try testing.expectEqual(c.kept, parsed.header.an_count);
         try testing.expectEqual(c.answers[0].rtype, parsed.answers[0].rtype);
+    }
+}
+
+test "buildResponseWire: a rebinding scrub clears AD" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    for ([_][4]u8{ .{ 93, 184, 216, 34 }, .{ 192, 168, 1, 1 } }, [_]bool{ true, false }) |ip, ad| {
+        var msg = shapePositiveMessage(&.{shapeARecord(ip)}, &.{}, &.{});
+        msg.header.flags.ad = true;
+        var buf: [dns.max_udp_payload]u8 = undefined;
+        const wire = buildResponseWire(&buf, .{
+            .query_id = 0,
+            .opcode = .query,
+            .rd = true,
+            .cd = false,
+            .questions = &.{.{ .name = shape_test_name, .qtype = .a, .qclass = .in }},
+            .client_edns = true,
+            .client_do = true,
+            .client_wants_ad = true,
+            .max_udp_payload = dns.max_udp_payload,
+            .rebinding = &scrub_on,
+        }, msg, a).?;
+        try testing.expectEqual(ad, (try dns.parseMessage(a, wire)).header.flags.ad);
     }
 }
 
