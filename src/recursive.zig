@@ -3142,11 +3142,13 @@ fn validateDnskeyAgainstDs(
 ) !dns.RrsigData {
     var ds_records: [16]dns.DsData = undefined;
     var ds_count: usize = 0;
+    // Refuse rather than truncate: wire order is unsigned, so the dropped
+    // tail is whichever DS the sender chose to put last.
     for (ds_records_rr) |rr| {
-        if (rr.rtype == .ds and ds_count < ds_records.len) {
-            ds_records[ds_count] = rr.rdata.ds;
-            ds_count += 1;
-        }
+        if (rr.rtype != .ds) continue;
+        if (ds_count == ds_records.len) return error.TooManyDs;
+        ds_records[ds_count] = rr.rdata.ds;
+        ds_count += 1;
     }
     if (ds_count == 0) return error.NoDs;
     // RFC 4035 §5.2: DNSKEY RRset MUST be self-signed.
