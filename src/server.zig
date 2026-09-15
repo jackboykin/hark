@@ -670,19 +670,12 @@ const BgKind = enum {
     /// that records its failures (RFC 9520): absence is the fire condition,
     /// so an unrecorded failure re-fires on every client query.
     cousin,
-    /// CD=1 revalidation. Re-resolve with dnssec_enabled=true
-    /// to upgrade the .unchecked cache entry to .secure (or invalidate on
-    /// BOGUS). Runs with `bypass_cache=true` so validation actually fires
-    /// — cache-hit on .unchecked records returns them without re-verifying,
-    /// so we pay the upstream round-trip to get signed data for validation.
-    revalidate,
 };
 
 /// Errors are expected and ignored; runs for cache side effects.
 fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, alloc: mem.Allocator, name: []const u8, qtype: dns.RType, kind: BgKind) void {
-    const dedup_flag: u8 = if (kind == .revalidate) dedup_mod.flag_revalidate else 0;
-    if (ctx.dedup) |d| if (!d.tryAcquireLeader(name, qtype, dedup_flag)) return;
-    defer if (ctx.dedup) |d| d.releaseLeader(name, qtype, dedup_flag);
+    if (ctx.dedup) |d| if (!d.tryAcquireLeader(name, qtype, 0)) return;
+    defer if (ctx.dedup) |d| d.releaseLeader(name, qtype, 0);
 
     var resolver = recursive.RecursiveResolver.fromContext(ctx, transports, .{ .bypass_cache = kind != .cousin });
     _ = resolver.resolve(alloc, name, qtype) catch |err| {
@@ -1092,7 +1085,6 @@ const WorkerState = struct {
 
         self.recordClientOutcome(result.from_cache); // cache_only ⇒ always a hit
         self.dispatchPrefetches(result, name_str);
-        if (query_msg.header.flags.cd) self.scheduleCd1Revalidate(name_str, question.qtype);
         return true;
     }
 
@@ -1247,9 +1239,6 @@ const WorkerState = struct {
 
         self.recordClientOutcome(result.from_cache);
         self.dispatchPrefetches(result, name_str);
-        if (query.header.flags.cd) {
-            self.scheduleCd1Revalidate(name_str, question.qtype);
-        }
     }
 
     fn sendError(self: *WorkerState, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended_rcode: u8, rd: bool, questions: []const dns.Question) void {
@@ -1309,18 +1298,6 @@ const WorkerState = struct {
     fn spawnPrefetch(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
         if (self.server.trySpawnBgPrefetch(name, qtype, .prefetch)) return;
         _ = self.server.prefetch_drops.fetchAdd(1, .monotonic);
-    }
-
-    /// Schedule background DNSSEC validation for a cache entry populated by
-    /// a CD=1 query. The original response shipped to the client with AD=0
-    /// and the RRset is cached as .unchecked; background validation
-    /// promotes it to .secure (benefiting subsequent CD=0 lookups) or
-    /// invalidates on BOGUS. Silently drops on cap/spawn failure — the only
-    /// loss is missed cache warming, never an incorrect response.
-    fn scheduleCd1Revalidate(self: *WorkerState, name: []const u8, qtype: dns.RType) void {
-        if (!self.server.config.dnssec) return;
-        if (self.server.cache.hasValidatedPositive(name, qtype, .in)) return;
-        _ = self.server.trySpawnBgPrefetch(name, qtype, .revalidate);
     }
 
     fn resolveWithDedupUsing(
@@ -1562,9 +1539,8 @@ test "createSocket UDP reuseport allows multiple binds" {
 
 test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     // RFC 6840 §5.9 / RFC 4035 §3.2.2: AD MUST NOT be set unless the
-    // resolver verified. A cache entry stored as .unchecked (e.g. by the
-    // CD=1 early-serve path before background validation upgrades it)
-    // must not produce AD=1 responses to CD=0 clients.
+    // resolver verified. A cache entry stored as .unchecked must not
+    // produce AD=1 responses to CD=0 clients.
 
     const alloc = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1619,45 +1595,6 @@ test "AD bit cleared on unvalidated (.unchecked) cache hit" {
     }, response_secure, a).?;
     const parsed2 = try dns.parseMessage(a, wire2);
     try testing.expectEqual(true, parsed2.header.flags.ad);
-}
-
-test "hasValidatedPositive returns true only for non-.unchecked entries" {
-    // Guards the predicate that scheduleCd1Revalidate uses to short-circuit
-    // repeated CD=1 queries to an already-validated name. A steady CD=1
-    // workload would otherwise pay a bg spawn + upstream round-trip per
-    // query even after the cache entry is .secure.
-    const config = @import("config.zig");
-    var cfg = config.parseConfig(testing.allocator,
-        \\[server]
-        \\dnssec = true
-    ) catch return error.SkipZigTest;
-    defer cfg.deinit();
-
-    var server = try Server.init(testing.allocator, cfg, testing.io);
-    defer server.deinit();
-
-    // Before any cached entry: hasValidatedPositive is false; bg scheduler
-    // would spawn (we don't actually spawn here — just exercise the check).
-    try testing.expect(!server.cache.hasValidatedPositive("example.com", .a, .in));
-
-    // Populate cache with a .secure answer (simulates a prior CD=0 resolve
-    // or a completed bg revalidation).
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const name = try dns.parseDottedName(a, "example.com");
-    const answers = try a.alloc(dns.ResourceRecord, 1);
-    answers[0] = .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-    const resp = dns.Message{
-        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = true, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error } },
-        .questions = &.{},
-        .answers = answers,
-    };
-    server.cache.storeResponse(resp, dns.Name{ .labels = &.{} }, .secure, std.math.maxInt(u32));
-
-    try testing.expect(server.cache.hasValidatedPositive("example.com", .a, .in));
-    // .unchecked entries are NOT protected — bg scheduler should still fire.
-    try testing.expect(!server.cache.hasValidatedPositive("unknown.com", .a, .in));
 }
 
 test "trySpawnBgPrefetch rejects oversize and empty names" {

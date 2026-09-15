@@ -75,14 +75,14 @@ const PrecomputedCtx = struct {
 
 /// DNSSEC validation status for cached RRsets, least trusted first: a store
 /// never displaces a fresh entry of higher rank (RFC 9520 §3.4).
-/// Intentionally a subset of dnssec.SecurityStatus: the cache only stores
-/// .secure (validated) or .insecure (provably unsigned); validation
-/// failures (.bogus) are never cached — they produce immediate SERVFAIL.
 pub const SecurityStatus = enum {
     /// Parent-side referral data (RFC 2181 §5.4.1): steers the walk, is
     /// never an answer, and any real answer displaces it.
     glue,
     unchecked,
+    /// A SERVFAIL marker for a validation failure, never data (RFC 4035 §4.7).
+    /// CD=0 is served it; CD=1 resolves past it.
+    bogus,
     insecure,
     secure,
 
@@ -691,8 +691,8 @@ pub const RRsetCache = struct {
             },
             .negative => |neg| {
                 if (name_error_only and neg.rcode != .name_error) return null;
-                // SERVFAIL never serves stale: short TTL (e.g. 1s for DNSSEC bogus)
-                // is intentional; extending it would prolong failure beyond design.
+                // SERVFAIL never serves stale: its short TTL is intentional;
+                // extending it would prolong failure beyond design.
                 const disable_stale = neg.rcode == .server_failure;
                 const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
                 const soa_rrs = cloneRRset(caller_alloc, neg.pack, neg.pack.records(), hit.remaining_ttl) catch return null;
@@ -925,8 +925,8 @@ pub const RRsetCache = struct {
         const slot = self.prepareSlot(lower_view, rtype, rclass, security_status, overwrite) orelse return;
         defer slot.shard.write.lock.unlock(self.io);
 
-        // Don't apply min_ttl — callers provide intentional TTLs (e.g. 1s for
-        // DNSSEC SERVFAIL). RFC 9520 §3 caps resolution-failure caching at
+        // Don't apply min_ttl — callers provide intentional TTLs (e.g. 5s for
+        // a resolution failure). RFC 9520 §3 caps resolution-failure caching at
         // 5 minutes; NXDOMAIN/NODATA at RFC 2308 §5's 3h SHOULD ceiling.
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         // Caller-chosen TTL on a record-less entry: nothing to bound it by.
@@ -955,29 +955,6 @@ pub const RRsetCache = struct {
         self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked, .unless_fresh);
     }
 
-    /// True if a non-expired positive entry exists for (name, rtype, rclass)
-    /// with a `.secure` or `.insecure` status — the entries RFC 9520 §3.4
-    /// considers trustworthy.
-    /// Takes the shared lock; safe to call without holding any other lock.
-    pub fn hasValidatedPositive(
-        self: *RRsetCache,
-        name: []const u8,
-        rtype: dns.RType,
-        rclass: dns.RClass,
-    ) bool {
-        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
-        const key = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
-        const shard, const h = self.shardWithHash(key);
-        shard.write.lock.lockSharedUncancelable(self.io);
-        defer shard.write.lock.unlockShared(self.io);
-        const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
-        return switch (shard.map.values()[idx]) {
-            .positive => |p| self.now_fn() < p.expires_at and (p.security_status == .secure or p.security_status == .insecure),
-            .negative => false,
-        };
-    }
-
     /// Displacement policy for a store finding a live entry in its slot.
     /// `.unless_fresh` is for failure markers, which never displace a fresh
     /// entry of any status; checked under the shard write lock so a
@@ -987,10 +964,9 @@ pub const RRsetCache = struct {
 
     /// One home for "may this write displace the existing entry": the RFC
     /// 9520 §3.4 anti-downgrade rank check plus the failure-marker policy.
-    /// Same-rank overwrites land (refresh, zone-state flip), upgrades land
-    /// (CD=1 revalidation), downgrades skip — so a forged `.insecure` cannot
-    /// displace a real `.secure`, and a CD=1 `.unchecked` cannot displace
-    /// either.
+    /// Same-rank overwrites and upgrades land, downgrades skip — so a forged
+    /// `.insecure` cannot displace a real `.secure`, and a bogus verdict
+    /// displaces `.unchecked` but neither of those.
     fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus, overwrite: Overwrite) bool {
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const existing = shard.map.values()[idx];
@@ -2298,8 +2274,7 @@ test "serve stale: fresh, inside the window, beyond it (RFC 8767)" {
 
 test "SERVFAIL never serves stale" {
     // RFC 8767 + design intent: a SERVFAIL with intentionally-short TTL
-    // (e.g. 1s for DNSSEC bogus per recursive.zig's bogusServfail) must
-    // not be extended into the serve-stale window. Doing so would prolong
+    // must not be extended into the serve-stale window. Doing so would prolong
     // upstream failure long after the zone is fixed.
     const alloc = testing.allocator;
     test_time = 1000;
@@ -2438,17 +2413,19 @@ test "BOGUS invalidates .unchecked positive to SERVFAIL" {
     defer cache.deinit();
 
     try storeTestAWithStatus(&cache, alloc, &.{ "example", "com" }, 300, .{ 1, 2, 3, 4 }, .unchecked);
-    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 1, .unchecked, .always);
+    cache.storeNegativeBare("example.com", .a, .in, .server_failure, 60, .bogus, .always);
+    try storeTestAWithStatus(&cache, alloc, &.{ "example", "org" }, 300, .{ 1, 2, 3, 4 }, .insecure);
+    cache.storeNegativeBare("example.org", .a, .in, .server_failure, 60, .bogus, .always);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const r = cache.lookup(arena.allocator(), "example.com", .a, .in) orelse return error.TestExpectedHit;
     try testing.expectEqual(dns.RCode.server_failure, r.negative.rcode);
+    try testing.expectEqual(SecurityStatus.bogus, r.negative.security_status);
+    try expectCachedHitStatus(alloc, &cache, "example.org", .insecure);
 }
 
-test ".unchecked positive is upgraded to .secure on revalidation store" {
-    // CD=1 then bg-revalidator: the .secure store must replace the
-    // .unchecked entry, else scheduleCd1Revalidate is a silent no-op.
+test ".unchecked positive is upgraded to .secure on store" {
     const alloc = testing.allocator;
     test_time = 1000;
     var cache = makeTestCache(alloc);
@@ -2474,8 +2451,8 @@ test "fresh .secure positive replaces fresh .secure negative on same key" {
 }
 
 test ".unchecked store does not downgrade fresh .secure positive" {
-    // Anti-downgrade: an .unchecked store from a CD=1 query must not
-    // replace an already-validated .secure entry.
+    // Anti-downgrade: an .unchecked store must not replace an
+    // already-validated .secure entry.
     const alloc = testing.allocator;
     test_time = 1000;
     var cache = makeTestCache(alloc);

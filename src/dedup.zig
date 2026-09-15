@@ -6,8 +6,7 @@ const dns = @import("dns.zig");
 /// Populations that must not coalesce; `internal` keeps the resolver's own
 /// DNSKEY/DS/NS fetches off the client query that triggered them.
 pub const flag_cd: u8 = 1;
-pub const flag_revalidate: u8 = 2;
-pub const flag_internal: u8 = 4;
+pub const flag_internal: u8 = 2;
 
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");

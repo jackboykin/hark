@@ -250,6 +250,8 @@ pub const RecursiveResolver = struct {
     qname_minimization: bool = true,
     /// Whether to validate DNSSEC signatures (may be disabled per-query by CD bit)
     dnssec_enabled: bool = false,
+    /// Client CD bit: answers are read from the cache but never written to it.
+    cd: bool = false,
     /// Whether to request DNSSEC data (DO bit) — always true if server is DNSSEC-capable.
     /// RFC 4035 §3.2.1: MUST set DO regardless of CD bit or per-query validation.
     dnssec_aware: bool = false,
@@ -349,6 +351,7 @@ pub const RecursiveResolver = struct {
             .dnssec_aware = ctx.config.dnssec,
             // RFC 4035 §3.2.2: CD=1 means client handles validation — skip ours.
             .dnssec_enabled = ctx.config.dnssec and !opts.cd,
+            .cd = opts.cd,
             .encrypted_ns = ctx.encrypted_ns,
             .rtt_cache = ctx.rtt_cache,
             .ns_selector = ctx.ns_selector,
@@ -378,6 +381,12 @@ pub const RecursiveResolver = struct {
         // `budget` is deliberately not reset: clones share the parent's counters.
         // A per-clone reset reopens fan-out amplification (NXNS, KeyTrap).
         return resolver;
+    }
+
+    /// Where final answers are stored: nowhere under CD=1, whose unvalidated
+    /// data would otherwise be served to CD=0 clients.
+    fn answerCache(self: *const RecursiveResolver) ?*RRsetCache {
+        return if (self.cd) null else self.cache;
     }
 
     fn consumeQuery(self: *RecursiveResolver) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
@@ -769,7 +778,7 @@ pub const RecursiveResolver = struct {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
             switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.servers(), &neg_ttl_cap)) {
                 .proceed => |status| if (status == .secure) {
-                    if (self.cache) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                    if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
                 },
                 .bogus => {},
             }
@@ -788,7 +797,7 @@ pub const RecursiveResolver = struct {
         var neg_ttl_cap: u32 = std.math.maxInt(u32);
         switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.servers(), &neg_ttl_cap)) {
             .proceed => |status| if (response.header.flags.aa) {
-                if (self.cache) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
             },
             .bogus => return walk.stopProbing(),
         }
@@ -842,7 +851,7 @@ pub const RecursiveResolver = struct {
         const redirect = (try redirectFor(allocator, response.answers, walk.target, walk.zone)) orelse return .none;
 
         // Store before following: this response never reaches final answer validation.
-        if (self.cache) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
+        if (self.answerCache()) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
         if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .{ .bogus = "cname loop" };
         // Carry the expansion's proofs past this hop so the client sees them;
         // `proveWildcard` already verified them under the answer's keys.
@@ -945,7 +954,11 @@ pub const RecursiveResolver = struct {
         if (self.bypass_cache) return .none;
         const c = self.cache orelse return .none;
         if (c.lookup(allocator, current_name, qtype, .in)) |result| {
-            if (result == .hit and !result.hit.security_status.answerable()) return .none;
+            switch (result) {
+                .hit => |h| if (!h.security_status.answerable()) return .none,
+                // RFC 4035 §3.2.2: a CD=1 client gets the data a bogus verdict withholds.
+                .negative => |n| if (self.cd and n.security_status == .bogus) return .none,
+            }
             const meta = switch (result) {
                 inline .hit, .negative => |entry| .{
                     .needs_prefetch = entry.needs_prefetch,
@@ -1233,7 +1246,7 @@ pub const RecursiveResolver = struct {
             var neg_ttl_cap: u32 = std.math.maxInt(u32);
             switch (self.verifiedNegativeResponse(allocator, security_state, response.authorities, target_name, qtype, rcode == .name_error, servers, &neg_ttl_cap)) {
                 .proceed => |status| {
-                    if (aa or status == .secure) if (self.cache) |c| c.storeNegative(current_name, qtype, .in, rcode, response.authorities, parent_zone, status, neg_ttl_cap);
+                    if (aa or status == .secure) if (self.answerCache()) |c| c.storeNegative(current_name, qtype, .in, rcode, response.authorities, parent_zone, status, neg_ttl_cap);
                     if (status == .secure) {
                         response.header.flags.ad = true;
                         self.storeNsec(response.authorities, neg_ttl_cap);
@@ -1281,7 +1294,7 @@ pub const RecursiveResolver = struct {
                 .skip => {},
             }
         }
-        if (self.cache) |c| if (qtype != .any) {
+        if (self.answerCache()) |c| if (qtype != .any) {
             c.storeResponse(response.*, parent_zone, answer_status, answer_ttl_cap);
             if (wildcard) |w| if (self.nsec_cache != null) self.storeWildcardRRsets(response.answers, qtype, w, answer_ttl_cap);
         };
@@ -1413,7 +1426,7 @@ pub const RecursiveResolver = struct {
         }
         if (wc_count == 0) return;
 
-        if (self.cache) |c| {
+        if (self.answerCache()) |c| {
             // storeResponse reads only rcode + record sections, so the
             // synthesizedMessage header vehicle is as good as a bespoke one.
             c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), wildcard.signer, .secure, ttl_cap);
@@ -1899,8 +1912,8 @@ pub const RecursiveResolver = struct {
         return error.Timeout;
     }
 
-    /// RFC 9520 §3.2: minimum negative-cache TTL for DNSSEC validation failures.
-    const dnssec_bogus_ttl: u32 = 1;
+    /// RFC 4035 §4.7 BAD cache; Unbound's val-bogus-ttl.
+    const dnssec_bogus_ttl: u32 = 60;
 
     /// Dedup follower timeout for DNSKEY fetches. Cold-cache DNSSEC chains
     /// (root → TLD → SLD → DNSKEY) can take 3-5s; 6s provides headroom.
@@ -1925,7 +1938,7 @@ pub const RecursiveResolver = struct {
     /// Caches a SERVFAIL with dnssec_bogus_ttl and returns SERVFAIL to the client.
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, why: []const u8) ResolveResult {
         @branchHint(.cold);
-        if (self.cache) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .unchecked, .unless_fresh);
+        if (self.answerCache()) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .bogus, .always);
         return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .servfail_why = why };
     }
 
