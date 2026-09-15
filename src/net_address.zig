@@ -225,12 +225,9 @@ pub fn isSpecialUseIp4(b: [4]u8) bool {
     return false;
 }
 
-/// Shared special-use IPv6 set: loopback, unspecified, ULA, link-local, the
-/// documentation prefix (RFC 3849), and IPv4-mapped addresses re-evaluated
-/// against the v4 set. Multicast ff00::/8 excluded for symmetry with IPv4.
+/// ::/96, ULA, link-local, 2001:db8::/32, and IPv4-mapped judged as v4; no multicast.
 pub fn isSpecialUseIp6(b: [16]u8) bool {
-    // ::/128 and ::1/128
-    if (mem.eql(u8, b[0..15], &@as([15]u8, @splat(0)))) return b[15] <= 1;
+    if (mem.eql(u8, b[0..12], &@as([12]u8, @splat(0)))) return true;
     // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
     // doesn't slip through as a "v6 address" the v6 set has no opinion on.
     if (isIp4Mapped(&b)) return isSpecialUseIp4(b[12..16].*);
@@ -355,6 +352,7 @@ test "special-use IPv4 set leaves routable space alone (incl. boundaries + multi
 test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
     try testing.expect(isSpecialUseIp6(@as([16]u8, @splat(0)))); // ::
     try testing.expect(isSpecialUseIp6(@as([15]u8, @splat(0)) ++ [_]u8{1})); // ::1
+    try testing.expect(isSpecialUseIp6(@as([12]u8, @splat(0)) ++ [_]u8{ 127, 0, 0, 1 })); // ::127.0.0.1
     try testing.expect(isSpecialUseIp6([_]u8{0xfc} ++ @as([15]u8, @splat(0)))); // fc00::/7
     try testing.expect(isSpecialUseIp6([_]u8{0xfd} ++ @as([15]u8, @splat(0))));
     try testing.expect(isSpecialUseIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)))); // fe80::/10
