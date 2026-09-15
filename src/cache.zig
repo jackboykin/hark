@@ -930,7 +930,7 @@ pub const RRsetCache = struct {
         // 5 minutes; NXDOMAIN/NODATA at RFC 2308 §5's 3h SHOULD ceiling.
         const ceiling: u32 = if (rcode == .server_failure) servfail_max_ttl else negative_max_ttl;
         // Caller-chosen TTL on a record-less entry: nothing to bound it by.
-        const life = self.lifetime(@min(ttl, ceiling), std.math.maxInt(u32));
+        const life = self.lifetime(@min(bogusBackoff(slot.shard, slot.h, slot.key, security_status, ttl), ceiling), std.math.maxInt(u32));
         self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
@@ -943,6 +943,17 @@ pub const RRsetCache = struct {
             return;
         };
         self.noteInsert(slot.shard);
+    }
+
+    /// RFC 9520 §3.2: a name that keeps failing validation doubles its wait.
+    fn bogusBackoff(shard: *Shard, h: u32, key: CacheKey, status: SecurityStatus, ttl: u32) u32 {
+        if (status != .bogus) return ttl;
+        const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return ttl;
+        const prior = shard.map.values()[idx];
+        return switch (prior) {
+            .negative => |n| if (n.security_status == .bogus) n.original_ttl *| 2 else ttl,
+            .positive => ttl,
+        };
     }
 
     /// Cache a resolution failure per RFC 9520 §3. TTL chosen short (5 s)

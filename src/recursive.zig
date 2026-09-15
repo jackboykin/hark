@@ -1922,8 +1922,8 @@ pub const RecursiveResolver = struct {
         return error.Timeout;
     }
 
-    /// RFC 4035 §4.7 BAD cache; Unbound's val-bogus-ttl.
-    const dnssec_bogus_ttl: u32 = 60;
+    /// Initial BAD-cache TTL (RFC 4035 §4.7); the cache backs it off.
+    const dnssec_bogus_ttl: u32 = 5;
 
     /// Dedup follower timeout for DNSKEY fetches. Cold-cache DNSSEC chains
     /// (root → TLD → SLD → DNSKEY) can take 3-5s; 6s provides headroom.
