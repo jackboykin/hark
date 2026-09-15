@@ -266,6 +266,7 @@ pub const DnssecAlgorithm = enum(u8) {
     ecdsap384sha384 = 14,
     ed25519 = 15,
     ed448 = 16,
+    mldsa44 = 18,
     _,
 };
 

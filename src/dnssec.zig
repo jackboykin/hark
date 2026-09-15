@@ -10,6 +10,7 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
 
 // See verifyRsa for why we drive std.crypto.ff directly.
 const RsaModulus = std.crypto.ff.Modulus(4096);
@@ -175,16 +176,57 @@ pub fn validateDnskeyRrset(
     // anchored key whose tag matches. One flat walk — a (rrsig, key)
     // pair is attempted at most once, so identical attempts are never
     // re-charged against the KeyTrap budget.
+    // Unless the DS advertises ML-DSA-44: then only an ML-DSA-44 RRSIG
+    // counts (draft-westerbaan-dnssec-mldsa §7.2, RFC 4035 §5.3.3 policy).
+    const pq = hasMlDsaDs(ds_records);
     for (dnskey_records) |rrsig_rr| {
         if (rrsig_rr.rtype != .rrsig) continue;
         const rrsig = rrsig_rr.rdata.rrsig;
         if (rrsig.type_covered != .dnskey) continue;
+        if (pq and rrsig.algorithm != .mldsa44) continue;
         for (filtered, 0..) |rr, i| {
             if (!anchored[i] or key_tags[i] != rrsig.key_tag) continue;
             if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget)) return rrsig;
         }
     }
     return error.InvalidSignature;
+}
+
+/// A DS hark can't digest anchors nothing (RFC 4035 §5.2), so it demands
+/// nothing either; the DS RRset is signed, so that is the zone's choice.
+fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
+    for (ds_records) |ds| if (ds.algorithm == .mldsa44 and digestSupported(ds.digest_type) and dsEligible(ds, ds_records)) return true;
+    return false;
+}
+
+fn digestSupported(digest_type: dns.DigestType) bool {
+    return switch (digest_type) {
+        .sha1, .sha256, .sha384 => true,
+        _ => false,
+    };
+}
+
+/// A keyset whose DS advertises ML-DSA-44, reduced to the keys that may
+/// validate under it. The apex already refused every other signature;
+/// below it verifyRrsig binds an RRSIG to a key of its own algorithm, so
+/// with the classical keys gone a classical RRSIG has nothing to verify
+/// against. No per-RRset check, no flag. The apex RRSIGs are dropped too:
+/// no keyset consumer reads them and they would not verify over the subset.
+pub fn postQuantumKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
+    const keep = struct {
+        fn f(rr: dns.ResourceRecord) bool {
+            return rr.rtype == .dnskey and rr.rdata.dnskey.algorithm == .mldsa44;
+        }
+    }.f;
+    var n: usize = 0;
+    for (records) |rr| n += @intFromBool(keep(rr));
+    const kept = try allocator.alloc(dns.ResourceRecord, n);
+    n = 0;
+    for (records) |rr| if (keep(rr)) {
+        kept[n] = rr;
+        n += 1;
+    };
+    return kept;
 }
 
 /// RFC 6840 §4.4: an NSEC/NSEC3 type bitmap proves an insecure delegation
@@ -299,40 +341,26 @@ fn writeNameWire(buf: []u8, name: dns.Name, comptime lower: bool) error{BufferTo
     return pos;
 }
 
+/// RFC 4034 §5.1.4: digest of canonical owner name || DNSKEY RDATA.
+fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) error{BufferTooSmall}![Hash.digest_length]u8 {
+    var name_buf: [255]u8 = undefined;
+    const name_len = try writeCanonicalNameWire(&name_buf, owner);
+    var h = Hash.init(.{});
+    h.update(name_buf[0..name_len]);
+    h.update(&mem.toBytes(mem.nativeToBig(u16, dnskey.flags)));
+    h.update(&.{ dnskey.protocol, @backingInt(dnskey.algorithm) });
+    h.update(dnskey.public_key);
+    return h.finalResult();
+}
+
 fn verifyDs(ds: dns.DsData, dnskey: dns.DnskeyData, owner_name: dns.Name) VerifyError!void {
-    var wire_buf: [1024]u8 = undefined;
-    const name_len = try writeCanonicalNameWire(&wire_buf, owner_name);
-
-    var pos = name_len;
-    if (pos + 4 + dnskey.public_key.len > wire_buf.len) return error.BufferTooSmall;
-    mem.writeInt(u16, wire_buf[pos..][0..2], dnskey.flags, .big);
-    pos += 2;
-    wire_buf[pos] = dnskey.protocol;
-    pos += 1;
-    wire_buf[pos] = @backingInt(dnskey.algorithm);
-    pos += 1;
-    @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
-    pos += dnskey.public_key.len;
-
-    const data = wire_buf[0..pos];
-
     const ok = switch (ds.digest_type) {
-        .sha1 => verifyDigest(Sha1, data, ds.digest),
-        .sha256 => verifyDigest(Sha256, data, ds.digest),
-        .sha384 => verifyDigest(Sha384, data, ds.digest),
+        .sha1 => mem.eql(u8, &try dsDigest(Sha1, owner_name, dnskey), ds.digest),
+        .sha256 => mem.eql(u8, &try dsDigest(Sha256, owner_name, dnskey), ds.digest),
+        .sha384 => mem.eql(u8, &try dsDigest(Sha384, owner_name, dnskey), ds.digest),
         _ => return error.UnsupportedAlgorithm,
     };
     if (!ok) return error.InvalidSignature;
-}
-
-/// Fixed-shape digest check: the expected length must match the hash and the
-/// hash of `data` must equal `expected`. Either mismatch yields false — the
-/// caller maps that to InvalidSignature, preserving verifyDs's semantics.
-fn verifyDigest(comptime Hash: type, data: []const u8, expected: []const u8) bool {
-    if (expected.len != Hash.digest_length) return false;
-    var hash: [Hash.digest_length]u8 = undefined;
-    Hash.hash(data, &hash, .{});
-    return mem.eql(u8, &hash, expected);
 }
 
 // ── RRSIG Signed Data Construction (RFC 4034 §5.3) ──────────────────
@@ -577,6 +605,7 @@ fn verifyRrsig(
         .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, rrsig.signature, &data, dnskey.public_key),
         .ecdsap384sha384 => try verifyEcdsa(EcdsaP384, rrsig.signature, &data, dnskey.public_key),
         .ed25519 => try verifyEd25519(rrsig.signature, &data, dnskey.public_key),
+        .mldsa44 => try verifyMlDsa(rrsig.signature, &data, dnskey.public_key),
         else => return error.UnsupportedAlgorithm,
     }
 }
@@ -705,6 +734,19 @@ fn verifyEd25519(signature: []const u8, data: *const SignedData, key_data: []con
 
     const pub_key = Ed25519.PublicKey.fromBytes(key_data[0..32].*) catch return error.InvalidKey;
     const sig = Ed25519.Signature.fromBytes(signature[0..64].*);
+    var verifier = sig.verifier(pub_key) catch return error.InvalidSignature;
+    data.feed(&verifier);
+    verifier.verify() catch return error.InvalidSignature;
+}
+
+/// draft-westerbaan-dnssec-mldsa §3-4: raw FIPS 204 encodings, pure
+/// (non-prehash) ML-DSA-44 with an empty context string.
+fn verifyMlDsa(signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
+    if (key_data.len != MlDsa44.PublicKey.encoded_length) return error.InvalidKey;
+    if (signature.len != MlDsa44.Signature.encoded_length) return error.InvalidSignature;
+
+    const pub_key = MlDsa44.PublicKey.fromBytes(key_data[0..MlDsa44.PublicKey.encoded_length].*) catch return error.InvalidKey;
+    const sig = MlDsa44.Signature.fromBytes(signature[0..MlDsa44.Signature.encoded_length].*) catch return error.InvalidSignature;
     var verifier = sig.verifier(pub_key) catch return error.InvalidSignature;
     data.feed(&verifier);
     verifier.verify() catch return error.InvalidSignature;
@@ -1355,7 +1397,7 @@ fn validateNsec3NegativeProof(
 /// validation-unsupported.
 fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
-        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519 => true,
+        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => true,
         else => false,
     };
 }
@@ -1371,11 +1413,7 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     for (records) |rr| {
         if (rr.rtype != .ds) continue;
         const ds = rr.rdata.ds;
-        if (!isSupportedAlgorithm(ds.algorithm)) continue;
-        switch (ds.digest_type) {
-            .sha1, .sha256, .sha384 => return true,
-            _ => {},
-        }
+        if (isSupportedAlgorithm(ds.algorithm) and digestSupported(ds.digest_type)) return true;
     }
     return false;
 }
@@ -1579,6 +1617,7 @@ test "isSupportedAlgorithm covers RFC 8624 MUST-validate set" {
     try testing.expect(isSupportedAlgorithm(.ecdsap256sha256));
     try testing.expect(isSupportedAlgorithm(.ecdsap384sha384));
     try testing.expect(isSupportedAlgorithm(.ed25519));
+    try testing.expect(isSupportedAlgorithm(.mldsa44));
     // Algorithms RFC 8624 declares MUST NOT use for either signing or
     // validation should still register as unsupported.
     try testing.expect(!isSupportedAlgorithm(.rsamd5));
@@ -1619,27 +1658,6 @@ test "canonical name wire format" {
     try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
-fn testDsDigest(owner: dns.Name, dnskey: dns.DnskeyData) ![Sha256.digest_length]u8 {
-    return testDsDigestWith(Sha256, owner, dnskey);
-}
-
-fn testDsDigestWith(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) ![Hash.digest_length]u8 {
-    var wire_buf: [1024]u8 = undefined;
-    const name_len = try writeCanonicalNameWire(&wire_buf, owner);
-    var pos = name_len;
-    mem.writeInt(u16, wire_buf[pos..][0..2], dnskey.flags, .big);
-    pos += 2;
-    wire_buf[pos] = dnskey.protocol;
-    pos += 1;
-    wire_buf[pos] = @backingInt(dnskey.algorithm);
-    pos += 1;
-    @memcpy(wire_buf[pos..][0..dnskey.public_key.len], dnskey.public_key);
-    pos += dnskey.public_key.len;
-    var digest: [Hash.digest_length]u8 = undefined;
-    Hash.hash(wire_buf[0..pos], &digest, .{});
-    return digest;
-}
-
 const test_dnskey = dns.DnskeyData{
     .flags = 257,
     .protocol = 3,
@@ -1661,7 +1679,7 @@ const test_owner = dns.Name{
 };
 
 test "DS hash verification - synthetic" {
-    var expected_digest = try testDsDigest(test_owner, test_dnskey);
+    var expected_digest = try dsDigest(Sha256, test_owner, test_dnskey);
 
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
@@ -1676,7 +1694,7 @@ test "DS hash verification - synthetic" {
 test "DS hash verification - sha1 and sha384 digest types" {
     // verifyDs's three digest arms collapse to one comptime helper; exercise
     // the sha1 and sha384 instantiations (only sha256 was covered above).
-    const d1 = try testDsDigestWith(Sha1, test_owner, test_dnskey);
+    const d1 = try dsDigest(Sha1, test_owner, test_dnskey);
     try verifyDs(.{
         .key_tag = keyTag(test_dnskey),
         .algorithm = .rsasha256,
@@ -1684,7 +1702,7 @@ test "DS hash verification - sha1 and sha384 digest types" {
         .digest = &d1,
     }, test_dnskey, test_owner);
 
-    const d384 = try testDsDigestWith(Sha384, test_owner, test_dnskey);
+    const d384 = try dsDigest(Sha384, test_owner, test_dnskey);
     try verifyDs(.{
         .key_tag = keyTag(test_dnskey),
         .algorithm = .rsasha256,
@@ -1720,11 +1738,12 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
     try testing.expect(!anySupportedDs(&.{}));
     // One supported member is enough, wherever it sits.
     try testing.expect(anySupportedDs(&.{ ds_rr(.ed448, .sha256), ds_rr(.ecdsap256sha256, .sha256) }));
+    try testing.expect(anySupportedDs(&.{ds_rr(.mldsa44, .sha256)}));
 }
 
 test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     // RFC 4035 §5.2: stripped RRSIG on DNSKEY must not bypass validation.
-    var digest = try testDsDigest(test_owner, test_dnskey);
+    var digest = try dsDigest(Sha256, test_owner, test_dnskey);
 
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
@@ -1754,7 +1773,7 @@ test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
     // would let a signature over the first 64 authenticate a set the caller
     // then caches whole — appended forgeries included — so overflow is a
     // hard refusal, not a truncated collect.
-    var digest = try testDsDigest(test_owner, test_dnskey);
+    var digest = try dsDigest(Sha256, test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
         .algorithm = .rsasha256,
@@ -1842,7 +1861,7 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
     const resigned = try testSignRrset(recs[0..64], .dnskey, test_owner, .ed25519, &sig2, &signer_pub);
     recs[0] = dnskeyRr(test_owner, resigned.dnskey);
 
-    var digest = try testDsDigest(test_owner, resigned.dnskey);
+    var digest = try dsDigest(Sha256, test_owner, resigned.dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(resigned.dnskey),
         .algorithm = .ed25519,
@@ -1880,7 +1899,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
     // verify cross-product. consumeVerify charges before any crypto, so the walk
     // halts at the ceiling however large N·M grows. Pins that against the walk's
     // next refactor.
-    var digest = try testDsDigest(test_owner, test_dnskey);
+    var digest = try dsDigest(Sha256, test_owner, test_dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(test_dnskey),
         .algorithm = .rsasha256,
@@ -2120,6 +2139,119 @@ test "Ed25519 signature verification" {
     try testing.expectError(error.InvalidSignature, verifyEd25519(&sig_bytes, &SignedData.raw("tampered"), &pub_bytes));
 }
 
+test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag, RRSIG over MX)" {
+    const dnskey_b64 =
+        "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" ++
+        "Eg==";
+    const rrsig_b64 =
+        "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" ++
+        "VFVbg5SXo62wztPoAAAAAAAAAAAAAA0jNEY=";
+    const decoder = std.base64.standard.Decoder;
+    var pub_key: [MlDsa44.PublicKey.encoded_length]u8 = undefined;
+    var signature: [MlDsa44.Signature.encoded_length]u8 = undefined;
+    try testing.expectEqual(pub_key.len, try decoder.calcSizeForSlice(dnskey_b64));
+    try testing.expectEqual(signature.len, try decoder.calcSizeForSlice(rrsig_b64));
+    try decoder.decode(&pub_key, dnskey_b64);
+    try decoder.decode(&signature, rrsig_b64);
+
+    const dnskey = dns.DnskeyData{ .flags = 257, .protocol = 3, .algorithm = .mldsa44, .public_key = &pub_key };
+    try testing.expectEqual(@as(u16, 59829), keyTag(dnskey));
+
+    var digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&digest, "812cb1a22af04380e2f72d91c06c14eb1a918cf30037a8a9c67497e9264b4bfa");
+    try verifyDs(.{ .key_tag = 59829, .algorithm = .mldsa44, .digest_type = .sha256, .digest = &digest }, dnskey, test_owner);
+
+    const mx = [_]dns.ResourceRecord{.{
+        .name = test_owner,
+        .rtype = .mx,
+        .rclass = .in,
+        .ttl = 3600,
+        .rdata = .{ .mx = .{ .preference = 10, .exchange = .{ .labels = &[_][]const u8{ "mail", "example", "com" } } } },
+    }};
+    var rrsig = dns.RrsigData{
+        .type_covered = .mx,
+        .algorithm = .mldsa44,
+        .labels = 2,
+        .original_ttl = 3600,
+        .sig_expiration = 1440021600,
+        .sig_inception = 1438207200,
+        .key_tag = 59829,
+        .signer_name = test_owner,
+        .signature = &signature,
+    };
+    var budget: ValidationBudget = .{};
+    try verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget);
+
+    signature[100] ^= 1;
+    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget));
+    signature[100] ^= 1;
+    rrsig.signer_name = test_com;
+    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget));
+}
+
 test "invalid key sizes are rejected" {
     const msg = "test";
     const sig64: [64]u8 = @splat(0);
@@ -2131,6 +2263,10 @@ test "invalid key sizes are rejected" {
     try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, &sig96, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
+    // ML-DSA-44: key 1312 bytes, signature 2420 bytes
+    const pq_sig: [MlDsa44.Signature.encoded_length]u8 = @splat(0);
+    try testing.expectError(error.InvalidKey, verifyMlDsa(&pq_sig, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidSignature, verifyMlDsa(&sig64, &SignedData.raw(msg), &@as([MlDsa44.PublicKey.encoded_length]u8, @splat(0))));
 }
 
 test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK shape)" {
@@ -4002,6 +4138,93 @@ fn testSignRrset(
     return .{ .rrsig = rrsig, .dnskey = dnskey };
 }
 
+fn testSignMlDsa(
+    rrset: []const dns.ResourceRecord,
+    covered: dns.RType,
+    signer: dns.Name,
+    dnskey: dns.DnskeyData,
+    kp: *const MlDsa44.KeyPair,
+    sig_buf: *[MlDsa44.Signature.encoded_length]u8,
+) !dns.RrsigData {
+    var rrsig = dns.RrsigData{
+        .type_covered = covered,
+        .algorithm = .mldsa44,
+        .labels = @intCast(signedLabels(rrset[0].name)),
+        .original_ttl = 300,
+        .sig_inception = 1_699_000_000,
+        .sig_expiration = 1_800_000_000,
+        .key_tag = keyTag(dnskey),
+        .signer_name = signer,
+        .signature = &.{},
+    };
+    var canonical_buf: [65536]u8 = undefined;
+    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
+    var sig = try kp.signer(null);
+    data.feed(&sig);
+    sig_buf.* = sig.finalize().toBytes();
+    rrsig.signature = sig_buf;
+    return rrsig;
+}
+
+test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the only one that counts" {
+    const pq_kp = try MlDsa44.KeyPair.generateDeterministic(@splat(7));
+    const pq_pub = pq_kp.public_key.toBytes();
+    const pq_key = dns.DnskeyData{ .flags = 257, .protocol = 3, .algorithm = .mldsa44, .public_key = &pq_pub };
+    var ed_pub: [32]u8 = undefined;
+    var ed_sig: [64]u8 = undefined;
+    const ed_key = dns.DnskeyData{ .flags = 256, .protocol = 3, .algorithm = .ed25519, .public_key = &ed_pub };
+    const key = struct {
+        fn rr(dk: dns.DnskeyData) dns.ResourceRecord {
+            return .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dk } };
+        }
+        fn sig(rrsig: dns.RrsigData) dns.ResourceRecord {
+            return .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = rrsig } };
+        }
+    };
+    // ed_pub is undefined until testSignRrset fills it, so the Ed25519 signature
+    // goes first and the ML-DSA-44 one sees the finished keyset.
+    const keys = [_]dns.ResourceRecord{ key.rr(ed_key), key.rr(pq_key) };
+    const ed = try testSignRrset(&keys, .dnskey, test_owner, .ed25519, &ed_sig, &ed_pub);
+    var pq_sig: [MlDsa44.Signature.encoded_length]u8 = undefined;
+    const pq = try testSignMlDsa(&keys, .dnskey, test_owner, pq_key, &pq_kp, &pq_sig);
+    var ed_digest = try dsDigest(Sha256, test_owner, ed_key);
+    var pq_digest = try dsDigest(Sha256, test_owner, pq_key);
+    const ed_ds = dns.DsData{ .key_tag = keyTag(ed_key), .algorithm = .ed25519, .digest_type = .sha256, .digest = &ed_digest };
+    const pq_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha256, .digest = &pq_digest };
+
+    // Downgrade: ML-DSA-44 signature stripped, classical one intact. Bogus.
+    const stripped = keys ++ [_]dns.ResourceRecord{key.sig(ed.rrsig)};
+    var b1: ValidationBudget = .{};
+    try testing.expectError(error.InvalidSignature, validateDnskeyRrset(&stripped, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b1));
+
+    // Both present, either order: the ML-DSA-44 one is what verifies.
+    const dual = keys ++ [_]dns.ResourceRecord{ key.sig(ed.rrsig), key.sig(pq) };
+    var b2: ValidationBudget = .{};
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b2)).algorithm);
+    const dual_rev = keys ++ [_]dns.ResourceRecord{ key.sig(pq), key.sig(ed.rrsig) };
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual_rev, &.{ pq_ds, ed_ds }, test_owner, 1_700_000_000, &b2)).algorithm);
+
+    // An ML-DSA-44 DS that anchors nothing demands nothing: unknown digest,
+    // or SHA-1 beside a usable SHA-256 DS (RFC 4509 §3).
+    const odd_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
+    var b4: ValidationBudget = .{};
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, odd_ds }, test_owner, 1_700_000_000, &b4)).algorithm);
+    var pq_sha1 = try dsDigest(Sha1, test_owner, pq_key);
+    const sha1_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, sha1_ds }, test_owner, 1_700_000_000, &b4)).algorithm);
+
+    // Only the ML-DSA-44 key survives into the keyset used below the apex.
+    const kept = try postQuantumKeys(testing.allocator, &dual);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].rdata.dnskey.algorithm);
+
+    // No ML-DSA-44 DS: the key's presence in the DNSKEY RRset alone demands
+    // nothing (RFC 6840 §5.11 MUST NOT; RFC 6781 §4.1.4 liberal rollover).
+    var b3: ValidationBudget = .{};
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ed_ds}, test_owner, 1_700_000_000, &b3)).algorithm);
+}
+
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     // Ed25519 key labelled `.rsasha256`; the RRSIG says .ed25519 and carries the
     // key's tag, so only the algorithm comparison can refuse it.
@@ -4013,7 +4236,7 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     const signed = try testSignRrset(recs[0..1], .dnskey, test_owner, .rsasha256, &sig_bytes, &pub_bytes);
     recs[1] = .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
 
-    var digest = try testDsDigest(test_owner, signed.dnskey);
+    var digest = try dsDigest(Sha256, test_owner, signed.dnskey);
     const ds = dns.DsData{
         .key_tag = keyTag(signed.dnskey),
         .algorithm = .rsasha256,

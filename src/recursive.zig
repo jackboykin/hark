@@ -2076,11 +2076,15 @@ pub const RecursiveResolver = struct {
             // (default IANA; test harness overrides via ServerConfig).
             dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, budget) catch return null;
 
+        // The apex verified under ML-DSA-44 only because the DS demanded it;
+        // nothing below may verify under the classical keys.
+        const keys = if (sig.algorithm == .mldsa44) try dnssec.postQuantumKeys(allocator, resp.answers) else resp.answers;
+
         // RFC 4035 §5.3: "the validator SHOULD cache the RRset" — after validation.
         // Store only answers to avoid polluting the key cache with NS/glue.
-        kc.storeResponse(answersOnly(resp), zone_parsed, .unchecked, dnssec.rrsigTtlCap(sig, now_u32));
+        kc.storeResponse(synthesizedMessage(keys, &.{}, .no_error, false), zone_parsed, .unchecked, dnssec.rrsigTtlCap(sig, now_u32));
 
-        return resp.answers;
+        return keys;
     }
 
     /// probeRRset, following one referral. Not for DS, which lives in the
@@ -3191,13 +3195,6 @@ fn parentZoneOf(zone_name: []const u8) []const u8 {
     const pos = dns.indexOfUnescapedDot(zone_name, 0) orelse return "";
     if (pos + 1 >= zone_name.len) return "";
     return zone_name[pos + 1 ..];
-}
-
-fn answersOnly(msg: dns.Message) dns.Message {
-    var m = msg;
-    m.authorities = &.{};
-    m.additionals = &.{};
-    return m;
 }
 
 /// Returns current epoch time as u32 for DNSSEC signature validation.
