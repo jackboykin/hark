@@ -283,9 +283,8 @@ pub fn buildResponseWire(
         break :blk &.{};
     };
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
-        // Echo back the per-request budget so a client knows our willingness
-        // to accept large queries — matches what we're willing to emit.
-        .udp_payload_size = ctx.max_udp_payload,
+        // RFC 6891 §6.2.3: our own receive limit, not the send budget.
+        .udp_payload_size = dns.edns_udp_payload,
         .extended_rcode = 0,
         .version = 0,
         .do_bit = ctx.client_do,
@@ -777,7 +776,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
         try testing.expectEqual(row.ns, parsed.header.ns_count);
         try testing.expectEqual(@as(u16, 1), parsed.header.ar_count);
         try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
-        try testing.expectEqual(row.max, parsed.opt.?.udp_payload_size);
+        try testing.expectEqual(dns.edns_udp_payload, parsed.opt.?.udp_payload_size);
     };
 }
 
