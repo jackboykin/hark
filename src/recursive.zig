@@ -562,6 +562,9 @@ pub const RecursiveResolver = struct {
         zone: dns.Name = .{ .labels = &.{} },
         addrs: [max_servers_per_level]na.Address = undefined,
         addr_count: usize = 0,
+        /// NS names still without an address; `moreServers` resolves them
+        /// when the set is exhausted.
+        pending: []const dns.Name = &.{},
         delegations: usize = 0,
         /// RFC 9156 probe depth: labels of `target` sent in the next query.
         /// Equal to `target.labels.len` means the full name goes out.
@@ -659,7 +662,11 @@ pub const RecursiveResolver = struct {
                 }
 
                 try self.consumeQuery();
-                const sqr = try self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone);
+                const sqr = self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone) catch |err| {
+                    if (err == error.Timeout and try self.moreServers(allocator, &walk, depth)) continue;
+                    return err;
+                };
+                if (self.shouldTrySibling(sqr.message, walk.zone) and try self.moreServers(allocator, &walk, depth)) continue;
                 var response = sqr.message;
                 const responding_server = sqr.responding_server;
 
@@ -887,6 +894,7 @@ pub const RecursiveResolver = struct {
 
         if (try self.findClosestCachedDelegation(allocator, seed_name)) |deleg| {
             walk.setServers(deleg.addrs[0..deleg.count]);
+            walk.pending = deleg.pending;
             walk.zone = deleg.zone;
 
             if (security_state.* == .secure and deleg.insecure) security_state.* = .insecure;
@@ -1174,18 +1182,17 @@ pub const RecursiveResolver = struct {
             security_state.* = self.ensureDelegationSecurity(allocator, zone_cut, authorities, walk.servers());
         }
 
-        const addrs: NsAddrResult = if (referral.addr_count > 0)
-            .{ .addrs = referral.addrs, .count = referral.addr_count }
-        else if (try self.lookupCachedNsAddresses(allocator, referral.nsNames())) |res|
-            res
-        else
-            (try self.resolveNsAddresses(allocator, referral.nsNames(), depth)) orelse return error.NoGlueRecords;
+        // Glue plus the cache for the unglued names (Unbound's cache_fill_missing).
+        var set: NsAddrSet = .{ .addrs = referral.addrs, .count = referral.addr_count };
+        try self.lookupCachedNsAddresses(allocator, referral.unglued(), &set);
+        if (set.count == 0) set = (try self.resolveNsAddresses(allocator, referral.nsNames(), depth)) orelse return error.NoGlueRecords;
 
         // extractReferral only accepts strictly deeper cuts, so no loop check.
         if (walk.delegations >= max_delegations) return error.MaxDelegationsExceeded;
         walk.delegations += 1;
         walk.zone = zone_cut;
-        walk.setServers(addrs.addrs[0..addrs.count]);
+        walk.setServers(set.servers());
+        walk.pending = try allocator.dupe(dns.Name, set.pendingNames());
     }
 
     /// RFC 9520 §3: cache a resolution failure so the next stub retry
@@ -1411,6 +1418,16 @@ pub const RecursiveResolver = struct {
             // synthesizedMessage header vehicle is as good as a bespoke one.
             c.storeResponse(synthesizedMessage(wc_records[0..wc_count], &.{}, .no_error, false), wildcard.signer, .secure, ttl_cap);
         }
+    }
+
+    /// Swap the exhausted set for the addresses of `walk.pending`.
+    fn moreServers(self: *RecursiveResolver, allocator: mem.Allocator, walk: *Walk, depth: usize) error{OutOfMemory}!bool {
+        const names = walk.pending;
+        walk.pending = &.{};
+        if (names.len == 0) return false;
+        const found = (self.resolveNsAddresses(allocator, names, depth) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else false) orelse return false;
+        walk.setServers(found.servers());
+        return true;
     }
 
     fn queryServerUdp(
@@ -2118,13 +2135,15 @@ pub const RecursiveResolver = struct {
     /// Where a lame sibling's referral points when the cut is `zone_name`
     /// itself (parent one label up; extractReferral wants strictly deeper).
     /// .fr and afnic.fr share g.ext.nic.fr but not d.nic.fr.
-    fn referralAddrs(self: *RecursiveResolver, allocator: mem.Allocator, response: dns.Message, zone_name: []const u8) !?NsAddrResult {
+    fn referralAddrs(self: *RecursiveResolver, allocator: mem.Allocator, response: dns.Message, zone_name: []const u8) !?NsAddrSet {
         if (response.header.flags.aa or response.answers.len != 0) return null;
         const zone = try dns.parseDottedName(allocator, zone_name);
         if (zone.labels.len == 0) return null;
         const ref = extractReferral(response, zone, .{ .labels = zone.labels[1..] }, self.referralPolicy()) orelse return null;
-        if (ref.addr_count > 0) return .{ .addrs = ref.addrs, .count = ref.addr_count };
-        return (try self.lookupCachedNsAddresses(allocator, ref.nsNames())) orelse self.resolveNsAddresses(allocator, ref.nsNames(), 1);
+        var set: NsAddrSet = .{ .addrs = ref.addrs, .count = ref.addr_count };
+        try self.lookupCachedNsAddresses(allocator, ref.unglued(), &set);
+        if (set.count > 0) return set;
+        return self.resolveNsAddresses(allocator, ref.nsNames(), 1);
     }
 
     /// Re-fetch DS for a zone by finding the parent zone's NS in cache
@@ -2158,12 +2177,14 @@ pub const RecursiveResolver = struct {
         }
         // Try cached addresses first; fall back to network resolution when
         // addresses have expired alongside DS/DNSKEY (common with equal TTLs).
-        const addrs = (self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count]) catch null) orelse blk: {
+        var set: NsAddrSet = .{};
+        self.lookupCachedNsAddresses(allocator, ns_names[0..ns_count], &set) catch {};
+        if (set.count == 0) {
             self.scratch.resolving_ds = true;
             defer self.scratch.resolving_ds = false;
-            break :blk (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return null;
-        };
-        return self.reproveDelegationSecurity(allocator, zone_name, addrs.addrs[0..addrs.count]);
+            set = (self.resolveNsAddresses(allocator, ns_names[0..ns_count], 1) catch null) orelse return null;
+        }
+        return self.reproveDelegationSecurity(allocator, zone_name, set.servers());
     }
 
     /// Refresh expired DS status by querying parent servers directly. Uses
@@ -2599,7 +2620,7 @@ pub const RecursiveResolver = struct {
         allocator: mem.Allocator,
         ns_names: []const dns.Name,
         depth: usize,
-    ) !?NsAddrResult {
+    ) !?NsAddrSet {
         if (depth >= max_resolve_depth) return null;
 
         // Fetch policy (Unbound-style): resolve more NS names at shallow depths
@@ -2720,7 +2741,7 @@ pub const RecursiveResolver = struct {
         ns_names: []const dns.Name,
         depth: usize,
         ns_fetch_limit: usize,
-    ) !?NsAddrResult {
+    ) !?NsAddrSet {
         var addrs: [max_servers_per_level]na.Address = undefined;
         var count: usize = 0;
         var resolved_ns_count: usize = 0;
@@ -2746,7 +2767,7 @@ pub const RecursiveResolver = struct {
         ns_names: []const dns.Name,
         depth: usize,
         ns_fetch_limit: usize,
-    ) !?NsAddrResult {
+    ) !?NsAddrSet {
         const rtypes_n = address_rtypes.len;
         const names_n = @min(ns_names.len, ns_fetch_limit);
         if (names_n == 0) return null;
@@ -2867,29 +2888,38 @@ pub const RecursiveResolver = struct {
         }
     };
 
-    const NsAddrResult = struct { addrs: [max_servers_per_level]na.Address, count: usize };
-    /// `insecure`: negative DS at or above this cut (RFC 4035 §4.3).
-    const DelegationResult = struct { addrs: [max_servers_per_level]na.Address, count: usize, zone: dns.Name, insecure: bool };
+    /// Addresses on hand and the NS names that still have none.
+    const NsAddrSet = struct {
+        addrs: [max_servers_per_level]na.Address = undefined,
+        count: usize = 0,
+        pending: [max_servers_per_level]dns.Name = undefined,
+        pending_count: usize = 0,
 
-    /// Check cache for A/AAAA records of NS names, avoiding network queries.
-    /// Collects addresses from all cached NS names (cache lookups are free)
-    /// for better server diversity.
+        fn servers(set: *const NsAddrSet) []const na.Address {
+            return set.addrs[0..set.count];
+        }
+
+        fn pendingNames(set: *const NsAddrSet) []const dns.Name {
+            return set.pending[0..set.pending_count];
+        }
+    };
+    /// `insecure`: negative DS at or above this cut (RFC 4035 §4.3).
+    const DelegationResult = struct { addrs: [max_servers_per_level]na.Address, count: usize, zone: dns.Name, insecure: bool, pending: []const dns.Name };
+
+    /// Cached A/AAAA of `ns_names` into `set`; names with none go to `pending`.
     fn lookupCachedNsAddresses(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         ns_names: []const dns.Name,
-    ) !?NsAddrResult {
-        const cache = self.cache orelse return null;
-
-        var addrs: [max_servers_per_level]na.Address = undefined;
-        var count: usize = 0;
-
+        set: *NsAddrSet,
+    ) error{OutOfMemory}!void {
         for (ns_names) |ns_name| {
-            try self.collectCachedNsAddresses(allocator, cache, ns_name, &addrs, &count, 0);
+            const before = set.count;
+            if (self.cache) |cache| try self.collectCachedNsAddresses(allocator, cache, ns_name, &set.addrs, &set.count, 0);
+            if (set.count > before) continue;
+            set.pending[set.pending_count] = ns_name;
+            set.pending_count += 1;
         }
-
-        if (count == 0) return null;
-        return .{ .addrs = addrs, .count = count };
     }
 
     // Max alias hops we'll follow when collecting NS addresses from cache.
@@ -3010,7 +3040,9 @@ pub const RecursiveResolver = struct {
                 }
             }
 
-            const res = (try self.lookupCachedNsAddresses(scratch, ns_names[0..ns_count])) orelse continue;
+            var set: NsAddrSet = .{};
+            try self.lookupCachedNsAddresses(scratch, ns_names[0..ns_count], &set);
+            if (set.count == 0) continue;
 
             // If DS is a cache miss, another thread may not have cached
             // the insecure delegation yet. Try a targeted DS re-probe
@@ -3036,14 +3068,16 @@ pub const RecursiveResolver = struct {
                 }
             }
 
-            // Zone name must live on the caller's arena: `best` outlives
-            // the scratch reset. Addresses are plain `na.Address` values.
+            // Names must live on the caller's arena: `best` outlives the scratch reset.
             const zone_name = try dns.parseDottedName(allocator, zone_str);
+            const pending = try allocator.alloc(dns.Name, set.pending_count);
+            for (pending, set.pendingNames()) |*dst, src| dst.* = try dns.cloneName(allocator, src);
             best = .{
-                .addrs = res.addrs,
-                .count = res.count,
+                .addrs = set.addrs,
+                .count = set.count,
                 .zone = zone_name,
                 .insecure = insecure,
+                .pending = pending,
             };
         }
 
@@ -3381,14 +3415,19 @@ fn negativeResolveResult(
 /// Names and addresses borrow from the response.
 const ReferralResult = struct {
     zone_cut: dns.Name,
+    /// Names with glue come first; `unglued()` is the rest.
     ns_names: [max_servers_per_level]dns.Name,
     ns_count: usize,
-    /// Glue; `addr_count == 0` means the NS names must be resolved.
+    glued: usize,
     addrs: [max_servers_per_level]na.Address,
     addr_count: usize,
 
     fn nsNames(r: *const ReferralResult) []const dns.Name {
         return r.ns_names[0..r.ns_count];
+    }
+
+    fn unglued(r: *const ReferralResult) []const dns.Name {
+        return r.ns_names[r.glued..r.ns_count];
     }
 };
 
@@ -3444,6 +3483,7 @@ fn extractReferral(
 
     var glue_addrs: [max_servers_per_level]na.Address = undefined;
     var glue_count: usize = 0;
+    var glued: usize = 0;
     for (response.additionals) |rr| {
         const is_a = rr.rtype == .a;
         const is_aaaa = rr.rtype == .aaaa;
@@ -3454,7 +3494,7 @@ fn extractReferral(
         // accepted under root referrals.
         if (!rr.name.isSubdomainOf(parent_zone)) continue;
 
-        for (ns_names[0..ns_count]) |ns_name| {
+        for (ns_names[0..ns_count], 0..) |ns_name, i| {
             if (ns_name.eql(rr.name)) {
                 if (glue_count < max_servers_per_level) {
                     const addr = if (is_a)
@@ -3464,6 +3504,10 @@ fn extractReferral(
                     if (!policy.allow_loopback and na.isNonRoutableNs(addr)) break;
                     glue_addrs[glue_count] = addr;
                     glue_count += 1;
+                    if (i >= glued) {
+                        mem.swap(dns.Name, &ns_names[i], &ns_names[glued]);
+                        glued += 1;
+                    }
                 }
                 break;
             }
@@ -3473,6 +3517,7 @@ fn extractReferral(
         .zone_cut = zc,
         .ns_names = ns_names,
         .ns_count = ns_count,
+        .glued = glued,
         .addrs = glue_addrs,
         .addr_count = glue_count,
     };

@@ -1,0 +1,160 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN partial glue: a warm walk seeded from cache still widens to the glueless NS
+
+; 003 with a warm cache and a refusal instead of silence: the second query
+; is seeded from the cached delegation, which holds only the glued address.
+;
+; Topology
+;   root    127.0.10.1  knows org (-> 127.0.10.5) and net (-> 127.0.10.6)
+;   org     127.0.10.5  refers ntp.org to ns1.everett.org. (glue 127.0.10.3)
+;                       and anyns.pch.net. (no glue: out of bailiwick)
+;   everett 127.0.10.3  answers through step 2, refuses afterwards
+;   net     127.0.10.6  refers pch.net to anyns.pch.net. WITH glue
+;   pch     127.0.10.4  authoritative for pch.net AND ntp.org
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.org-tld.fake.
+    SECTION ADDITIONAL
+      a.org-tld.fake. 86400 IN A 127.0.10.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      net. IN A
+    SECTION AUTHORITY
+      net. 86400 IN NS a.net-tld.fake.
+    SECTION ADDITIONAL
+      a.net-tld.fake. 86400 IN A 127.0.10.6
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ntp.org. IN A
+    SECTION AUTHORITY
+      ntp.org. 86400 IN NS ns1.everett.org.
+      ntp.org. 86400 IN NS anyns.pch.net.
+    SECTION ADDITIONAL
+      ns1.everett.org. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      pool.ntp.org. IN A
+    SECTION ANSWER
+      pool.ntp.org. 130 IN A 198.137.202.32
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      pch.net. IN A
+    SECTION AUTHORITY
+      pch.net. 86400 IN NS anyns.pch.net.
+    SECTION ADDITIONAL
+      anyns.pch.net. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      anyns.pch.net. IN A
+    SECTION ANSWER
+      anyns.pch.net. 3600 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      anyns.pch.net. IN AAAA
+    SECTION AUTHORITY
+      pch.net. 3600 IN SOA anyns.pch.net. hostmaster.pch.net. 1 7200 3600 1209600 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      2.pool.ntp.org. IN A
+    SECTION ANSWER
+      2.pool.ntp.org. 130 IN A 23.111.186.186
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    pool.ntp.org. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    pool.ntp.org. IN A
+  SECTION ANSWER
+    pool.ntp.org. 130 IN A 198.137.202.32
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    2.pool.ntp.org. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    2.pool.ntp.org. IN A
+  SECTION ANSWER
+    2.pool.ntp.org. 130 IN A 23.111.186.186
+ENTRY_END
+
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    pool.ntp.org. A 127.0.10.3
+    2.pool.ntp.org. A 127.0.10.3
+    anyns.pch.net. A 127.0.10.4
+    2.pool.ntp.org. A 127.0.10.4
+ENTRY_END
+
+SCENARIO_END
