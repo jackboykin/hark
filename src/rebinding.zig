@@ -36,7 +36,6 @@ const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const dns64 = @import("dns64.zig");
 const na = @import("net_address.zig");
-const special_use = @import("special_use.zig");
 
 const log = std.log.scoped(.rebinding);
 
@@ -231,20 +230,12 @@ fn embeddedIp4(bytes: []const u8, cfg: Config) ?[4]u8 {
     return null;
 }
 
-/// Default block set is the shared special-use table (net_address.zig) —
-/// deliberately multicast-free here, unlike NS egress, and minus the two
-/// fixed `ipv4only.arpa` answers inside 192.0.0.0/24.
 fn matchesDefault(bytes: []const u8) bool {
     return switch (bytes.len) {
-        4 => na.isSpecialUseIp4(bytes[0..4].*) and !isIpv4Only(bytes[0..4].*),
+        4 => na.isSpecialUseIp4(bytes[0..4].*),
         16 => na.isSpecialUseIp6(bytes[0..16].*),
         else => false,
     };
-}
-
-fn isIpv4Only(b: [4]u8) bool {
-    for (special_use.ipv4only_addrs) |addr| if (mem.eql(u8, &b, &addr)) return true;
-    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -303,31 +294,17 @@ test "extra_allow v4 entry carves out IPv4-mapped IPv6 too (symmetric DNSBL beha
     try testing.expect(shouldDrop(rrAAAA(public_name, mapped_rfc1918), cfg));
 }
 
-test "ipv4only.arpa addresses survive the default block; the rest of 192.0.0.0/24 does not" {
-    const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const name = dns.Name{ .labels = &.{ "ipv4only", "arpa" } };
-    var rrs = [_]dns.ResourceRecord{ rrA(name, .{ 192, 0, 0, 170 }), rrA(name, .{ 192, 0, 0, 171 }), rrA(name, .{ 192, 0, 0, 1 }) };
-    const kept = try scrub(testing.allocator, &rrs, cfg);
-    defer testing.allocator.free(kept);
-    try testing.expectEqual(@as(usize, 2), kept.len);
-    try testing.expectEqual(@as(u8, 170), kept[0].rdata.a[3]);
-    try testing.expectEqual(@as(u8, 171), kept[1].rdata.a[3]);
-}
-
-test "nat64 prefix: synthesized AAAA is judged by its embedded v4, ipv4only.arpa included" {
+test "nat64 prefix: synthesized AAAA is judged by its embedded v4" {
     const p = dns64.Prefix.well_known;
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{}, .nat64 = p };
-    const arpa = dns.Name{ .labels = &.{ "ipv4only", "arpa" } };
     var rrs = [_]dns.ResourceRecord{
         rrAAAA(public_name, p.embed(.{ 192, 168, 1, 1 })),
         rrAAAA(public_name, p.embed(.{ 93, 184, 216, 34 })),
-        rrAAAA(arpa, p.embed(.{ 192, 0, 0, 170 })),
     };
     const kept = try scrub(testing.allocator, &rrs, cfg);
     defer testing.allocator.free(kept);
-    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expectEqualSlices(u8, &p.embed(.{ 93, 184, 216, 34 }), &kept[0].rdata.aaaa);
-    try testing.expectEqualSlices(u8, &p.embed(.{ 192, 0, 0, 170 }), &kept[1].rdata.aaaa);
     try testing.expectEqual(rrs.len, (try scrub(testing.allocator, &rrs, .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} })).len);
 }
 

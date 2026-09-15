@@ -10,6 +10,7 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
+const special_use = @import("special_use.zig");
 
 // ── Response shaping ───────────────────────────────────────────────────
 //
@@ -239,13 +240,6 @@ pub const ResponseContext = struct {
     /// the operator disabled the option. Servers MUST only advertise
     /// this on stream transports.
     tcp_keepalive: ?u16 = null,
-    /// DNS rebinding scrub policy. `enabled=true` activates the egress
-    /// filter that strips private-IP A/AAAA from public-zone answers.
-    /// Defaults to `&Config.off` (a static no-op sentinel) so tests and
-    /// synthesised responses needn't wire it; the worker overrides to
-    /// `&self.config.rebinding` so the scrub applies uniformly to
-    /// cache-served and freshly-resolved responses (both flow through
-    /// `buildResponseWire`).
     rebinding: *const rebinding.Config = &rebinding.Config.off,
 
     pub fn fromQuery(query: dns.Message, max_udp_payload: u16) ResponseContext {
@@ -296,6 +290,16 @@ pub fn buildResponseWire(
 
     const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
 
+    // Special-use answers are hark's own. Keyed on qname, so a CNAME
+    // into localhost still scrubs.
+    var qname_buf: [dns.max_dotted_len + 1]u8 = undefined;
+    const rebind_cfg = if (ctx.rebinding.enabled and ctx.questions.len > 0 and
+        special_use.classify(ctx.questions[0].name.formatInto(&qname_buf), qtype) != .none)
+        &rebinding.Config.off
+    else
+        ctx.rebinding;
+
+
     // Apply the unified response-shaping matrix. See `shapeResponse` for the
     // per-section keep/strip rules. OOM returns null — the I/O caller
     // surfaces it as SERVFAIL rather than emitting a half-shaped response.
@@ -306,7 +310,7 @@ pub fn buildResponseWire(
         ctx.client_do,
         ctx.cd,
         ctx.minimal_responses,
-        ctx.rebinding,
+        rebind_cfg,
     ) catch return null;
     const answers = shaped.answers;
     const authorities = shaped.authorities;
@@ -937,6 +941,41 @@ test "shape: rebinding scrub reaches additionals on NODATA passthrough" {
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const on = try shapeResponse(a, msg, .a, false, false, true, &scrub_on);
     try testing.expectEqual(@as(usize, 0), on.additionals.len);
+}
+
+test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME into it does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
+    const localhost = try dns.parseDottedName(a, "localhost");
+    const attacker = try dns.parseDottedName(a, "attacker.com");
+    const loopback: dns.ResourceRecord = .{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } };
+    const alias: dns.ResourceRecord = .{ .name = attacker, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = localhost } };
+
+    const cases = [_]struct { qname: dns.Name, answers: []const dns.ResourceRecord, kept: u16 }{
+        .{ .qname = localhost, .answers = &.{loopback}, .kept = 1 },
+        .{ .qname = attacker, .answers = &.{ alias, loopback }, .kept = 1 },
+    };
+    for (cases) |c| {
+        var buf: [dns.max_udp_payload]u8 = undefined;
+        const wire = buildResponseWire(&buf, .{
+            .query_id = 0,
+            .opcode = .query,
+            .rd = true,
+            .cd = false,
+            .questions = &.{.{ .name = c.qname, .qtype = .a, .qclass = .in }},
+            .client_edns = false,
+            .client_do = false,
+            .client_wants_ad = false,
+            .max_udp_payload = dns.max_udp_payload,
+            .rebinding = &scrub_on,
+        }, shapePositiveMessage(c.answers, &.{}, &.{}), a).?;
+        const parsed = try dns.parseMessage(a, wire);
+        try testing.expectEqual(c.kept, parsed.header.an_count);
+        try testing.expectEqual(c.answers[0].rtype, parsed.answers[0].rtype);
+    }
 }
 
 test "shape: positive DO=0 strips NS from authority, glue from additional, RRSIG everywhere" {

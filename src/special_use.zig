@@ -168,7 +168,7 @@ pub fn synthesize(
 const ttl_localhost: u32 = 86_400;
 
 /// RFC 7050 §8.
-pub const ipv4only_addrs = [2][4]u8{ .{ 192, 0, 0, 170 }, .{ 192, 0, 0, 171 } };
+const ipv4only_addrs = [2][4]u8{ .{ 192, 0, 0, 170 }, .{ 192, 0, 0, 171 } };
 
 const testing = std.testing;
 
