@@ -634,7 +634,7 @@ pub const RecursiveResolver = struct {
                 .served => |served| return served,
                 .follow_cname => |dispatch| {
                     if (!try cname_chain.push(allocator, dispatch.redirect, dispatch.security_status, "cache-served"))
-                        return self.bogusServfail(current_name, qtype, "cname loop");
+                        return self.loopServfail(name, qtype, depth);
                     try aggregateCachedCnameWildcardProofs(allocator, dispatch.security_status, dispatch.nsec_proofs, &cname_chain.wildcard_proofs);
                     current_name = try nameToDotted(allocator, dispatch.redirect.target);
                     security_state = self.securityStateAfterCname(security_state);
@@ -708,6 +708,7 @@ pub const RecursiveResolver = struct {
                     switch (try self.followUpstreamCname(allocator, &walk, &response, qtype, security_state, responding_server, &cname_chain)) {
                         .none => {},
                         .bogus => |why| return self.bogusServfail(walk.name, qtype, why),
+                        .loop => return self.loopServfail(name, qtype, depth),
                         .same_zone => continue,
                         .cross_zone => {
                             current_name = walk.name;
@@ -808,6 +809,8 @@ pub const RecursiveResolver = struct {
         /// Answer holds the queried type (or no CNAME): finalize it.
         none,
         bogus: []const u8,
+        /// Target revisits the chain.
+        loop,
         /// Target under the current zone: keep servers, restart probing.
         same_zone,
         /// Target elsewhere: re-walk from the root with `walk.name`.
@@ -852,7 +855,7 @@ pub const RecursiveResolver = struct {
 
         // Store before following: this response never reaches final answer validation.
         if (self.answerCache()) |c| c.storeResponse(response.*, walk.zone, cname_status, cname_ttl_cap);
-        if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .{ .bogus = "cname loop" };
+        if (!try cname_chain.push(allocator, redirect, cname_status, "upstream-served")) return .loop;
         // Carry the expansion's proofs past this hop so the client sees them;
         // `proveWildcard` already verified them under the answer's keys.
         if (wildcard != null) for (response.authorities) |rr| {
@@ -1220,6 +1223,13 @@ pub const RecursiveResolver = struct {
         @branchHint(.cold);
         if (depth != 0) return;
         if (self.cache) |c| c.cacheServfail(name, qtype);
+    }
+
+    /// A CNAME loop is a resolution failure, not a validation verdict.
+    fn loopServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, depth: usize) ResolveResult {
+        @branchHint(.cold);
+        self.cacheResolutionFailure(name, qtype, depth);
+        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .servfail_why = "cname loop" };
     }
 
     /// Any error rcode, or NOERROR with no answers and no referral. Under a
