@@ -2,7 +2,7 @@
 
 hark is a recursive DNS resolver. Small and Linux-first. io_uring for client I/O.
 
-Many standard DNS features are present, like QNAME minimization, 0x20 case randomization, DNSSEC, and negative caching. hark also has less common features such as opportunistic encryption to authoritatives over TLS and rebind protection.
+Many standard DNS features are present, like QNAME minimization, 0x20 case randomization, DNSSEC, and negative caching. hark also has less common features such as opportunistic encryption to authoritatives over TLS, rebind protection, and post-quantum DNSSEC with ML-DSA-44.
 
 ## Building
 
