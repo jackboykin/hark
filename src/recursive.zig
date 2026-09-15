@@ -1438,10 +1438,8 @@ pub const RecursiveResolver = struct {
             response_buf,
         ) catch |err| {
             if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
-            if (err != error.Timeout) {
-                var addr_buf: [64]u8 = undefined;
-                log.debug("UDP query to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
-            }
+            var addr_buf: [64]u8 = undefined;
+            log.debug("UDP query to {s} failed: {s} (timeout {d}ms)", .{ na.format(server, &addr_buf), @errorName(err), timeout });
             return null;
         };
         const elapsed_us = monotonic.nowUs() - query_start;
@@ -1868,6 +1866,11 @@ pub const RecursiveResolver = struct {
             var rb: [24]u8 = undefined;
             log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), dns.safeTagName(sf.header.flags.rcode, &rb) });
             return .{ .message = sf, .responding_server = null };
+        }
+        {
+            var zb: [dns.max_dotted_len + 1]u8 = undefined;
+            var tb: [24]u8 = undefined;
+            log.debug("{s} {s}: no server for {s} answered ({d} candidates)", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), sel.len });
         }
         return error.Timeout;
     }
