@@ -621,6 +621,34 @@ pub const RRsetCache = struct {
         };
     }
 
+    /// Whether any record of a fresh positive entry satisfies `pred` over
+    /// its RDATA. Read under the shard lock: no clone, no visit, no
+    /// counters — an internal probe, not a query.
+    pub fn anyRdata(
+        self: *RRsetCache,
+        name: []const u8,
+        rtype: dns.RType,
+        rclass: dns.RClass,
+        pred: *const fn ([]const u8) bool,
+    ) bool {
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
+        const lower_name = lowerNameBuf(&lower_buf, name) orelse return false;
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = rclass };
+        const shard, const h = self.shardWithHash(probe);
+        shard.write.lock.lockSharedUncancelable(self.io);
+        defer shard.write.lock.unlockShared(self.io);
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return false;
+        const rrset = switch (shard.map.values()[idx]) {
+            .positive => |p| p,
+            .negative => return false,
+        };
+        if (self.now_fn() >= rrset.expires_at) return false;
+        for (rrset.pack.records()) |cr| {
+            if (pred(rrset.pack.wire(cr)[cr.wire_ttl_offset + 6 ..])) return true;
+        }
+        return false;
+    }
+
     /// Look up an RRset by (name, rtype, rclass). On hit, records and sigs
     /// are cloned into `caller_alloc` with TTLs adjusted to remaining time.
     ///

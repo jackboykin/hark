@@ -1487,28 +1487,36 @@ pub const RecursiveResolver = struct {
         // Record liveness — truncated responses still prove server is alive
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
 
-        // RFC 2181 §9: TC-set UDP response must be retried over TCP.
+        // RFC 2181 §9. The server just answered, so the full budget is safe.
         if (dns.hasTcBit(response_data)) {
-            return self.tcpFallback(allocator, wire_query, server);
+            return self.queryServerTcp(allocator, wire_query, server, self.remainingMs());
         }
 
         return try tryParseMessage(allocator, response_data, server);
     }
 
-    fn tcpFallback(
+    fn queryServerTcp(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         wire_query: []const u8,
         server: na.Address,
+        timeout: u32,
     ) error{OutOfMemory}!?dns.Message {
         if (!self.transports.?.tcp_enabled) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.remainingMs()) catch |err| {
+        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, timeout) catch |err| {
             var addr_buf: [64]u8 = undefined;
-            log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
+            log.debug("TCP query to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
         };
         return try tryParseMessage(allocator, tcp_data, server);
+    }
+
+    /// A DS naming ML-DSA-44 means every DO answer truncates at 1232: TCP
+    /// first. A TTL-0 DS never caches, so the DNSKEY fetch passes the flag itself.
+    fn zoneTruncates(self: *RecursiveResolver, zone: []const u8) bool {
+        const kc = self.keyCache() orelse return false;
+        return kc.anyRdata(zone, .ds, .in, dnssec.dsRdataExceedsUdp);
     }
 
     fn caseRng(self: *RecursiveResolver, addr_key: AddressKey) ?std.Io {
@@ -1545,16 +1553,10 @@ pub const RecursiveResolver = struct {
         mismatch,
     };
 
-    /// The 0x20 retry kernel — single home for case-hardened Do53 (both
-    /// queryAuthoritativeServers and fetchRRset go through here). Build
-    /// the query with per-server case randomization and a fresh TXID per
-    /// attempt (RFC 5452 §9.2), send over UDP (TC falls back to TCP inside
-    /// queryServerUdp), and verify the exact-case QNAME echo: a mangled
-    /// echo means the server (or a middlebox in front of it) mangled case
-    /// — mark it and resend once in lowercase; the reprobe TTL on the
-    /// marker recovers automatically if the middlebox is later removed.
-    /// The echo check goes through caseMangledEcho — see its doc for why
-    /// question-less and unrelated-question replies are exempt.
+    /// The 0x20 retry kernel for all Do53 upstream queries: fresh TXID and
+    /// random case per attempt (RFC 5452 §9.2), UDP unless the zone is
+    /// known to truncate. A mangled echo marks the server and resends
+    /// lowercase once; the mark expires so a removed middlebox recovers.
     fn do53CaseHardened(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1563,6 +1565,7 @@ pub const RecursiveResolver = struct {
         server: na.Address,
         timeout: u32,
         do_bit: bool,
+        tcp_first: bool,
     ) !Do53Result {
         var case_rng = self.caseRng(AddressKey.fromAddress(server));
         while (true) {
@@ -1576,7 +1579,10 @@ pub const RecursiveResolver = struct {
             const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
             const start_us = monotonic.nowUs();
-            const response = try self.queryServerUdp(allocator, wire_query, query_id, server, timeout) orelse
+            const response = try (if (tcp_first)
+                self.queryServerTcp(allocator, wire_query, server, timeout)
+            else
+                self.queryServerUdp(allocator, wire_query, query_id, server, timeout)) orelse
                 return .timeout;
             const elapsed_us = monotonic.nowUs() - start_us;
 
@@ -1741,7 +1747,7 @@ pub const RecursiveResolver = struct {
         // server over TCP immediately; falling through to the sequential loop
         // would re-query servers that already lost the race (wasted UDP RTTs).
         const resp = if (dns.hasTcBit(stag_result.response_data))
-            try self.tcpFallback(allocator, wires[winner], responding_addr) orelse return null
+            try self.queryServerTcp(allocator, wires[winner], responding_addr, self.remainingMs()) orelse return null
         else
             try tryParseMessage(allocator, stag_result.response_data, responding_addr) orelse return null;
 
@@ -1865,7 +1871,11 @@ pub const RecursiveResolver = struct {
             }
         }
 
-        if (sel.len >= 2 and self.stagger_ms > 0) {
+        // The race is UDP; here it would only race to TC bits.
+        var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
+        const tcp_first = self.dnssec_aware and self.zoneTruncates(parent_zone.formatInto(&zone_buf));
+
+        if (!tcp_first and sel.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
                 if (self.encrypted_ns) |oc| _ = oc.do53_answers.fetchAdd(1, .monotonic);
                 return stag;
@@ -1880,7 +1890,7 @@ pub const RecursiveResolver = struct {
 
             const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
 
-            const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware)) {
+            const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware, tcp_first)) {
                 .timeout => {
                     self.recordNsOutcome(parent_zone, server, .timeout, 0);
                     continue :server_loop;
@@ -2036,60 +2046,50 @@ pub const RecursiveResolver = struct {
         });
     }
 
-    /// Fetch DNSKEY from network, validate against cached DS (RFC 4035 §5.3),
-    /// and only cache after validation passes.
+    /// The DS anchoring a zone's DNSKEY (RFC 4035 §5.2). Only .secure
+    /// counts, else forged DS + DNSKEY would self-validate; otherwise
+    /// refetch and use in flight (RFC 1035 §3.2.1). Null when proven
+    /// insecure or unobtainable.
+    fn anchoringDs(self: *RecursiveResolver, allocator: mem.Allocator, zone_name: []const u8) ?[]const dns.ResourceRecord {
+        const kc = self.keyCache() orelse return null;
+        if (kc.lookup(allocator, zone_name, .ds, .in)) |result| switch (result) {
+            .hit => |h| return if (h.security_status == .secure) h.records else self.fetchDsFromParent(allocator, zone_name),
+            .negative => return null,
+        };
+        if (self.fetchDsFromParent(allocator, zone_name)) |ds| return ds;
+        return switch (kc.lookup(allocator, zone_name, .ds, .in) orelse return null) {
+            .negative => null,
+            .hit => |h| h.records,
+        };
+    }
+
+    /// DS first: its algorithm picks the DNSKEY fetch's transport. Root
+    /// anchors on the configured TAs.
     fn fetchAndValidateDnskey(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
         zone_name: []const u8,
         servers: []const na.Address,
     ) !?[]const dns.ResourceRecord {
+        const kc = self.keyCache() orelse return null;
+        const ds: ?[]const dns.ResourceRecord = if (zone_name.len > 0) (self.anchoringDs(allocator, zone_name) orelse return null) else null;
+
         // Network fetch — don't cache yet (RFC 4035 §5.3: validate first).
         // A fetch that never reaches a live signer is RFC 4035 §4.3
         // Indeterminate, not Bogus; retry once so a single transient failure
         // doesn't collapse into a caller-cached SERVFAIL.
         const resp = for (0..2) |_| {
-            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3)) |r| {
+            if (try self.fetchRRset(allocator, zone_name, .dnskey, servers, 3, if (ds) |d| dnssec.dsExceedsUdp(d) else false)) |r| {
                 if (r.answers.len != 0) break r;
             }
         } else return null;
 
         const zone_parsed = try dns.parseDottedName(allocator, zone_name);
-
-        // Validate DNSKEY against cached DS before caching (RFC 4035 §5.2).
-        // Only .secure DS is a valid trust anchor — any other status means
-        // the parent-zone RRSIG never verified, so trusting it would let
-        // forged DS + forged DNSKEY self-validate.
-        const kc = self.keyCache() orelse return null;
         const now_u32 = epochNowU32();
         const budget = self.validationBudget();
-        const sig: dns.RrsigData = if (kc.lookup(allocator, zone_name, .ds, .in)) |result| switch (result) {
-            .hit => |h| blk: {
-                const ds = if (h.security_status == .secure) h.records else self.fetchDsFromParent(allocator, zone_name) orelse return null;
-                break :blk validateDnskeyAgainstDs(resp.answers, ds, zone_parsed, now_u32, budget) catch return null;
-            },
-            // Proven-insecure delegation: no signed DNSKEYs to anchor.
-            // Returning the unvalidated answers would let the caller
-            // verify forged RRSIGs against forged DNSKEYs and stamp AD.
-            .negative => return null,
-        } else if (zone_name.len > 0) blk: {
-            // DS not in cache. Re-fetch from parent and validate against the
-            // freshly fetched records — RFC 1035 §3.2.1 permits using TTL=0
-            // RRs "for the transaction in progress" even though they will
-            // not be retained in the cache. The negative-DS cache (with
-            // NSEC TTL, not the suppressed DS TTL) still distinguishes
-            // insecure delegations from outright failures.
-            if (self.fetchDsFromParent(allocator, zone_name)) |ds_records| {
-                break :blk validateDnskeyAgainstDs(resp.answers, ds_records, zone_parsed, now_u32, budget) catch return null;
-            }
-            break :blk switch (kc.lookup(allocator, zone_name, .ds, .in) orelse return null) {
-                // Insecure delegation proven during fetch — see above.
-                .negative => return null,
-                .hit => |h| validateDnskeyAgainstDs(resp.answers, h.records, zone_parsed, now_u32, budget) catch return null,
-            };
-        } else
-            // Root zone: validate against the configured trust anchors
-            // (default IANA; test harness overrides via ServerConfig).
+        const sig = if (ds) |d|
+            validateDnskeyAgainstDs(resp.answers, d, zone_parsed, now_u32, budget) catch return null
+        else
             dnssec.validateDnskeyRrset(resp.answers, self.trust_anchors, zone_parsed, now_u32, budget) catch return null;
 
         // The apex verified under ML-DSA-44 only because the DS demanded it;
@@ -2112,11 +2112,12 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         servers: []const na.Address,
         max_servers: usize,
+        tcp_first: bool,
     ) !?dns.Message {
-        const response = try self.probeRRset(allocator, zone_name, qtype, servers, max_servers) orelse return null;
+        const response = try self.probeRRset(allocator, zone_name, qtype, servers, max_servers, tcp_first) orelse return null;
         if (qtype == .ds) return response;
         const hop = try self.referralAddrs(allocator, response, zone_name) orelse return response;
-        return self.probeRRset(allocator, zone_name, qtype, hop.addrs[0..hop.count], max_servers);
+        return self.probeRRset(allocator, zone_name, qtype, hop.addrs[0..hop.count], max_servers, tcp_first);
     }
 
     /// Query authoritative servers for a specific RRset, with RTT tracking
@@ -2129,6 +2130,7 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         servers: []const na.Address,
         max_servers: usize,
+        tcp_first: bool,
     ) !?dns.Message {
         // Second upstream-touching entry alongside queryAuthoritativeServers.
         // findClosestCachedDelegation → reproveDelegationSecurity → here
@@ -2152,7 +2154,7 @@ pub const RecursiveResolver = struct {
             try self.consumeQuery();
 
             const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
-            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, timeout, true)) {
+            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, timeout, true, tcp_first)) {
                 .timeout, .mismatch => continue,
                 .response => |r| r.message,
             };
@@ -2271,7 +2273,9 @@ pub const RecursiveResolver = struct {
         // Root has no parent to reprove DS against — caller chose root_hints
         // anchor, not this path. parentZoneOf("") returns "" and would loop.
         std.debug.assert(zone_name.len > 0);
-        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2) catch return null) orelse return null;
+        // The parent signs DS; a wrong guess across an ENT just means UDP.
+        const tcp_first = self.zoneTruncates(parentZoneOf(zone_name));
+        const response = (self.fetchRRset(allocator, zone_name, .ds, parent_servers, 2, tcp_first) catch return null) orelse return null;
         const zone = dns.parseDottedName(allocator, zone_name) catch return null;
 
         // Locate the section that carries the DS RRset (RFC 4035 §5.2: DS
@@ -4617,7 +4621,7 @@ test "fetchRRset returns CacheOnlyMiss when cache_only=true" {
         .cache_only = true,
     };
     const servers: []const na.Address = &.{na.initIp4(.{ 192, 0, 2, 1 }, 53)};
-    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1);
+    const result = resolver.fetchRRset(testing.allocator, "example.com", .a, servers, 1, false);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
