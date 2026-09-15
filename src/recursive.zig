@@ -1495,9 +1495,6 @@ pub const RecursiveResolver = struct {
         return try tryParseMessage(allocator, response_data, server);
     }
 
-    /// Issue the query over TCP (pooled if available). Returns null if TCP
-    /// isn't configured, the request fails, or the response is malformed.
-    /// Caller is responsible for question-match validation when needed.
     fn tcpFallback(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
