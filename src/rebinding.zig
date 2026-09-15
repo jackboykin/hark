@@ -6,14 +6,9 @@
 /// Filter site: egress hooks in `response.shapeResponse`, one per
 /// section. Filtering at the wire boundary covers fresh resolution,
 /// cache hits, and TTL=0 answers (which would skip a cache-insertion
-/// filter) in one place, and lets operator config changes
-/// (`allow_zones`, `extra_allow`) take effect immediately instead of
-/// waiting for TTL expiry.
+/// filter) in one place.
 ///
 /// What we *don't* do, and why:
-///   • Synthesise SOA in authority on an empty-rrset. RFC 2308 makes SOA
-///     optional in NODATA; emitting empty-authority means the stub retries
-///     on next config change instead of negative-caching a stale block.
 ///   • SERVFAIL or REFUSED on a scrub. REFUSED tends to push stubs to the
 ///     next resolver in resolv.conf, leaking the same query to an
 ///     unprotected upstream and giving the attacker their rebind anyway.
@@ -28,7 +23,8 @@
 /// the wire. For a CNAME chain `home.example.com → box.lan.example → A
 /// 192.168.1.1`, the terminal A's `name` is `box.lan.example`, so a
 /// `lan.example` allowlist entry passes the chain through unmolested
-/// — the right behaviour, matching Unbound (not BIND's qname-based variant).
+/// — as in Unbound and BIND. A public CNAME into an allowlisted zone
+/// passes too; hark has no deny-answer-aliases.
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -168,18 +164,10 @@ pub fn scrub(
     }
     if (drop_count == 0) return records;
 
-    // One line per scrubbed answer, not per RR — a hostile domain can carry
-    // hundreds of private-address records.
     var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
     log.info("scrub dropped={d} owner={s}", .{ drop_count, records[first_drop].name.formatLower(&name_buf) });
 
-    // Orphan-RRSIG sweep. Dropping any record from an rrset invalidates
-    // the upstream's RRSIG (it signed the full set as it existed at the
-    // authoritative). Leaving the signature behind violates RFC 4035
-    // §3.1 and SERVFAILs strict validators on DO=1. The marks bitmap is
-    // the scope — an RRSIG drops iff a member of its rrset was dropped,
-    // so the sweep can never drift from `shouldDrop`. O(N²) but N is
-    // bounded by the section size.
+    // An rrset that lost a member no longer matches its RRSIG, so the RRSIG goes too.
     for (records, 0..) |rr, i| {
         if (marks[i] or rr.rtype != .rrsig) continue;
         const covered = rr.rdata.rrsig.type_covered;
