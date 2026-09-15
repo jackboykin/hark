@@ -16,7 +16,6 @@ pub const Transports = struct {
 };
 const EncryptedNs = @import("encrypted_ns.zig").EncryptedNs;
 const AddressKey = @import("net_address.zig").AddressKey;
-const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
@@ -264,7 +263,6 @@ pub const RecursiveResolver = struct {
     dedup: ?*InFlightTable = null,
     nsec_cache: ?*NsecCache = null,
     key_cache: ?*RRsetCache = null,
-    tcp_pool: ?*TcpConnectionPool = null,
     /// Parallel NS-address resolution on helper threads. Off inside helpers.
     fanout: bool = false,
     /// Per-resolution memory cap: the main query arena and each NS-fanout
@@ -322,7 +320,6 @@ pub const RecursiveResolver = struct {
         dedup: ?*InFlightTable,
         nsec_cache: ?*NsecCache,
         key_cache: ?*RRsetCache,
-        tcp_pool: ?*TcpConnectionPool,
     };
 
     /// Per-query knobs that vary across calls within the same Context.
@@ -363,7 +360,6 @@ pub const RecursiveResolver = struct {
             .prefetch_cousin = ctx.config.prefetch_cousin,
             .case_state = ctx.case_state,
             .dedup = ctx.dedup,
-            .tcp_pool = ctx.tcp_pool,
             .fanout = true,
             .query_memory_limit = ctx.config.query_memory_limit,
             .nsec_cache = if (ctx.config.dnssec and !opts.cd) ctx.nsec_cache else null,
@@ -1487,7 +1483,7 @@ pub const RecursiveResolver = struct {
     ) error{OutOfMemory}!?dns.Message {
         if (!self.transports.?.tcp_enabled) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.tcp_pool, self.remainingMs()) catch |err| {
+        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, self.remainingMs()) catch |err| {
             var addr_buf: [64]u8 = undefined;
             log.debug("TCP fallback to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;

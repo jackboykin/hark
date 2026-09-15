@@ -81,7 +81,7 @@ pub const ServerConfig = struct {
     /// Cap on queries served over a single TCP connection before the
     /// server closes it (load-shedding + memory bound).
     tcp_queries_per_conn: u32,
-    /// Upstream TCP / DoT connection-pool idle timeout (seconds). Closes
+    /// Upstream DoT connection-pool idle timeout (seconds). Closes
     /// pooled connections to authoritatives after this much inactivity.
     upstream_tcp_idle_sec: i64,
 

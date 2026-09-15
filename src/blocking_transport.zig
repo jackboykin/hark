@@ -5,11 +5,7 @@ const testing = std.testing;
 const Io = std.Io;
 const dns = @import("dns.zig");
 const monotonic = @import("monotonic.zig");
-const pool_mod = @import("connection_pool.zig");
-const TcpConnectionPool = pool_mod.TcpConnectionPool;
-const TcpPooledConnection = pool_mod.TcpPooledConnection;
 const na = @import("net_address.zig");
-const AddressKey = na.AddressKey;
 const sys = @import("sys.zig");
 const rand = @import("rand.zig");
 
@@ -294,52 +290,12 @@ pub const BlockingUdpTransport = struct {
 
 const tcp_connect_timeout_ms: u32 = 5000;
 
-/// Send a DNS query over TCP. With pool != null, tries an idle pooled
-/// connection first and stores a fresh one on success.
-pub fn queryTcp(
-    io: Io,
-    wire_query: []const u8,
-    server: na.Address,
-    response_buf: []u8,
-    pool: ?*TcpConnectionPool,
-    timeout_ms: u32,
-) ![]const u8 {
+/// One query per connection: most authoritatives drop or ignore a second.
+pub fn queryTcp(io: Io, wire_query: []const u8, server: na.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
     const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
-
-    if (pool) |p| {
-        const key = AddressKey.fromAddress(server);
-        if (p.acquire(key)) |conn| {
-            if (sendAndReceiveTcp(conn.stream, io, wire_query, response_buf, deadline_ns)) |data| {
-                pool_mod.applyKeepaliveHint(conn, data);
-                p.release(key, conn, true);
-                return data;
-            } else |_| {
-                p.release(key, conn, false);
-            }
-        }
-    }
-
     const stream = try connectTcp(server, @min(timeout_ms, tcp_connect_timeout_ms));
-    const data = sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns) catch |err| {
-        stream.close(io);
-        return err;
-    };
-
-    if (pool) |p| {
-        const key = AddressKey.fromAddress(server);
-        const new_conn = p.allocator.create(TcpPooledConnection) catch {
-            // Pool out of memory — close the stream since no one will own it.
-            stream.close(io);
-            return data;
-        };
-        new_conn.* = .{ .stream = stream, .io = io };
-        pool_mod.applyKeepaliveHint(new_conn, data);
-        p.release(key, new_conn, true);
-        return data;
-    }
-
-    stream.close(io);
-    return data;
+    defer stream.close(io);
+    return sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns);
 }
 
 /// SNDTIMEO bounds the connect (std's connect timeout panics under
@@ -557,7 +513,7 @@ test "queryTcp loopback query" {
     const thread = try std.Thread.spawn(.{}, tcpEchoServerThread, .{ &server, io });
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
-    const response = try queryTcp(io, wire_query, server_addr, &response_buf, null, 10_000);
+    const response = try queryTcp(io, wire_query, server_addr, &response_buf, 10_000);
     thread.join();
 
     try testing.expect(response.len >= 12);

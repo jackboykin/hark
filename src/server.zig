@@ -24,7 +24,6 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const BumpGatedGroup = @import("bg_group.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const BlockingUdpTransport = @import("blocking_transport.zig").BlockingUdpTransport;
-const TcpConnectionPool = @import("connection_pool.zig").TcpConnectionPool;
 const Transports = recursive.Transports;
 const na = @import("net_address.zig");
 const response = @import("response.zig");
@@ -417,7 +416,6 @@ pub const Server = struct {
             .dedup = &self.dedup,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .key_cache = if (self.key_cache) |*kc| kc else null,
-            .tcp_pool = null,
         };
     }
 
@@ -623,14 +621,9 @@ pub const Server = struct {
             log.err("failed to enable io_uring: {s}", .{@errorName(err)});
             self.exit(1);
         };
-        // Per-worker Do53 TCP connection pool (RFC 7766)
-        var do53_tcp_pool = TcpConnectionPool.init(self.allocator, self.io);
-        do53_tcp_pool.max_idle_sec = self.config.upstream_tcp_idle_sec;
-
         var ws = WorkerState{
             .server = self,
             .loop = rig.loop,
-            .tcp_pool = &do53_tcp_pool,
         };
 
         var spawned: usize = 0;
@@ -749,19 +742,9 @@ const Reply = union(enum) {
 const WorkerState = struct {
     server: *Server,
     loop: *EventLoop,
-    tcp_pool: ?*TcpConnectionPool = null,
     tcp_clients: [max_tcp_clients_per_worker]*TcpClient = undefined,
     tcp_count: usize = 0,
     recv_pta: PerThreadArena = undefined,
-
-    /// Build a resolver Context: the server-level one plus this worker's
-    /// Do53 TCP pool. Per-query knobs (cd, bypass_cache) go through
-    /// RuntimeOpts, not here.
-    fn resolverContext(self: *WorkerState) recursive.RecursiveResolver.Context {
-        var ctx = self.server.resolverContext();
-        ctx.tcp_pool = self.tcp_pool;
-        return ctx;
-    }
 
     fn logCacheStats(self: *const WorkerState) void {
         const stats = self.server.cache.getStats();
@@ -1090,7 +1073,7 @@ const WorkerState = struct {
         if (build_options.testing_enabled and parseAdvanceClockQname(name_str) != null) return false;
 
         var resolver = recursive.RecursiveResolver.fromContext(
-            self.resolverContext(),
+            self.server.resolverContext(),
             null,
             .{ .cd = query_msg.header.flags.cd, .cache_only = true },
         );
@@ -1144,7 +1127,7 @@ const WorkerState = struct {
             }
         }
         var resolver = recursive.RecursiveResolver.fromContext(
-            self.resolverContext(),
+            self.server.resolverContext(),
             transports,
             .{ .cd = cd, .bypass_cache = bypass_cache },
         );
@@ -1202,7 +1185,7 @@ const WorkerState = struct {
                     defer self.server.bg_tasks.release();
                     const qtype: dns.RType = @fromBackingInt(mem.readInt(u16, item.payload[0..2], .big));
                     const kind: BgKind = @fromBackingInt(@intCast(item.payload[2]));
-                    runBgTask(self.resolverContext(), transports, query_pta.reset(), item.payload[3..], qtype, kind);
+                    runBgTask(self.server.resolverContext(), transports, query_pta.reset(), item.payload[3..], qtype, kind);
                 },
                 .tcp => {
                     defer self.server.work_queue.release(item.reservation);
