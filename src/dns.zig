@@ -59,6 +59,7 @@ pub const RCode = enum(u4) {
     name_error = 3,
     not_implemented = 4,
     refused = 5,
+    yx_domain = 6,
     _,
 
     /// Server-side error (SERVFAIL/REFUSED) — the server received the query

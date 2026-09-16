@@ -700,10 +700,9 @@ pub const RecursiveResolver = struct {
 
                 self.probeParentChildCut(allocator, &walk, &response, &security_state);
 
-                if (response.header.flags.rcode != .no_error)
-                    return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
-
-                if (response.answers.len > 0) {
+                // RFC 2308 §2.1: follow an NXDOMAIN's CNAME chain, drop any other error-rcode record.
+                const rcode = response.header.flags.rcode;
+                if (response.answers.len > 0 and (rcode == .no_error or rcode == .name_error)) {
                     switch (try self.followUpstreamCname(allocator, &walk, &response, qtype, security_state, responding_server, &cname_chain)) {
                         .none => {},
                         .bogus => |why| return self.bogusServfail(walk.name, qtype, why),
@@ -715,7 +714,22 @@ pub const RecursiveResolver = struct {
                             continue :cname_loop;
                         },
                     }
-                    return self.finalizeAnswer(allocator, &response, &walk, qtype, security_state, responding_server, &cname_chain);
+                    if (rcode == .no_error) return self.finalizeAnswer(allocator, &response, &walk, qtype, security_state, responding_server, &cname_chain);
+                }
+                if (rcode != .no_error) {
+                    // YXDOMAIN keeps its DNAME (RFC 6672 §2.2).
+                    var kept: []dns.ResourceRecord = &.{};
+                    if (rcode == .yx_domain) {
+                        kept = try allocator.alloc(dns.ResourceRecord, response.answers.len);
+                        var n: usize = 0;
+                        for (response.answers) |rr| if (rr.rtype == .dname or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .dname)) {
+                            kept[n] = rr;
+                            n += 1;
+                        };
+                        kept = kept[0..n];
+                    }
+                    response.answers = kept;
+                    return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
                 }
 
                 const referral = extractReferral(response, walk.target, walk.zone, self.referralPolicy()) orelse
