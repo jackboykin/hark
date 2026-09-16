@@ -2123,10 +2123,20 @@ pub const RecursiveResolver = struct {
         // delegation needs DS/DNSKEY re-prove.
         if (self.cache_only) return error.CacheOnlyMiss;
 
-        const try_count = @min(servers.len, max_servers);
         const now_ms: i64 = if (self.rtt_cache) |rc| rc.nowMs() else 0;
         const zone = try dns.parseDottedName(allocator, zone_name);
-        for (servers[0..try_count], 0..) |server, i| {
+        // DS is asked of the parent's servers; everything else of the zone's own.
+        const arm_zone: dns.Name = if (qtype == .ds and zone.labels.len > 0) .{ .labels = zone.labels[1..] } else zone;
+        var order_buf: [max_servers_per_level]usize = undefined;
+        const sel = if (self.ns_selector) |ns|
+            ns.selectServers(arm_zone, servers, self.rtt_cache, &order_buf)
+        else blk: {
+            for (0..servers.len) |idx| order_buf[idx] = idx;
+            break :blk order_buf[0..servers.len];
+        };
+        const try_count = @min(sel.len, max_servers);
+        for (sel[0..try_count], 0..) |server_idx, i| {
+            const server = servers[server_idx];
             const addr_key = AddressKey.fromAddress(server);
 
             if (self.rtt_cache) |rc| {
@@ -2137,12 +2147,26 @@ pub const RecursiveResolver = struct {
             // tree-wide budget so a signed-zone variant can't sidestep it.
             try self.consumeQuery();
 
-            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, i + 1 >= try_count, true, tcp_first)) {
-                .timeout, .mismatch => continue,
-                .response => |r| r.message,
+            const exchange = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, i + 1 >= try_count, true, tcp_first)) {
+                .timeout => {
+                    self.recordNsOutcome(arm_zone, server, .timeout, 0);
+                    continue;
+                },
+                .mismatch => continue,
+                .response => |r| r,
             };
-            if (response.header.flags.rcode != .no_error) continue;
-            if (zone.labels.len > 0 and self.shouldTrySibling(response, .{ .labels = zone.labels[1..] })) continue;
+            const response = exchange.message;
+            const rcode = response.header.flags.rcode;
+            if (rcode != .no_error) {
+                // NXDOMAIN on a DS probe is the parent answering; SERVFAIL is not.
+                self.recordNsOutcome(arm_zone, server, if (rcode.isServerError()) .server_error else .success, exchange.elapsed_us);
+                continue;
+            }
+            if (zone.labels.len > 0 and self.shouldTrySibling(response, .{ .labels = zone.labels[1..] })) {
+                self.recordNsOutcome(arm_zone, server, .server_error, exchange.elapsed_us);
+                continue;
+            }
+            self.recordNsOutcome(arm_zone, server, .success, exchange.elapsed_us);
             return response;
         }
         return null;
