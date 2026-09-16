@@ -572,8 +572,8 @@ pub const Server = struct {
         const stats = self.cache.getStats();
         const hit_total = stats.hits + stats.misses;
         const hit_pct: u64 = if (hit_total > 0) stats.hits * 100 / hit_total else 0;
-        log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d}/{d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted), {d} prefetch-eligible, {d} stale", .{
-            stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.prefetch_eligible, stats.stale_hits,
+        log.info("cache stats (rrset lookups, incl. internal): {d} entries, {d}/{d} KiB, {d} hits, {d} misses ({d}% hit, {d} expired-remiss), {d} evictions ({d} cap-exhausted), {d} store-failures, {d} prefetch-eligible, {d} stale", .{
+            stats.entries, stats.memory_bytes / 1024, stats.max_bytes / 1024, stats.hits, stats.misses, hit_pct, stats.expired_remiss, stats.evictions, stats.cap_exhausted_evictions, stats.store_failures, stats.prefetch_eligible, stats.stale_hits,
         });
         self.logOteStats();
         if (self.key_cache) |*kc| {

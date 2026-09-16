@@ -473,6 +473,8 @@ const WriteSide = struct {
     evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Subset of `evictions` where the SIEVE scan cap was exhausted.
     cap_exhausted_evictions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Stores the byte budget refused.
+    store_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 /// Cache-wide, so stats report what eviction compares against. Shards write
@@ -552,6 +554,7 @@ pub const RRsetCache = struct {
         evictions: u64 = 0,
         /// Subset of `evictions` where the SIEVE scan cap was exhausted.
         cap_exhausted_evictions: u64 = 0,
+        store_failures: u64 = 0,
         prefetch_eligible: u64 = 0,
         stale_hits: u64 = 0,
         /// Subset of `misses` where the entry existed but had expired. See
@@ -568,6 +571,7 @@ pub const RRsetCache = struct {
         for (self.shards[0..self.shard_count]) |*shard| {
             stats.evictions += shard.write.evictions.load(.monotonic);
             stats.cap_exhausted_evictions += shard.write.cap_exhausted_evictions.load(.monotonic);
+            stats.store_failures += shard.write.store_failures.load(.monotonic);
         }
         for (&self.read_counters) |*rc| {
             stats.hits += rc.hits.load(.monotonic);
@@ -912,6 +916,7 @@ pub const RRsetCache = struct {
         // under OOM — a denial a DO client couldn't validate (RFC 4035 §3.1.3.2/.3).
         const pack = buildPack(slot.alloc, &.{soa}, &.{}, proofs) catch {
             slot.alloc.free(slot.key.name);
+            _ = slot.shard.write.store_failures.fetchAdd(1, .monotonic);
             return;
         };
 
@@ -928,6 +933,7 @@ pub const RRsetCache = struct {
         } }) catch {
             slot.alloc.free(pack.blob);
             slot.alloc.free(slot.key.name);
+            _ = slot.shard.write.store_failures.fetchAdd(1, .monotonic);
             return;
         };
         self.noteInsert(slot.shard);
@@ -968,6 +974,7 @@ pub const RRsetCache = struct {
             .security_status = security_status,
         } }) catch {
             slot.alloc.free(slot.key.name);
+            _ = slot.shard.write.store_failures.fetchAdd(1, .monotonic);
             return;
         };
         self.noteInsert(slot.shard);
@@ -1186,6 +1193,7 @@ pub const RRsetCache = struct {
 
         const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
             slot.alloc.free(slot.key.name);
+            _ = slot.shard.write.store_failures.fetchAdd(1, .monotonic);
             return;
         };
 
@@ -1200,6 +1208,7 @@ pub const RRsetCache = struct {
         } }) catch {
             slot.alloc.free(pack.blob);
             slot.alloc.free(slot.key.name);
+            _ = slot.shard.write.store_failures.fetchAdd(1, .monotonic);
             return;
         };
         self.noteInsert(slot.shard);
