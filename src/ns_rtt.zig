@@ -12,6 +12,24 @@ const initial_timeout_ms: u32 = 400;
 /// jitter headroom, this only catches degenerate sub-millisecond RTTs.
 const min_timeout_ms: u32 = 50;
 
+/// How a query reaches a server. The estimate is the exchange leg on an
+/// established path, the same quantity on every transport; a cold
+/// exchange first pays the handshake.
+pub const Transport = enum {
+    udp,
+    tcp,
+    dot,
+
+    /// Round trips a cold exchange costs, handshake included.
+    pub fn coldRtts(t: Transport) u32 {
+        return switch (t) {
+            .udp => 1,
+            .tcp => 2,
+            .dot => 3,
+        };
+    }
+};
+
 /// Maximum RTO cap (Knot).
 const max_timeout_ms: u32 = 10_000;
 
@@ -115,13 +133,19 @@ pub const RttCache = struct {
         return &self.shards[h & shard_mask];
     }
 
-    pub fn getTimeout(self: *RttCache, key: AddressKey) u32 {
+    /// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
+    const failover_timeout_cap_ms: u32 = 2000;
+
+    /// What `key` needs for a cold exchange over `transport`. A non-last
+    /// server is capped so a walk can still fail over.
+    pub fn getTimeout(self: *RttCache, key: AddressKey, is_last: bool, transport: Transport) u32 {
         const shard = self.shardFor(key);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
 
-        const state = shard.entries.get(key) orelse return initial_timeout_ms;
-        return computeTimeout(state);
+        const base = if (shard.entries.get(key)) |state| computeTimeout(state) else initial_timeout_ms;
+        const want = if (is_last) base else @min(base, failover_timeout_cap_ms);
+        return want * transport.coldRtts();
     }
 
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
@@ -301,7 +325,7 @@ test "getTimeout returns initial for unknown server" {
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
-    try testing.expectEqual(initial_timeout_ms, cache.getTimeout(testAddr(1)));
+    try testing.expectEqual(initial_timeout_ms, cache.getTimeout(testAddr(1), true, .udp));
 }
 
 test "recordSuccess updates EWMA" {
@@ -314,11 +338,11 @@ test "recordSuccess updates EWMA" {
     // First sample: srtt = 100ms, rttvar = 50ms → RTO = 300
     // rttvar floor = srtt/4 = 25ms, actual rttvar = 50ms > 25ms, no effect
     cache.recordSuccess(key, 100_000);
-    try testing.expectEqual(@as(u32, 300), cache.getTimeout(key)); // 100 + 4*50
+    try testing.expectEqual(@as(u32, 300), cache.getTimeout(key, true, .udp)); // 100 + 4*50
 
     // Second sample: 200ms → srtt moves toward 200, variance adjusts
     cache.recordSuccess(key, 200_000);
-    const t2 = cache.getTimeout(key);
+    const t2 = cache.getTimeout(key, true, .udp);
     try testing.expect(t2 > 0);
     try testing.expect(t2 <= max_timeout_ms);
 }
@@ -458,12 +482,12 @@ test "hedge stagger survives transient timeouts that inflate RTO" {
 
     const key = testAddr(1);
     cache.recordSuccess(key, 20_000);
-    const rto_clean = cache.getTimeout(key);
+    const rto_clean = cache.getTimeout(key, true, .udp);
     const hedge = cache.getHedgeStagger(key);
 
     cache.recordTimeout(key);
 
-    try testing.expect(cache.getTimeout(key) > rto_clean);
+    try testing.expect(cache.getTimeout(key, true, .udp) > rto_clean);
     try testing.expectEqual(hedge, cache.getHedgeStagger(key));
 }
 
@@ -501,7 +525,7 @@ test "recordTimeout increments consecutive count and marks dead" {
     cache.recordTimeout(key);
     cache.recordTimeout(key);
     try testing.expect(cache.isDead(key, cache.nowMs()));
-    try testing.expectEqual(dead_probe_timeout_ms, cache.getTimeout(key));
+    try testing.expectEqual(dead_probe_timeout_ms, cache.getTimeout(key, true, .udp));
 
     test_now_ms = 1000 + dead_duration_ms + 1;
     try testing.expect(!cache.isDead(key, cache.nowMs()));
@@ -537,4 +561,22 @@ test "dead window escalation caps and eviction releases the gate" {
     cache.recordSuccess(testAddr(octet), 100_000);
     try testing.expectEqual(@as(u32, 0), shard.dead_marked.v.load(.monotonic));
     try testing.expect(!cache.isDead(key, cache.nowMs()));
+}
+
+test "a cold exchange costs the transport's round trips of the estimate" {
+    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io, .max_entries = 16 });
+    defer cache.deinit();
+    const key = testAddr(1);
+    try testing.expectEqual(initial_timeout_ms * 2, cache.getTimeout(key, true, .tcp));
+
+    for (0..8) |_| cache.recordSuccess(key, 150_000);
+    const udp = cache.getTimeout(key, true, .udp);
+    try testing.expect(udp > min_timeout_ms);
+    try testing.expectEqual(udp * 2, cache.getTimeout(key, true, .tcp));
+    try testing.expectEqual(udp * 3, cache.getTimeout(key, true, .dot));
+
+    // The failover cap bounds one round trip; the cold total is above it.
+    for (0..3) |_| cache.recordTimeout(key);
+    try testing.expect(cache.getTimeout(key, true, .udp) > RttCache.failover_timeout_cap_ms);
+    try testing.expectEqual(RttCache.failover_timeout_cap_ms * 2, cache.getTimeout(key, false, .tcp));
 }

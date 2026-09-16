@@ -23,6 +23,7 @@ const na = @import("net_address.zig");
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const NsOutcome = @import("ns_selector.zig").Outcome;
+const Transport = @import("ns_rtt.zig").Transport;
 const cache_mod = @import("cache.zig");
 const RRsetCache = cache_mod.RRsetCache;
 const dedup_mod = @import("dedup.zig");
@@ -416,13 +417,14 @@ pub const RecursiveResolver = struct {
         };
     }
 
-    /// Non-last server timeout cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2s).
-    const failover_timeout_cap: u32 = 2000;
+    /// What the server needs over `transport`, before the query budget.
+    fn coldTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool, transport: Transport) u32 {
+        const rc = self.rtt_cache orelse return self.transports.?.udp.config.timeout_ms * transport.coldRtts();
+        return rc.getTimeout(addr_key, is_last, transport);
+    }
 
-    fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool) u32 {
-        const base: u32 = if (self.rtt_cache) |rc| rc.getTimeout(addr_key) else self.transports.?.udp.config.timeout_ms;
-        const want = if (is_last) base else @min(base, failover_timeout_cap);
-        return @min(want, self.remainingMs());
+    fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool, transport: Transport) u32 {
+        return @min(self.coldTimeout(addr_key, is_last, transport), self.remainingMs());
     }
 
     pub const ResolveResult = struct {
@@ -1503,7 +1505,7 @@ pub const RecursiveResolver = struct {
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
         const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, timeout) catch |err| {
             var addr_buf: [64]u8 = undefined;
-            log.debug("TCP query to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
+            log.debug("TCP query to {s} failed: {s} (timeout {d}ms)", .{ na.format(server, &addr_buf), @errorName(err), timeout });
             return null;
         };
         // Nowhere left to escalate: TC over TCP is a broken server. Null
@@ -1558,13 +1560,15 @@ pub const RecursiveResolver = struct {
         name: []const u8,
         qtype: dns.RType,
         server: na.Address,
-        timeout: u32,
+        is_last: bool,
         do_bit: bool,
         tcp_first: bool,
     ) !Do53Result {
         const case_rng = self.caseRng();
+        const addr_key = AddressKey.fromAddress(server);
         var tcp = tcp_first;
         while (true) {
+            const timeout = self.serverTimeout(addr_key, is_last, if (tcp) .tcp else .udp);
             const query_id = rand.queryId(self.io);
             const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
                 .rd = false,
@@ -1615,8 +1619,7 @@ pub const RecursiveResolver = struct {
         var padded_buf: [dns.edns_udp_payload]u8 = undefined;
         const padded_query = try dns.serializeMessage(&padded_buf, padded_msg);
 
-        // Three round-trips cold; the Do53 timeout is ≥2×srtt.
-        const full_ms = 4 * self.serverTimeout(AddressKey.fromAddress(server), false);
+        const full_ms = self.coldTimeout(AddressKey.fromAddress(server), false, .dot);
         const budget_ms = @min(self.remainingMs(), full_ms);
         const deadline_ns = monotonic.nowNs() + @as(i128, budget_ms) * std.time.ns_per_ms;
         const verdict: ?dns.Message = blk: {
@@ -1870,9 +1873,7 @@ pub const RecursiveResolver = struct {
             if (self.rtt_cache) |rc| if (!rc.admit(addr_key, rc.nowMs())) continue;
             const is_last_server = server_i + 1 == sel.len;
 
-            const per_server_timeout = self.serverTimeout(addr_key, is_last_server);
-
-            const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, per_server_timeout, self.dnssec_aware, tcp_first)) {
+            const exchange = switch (try self.do53CaseHardened(allocator, query_name, query_type, server, is_last_server, self.dnssec_aware, tcp_first)) {
                 .timeout => {
                     self.recordNsOutcome(parent_zone, server, .timeout, 0);
                     continue :server_loop;
@@ -2135,8 +2136,7 @@ pub const RecursiveResolver = struct {
             // tree-wide budget so a signed-zone variant can't sidestep it.
             try self.consumeQuery();
 
-            const timeout = self.serverTimeout(addr_key, i + 1 >= try_count);
-            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, timeout, true, tcp_first)) {
+            const response = switch (try self.do53CaseHardened(allocator, zone_name, qtype, server, i + 1 >= try_count, true, tcp_first)) {
                 .timeout, .mismatch => continue,
                 .response => |r| r.message,
             };
