@@ -1,0 +1,174 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a child's NS answer cannot keep a revoked delegation alive
+
+; Ghost domain names (CVE-2012-1033): the parent delegates for 3600 s, the
+; child answers its own NS with 86400 s, the parent pulls the delegation.
+; Past 3600 s the name must be gone. The NS host is out of zone so only the
+; NS entry, not glue, can keep it alive.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      net. IN A
+    SECTION AUTHORITY
+      net. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── .com, delegation live ─────────────────────────────────────────
+RANGE_BEGIN 0 5
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 3600 IN NS ns.hoster.net.
+  ENTRY_END
+RANGE_END
+
+; ── .com, delegation revoked ──────────────────────────────────────
+RANGE_BEGIN 6 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.fake. 2 1800 900 604800 900
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.fake. 2 1800 900 604800 900
+  ENTRY_END
+RANGE_END
+
+; ── the dns host's own delegation, untouched throughout ──────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      hoster.net. IN A
+    SECTION AUTHORITY
+      hoster.net. 86400 IN NS ns.hoster.net.
+    SECTION ADDITIONAL
+      ns.hoster.net. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── the dns host, still serving example.com after the takedown ───
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.hoster.net. IN A
+    SECTION ANSWER
+      ns.hoster.net. 86400 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN NS
+    SECTION ANSWER
+      example.com. 86400 IN NS ns.hoster.net.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 1800
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example.com. IN NS
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example.com. IN NS
+  SECTION ANSWER
+    example.com. IN NS ns.hoster.net.
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 1900
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+SCENARIO_END

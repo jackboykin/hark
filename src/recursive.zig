@@ -2238,10 +2238,7 @@ pub const RecursiveResolver = struct {
         const cache = self.cache orelse return null;
         var parent_zone = parentZoneOf(zone_name);
         const ns_hit = while (parent_zone.len > 0) : (parent_zone = parentZoneOf(parent_zone)) {
-            if (cache.lookup(allocator, parent_zone, .ns, .in)) |result| switch (result) {
-                .hit => |h| break h,
-                .negative => {},
-            };
+            if (steeringDelegation(cache, allocator, parent_zone)) |h| break h;
         } else return self.reproveDelegationSecurity(allocator, zone_name, self.root_hints);
         var ns_names: [max_servers_per_level]dns.Name = undefined;
         var ns_count: usize = 0;
@@ -3095,13 +3092,9 @@ pub const RecursiveResolver = struct {
             _ = scratch_arena.reset(.retain_capacity);
             const scratch = scratch_arena.allocator();
 
-            const ns_lookup = cache.lookup(scratch, zone_str, .ns, .in) orelse {
+            const hit = steeringDelegation(cache, scratch, zone_str) orelse {
                 if (had_ns_hit) break;
                 continue;
-            };
-            const hit = switch (ns_lookup) {
-                .hit => |h| h,
-                .negative => continue,
             };
             had_ns_hit = true;
 
@@ -3167,6 +3160,15 @@ pub const RecursiveResolver = struct {
         return best;
     }
 };
+
+/// An NS set the walk may seed from: the parent's lease on it is live.
+fn steeringDelegation(cache: *RRsetCache, alloc: mem.Allocator, zone: []const u8) ?@FieldType(cache_mod.CacheLookupResult, "hit") {
+    const result = cache.lookup(alloc, zone, .ns, .in) orelse return null;
+    return switch (result) {
+        .hit => |h| if (h.steer and !h.is_stale) h else null,
+        .negative => null,
+    };
+}
 
 fn hasCachedInsecureDelegation(cache: ?*RRsetCache, zone: dns.Name) bool {
     const c = cache orelse return false;
@@ -5185,6 +5187,28 @@ test "findClosestCachedDelegation uses a cut below an insecure parent without a 
     try testing.expect(deleg.insecure);
     try testing.expectEqual(@as(usize, 1), deleg.count);
     try testing.expectEqual([4]u8{ 2, 2, 2, 2 }, deleg.addrs[0].ip4.bytes);
+}
+
+test "findClosestCachedDelegation seeds only from an NS set a referral leased" {
+    const alloc = testing.allocator;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io });
+    defer cache.deinit();
+
+    const zone = dns.Name{ .labels = &.{ "example", "com" } };
+    const ns = dns.Name{ .labels = &.{ "ns", "hoster", "net" } };
+    const answers = [_]dns.ResourceRecord{ makeNsRr(zone, ns), makeGlueA(ns, .{ 2, 2, 2, 2 }) };
+    cache.storeResponse(.{ .header = test_header, .questions = &.{}, .answers = &answers }, .{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+
+    var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io, .cache = &cache, .cache_only = true };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // The child's own NS set, as left by a sweep or a late reply.
+    try testing.expect(try resolver.findClosestCachedDelegation(arena.allocator(), "www.example.com") == null);
+
+    cache.storeReferral(&.{makeNsRr(zone, ns)}, &.{}, .{ .labels = &.{"com"} }, zone, &.{ns});
+    const deleg = (try resolver.findClosestCachedDelegation(arena.allocator(), "www.example.com")) orelse return error.TestExpectedDelegation;
+    try testing.expect(deleg.zone.eql(zone));
 }
 
 var clock_reads: usize = 0;

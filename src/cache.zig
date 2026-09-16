@@ -202,6 +202,10 @@ const CachedRRset = struct {
     original_ttl: u32,
     stored_at: i64,
     security_status: SecurityStatus = .unchecked,
+    /// The parent's lease on an NS set: a referral grants it, a child's own
+    /// NS inherits it from a live entry but never mints or extends it, and
+    /// the walk seeds only from holders (ghost domain names, CVE-2012-1033).
+    steer: bool = false,
 };
 
 const NegativeEntry = struct {
@@ -257,6 +261,7 @@ pub const CacheLookupResult = union(enum) {
         /// the serve-stale window. Resolvers SHOULD attempt fresh resolution
         /// before serving a stale answer.
         is_stale: bool = false,
+        steer: bool = false,
     },
     negative: struct {
         rcode: dns.RCode,
@@ -719,6 +724,7 @@ pub const RRsetCache = struct {
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = servedStatus(rrset.security_status, hit.is_stale),
                     .is_stale = hit.is_stale,
+                    .steer = rrset.steer,
                 } };
             },
             .negative => |neg| {
@@ -1018,7 +1024,22 @@ pub const RRsetCache = struct {
         const existing = shard.map.values()[idx];
         if (self.now_fn() >= existing.expiresAt()) return false;
         if (overwrite == .unless_fresh) return true;
+        // A referral yields only to a live leased set.
+        if (new_status == .glue and key.rtype == .ns and !(existing == .positive and existing.positive.steer)) return false;
         return @backingInt(new_status) < @backingInt(existing.status());
+    }
+
+    /// Remaining life of the lease this NS store inherits, or null for none.
+    fn steerLease(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, status: SecurityStatus) ?u32 {
+        if (key.rtype != .ns) return null;
+        if (status == .glue) return std.math.maxInt(u32);
+        const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return null;
+        const p = switch (shard.map.values()[idx]) {
+            .positive => |p| p,
+            .negative => return null,
+        };
+        const remaining = p.expires_at - self.now_fn();
+        return if (p.steer and remaining > 0) @intCast(remaining) else null;
     }
 
     /// Stale hits degrade to `.unchecked`: their RRSIGs may have expired
@@ -1190,6 +1211,7 @@ pub const RRsetCache = struct {
 
         const slot = self.prepareSlot(lower_name, rr.rtype, rr.rclass, status, .always) orelse return;
         defer slot.shard.write.lock.unlock(self.io);
+        const lease = self.steerLease(slot.shard, slot.h, slot.key, status);
 
         const pack = buildPack(slot.alloc, matches, sigs, nsec_proofs) catch {
             slot.alloc.free(slot.key.name);
@@ -1197,7 +1219,7 @@ pub const RRsetCache = struct {
             return;
         };
 
-        const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), authenticated_ttl_max);
+        const life = self.lifetime(clampTtl(self.min_ttl, min_ttl), @min(authenticated_ttl_max, lease orelse std.math.maxInt(u32)));
         self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .pack = pack,
@@ -1205,6 +1227,7 @@ pub const RRsetCache = struct {
             .original_ttl = life.ttl,
             .stored_at = life.stored_at,
             .security_status = status,
+            .steer = lease != null,
         } }) catch {
             slot.alloc.free(pack.blob);
             slot.alloc.free(slot.key.name);
@@ -2524,6 +2547,54 @@ test ".glue sits below .unchecked in both directions" {
     try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
     try storeTestAWithStatus(&cache, alloc, &.{ "ns", "example", "com" }, 300, .{ 6, 6, 6, 6 }, .glue);
     try expectCachedHitStatus(alloc, &cache, "ns.example.com", .unchecked);
+}
+
+fn storeTestNs(cache: *RRsetCache, alloc: Allocator, ttl: u32, status: SecurityStatus) !void {
+    const answers = try alloc.alloc(dns.ResourceRecord, 1);
+    answers[0] = .{
+        .name = try makeTestName(alloc, &.{ "example", "com" }),
+        .rtype = .ns,
+        .rclass = .in,
+        .ttl = ttl,
+        .rdata = .{ .ns = try makeTestName(alloc, &.{ "ns", "hoster", "net" }) },
+    };
+    const response = makeTestResponse(answers);
+    defer dns.freeMessage(alloc, response);
+    cache.storeResponse(response, dns.Name{ .labels = &.{} }, status, std.math.maxInt(u32));
+}
+
+test "only a referral grants steering; a child's NS inherits it live or not at all" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ns = struct {
+        fn hit(c: *RRsetCache, a: Allocator) @FieldType(CacheLookupResult, "hit") {
+            return c.lookup(a, "example.com", .ns, .in).?.hit;
+        }
+    };
+
+    try storeTestNs(&cache, alloc, 3600, .glue);
+    test_time = 2800;
+    try storeTestNs(&cache, alloc, 86400, .unchecked);
+    try testing.expect(ns.hit(&cache, arena.allocator()).steer);
+    try testing.expectEqual(@as(u32, 1800), ns.hit(&cache, arena.allocator()).remaining_ttl);
+
+    // Lease expired: answer data with the child's own TTL, no steering.
+    test_time = 5000;
+    try storeTestNs(&cache, alloc, 86400, .unchecked);
+    try testing.expect(!ns.hit(&cache, arena.allocator()).steer);
+    try testing.expectEqual(@as(u32, 86400), ns.hit(&cache, arena.allocator()).remaining_ttl);
+
+    // The parent re-grants over an unsteered set or a child's NODATA, rank notwithstanding.
+    try storeTestNs(&cache, alloc, 3600, .glue);
+    try testing.expectEqual(SecurityStatus.glue, ns.hit(&cache, arena.allocator()).security_status);
+    cache.storeNegativeBare("example.com", .ns, .in, .no_error, 300, .unchecked, .always);
+    try testing.expect(cache.lookup(arena.allocator(), "example.com", .ns, .in).? == .negative);
+    try storeTestNs(&cache, alloc, 3600, .glue);
+    try testing.expect(ns.hit(&cache, arena.allocator()).steer);
 }
 
 test "shard distribution is reasonable for random names" {
