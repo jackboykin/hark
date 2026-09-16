@@ -135,8 +135,9 @@ pub const InFlightTable = struct {
                 // Deadline hit, leader still in-flight: return .follower anyway;
                 // the caller re-resolves on its own. A rare duplicate upstream
                 // query beats blocking past the client budget.
-                if (monotonic.nowNs() >= deadline_ns) break;
-                shard.condition.waitUncancelable(self.io, &shard.mutex);
+                const remaining_ns = deadline_ns - monotonic.nowNs();
+                if (remaining_ns <= 0) break;
+                shard.condition.waitTimeout(self.io, &shard.mutex, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining_ns)), .clock = .awake } }) catch {};
             }
             return .follower;
         }
@@ -251,6 +252,19 @@ test "acquireOrWaitWithTimeout uses custom timeout" {
     _ = table.acquireOrWait("example.com", .a, 0);
     const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, monotonic.nowNs());
     try testing.expectEqual(.follower, r);
+    table.releaseLeader("example.com", .a, 0);
+}
+
+test "follower deadline expires without a release" {
+    var table = InFlightTable.init(testing.allocator, testing.io);
+    defer table.deinit();
+
+    try testing.expectEqual(.leader, table.acquireOrWait("example.com", .a, 0));
+    const start = monotonic.nowNs();
+    const r = table.acquireOrWaitWithTimeout("example.com", .a, 0, start + 20 * std.time.ns_per_ms);
+    try testing.expectEqual(.follower, r);
+    const waited = monotonic.nowNs() - start;
+    try testing.expect(waited >= 20 * std.time.ns_per_ms and waited < std.time.ns_per_s);
     table.releaseLeader("example.com", .a, 0);
 }
 
