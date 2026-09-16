@@ -291,11 +291,19 @@ pub const BlockingUdpTransport = struct {
 const tcp_connect_timeout_ms: u32 = 5000;
 
 /// One query per connection: most authoritatives drop or ignore a second.
-pub fn queryTcp(io: Io, wire_query: []const u8, server: na.Address, response_buf: []u8, timeout_ms: u32) ![]const u8 {
+pub const TcpReply = struct {
+    data: []const u8,
+    /// Query to reply on the connected stream: the RTT sample, handshake excluded.
+    exchange_us: i64,
+};
+
+pub fn queryTcp(io: Io, wire_query: []const u8, server: na.Address, response_buf: []u8, timeout_ms: u32) !TcpReply {
     const deadline_ns = monotonic.nowNs() + @as(i128, timeout_ms) * 1_000_000;
     const stream = try connectTcp(server, @min(timeout_ms, tcp_connect_timeout_ms));
     defer stream.close(io);
-    return sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns);
+    const start_us = monotonic.nowUs();
+    const data = try sendAndReceiveTcp(stream, io, wire_query, response_buf, deadline_ns);
+    return .{ .data = data, .exchange_us = monotonic.nowUs() - start_us };
 }
 
 /// SNDTIMEO bounds the connect (std's connect timeout panics under
@@ -513,7 +521,7 @@ test "queryTcp loopback query" {
     const thread = try std.Thread.spawn(.{}, tcpEchoServerThread, .{ &server, io });
 
     var response_buf: [dns.edns_udp_payload]u8 = undefined;
-    const response = try queryTcp(io, wire_query, server_addr, &response_buf, 10_000);
+    const response = (try queryTcp(io, wire_query, server_addr, &response_buf, 10_000)).data;
     thread.join();
 
     try testing.expect(response.len >= 12);

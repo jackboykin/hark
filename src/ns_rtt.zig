@@ -246,16 +246,6 @@ pub const RttCache = struct {
         state.dead_until_ms = 0;
     }
 
-    /// Clear death-tracking without an RTT sample (DoT successes must not
-    /// shape Do53 estimates, but must break the one-way timeout ratchet).
-    pub fn recordAlive(self: *RttCache, key: AddressKey) void {
-        const shard = self.shardFor(key);
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-        const state = shard.entries.getPtr(key) orelse return;
-        revive(shard, state);
-    }
-
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
         const shard = self.shardFor(key);
         if (shard.dead_marked.v.load(.monotonic) == 0) return false;

@@ -72,13 +72,19 @@ pub fn tlsAddress(server: na.Address) na.Address {
 }
 
 /// A pooled failure (usually an idle close) is not the server's verdict.
-pub fn query(pool: *Pool, allocator: Allocator, wire_query: []const u8, server: na.Address, deadline_ns: i128) Allocator.Error!?[]u8 {
+pub const Reply = struct {
+    data: []u8,
+    /// Query to reply on the established session: the RTT sample, handshake excluded.
+    exchange_us: i64,
+};
+
+pub fn query(pool: *Pool, allocator: Allocator, wire_query: []const u8, server: na.Address, deadline_ns: i128) Allocator.Error!?Reply {
     const key = AddressKey.fromAddress(server);
     if (pool.acquire(key)) |conn| {
         // The budget is sized for a 3-RTT dial; a black-holed conn gets one share.
         const now = monotonic.nowNs();
         conn.deadline_ns = now + @divTrunc(deadline_ns - now, 4);
-        if (try exchange(pool, key, conn, allocator, wire_query)) |data| return data;
+        if (try exchange(pool, key, conn, allocator, wire_query)) |reply| return reply;
     }
     const conn = dial(pool, server, deadline_ns) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -126,14 +132,16 @@ pub fn dial(pool: *Pool, server: na.Address, deadline_ns: i128) !*Connection {
     return conn;
 }
 
-fn exchange(pool: *Pool, key: AddressKey, conn: *Connection, allocator: Allocator, wire_query: []const u8) Allocator.Error!?[]u8 {
+fn exchange(pool: *Pool, key: AddressKey, conn: *Connection, allocator: Allocator, wire_query: []const u8) Allocator.Error!?Reply {
+    const start_us = monotonic.nowUs();
     const data = exchangeOn(conn, allocator, wire_query) catch |err| {
         pool.release(key, conn, false);
         return if (err == error.OutOfMemory) error.OutOfMemory else null;
     };
+    const exchange_us = monotonic.nowUs() - start_us;
     pool_mod.applyKeepaliveHint(conn, data);
     pool.release(key, conn, true);
-    return data;
+    return .{ .data = data, .exchange_us = exchange_us };
 }
 
 fn exchangeOn(conn: *Connection, allocator: Allocator, wire_query: []const u8) ![]u8 {
@@ -195,13 +203,13 @@ test "query dials cold then reuses the pooled connection against 1.1.1.1:853" {
     var wire_buf: [dns.max_udp_payload]u8 = undefined;
     const wire_query = try dns.serializeMessage(&wire_buf, msg);
 
-    const first = try query(&pool, testing.allocator, wire_query, server, monotonic.nowNs() + 10 * std.time.ns_per_s) orelse
-        return error.SkipZigTest;
+    const first = (try query(&pool, testing.allocator, wire_query, server, monotonic.nowNs() + 10 * std.time.ns_per_s) orelse
+        return error.SkipZigTest).data;
     defer testing.allocator.free(first);
     try testing.expectEqual(@as(usize, 1), pool.total_conns);
 
-    const second = try query(&pool, testing.allocator, wire_query, server, monotonic.nowNs() + 10 * std.time.ns_per_s) orelse
-        return error.SkipZigTest;
+    const second = (try query(&pool, testing.allocator, wire_query, server, monotonic.nowNs() + 10 * std.time.ns_per_s) orelse
+        return error.SkipZigTest).data;
     defer testing.allocator.free(second);
     try testing.expectEqual(@as(usize, 1), pool.total_conns);
 

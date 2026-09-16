@@ -1503,11 +1503,13 @@ pub const RecursiveResolver = struct {
     ) error{OutOfMemory}!?dns.Message {
         if (!self.transports.?.tcp_enabled) return null;
         const tcp_buf = try allocator.alloc(u8, dns.max_message_len);
-        const tcp_data = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, timeout) catch |err| {
+        const reply = blocking_transport.queryTcp(self.io, wire_query, server, tcp_buf, timeout) catch |err| {
             var addr_buf: [64]u8 = undefined;
             log.debug("TCP query to {s} failed: {s} (timeout {d}ms)", .{ na.format(server, &addr_buf), @errorName(err), timeout });
             return null;
         };
+        if (self.rtt_cache) |rc| rc.recordSuccess(AddressKey.fromAddress(server), reply.exchange_us);
+        const tcp_data = reply.data;
         // Nowhere left to escalate: TC over TCP is a broken server. Null
         // is the .timeout path, on to a sibling.
         if (dns.hasTcBit(tcp_data)) {
@@ -1623,12 +1625,13 @@ pub const RecursiveResolver = struct {
         const budget_ms = @min(self.remainingMs(), full_ms);
         const deadline_ns = monotonic.nowNs() + @as(i128, budget_ms) * std.time.ns_per_ms;
         const verdict: ?dns.Message = blk: {
-            const tls_data = try tls_transport.query(&oc.pool, allocator, padded_query, server, deadline_ns) orelse {
+            const reply = try tls_transport.query(&oc.pool, allocator, padded_query, server, deadline_ns) orelse {
                 // A clipped-budget miss is ours.
                 if (budget_ms < full_ms or budget_ms == 0) return null;
                 break :blk null;
             };
-            const r = try tryParseMessage(allocator, tls_data, server) orelse break :blk null;
+            if (self.rtt_cache) |rc| rc.recordSuccess(AddressKey.fromAddress(server), reply.exchange_us);
+            const r = try tryParseMessage(allocator, reply.data, server) orelse break :blk null;
             if (r.header.flags.rcode == .format_error) break :blk null;
             if (!dns.validateQuestionMatch(r, padded_msg.questions[0].name, qtype)) {
                 // RFC 9619: error replies may omit the question; no demotion.
@@ -1639,8 +1642,6 @@ pub const RecursiveResolver = struct {
         };
         oc.record(server, verdict != null);
         const response = verdict orelse return null;
-        // Clear the Do53 death ratchet; RTT estimates stay untouched.
-        if (self.rtt_cache) |rc| rc.recordAlive(AddressKey.fromAddress(server));
         _ = oc.dot_answers.fetchAdd(1, .monotonic);
         return response;
     }
