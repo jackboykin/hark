@@ -600,7 +600,18 @@ pub const RecursiveResolver = struct {
         }
     };
 
-    fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) anyerror!ResolveResult {
+    /// Explicit: the walk recurses through itself.
+    pub const ResolveError = dns.Error || error{
+        CacheOnlyMiss,
+        Timeout,
+        ResolveDeadline,
+        GlobalQueryBudgetExhausted,
+        CnameChainTooLong,
+        MaxDelegationsExceeded,
+        NoGlueRecords,
+    };
+
+    fn resolveImpl(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) ResolveError!ResolveResult {
         var current_name: []const u8 = name;
         // total_probes bounds QMIN iterations (including cache-hit advances).
         var total_probes: usize = 0;
@@ -1837,7 +1848,7 @@ pub const RecursiveResolver = struct {
         query_type: dns.RType,
         servers: []na.Address,
         parent_zone: dns.Name,
-    ) anyerror!ServerQueryResult {
+    ) !ServerQueryResult {
         if (self.cache_only) return error.CacheOnlyMiss;
 
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
