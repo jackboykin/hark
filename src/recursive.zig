@@ -76,7 +76,7 @@ const max_global_queries = 100;
 const max_resolve_ms: u32 = 7_000;
 // Real depth tops out near 5; 16 covers QMIN-with-referrals stacks.
 const max_delegations = 16;
-const max_servers_per_level = 26;
+pub const max_servers_per_level = 26;
 // Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
 const max_cname_chain = 16;
 // QMIN probe ceiling; past it, queries go straight to the full qname

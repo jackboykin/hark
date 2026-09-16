@@ -136,6 +136,7 @@ pub const ServerConfig = struct {
 const ConfigError = error{
     InvalidListenAddress,
     InvalidRootHintAddress,
+    TooManyRootHints,
     InvalidValue,
     InvalidWorkerCount,
     InvalidQueryMemoryLimit,
@@ -395,6 +396,12 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     if (parsed.table.getTable("resolver")) |resolver| {
         if (resolver.getStringArray("root-hints")) |addrs| {
             const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
+            const max_hints = @import("recursive.zig").max_servers_per_level;
+            if (new_hints.len > max_hints) {
+                errLog("config: root-hints holds at most {d} addresses, got {d}", .{ max_hints, new_hints.len });
+                allocator.free(new_hints);
+                return error.TooManyRootHints;
+            }
             allocator.free(cfg.root_hints);
             cfg.root_hints = new_hints;
         }
@@ -945,7 +952,6 @@ test "test-only knobs gated on -Dtesting" {
     const cfg_text =
         \\[resolver]
         \\upstream-port = 5353
-        \\allow-loopback-upstreams = true
         \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
     ;
     if (build_options.testing_enabled) {
@@ -1023,6 +1029,13 @@ test "an out-of-range integer is rejected, never clamped" {
 fn parseConfigOomProbe(allocator: Allocator, contents: []const u8) !void {
     var cfg = try parseConfig(allocator, contents);
     cfg.deinit();
+}
+
+test "root-hints refuses more addresses than a walk level holds" {
+    try testing.expectError(error.TooManyRootHints, parseConfig(testing.allocator,
+        \\[resolver]
+        \\root-hints = ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53", "192.0.2.4:53", "192.0.2.5:53", "192.0.2.6:53", "192.0.2.7:53", "192.0.2.8:53", "192.0.2.9:53", "192.0.2.10:53", "192.0.2.11:53", "192.0.2.12:53", "192.0.2.13:53", "192.0.2.14:53", "192.0.2.15:53", "192.0.2.16:53", "192.0.2.17:53", "192.0.2.18:53", "192.0.2.19:53", "192.0.2.20:53", "192.0.2.21:53", "192.0.2.22:53", "192.0.2.23:53", "192.0.2.24:53", "192.0.2.25:53", "192.0.2.26:53", "192.0.2.27:53"]
+    ));
 }
 
 test "parseConfig handles OOM without leaking" {
