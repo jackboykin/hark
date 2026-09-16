@@ -549,6 +549,7 @@ pub const Server = struct {
             if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
             if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
         }
+        if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
 
         for (rigs[1..], 1..) |*rig, i| {
             _ = std.Thread.spawn(.{}, runWorker, .{ self, rig, listen_addrs.len, @as(posix.fd_t, -1) }) catch |err| {
