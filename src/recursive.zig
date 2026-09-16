@@ -1509,6 +1509,13 @@ pub const RecursiveResolver = struct {
             log.debug("TCP query to {s} failed: {s}", .{ na.format(server, &addr_buf), @errorName(err) });
             return null;
         };
+        // Nowhere left to escalate: TC over TCP is a broken server. Null
+        // is the .timeout path, on to a sibling.
+        if (dns.hasTcBit(tcp_data)) {
+            var addr_buf: [64]u8 = undefined;
+            log.debug("TC over TCP from {s}; skipping server", .{na.format(server, &addr_buf)});
+            return null;
+        }
         return try tryParseMessage(allocator, tcp_data, server);
     }
 
