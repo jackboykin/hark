@@ -2160,6 +2160,8 @@ pub const RecursiveResolver = struct {
             const response = exchange.message;
             const rcode = response.header.flags.rcode;
             if (rcode != .no_error) {
+                var addr_buf: [64]u8 = undefined;
+                log.debug("{s} {s} probe: {s} from {s}", .{ zone_name, @tagName(qtype), @tagName(rcode), na.format(server, &addr_buf) });
                 // NXDOMAIN on a DS probe is the parent answering; SERVFAIL is not.
                 self.recordNsOutcome(arm_zone, server, if (rcode.isServerError()) .server_error else .success, exchange.elapsed_us);
                 continue;
