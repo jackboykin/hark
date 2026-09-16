@@ -477,6 +477,7 @@ pub const EventLoop = struct {
             };
         }
         const buf_id = try cqe.buffer_id();
+        if (buf_id >= ring.buffers_count) return error.RecvFailed;
         // Past this point the kernel has claimed a buffer; any parse
         // failure must return it to the ring, or malformed-packet
         // bursts will starve the ring to ENOBUFS.
