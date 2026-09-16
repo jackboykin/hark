@@ -10,7 +10,10 @@ const initial_timeout_ms: u32 = 400;
 
 /// Minimum RTO floor. With the rttvar floor (srtt/4) guaranteeing
 /// jitter headroom, this only catches degenerate sub-millisecond RTTs.
-const min_timeout_ms: u32 = 50;
+/// Per round trip; a cold exchange gets one per `Transport.coldRtts`. At
+/// 50 a two-round-trip exchange to a 20 ms server timed out once in ~400.
+const min_timeout_ms: u32 = 100;
+const min_stagger_ms: u32 = 50;
 
 /// How a query reaches a server. The estimate is the exchange leg on an
 /// established path, the same quantity on every transport; a cold
@@ -197,7 +200,7 @@ pub const RttCache = struct {
 
         const stagger_us = @as(i64, hedge_multiplier) * state.min_rtt_us;
         const stagger_ms: u32 = @intCast(@max(1, @divTrunc(stagger_us, 1000)));
-        return @max(min_timeout_ms, @min(stagger_ms, max_hedge_stagger_ms));
+        return @max(min_stagger_ms, @min(stagger_ms, max_hedge_stagger_ms));
     }
 
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
