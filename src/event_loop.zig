@@ -515,6 +515,15 @@ fn createTestLoop() !*EventLoop {
     return loop;
 }
 
+fn bindTestUdp() !posix.fd_t {
+    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    errdefer sys.close(sock);
+    const addr = na.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var pa: na.PosixAddress = undefined;
+    try sys.bind(sock, &pa.any, na.toSockaddr(&addr, &pa));
+    return sock;
+}
+
 test "Slot stays lean — read ops must not drag packet-sized buffers back in" {
     // The pre-union Slot carried a 4 KiB recv_buf in every slot whether
     // the op needed it or not (~256 KiB/worker dead). Budget: the small
@@ -593,12 +602,8 @@ test "EventLoop recvFromMulti receives multiple packets on one SQE" {
     const loop = try createTestLoop();
     defer loop.destroy();
 
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sock = try bindTestUdp();
     defer sys.close(sock);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(sock, &bind_pa.any, bind_len);
     const server_addr = try na.getSockName(sock);
 
     var ctx: u8 = 1;
@@ -674,11 +679,7 @@ test "termination is reported per-CQE, not by asking the recycled slot table" {
     var ctxs: [2]u8 = .{ 1, 2 };
     var ops: [2]?OperationId = undefined;
     for (&socks, 0..) |*s, i| {
-        s.* = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-        const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-        var bind_pa: na.PosixAddress = undefined;
-        const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-        try sys.bind(s.*, &bind_pa.any, bind_len);
+        s.* = try bindTestUdp();
         ops[i] = try loop.recvFromMulti(s.*, @ptrCast(&ctxs[i]));
     }
     defer for (socks) |s| sys.close(s);
@@ -749,12 +750,8 @@ test "read payload survives an op arming into the freed slot mid-batch" {
 
     // Arm a recvmsg — allocSlot pops the just-freed read slot and initOp
     // writes the recv_multi msghdr over the shared union storage.
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sock = try bindTestUdp();
     defer sys.close(sock);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(sock, &bind_pa.any, bind_len);
     _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
     try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
@@ -766,12 +763,8 @@ test "truncated datagram is rejected without tearing down the multishot" {
     const loop = try createTestLoop();
     defer loop.destroy();
 
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sock = try bindTestUdp();
     defer sys.close(sock);
-    const bind_na = na.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var bind_pa: na.PosixAddress = undefined;
-    const bind_len = na.toSockaddr(&bind_na, &bind_pa);
-    try sys.bind(sock, &bind_pa.any, bind_len);
     const server_addr = try na.getSockName(sock);
     var pa: na.PosixAddress = undefined;
     const sa_len = na.toSockaddr(&server_addr, &pa);
