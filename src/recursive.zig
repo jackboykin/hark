@@ -570,6 +570,9 @@ pub const RecursiveResolver = struct {
         /// when the set is exhausted.
         pending: []const dns.Name = &.{},
         delegations: usize = 0,
+        /// `zone` signs with an algorithm whose DO answers overflow 1232,
+        /// decided where the cut is: from the referral's DS, else the cache.
+        tcp: bool = false,
         /// RFC 9156 probe depth: labels of `target` sent in the next query.
         /// Equal to `target.labels.len` means the full name goes out.
         probe_labels: usize = 0,
@@ -677,7 +680,7 @@ pub const RecursiveResolver = struct {
                 }
 
                 try self.consumeQuery();
-                const sqr = self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone) catch |err| {
+                const sqr = self.queryAuthoritativeServers(allocator, query_name, query_type, walk.addrs[0..walk.addr_count], walk.zone, walk.tcp) catch |err| {
                     if (err == error.Timeout and try self.moreServers(allocator, &walk, depth)) continue;
                     return err;
                 };
@@ -927,6 +930,8 @@ pub const RecursiveResolver = struct {
             walk.setServers(deleg.addrs[0..deleg.count]);
             walk.pending = deleg.pending;
             walk.zone = deleg.zone;
+            var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
+            walk.tcp = self.zoneTruncates(deleg.zone.formatInto(&zone_buf));
 
             if (security_state.* == .secure and deleg.insecure) security_state.* = .insecure;
             return;
@@ -1226,6 +1231,7 @@ pub const RecursiveResolver = struct {
         if (walk.delegations >= max_delegations) return error.MaxDelegationsExceeded;
         walk.delegations += 1;
         walk.zone = zone_cut;
+        walk.tcp = dnssec.dsExceedsUdp(authorities);
         walk.setServers(set.servers());
         walk.pending = try allocator.dupe(dns.Name, set.pendingNames());
     }
@@ -1546,7 +1552,8 @@ pub const RecursiveResolver = struct {
     }
 
     /// A DS naming ML-DSA-44 means every DO answer truncates at 1232: TCP
-    /// first. A TTL-0 DS never caches, so the DNSKEY fetch passes the flag itself.
+    /// first. A TTL-0 DS never caches, so the referral and the DNSKEY fetch
+    /// read the DS in hand.
     fn zoneTruncates(self: *RecursiveResolver, zone: []const u8) bool {
         const kc = self.keyCache() orelse return false;
         return kc.anyRdata(zone, .ds, .in, dnssec.dsRdataExceedsUdp);
@@ -1848,6 +1855,7 @@ pub const RecursiveResolver = struct {
         query_type: dns.RType,
         servers: []na.Address,
         parent_zone: dns.Name,
+        zone_truncates: bool,
     ) !ServerQueryResult {
         if (self.cache_only) return error.CacheOnlyMiss;
 
@@ -1885,8 +1893,7 @@ pub const RecursiveResolver = struct {
         }
 
         // The race is UDP; here it would only race to TC bits.
-        var zone_buf: [dns.max_dotted_len + 1]u8 = undefined;
-        const tcp_first = self.dnssec_aware and self.zoneTruncates(parent_zone.formatInto(&zone_buf));
+        const tcp_first = self.dnssec_aware and zone_truncates;
 
         if (!tcp_first and sel.len >= 2 and self.stagger_ms > 0) {
             if (try self.tryStaggeredQuery(allocator, query_name, query_type, servers, sel, parent_zone)) |stag| {
@@ -4670,7 +4677,7 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
     var servers: [max_servers_per_level]na.Address = undefined;
     servers[0] = na.initIp4(.{ 192, 0, 2, 1 }, 53);
     const parent_zone = dns.Name{ .labels = &.{} };
-    const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, servers[0..1], parent_zone);
+    const result = resolver.queryAuthoritativeServers(testing.allocator, "example.com", .a, servers[0..1], parent_zone, false);
     try testing.expectError(error.CacheOnlyMiss, result);
 }
 
