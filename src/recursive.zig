@@ -1612,7 +1612,7 @@ pub const RecursiveResolver = struct {
         qtype: dns.RType,
         server: na.Address,
         oc: *EncryptedNs,
-    ) !?dns.Message {
+    ) !?DotReply {
         const query_id = rand.queryId(self.io);
         const padded_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
             .rd = false,
@@ -1624,7 +1624,7 @@ pub const RecursiveResolver = struct {
         const full_ms = self.coldTimeout(AddressKey.fromAddress(server), false, .dot);
         const budget_ms = @min(self.remainingMs(), full_ms);
         const deadline_ns = monotonic.nowNs() + @as(i128, budget_ms) * std.time.ns_per_ms;
-        const verdict: ?dns.Message = blk: {
+        const verdict: ?DotReply = blk: {
             const reply = try tls_transport.query(&oc.pool, allocator, padded_query, server, deadline_ns) orelse {
                 // A clipped-budget miss is ours.
                 if (budget_ms < full_ms or budget_ms == 0) return null;
@@ -1638,13 +1638,14 @@ pub const RecursiveResolver = struct {
                 if (r.questions.len == 0 and r.header.flags.rcode.isServerError()) return null;
                 break :blk null;
             }
-            break :blk r;
+            break :blk .{ .message = r, .exchange_us = reply.exchange_us };
         };
         oc.record(server, verdict != null);
-        const response = verdict orelse return null;
-        _ = oc.dot_answers.fetchAdd(1, .monotonic);
-        return response;
+        if (verdict != null) _ = oc.dot_answers.fetchAdd(1, .monotonic);
+        return verdict;
     }
+
+    const DotReply = struct { message: dns.Message, exchange_us: i64 };
 
     /// Cap on simultaneous staggered legs. Matches typical ns_fetch_limit at
     /// depth 0; must not exceed `BlockingUdpTransport.max_staggered_legs`.
@@ -1845,12 +1846,13 @@ pub const RecursiveResolver = struct {
             for (sel[0..@min(sel.len, max_staggered_legs)]) |idx| oc.discover(servers[idx]);
             for (sel) |idx| {
                 if (oc.getStatus(servers[idx]) != .capable) continue;
-                if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |tls_response| {
-                    if (self.shouldTrySibling(tls_response, parent_zone)) {
-                        recordFailure(&last_server_failure, tls_response);
+                if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |dot| {
+                    if (self.shouldTrySibling(dot.message, parent_zone)) {
+                        self.recordNsOutcome(parent_zone, servers[idx], .server_error, dot.exchange_us);
+                        recordFailure(&last_server_failure, dot.message);
                     } else {
-                        // TLS latency would poison the Do53 RTT estimates.
-                        return .{ .message = tls_response, .responding_server = null };
+                        self.recordNsOutcome(parent_zone, servers[idx], .success, dot.exchange_us);
+                        return .{ .message = dot.message, .responding_server = servers[idx] };
                     }
                 }
                 break;
