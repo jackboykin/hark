@@ -67,7 +67,7 @@ MATCH_VALID_FLAGS = frozenset({
 # copy_id is a no-op; copy_query echoes the query's QUESTION section.
 # `force_lower_qname` opts the response out of the verbatim-echo default
 # and forces the question name to lowercase — used to test hark's 0x20
-# echo verification (`eqlExact` mismatch → markCaseBroken + retry).
+# echo verification (`eqlExact` mismatch → retry over TCP).
 ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query", "force_lower_qname"})
 
 # Section names → dnspython section indices via parse helper. QUERY_LOG is a

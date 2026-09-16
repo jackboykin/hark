@@ -7,7 +7,6 @@ pub const dnssec = @import("dnssec.zig");
 pub const tls_transport = @import("tls_transport.zig");
 pub const connection_pool = @import("connection_pool.zig");
 pub const encrypted_ns = @import("encrypted_ns.zig");
-pub const case_state = @import("case_state.zig");
 pub const toml = @import("toml.zig");
 pub const config = @import("config.zig");
 pub const server = @import("server.zig");
@@ -48,7 +47,6 @@ test {
     _ = @import("tls_transport.zig");
     _ = @import("connection_pool.zig");
     _ = @import("encrypted_ns.zig");
-    _ = @import("case_state.zig");
     _ = @import("toml.zig");
     _ = @import("config.zig");
     _ = @import("server.zig");

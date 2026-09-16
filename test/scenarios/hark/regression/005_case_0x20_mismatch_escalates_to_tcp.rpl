@@ -1,0 +1,48 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN 0x20-case mismatch on echoed question retries over TCP
+
+; A mangled 0x20 echo is resent to the same auth over TCP. The UDP
+; entry lowercases the echo and answers a decoy; TCP answers for real.
+; 36 eligible letters: P(no retry) = 2^-36.
+
+RANGE_BEGIN 0 100
+  ENTRY_BEGIN
+    MATCH opcode qname qtype UDP
+    ADJUST copy_id copy_query force_lower_qname
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      abcdefghijklmnopqrstuvwxyz.example.com. IN A
+    SECTION ANSWER
+      abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.99
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype TCP
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      abcdefghijklmnopqrstuvwxyz.example.com. IN A
+    SECTION ANSWER
+      abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    abcdefghijklmnopqrstuvwxyz.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    abcdefghijklmnopqrstuvwxyz.example.com. IN A
+  SECTION ANSWER
+    abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

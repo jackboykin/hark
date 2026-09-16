@@ -12,7 +12,6 @@ const max_operations = @import("event_loop.zig").max_operations;
 const recursive = @import("recursive.zig");
 const acl = @import("acl.zig");
 const EncryptedNs = @import("encrypted_ns.zig").EncryptedNs;
-const CaseState = @import("case_state.zig").CaseState;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const cache_mod = @import("cache.zig");
@@ -291,7 +290,6 @@ pub const Server = struct {
     ns_selector: NsSelector,
     dedup: InFlightTable,
     encrypted_ns: ?EncryptedNs,
-    case_state: ?CaseState,
     nsec_cache: ?NsecCache,
     key_cache: ?RRsetCache,
     udp_queue_drops: std.atomic.Value(u64) align(std.atomic.cache_line),
@@ -379,7 +377,6 @@ pub const Server = struct {
             .ns_selector = ns_selector,
             .dedup = InFlightTable.init(allocator, io),
             .encrypted_ns = if (cfg.opportunistic) EncryptedNs.init(allocator, io, cfg.upstream_tcp_idle_sec) else null,
-            .case_state = if (cfg.case_randomization) CaseState.init(allocator, io) else null,
             .nsec_cache = if (cfg.dnssec) NsecCache.init(.{
                 .backing = allocator,
                 .max_bytes = NsecCache.default_max_bytes,
@@ -412,7 +409,6 @@ pub const Server = struct {
             .rtt_cache = &self.rtt_cache,
             .ns_selector = &self.ns_selector,
             .encrypted_ns = if (self.encrypted_ns) |*oc| oc else null,
-            .case_state = if (self.case_state) |*cs| cs else null,
             .dedup = &self.dedup,
             .nsec_cache = if (self.nsec_cache) |*nc| nc else null,
             .key_cache = if (self.key_cache) |*kc| kc else null,
@@ -450,7 +446,6 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         if (self.encrypted_ns) |*oc| oc.deinit();
-        if (self.case_state) |*cs| cs.deinit();
         self.dedup.deinit();
         if (self.nsec_cache) |*nc| nc.deinit();
         if (self.key_cache) |*kc| kc.deinit();

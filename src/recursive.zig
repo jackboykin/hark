@@ -28,7 +28,6 @@ const RRsetCache = cache_mod.RRsetCache;
 const dedup_mod = @import("dedup.zig");
 const InFlightTable = dedup_mod.InFlightTable;
 const NsecCache = @import("nsec_cache.zig").NsecCache;
-const CaseState = @import("case_state.zig").CaseState;
 const ServerConfig = @import("config.zig").ServerConfig;
 const log = std.log.scoped(.resolver);
 
@@ -277,9 +276,8 @@ pub const RecursiveResolver = struct {
     /// is the interval only when no RTT cache is wired (tests).
     stagger_ms: u32 = 0,
 
-    /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon). null when
-    /// disabled.
-    case_state: ?*CaseState = null,
+    /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon).
+    case_randomization: bool = true,
 
     /// Mirrors config `prefetch-cousin`; gates SVCB cousin extraction.
     prefetch_cousin: bool = true,
@@ -318,7 +316,6 @@ pub const RecursiveResolver = struct {
         rtt_cache: *RttCache,
         ns_selector: *NsSelector,
         encrypted_ns: ?*EncryptedNs,
-        case_state: ?*CaseState,
         dedup: ?*InFlightTable,
         nsec_cache: ?*NsecCache,
         key_cache: ?*RRsetCache,
@@ -361,7 +358,7 @@ pub const RecursiveResolver = struct {
             .dns64 = if (opts.cd) null else ctx.config.dns64,
             .stagger_ms = ctx.config.stagger_ms,
             .prefetch_cousin = ctx.config.prefetch_cousin,
-            .case_state = ctx.case_state,
+            .case_randomization = ctx.config.case_randomization,
             .dedup = ctx.dedup,
             .fanout = true,
             .query_memory_limit = ctx.config.query_memory_limit,
@@ -1526,25 +1523,14 @@ pub const RecursiveResolver = struct {
         return kc.anyRdata(zone, .ds, .in, dnssec.dsRdataExceedsUdp);
     }
 
-    fn caseRng(self: *RecursiveResolver, addr_key: AddressKey) ?std.Io {
-        const cs = self.case_state orelse return null;
-        return if (cs.shouldRandomize(addr_key)) self.io else null;
-    }
-
-    /// Mark a server as 0x20 case-mangling. Subsequent queries to it skip
-    /// randomization for `reprobe_sec`.
-    fn markCaseBroken(self: *RecursiveResolver, server: na.Address) void {
-        const cs = self.case_state orelse return;
-        cs.markBroken(AddressKey.fromAddress(server));
-        var addr_buf: [64]u8 = undefined;
-        log.debug("0x20 case mangled by {s}; marking non-conformant", .{na.format(server, &addr_buf)});
+    fn caseRng(self: *RecursiveResolver) ?std.Io {
+        return if (self.case_randomization) self.io else null;
     }
 
     /// True only when the echoed question is the query name with mangled
     /// byte case. Error rcodes are exempt from question-match (RFC 9619 /
     /// validateResponse), so a reply can arrive question-less or carrying
-    /// an unrelated question — neither is evidence of case-mangling and
-    /// must not mark the server broken.
+    /// an unrelated question — neither is evidence of case-mangling.
     fn caseMangledEcho(query_name: dns.Name, response: dns.Message) bool {
         return response.questions.len == 1 and
             query_name.eql(response.questions[0].name) and
@@ -1562,8 +1548,10 @@ pub const RecursiveResolver = struct {
 
     /// The 0x20 retry kernel for all Do53 upstream queries: fresh TXID and
     /// random case per attempt (RFC 5452 §9.2), UDP unless the zone is
-    /// known to truncate. A mangled echo marks the server and resends
-    /// lowercase once; the mark expires so a removed middlebox recovers.
+    /// known to truncate. A mangled echo is a middlebox or a forgery that
+    /// guessed TXID and port; the resend goes over TCP, which settles
+    /// both. Nothing is remembered per server: a mark that lowercases
+    /// later queries would let one forgery switch 0x20 off.
     fn do53CaseHardened(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1574,7 +1562,8 @@ pub const RecursiveResolver = struct {
         do_bit: bool,
         tcp_first: bool,
     ) !Do53Result {
-        var case_rng = self.caseRng(AddressKey.fromAddress(server));
+        const case_rng = self.caseRng();
+        var tcp = tcp_first;
         while (true) {
             const query_id = rand.queryId(self.io);
             const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
@@ -1586,7 +1575,7 @@ pub const RecursiveResolver = struct {
             const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
             const start_us = monotonic.nowUs();
-            const response = try (if (tcp_first)
+            const response = try (if (tcp)
                 self.queryServerTcp(allocator, wire_query, server, timeout)
             else
                 self.queryServerUdp(allocator, wire_query, query_id, server, timeout)) orelse
@@ -1596,9 +1585,10 @@ pub const RecursiveResolver = struct {
             // RFC 5452 §9.1 / RFC 9619: question must match; error rcodes exempt.
             dns.validateResponse(response, query_msg.questions[0].name, qtype) catch return .mismatch;
 
-            if (case_rng != null and caseMangledEcho(query_msg.questions[0].name, response)) {
-                self.markCaseBroken(server);
-                case_rng = null;
+            if (!tcp and case_rng != null and caseMangledEcho(query_msg.questions[0].name, response)) {
+                var addr_buf: [64]u8 = undefined;
+                log.debug("0x20 case mangled by {s}; retrying over TCP", .{na.format(server, &addr_buf)});
+                tcp = true;
                 continue;
             }
             return .{ .response = .{ .message = response, .elapsed_us = elapsed_us } };
@@ -1698,22 +1688,8 @@ pub const RecursiveResolver = struct {
         var qids: [max_staggered_legs]u16 = undefined;
         var leg_addrs: [max_staggered_legs]na.Address = undefined;
 
-        // All legs share one case pattern (memcpy + ID-patch optimization),
-        // so disable 0x20 if any leg is marked. Per-leg builds would let
-        // unmarked legs keep 0x20, but cost extra serializes and a per-leg
-        // sent-name table to verify the winner against. The sequential
-        // fallback preserves per-server protection, so the staggered path
-        // can take the simpler hit. Trade reconsidered if measurement
-        // shows the sequential fallback is firing often.
-        var case_rng: ?std.Io = self.caseRng(AddressKey.fromAddress(servers[leg_idxs[0]]));
-        if (case_rng != null) {
-            for (leg_idxs[1..leg_count]) |idx| {
-                if (self.caseRng(AddressKey.fromAddress(servers[idx])) == null) {
-                    case_rng = null;
-                    break;
-                }
-            }
-        }
+        // All legs share one case pattern (memcpy + ID-patch optimization).
+        const case_rng = self.caseRng();
 
         qids[0] = rand.queryId(self.io);
         const msg0 = dns.buildQuery(allocator, qids[0], query_name, query_type, .{
@@ -1753,7 +1729,7 @@ pub const RecursiveResolver = struct {
         // RFC 2181 §9: TC-set response cannot be used. Retry the winning
         // server over TCP immediately; falling through to the sequential loop
         // would re-query servers that already lost the race (wasted UDP RTTs).
-        const resp = if (dns.hasTcBit(stag_result.response_data))
+        var resp = if (dns.hasTcBit(stag_result.response_data))
             try self.queryServerTcp(allocator, wires[winner], responding_addr, self.remainingMs()) orelse return null
         else
             try tryParseMessage(allocator, stag_result.response_data, responding_addr) orelse return null;
@@ -1762,11 +1738,10 @@ pub const RecursiveResolver = struct {
         // the query. (The sequential path enforces this via queryAuthoritativeServers.)
         dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
 
-        // 0x20 echo verify. Mark and bail to sequential, which will rebuild
-        // lowercase against the same server and retry properly.
+        // Mangled echo: settle over TCP, like TC (see do53CaseHardened).
         if (case_rng != null and caseMangledEcho(msg0.questions[0].name, resp)) {
-            self.markCaseBroken(responding_addr);
-            return null;
+            resp = try self.queryServerTcp(allocator, wires[winner], responding_addr, self.remainingMs()) orelse return null;
+            dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
         }
 
         // The sequential server_loop handles this via `last_server_failure`,
