@@ -373,12 +373,12 @@ pub const EventLoop = struct {
         sqe.user_data = std.math.maxInt(u64);
     }
 
-    pub fn tick(self: *EventLoop, completions_buf: []Completion) ![]Completion {
+    pub fn tick(self: *EventLoop, completions_buf: *[max_operations]Completion) ![]Completion {
         _ = try self.ring.submit_and_wait(1);
         return self.reapCompletions(completions_buf);
     }
 
-    fn reapCompletions(self: *EventLoop, buf: []Completion) ![]Completion {
+    fn reapCompletions(self: *EventLoop, buf: *[max_operations]Completion) ![]Completion {
         var cqes: [max_operations]linux.io_uring_cqe = undefined;
         const count = try self.ring.copy_cqes(&cqes, 0);
 
@@ -390,11 +390,6 @@ pub const EventLoop = struct {
             const id: OperationId = @intCast(cqe.user_data);
             const slot = &self.slots[id];
             if (!slot.active) continue;
-
-            if (out >= buf.len) {
-                self.freeSlot(id);
-                continue;
-            }
 
             const completion = &buf[out];
             completion.context = slot.context;
