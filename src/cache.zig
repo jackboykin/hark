@@ -205,11 +205,18 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
     };
 }
 
+const Lifetime = struct {
+    stored_at: i64,
+    ttl: u32,
+
+    fn expiresAt(self: Lifetime) i64 {
+        return self.stored_at + self.ttl;
+    }
+};
+
 const CachedRRset = struct {
     pack: Pack,
-    expires_at: i64,
-    original_ttl: u32,
-    stored_at: i64,
+    life: Lifetime,
     security_status: SecurityStatus = .unchecked,
     /// The parent's lease on an NS set: a referral grants it, a child's own
     /// NS inherits it from a live entry but never mints or extends it, and
@@ -219,9 +226,7 @@ const CachedRRset = struct {
 
 const NegativeEntry = struct {
     rcode: dns.RCode,
-    expires_at: i64,
-    original_ttl: u32,
-    stored_at: i64,
+    life: Lifetime,
     /// SOA as records[0] when present.
     pack: Pack = .{},
     security_status: SecurityStatus = .unchecked,
@@ -233,8 +238,8 @@ pub const CacheEntry = union(enum) {
 
     fn expiresAt(self: CacheEntry) i64 {
         return switch (self) {
-            .positive => |p| p.expires_at,
-            .negative => |n| n.expires_at,
+            .positive => |p| p.life.expiresAt(),
+            .negative => |n| n.life.expiresAt(),
         };
     }
 
@@ -660,7 +665,7 @@ pub const RRsetCache = struct {
             .positive => |p| p,
             .negative => return false,
         };
-        if (self.now_fn() >= rrset.expires_at) return false;
+        if (self.now_fn() >= rrset.life.expiresAt()) return false;
         for (rrset.pack.records()) |cr| {
             if (pred(rrset.pack.wire(cr)[cr.wire_ttl_offset + 6 ..])) return true;
         }
@@ -716,7 +721,7 @@ pub const RRsetCache = struct {
         switch (entry) {
             .positive => |rrset| {
                 if (name_error_only) return null;
-                const hit = self.evalFreshness(rrset.expires_at, rrset.stored_at, rrset.original_ttl, now, false) orelse return null;
+                const hit = self.evalFreshness(rrset.life, now, false) orelse return null;
                 const records = cloneRRset(caller_alloc, rrset.pack, rrset.pack.records(), hit.remaining_ttl) catch return null;
                 // Read path: degrade sigs/proofs to empty on OOM rather than
                 // drop the answer. The records themselves are complete (the
@@ -741,7 +746,7 @@ pub const RRsetCache = struct {
                 // SERVFAIL never serves stale: its short TTL is intentional;
                 // extending it would prolong failure beyond design.
                 const disable_stale = neg.rcode == .server_failure;
-                const hit = self.evalFreshness(neg.expires_at, neg.stored_at, neg.original_ttl, now, disable_stale) orelse return null;
+                const hit = self.evalFreshness(neg.life, now, disable_stale) orelse return null;
                 const soa_rrs = cloneRRset(caller_alloc, neg.pack, neg.pack.records(), hit.remaining_ttl) catch return null;
                 const soa: ?dns.ResourceRecord = if (soa_rrs.len == 0) null else soa_rrs[0];
                 const nsec_proofs: []dns.ResourceRecord = cloneCachedRecords(caller_alloc, neg.pack, neg.pack.proofs(), hit.remaining_ttl) catch &.{};
@@ -786,17 +791,15 @@ pub const RRsetCache = struct {
     /// Returns null on full miss (expired beyond stale window, or stale disabled).
     fn evalFreshness(
         self: *RRsetCache,
-        expires_at: i64,
-        stored_at: i64,
-        original_ttl: u32,
+        life: Lifetime,
         now: i64,
         disable_stale: bool,
     ) ?struct { remaining_ttl: u32, needs_prefetch: bool, is_stale: bool } {
         const cs = &self.read_counters[threadCounterSlot()];
+        const expires_at = life.expiresAt();
         if (now < expires_at) {
-            const elapsed: u32 = @intCast(@min(@max(now - stored_at, 0), original_ttl));
-            const remaining = original_ttl - elapsed;
-            const needs_prefetch = self.prefetch and (remaining <= original_ttl / 10);
+            const remaining: u32 = @intCast(@min(expires_at - now, life.ttl));
+            const needs_prefetch = self.prefetch and (remaining <= life.ttl / 10);
             _ = cs.hits.fetchAdd(1, .monotonic);
             if (needs_prefetch) _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
             return .{ .remaining_ttl = remaining, .needs_prefetch = needs_prefetch, .is_stale = false };
@@ -814,8 +817,6 @@ pub const RRsetCache = struct {
         return .{ .remaining_ttl = 30, .needs_prefetch = true, .is_stale = true };
     }
 
-    const Lifetime = struct { ttl: u32, expires_at: i64, stored_at: i64 };
-
     /// `ttl` arrives floored and capped by config; `authenticated_ttl_max` is
     /// the validator's bound (`maxInt` if none) and goes on last, so `min_ttl`
     /// cannot lift an entry past its own proof.
@@ -826,7 +827,7 @@ pub const RRsetCache = struct {
     fn lifetime(self: *RRsetCache, ttl: u32, authenticated_ttl_max: u32) Lifetime {
         const capped = @min(ttl, authenticated_ttl_max);
         const now = self.now_fn();
-        return .{ .ttl = capped, .expires_at = now + @as(i64, capped), .stored_at = now };
+        return .{ .ttl = capped, .stored_at = now };
     }
 
     /// Cache a positive response's answer section, bailiwick-filtered.
@@ -940,9 +941,7 @@ pub const RRsetCache = struct {
         self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
-            .expires_at = life.expires_at,
-            .original_ttl = life.ttl,
-            .stored_at = life.stored_at,
+            .life = life,
             .pack = pack,
             .security_status = security_status,
         } }) catch {
@@ -983,9 +982,7 @@ pub const RRsetCache = struct {
         self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .negative = .{
             .rcode = rcode,
-            .expires_at = life.expires_at,
-            .original_ttl = life.ttl,
-            .stored_at = life.stored_at,
+            .life = life,
             .security_status = security_status,
         } }) catch {
             slot.alloc.free(slot.key.name);
@@ -1001,7 +998,7 @@ pub const RRsetCache = struct {
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return ttl;
         const prior = shard.map.values()[idx];
         return switch (prior) {
-            .negative => |n| if (n.security_status == .bogus) n.original_ttl *| 2 else ttl,
+            .negative => |n| if (n.security_status == .bogus) n.life.ttl *| 2 else ttl,
             .positive => ttl,
         };
     }
@@ -1047,7 +1044,7 @@ pub const RRsetCache = struct {
             .positive => |p| p,
             .negative => return null,
         };
-        const remaining = p.expires_at - self.now_fn();
+        const remaining = p.life.expiresAt() - self.now_fn();
         return if (p.steer and remaining > 0) @intCast(remaining) else null;
     }
 
@@ -1232,9 +1229,7 @@ pub const RRsetCache = struct {
         self.removeAndFree(slot.shard, slot.h, slot.key);
         slot.shard.map.put(slot.alloc, slot.key, .{ .positive = .{
             .pack = pack,
-            .expires_at = life.expires_at,
-            .original_ttl = life.ttl,
-            .stored_at = life.stored_at,
+            .life = life,
             .security_status = status,
             .steer = lease != null,
         } }) catch {
