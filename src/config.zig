@@ -396,7 +396,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     if (parsed.table.getTable("resolver")) |resolver| {
         if (resolver.getStringArray("root-hints")) |addrs| {
             const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
-            const max_hints = @import("recursive.zig").max_servers_per_level;
+            const max_hints = @import("delegation.zig").max_servers_per_level;
             if (new_hints.len > max_hints) {
                 errLog("config: root-hints holds at most {d} addresses, got {d}", .{ max_hints, new_hints.len });
                 allocator.free(new_hints);

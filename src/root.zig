@@ -2,6 +2,7 @@ pub const dns = @import("dns.zig");
 pub const dns_print = @import("dns_print.zig");
 pub const event_loop = @import("event_loop.zig");
 pub const recursive = @import("recursive.zig");
+pub const delegation = @import("delegation.zig");
 pub const cache = @import("cache.zig");
 pub const dnssec = @import("dnssec.zig");
 pub const tls_transport = @import("tls_transport.zig");
@@ -42,6 +43,7 @@ test {
     _ = @import("dns_print.zig");
     _ = @import("event_loop.zig");
     _ = @import("recursive.zig");
+    _ = @import("delegation.zig");
     _ = @import("cache.zig");
     _ = @import("dnssec.zig");
     _ = @import("tls_transport.zig");

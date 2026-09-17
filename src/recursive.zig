@@ -20,6 +20,9 @@ const RttCache = @import("ns_rtt.zig").RttCache;
 const rand = @import("rand.zig");
 const monotonic = @import("monotonic.zig");
 const na = @import("net_address.zig");
+const delegation = @import("delegation.zig");
+const Walk = delegation.Walk;
+const max_servers_per_level = delegation.max_servers_per_level;
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const NsSelector = @import("ns_selector.zig").NsSelector;
 const NsOutcome = @import("ns_selector.zig").Outcome;
@@ -76,12 +79,8 @@ const max_global_queries = 100;
 const max_resolve_ms: u32 = 7_000;
 // Real depth tops out near 5; 16 covers QMIN-with-referrals stacks.
 const max_delegations = 16;
-pub const max_servers_per_level = 26;
 // Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
 const max_cname_chain = 16;
-// QMIN probe ceiling; past it, queries go straight to the full qname
-// (RFC 9156's MAX_MINIMISE_COUNT).
-const max_minimize_count = 10;
 
 /// Redirect records collected over one resolveImpl chain walk, plus the
 /// wildcard-expansion proofs authenticating them. Always paired and
@@ -232,15 +231,9 @@ pub const RecursiveResolver = struct {
     /// at scripted authoritatives, and by operators running split-horizon
     /// deployments against private root servers.
     root_hints: []const na.Address = &root_hints_default,
-    /// Default port for upstream queries. Used when constructing addresses
-    /// from glue records (which have no port field per RFC 1035). Production
-    /// is always 53. The corresponding `[resolver] upstream-port` config key
-    /// is gated behind `-Dtesting=true`.
-    upstream_port: u16 = 53,
-    /// Bypass the 127/8 rebinding defense for upstream addresses. Tests only.
-    /// The corresponding `[resolver] allow-loopback-upstreams` config key is
-    /// gated behind `-Dtesting=true`.
-    allow_loopback_upstreams: bool = false,
+    /// Glue has no port (RFC 1035) and 127/8 is a rebinding target; both
+    /// bend only for `-Dtesting` keys.
+    upstream: delegation.AddrPolicy = .{},
     /// Root trust anchors. Defaults to the hardcoded IANA list. The server
     /// passes a config-supplied slice when `[resolver] trust-anchors = [...]`
     /// is set (test-only key) — used by the scripted DNSSEC harness to
@@ -346,8 +339,7 @@ pub const RecursiveResolver = struct {
             .transports = transports,
             .io = ctx.io,
             .root_hints = ctx.config.rootHints(),
-            .upstream_port = ctx.config.upstream_port,
-            .allow_loopback_upstreams = ctx.config.allow_loopback_upstreams,
+            .upstream = .{ .upstream_port = ctx.config.upstream_port, .allow_loopback = ctx.config.allow_loopback_upstreams },
             .trust_anchors = ctx.config.trustAnchors(),
             .cache = ctx.cache,
             .qname_minimization = ctx.config.qname_minimization,
@@ -423,13 +415,6 @@ pub const RecursiveResolver = struct {
         if (self.key_cache) |kc| return kc;
         std.debug.assert(!self.dnssec_enabled or self.cache != null);
         return self.cache;
-    }
-
-    fn referralPolicy(self: *RecursiveResolver) ReferralAddrPolicy {
-        return .{
-            .upstream_port = self.upstream_port,
-            .allow_loopback = self.allow_loopback_upstreams,
-        };
     }
 
     /// What the server needs over `transport`, before the query budget.
@@ -572,52 +557,6 @@ pub const RecursiveResolver = struct {
 
     const max_resolve_depth = 3;
 
-    /// Iteration state for one name's descent through the delegation tree.
-    /// Same-zone CNAME hops keep the zone and servers and only restart
-    /// QNAME minimization; cross-zone hops start a fresh Walk.
-    const Walk = struct {
-        name: []const u8,
-        target: dns.Name,
-        zone: dns.Name = .{ .labels = &.{} },
-        addrs: [max_servers_per_level]na.Address = undefined,
-        addr_count: usize = 0,
-        /// NS names still without an address; `moreServers` resolves them
-        /// when the set is exhausted.
-        pending: []const dns.Name = &.{},
-        delegations: usize = 0,
-        /// `zone` signs with an algorithm whose DO answers overflow 1232,
-        /// decided where the cut is: from the referral's DS, else the cache.
-        tcp: bool = false,
-        /// RFC 9156 probe depth: labels of `target` sent in the next query.
-        /// Equal to `target.labels.len` means the full name goes out.
-        probe_labels: usize = 0,
-
-        fn init(allocator: mem.Allocator, name: []const u8) !Walk {
-            return .{ .name = name, .target = try dns.parseDottedName(allocator, name) };
-        }
-
-        fn servers(w: *const Walk) []const na.Address {
-            return w.addrs[0..w.addr_count];
-        }
-
-        fn setServers(w: *Walk, list: []const na.Address) void {
-            w.addr_count = list.len;
-            @memcpy(w.addrs[0..list.len], list);
-        }
-
-        fn stopProbing(w: *Walk) void {
-            w.probe_labels = w.target.labels.len;
-        }
-
-        fn restartProbing(w: *Walk, qmin: bool) void {
-            w.probe_labels = if (qmin) w.zone.labels.len + 1 else w.target.labels.len;
-        }
-
-        fn probeName(w: *const Walk) dns.Name {
-            return .{ .labels = w.target.labels[w.target.labels.len - w.probe_labels ..] };
-        }
-    };
-
     /// Explicit: the walk recurses through itself.
     pub const ResolveError = dns.Error || error{
         CacheOnlyMiss,
@@ -680,8 +619,7 @@ pub const RecursiveResolver = struct {
             walk.restartProbing(self.qname_minimization);
 
             while (true) {
-                const is_final = walk.probe_labels >= walk.target.labels.len or
-                    !self.qname_minimization or total_probes >= max_minimize_count;
+                const is_final = walk.isFinal(self.qname_minimization, total_probes);
 
                 const query_name: []const u8 = if (is_final) walk.name else blk: {
                     var child_buf: [dns.max_dotted_len + 1]u8 = undefined;
@@ -699,7 +637,7 @@ pub const RecursiveResolver = struct {
                     if (err == error.Timeout and try self.moreServers(allocator, &walk, depth)) continue;
                     return err;
                 };
-                if (self.shouldTrySibling(sqr.message, walk.zone) and try self.moreServers(allocator, &walk, depth)) continue;
+                if (delegation.shouldTrySibling(sqr.message, walk.zone, self.upstream) and try self.moreServers(allocator, &walk, depth)) continue;
                 var response = sqr.message;
                 const responding_server = sqr.responding_server;
 
@@ -761,7 +699,7 @@ pub const RecursiveResolver = struct {
                     return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
                 }
 
-                const referral = extractReferral(response, walk.target, walk.zone, self.referralPolicy()) orelse
+                const referral = delegation.extractReferral(response, walk.target, walk.zone, self.upstream) orelse
                     return self.finalizeNegative(allocator, &response, &walk, name, qtype, depth, security_state, &cname_chain);
 
                 if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
@@ -798,53 +736,38 @@ pub const RecursiveResolver = struct {
         query_name: []const u8,
         depth: usize,
     ) !void {
-        const rcode = response.header.flags.rcode;
-        // Referrals only from successful responses: error responses can
-        // carry NS records in authority that are not valid delegations.
-        if (rcode == .no_error) {
-            if (extractReferral(response, walk.target, walk.zone, self.referralPolicy())) |referral| {
+        var neg_ttl_cap: u32 = std.math.maxInt(u32);
+        switch (delegation.probeStep(response, walk, self.upstream)) {
+            .referral => |referral| {
                 if (self.cache) |c| c.storeReferral(response.authorities, response.additionals, walk.zone, referral.zone_cut, referral.nsNames());
                 try self.followReferral(allocator, referral, response.authorities, depth, security_state, walk);
                 walk.restartProbing(self.qname_minimization);
-                return;
-            }
-        }
-
-        if (rcode == .name_error) {
-            // Stop minimizing (relaxed mode) but cache only a `.secure` NXDOMAIN:
-            // `lookupNxdomainAncestor` serves any non-secure negative as an RFC
-            // 8020 NX-cut, so an unsigned RFC 8020 violator's ENT-NXDOMAIN
-            // (dynect.net) would make every child name unresolvable for the
-            // negative TTL.
-            // `.insecure` is excluded too: Opt-Out leaves the name possibly an
-            // unsigned delegation, too thin to cache against the full name.
-            var neg_ttl_cap: u32 = std.math.maxInt(u32);
-            switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.servers(), &neg_ttl_cap)) {
-                .proceed => |status| if (status == .secure) {
-                    if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
-                },
-                .bogus => {},
-            }
-            walk.stopProbing();
-            return;
-        }
-
-        if (rcode != .no_error) return walk.stopProbing();
-
-        if (response.answers.len > 0) {
-            walk.probe_labels += 1;
-            return;
-        }
-
-        // NODATA: the name exists; cache the negative and advance.
-        var neg_ttl_cap: u32 = std.math.maxInt(u32);
-        switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.servers(), &neg_ttl_cap)) {
-            .proceed => |status| if (response.header.flags.aa) {
-                if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
             },
-            .bogus => return walk.stopProbing(),
+            .nxdomain => {
+                // Cache only a `.secure` NXDOMAIN: `lookupNxdomainAncestor`
+                // serves any non-secure negative as an RFC 8020 NX-cut, so an
+                // unsigned RFC 8020 violator's ENT-NXDOMAIN (dynect.net) would
+                // make every child name unresolvable for the negative TTL.
+                // `.insecure` is excluded too: Opt-Out leaves the name possibly
+                // an unsigned delegation, too thin to cache against the full name.
+                switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, true, walk.servers(), &neg_ttl_cap)) {
+                    .proceed => |status| if (status == .secure) {
+                        if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .name_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                    },
+                    .bogus => {},
+                }
+                walk.stopProbing();
+            },
+            .nodata => switch (self.verifiedNegativeResponse(allocator, security_state.*, response.authorities, walk.probeName(), .a, false, walk.servers(), &neg_ttl_cap)) {
+                .proceed => |status| {
+                    if (response.header.flags.aa) if (self.answerCache()) |c| c.storeNegative(query_name, .a, .in, .no_error, response.authorities, walk.zone, status, neg_ttl_cap);
+                    walk.probe_labels += 1;
+                },
+                .bogus => walk.stopProbing(),
+            },
+            .answered => walk.probe_labels += 1,
+            .failed => walk.stopProbing(),
         }
-        walk.probe_labels += 1;
     }
 
     const CnameHop = union(enum) {
@@ -1203,8 +1126,7 @@ pub const RecursiveResolver = struct {
         security_state: *dnssec.SecurityStatus,
     ) void {
         if (!self.dnssec_enabled or security_state.* != .secure) return;
-        if (walk.target.labels.len <= walk.zone.labels.len) return;
-        if (!response.header.flags.aa or hasSignedRecords(response.*)) return;
+        if (!delegation.hidesCut(response.*, walk)) return;
 
         var probe_depth: usize = walk.zone.labels.len + 1;
         while (probe_depth <= walk.target.labels.len) : (probe_depth += 1) {
@@ -1224,7 +1146,7 @@ pub const RecursiveResolver = struct {
     fn followReferral(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
-        referral: ReferralResult,
+        referral: delegation.Referral,
         authorities: []const dns.ResourceRecord,
         depth: usize,
         security_state: *dnssec.SecurityStatus,
@@ -1792,7 +1714,7 @@ pub const RecursiveResolver = struct {
         // but the race path returns first-by-latency — so a fast-failing NS
         // would propagate verbatim without this check. Score and bail to
         // sequential.
-        if (self.shouldTrySibling(resp, parent_zone)) {
+        if (delegation.shouldTrySibling(resp, parent_zone, self.upstream)) {
             self.recordNsOutcome(parent_zone, responding_addr, .server_error, elapsed_us);
             return null;
         }
@@ -1810,50 +1732,6 @@ pub const RecursiveResolver = struct {
         message: dns.Message,
         responding_server: ?na.Address,
     };
-
-    /// RFC 1034 §4.3.5: drop this reply and ask a sibling. SERVFAIL, REFUSED
-    /// and FORMERR (hark never retries without EDNS); a lame reply, non-AA
-    /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
-    /// recursor's cache, RA set and AA clear, which an RD-clear query gets
-    /// only from a server that recursed on its own. A recursor's referral
-    /// is still followed. validateResponse guarantees `questions[0]`.
-    fn shouldTrySibling(self: *RecursiveResolver, response: dns.Message, parent_zone: dns.Name) bool {
-        const flags = response.header.flags;
-        const rec_lame = flags.ra and !flags.aa;
-        switch (flags.rcode) {
-            .server_failure, .refused, .format_error => return true,
-            .name_error => return rec_lame,
-            .no_error => {},
-            else => return false,
-        }
-        if (flags.aa) return false;
-        if (response.answers.len != 0) return rec_lame;
-        for (response.authorities) |rr| if (rr.rtype == .soa) return rec_lame;
-        return extractReferral(response, response.questions[0].name, parent_zone, self.referralPolicy()) == null;
-    }
-
-    /// Which all-siblings-failed rcode a stub deserves: the most
-    /// resolver-meaningful one wins, so the randomized NS order can't flip
-    /// the surfaced answer. SERVFAIL ("I couldn't resolve this") outranks
-    /// REFUSED (a policy stance) outranks FORMERR — a FORMERR only means an
-    /// upstream couldn't parse *hark's* query, never the stub's. Rank 0 is a
-    /// lame or recursor reply and leaves as SERVFAIL.
-    fn failurePrecedence(rcode: dns.RCode) u8 {
-        return switch (rcode) {
-            .server_failure => 3,
-            .refused => 2,
-            .format_error => 1,
-            else => 0,
-        };
-    }
-
-    /// Keep `response` as the fallback failure only if it ranks at least as
-    /// high as the one already held; ties keep the later server.
-    fn recordFailure(held: *?dns.Message, response: dns.Message) void {
-        if (held.* == null or
-            failurePrecedence(response.header.flags.rcode) >= failurePrecedence(held.*.?.header.flags.rcode))
-            held.* = response;
-    }
 
     fn queryAuthoritativeServers(
         self: *RecursiveResolver,
@@ -1887,9 +1765,9 @@ pub const RecursiveResolver = struct {
             for (sel) |idx| {
                 if (oc.getStatus(servers[idx]) != .capable) continue;
                 if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |dot| {
-                    if (self.shouldTrySibling(dot.message, parent_zone)) {
+                    if (delegation.shouldTrySibling(dot.message, parent_zone, self.upstream)) {
                         self.recordNsOutcome(parent_zone, servers[idx], .server_error, dot.exchange_us);
-                        recordFailure(&last_server_failure, dot.message);
+                        delegation.recordFailure(&last_server_failure, dot.message);
                     } else {
                         self.recordNsOutcome(parent_zone, servers[idx], .success, dot.exchange_us);
                         return .{ .message = dot.message, .responding_server = servers[idx] };
@@ -1927,9 +1805,9 @@ pub const RecursiveResolver = struct {
 
             // recordNsOutcome is the persistent per-zone+IP penalty (Thompson
             // arm, reward 0.1 — still selectable if siblings degrade).
-            if (self.shouldTrySibling(response, parent_zone)) {
+            if (delegation.shouldTrySibling(response, parent_zone, self.upstream)) {
                 self.recordNsOutcome(parent_zone, server, .server_error, exchange.elapsed_us);
-                recordFailure(&last_server_failure, response);
+                delegation.recordFailure(&last_server_failure, response);
                 continue :server_loop;
             }
 
@@ -1943,7 +1821,7 @@ pub const RecursiveResolver = struct {
             var tb: [24]u8 = undefined;
             var rb: [24]u8 = undefined;
             log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), dns.safeTagName(sf.header.flags.rcode, &rb) });
-            const message = if (failurePrecedence(sf.header.flags.rcode) == 0) synthesizedMessage(&.{}, &.{}, .server_failure, false) else sf;
+            const message = if (delegation.failurePrecedence(sf.header.flags.rcode) == 0) synthesizedMessage(&.{}, &.{}, .server_failure, false) else sf;
             return .{ .message = message, .responding_server = null };
         }
         {
@@ -2205,7 +2083,7 @@ pub const RecursiveResolver = struct {
                 self.recordNsOutcome(arm_zone, server, if (rcode.isServerError()) .server_error else .success, exchange.elapsed_us);
                 continue;
             }
-            if (zone.labels.len > 0 and self.shouldTrySibling(response, .{ .labels = zone.labels[1..] })) {
+            if (zone.labels.len > 0 and delegation.shouldTrySibling(response, .{ .labels = zone.labels[1..] }, self.upstream)) {
                 self.recordNsOutcome(arm_zone, server, .server_error, exchange.elapsed_us);
                 continue;
             }
@@ -2215,14 +2093,8 @@ pub const RecursiveResolver = struct {
         return null;
     }
 
-    /// Where a lame sibling's referral points when the cut is `zone_name`
-    /// itself (parent one label up; extractReferral wants strictly deeper).
-    /// .fr and afnic.fr share g.ext.nic.fr but not d.nic.fr.
     fn referralAddrs(self: *RecursiveResolver, allocator: mem.Allocator, response: dns.Message, zone_name: []const u8) !?NsAddrSet {
-        if (response.header.flags.aa or response.answers.len != 0) return null;
-        const zone = try dns.parseDottedName(allocator, zone_name);
-        if (zone.labels.len == 0) return null;
-        const ref = extractReferral(response, zone, .{ .labels = zone.labels[1..] }, self.referralPolicy()) orelse return null;
+        const ref = delegation.referralAtCut(response, try dns.parseDottedName(allocator, zone_name), self.upstream) orelse return null;
         var set: NsAddrSet = .{ .addrs = ref.addrs, .count = ref.addr_count };
         try self.lookupCachedNsAddresses(allocator, ref.unglued(), &set);
         if (set.count > 0) return set;
@@ -2759,13 +2631,7 @@ pub const RecursiveResolver = struct {
     ) void {
         for (records) |rr| {
             if (count.* >= max_servers_per_level) break;
-            const addr: na.Address = switch (rr.rtype) {
-                .a => na.initIp4(rr.rdata.a, self.upstream_port),
-                .aaaa => na.initIp6(rr.rdata.aaaa, self.upstream_port, 0, 0),
-                else => continue,
-            };
-            if (!self.allow_loopback_upstreams and na.isNonRoutableNs(addr)) continue;
-            addrs[count.*] = addr;
+            addrs[count.*] = self.upstream.address(rr) orelse continue;
             count.* += 1;
         }
     }
@@ -3491,117 +3357,6 @@ fn negativeResolveResult(
     };
 }
 
-/// Names and addresses borrow from the response.
-const ReferralResult = struct {
-    zone_cut: dns.Name,
-    /// Names with glue come first; `unglued()` is the rest.
-    ns_names: [max_servers_per_level]dns.Name,
-    ns_count: usize,
-    glued: usize,
-    addrs: [max_servers_per_level]na.Address,
-    addr_count: usize,
-
-    fn nsNames(r: *const ReferralResult) []const dns.Name {
-        return r.ns_names[0..r.ns_count];
-    }
-
-    fn unglued(r: *const ReferralResult) []const dns.Name {
-        return r.ns_names[r.glued..r.ns_count];
-    }
-};
-
-fn hasSignedRecords(response: dns.Message) bool {
-    for (response.answers) |rr| if (rr.rtype == .rrsig) return true;
-    for (response.authorities) |rr| if (rr.rtype == .rrsig) return true;
-    return false;
-}
-
-/// Address-construction policy applied when materializing referral glue.
-/// Defaults are production-safe; tests override to redirect at scripted
-/// authorities on non-privileged ports in 127/8.
-const ReferralAddrPolicy = struct {
-    upstream_port: u16 = 53,
-    allow_loopback: bool = false,
-};
-
-fn extractReferral(
-    response: dns.Message,
-    target: dns.Name,
-    parent_zone: dns.Name,
-    policy: ReferralAddrPolicy,
-) ?ReferralResult {
-    var zone_cut: ?dns.Name = null;
-    var zone_cut_depth: usize = 0;
-    for (response.authorities) |rr| {
-        if (rr.rtype == .ns and target.isSubdomainOf(rr.name)) {
-            if (zone_cut == null or rr.name.labels.len > zone_cut_depth) {
-                zone_cut = rr.name;
-                zone_cut_depth = rr.name.labels.len;
-            }
-        }
-    }
-    const zc = zone_cut orelse return null;
-
-    // A valid referral always delegates to a child zone — the zone cut must
-    // be strictly deeper than the current parent zone.  If the authority
-    // section contains NS records for the same zone (or a parent), it is
-    // not a referral (e.g. a server returning its own NS records alongside
-    // a CNAME answer).  RFC 1034 §4.2.1, RFC 8499 §7.
-    if (zc.labels.len <= parent_zone.labels.len) return null;
-
-    var ns_count: usize = 0;
-    var ns_names: [max_servers_per_level]dns.Name = undefined;
-    for (response.authorities) |rr| {
-        if (rr.rtype == .ns and rr.name.eql(zc)) {
-            if (ns_count < max_servers_per_level) {
-                ns_names[ns_count] = rr.rdata.ns;
-                ns_count += 1;
-            }
-        }
-    }
-
-    var glue_addrs: [max_servers_per_level]na.Address = undefined;
-    var glue_count: usize = 0;
-    var glued: usize = 0;
-    for (response.additionals) |rr| {
-        const is_a = rr.rtype == .a;
-        const is_aaaa = rr.rtype == .aaaa;
-        if (!is_a and !is_aaaa) continue;
-        // Bailiwick: glue name must be within the parent zone (the zone
-        // the referring server is authoritative for). `isSubdomainOf`
-        // already returns true when parent is root, so all glue is
-        // accepted under root referrals.
-        if (!rr.name.isSubdomainOf(parent_zone)) continue;
-
-        for (ns_names[0..ns_count], 0..) |ns_name, i| {
-            if (ns_name.eql(rr.name)) {
-                if (glue_count < max_servers_per_level) {
-                    const addr = if (is_a)
-                        na.initIp4(rr.rdata.a, policy.upstream_port)
-                    else
-                        na.initIp6(rr.rdata.aaaa, policy.upstream_port, 0, 0);
-                    if (!policy.allow_loopback and na.isNonRoutableNs(addr)) break;
-                    glue_addrs[glue_count] = addr;
-                    glue_count += 1;
-                    if (i >= glued) {
-                        mem.swap(dns.Name, &ns_names[i], &ns_names[glued]);
-                        glued += 1;
-                    }
-                }
-                break;
-            }
-        }
-    }
-    return .{
-        .zone_cut = zc,
-        .ns_names = ns_names,
-        .ns_count = ns_count,
-        .glued = glued,
-        .addrs = glue_addrs,
-        .addr_count = glue_count,
-    };
-}
-
 /// `proceed` carries the *proof's* verdict, not the zone's, so AD and the cached
 /// rank come from one source: an Opt-Out proof is valid but §9.2 forbids AD.
 /// Unbound, BIND and Knot all cache these under an explicit insecure rank.
@@ -3648,210 +3403,6 @@ fn makeNsRr(zone: dns.Name, ns_name: dns.Name) dns.ResourceRecord {
 
 fn makeGlueA(name: dns.Name, addr: [4]u8) dns.ResourceRecord {
     return .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 172800, .rdata = .{ .a = addr } };
-}
-
-fn makeGlueAaaa(name: dns.Name, addr: [16]u8) dns.ResourceRecord {
-    return .{ .name = name, .rtype = .aaaa, .rclass = .in, .ttl = 172800, .rdata = .{ .aaaa = addr } };
-}
-
-fn makeResponse(alloc: mem.Allocator, authorities: []const dns.ResourceRecord, additionals: []const dns.ResourceRecord) !dns.Message {
-    const auths = try alloc.alloc(dns.ResourceRecord, authorities.len);
-    @memcpy(auths, authorities);
-    const adds = try alloc.alloc(dns.ResourceRecord, additionals.len);
-    @memcpy(adds, additionals);
-    return .{
-        .header = test_header,
-        .questions = &.{},
-        .authorities = auths,
-        .additionals = adds,
-    };
-}
-
-test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral" {
-    var resolver: RecursiveResolver = .{ .transports = null, .io = testing.io };
-    const zone = dns.Name{ .labels = &.{ "example", "fake" } };
-    const www = dns.Name{ .labels = &.{ "www", "example", "fake" } };
-    const questions: []const dns.Question = &.{.{ .name = www, .qtype = .a, .qclass = .in }};
-    var msg = dns.Message{ .header = test_header, .questions = questions };
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-
-    msg.header.flags.aa = true;
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-    msg.header.flags.aa = false;
-
-    const soa = dns.ResourceRecord{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 600 } } };
-    msg.authorities = &.{soa};
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-
-    msg.authorities = &.{makeNsRr(www, zone)};
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-    msg.authorities = &.{makeNsRr(.{ .labels = &.{"fake"} }, zone)};
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-
-    msg.authorities = &.{};
-    msg.header.flags.rcode = .refused;
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-    msg.header.flags.rcode = .name_error;
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-
-    msg.header.flags.ra = true;
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-    msg.header.flags.aa = true;
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-    msg.header.flags.aa = false;
-    msg.header.flags.rcode = .no_error;
-    msg.authorities = &.{soa};
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-    msg.authorities = &.{};
-    msg.answers = &.{makeGlueA(www, .{ 10, 20, 30, 40 })};
-    try testing.expect(resolver.shouldTrySibling(msg, zone));
-    msg.header.flags.ra = false;
-    try testing.expect(!resolver.shouldTrySibling(msg, zone));
-}
-
-test "extractReferral with NS and glue A records" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
-    defer dns.freeMessage(alloc, response);
-
-    const target = dns.Name{ .labels = &.{ "www", "example", "com" } };
-    const result = extractReferral(response, target, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    const expected = na.initIp4(.{ 1, 2, 3, 4 }, 53);
-    try testing.expectEqual(expected.ip4.bytes, result.addrs[0].ip4.bytes);
-    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
-    try testing.expect(result.zone_cut.eql(zone_name));
-}
-
-test "extractReferral with no NS records returns null" {
-    const response = dns.Message{
-        .header = test_header,
-        .questions = &.{},
-    };
-    try testing.expect(extractReferral(response, dns.Name{ .labels = &.{ "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) == null);
-}
-
-test "extractReferral with NS but no glue returns zero addrs" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-    try testing.expectEqual(@as(usize, 1), result.ns_count);
-    try testing.expect(result.zone_cut.eql(zone_name));
-    const ns_dotted = try nameToDotted(alloc, result.ns_names[0]);
-    defer alloc.free(ns_dotted);
-    try testing.expectEqualStrings("ns1.example.com", ns_dotted);
-}
-
-test "extractReferral case-insensitive glue matching" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "NS1", "EXAMPLE", "COM" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 1, 2, 3, 4 })});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-}
-
-test "extractReferral rejects private IP glue (DNS rebinding defense)" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-}
-
-test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
-    // Locks in the test-only opt-in branch: with allow_loopback=true,
-    // loopback glue is *not* rejected. Without this test, inverting the
-    // boolean default would silently pass every other test.
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 127, 0, 0, 1 })});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(
-        response,
-        dns.Name{ .labels = &.{ "www", "example", "com" } },
-        dns.Name{ .labels = &.{} },
-        .{ .allow_loopback = true, .upstream_port = 5353 },
-    ) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    try testing.expectEqual(@as(u16, 5353), result.addrs[0].getPort());
-}
-
-test "extractReferral rejects out-of-zone glue" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "evil", "org" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "evil", "org" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 6, 6, 6, 6 })});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{"com"} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-}
-
-test "extractReferral without glue carries multiple NS names" {
-    const alloc = testing.allocator;
-    const ns1 = try makeName(alloc, &.{ "ns1", "other", "net" });
-    const ns2 = try makeName(alloc, &.{ "ns2", "other", "net" });
-    const zone1 = try makeName(alloc, &.{ "example", "com" });
-    const zone2 = try makeName(alloc, &.{ "example", "com" });
-    const response = try makeResponse(alloc, &.{ makeNsRr(zone1, ns1), makeNsRr(zone2, ns2) }, &.{});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-    try testing.expectEqual(@as(usize, 2), result.ns_count);
-    try testing.expect(result.zone_cut.eql(zone1));
-}
-
-test "extractReferral with AAAA glue returns IPv6 address" {
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const ipv6 = [_]u8{ 0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueAaaa(glue_name, ipv6)});
-    defer dns.freeMessage(alloc, response);
-
-    const result = extractReferral(response, dns.Name{ .labels = &.{ "www", "example", "com" } }, dns.Name{ .labels = &.{} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
-    const expected = na.initIp6(ipv6, 53, 0, 0);
-    try testing.expectEqual(expected.ip6.bytes, result.addrs[0].ip6.bytes);
-}
-
-test "extractReferral rejects same-zone NS as non-referral" {
-    // A server returning NS records for its own zone (e.g. alongside a CNAME
-    // answer) is not a referral — the zone cut must be strictly deeper than
-    // the parent zone.  RFC 1034 §4.2.1, RFC 8499 §7.
-    const alloc = testing.allocator;
-    const ns_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const zone_name = try makeName(alloc, &.{ "example", "com" });
-    const glue_name = try makeName(alloc, &.{ "ns1", "example", "com" });
-    const response = try makeResponse(alloc, &.{makeNsRr(zone_name, ns_name)}, &.{makeGlueA(glue_name, .{ 192, 0, 2, 1 })});
-    defer dns.freeMessage(alloc, response);
-
-    const target = dns.Name{ .labels = &.{ "api", "example", "com" } };
-    const parent_zone = dns.Name{ .labels = &.{ "example", "com" } };
-    try testing.expect(extractReferral(response, target, parent_zone, .{}) == null);
 }
 
 test "nameToDotted round-trips correctly" {
@@ -5212,7 +4763,7 @@ test "seedServersForQuery keeps the insecure verdict when the ancestor's negativ
     clock_reads = 0;
 
     // Every read after the walk sees the negative DS expired.
-    var walk = try RecursiveResolver.Walk.init(arena.allocator(), "iphone-ld.g.aaplimg.com");
+    var walk = try Walk.init(arena.allocator(), "iphone-ld.g.aaplimg.com");
     var state: dnssec.SecurityStatus = .secure;
     try resolver.seedServersForQuery(arena.allocator(), .a, &walk, &state);
     try testing.expectEqual(dnssec.SecurityStatus.insecure, state);
