@@ -1,0 +1,214 @@
+; hark: root-hints = 127.0.10.1
+; hark: serve-stale-ttl = 3600
+; hark: client-timeout = 2
+
+SCENARIO_BEGIN A refresh against a blackholed authority serves stale and holds it
+
+; RFC 8767 §5: four silent authorities outlast a stub's patience, so the
+; client timer (1.8 s) serves stale before a 2 s client gives up.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+      example.com. 86400 IN NS ns3.example.com.
+      example.com. 86400 IN NS ns4.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+      ns3.example.com. 86400 IN A 127.0.10.5
+      ns4.example.com. 86400 IN A 127.0.10.6
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ; Absorbs the AAAA cousin prefetch.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN AAAA
+    SECTION AUTHORITY
+      example.com. 86400 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
+  ENTRY_END
+RANGE_END
+
+; ── www A: every server healthy, then every server silent ───────
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 120
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+; Held: no second attempt at the silent authority.
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END

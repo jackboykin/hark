@@ -141,6 +141,8 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.workers = scenario.workers
     if scenario.dns64_prefix is not None:
         cfg.dns64_prefix = scenario.dns64_prefix
+    if scenario.serve_stale_ttl is not None:
+        cfg.serve_stale_ttl = scenario.serve_stale_ttl
     if scenario.rebinding_enabled is not None:
         cfg.rebinding_enabled = scenario.rebinding_enabled
     if scenario.rebinding_allow_zones:
@@ -212,7 +214,7 @@ def _run_steps(
         resp.set_step(step.n)
         if step.kind == "QUERY":
             assert step.entry is not None
-            last_response = client.send_query(step.entry, HARK_LISTEN)
+            last_response = client.send_query(step.entry, HARK_LISTEN, scenario.client_timeout)
         elif step.kind == "CHECK_ANSWER":
             assert step.entry is not None
             if last_response is None:

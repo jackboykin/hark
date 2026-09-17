@@ -1,0 +1,141 @@
+; hark: root-hints = 127.0.10.1
+; hark: serve-stale-ttl = 3600
+
+SCENARIO_BEGIN A stale CNAME at the head is the fallback for a failed refresh
+
+; A failed refresh of www A serves the stale www CNAME chain with EDE 3.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ; Absorbs the AAAA cousin prefetch.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      web.example.com. IN AAAA
+    SECTION AUTHORITY
+      example.com. 86400 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
+  ENTRY_END
+RANGE_END
+
+; ── www A: a same-zone chain, then SERVFAIL ─────────────────────────
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN CNAME web.example.com.
+      web.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN CNAME web.example.com.
+    web.example.com. 60 IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 120
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN CNAME web.example.com.
+    web.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN CNAME web.example.com.
+    web.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END

@@ -200,9 +200,17 @@ class Responder:
             if self._consume_drop():
                 return  # simulate auth timeout (close without response)
             response = self._build_response(address, query, transport="tcp")
-            if response is not None:
-                wire = response.to_wire()
-                conn.sendall(len(wire).to_bytes(2, "big") + wire)
+            if response is None:
+                # Blackholed: hold the connection open until hark gives up.
+                while not self._stop.is_set():
+                    try:
+                        if not conn.recv(1):
+                            return
+                    except socket.timeout:
+                        continue
+                return
+            wire = response.to_wire()
+            conn.sendall(len(wire).to_bytes(2, "big") + wire)
         finally:
             conn.close()
 
@@ -241,6 +249,9 @@ class Responder:
             r = dns.message.make_response(query)
             r.set_rcode(dns.rcode.REFUSED)
             return r
+
+        if "drop" in entry.adjust:
+            return None
 
         # `make_response` copies the query's question verbatim — echoing
         # case is mandatory (RFC 1035 §3.1) and load-bearing for hark's

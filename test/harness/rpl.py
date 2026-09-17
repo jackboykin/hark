@@ -19,6 +19,8 @@ Hark-only extensions:
   - ; hark: qname-minimisation = no         header directive (optional)
   - ; hark: workers = <n>                   header directive (optional)
   - ; hark: dns64-prefix = <pref64/n>       header directive (optional)
+  - ; hark: serve-stale-ttl = <seconds>     header directive (optional)
+  - ; hark: client-timeout = <seconds>      header directive: how long each QUERY waits (default 5)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>
@@ -30,6 +32,7 @@ Hark-only extensions:
   - MATCH UDP / MATCH TCP                   per-transport entry discrimination
   - MATCH ede=<code>                        CHECK_ANSWER: RFC 8914 option carries <code> (testbound)
   - REPLY EDNS                              STEP QUERY: send an OPT without DO
+  - ADJUST drop                             never answer this entry (a blackholed authority)
 """
 
 from __future__ import annotations
@@ -70,7 +73,7 @@ MATCH_VALID_FLAGS = frozenset({
 # `force_lower_qname` opts the response out of the verbatim-echo default
 # and forces the question name to lowercase — used to test hark's 0x20
 # echo verification (`eqlExact` mismatch → retry over TCP).
-ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query", "force_lower_qname"})
+ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query", "force_lower_qname", "drop"})
 
 # Section names → dnspython section indices via parse helper. QUERY_LOG is a
 # hark-only section used inside CHECK_QUERY_LOG entries; lines are
@@ -204,6 +207,8 @@ class Scenario:
     stagger_ms: int | None = None
     workers: int | None = None
     dns64_prefix: str | None = None
+    serve_stale_ttl: int | None = None
+    client_timeout: float = 5.0
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────
@@ -277,6 +282,10 @@ class _Parser:
             self.scenario.workers = int(val.strip())
         elif key == "dns64-prefix":
             self.scenario.dns64_prefix = val.strip()
+        elif key == "serve-stale-ttl":
+            self.scenario.serve_stale_ttl = int(val.strip())
+        elif key == "client-timeout":
+            self.scenario.client_timeout = float(val.strip())
         elif key == "dnssec-zone":
             # Canonicalize: lowercase, ensure trailing dot. Multiple
             # directives accumulate; same value collapses (idempotent).

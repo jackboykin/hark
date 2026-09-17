@@ -32,6 +32,7 @@ class HarkConfig:
     qname_minimization: bool = True
     dnssec: bool = False
     cache_min_ttl: int = 0
+    serve_stale_ttl: int = 0
     minimal_responses: bool = True
     # NS-racing stagger in ms; None = hark default (150). 0 disables the
     # staggered race, forcing the deterministic sequential server loop.
@@ -96,8 +97,11 @@ class HarkConfig:
         if self.trust_anchors:
             anchors = ", ".join(f'"{a}"' for a in self.trust_anchors)
             lines.append(f"trust-anchors = [{anchors}]")
-        if self.cache_min_ttl:
-            lines += ["", "[cache]", f"min-ttl = {self.cache_min_ttl}"]
+        cache = [f"min-ttl = {self.cache_min_ttl}"] if self.cache_min_ttl else []
+        if self.serve_stale_ttl:
+            cache.append(f"serve-stale-ttl = {self.serve_stale_ttl}")
+        if cache:
+            lines += ["", "[cache]", *cache]
         lines += [
             "",
             "[rebinding]",

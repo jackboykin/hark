@@ -1,0 +1,209 @@
+; hark: root-hints = 127.0.10.1
+; hark: serve-stale-ttl = 3600
+
+SCENARIO_BEGIN A failed background refresh behind a fresh CNAME marks nothing
+
+; Fresh www CNAME, stale web A. The background refresh fails, holds the
+; chain, and marks nothing: queries keep the stale chain, unrefreshed.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example.com. IN A
+  ENTRY_END
+  ; Absorbs the AAAA cousin prefetch.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      web.example.com. IN AAAA
+    SECTION AUTHORITY
+      example.com. 86400 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
+  ENTRY_END
+RANGE_END
+
+; ── Healthy chain, then every name SERVFAILs ────────────────────────
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 3600 IN CNAME web.example.com.
+      web.example.com. 60 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      web.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 120
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3480 IN CNAME web.example.com.
+    web.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3480 IN CNAME web.example.com.
+    web.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3480 IN CNAME web.example.com.
+    web.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 11 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 12 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 14 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 15 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 16 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+; Root, com, www A, its cousin, the failed refresh, maybe one racing query.
+STEP 17 CHECK_MAX_QUERIES 6
+
+SCENARIO_END
