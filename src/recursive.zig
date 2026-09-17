@@ -77,6 +77,8 @@ pub const root_hints_default: [26]na.Address = .{
 const max_global_queries = 100;
 // PowerDNS max-total-msec; Knot/BIND 10s.
 const max_resolve_ms: u32 = 7_000;
+// RFC 8767 §5 client response timer; Unbound's default.
+const stale_client_timeout_ms: u32 = 1_800;
 comptime {
     std.debug.assert(dedup_mod.follower_wait_ns == @as(u64, max_resolve_ms) * std.time.ns_per_ms);
 }
@@ -285,6 +287,11 @@ pub const RecursiveResolver = struct {
     /// null outside an active `resolve()`: cache-only paths and unit tests
     /// never go upstream.
     budget: ?*Budget = null,
+    /// When the client's query arrived; the stale refresh timer counts from it.
+    received_ns: ?i128 = null,
+    /// A stale refresh's client timer. A resolver field, not in `Budget`, so
+    /// fan-out clones inherit it without a shared write.
+    stale_deadline_ns: i128 = std.math.maxInt(i128),
 
     /// Injectable time and chance; the caches keep their own `now_fn`.
     /// Fan-out clones share `rng`, so a seeded one wants `fanout` off.
@@ -306,6 +313,10 @@ pub const RecursiveResolver = struct {
         /// re-walk refreshes whichever member is aging; mid-chain hits happen
         /// before the final result exists, so they can't set `prefetch_name`.
         chain_prefetch: bool = false,
+        /// Stale head whose refresh failed: a re-walk would repeat it.
+        stale_head: bool = false,
+        /// The client timer cut a stale refresh short; it carries on in the background.
+        refresh_cut: bool = false,
     };
 
     /// Stable inputs that come from the surrounding Server / WorkerState.
@@ -333,6 +344,7 @@ pub const RecursiveResolver = struct {
         bypass_cache: bool = false,
         /// Cache-only fast path. See `RecursiveResolver.cache_only`.
         cache_only: bool = false,
+        received_ns: ?i128 = null,
     };
 
     pub fn fromContext(ctx: Context, transports: ?Transports, opts: RuntimeOpts) RecursiveResolver {
@@ -355,6 +367,7 @@ pub const RecursiveResolver = struct {
             .ns_selector = ctx.ns_selector,
             .bypass_cache = opts.bypass_cache,
             .cache_only = opts.cache_only,
+            .received_ns = opts.received_ns,
             // RFC 6147 §5.5: none for CD=1.
             .dns64 = if (opts.cd) null else ctx.config.dns64,
             .stagger_ms = ctx.config.stagger_ms,
@@ -388,7 +401,9 @@ pub const RecursiveResolver = struct {
     }
 
     fn consumeQuery(self: *RecursiveResolver) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
-        if (self.budget) |b| try b.consumeQuery(self.now_ns_fn());
+        const now = self.now_ns_fn();
+        if (now >= self.stale_deadline_ns) return error.ResolveDeadline;
+        if (self.budget) |b| try b.consumeQuery(now);
     }
 
     fn nowUs(self: *const RecursiveResolver) i64 {
@@ -402,7 +417,7 @@ pub const RecursiveResolver = struct {
 
     fn remainingMs(self: *const RecursiveResolver) u32 {
         const b = self.budget orelse return max_resolve_ms;
-        const ns = b.deadline_ns - self.now_ns_fn();
+        const ns = @min(b.deadline_ns, self.stale_deadline_ns) - self.now_ns_fn();
         return if (ns <= 0) 0 else @intCast(@min(@divTrunc(ns, std.time.ns_per_ms), max_resolve_ms));
     }
 
@@ -461,11 +476,14 @@ pub const RecursiveResolver = struct {
         // resolve re-walks the whole chain. `name` is caller-owned and
         // outlives the result — same lifetime contract as the head-hit
         // prefetch_name set in tryServeFromCache.
-        if (self.scratch.chain_prefetch and result.prefetch_name == null) {
+        if ((self.scratch.chain_prefetch and !self.scratch.stale_head or self.scratch.refresh_cut) and result.prefetch_name == null) {
             result.prefetch_name = name;
             result.prefetch_qtype = qtype;
         }
         result.from_cache = budget.queries.load(.monotonic) == 0;
+        const rcode = result.message.header.flags.rcode;
+        if (self.scratch.stale_head and result.ede == null and (rcode == .no_error or rcode == .name_error))
+            result.ede = .{ .code = .stale_answer };
         // Non-NOERROR answers never earn a cousin: NXDOMAIN is
         // qtype-independent (RFC 8020) and SERVFAIL would re-walk a
         // path that just failed.
@@ -894,22 +912,15 @@ pub const RecursiveResolver = struct {
     };
 
     /// Cache check 1: positive or negative hit on the main RRset cache.
-    /// Returns `.none` on miss. RFC 8767 §6 requires trying fresh once
-    /// before serving a stale entry; the `bypass_cache` save/restore
-    /// lives inside this helper so the recursive call doesn't leak the
-    /// flag to other callers. Both stale recursion and prefetch-window
+    /// Returns `.none` on miss. Both stale refresh and prefetch-window
     /// signalling are gated to the head of the CNAME chain
     /// (empty chain) — mid-chain re-entry would re-walk preceding
     /// labels.
     ///
     /// CNAME-follow fallback: when the direct `(current_name, qtype)`
     /// lookup misses and qtype isn't .cname, probe for a cached CNAME.
-    /// A fresh hit returns `.follow_cname`; the outer loop pushes it
-    /// onto the chain and continues. Stale CNAMEs at the head of the
-    /// chain are skipped so the direct upstream path can run — the
-    /// stale-revalidate gate (empty chain) protects against
-    /// silently serving a stale redirect when fresh resolution is on
-    /// the table.
+    /// A hit returns `.follow_cname`; the outer loop pushes it
+    /// onto the chain and continues.
     fn tryServeFromCache(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -931,31 +942,23 @@ pub const RecursiveResolver = struct {
                 inline .hit, .negative => |entry| .{
                     .needs_prefetch = entry.needs_prefetch,
                     .is_stale = entry.is_stale,
+                    .refresh_failed = entry.refresh_failed,
                 },
             };
             const at_chain_head = chain.hops == 0;
-            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and at_chain_head) name else null;
+            // A stale head refreshes inline, or just failed to.
+            const prefetch_out: ?[]const u8 = if (meta.needs_prefetch and at_chain_head and !meta.is_stale) name else null;
             // Mid-chain member (the short-TTL tail of a CNAME chain, in
             // practice) inside its prefetch window: can't re-enter here as
             // prefetch_name — flag the resolver so resolve() targets the
             // head instead. Covers stale mid-chain hits too (needs_prefetch
-            // is always set on stale), so a silently-followed stale link
+            // is set on stale unless a refresh failed), so a silently-followed stale link
             // at least triggers a bg refresh.
             if (meta.needs_prefetch and !at_chain_head) self.scratch.chain_prefetch = true;
 
-            // RFC 8767 §6: a stale cache entry must not be the first answer
-            // when fresh resolution is achievable. Try fresh once with
-            // bypass_cache; on any failure fall back to the stale answer.
-            if (meta.is_stale and at_chain_head) {
-                // Save/restore so a future caller that arrives here with
-                // bypass_cache already set doesn't get its flag silently
-                // flipped to false.
-                const prev_bypass = self.bypass_cache;
-                self.bypass_cache = true;
-                defer self.bypass_cache = prev_bypass;
-                if (self.resolveImpl(allocator, current_name, qtype, depth)) |fresh| {
-                    return .{ .served = fresh };
-                } else |_| {}
+            // RFC 8767 §5: refresh before serving stale, unless held.
+            if (meta.is_stale and at_chain_head and !meta.refresh_failed) {
+                if (try self.refreshStale(allocator, name, qtype, depth)) |fresh| return .{ .served = fresh };
             }
 
             var served: ResolveResult = switch (result) {
@@ -997,12 +1000,13 @@ pub const RecursiveResolver = struct {
         // all collapse this path.
         if (c.lookup(allocator, current_name, .cname, .in)) |cname_result| switch (cname_result) {
             .hit => |h| {
-                // Stale CNAME at the head of the chain: skip the follow
-                // and let the upstream path run. Mid-chain stale is
-                // already a degraded answer — the chain head was fresh
-                // when we entered — so following is acceptable there.
-                if (h.is_stale and chain.hops == 0) return .none;
                 if (h.records.len == 0 or !h.security_status.answerable()) return .none;
+                // Mid-chain stale is followed as is: the head was fresh.
+                const stale_head = h.is_stale and chain.hops == 0;
+                if (stale_head and !h.refresh_failed) {
+                    if (try self.refreshStale(allocator, name, qtype, depth)) |fresh| return .{ .served = fresh };
+                }
+                if (stale_head) self.scratch.stale_head = true;
                 // Stub queries never hit (name, .cname) directly, so this is
                 // the redirect's only refresh path.
                 if (h.needs_prefetch) self.scratch.chain_prefetch = true;
@@ -1018,6 +1022,27 @@ pub const RecursiveResolver = struct {
             .negative => {}, // cached NXDOMAIN/NODATA on .cname → upstream path handles it
         };
         return .none;
+    }
+
+    /// Null when every server failed or the client timer ran out; the stale
+    /// entry is then held.
+    fn refreshStale(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType, depth: usize) error{CacheOnlyMiss}!?ResolveResult {
+        if (self.cache_only) return error.CacheOnlyMiss;
+        const prev_bypass = self.bypass_cache;
+        self.bypass_cache = true;
+        defer self.bypass_cache = prev_bypass;
+        const prev_deadline = self.stale_deadline_ns;
+        if (depth == 0) self.stale_deadline_ns = (self.received_ns orelse self.now_ns_fn()) + @as(i128, stale_client_timeout_ms) * std.time.ns_per_ms;
+        defer self.stale_deadline_ns = prev_deadline;
+        if (self.resolveImpl(allocator, name, qtype, depth)) |fresh| {
+            // Bogus already replaced the stale entry.
+            const bogus = if (fresh.ede) |e| e.code == .dnssec_bogus else false;
+            if (bogus or delegation.failurePrecedence(fresh.message.header.flags.rcode) == 0) return fresh;
+        } else |_| {}
+        // §7: a refresh cut short keeps going after the stale answer is sent.
+        if (self.now_ns_fn() >= self.stale_deadline_ns) self.scratch.refresh_cut = true;
+        self.cacheResolutionFailure(name, qtype, depth);
+        return null;
     }
 
     /// RFC 6672 §3.4.1 step 1: a cached DNAME above `current_name` redirects
@@ -1181,23 +1206,19 @@ pub const RecursiveResolver = struct {
         walk.pending = try allocator.dupe(dns.Name, set.pendingNames());
     }
 
-    /// RFC 9520 §3: cache a resolution failure so the next stub retry
-    /// doesn't re-walk the whole upstream chain. Pinned against the
-    /// original qname (`name`) so mid-CNAME failures still short-circuit
-    /// the stub's retry of the outer query. 5 s TTL enforced by
-    /// `cacheServfail`.
+    /// RFC 9520 §3: mark the failure on the original qname, so a stub's
+    /// retry short-circuits even when a CNAME target was what failed.
     ///
-    /// Only at the user-facing query (depth == 0). At sub-recursion
-    /// depths the caller is the resolver itself (NS A/AAAA fanout,
-    /// internal DS probes); a cached failure there collapses sibling
-    /// fanout and turns one transient blip into a 5 s outage for every
-    /// name whose delegation NSes overlap with the failed lookup —
-    /// which is exactly the NoGlueRecords path on out-of-bailiwick NS
-    /// like dynect.net.
+    /// Top level only. Under NS fanout or a DS probe, a marker turns one
+    /// blip into an outage for every name sharing those servers.
+    ///
+    /// A refresh (bypass_cache) holds its stale data instead, since a
+    /// marker would shadow it.
     fn cacheResolutionFailure(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, depth: usize) void {
         @branchHint(.cold);
         if (depth != 0) return;
-        if (self.cache) |c| c.cacheServfail(name, qtype);
+        const c = self.cache orelse return;
+        if (self.bypass_cache) c.holdStale(name, qtype) else c.cacheServfail(name, qtype);
     }
 
     /// A CNAME loop is a resolution failure, not a validation verdict.

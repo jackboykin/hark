@@ -682,11 +682,8 @@ fn runBgTask(ctx: recursive.RecursiveResolver.Context, transports: Transports, a
     _ = resolver.resolve(alloc, name, qtype) catch |err| {
         var qtype_buf: [24]u8 = undefined;
         log.debug("bg resolve {s} {s}: {s}", .{ name, dns.safeTagName(qtype, &qtype_buf), @errorName(err) });
-        // Only cousins record: a refresh kind still holds the entry it meant
-        // to refresh, so a SERVFAIL would clobber it. cacheServfail refuses
-        // fresh entries under the shard write lock, which closes the race
-        // with a concurrent successful resolve.
-        if (kind == .cousin) ctx.cache.cacheServfail(name, qtype);
+        // Cousins fire on absence (see BgKind), so they mark.
+        if (kind == .cousin) ctx.cache.cacheServfail(name, qtype) else ctx.cache.holdStale(name, qtype);
     };
 }
 
@@ -1105,7 +1102,7 @@ const WorkerState = struct {
         name: []const u8,
         qtype: dns.RType,
         cd: bool,
-        bypass_cache: bool,
+        received_ns: i128,
         transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
         // Test harness control channel: `_advance-clock.<N>.testharness.invalid.`
@@ -1124,7 +1121,7 @@ const WorkerState = struct {
         var resolver = recursive.RecursiveResolver.fromContext(
             self.server.resolverContext(),
             transports,
-            .{ .cd = cd, .bypass_cache = bypass_cache },
+            .{ .cd = cd, .received_ns = received_ns },
         );
         return resolver.resolve(alloc, name, qtype);
     }
@@ -1149,7 +1146,7 @@ const WorkerState = struct {
         // and populate the cache through ordinary recursion.
         if (self.server.primed.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
             const alloc = query_pta.reset();
-            if (self.resolveWithDedupUsing(alloc, ".", .ns, false, transports)) |result| {
+            if (self.resolveWithDedupUsing(alloc, ".", .ns, false, monotonic.nowNs(), transports)) |result| {
                 // SERVFAIL counts as failure even though Zig sees a normal
                 // return — otherwise the .unchecked SERVFAIL written into
                 // the cache by the resolver (5 min ceiling) would shadow
@@ -1173,7 +1170,7 @@ const WorkerState = struct {
                     // releasing right after processQuery is safe.
                     defer self.server.work_queue.release(item.reservation);
                     if (stale) continue;
-                    self.processQuery(.{ .udp = .{ .sock = item.sock_fd, .addr = item.client_addr } }, item.payload, transports, &query_pta);
+                    self.processQuery(.{ .udp = .{ .sock = item.sock_fd, .addr = item.client_addr } }, item.payload, item.enqueued_ns, transports, &query_pta);
                 },
                 .bg => {
                     defer self.server.work_queue.release(item.reservation);
@@ -1187,13 +1184,13 @@ const WorkerState = struct {
                     const client: *TcpClient = @ptrFromInt(mem.readInt(usize, item.payload[0..@sizeOf(usize)], .little));
                     defer client.unref(self.server.allocator);
                     if (stale) continue;
-                    self.processQuery(.{ .tcp = client }, item.payload[@sizeOf(usize)..], transports, &query_pta);
+                    self.processQuery(.{ .tcp = client }, item.payload[@sizeOf(usize)..], item.enqueued_ns, transports, &query_pta);
                 },
             }
         }
     }
 
-    fn processQuery(self: *WorkerState, reply: Reply, data: []const u8, transports: Transports, query_pta: *PerThreadArena) void {
+    fn processQuery(self: *WorkerState, reply: Reply, data: []const u8, received_ns: i128, transports: Transports, query_pta: *PerThreadArena) void {
         const alloc = query_pta.reset();
 
         const query = dns.parseMessage(alloc, data) catch {
@@ -1220,7 +1217,7 @@ const WorkerState = struct {
         const tag: []const u8 = if (reply == .tcp) " tcp" else "";
 
         const start_ns = monotonic.nowNs();
-        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, transports) catch |err| {
+        const result = self.resolveWithDedupUsing(alloc, name_str, question.qtype, query.header.flags.cd, received_ns, transports) catch |err| {
             @branchHint(.cold);
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
@@ -1316,6 +1313,7 @@ const WorkerState = struct {
         name: []const u8,
         qtype: dns.RType,
         cd: bool,
+        received_ns: i128,
         transports: Transports,
     ) !recursive.RecursiveResolver.ResolveResult {
         // Dedup only prevents duplicate upstream queries. On a cache hit no
@@ -1329,7 +1327,7 @@ const WorkerState = struct {
         defer if (role == .leader) self.server.dedup.releaseLeader(name, qtype, cd_flag);
         // Before the release wakes followers, so they find the marker.
         errdefer self.server.cache.cacheServfail(name, qtype);
-        var result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
+        var result = try self.resolveQueryWith(alloc, name, qtype, cd, received_ns, transports);
         // A follower's own resolve is a cache hit by construction (the
         // leader populated it), but the client still waited on the
         // leader's upstream round-trip — that's a miss experientially.
