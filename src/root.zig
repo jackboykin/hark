@@ -1,5 +1,4 @@
 pub const dns = @import("dns.zig");
-pub const dns_print = @import("dns_print.zig");
 pub const event_loop = @import("event_loop.zig");
 pub const recursive = @import("recursive.zig");
 pub const delegation = @import("delegation.zig");
@@ -40,7 +39,6 @@ pub const build_mode = @import("builtin").mode;
 // Add a line here when you add a module file.
 test {
     _ = @import("dns.zig");
-    _ = @import("dns_print.zig");
     _ = @import("event_loop.zig");
     _ = @import("uring.zig");
     _ = @import("epoll.zig");

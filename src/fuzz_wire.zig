@@ -5,7 +5,6 @@ const std = @import("std");
 const testing = std.testing;
 const Smith = testing.Smith;
 const dns = @import("dns.zig");
-const dns_print = @import("dns_print.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
 const cache = @import("cache.zig");
@@ -157,10 +156,6 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     _ = dns.serializeMessage(&small, msg) catch {};
     _ = dns.extractKeepaliveTimeout(input);
     _ = dns.hasTcBit(input);
-
-    var sink: [1 << 16]u8 = undefined;
-    var w = std.Io.Writer.fixed(&sink);
-    dns_print.printMessage(msg, &w) catch {};
 
     const once = try rebinding.scrub(alloc, msg.answers, scrub_cfg);
     if ((try rebinding.scrub(alloc, once, scrub_cfg)).len != once.len) return error.ScrubNotIdempotent;

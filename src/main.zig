@@ -1,12 +1,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const hark = @import("hark");
-const dns = hark.dns;
-const dns_print = hark.dns_print;
-const RecursiveResolver = hark.recursive.RecursiveResolver;
 const Io = std.Io;
 const Server = hark.server.Server;
-const BlockingUdpTransport = hark.blocking_transport.BlockingUdpTransport;
 
 var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -80,10 +76,6 @@ pub fn main(init: std.process.Init) !void {
         stdout_writer.interface.print("hark {s}\n", .{build_options.version}) catch std.process.exit(1);
         stdout_writer.interface.flush() catch std.process.exit(1);
         return;
-    } else if (std.mem.eql(u8, command, "dump")) {
-        return runDump(allocator, io);
-    } else if (std.mem.eql(u8, command, "query")) {
-        return runQuery(allocator, args[2..], io);
     } else if (std.mem.eql(u8, command, "serve")) {
         return runServe(allocator, args[2..], io);
     } else {
@@ -98,178 +90,14 @@ fn printUsage() void {
         \\Usage: hark <command> [options]
         \\
         \\Commands:
-        \\  dump                Read a raw DNS packet from stdin and print it
-        \\  query <name> [type] [options]
-        \\                      Resolve a DNS query recursively
         \\  serve [options]     Start DNS server
         \\  version             Print version
-        \\
-        \\Query options:
-        \\  --opportunistic     Opportunistic encryption to authoritatives (RFC 9539)
-        \\  --no-qmin           Disable QNAME minimization (RFC 9156)
-        \\  --dnssec            Enable DNSSEC validation
-        \\  --no-dnssec         Disable DNSSEC validation (default)
-        \\  --verbose, -v       Enable debug logging
         \\
         \\Serve options:
         \\  --config <path>     Path to config file (default: /etc/hark/hark.toml)
         \\  --verbose, -v       Enable debug logging (per-query log lines)
         \\
-        \\Defaults: type=A, QNAME minimization enabled, DNSSEC off
-        \\
     , .{});
-}
-
-fn runDump(gpa: std.mem.Allocator, io: Io) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var stdin_buf: [4096]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
-    const input = stdin_reader.interface.allocRemaining(allocator, @fromBackingInt(@intCast(dns.max_udp_payload * 4))) catch |err| {
-        log.err("failed to read stdin: {}", .{err});
-        std.process.exit(1);
-    };
-
-    if (input.len == 0) {
-        log.err("no input; pipe a raw DNS packet via stdin", .{});
-        std.process.exit(1);
-    }
-
-    const msg = dns.parseMessage(allocator, input) catch |err| {
-        log.err("failed to parse DNS message: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    dns_print.printMessage(msg, stdout) catch |err| {
-        log.err("failed to print message: {}", .{err});
-        std.process.exit(1);
-    };
-
-    stdout.flush() catch {};
-}
-
-fn runQuery(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
-    if (args.len == 0) {
-        log.err("query requires a domain name", .{});
-        printUsage();
-        std.process.exit(1);
-    }
-
-    const name = args[0];
-    var qtype: dns.RType = .a;
-    var no_qmin = false;
-    var dnssec_enabled = false;
-    var opportunistic = false;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
-            log_verbose.store(true, .release);
-        } else if (std.mem.eql(u8, args[i], "--opportunistic")) {
-            opportunistic = true;
-        } else if (std.mem.eql(u8, args[i], "--no-qmin")) {
-            no_qmin = true;
-        } else if (std.mem.eql(u8, args[i], "--dnssec")) {
-            dnssec_enabled = true;
-        } else if (std.mem.eql(u8, args[i], "--no-dnssec")) {
-            dnssec_enabled = false;
-        } else {
-            qtype = parseRType(args[i]) orelse {
-                log.err("unknown record type: {s}", .{args[i]});
-                std.process.exit(1);
-            };
-        }
-    }
-
-    // Reuse Server.init/fromContext so one-shot `query` is wired exactly like
-    // `serve` (caches, NS selector, DNSSEC, opportunistic, fanout) from the
-    // same config path, instead of a hand-rolled subset that silently drifts.
-    // init never binds sockets; only run() does.
-    var cfg = hark.config.parseConfig(allocator, "") catch |err| {
-        log.err("building default config: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    cfg.qname_minimization = !no_qmin;
-    cfg.dnssec = dnssec_enabled;
-    cfg.opportunistic = opportunistic;
-    defer cfg.deinit();
-
-    var server = Server.init(allocator, cfg, io) catch |err| {
-        log.err("initializing resolver: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer server.deinit();
-
-    // Fresh transports for this single resolve (mirrors the bg-prefetch
-    // path). `opportunistic` rides in via cfg, set above before init.
-    var udp = BlockingUdpTransport.init(.{}, server.io);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var resolver = RecursiveResolver.fromContext(
-        server.resolverContext(),
-        .{ .udp = &udp, .tcp_enabled = true },
-        .{},
-    );
-    const result = resolver.resolve(arena.allocator(), name, qtype) catch |err| {
-        log.err("query failed: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    var questions: []const dns.Question = result.message.questions;
-    var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    var question: [1]dns.Question = undefined;
-    if (name.len <= lower_buf.len) {
-        if (dns.parseDottedName(arena.allocator(), dns.lowerNameIntoBuf(&lower_buf, name))) |qname| {
-            question[0] = .{ .name = qname, .qtype = qtype, .qclass = .in };
-            questions = &question;
-        } else |_| {}
-    }
-
-    var wire_buf: [dns.max_message_len]u8 = undefined;
-    const wire = hark.response.buildResponseWire(&wire_buf, .{
-        .query_id = 0,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .questions = questions,
-        .client_edns = true,
-        .client_do = true,
-        .client_wants_ad = true,
-        .max_udp_payload = dns.max_message_len,
-        .minimal_responses = cfg.minimal_responses,
-        .rebinding = &cfg.rebinding,
-    }, result.message, arena.allocator()) orelse {
-        log.err("building response failed", .{});
-        std.process.exit(1);
-    };
-    const response = try dns.parseMessage(arena.allocator(), wire);
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    dns_print.printMessage(response, stdout) catch |err| {
-        log.err("failed to print response: {}", .{err});
-        std.process.exit(1);
-    };
-
-    stdout.flush() catch {};
-}
-
-fn parseRType(s: []const u8) ?dns.RType {
-    var buf: [16]u8 = undefined;
-    if (s.len > buf.len) return null;
-    for (s, 0..) |c, idx| buf[idx] = std.ascii.toLower(c);
-    const result = std.meta.stringToEnum(dns.RType, buf[0..s.len]) orelse return null;
-    if (result == .opt) return null; // pseudo-type, not a real query type
-    return result;
 }
 
 fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
