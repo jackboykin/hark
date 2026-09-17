@@ -213,8 +213,8 @@ const Budget = struct {
     }
 
     /// Callers propagate the error; the server maps it to SERVFAIL.
-    fn consumeQuery(self: *Budget) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
-        if (monotonic.nowNs() >= self.deadline_ns)
+    fn consumeQuery(self: *Budget, now_ns: i128) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
+        if (now_ns >= self.deadline_ns)
             return error.ResolveDeadline;
         if (self.queries.fetchAdd(1, .monotonic) >= self.max_queries)
             return error.GlobalQueryBudgetExhausted;
@@ -290,6 +290,12 @@ pub const RecursiveResolver = struct {
     /// null outside an active `resolve()`: cache-only paths and unit tests
     /// never go upstream.
     budget: ?*Budget = null,
+
+    /// Injectable time and chance; the caches keep their own `now_fn`.
+    /// Fan-out clones share `rng`, so a seeded one wants `fanout` off.
+    now_ns_fn: *const fn () i128 = &monotonic.nowNs,
+    wall_sec_fn: *const fn () i64 = &monotonic.wallclockSec,
+    rng: std.Random = rand.thread,
 
     const Scratch = struct {
         /// Re-entrancy guard: fetchDsFromParent → resolveNsAddresses →
@@ -388,12 +394,21 @@ pub const RecursiveResolver = struct {
     }
 
     fn consumeQuery(self: *RecursiveResolver) error{ GlobalQueryBudgetExhausted, ResolveDeadline }!void {
-        if (self.budget) |b| try b.consumeQuery();
+        if (self.budget) |b| try b.consumeQuery(self.now_ns_fn());
+    }
+
+    fn nowUs(self: *const RecursiveResolver) i64 {
+        return @intCast(@divTrunc(self.now_ns_fn(), std.time.ns_per_us));
+    }
+
+    /// Truncation keeps RFC 4034 §3.1.5 serial arithmetic wrapping.
+    fn epochNow(self: *const RecursiveResolver) u32 {
+        return @truncate(@as(u64, @intCast(self.wall_sec_fn())));
     }
 
     fn remainingMs(self: *const RecursiveResolver) u32 {
         const b = self.budget orelse return max_resolve_ms;
-        const ns = b.deadline_ns - monotonic.nowNs();
+        const ns = b.deadline_ns - self.now_ns_fn();
         return if (ns <= 0) 0 else @intCast(@min(@divTrunc(ns, std.time.ns_per_ms), max_resolve_ms));
     }
 
@@ -450,7 +465,7 @@ pub const RecursiveResolver = struct {
 
     pub fn resolve(self: *RecursiveResolver, allocator: mem.Allocator, name: []const u8, qtype: dns.RType) !ResolveResult {
         // Helpers join before this frame returns, so the pointer stays live.
-        var budget: Budget = .{ .deadline_ns = monotonic.nowNs() + @as(i128, max_resolve_ms) * std.time.ns_per_ms };
+        var budget: Budget = .{ .deadline_ns = self.now_ns_fn() + @as(i128, max_resolve_ms) * std.time.ns_per_ms };
         self.budget = &budget;
         defer self.budget = null;
         var result = try self.resolveDns64(allocator, name, qtype);
@@ -1492,7 +1507,7 @@ pub const RecursiveResolver = struct {
         timeout: u32,
     ) error{OutOfMemory}!?dns.Message {
         const addr_key = AddressKey.fromAddress(server);
-        const query_start = monotonic.nowUs();
+        const query_start = self.nowUs();
 
         // Fresh per-hop response_buf in the caller arena: parsed Name/rdata
         // slices alias this buffer, and state such as parent_zone,
@@ -1512,7 +1527,7 @@ pub const RecursiveResolver = struct {
             log.debug("UDP query to {s} failed: {s} (timeout {d}ms)", .{ na.format(server, &addr_buf), @errorName(err), timeout });
             return null;
         };
-        const elapsed_us = monotonic.nowUs() - query_start;
+        const elapsed_us = self.nowUs() - query_start;
 
         // Record liveness — truncated responses still prove server is alive
         if (self.rtt_cache) |rc| rc.recordSuccess(addr_key, elapsed_us);
@@ -1560,7 +1575,7 @@ pub const RecursiveResolver = struct {
     }
 
     fn caseRng(self: *RecursiveResolver) ?std.Random {
-        return if (self.case_randomization) rand.thread else null;
+        return if (self.case_randomization) self.rng else null;
     }
 
     /// True only when the echoed question is the query name with mangled
@@ -1603,7 +1618,7 @@ pub const RecursiveResolver = struct {
         var tcp = tcp_first;
         while (true) {
             const timeout = self.serverTimeout(addr_key, is_last, if (tcp) .tcp else .udp);
-            const query_id = rand.thread.int(u16);
+            const query_id = self.rng.int(u16);
             const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
                 .rd = false,
                 .edns = .{ .do_bit = do_bit },
@@ -1612,13 +1627,13 @@ pub const RecursiveResolver = struct {
             var wire_buf: [dns.edns_udp_payload]u8 = undefined;
             const wire_query = try dns.serializeMessage(&wire_buf, query_msg);
 
-            const start_us = monotonic.nowUs();
+            const start_us = self.nowUs();
             const response = try (if (tcp)
                 self.queryServerTcp(allocator, wire_query, server, timeout)
             else
                 self.queryServerUdp(allocator, wire_query, query_id, server, timeout)) orelse
                 return .timeout;
-            const elapsed_us = monotonic.nowUs() - start_us;
+            const elapsed_us = self.nowUs() - start_us;
 
             // RFC 5452 §9.1 / RFC 9619: question must match; error rcodes exempt.
             dns.validateResponse(response, query_msg.questions[0].name, qtype) catch return .mismatch;
@@ -1645,7 +1660,7 @@ pub const RecursiveResolver = struct {
         server: na.Address,
         oc: *EncryptedNs,
     ) !?DotReply {
-        const query_id = rand.thread.int(u16);
+        const query_id = self.rng.int(u16);
         const padded_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware, .padding_block = dns.dot_padding_block },
@@ -1655,7 +1670,7 @@ pub const RecursiveResolver = struct {
 
         const full_ms = self.coldTimeout(AddressKey.fromAddress(server), false, .dot);
         const budget_ms = @min(self.remainingMs(), full_ms);
-        const deadline_ns = monotonic.nowNs() + @as(i128, budget_ms) * std.time.ns_per_ms;
+        const deadline_ns = self.now_ns_fn() + @as(i128, budget_ms) * std.time.ns_per_ms;
         const verdict: ?DotReply = blk: {
             const reply = try tls_transport.query(&oc.pool, allocator, padded_query, server, deadline_ns) orelse {
                 // A clipped-budget miss is ours.
@@ -1728,7 +1743,7 @@ pub const RecursiveResolver = struct {
         // All legs share one case pattern (memcpy + ID-patch optimization).
         const case_rng = self.caseRng();
 
-        qids[0] = rand.thread.int(u16);
+        qids[0] = self.rng.int(u16);
         const msg0 = dns.buildQuery(allocator, qids[0], query_name, query_type, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
@@ -1740,14 +1755,14 @@ pub const RecursiveResolver = struct {
         leg_addrs[0] = servers[leg_idxs[0]];
 
         for (1..leg_count) |i| {
-            qids[i] = rand.thread.int(u16);
+            qids[i] = self.rng.int(u16);
             @memcpy(wires_storage[i][0..w0.len], w0);
             dns.patchQueryId(wires_storage[i][0..w0.len], qids[i]);
             wires[i] = wires_storage[i][0..w0.len];
             leg_addrs[i] = servers[leg_idxs[i]];
         }
 
-        const query_start = monotonic.nowUs();
+        const query_start = self.nowUs();
         const response_buf = try allocator.alloc(u8, dns.edns_udp_payload);
         const stag_result = self.transports.?.udp.queryStaggered(
             wires[0..leg_count],
@@ -1758,7 +1773,7 @@ pub const RecursiveResolver = struct {
             response_buf,
         ) catch return null;
 
-        const elapsed_us = monotonic.nowUs() - query_start;
+        const elapsed_us = self.nowUs() - query_start;
         const winner = stag_result.responding_idx;
         const responding_addr = leg_addrs[winner];
         const addr_key = AddressKey.fromAddress(responding_addr);
@@ -1862,9 +1877,9 @@ pub const RecursiveResolver = struct {
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
         var order_buf: [max_servers_per_level]usize = undefined;
         const sel = if (self.ns_selector) |ns|
-            ns.selectServers(parent_zone, servers, self.rtt_cache, rand.thread, &order_buf)
+            ns.selectServers(parent_zone, servers, self.rtt_cache, self.rng, &order_buf)
         else blk: {
-            rand.thread.shuffle(na.Address, servers);
+            self.rng.shuffle(na.Address, servers);
             for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..servers.len];
         };
@@ -2003,7 +2018,7 @@ pub const RecursiveResolver = struct {
         const dedup = self.dedup orelse return ctx.fetch();
         var budget = timeout_ns;
         for (0..2) |_| {
-            switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, monotonic.nowNs() + budget)) {
+            switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, self.now_ns_fn() + budget)) {
                 .leader => {
                     defer dedup.releaseLeader(name, rtype, dedup_mod.flag_internal);
                     return ctx.fetch();
@@ -2103,7 +2118,7 @@ pub const RecursiveResolver = struct {
         } else return null;
 
         const zone_parsed = try dns.parseDottedName(allocator, zone_name);
-        const now_u32 = epochNowU32();
+        const now_u32 = self.epochNow();
         const budget = self.validationBudget();
         const sig = if (ds) |d|
             validateDnskeyAgainstDs(resp.answers, d, zone_parsed, now_u32, budget) catch return null
@@ -2163,7 +2178,7 @@ pub const RecursiveResolver = struct {
         const arm_zone: dns.Name = if (qtype == .ds and zone.labels.len > 0) .{ .labels = zone.labels[1..] } else zone;
         var order_buf: [max_servers_per_level]usize = undefined;
         const sel = if (self.ns_selector) |ns|
-            ns.selectServers(arm_zone, servers, self.rtt_cache, rand.thread, &order_buf)
+            ns.selectServers(arm_zone, servers, self.rtt_cache, self.rng, &order_buf)
         else blk: {
             for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..servers.len];
@@ -2376,7 +2391,7 @@ pub const RecursiveResolver = struct {
             var signer_buf: [dns.max_dotted_len + 1]u8 = undefined;
             const parent_dotted = signer.formatInto(&signer_buf);
             const parent_dnskeys = (self.fetchDnskey(allocator, parent_dotted, parent_servers) catch null) orelse return null;
-            const now_u32 = epochNowU32();
+            const now_u32 = self.epochNow();
             const ds_sig = dnssec.validateRrset(
                 zone_ds,
                 zone,
@@ -2444,7 +2459,7 @@ pub const RecursiveResolver = struct {
         // type_covered RRSIG; treat as unauthenticated rather than bogus.
         if (qtype == .any) return .skip;
 
-        const now_u32 = epochNowU32();
+        const now_u32 = self.epochNow();
 
         // Every RRset in the section, under its own signer's keys, weakest
         // verdict wins. Narrower scoping has twice produced AD=1 over records
@@ -2652,7 +2667,7 @@ pub const RecursiveResolver = struct {
         const signer_dotted = nameToDotted(allocator, signer) catch return .unchecked;
         const dnskey_records = (self.fetchDnskey(allocator, signer_dotted, parent_servers) catch return .unchecked) orelse return .unchecked;
 
-        return switch (dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, epochNowU32(), self.validationBudget(), ttl_cap)) {
+        return switch (dnssec.verifyAuthorityProofSigs(authorities, dnskey_records, self.epochNow(), self.validationBudget(), ttl_cap)) {
             .secure => .{ .secure = signer },
             .bogus => .bogus,
             .unchecked, .insecure => .unchecked,
@@ -2722,7 +2737,7 @@ pub const RecursiveResolver = struct {
         std.debug.assert(ns_names.len <= max_servers_per_level);
         var shuffled: [max_servers_per_level]dns.Name = undefined;
         @memcpy(shuffled[0..ns_names.len], ns_names);
-        rand.thread.shuffle(dns.Name, shuffled[0..ns_names.len]);
+        self.rng.shuffle(dns.Name, shuffled[0..ns_names.len]);
         const names = shuffled[0..ns_names.len];
 
         // Parallel path: one helper thread per (ns_name × rtype) task beyond
@@ -2783,7 +2798,7 @@ pub const RecursiveResolver = struct {
         const tag = dedup_mod.tag(ns_dotted, rtype, dedup_mod.flag_internal);
         const leader = if (self.dedup) |dedup|
             !budget.holds(tag) and
-                dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, dedup_mod.flag_internal, monotonic.nowNs() + ns_addr_dedup_timeout_ns) == .leader
+                dedup.acquireOrWaitWithTimeout(ns_dotted, rtype, dedup_mod.flag_internal, self.now_ns_fn() + ns_addr_dedup_timeout_ns) == .leader
         else
             false;
         if (leader) budget.hold(tag);
@@ -3260,14 +3275,6 @@ fn parentZoneOf(zone_name: []const u8) []const u8 {
     const pos = dns.indexOfUnescapedDot(zone_name, 0) orelse return "";
     if (pos + 1 >= zone_name.len) return "";
     return zone_name[pos + 1 ..];
-}
-
-/// Returns current epoch time as u32 for DNSSEC signature validation.
-/// Uses wall clock (not monotonic) because RRSIG inception/expiration
-/// are defined as epoch seconds (RFC 4034 §3.1.5). Truncation gives
-/// correct serial number arithmetic wrapping behavior.
-fn epochNowU32() u32 {
-    return @truncate(@as(u64, @intCast(monotonic.wallclockSec())));
 }
 
 fn nameToDotted(allocator: mem.Allocator, name: dns.Name) ![]const u8 {
@@ -4685,19 +4692,20 @@ test "queryAuthoritativeServers returns CacheOnlyMiss when cache_only=true" {
 
 test "Budget.consumeQuery permits exactly max draws then refuses" {
     var budget: Budget = .{ .max_queries = 5 };
-    for (0..5) |_| try budget.consumeQuery();
-    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
+    for (0..5) |_| try budget.consumeQuery(0);
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery(0));
     // Stays refused once exhausted — the counter never resets mid-resolution
     // (the property that makes it NXNS-proof; cf. BIND #4741). The shared-by-
     // pointer-across-cloneForThread invariant is guarded end-to-end by
     // test/harness/test_nxns_amplification.py, not here — a unit test can only
     // restate Zig's value-copy semantics, which is not the thing that breaks.
-    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery());
+    try testing.expectError(error.GlobalQueryBudgetExhausted, budget.consumeQuery(0));
 }
 
-test "Budget.consumeQuery refuses past the wall-clock deadline" {
-    var budget: Budget = .{ .deadline_ns = monotonic.nowNs() - 1 };
-    try testing.expectError(error.ResolveDeadline, budget.consumeQuery());
+test "Budget.consumeQuery refuses from the deadline on" {
+    var budget: Budget = .{ .deadline_ns = 100 };
+    try budget.consumeQuery(99);
+    try testing.expectError(error.ResolveDeadline, budget.consumeQuery(100));
 }
 
 test "validation budget stays tree-wide across cloneForThread under concurrent fan-out" {
@@ -5075,7 +5083,7 @@ test "storeWildcardRRsets abandons a wildcard RRset that overflows its collect b
                     // Live against the real wall clock, which this cache uses:
                     // 0xFFFFFFFF would not do — RFC 1982 serial arithmetic puts
                     // anything more than 2^31 s ahead of now in the *past*.
-                    .sig_expiration = epochNowU32() +% 3600,
+                    .sig_expiration = resolver.epochNow() +% 3600,
                     .key_tag = 1,
                     .signer_name = signer,
                     .signature = &.{},
@@ -5117,7 +5125,7 @@ test "storeWildcardRRsets bounds the synthesized entry by the validator's ttl ca
             .labels = 2,
             .original_ttl = 300,
             .sig_inception = 0,
-            .sig_expiration = epochNowU32() +% 3600,
+            .sig_expiration = resolver.epochNow() +% 3600,
             .key_tag = 1,
             .signer_name = signer,
             .signature = &.{},
