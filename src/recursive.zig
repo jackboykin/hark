@@ -423,10 +423,6 @@ pub const RecursiveResolver = struct {
         return rc.getTimeout(addr_key, is_last, transport);
     }
 
-    fn serverTimeout(self: *RecursiveResolver, addr_key: AddressKey, is_last: bool, transport: Transport) u32 {
-        return @min(self.coldTimeout(addr_key, is_last, transport), self.remainingMs());
-    }
-
     pub const ResolveResult = struct {
         message: dns.Message,
         servfail_why: ?[]const u8 = null,
@@ -1427,6 +1423,7 @@ pub const RecursiveResolver = struct {
         query_id: u16,
         server: na.Address,
         timeout: u32,
+        clipped: bool,
     ) error{OutOfMemory}!?dns.Message {
         const addr_key = AddressKey.fromAddress(server);
         const query_start = self.nowUs();
@@ -1444,7 +1441,7 @@ pub const RecursiveResolver = struct {
             timeout,
             response_buf,
         ) catch |err| {
-            if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
+            if (!clipped) if (self.rtt_cache) |rc| rc.recordTimeout(addr_key);
             var addr_buf: [64]u8 = undefined;
             log.debug("UDP query to {s} failed: {s} (timeout {d}ms)", .{ na.format(server, &addr_buf), @errorName(err), timeout });
             return null;
@@ -1505,6 +1502,8 @@ pub const RecursiveResolver = struct {
         response: struct { message: dns.Message, elapsed_us: i64 },
         /// Transport timeout/error or unparseable reply.
         timeout,
+        /// Budget-clipped: no verdict on the server.
+        expired,
         /// A reply arrived but failed question validation (RFC 5452 §9.1).
         mismatch,
     };
@@ -1529,7 +1528,10 @@ pub const RecursiveResolver = struct {
         const addr_key = AddressKey.fromAddress(server);
         var tcp = tcp_first;
         while (true) {
-            const timeout = self.serverTimeout(addr_key, is_last, if (tcp) .tcp else .udp);
+            const full = self.coldTimeout(addr_key, is_last, if (tcp) .tcp else .udp);
+            const timeout = @min(full, self.remainingMs());
+            if (timeout == 0) return error.ResolveDeadline;
+            const clipped = timeout < full;
             const query_id = self.rng.int(u16);
             const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
                 .rd = false,
@@ -1543,8 +1545,8 @@ pub const RecursiveResolver = struct {
             const response = try (if (tcp)
                 self.queryServerTcp(allocator, wire_query, server, timeout)
             else
-                self.queryServerUdp(allocator, wire_query, query_id, server, timeout)) orelse
-                return .timeout;
+                self.queryServerUdp(allocator, wire_query, query_id, server, timeout, clipped)) orelse
+                return if (clipped) .expired else .timeout;
             const elapsed_us = self.nowUs() - start_us;
 
             switch (dns.checkEcho(response, query_msg.questions[0].name, qtype)) {
@@ -1644,6 +1646,7 @@ pub const RecursiveResolver = struct {
             self.stagger_ms;
 
         const overall_timeout = @min(self.transports.?.udp.config.timeout_ms, self.remainingMs());
+        if (overall_timeout == 0) return null;
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
         // per leg because each socket's send holds the wire bytes past the
@@ -1798,7 +1801,7 @@ pub const RecursiveResolver = struct {
                     self.recordNsOutcome(parent_zone, server, .timeout, 0);
                     continue :server_loop;
                 },
-                .mismatch => continue :server_loop,
+                .mismatch, .expired => continue :server_loop,
                 .response => |r| r,
             };
             const response = exchange.message;
@@ -2071,7 +2074,7 @@ pub const RecursiveResolver = struct {
                     self.recordNsOutcome(arm_zone, server, .timeout, 0);
                     continue;
                 },
-                .mismatch => continue,
+                .mismatch, .expired => continue,
                 .response => |r| r,
             };
             const response = exchange.message;
