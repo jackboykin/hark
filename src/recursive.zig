@@ -77,6 +77,9 @@ pub const root_hints_default: [26]na.Address = .{
 const max_global_queries = 100;
 // PowerDNS max-total-msec; Knot/BIND 10s.
 const max_resolve_ms: u32 = 7_000;
+comptime {
+    std.debug.assert(dedup_mod.follower_wait_ns == @as(u64, max_resolve_ms) * std.time.ns_per_ms);
+}
 // Real depth tops out near 5; 16 covers QMIN-with-referrals stacks.
 const max_delegations = 16;
 // Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.

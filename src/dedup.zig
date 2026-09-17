@@ -45,6 +45,8 @@ const IdentityContext = struct {
     }
 };
 
+pub const follower_wait_ns = 7 * std.time.ns_per_s;
+
 pub const AcquireResult = enum { leader, follower, uncoordinated };
 
 /// The table's key for `(name, qtype, flags)`; callers use it as a compact
@@ -105,9 +107,6 @@ pub const InFlightTable = struct {
     /// Returns `.uncoordinated` if the entry could not be allocated: resolve, don't release
     /// (that would evict a real leader and wake its followers early).
     ///
-    /// The default 2s budget bounds how long a follower waits on the leader.
-    /// It's shorter than typical recursive-resolver client timeouts (5-10s);
-    /// a sub-second client API would need explicit deadline propagation here.
     /// Passing `null` defers the clock read so the leader fast path skips it.
     pub fn acquireOrWait(self: *InFlightTable, name: []const u8, qtype: dns.RType, flags: u8) AcquireResult {
         return self.acquireOrWaitImpl(name, qtype, flags, null);
@@ -130,7 +129,7 @@ pub const InFlightTable = struct {
         if (shard.map.contains(key)) {
             // Wait on this shard's condvar. Any same-shard release wakes us;
             // we exit when our entry is gone or the deadline expires.
-            const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + 2 * std.time.ns_per_s);
+            const deadline_ns = deadline_ns_opt orelse (monotonic.nowNs() + follower_wait_ns);
             while (shard.map.contains(key)) {
                 // Deadline hit, leader still in-flight: return .follower anyway;
                 // the caller re-resolves on its own. A rare duplicate upstream
