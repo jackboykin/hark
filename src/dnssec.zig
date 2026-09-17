@@ -613,8 +613,15 @@ fn verifyRrsig(
     if (dns.serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
     if (dns.serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
 
-    var canonical_buf: [65536]u8 = undefined;
-    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
+    // A cold burst's largest signed data was 4.3 KiB (RSA DNSKEY rollover);
+    // spilling only TCP-sized sets keeps 64 KiB off every validating stack.
+    var canonical_buf: [8192]u8 = undefined;
+    var spill: []u8 = &.{};
+    defer std.heap.page_allocator.free(spill);
+    const data = buildSignedData(&canonical_buf, rrsig, rrset) catch data: {
+        spill = std.heap.page_allocator.alloc(u8, 65536) catch return error.BufferTooSmall;
+        break :data try buildSignedData(spill, rrsig, rrset);
+    };
 
     switch (rrsig.algorithm) {
         .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha1),
@@ -4041,6 +4048,21 @@ test "verifyRrsig rejects labels below the signer's label count" {
     var budget: ValidationBudget = .{};
     try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
     signed.rrsig.labels = 1;
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
+}
+
+test "verifyRrsig verifies signed data past its stack buffer" {
+    const chunk: [255]u8 = @splat('x');
+    const strings: [40][]const u8 = @splat(&chunk);
+    var recs = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = &strings } } },
+    };
+    var sig_buf: [64]u8 = undefined;
+    var pub_buf: [32]u8 = undefined;
+    const signed = try testSignRrset(&recs, .txt, test_owner, .ed25519, &sig_buf, &pub_buf);
+    var budget: ValidationBudget = .{};
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
+    recs[0].rdata.txt.strings = strings[1..];
     try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
 }
 
