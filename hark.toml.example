@@ -4,7 +4,8 @@
 listen = ["127.0.0.1:53", "[::1]:53"]
 allow-from = []               # client CIDR allowlist; empty = allow all.
                               # Required when binding non-loopback (BCP 140).
-workers = 2                   # io_uring rings; raise for high QPS
+workers = 2                   # client event loops; raise for high QPS
+io-uring = true               # false forces epoll; a refused ring falls back anyway
 resolution-threads = 4        # upstream query threads per worker
 max-udp-payload = 1232        # advertised EDNS0 buffer size
 minimal-responses = true      # strip non-load-bearing authority/additional RRs

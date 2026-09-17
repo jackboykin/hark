@@ -50,6 +50,7 @@ pub const ServerConfig = struct {
     opportunistic: bool,
     dns64: ?dns64.Prefix,
     workers: u16,
+    io_uring: bool,
     resolution_threads: u16,
     stagger_ms: u32,
     log_queries: bool,
@@ -173,10 +174,11 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .opportunistic = false,
         .dns64 = null,
         // 2 workers is enough for most deployments. Each worker is one
-        // io_uring ring; per-worker resolution-threads handle upstream
-        // concurrency. Raise this for high-QPS edge resolvers — io_uring
+        // event loop; per-worker resolution-threads handle upstream
+        // concurrency. Raise this for high-QPS edge resolvers — client-plane
         // drainage is rarely the bottleneck; resolution work dominates.
         .workers = 2,
+        .io_uring = true,
         .resolution_threads = 4,
         .stagger_ms = 150,
         .log_queries = false,
@@ -212,6 +214,7 @@ const config_schema = [_]SectionSpec{
     .{ .name = "server", .keys = &.{
         .{ .name = "listen", .kind = .string_array },
         .{ .name = "workers", .kind = .integer },
+        .{ .name = "io-uring", .kind = .boolean },
         .{ .name = "resolution-threads", .kind = .integer },
         .{ .name = "max-udp-payload", .kind = .integer },
         .{ .name = "user", .kind = .integer },
@@ -391,6 +394,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (try nonNegative(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
         if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
+        if (server.getBool("io-uring")) |u| cfg.io_uring = u;
     }
 
     if (parsed.table.getTable("resolver")) |resolver| {
@@ -768,6 +772,18 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(true, cfg.prefetch);
     try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
+}
+
+test "io-uring defaults on and parses off" {
+    var on = try parseConfig(testing.allocator, "");
+    defer on.deinit();
+    try testing.expect(on.io_uring);
+    var off = try parseConfig(testing.allocator,
+        \\[server]
+        \\io-uring = false
+    );
+    defer off.deinit();
+    try testing.expect(!off.io_uring);
 }
 
 test "tcp idle/queries/upstream knobs parse and validate" {

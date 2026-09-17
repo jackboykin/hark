@@ -25,6 +25,10 @@ class HarkConfig:
     upstream_port: int = 5353
     root_hints: list[str] = dataclasses.field(default_factory=list)
     workers: int = 1
+    # `HARK_IO_URING=0 pytest` runs the suite on epoll.
+    io_uring: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("HARK_IO_URING", "1") != "0"
+    )
     qname_minimization: bool = True
     dnssec: bool = False
     cache_min_ttl: int = 0
@@ -68,6 +72,7 @@ class HarkConfig:
             "[server]",
             f'listen = ["{self.listen_ip}:{self.listen_port}"]',
             f"workers = {self.workers}",
+            f"io-uring = {str(self.io_uring).lower()}",
             f"minimal-responses = {str(self.minimal_responses).lower()}",
         ]
         if self.tcp_idle_timeout_ms is not None:

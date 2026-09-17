@@ -510,7 +510,7 @@ pub const Server = struct {
         // on the main thread, before the drop and before any thread
         // exists to inherit the wrong credentials.
         const rigs = try self.allocator.alloc(Rig, workers);
-        var backend: event_loop.Backend = .io_uring;
+        var backend: event_loop.Backend = if (self.config.io_uring) .io_uring else .epoll;
         for (rigs) |*rig| {
             rig.loop = EventLoop.create(self.allocator, backend) catch |err| {
                 log.err("failed to create event loop: {s}", .{@errorName(err)});
