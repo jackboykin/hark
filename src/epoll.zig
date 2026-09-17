@@ -1,5 +1,7 @@
-//! Readiness fallback where io_uring is refused: an event runs the syscall
-//! the SQE would have, a spurious wake re-arms silently.
+//! epoll backend. Readiness drives the op's own syscall: accept4, read, or
+//! one recvmmsg batch for UDP. UDP stays level-triggered and armed; the
+//! rest are one-shot, and EAGAIN on a spurious wake re-arms silently.
+//! Timers live in the slot table and bound the epoll_wait timeout.
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
@@ -14,7 +16,7 @@ const Completion = event_loop.Completion;
 const OperationId = event_loop.OperationId;
 const Slot = event_loop.Slot;
 const max_operations = event_loop.max_operations;
-const multishot_payload_max = event_loop.multishot_payload_max;
+const udp_payload_max = event_loop.udp_payload_max;
 const no_addr = event_loop.no_addr;
 
 const Epoll = @This();
@@ -36,7 +38,7 @@ pub fn init(allocator: std.mem.Allocator) !Epoll {
     errdefer sys.close(fd);
     var e: Epoll = .{
         .fd = fd,
-        .buffers = try allocator.alloc(u8, @as(usize, max_operations) * multishot_payload_max),
+        .buffers = try allocator.alloc(u8, @as(usize, max_operations) * udp_payload_max),
         .free = undefined,
         .free_count = max_operations,
     };
@@ -59,7 +61,7 @@ pub fn arm(e: *Epoll, slot: *Slot, id: OperationId) !void {
 }
 
 fn bufferAt(e: *const Epoll, buffer_id: u16) []u8 {
-    return e.buffers[@as(usize, buffer_id) * multishot_payload_max ..][0..multishot_payload_max];
+    return e.buffers[@as(usize, buffer_id) * udp_payload_max ..][0..udp_payload_max];
 }
 
 pub fn release(e: *Epoll, buffer_id: u16) void {
@@ -145,7 +147,7 @@ fn drainUdp(e: *Epoll, slot: *const Slot, out: []Completion) usize {
     var msgs: [max_operations]linux.mmsghdr = undefined;
     for (0..n) |i| {
         ids[i] = e.free[e.free_count - 1 - i];
-        iovs[i] = .{ .base = e.bufferAt(ids[i]).ptr, .len = multishot_payload_max };
+        iovs[i] = .{ .base = e.bufferAt(ids[i]).ptr, .len = udp_payload_max };
         msgs[i] = .{ .len = 0, .hdr = .{
             .name = &names[i].any,
             .namelen = @sizeOf(na.PosixAddress),

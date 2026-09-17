@@ -25,9 +25,9 @@ class HarkConfig:
     upstream_port: int = 5353
     root_hints: list[str] = dataclasses.field(default_factory=list)
     workers: int = 1
-    # `HARK_IO_URING=0 pytest` runs the suite on epoll.
-    io_uring: bool = dataclasses.field(
-        default_factory=lambda: os.environ.get("HARK_IO_URING", "1") != "0"
+    # `HARK_EVENT_LOOP=io_uring pytest` runs the suite on io_uring.
+    event_loop: str = dataclasses.field(
+        default_factory=lambda: os.environ.get("HARK_EVENT_LOOP", "epoll")
     )
     qname_minimization: bool = True
     dnssec: bool = False
@@ -72,7 +72,7 @@ class HarkConfig:
             "[server]",
             f'listen = ["{self.listen_ip}:{self.listen_port}"]',
             f"workers = {self.workers}",
-            f"io-uring = {str(self.io_uring).lower()}",
+            f'event-loop = "{self.event_loop}"',
             f"minimal-responses = {str(self.minimal_responses).lower()}",
         ]
         if self.tcp_idle_timeout_ms is not None:

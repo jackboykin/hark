@@ -14,7 +14,7 @@ const Completion = event_loop.Completion;
 const OperationId = event_loop.OperationId;
 const Slot = event_loop.Slot;
 const max_operations = event_loop.max_operations;
-const multishot_payload_max = event_loop.multishot_payload_max;
+const udp_payload_max = event_loop.udp_payload_max;
 const no_addr = event_loop.no_addr;
 
 const Uring = @This();
@@ -30,10 +30,10 @@ const multishot_group_id: u16 = 0;
 const multishot_buf_count: u16 = 256;
 const multishot_name_reserve: u32 = 28; // sockaddr_in6 max
 /// io_uring_recvmsg_out header + reserved name + payload.
-const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + multishot_payload_max;
+const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + udp_payload_max;
 
-/// PermissionDenied and SystemOutdated come back unlogged: the caller
-/// decides whether they mean "fall back".
+/// PermissionDenied and SystemOutdated come back unlogged: the host refuses
+/// io_uring, which a test skips and the server explains.
 pub fn init(allocator: std.mem.Allocator) !Uring {
     var params = std.mem.zeroes(linux.io_uring_params);
     // COOP_TASKRUN: skip kernel→user IPI when the task is already running

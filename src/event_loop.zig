@@ -13,24 +13,25 @@ pub const max_operations = 64;
 /// Read ops serve only the signalfd — the buffer needs
 /// room for a few packed signalfd_siginfo records (128 B each; signalfd
 /// coalesces per signo, and excess records stay queued in the fd until
-/// the op is re-armed), never packet data. UDP payloads ride the
-/// multishot buffer ring instead.
+/// the op is re-armed), never packet data. UDP payloads live in the
+/// backend's packet buffers instead.
 const read_buf_size = 4 * @sizeOf(linux.signalfd_siginfo);
 
-pub const multishot_payload_max: u32 = 4096;
+pub const udp_payload_max: u32 = 4096;
 
 pub const no_addr = na.initIp4(.{ 0, 0, 0, 0 }, 0);
 
 pub const OperationId = u16;
 
-pub const Backend = enum { io_uring, epoll };
+pub const Backend = enum { epoll, io_uring };
 
 pub const Completion = struct {
     context: *anyopaque,
     result: Result,
-    /// True when the kernel finished with this operation and its slot was
-    /// freed — for multishot, when IORING_CQE_F_MORE was clear. The caller
-    /// must re-arm iff this is set.
+    /// True when the operation is finished and its slot was freed. A
+    /// `recvFromMulti` arm stays live across completions until the backend
+    /// ends it (io_uring on ENOBUFS; epoll never). The caller must re-arm
+    /// iff this is set.
     ///
     /// This travels on the completion rather than being asked of the slot
     /// table afterwards because by then the answer is gone: a batch frees
@@ -54,7 +55,7 @@ pub const RecvResult = struct {
     data: []const u8,
     addr: na.Address,
     err: ?anyerror,
-    /// Non-null for multishot recv completions. Caller MUST call
+    /// Non-null for `recvFromMulti` completions. Caller MUST call
     /// `releaseBuf(buf_id)` after processing `data`, or the pool starves.
     buf_id: ?u16 = null,
 };
@@ -71,8 +72,9 @@ pub const ReadResult = struct {
     /// slot can be freed and re-armed mid-batch without invalidating
     /// this completion. (When `data` aliased the slot, any arm that
     /// claimed the freed slot — the LIFO free list makes that likely —
-    /// clobbered a not-yet-consumed payload: an accept CQE reaped ahead
-    /// of a signal CQE zeroed the siginfo and turned stats into shutdown.)
+    /// clobbered a not-yet-consumed payload: an accept completion reaped
+    /// ahead of a signal completion zeroed the siginfo and turned stats
+    /// into shutdown.)
     buf: [read_buf_size]u8,
     len: usize,
     err: ?anyerror,
@@ -87,14 +89,13 @@ pub const Slot = struct {
     active: bool,
     /// -1 for timers.
     fd: posix.fd_t,
-    /// io_uring writes through pointers into the active variant, so it and
-    /// the slot stay put until the op completes.
+    /// The kernel writes through pointers into the active variant, so it
+    /// and the slot stay put until the op completes.
     state: State,
 
     const State = union(enum) {
-        /// Multishot recvmsg owns msghdr, filled by io_uring's arm (kernel
-        /// reads namelen/iovlen at submit time; payloads arrive via the
-        /// buffer ring).
+        /// io_uring's multishot recvmsg layout, filled at arm; epoll's
+        /// recvmmsg builds its own headers per batch.
         recv_multi: posix.msghdr,
         /// accept owns the peer-address out-params the kernel fills.
         accept: struct { addr: na.PosixAddress, addr_len: posix.socklen_t },
@@ -113,13 +114,11 @@ pub const EventLoop = struct {
     free_list: [max_operations]OperationId,
     free_count: u16,
     backend: union(Backend) {
-        io_uring: Uring,
         epoll: Epoll,
+        io_uring: Uring,
     },
 
-    /// Epoll only when preferred or the kernel refuses io_uring outright:
-    /// a misconfigured ring is fatal, not a sandbox.
-    pub fn create(allocator: std.mem.Allocator, prefer: Backend) !*EventLoop {
+    pub fn create(allocator: std.mem.Allocator, backend: Backend) !*EventLoop {
         const self = try allocator.create(EventLoop);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
@@ -128,25 +127,18 @@ pub const EventLoop = struct {
             self.slots[i] = .{ .context = undefined, .active = false, .fd = -1, .state = undefined };
             self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
         }
-        if (prefer == .io_uring) {
-            if (Uring.init(allocator)) |u| {
-                self.backend = .{ .io_uring = u };
-                return self;
-            } else |err| switch (err) {
-                error.PermissionDenied => log.warn("io_uring refused (EPERM: seccomp, container runtime or kernel.io_uring_disabled); using epoll", .{}),
-                error.SystemOutdated => log.warn("io_uring unavailable (ENOSYS: kernel built without it); using epoll", .{}),
-                else => return err,
-            }
-        }
-        self.backend = .{ .epoll = try Epoll.init(allocator) };
+        self.backend = switch (backend) {
+            .epoll => .{ .epoll = try Epoll.init(allocator) },
+            .io_uring => .{ .io_uring = try Uring.init(allocator) },
+        };
         return self;
     }
 
-    /// Binds a ring to the calling thread; must precede the first submit.
+    /// Binds the loop to the calling thread; must precede the first tick.
     pub fn enable(self: *EventLoop) !void {
         switch (self.backend) {
-            .io_uring => |*u| try u.enable(),
             .epoll => {},
+            .io_uring => |*u| try u.enable(),
         }
     }
 
@@ -241,11 +233,10 @@ pub const EventLoop = struct {
 };
 
 pub fn createTestLoop(backend: Backend) !*EventLoop {
-    const loop = try EventLoop.create(testing.allocator, backend);
-    if (loop.backend != backend) {
-        loop.destroy();
-        return error.SkipZigTest;
-    }
+    const loop = EventLoop.create(testing.allocator, backend) catch |err| return switch (err) {
+        error.PermissionDenied, error.SystemOutdated => error.SkipZigTest,
+        else => err,
+    };
     watchdog(10);
     try loop.enable();
     return loop;
@@ -280,7 +271,7 @@ test "Slot stays lean — read ops must not drag packet-sized buffers back in" {
     // The pre-union Slot carried a 4 KiB recv_buf in every slot whether
     // the op needed it or not (~256 KiB/worker dead). Budget: the small
     // read buffer plus header change. If this fires, some variant grew a
-    // packet-sized payload — packets belong in the multishot buffer ring.
+    // packet-sized payload — packets belong in the backend's packet buffers.
     try testing.expect(@sizeOf(Slot) <= read_buf_size + 64);
 }
 
@@ -473,7 +464,7 @@ test "truncated datagram is rejected without tearing down the multishot" {
 
             const s = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
             defer sys.close(s);
-            const big: [multishot_payload_max + 1]u8 = @splat('x');
+            const big: [udp_payload_max + 1]u8 = @splat('x');
             _ = try sys.sendto(s, &big, 0, &pa.any, sa_len);
 
             var completions: [max_operations]Completion = undefined;

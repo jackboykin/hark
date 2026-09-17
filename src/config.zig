@@ -9,6 +9,7 @@ const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
+const Backend = @import("event_loop.zig").Backend;
 const build_options = @import("build_options");
 
 /// Error variants can't carry the offending key name, so log it at rejection
@@ -50,7 +51,7 @@ pub const ServerConfig = struct {
     opportunistic: bool,
     dns64: ?dns64.Prefix,
     workers: u16,
-    io_uring: bool,
+    event_loop: Backend,
     resolution_threads: u16,
     stagger_ms: u32,
     log_queries: bool,
@@ -178,7 +179,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         // concurrency. Raise this for high-QPS edge resolvers — client-plane
         // drainage is rarely the bottleneck; resolution work dominates.
         .workers = 2,
-        .io_uring = true,
+        .event_loop = .epoll,
         .resolution_threads = 4,
         .stagger_ms = 150,
         .log_queries = false,
@@ -214,7 +215,7 @@ const config_schema = [_]SectionSpec{
     .{ .name = "server", .keys = &.{
         .{ .name = "listen", .kind = .string_array },
         .{ .name = "workers", .kind = .integer },
-        .{ .name = "io-uring", .kind = .boolean },
+        .{ .name = "event-loop", .kind = .string },
         .{ .name = "resolution-threads", .kind = .integer },
         .{ .name = "max-udp-payload", .kind = .integer },
         .{ .name = "user", .kind = .integer },
@@ -394,7 +395,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (try nonNegative(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
         if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
-        if (server.getBool("io-uring")) |u| cfg.io_uring = u;
+        if (server.getString("event-loop")) |s| cfg.event_loop = std.meta.stringToEnum(Backend, s) orelse {
+            errLog("config: event-loop '{s}' is not io_uring or epoll", .{s});
+            return error.InvalidValue;
+        };
     }
 
     if (parsed.table.getTable("resolver")) |resolver| {
@@ -774,16 +778,17 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
 }
 
-test "io-uring defaults on and parses off" {
-    var on = try parseConfig(testing.allocator, "");
-    defer on.deinit();
-    try testing.expect(on.io_uring);
-    var off = try parseConfig(testing.allocator,
+test "event-loop defaults to epoll, parses io_uring, refuses the rest" {
+    var default = try parseConfig(testing.allocator, "");
+    defer default.deinit();
+    try testing.expectEqual(Backend.epoll, default.event_loop);
+    var uring = try parseConfig(testing.allocator,
         \\[server]
-        \\io-uring = false
+        \\event-loop = "io_uring"
     );
-    defer off.deinit();
-    try testing.expect(!off.io_uring);
+    defer uring.deinit();
+    try testing.expectEqual(Backend.io_uring, uring.event_loop);
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, "[server]\nevent-loop = \"io-uring\"\n"));
 }
 
 test "tcp idle/queries/upstream knobs parse and validate" {

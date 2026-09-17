@@ -100,7 +100,7 @@ const PerThreadArena = struct {
     }
 };
 
-const max_work_query_bytes = @import("event_loop.zig").multishot_payload_max;
+const max_work_query_bytes = @import("event_loop.zig").udp_payload_max;
 
 /// .bg payload: [qtype u16 BE][BgKind u8][name]
 /// .tcp payload: [*TcpClient usize LE][query wire]
@@ -511,14 +511,15 @@ pub const Server = struct {
         // on the main thread, before the drop and before any thread
         // exists to inherit the wrong credentials.
         const rigs = try self.allocator.alloc(Rig, workers);
-        var backend: event_loop.Backend = if (self.config.io_uring) .io_uring else .epoll;
         for (rigs) |*rig| {
-            rig.loop = EventLoop.create(self.allocator, backend) catch |err| {
-                log.err("failed to create event loop: {s}", .{@errorName(err)});
+            rig.loop = EventLoop.create(self.allocator, self.config.event_loop) catch |err| {
+                switch (err) {
+                    error.PermissionDenied => log.err("io_uring refused (EPERM: seccomp, container runtime or kernel.io_uring_disabled); set event-loop = \"epoll\"", .{}),
+                    error.SystemOutdated => log.err("io_uring unavailable (ENOSYS: kernel built without it); set event-loop = \"epoll\"", .{}),
+                    else => log.err("failed to create event loop: {s}", .{@errorName(err)}),
+                }
                 return err;
             };
-            // A refused ring is refused for every worker: warn once.
-            backend = rig.loop.backend;
             rig.udp = @splat(-1);
             rig.tcp = @splat(-1);
             for (listen_addrs, 0..) |addr, i| {
@@ -552,7 +553,7 @@ pub const Server = struct {
             if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
             if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
         }
-        log.info("workers={d} ({t})", .{ workers, backend });
+        log.info("workers={d} ({t})", .{ workers, self.config.event_loop });
         if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
 
         for (rigs[1..], 1..) |*rig, i| {
