@@ -2384,6 +2384,38 @@ pub fn validateResponse(msg: Message, expected_name: Name, qtype: RType) error{F
     }
 }
 
+pub const Echo = enum { ok, mismatch, mangled };
+
+/// RFC 5452 §9.1 / RFC 9619 match, then byte case: a same-name case mismatch
+/// is a middlebox or a forgery that guessed TXID and port. Error rcodes may
+/// omit or misstate the question without mangling.
+pub fn checkEcho(response: Message, sent: Name, qtype: RType) Echo {
+    validateResponse(response, sent, qtype) catch return .mismatch;
+    if (response.questions.len != 1) return .ok;
+    const echoed = response.questions[0].name;
+    return if (sent.eql(echoed) and !sent.eqlExact(echoed)) .mangled else .ok;
+}
+
+test "checkEcho: only a same-name case mismatch marks mangling" {
+    const sent = Name{ .labels = &.{ "eXaMpLe", "cOm" } };
+    const flags = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .refused };
+    const reply = struct {
+        // comptime name so the questions array lands in static memory —
+        // a runtime param would leave it dangling on this frame's stack.
+        fn make(comptime name: Name, rcode: RCode) Message {
+            var f = flags;
+            f.rcode = rcode;
+            return .{ .header = .{ .id = 0, .flags = f }, .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }} };
+        }
+    }.make;
+
+    try std.testing.expectEqual(Echo.mangled, checkEcho(reply(.{ .labels = &.{ "example", "com" } }, .no_error), sent, .a));
+    try std.testing.expectEqual(Echo.ok, checkEcho(reply(sent, .no_error), sent, .a));
+    try std.testing.expectEqual(Echo.mismatch, checkEcho(reply(.{ .labels = &.{ "other", "net" } }, .no_error), sent, .a));
+    try std.testing.expectEqual(Echo.ok, checkEcho(reply(.{ .labels = &.{ "other", "net" } }, .refused), sent, .a));
+    try std.testing.expectEqual(Echo.ok, checkEcho(.{ .header = .{ .id = 0, .flags = flags }, .questions = &.{} }, sent, .a));
+}
+
 test "validateResponse accepts a question-less error reply but rejects question-less NOERROR" {
     // RFC 9619: error rcodes may omit the question; NOERROR may not. An error
     // reply with QDCOUNT=0 thus passes here with empty questions — recursive.zig's

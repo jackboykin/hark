@@ -1578,16 +1578,6 @@ pub const RecursiveResolver = struct {
         return if (self.case_randomization) self.rng else null;
     }
 
-    /// True only when the echoed question is the query name with mangled
-    /// byte case. Error rcodes are exempt from question-match (RFC 9619 /
-    /// validateResponse), so a reply can arrive question-less or carrying
-    /// an unrelated question — neither is evidence of case-mangling.
-    fn caseMangledEcho(query_name: dns.Name, response: dns.Message) bool {
-        return response.questions.len == 1 and
-            query_name.eql(response.questions[0].name) and
-            !query_name.eqlExact(response.questions[0].name);
-    }
-
     const Do53Result = union(enum) {
         /// Question echo verified; rcode policy stays with the caller.
         response: struct { message: dns.Message, elapsed_us: i64 },
@@ -1635,14 +1625,15 @@ pub const RecursiveResolver = struct {
                 return .timeout;
             const elapsed_us = self.nowUs() - start_us;
 
-            // RFC 5452 §9.1 / RFC 9619: question must match; error rcodes exempt.
-            dns.validateResponse(response, query_msg.questions[0].name, qtype) catch return .mismatch;
-
-            if (!tcp and case_rng != null and caseMangledEcho(query_msg.questions[0].name, response)) {
-                var addr_buf: [64]u8 = undefined;
-                log.debug("0x20 case mangled by {s}; retrying over TCP", .{na.format(server, &addr_buf)});
-                tcp = true;
-                continue;
+            switch (dns.checkEcho(response, query_msg.questions[0].name, qtype)) {
+                .mismatch => return .mismatch,
+                .mangled => if (!tcp and case_rng != null) {
+                    var addr_buf: [64]u8 = undefined;
+                    log.debug("0x20 case mangled by {s}; retrying over TCP", .{na.format(server, &addr_buf)});
+                    tcp = true;
+                    continue;
+                },
+                .ok => {},
             }
             return .{ .response = .{ .message = response, .elapsed_us = elapsed_us } };
         }
@@ -1786,14 +1777,15 @@ pub const RecursiveResolver = struct {
         else
             try tryParseMessage(allocator, stag_result.response_data, responding_addr) orelse return null;
 
-        // RFC 5452 §9.1 / RFC 9619: reject responses whose question doesn't echo
-        // the query. (The sequential path enforces this via queryAuthoritativeServers.)
-        dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
-
         // Mangled echo: settle over TCP, like TC (see do53CaseHardened).
-        if (case_rng != null and caseMangledEcho(msg0.questions[0].name, resp)) {
-            resp = try self.queryServerTcp(allocator, wires[winner], responding_addr, self.remainingMs()) orelse return null;
-            dns.validateResponse(resp, msg0.questions[0].name, query_type) catch return null;
+        const sent = msg0.questions[0].name;
+        switch (dns.checkEcho(resp, sent, query_type)) {
+            .mismatch => return null,
+            .mangled => if (case_rng != null) {
+                resp = try self.queryServerTcp(allocator, wires[winner], responding_addr, self.remainingMs()) orelse return null;
+                if (dns.checkEcho(resp, sent, query_type) == .mismatch) return null;
+            },
+            .ok => {},
         }
 
         // The sequential server_loop handles this via `last_server_failure`,
@@ -3715,37 +3707,6 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
     try testing.expect(resolver.shouldTrySibling(msg, zone));
     msg.header.flags.ra = false;
     try testing.expect(!resolver.shouldTrySibling(msg, zone));
-}
-
-test "caseMangledEcho: only a same-name case mismatch marks mangling" {
-    const query_name = dns.Name{ .labels = &.{ "eXaMpLe", "cOm" } };
-    const question = struct {
-        // comptime name so the questions array lands in static memory —
-        // a runtime param would leave it dangling on this frame's stack.
-        fn make(comptime name: dns.Name) dns.Message {
-            return .{
-                .header = test_header,
-                .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
-            };
-        }
-    }.make;
-
-    try std.testing.expect(RecursiveResolver.caseMangledEcho(
-        query_name,
-        question(.{ .labels = &.{ "example", "com" } }),
-    ));
-    try std.testing.expect(!RecursiveResolver.caseMangledEcho(query_name, question(query_name)));
-    // Unrelated question (error rcodes are exempt from question-match,
-    // RFC 9619): must NOT mark the server case-broken.
-    try std.testing.expect(!RecursiveResolver.caseMangledEcho(
-        query_name,
-        question(.{ .labels = &.{ "other", "net" } }),
-    ));
-    // Question-less error reply: must not index questions[0].
-    try std.testing.expect(!RecursiveResolver.caseMangledEcho(query_name, .{
-        .header = test_header,
-        .questions = &.{},
-    }));
 }
 
 test "extractReferral with NS and glue A records" {
