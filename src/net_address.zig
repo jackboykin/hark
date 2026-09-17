@@ -13,8 +13,8 @@ const rand = @import("rand.zig");
 /// `randomizeHashSeed`.
 var hash_seed: u64 = 0;
 
-pub fn randomizeHashSeed(io: std.Io) void {
-    hash_seed = rand.hashSeed(io);
+pub fn randomizeHashSeed() void {
+    hash_seed = rand.thread.int(u64);
 }
 
 pub const Address = std.Io.net.IpAddress;

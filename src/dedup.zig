@@ -15,8 +15,8 @@ const monotonic = @import("monotonic.zig");
 /// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
 var dedup_hash_seed: u64 = 0;
 
-pub fn randomizeHashSeed(io: std.Io) void {
-    dedup_hash_seed = rand.hashSeed(io);
+pub fn randomizeHashSeed() void {
+    dedup_hash_seed = rand.thread.int(u64);
 }
 
 /// Seeded hash of (lowercased name, qtype, flags) stands in for the name.

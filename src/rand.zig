@@ -1,37 +1,35 @@
-/// One thread-local ChaCha CSPRNG behind every draw, seeded once from
-/// `io.random` — which takes a global mutex on threads Io.Threaded didn't
-/// spawn (all of hark's resolution pool): ~6% CPU on the miss workload.
+/// Draws from the calling thread's ChaCha CSPRNG, so `thread` copies across
+/// threads. Not `io.random`: its global mutex on threads Io.Threaded didn't
+/// spawn cost ~6% CPU on misses.
 const std = @import("std");
-const Io = std.Io;
+const linux = std.os.linux;
 
 threadlocal var csprng: ?std.Random.DefaultCsprng = null;
 
-fn rng(io: Io) std.Random {
+pub const thread: std.Random = .{ .ptr = undefined, .fillFn = fill };
+
+fn fill(_: *anyopaque, buf: []u8) void {
     if (csprng == null) {
         @branchHint(.unlikely);
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
-        io.random(&seed);
+        // With signals blocked, only a missing entropy source reads short;
+        // guessable TXIDs are worse than no resolver.
+        if (linux.getrandom(&seed, seed.len, 0) != seed.len) @panic("getrandom failed");
         csprng = .init(seed);
     }
-    return csprng.?.random();
+    csprng.?.fill(buf);
 }
 
-pub fn queryId(io: Io) u16 {
-    return rng(io).int(u16);
-}
-
-pub fn hashSeed(io: Io) u64 {
-    return rng(io).int(u64);
-}
-
-pub fn poolSlot(io: Io, n: usize) usize {
-    return rng(io).uintLessThan(usize, n);
-}
-
-pub fn uniformFloat(io: Io) f32 {
-    return rng(io).float(f32);
-}
-
-pub fn shuffle(comptime T: type, io: Io, items: []T) void {
-    rng(io).shuffle(T, items);
+test "thread draws differ across threads" {
+    const T = struct {
+        fn draw(out: *u64) void {
+            out.* = thread.int(u64);
+        }
+    };
+    var a: u64 = 0;
+    var b: u64 = 0;
+    const t = try std.Thread.spawn(.{}, T.draw, .{&a});
+    T.draw(&b);
+    t.join();
+    try std.testing.expect(a != b);
 }

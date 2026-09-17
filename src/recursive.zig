@@ -1559,8 +1559,8 @@ pub const RecursiveResolver = struct {
         return kc.anyRdata(zone, .ds, .in, dnssec.dsRdataExceedsUdp);
     }
 
-    fn caseRng(self: *RecursiveResolver) ?std.Io {
-        return if (self.case_randomization) self.io else null;
+    fn caseRng(self: *RecursiveResolver) ?std.Random {
+        return if (self.case_randomization) rand.thread else null;
     }
 
     /// True only when the echoed question is the query name with mangled
@@ -1603,7 +1603,7 @@ pub const RecursiveResolver = struct {
         var tcp = tcp_first;
         while (true) {
             const timeout = self.serverTimeout(addr_key, is_last, if (tcp) .tcp else .udp);
-            const query_id = rand.queryId(self.io);
+            const query_id = rand.thread.int(u16);
             const query_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
                 .rd = false,
                 .edns = .{ .do_bit = do_bit },
@@ -1645,7 +1645,7 @@ pub const RecursiveResolver = struct {
         server: na.Address,
         oc: *EncryptedNs,
     ) !?DotReply {
-        const query_id = rand.queryId(self.io);
+        const query_id = rand.thread.int(u16);
         const padded_msg = try dns.buildQuery(allocator, query_id, name, qtype, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware, .padding_block = dns.dot_padding_block },
@@ -1728,7 +1728,7 @@ pub const RecursiveResolver = struct {
         // All legs share one case pattern (memcpy + ID-patch optimization).
         const case_rng = self.caseRng();
 
-        qids[0] = rand.queryId(self.io);
+        qids[0] = rand.thread.int(u16);
         const msg0 = dns.buildQuery(allocator, qids[0], query_name, query_type, .{
             .rd = false,
             .edns = .{ .do_bit = self.dnssec_aware },
@@ -1740,7 +1740,7 @@ pub const RecursiveResolver = struct {
         leg_addrs[0] = servers[leg_idxs[0]];
 
         for (1..leg_count) |i| {
-            qids[i] = rand.queryId(self.io);
+            qids[i] = rand.thread.int(u16);
             @memcpy(wires_storage[i][0..w0.len], w0);
             dns.patchQueryId(wires_storage[i][0..w0.len], qids[i]);
             wires[i] = wires_storage[i][0..w0.len];
@@ -1862,9 +1862,9 @@ pub const RecursiveResolver = struct {
         // Order servers: Thompson Sampling if available, Fisher-Yates otherwise
         var order_buf: [max_servers_per_level]usize = undefined;
         const sel = if (self.ns_selector) |ns|
-            ns.selectServers(parent_zone, servers, self.rtt_cache, &order_buf)
+            ns.selectServers(parent_zone, servers, self.rtt_cache, rand.thread, &order_buf)
         else blk: {
-            rand.shuffle(na.Address, self.io, servers);
+            rand.thread.shuffle(na.Address, servers);
             for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..servers.len];
         };
@@ -2163,7 +2163,7 @@ pub const RecursiveResolver = struct {
         const arm_zone: dns.Name = if (qtype == .ds and zone.labels.len > 0) .{ .labels = zone.labels[1..] } else zone;
         var order_buf: [max_servers_per_level]usize = undefined;
         const sel = if (self.ns_selector) |ns|
-            ns.selectServers(arm_zone, servers, self.rtt_cache, &order_buf)
+            ns.selectServers(arm_zone, servers, self.rtt_cache, rand.thread, &order_buf)
         else blk: {
             for (0..servers.len) |idx| order_buf[idx] = idx;
             break :blk order_buf[0..servers.len];
@@ -2722,7 +2722,7 @@ pub const RecursiveResolver = struct {
         std.debug.assert(ns_names.len <= max_servers_per_level);
         var shuffled: [max_servers_per_level]dns.Name = undefined;
         @memcpy(shuffled[0..ns_names.len], ns_names);
-        rand.shuffle(dns.Name, self.io, shuffled[0..ns_names.len]);
+        rand.thread.shuffle(dns.Name, shuffled[0..ns_names.len]);
         const names = shuffled[0..ns_names.len];
 
         // Parallel path: one helper thread per (ns_name × rtype) task beyond

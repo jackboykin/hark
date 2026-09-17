@@ -333,9 +333,9 @@ pub const Server = struct {
         // Randomize hash seeds for cache, dedup, and AddressKey-keyed tables
         // (RttCache, NsSelector arms) so an authoritative can't engineer
         // bucket collisions via crafted glue addresses or query keys.
-        cache_mod.randomizeHashSeed(io);
-        dedup_mod.randomizeHashSeed(io);
-        na.randomizeHashSeed(io);
+        cache_mod.randomizeHashSeed();
+        dedup_mod.randomizeHashSeed();
+        na.randomizeHashSeed();
 
         // Cache readers = recv workers + their resolution-thread pools; both
         // caches size their shards from this.

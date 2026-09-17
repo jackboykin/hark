@@ -70,7 +70,7 @@ const PortPool = struct {
     fn lease(io: Io, dest: na.Address) !Lease {
         const pool = &by_family[@intFromBool(dest == .ip6)];
         for (0..4) |_| {
-            const i = rand.poolSlot(io, size);
+            const i = rand.thread.uintLessThan(usize, size);
             switch (pool.states[i].swap(.leased, .acquire)) {
                 .leased => continue,
                 .idle => return .{ .sock = pool.socks[i], .slot = i, .pool = pool },

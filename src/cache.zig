@@ -43,8 +43,8 @@ const nxdomain_key: dns.RType = @fromBackingInt(@intCast(0));
 /// Remains 0 in tests (deterministic); call `randomizeHashSeed` in production.
 var hash_seed: u64 = 0;
 
-pub fn randomizeHashSeed(io: std.Io) void {
-    hash_seed = rand.hashSeed(io);
+pub fn randomizeHashSeed() void {
+    hash_seed = rand.thread.int(u64);
 }
 
 const CacheKeyContext = struct {

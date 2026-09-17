@@ -648,7 +648,7 @@ pub fn parseDottedName(allocator: Allocator, dotted: []const u8) Error!Name {
 /// Randomly flip the 0x20 (case) bit of ASCII letters in `name`'s labels.
 /// `@constCast` is sound because `parseDottedName` `dupe`s each label, so
 /// the underlying storage is mutable. RFC draft Vixie/Dagon.
-fn applyCase0x20(io: std.Io, name: Name) void {
+fn applyCase0x20(rng: std.Random, name: Name) void {
     var pool: u64 = 0;
     var bits_left: u8 = 0;
     for (name.labels) |label| {
@@ -656,9 +656,7 @@ fn applyCase0x20(io: std.Io, name: Name) void {
         for (bytes) |*b| {
             if (!std.ascii.isAlphabetic(b.*)) continue;
             if (bits_left == 0) {
-                var buf: [8]u8 = undefined;
-                io.random(&buf);
-                pool = mem.readInt(u64, &buf, .little);
+                pool = rng.int(u64);
                 bits_left = 64;
             }
             if (pool & 1 == 1) b.* ^= 0x20;
@@ -686,12 +684,12 @@ const QueryOptions = struct {
     /// RFC draft Vixie/Dagon "Use of Bit 0x20 in DNS Labels": when non-null,
     /// randomize ASCII letter case in QNAME using this RNG. Caller verifies
     /// the response echoes byte-for-byte.
-    case_rng: ?std.Io = null,
+    case_rng: ?std.Random = null,
 };
 
 pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RType, options: QueryOptions) Error!Message {
     const name = try parseDottedName(allocator, name_str);
-    if (options.case_rng) |io| applyCase0x20(io, name);
+    if (options.case_rng) |rng| applyCase0x20(rng, name);
     const questions = try allocator.alloc(Question, 1);
     questions[0] = .{ .name = name, .qtype = qtype, .qclass = .in };
 
@@ -3126,6 +3124,7 @@ test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" 
 }
 
 test "applyCase0x20 only flips ASCII letters; round-trips eql" {
+    var prng: std.Random.DefaultPrng = .init(0x20);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3133,7 +3132,7 @@ test "applyCase0x20 only flips ASCII letters; round-trips eql" {
     const original = try parseDottedName(alloc, "Foo.Bar123-baz.com");
     const randomized = try parseDottedName(alloc, "Foo.Bar123-baz.com");
 
-    applyCase0x20(testing.io, randomized);
+    applyCase0x20(prng.random(), randomized);
 
     for (randomized.labels, original.labels) |rl, ol| {
         try testing.expectEqual(rl.len, ol.len);
@@ -3163,6 +3162,7 @@ test "eqlExact rejects case-flipped name; eql accepts" {
 }
 
 test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
+    var prng: std.Random.DefaultPrng = .init(0x20);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3174,7 +3174,7 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const n = try parseDottedName(alloc, letters);
-        applyCase0x20(testing.io, n);
+        applyCase0x20(prng.random(), n);
         for (n.labels[0], 0..) |b, idx| {
             if (std.ascii.isUpper(b)) upper_counts[idx] += 1;
         }
@@ -3187,28 +3187,30 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
 }
 
 test "applyCase0x20 on root and all-numeric is a no-op" {
+    var prng: std.Random.DefaultPrng = .init(0x20);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const root = try parseDottedName(alloc, ".");
-    applyCase0x20(testing.io, root);
+    applyCase0x20(prng.random(), root);
     try testing.expectEqual(@as(usize, 0), root.labels.len);
 
     const numeric = try parseDottedName(alloc, "12345.com");
     const numeric_copy = try parseDottedName(alloc, "12345.com");
-    applyCase0x20(testing.io, numeric);
+    applyCase0x20(prng.random(), numeric);
     try testing.expect(mem.eql(u8, numeric.labels[0], numeric_copy.labels[0]));
 }
 
 test "buildQuery with case_rng" {
+    var prng: std.Random.DefaultPrng = .init(0x20);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const lower = try buildQuery(alloc, 0x1234, "example.com", .a, .{});
     const randomized = try buildQuery(alloc, 0x1234, "example.com", .a, .{
-        .case_rng = testing.io,
+        .case_rng = prng.random(),
     });
 
     try testing.expect(lower.questions[0].name.eql(randomized.questions[0].name));

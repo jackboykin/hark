@@ -7,7 +7,6 @@ const na = @import("net_address.zig");
 const AddressKey = na.AddressKey;
 const RttCache = @import("ns_rtt.zig").RttCache;
 const dns = @import("dns.zig");
-const rand = @import("rand.zig");
 
 /// Discount factor: γ = 0.995 → half-life ≈ 138 observations.
 const default_gamma: f32 = 0.995;
@@ -149,6 +148,7 @@ pub const NsSelector = struct {
         zone: dns.Name,
         servers: []const na.Address,
         rtt_cache: ?*RttCache,
+        rng: std.Random,
         order_buf: *[max_order]usize,
     ) []const usize {
         const zh = zoneHash(zone);
@@ -173,9 +173,9 @@ pub const NsSelector = struct {
             // Float == is bit-exact here because discountAndRead floors both
             // fields back to the prior via @max with the same constants.
             samples[live_count] = if (state.alpha == alpha_prior and state.beta == beta_prior)
-                rand.uniformFloat(self.io)
+                rng.float(f32)
             else
-                betaSample(self.io, state.alpha, state.beta);
+                betaSample(rng, state.alpha, state.beta);
             live_count += 1;
         }
 
@@ -256,16 +256,16 @@ fn zoneHash(name: dns.Name) u64 {
 // Gamma(α,1) via Marsaglia-Tsang (2000) for α ≥ 1.
 // Our α, β are always ≥ 1.0 due to the prior floor.
 
-fn betaSample(io: std.Io, alpha: f32, beta: f32) f32 {
-    const x = gammaSample(io, alpha);
-    const y = gammaSample(io, beta);
+fn betaSample(rng: std.Random, alpha: f32, beta: f32) f32 {
+    const x = gammaSample(rng, alpha);
+    const y = gammaSample(rng, beta);
     const sum = x + y;
     if (sum <= 0) return 0.5; // degenerate — return prior mean
     return x / sum;
 }
 
 /// Marsaglia-Tsang method for Gamma(α, 1) where α ≥ 1.
-fn gammaSample(io: std.Io, alpha: f32) f32 {
+fn gammaSample(rng: std.Random, alpha: f32) f32 {
     std.debug.assert(alpha >= 1.0);
 
     const d = alpha - 1.0 / 3.0;
@@ -277,13 +277,13 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
 
         // Rejection: draw normal x such that v = (1 + c*x)³ > 0
         while (true) {
-            x = normalSample(io);
+            x = normalSample(rng);
             v = 1.0 + c * x;
             if (v > 0) break;
         }
         v = v * v * v;
 
-        const u = rand.uniformFloat(io);
+        const u = rng.float(f32);
         // Fast accept (avoids log ~83% of the time)
         if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
         if (@log(u) < 0.5 * x * x + d * (1.0 - v + @log(v))) return d * v;
@@ -291,9 +291,9 @@ fn gammaSample(io: std.Io, alpha: f32) f32 {
 }
 
 /// Standard normal via Box-Muller transform.
-fn normalSample(io: std.Io) f32 {
-    const r1 = rand.uniformFloat(io);
-    const r2 = rand.uniformFloat(io);
+fn normalSample(rng: std.Random) f32 {
+    const r1 = rng.float(f32);
+    const r2 = rng.float(f32);
     // Avoid log(0)
     const safe_r1 = @max(r1, 1e-10);
     return @sqrt(-2.0 * @log(safe_r1)) * @cos(2.0 * math.pi * r2);
@@ -374,19 +374,22 @@ test "ArmKeyContext: 16-shard distribution in both halves" {
 }
 
 test "beta sample in range" {
+    var prng: std.Random.DefaultPrng = .init(0);
+    const rng = prng.random();
     for (0..1000) |_| {
-        const s = betaSample(testing.io, 1.0, 1.0);
+        const s = betaSample(rng, 1.0, 1.0);
         try testing.expect(s >= 0.0 and s <= 1.0);
     }
     // Skewed distribution: alpha >> beta → samples mostly near 1.0
     var sum: f32 = 0;
     for (0..1000) |_| {
-        sum += betaSample(testing.io, 100.0, 1.0);
+        sum += betaSample(rng, 100.0, 1.0);
     }
     try testing.expect(sum / 1000.0 > 0.9);
 }
 
 test "selectServers basic ordering" {
+    var prng: std.Random.DefaultPrng = .init(0);
     var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
@@ -404,13 +407,14 @@ test "selectServers basic ordering" {
     var server1_first: usize = 0;
     var order_buf: [max_order]usize = undefined;
     for (0..100) |_| {
-        const order = sel.selectServers(zone, &servers, null, &order_buf);
+        const order = sel.selectServers(zone, &servers, null, prng.random(), &order_buf);
         if (order.len > 0 and order[0] == 1) server1_first += 1;
     }
     try testing.expect(server1_first > 90);
 }
 
 test "discount causes re-exploration" {
+    var prng: std.Random.DefaultPrng = .init(0);
     var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
     sel.gamma = 0.9; // Aggressive discount for test
@@ -431,7 +435,7 @@ test "discount causes re-exploration" {
     var order_buf: [max_order]usize = undefined;
     var server0_first: usize = 0;
     for (0..200) |_| {
-        const order = sel.selectServers(zone, &servers, null, &order_buf);
+        const order = sel.selectServers(zone, &servers, null, prng.random(), &order_buf);
         if (order.len > 0 and order[0] == 0) server0_first += 1;
     }
     // After heavy discounting, server 0 should get picked sometimes (re-explored)
@@ -463,6 +467,7 @@ test "arms map is bounded under random-zone load" {
 }
 
 test "per-zone isolation" {
+    var prng: std.Random.DefaultPrng = .init(0);
     var sel = NsSelector.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer sel.deinit();
 
@@ -487,9 +492,9 @@ test "per-zone isolation" {
     var a0_first: usize = 0;
     var b1_first: usize = 0;
     for (0..100) |_| {
-        const oa = sel.selectServers(zone_a, &servers, null, &order_buf);
+        const oa = sel.selectServers(zone_a, &servers, null, prng.random(), &order_buf);
         if (oa.len > 0 and oa[0] == 0) a0_first += 1;
-        const ob = sel.selectServers(zone_b, &servers, null, &order_buf);
+        const ob = sel.selectServers(zone_b, &servers, null, prng.random(), &order_buf);
         if (ob.len > 0 and ob[0] == 1) b1_first += 1;
     }
     try testing.expect(a0_first > 90);
