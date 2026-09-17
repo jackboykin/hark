@@ -42,6 +42,8 @@ test {
     _ = @import("dns.zig");
     _ = @import("dns_print.zig");
     _ = @import("event_loop.zig");
+    _ = @import("uring.zig");
+    _ = @import("epoll.zig");
     _ = @import("recursive.zig");
     _ = @import("delegation.zig");
     _ = @import("cache.zig");
