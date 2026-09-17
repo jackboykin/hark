@@ -140,6 +140,18 @@ fn placeName(blob: []align(Pack.pack_align) u8, at: *usize, name: dns.Name) dns.
     return out;
 }
 
+/// Refuse at store rather than miss on every hit. A page parses nearly every
+/// RR; a TXT of empty strings, a slice per byte, retries on the heap.
+fn checkReparses(built: dns.BuiltRR, rtype: dns.RType) !void {
+    var page: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&page);
+    if (dns.parseRDataWire(fba.allocator(), built.bytes, rtype, built.ttl_offset)) |_| return else |err| if (err != error.OutOfMemory) return err;
+    const scratch = try std.heap.page_allocator.alloc(u8, rr_wire_stage_len * @sizeOf([]const u8));
+    defer std.heap.page_allocator.free(scratch);
+    fba = .init(scratch);
+    _ = try dns.parseRDataWire(fba.allocator(), built.bytes, rtype, built.ttl_offset);
+}
+
 /// All-or-nothing: sigs and proofs must travel with what they cover (RFC 4035 §3.2.3).
 fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []const dns.ResourceRecord, proofs: []const dns.ResourceRecord) !Pack {
     std.debug.assert(records.len > 0);
@@ -153,7 +165,6 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
 
     var wire_bytes: usize = 0;
     var stage: [rr_wire_stage_len]u8 = undefined;
-    var parse_scratch: [rr_wire_stage_len * @sizeOf([]const u8)]u8 = undefined;
     for (groups) |g| for (g) |rr| {
         wire_bytes += (try dns.buildResourceRecordWire(&stage, rr)).bytes.len;
     };
@@ -172,9 +183,7 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
     var wire_at = rec_bytes + names_bytes;
     for (groups, group_owner) |g, owner_name| for (g) |rr| {
         const built = try dns.buildResourceRecordWire(blob[wire_at..], rr);
-        // Refuse now, not a miss on every hit; scratch fits a TXT of one-byte strings.
-        var fba = std.heap.FixedBufferAllocator.init(&parse_scratch);
-        _ = try dns.parseRDataWire(fba.allocator(), built.bytes, rr.rtype, built.ttl_offset);
+        try checkReparses(built, rr.rtype);
         recs[idx] = .{
             .name = owner_name orelse placeName(blob, &names_at, rr.name),
             .rtype = rr.rtype,
@@ -2163,6 +2172,25 @@ test "a store refused at the byte cap leaves the old entry in place" {
 
     const hit = (cache.lookup(a, "hole.example", .txt, .in) orelse return error.TestUnexpectedResult).hit;
     try testing.expectEqual(1, hit.records.len);
+}
+
+test "a TXT of empty strings too many to reparse in a page still caches" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = makeTestCache(alloc);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 1000 slices × 16 B outgrows the 4 KiB reparse page.
+    const strings: []const []const u8 = &@as([1000][]const u8, @splat(""));
+    const rrs = try a.alloc(dns.ResourceRecord, 1);
+    rrs[0] = .{ .name = try makeTestName(a, &.{ "empty", "example" }), .rtype = .txt, .rclass = .in, .ttl = 300, .rdata = .{ .txt = .{ .strings = strings } } };
+    cache.storeResponse(makeTestResponse(rrs), .{ .labels = &.{} }, .unchecked, std.math.maxInt(u32));
+
+    const hit = (cache.lookup(a, "empty.example", .txt, .in) orelse return error.TestUnexpectedResult).hit;
+    try testing.expectEqual(1000, hit.records[0].rdata.txt.strings.len);
 }
 
 test "cache deep copy independence" {
