@@ -6,7 +6,8 @@ const linux = std.os.linux;
 const testing = std.testing;
 const Io = std.Io;
 const dns = @import("dns.zig");
-const EventLoop = @import("event_loop.zig").EventLoop;
+const event_loop = @import("event_loop.zig");
+const EventLoop = event_loop.EventLoop;
 const Completion = @import("event_loop.zig").Completion;
 const max_operations = @import("event_loop.zig").max_operations;
 const recursive = @import("recursive.zig");
@@ -504,18 +505,19 @@ pub const Server = struct {
             }
         }
 
-        log.info("workers={d}", .{workers});
-
         // Everything that needs privilege — rings (io_uring_disabled=1
         // gates setup on CAP_SYS_ADMIN) and low-port binds — happens here
         // on the main thread, before the drop and before any thread
         // exists to inherit the wrong credentials.
         const rigs = try self.allocator.alloc(Rig, workers);
+        var backend: event_loop.Backend = .io_uring;
         for (rigs) |*rig| {
-            rig.loop = EventLoop.create(self.allocator) catch |err| {
+            rig.loop = EventLoop.create(self.allocator, backend) catch |err| {
                 log.err("failed to create event loop: {s}", .{@errorName(err)});
                 return err;
             };
+            // A refused ring is refused for every worker: warn once.
+            backend = rig.loop.backend;
             rig.udp = @splat(-1);
             rig.tcp = @splat(-1);
             for (listen_addrs, 0..) |addr, i| {
@@ -549,6 +551,7 @@ pub const Server = struct {
             if (self.config.drop_gid) |g| log.info("dropped group to gid={d}", .{g});
             if (self.config.drop_uid) |u| log.info("dropped user to uid={d}", .{u});
         }
+        log.info("workers={d} ({t})", .{ workers, backend });
         if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
 
         for (rigs[1..], 1..) |*rig, i| {
@@ -614,7 +617,7 @@ pub const Server = struct {
 
     fn runWorker(self: *Server, rig: *const Rig, n_addrs: usize, sig_fd: posix.fd_t) noreturn {
         rig.loop.enable() catch |err| {
-            log.err("failed to enable io_uring: {s}", .{@errorName(err)});
+            log.err("failed to enable event loop: {s}", .{@errorName(err)});
             self.exit(1);
         };
         var ws = WorkerState{
@@ -854,7 +857,7 @@ const WorkerState = struct {
 
         while (true) {
             const results = self.loop.tick(&completions) catch |err| {
-                log.err("io_uring tick failed: {s}", .{@errorName(err)});
+                log.err("event loop tick failed: {s}", .{@errorName(err)});
                 self.server.exit(1);
             };
 

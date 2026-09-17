@@ -25,7 +25,11 @@ pub const multishot_payload_max: u32 = 4096;
 /// io_uring_recvmsg_out header + reserved name + payload.
 const multishot_buf_size: u32 = @sizeOf(linux.io_uring_recvmsg_out) + multishot_name_reserve + multishot_payload_max;
 
+const no_addr = na.initIp4(.{ 0, 0, 0, 0 }, 0);
+
 pub const OperationId = u16;
+
+pub const Backend = enum { io_uring, epoll };
 
 pub const Completion = struct {
     context: *anyopaque,
@@ -57,8 +61,7 @@ pub const RecvResult = struct {
     addr: na.Address,
     err: ?anyerror,
     /// Non-null for multishot recv completions. Caller MUST call
-    /// `releaseBuf(buf_id)` after processing `data`, or the buffer ring
-    /// will starve and further recvs will fail with ENOBUFS.
+    /// `releaseBuf(buf_id)` after processing `data`, or the pool starves.
     buf_id: ?u16 = null,
 };
 
@@ -88,10 +91,10 @@ pub const ReadResult = struct {
 const Slot = struct {
     context: *anyopaque,
     active: bool,
-    /// Kernel-visible per-kind storage: io_uring reads/writes through
-    /// pointers into the active variant while the op is in flight, so
-    /// the variant must stay untouched (and the slot unmoved) until its
-    /// CQE frees the slot.
+    /// What epoll watches; io_uring carries it in the SQE.
+    fd: posix.fd_t,
+    /// io_uring writes through pointers into the active variant, so it and
+    /// the slot stay put until the op completes.
     state: State,
 
     const State = union(enum) {
@@ -103,17 +106,9 @@ const Slot = struct {
         /// read owns a small buffer — signalfd/eventfd payloads only.
         read: [read_buf_size]u8,
         /// Caller's buffer outlives the op.
-        stream: void,
-        timer: linux.kernel_timespec,
+        stream: []u8,
+        timer: struct { ts: linux.kernel_timespec, deadline_ns: i64 },
     };
-
-    fn init() Slot {
-        return .{
-            .context = undefined,
-            .active = false,
-            .state = .{ .recv_multi = undefined },
-        };
-    }
 };
 
 /// Non-incremental buffer ring for multishot recvmsg. Each CQE consumes
@@ -172,20 +167,72 @@ const UdpBufRing = struct {
     }
 };
 
+/// Readiness fallback where io_uring is refused: an event runs the syscall
+/// the SQE would have, a spurious wake re-arms silently.
+const Epoll = struct {
+    fd: posix.fd_t,
+    /// `max_operations` buffers suffice: a tick's recvs are released
+    /// before the next.
+    buffers: []u8,
+    free: [max_operations]u16,
+    free_count: u16,
+
+    fn bufferAt(self: *const Epoll, buffer_id: u16) []u8 {
+        return self.buffers[@as(usize, buffer_id) * multishot_payload_max ..][0..multishot_payload_max];
+    }
+
+    fn release(self: *Epoll, buffer_id: u16) void {
+        self.free[self.free_count] = buffer_id;
+        self.free_count += 1;
+    }
+
+    /// MOD first: steady-state re-arms hit an fd already in the set.
+    fn watch(self: *Epoll, fd: posix.fd_t, events: u32, id: OperationId) !void {
+        var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = id } };
+        if (linux.errno(linux.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, fd, &ev)) == .SUCCESS) return;
+        if (linux.errno(linux.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS) return error.EpollCtlFailed;
+    }
+};
+
 pub const EventLoop = struct {
     allocator: std.mem.Allocator,
-    ring: linux.IoUring,
     slots: [max_operations]Slot,
     free_list: [max_operations]OperationId,
     free_count: u16,
-    /// Buffer ring backing multishot recvmsg. Required — needs kernel
-    /// 5.19+ for `IORING_REGISTER_PBUF_RING`.
-    udp_buf_ring: UdpBufRing,
+    backend: union(Backend) {
+        io_uring: struct {
+            ring: linux.IoUring,
+            /// Needs kernel 5.19+ for `IORING_REGISTER_PBUF_RING`.
+            udp_buf_ring: UdpBufRing,
+        },
+        epoll: Epoll,
+    },
 
-    pub fn create(allocator: std.mem.Allocator) !*EventLoop {
+    /// Epoll only when preferred or the kernel refuses io_uring outright:
+    /// a misconfigured ring is fatal, not a sandbox.
+    pub fn create(allocator: std.mem.Allocator, prefer: Backend) !*EventLoop {
         const self = try allocator.create(EventLoop);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        self.free_count = max_operations;
+        for (0..max_operations) |i| {
+            self.slots[i] = .{ .context = undefined, .active = false, .fd = -1, .state = undefined };
+            self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
+        }
+        if (prefer == .io_uring) {
+            if (self.initUring()) return self else |err| switch (err) {
+                error.PermissionDenied => log.warn("io_uring refused (EPERM: seccomp, container runtime or kernel.io_uring_disabled); using epoll", .{}),
+                error.SystemOutdated => log.warn("io_uring unavailable (ENOSYS: kernel built without it); using epoll", .{}),
+                else => return err,
+            }
+        }
+        try self.initEpoll();
+        return self;
+    }
+
+    fn initUring(self: *EventLoop) !void {
+        self.backend = .{ .io_uring = undefined };
+        const u = &self.backend.io_uring;
         var params = std.mem.zeroes(linux.io_uring_params);
         // COOP_TASKRUN: skip kernel→user IPI when the task is already running
         //   (each worker owns its ring; CQEs are processed at next
@@ -205,30 +252,38 @@ pub const EventLoop = struct {
             linux.IORING_SETUP_DEFER_TASKRUN |
             linux.IORING_SETUP_R_DISABLED;
         params.cq_entries = max_operations * 4;
-        self.ring = linux.IoUring.init_params(max_operations, &params) catch |err| {
-            log.err(
-                "failed to create io_uring ({s}); hark requires Linux 6.1+ with io_uring permitted (kernel.io_uring_disabled, seccomp)",
-                .{@errorName(err)},
-            );
-            return err;
+        u.ring = linux.IoUring.init_params(max_operations, &params) catch |err| switch (err) {
+            error.PermissionDenied, error.SystemOutdated => return err,
+            else => {
+                log.err("failed to create io_uring ({s}); hark requires Linux 6.1+", .{@errorName(err)});
+                return err;
+            },
         };
-        errdefer self.ring.deinit();
+        errdefer u.ring.deinit();
         std.debug.assert(params.features & linux.IORING_FEAT_NODROP != 0);
-        self.free_count = max_operations;
-        for (0..max_operations) |i| {
-            self.slots[i] = Slot.init();
-            self.free_list[i] = @intCast(max_operations - 1 - i); // stack order
-        }
-        self.udp_buf_ring = UdpBufRing.init(self.ring.fd, allocator) catch |err| {
-            log.err(
-                "failed to register io_uring buffer ring ({s}); hark requires Linux 6.1+",
-                .{@errorName(err)},
-            );
+        u.udp_buf_ring = UdpBufRing.init(u.ring.fd, self.allocator) catch |err| {
+            log.err("failed to register io_uring buffer ring ({s}); hark requires Linux 6.1+", .{@errorName(err)});
             return err;
         };
-        errdefer self.udp_buf_ring.deinit(allocator);
-        try restrict(self.ring.fd);
-        return self;
+        errdefer u.udp_buf_ring.deinit(self.allocator);
+        try restrict(u.ring.fd);
+    }
+
+    fn initEpoll(self: *EventLoop) !void {
+        const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("failed to create epoll instance ({t})", .{linux.errno(rc)});
+            return error.EpollCreateFailed;
+        }
+        const fd: posix.fd_t = @intCast(rc);
+        errdefer sys.close(fd);
+        self.backend = .{ .epoll = .{
+            .fd = fd,
+            .buffers = try self.allocator.alloc(u8, @as(usize, max_operations) * multishot_payload_max),
+            .free = undefined,
+            .free_count = max_operations,
+        } };
+        for (&self.backend.epoll.free, 0..) |*b, i| b.* = @intCast(i);
     }
 
     /// Irreversible from `enable`. std's io_uring_restriction is 24 B, the
@@ -253,23 +308,30 @@ pub const EventLoop = struct {
         }
     }
 
-    /// Binds the ring to the calling thread; must precede the first submit.
+    /// Binds a ring to the calling thread; must precede the first submit.
     pub fn enable(self: *EventLoop) !void {
-        const rc = linux.io_uring_register(self.ring.fd, .REGISTER_ENABLE_RINGS, null, 0);
-        if (linux.errno(rc) != .SUCCESS) return error.EnableRingsFailed;
+        switch (self.backend) {
+            .io_uring => |*u| {
+                const rc = linux.io_uring_register(u.ring.fd, .REGISTER_ENABLE_RINGS, null, 0);
+                if (linux.errno(rc) != .SUCCESS) return error.EnableRingsFailed;
+            },
+            .epoll => {},
+        }
     }
 
     pub fn destroy(self: *EventLoop) void {
         const allocator = self.allocator;
-        self.udp_buf_ring.deinit(allocator);
-        self.ring.deinit();
+        switch (self.backend) {
+            .io_uring => |*u| {
+                u.udp_buf_ring.deinit(allocator);
+                u.ring.deinit();
+            },
+            .epoll => |*e| {
+                sys.close(e.fd);
+                allocator.free(e.buffers);
+            },
+        }
         allocator.destroy(self);
-    }
-
-    fn allocSlot(self: *EventLoop) ?OperationId {
-        if (self.free_count == 0) return null;
-        self.free_count -= 1;
-        return self.free_list[self.free_count];
     }
 
     fn freeSlot(self: *EventLoop, id: OperationId) void {
@@ -278,26 +340,28 @@ pub const EventLoop = struct {
         self.free_count += 1;
     }
 
-    fn initOp(self: *EventLoop, state: Slot.State, context: *anyopaque) !OperationId {
-        const id = self.allocSlot() orelse return error.TooManyOperations;
-        const slot = &self.slots[id];
-        slot.state = state;
-        slot.context = context;
-        slot.active = true;
+    fn initOp(self: *EventLoop, fd: posix.fd_t, state: Slot.State, context: *anyopaque) !OperationId {
+        if (self.free_count == 0) return error.TooManyOperations;
+        self.free_count -= 1;
+        const id = self.free_list[self.free_count];
+        self.slots[id] = .{ .context = context, .active = true, .fd = fd, .state = state };
         return id;
     }
 
-    /// Arm a multishot recvmsg on `fd`. One SQE produces CQEs for every
-    /// inbound packet until the kernel stops the op (e.g. ENOBUFS).
-    /// Callers receive a `RecvResult` with `buf_id` set and MUST call
-    /// `releaseBuf` after processing the payload.
+    /// std's `prep_*` rewrite the whole SQE: tag it with `id` after.
+    fn sqe(self: *EventLoop) !*linux.io_uring_sqe {
+        return self.backend.io_uring.ring.get_sqe();
+    }
+
+    /// One arm yields a completion per datagram until the op terminates
+    /// (io_uring only, e.g. ENOBUFS). Callers MUST `releaseBuf` each `buf_id`.
     pub fn recvFromMulti(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
         // msghdr configures the kernel's output layout. iov is ignored
         // (buffer selected from the ring). namelen/controllen tell the
         // kernel how many bytes to reserve for sender address / control
         // msgs; we reserve multishot_name_reserve (sockaddr_in6) and 0
         // control since DNS doesn't need CMSG.
-        const id = try self.initOp(.{ .recv_multi = .{
+        const id = try self.initOp(fd, .{ .recv_multi = .{
             .name = null,
             .namelen = multishot_name_reserve,
             .iov = undefined,
@@ -307,80 +371,136 @@ pub const EventLoop = struct {
             .flags = 0,
         } }, context);
         errdefer self.freeSlot(id);
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_recvmsg(fd, &self.slots[id].state.recv_multi, 0);
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-        sqe.buf_index = self.udp_buf_ring.group_id;
-        sqe.user_data = id;
+        switch (self.backend) {
+            .io_uring => |*u| {
+                const s = try self.sqe();
+                s.prep_recvmsg(fd, &self.slots[id].state.recv_multi, 0);
+                s.ioprio |= linux.IORING_RECV_MULTISHOT;
+                s.flags |= linux.IOSQE_BUFFER_SELECT;
+                s.buf_index = u.udp_buf_ring.group_id;
+                s.user_data = id;
+            },
+            .epoll => |*e| try e.watch(fd, linux.EPOLL.IN, id),
+        }
         return id;
     }
 
     pub fn releaseBuf(self: *EventLoop, buf_id: u16) void {
-        self.udp_buf_ring.release(buf_id);
+        switch (self.backend) {
+            .io_uring => |*u| u.udp_buf_ring.release(buf_id),
+            .epoll => |*e| e.release(buf_id),
+        }
     }
 
+    /// `listen_fd` must be non-blocking: a reset can revoke epoll's readiness.
     pub fn accept(self: *EventLoop, listen_fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.{ .accept = .{
+        const id = try self.initOp(listen_fd, .{ .accept = .{
             .addr = std.mem.zeroes(na.PosixAddress),
             .addr_len = @sizeOf(na.PosixAddress),
         } }, context);
         errdefer self.freeSlot(id);
-        const a = &self.slots[id].state.accept;
-
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_accept(listen_fd, @ptrCast(&a.addr.any), &a.addr_len, 0);
-        sqe.user_data = id;
+        switch (self.backend) {
+            .io_uring => {
+                const a = &self.slots[id].state.accept;
+                const s = try self.sqe();
+                s.prep_accept(listen_fd, @ptrCast(&a.addr.any), &a.addr_len, 0);
+                s.user_data = id;
+            },
+            .epoll => |*e| try e.watch(listen_fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, id),
+        }
         return id;
     }
 
+    /// `fd` must be non-blocking, as for `accept`.
     pub fn read(self: *EventLoop, fd: posix.fd_t, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.{ .read = undefined }, context);
+        const id = try self.initOp(fd, .{ .read = undefined }, context);
         errdefer self.freeSlot(id);
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_read(fd, &self.slots[id].state.read, 0);
-        sqe.user_data = id;
+        switch (self.backend) {
+            .io_uring => {
+                const s = try self.sqe();
+                s.prep_read(fd, &self.slots[id].state.read, 0);
+                s.user_data = id;
+            },
+            .epoll => |*e| try e.watch(fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, id),
+        }
         return id;
     }
 
     pub fn readStream(self: *EventLoop, fd: posix.fd_t, buf: []u8, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.{ .stream = {} }, context);
+        const id = try self.initOp(fd, .{ .stream = buf }, context);
         errdefer self.freeSlot(id);
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_read(fd, buf, 0);
-        sqe.user_data = id;
+        switch (self.backend) {
+            .io_uring => {
+                const s = try self.sqe();
+                s.prep_read(fd, buf, 0);
+                s.user_data = id;
+            },
+            .epoll => |*e| try e.watch(fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, id),
+        }
         return id;
     }
 
     pub fn timer(self: *EventLoop, ms: u32, context: *anyopaque) !OperationId {
-        const id = try self.initOp(.{ .timer = .{
-            .sec = ms / 1000,
-            .nsec = @as(i64, ms % 1000) * std.time.ns_per_ms,
+        const id = try self.initOp(-1, .{ .timer = .{
+            .ts = .{ .sec = ms / 1000, .nsec = @as(i64, ms % 1000) * std.time.ns_per_ms },
+            .deadline_ns = nowNs() + @as(i64, ms) * std.time.ns_per_ms,
         } }, context);
         errdefer self.freeSlot(id);
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_timeout(&self.slots[id].state.timer, 0, 0);
-        sqe.user_data = id;
+        switch (self.backend) {
+            .io_uring => {
+                const s = try self.sqe();
+                s.prep_timeout(&self.slots[id].state.timer.ts, 0, 0);
+                s.user_data = id;
+            },
+            .epoll => {},
+        }
         return id;
     }
 
     /// Test-only: the one way to force a multishot termination on demand.
     /// Production never cancels; the process exits with its ops armed.
+    /// io_uring only — epoll's multishot cannot terminate.
     fn cancel(self: *EventLoop, target_id: OperationId) !void {
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_cancel(@as(u64, target_id), 0);
-        sqe.user_data = std.math.maxInt(u64);
+        var s = try self.backend.io_uring.ring.get_sqe();
+        s.prep_cancel(@as(u64, target_id), 0);
+        s.user_data = std.math.maxInt(u64);
     }
 
     pub fn tick(self: *EventLoop, completions_buf: *[max_operations]Completion) ![]Completion {
-        _ = try self.ring.submit_and_wait(1);
-        return self.reapCompletions(completions_buf);
+        switch (self.backend) {
+            .io_uring => |*u| {
+                _ = try u.ring.submit_and_wait(1);
+                return self.reapCompletions(completions_buf);
+            },
+            .epoll => return self.pollCompletions(completions_buf),
+        }
+    }
+
+    fn finish(self: *EventLoop, id: OperationId, res: isize) Completion {
+        const slot = &self.slots[id];
+        defer self.freeSlot(id);
+        return .{ .context = slot.context, .terminated = true, .result = switch (slot.state) {
+            .recv_multi => unreachable,
+            .accept => |*a| .{ .accept = if (res >= 0)
+                .{ .fd = @intCast(res), .addr = na.fromSockaddr(&a.addr), .err = null }
+            else
+                .{ .fd = -1, .addr = no_addr, .err = error.AcceptFailed } },
+            .read => |*rbuf| blk: {
+                var r: ReadResult = .{ .buf = undefined, .len = 0, .err = null };
+                if (res > 0) {
+                    r.len = @intCast(res);
+                    @memcpy(r.buf[0..r.len], rbuf[0..r.len]);
+                } else r.err = if (res == 0) error.EndOfFile else error.ReadFailed;
+                break :blk .{ .read = r };
+            },
+            .stream => .{ .stream = @intCast(@max(res, 0)) },
+            .timer => .{ .timer = {} },
+        } };
     }
 
     fn reapCompletions(self: *EventLoop, buf: *[max_operations]Completion) ![]Completion {
         var cqes: [max_operations]linux.io_uring_cqe = undefined;
-        const count = try self.ring.copy_cqes(&cqes, 0);
+        const count = try self.backend.io_uring.ring.copy_cqes(&cqes, 0);
 
         var out: usize = 0;
         for (cqes[0..count]) |cqe| {
@@ -391,67 +511,22 @@ pub const EventLoop = struct {
             const slot = &self.slots[id];
             if (!slot.active) continue;
 
-            const completion = &buf[out];
-            completion.context = slot.context;
+            if (slot.state != .recv_multi) {
+                buf[out] = self.finish(id, cqe.res);
+                out += 1;
+                continue;
+            }
 
             // Multishot ops keep the slot alive as long as F_MORE is set;
             // the kernel will produce more CQEs for the same user_data.
-            var free_after = true;
-
-            switch (slot.state) {
-                .recv_multi => {
-                    // When F_MORE is clear, the kernel has terminated the
-                    // multishot (e.g. on ENOBUFS); the slot must be freed
-                    // so the caller can re-arm it.
-                    free_after = cqe.flags & linux.IORING_CQE_F_MORE == 0;
-                    if (parseMultishotRecv(self, cqe)) |parsed| {
-                        completion.result = .{ .recv = .{
-                            .data = parsed.payload,
-                            .addr = parsed.addr,
-                            .err = null,
-                            .buf_id = parsed.buf_id,
-                        } };
-                    } else |err| {
-                        completion.result = .{ .recv = .{
-                            .data = &.{},
-                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = err,
-                        } };
-                    }
-                },
-                .accept => |*a| {
-                    if (cqe.res >= 0) {
-                        completion.result = .{ .accept = .{
-                            .fd = @intCast(cqe.res),
-                            .addr = na.fromSockaddr(&a.addr),
-                            .err = null,
-                        } };
-                    } else {
-                        completion.result = .{ .accept = .{
-                            .fd = -1,
-                            .addr = na.initIp4(.{ 0, 0, 0, 0 }, 0),
-                            .err = error.AcceptFailed,
-                        } };
-                    }
-                },
-                .read => |*rbuf| {
-                    var res = ReadResult{ .buf = undefined, .len = 0, .err = null };
-                    if (cqe.res > 0) {
-                        res.len = @intCast(cqe.res);
-                        @memcpy(res.buf[0..res.len], rbuf[0..res.len]);
-                    } else if (cqe.res == 0) {
-                        res.err = error.EndOfFile;
-                    } else {
-                        res.err = error.ReadFailed;
-                    }
-                    completion.result = .{ .read = res };
-                },
-                .stream => completion.result = .{ .stream = @intCast(@max(cqe.res, 0)) },
-                .timer => completion.result = .{ .timer = {} },
-            }
-
-            completion.terminated = free_after;
-            if (free_after) self.freeSlot(id);
+            // When it is clear the kernel has terminated the multishot (e.g.
+            // on ENOBUFS); the slot must be freed so the caller can re-arm it.
+            const terminated = cqe.flags & linux.IORING_CQE_F_MORE == 0;
+            buf[out] = .{ .context = slot.context, .terminated = terminated, .result = .{ .recv = if (self.parseMultishotRecv(cqe)) |parsed|
+                .{ .data = parsed.payload, .addr = parsed.addr, .err = null, .buf_id = parsed.buf_id }
+            else |err|
+                .{ .data = &.{}, .addr = no_addr, .err = err } } };
+            if (terminated) self.freeSlot(id);
             out += 1;
         }
 
@@ -468,7 +543,7 @@ pub const EventLoop = struct {
     /// destructure the `io_uring_recvmsg_out` header, and return the
     /// sender address + payload slice (both aliased into the buffer).
     fn parseMultishotRecv(self: *EventLoop, cqe: linux.io_uring_cqe) !MultishotParsed {
-        const ring = &self.udp_buf_ring;
+        const ring = &self.backend.io_uring.udp_buf_ring;
         if (cqe.res < 0) {
             const errno: linux.E = @fromBackingInt(@intCast(@as(u31, @intCast(-cqe.res))));
             return switch (errno) {
@@ -504,15 +579,141 @@ pub const EventLoop = struct {
             .buf_id = buf_id,
         };
     }
+
+    fn pollCompletions(self: *EventLoop, buf: *[max_operations]Completion) ![]Completion {
+        var events: [max_operations]linux.epoll_event = undefined;
+        const rc = linux.epoll_wait(self.backend.epoll.fd, &events, max_operations, self.epollTimeoutMs());
+        const ready: usize = switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            .INTR => 0,
+            else => return error.EpollWaitFailed,
+        };
+
+        var out: usize = 0;
+        const now = nowNs();
+        for (&self.slots, 0..) |*slot, id| {
+            if (slot.active and slot.state == .timer and slot.state.timer.deadline_ns <= now) {
+                buf[out] = self.finish(@intCast(id), 0);
+                out += 1;
+            }
+        }
+        // Ready fds and expired timers each hold a slot, so every share is at
+        // least one: a flooded socket can't crowd a listener out of the tick.
+        for (events[0..ready], 0..) |ev, i| {
+            const share = (max_operations - out) / (ready - i);
+            std.debug.assert(share > 0);
+            out += self.onReady(@intCast(ev.data.u64), buf[out..][0..share]);
+        }
+        return buf[0..out];
+    }
+
+    fn epollTimeoutMs(self: *const EventLoop) i32 {
+        var next: i64 = std.math.maxInt(i64);
+        for (&self.slots) |*s| if (s.active and s.state == .timer) {
+            next = @min(next, s.state.timer.deadline_ns);
+        };
+        if (next == std.math.maxInt(i64)) return -1;
+        const left = @max(next - nowNs(), 0);
+        return @intCast(@min(std.math.divCeil(i64, left, std.time.ns_per_ms) catch unreachable, std.math.maxInt(i32)));
+    }
+
+    fn onReady(self: *EventLoop, id: OperationId, out: []Completion) usize {
+        const slot = &self.slots[id];
+        if (!slot.active) return 0;
+        const rc = switch (slot.state) {
+            .recv_multi => return self.drainUdp(slot, out),
+            .accept => |*a| linux.accept4(slot.fd, &a.addr.any, &a.addr_len, 0),
+            .read => |*r| linux.read(slot.fd, r, r.len),
+            .stream => |s| linux.recvfrom(slot.fd, s.ptr, s.len, linux.MSG.DONTWAIT, null, null),
+            .timer => return 0,
+        };
+        switch (linux.errno(rc)) {
+            .AGAIN, .INTR => {
+                if (self.backend.epoll.watch(slot.fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, id)) return 0 else |_| {
+                    out[0] = self.finish(id, -1);
+                    return 1;
+                }
+            },
+            else => {
+                out[0] = self.finish(id, @bitCast(rc));
+                return 1;
+            },
+        }
+    }
+
+    /// One recvmmsg; what is left stays readable and wakes the next tick.
+    fn drainUdp(self: *EventLoop, slot: *const Slot, out: []Completion) usize {
+        const e = &self.backend.epoll;
+        const n = @min(out.len, e.free_count);
+        if (n == 0) return 0;
+        var ids: [max_operations]u16 = undefined;
+        var iovs: [max_operations]posix.iovec = undefined;
+        var names: [max_operations]na.PosixAddress = undefined;
+        var msgs: [max_operations]linux.mmsghdr = undefined;
+        for (0..n) |i| {
+            ids[i] = e.free[e.free_count - 1 - i];
+            iovs[i] = .{ .base = e.bufferAt(ids[i]).ptr, .len = multishot_payload_max };
+            msgs[i] = .{ .len = 0, .hdr = .{
+                .name = &names[i].any,
+                .namelen = @sizeOf(na.PosixAddress),
+                .iov = iovs[i..].ptr,
+                .iovlen = 1,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            } };
+        }
+        const rc = linux.recvmmsg(slot.fd, &msgs, @intCast(n), linux.MSG.DONTWAIT, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => return 0,
+            else => {
+                out[0] = .{ .context = slot.context, .result = .{ .recv = .{ .data = &.{}, .addr = no_addr, .err = error.RecvFailed } } };
+                return 1;
+            },
+        }
+        e.free_count -= @intCast(rc);
+        for (msgs[0..rc], ids[0..rc], names[0..rc], out[0..rc]) |m, id, *name, *c| {
+            c.* = .{ .context = slot.context, .result = .{ .recv = if (m.hdr.flags & linux.MSG.TRUNC != 0 or m.hdr.namelen == 0) blk: {
+                e.release(id);
+                break :blk .{ .data = &.{}, .addr = no_addr, .err = error.RecvFailed };
+            } else .{ .data = e.bufferAt(id)[0..m.len], .addr = na.fromSockaddr(name), .err = null, .buf_id = id } } };
+        }
+        return rc;
+    }
 };
 
-fn createTestLoop() !*EventLoop {
-    const loop = EventLoop.create(testing.allocator) catch |err| switch (err) {
-        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+fn nowNs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return ts.sec * std.time.ns_per_s + ts.nsec;
+}
+
+fn createTestLoop(backend: Backend) !*EventLoop {
+    const loop = try EventLoop.create(testing.allocator, backend);
+    if (loop.backend != backend) {
+        loop.destroy();
+        return error.SkipZigTest;
+    }
+    watchdog(10);
     try loop.enable();
     return loop;
+}
+
+fn destroyTestLoop(loop: *EventLoop) void {
+    watchdog(0);
+    loop.destroy();
+}
+
+/// SIGALRM kills a test whose lost completion would hang `tick`. 0 disarms.
+fn watchdog(secs: isize) void {
+    const t: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = secs, .nsec = 0 } };
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &t, null);
+}
+
+fn onBothBackends(f: fn (Backend) anyerror!void) !void {
+    try f(.epoll);
+    f(.io_uring) catch |err| if (err != error.SkipZigTest) return err;
 }
 
 fn bindTestUdp() !posix.fd_t {
@@ -533,131 +734,143 @@ test "Slot stays lean — read ops must not drag packet-sized buffers back in" {
 }
 
 test "readStream fills the caller's buffer, EOFs on shutdown; timer ticks" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
+    try onBothBackends(struct {
+        fn run(backend: Backend) !void {
+            const loop = try createTestLoop(backend);
+            defer destroyTestLoop(loop);
 
-    var fds: [2]i32 = undefined;
-    try testing.expectEqual(@as(usize, 0), linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds));
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
+            var fds: [2]i32 = undefined;
+            try testing.expectEqual(@as(usize, 0), linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds));
+            defer sys.close(fds[0]);
+            defer sys.close(fds[1]);
 
-    var buf: [16]u8 = undefined;
-    var rctx: u8 = 1;
-    var tctx: u8 = 2;
-    _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
-    _ = try loop.timer(5, @ptrCast(&tctx));
-    _ = try sys.write(fds[1], "hello");
+            var buf: [16]u8 = undefined;
+            var rctx: u8 = 1;
+            var tctx: u8 = 2;
+            _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
+            _ = try loop.timer(5, @ptrCast(&tctx));
+            _ = try sys.write(fds[1], "hello");
 
-    var got: ?usize = null;
-    var ticked = false;
-    var completions: [max_operations]Completion = undefined;
-    for (0..20) |_| {
-        for (try loop.tick(&completions)) |c| switch (c.result) {
-            .stream => |s| got = s,
-            .timer => ticked = true,
-            else => {},
-        };
-        if (got != null and ticked) break;
-    }
-    try testing.expectEqualStrings("hello", buf[0..got.?]);
-    try testing.expect(ticked);
+            var got: ?usize = null;
+            var ticked = false;
+            var completions: [max_operations]Completion = undefined;
+            for (0..20) |_| {
+                for (try loop.tick(&completions)) |c| switch (c.result) {
+                    .stream => |s| got = s,
+                    .timer => ticked = true,
+                    else => {},
+                };
+                if (got != null and ticked) break;
+            }
+            try testing.expectEqualStrings("hello", buf[0..got.?]);
+            try testing.expect(ticked);
 
-    _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
-    sys.shutdown(fds[1]);
-    var eof = false;
-    for (0..20) |_| {
-        for (try loop.tick(&completions)) |c| switch (c.result) {
-            .stream => |s| eof = s == 0,
-            else => {},
-        };
-        if (eof) break;
-    }
-    try testing.expect(eof);
+            _ = try loop.readStream(fds[0], &buf, @ptrCast(&rctx));
+            sys.shutdown(fds[1]);
+            var eof = false;
+            for (0..20) |_| {
+                for (try loop.tick(&completions)) |c| switch (c.result) {
+                    .stream => |s| eof = s == 0,
+                    else => {},
+                };
+                if (eof) break;
+            }
+            try testing.expect(eof);
+        }
+    }.run);
 }
 
 test "EventLoop create/destroy" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
-
-    try testing.expectEqual(@as(u16, max_operations), loop.free_count);
+    try onBothBackends(struct {
+        fn run(backend: Backend) !void {
+            const loop = try createTestLoop(backend);
+            defer destroyTestLoop(loop);
+            try testing.expectEqual(@as(u16, max_operations), loop.free_count);
+        }
+    }.run);
 }
 
 test "ring refuses opcodes outside the allowlist" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
+    const loop = try createTestLoop(.io_uring);
+    defer destroyTestLoop(loop);
+    const ring = &loop.backend.io_uring.ring;
 
-    var sqe = try loop.ring.get_sqe();
-    sqe.prep_nop();
-    sqe.user_data = 7;
-    _ = try loop.ring.submit_and_wait(1);
+    var s = try ring.get_sqe();
+    s.prep_nop();
+    s.user_data = 7;
+    _ = try ring.submit_and_wait(1);
     var cqes: [1]linux.io_uring_cqe = undefined;
-    try testing.expectEqual(@as(u32, 1), try loop.ring.copy_cqes(&cqes, 1));
+    try testing.expectEqual(@as(u32, 1), try ring.copy_cqes(&cqes, 1));
     try testing.expectEqual(@as(u64, 7), cqes[0].user_data);
     try testing.expectEqual(@as(i32, -@as(i32, @backingInt(linux.E.ACCES))), cqes[0].res);
-    const rc = linux.io_uring_register(loop.ring.fd, .REGISTER_PROBE, null, 0);
+    const rc = linux.io_uring_register(ring.fd, .REGISTER_PROBE, null, 0);
     try testing.expectEqual(linux.E.ACCES, linux.errno(rc));
 }
 
-test "EventLoop recvFromMulti receives multiple packets on one SQE" {
-    const loop = try createTestLoop();
-    defer loop.destroy();
+test "EventLoop recvFromMulti receives multiple packets on one arm" {
+    try onBothBackends(struct {
+        fn run(backend: Backend) !void {
+            const loop = try createTestLoop(backend);
+            defer destroyTestLoop(loop);
 
-    const sock = try bindTestUdp();
-    defer sys.close(sock);
-    const server_addr = try na.getSockName(sock);
+            const sock = try bindTestUdp();
+            defer sys.close(sock);
+            const server_addr = try na.getSockName(sock);
 
-    var ctx: u8 = 1;
-    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+            var ctx: u8 = 1;
+            _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
-    // Send 3 packets from a separate thread — one multishot SQE should
-    // produce 3 CQEs without re-arming.
-    const payloads = [_][]const u8{ "first", "second", "third" };
-    const SenderThread = struct {
-        fn run(addr: na.Address, msgs: []const []const u8) void {
-            const s = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
-            defer sys.close(s);
-            var pa: na.PosixAddress = undefined;
-            const sa_len = na.toSockaddr(&addr, &pa);
-            for (msgs) |m| _ = sys.sendto(s, m, 0, &pa.any, sa_len) catch return;
-        }
-    };
-    const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, &payloads });
+            // Send 3 packets from a separate thread — one multishot arm should
+            // produce 3 completions without re-arming.
+            const payloads = [_][]const u8{ "first", "second", "third" };
+            const SenderThread = struct {
+                fn run(addr: na.Address, msgs: []const []const u8) void {
+                    const s = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+                    defer sys.close(s);
+                    var pa: na.PosixAddress = undefined;
+                    const sa_len = na.toSockaddr(&addr, &pa);
+                    for (msgs) |m| _ = sys.sendto(s, m, 0, &pa.any, sa_len) catch return;
+                }
+            };
+            const thread = try std.Thread.spawn(.{}, SenderThread.run, .{ server_addr, &payloads });
 
-    var completions: [max_operations]Completion = undefined;
-    var seen: [payloads.len]bool = @splat(false);
-    var received: usize = 0;
-    var still_armed_seen = false;
+            var completions: [max_operations]Completion = undefined;
+            var seen: [payloads.len]bool = @splat(false);
+            var received: usize = 0;
+            var still_armed_seen = false;
 
-    for (0..10) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| {
-            switch (c.result) {
-                .recv => |r| {
-                    if (r.err == null and r.buf_id != null) {
-                        for (payloads, 0..) |p, pi| {
-                            if (std.mem.eql(u8, p, r.data) and !seen[pi]) {
-                                seen[pi] = true;
-                                received += 1;
-                                break;
+            for (0..10) |_| {
+                const results = try loop.tick(&completions);
+                for (results) |c| {
+                    switch (c.result) {
+                        .recv => |r| {
+                            if (r.err == null and r.buf_id != null) {
+                                for (payloads, 0..) |p, pi| {
+                                    if (std.mem.eql(u8, p, r.data) and !seen[pi]) {
+                                        seen[pi] = true;
+                                        received += 1;
+                                        break;
+                                    }
+                                }
+                                loop.releaseBuf(r.buf_id.?);
                             }
-                        }
-                        loop.releaseBuf(r.buf_id.?);
+                        },
+                        else => {},
                     }
-                },
-                else => {},
+                    // Multishot keeps delivering on one arm: every completion
+                    // carrying a payload must report the op as still live, so
+                    // no re-registration happens between packets.
+                    if (c.result == .recv and c.result.recv.err == null and !c.terminated)
+                        still_armed_seen = true;
+                }
+                if (received == payloads.len) break;
             }
-            // Multishot keeps delivering on one SQE: every CQE carrying a
-            // payload must report the op as still live (F_MORE set), so no
-            // re-registration happens between packets.
-            if (c.result == .recv and c.result.recv.err == null and !c.terminated)
-                still_armed_seen = true;
-        }
-        if (received == payloads.len) break;
-    }
 
-    thread.join();
-    try testing.expectEqual(payloads.len, received);
-    try testing.expect(still_armed_seen);
+            thread.join();
+            try testing.expectEqual(payloads.len, received);
+            try testing.expect(still_armed_seen);
+        }
+    }.run);
 }
 
 test "termination is reported per-CQE, not by asking the recycled slot table" {
@@ -672,8 +885,8 @@ test "termination is reported per-CQE, not by asking the recycled slot table" {
     // listener 2 was never re-armed, and because its op id stayed non-null
     // the repair loop skipped it too. A permanently deaf UDP listener, with
     // SO_REUSEPORT still hashing traffic to it, silent until restart.
-    const loop = try createTestLoop();
-    defer loop.destroy();
+    const loop = try createTestLoop(.io_uring);
+    defer destroyTestLoop(loop);
 
     var socks: [2]posix.fd_t = undefined;
     var ctxs: [2]u8 = .{ 1, 2 };
@@ -721,71 +934,116 @@ test "read payload survives an op arming into the freed slot mid-batch" {
     // the payload — a tcp-accept re-arm ahead of a signal completion
     // zeroed the siginfo and classifySignalRead turned stats into
     // shutdown. ReadResult now owns a copy; pin that.
-    const loop = try createTestLoop();
-    defer loop.destroy();
+    try onBothBackends(struct {
+        fn run(backend: Backend) !void {
+            const loop = try createTestLoop(backend);
+            defer destroyTestLoop(loop);
 
-    const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
-    const sr: isize = @bitCast(rc);
-    try testing.expect(sr >= 0);
-    const efd: posix.fd_t = @intCast(sr);
-    defer sys.close(efd);
+            const rc = linux.eventfd(0, linux.EFD.NONBLOCK);
+            const sr: isize = @bitCast(rc);
+            try testing.expect(sr >= 0);
+            const efd: posix.fd_t = @intCast(sr);
+            defer sys.close(efd);
 
-    const val: u64 = 0x1122334455667788;
-    _ = try sys.write(efd, std.mem.asBytes(&val));
+            const val: u64 = 0x1122334455667788;
+            _ = try sys.write(efd, std.mem.asBytes(&val));
 
-    var ctx: u8 = 7;
-    _ = try loop.read(efd, @ptrCast(&ctx));
+            var ctx: u8 = 7;
+            _ = try loop.read(efd, @ptrCast(&ctx));
 
-    var completions: [max_operations]Completion = undefined;
-    var saved: ?ReadResult = null;
-    for (0..5) |_| {
-        const results = try loop.tick(&completions);
-        for (results) |c| switch (c.result) {
-            .read => |r| saved = r,
-            else => {},
-        };
-        if (saved != null) break;
-    }
-    try testing.expect(saved != null);
+            var completions: [max_operations]Completion = undefined;
+            var saved: ?ReadResult = null;
+            for (0..5) |_| {
+                const results = try loop.tick(&completions);
+                for (results) |c| switch (c.result) {
+                    .read => |r| saved = r,
+                    else => {},
+                };
+                if (saved != null) break;
+            }
+            try testing.expect(saved != null);
 
-    // Arm a recvmsg — allocSlot pops the just-freed read slot and initOp
-    // writes the recv_multi msghdr over the shared union storage.
-    const sock = try bindTestUdp();
-    defer sys.close(sock);
-    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+            // Arm a recvmsg — the free list pops the just-freed read slot and
+            // initOp writes the recv_multi msghdr over the shared union storage.
+            const sock = try bindTestUdp();
+            defer sys.close(sock);
+            _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
 
-    try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&val), saved.?.data());
+        }
+    }.run);
 }
 
 test "truncated datagram is rejected without tearing down the multishot" {
     // The kernel keeps the multishot live after MSG_TRUNC. Freeing the slot
     // made the server re-arm on top of it: one leaked op per oversized datagram.
-    const loop = try createTestLoop();
-    defer loop.destroy();
+    try onBothBackends(struct {
+        fn run(backend: Backend) !void {
+            const loop = try createTestLoop(backend);
+            defer destroyTestLoop(loop);
 
-    const sock = try bindTestUdp();
-    defer sys.close(sock);
-    const server_addr = try na.getSockName(sock);
-    var pa: na.PosixAddress = undefined;
-    const sa_len = na.toSockaddr(&server_addr, &pa);
+            const sock = try bindTestUdp();
+            defer sys.close(sock);
+            const server_addr = try na.getSockName(sock);
+            var pa: na.PosixAddress = undefined;
+            const sa_len = na.toSockaddr(&server_addr, &pa);
 
-    var ctx: u8 = 1;
-    _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+            var ctx: u8 = 1;
+            _ = try loop.recvFromMulti(sock, @ptrCast(&ctx));
+
+            const s = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+            defer sys.close(s);
+            const big: [multishot_payload_max + 1]u8 = @splat('x');
+            _ = try sys.sendto(s, &big, 0, &pa.any, sa_len);
+
+            var completions: [max_operations]Completion = undefined;
+            const trunc = try loop.tick(&completions);
+            try testing.expectEqual(@as(usize, 1), trunc.len);
+            try testing.expectEqual(@as(?anyerror, error.RecvFailed), trunc[0].result.recv.err);
+            try testing.expect(!trunc[0].terminated);
+
+            _ = try sys.sendto(s, "hello", 0, &pa.any, sa_len);
+            const next = try loop.tick(&completions);
+            try testing.expectEqual(@as(usize, 1), next.len);
+            try testing.expectEqualStrings("hello", next[0].result.recv.data);
+            loop.releaseBuf(next[0].result.recv.buf_id.?);
+
+            // Every buffer came back: a rejected datagram must not leak one.
+            if (backend == .epoll) try testing.expectEqual(@as(u16, max_operations), loop.backend.epoll.free_count);
+        }
+    }.run);
+}
+
+test "epoll: a flooded socket cannot crowd a quiet one out of the tick" {
+    const loop = try createTestLoop(.epoll);
+    defer destroyTestLoop(loop);
+
+    var socks: [2]posix.fd_t = undefined;
+    var ctxs: [2]u8 = .{ 0, 1 };
+    for (&socks, &ctxs) |*sock, *ctx| {
+        sock.* = try bindTestUdp();
+        _ = try loop.recvFromMulti(sock.*, @ptrCast(ctx));
+    }
+    defer for (socks) |sock| sys.close(sock);
 
     const s = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
     defer sys.close(s);
-    const big: [multishot_payload_max + 1]u8 = @splat('x');
-    _ = try sys.sendto(s, &big, 0, &pa.any, sa_len);
+    var pa: na.PosixAddress = undefined;
+    const flood = try na.getSockName(socks[0]);
+    for (0..3 * max_operations) |_| _ = try sys.sendto(s, "flood", 0, &pa.any, na.toSockaddr(&flood, &pa));
+    const quiet = try na.getSockName(socks[1]);
+    _ = try sys.sendto(s, "quiet", 0, &pa.any, na.toSockaddr(&quiet, &pa));
 
     var completions: [max_operations]Completion = undefined;
-    const trunc = try loop.tick(&completions);
-    try testing.expectEqual(@as(usize, 1), trunc.len);
-    try testing.expectEqual(@as(?anyerror, error.RecvFailed), trunc[0].result.recv.err);
-    try testing.expect(!trunc[0].terminated);
+    const results = try loop.tick(&completions);
+    var per_sock: [2]usize = .{ 0, 0 };
+    for (results) |c| {
+        per_sock[@as(*u8, @ptrCast(c.context)).*] += 1;
+        loop.releaseBuf(c.result.recv.buf_id.?);
+    }
+    try testing.expectEqual(@as(usize, 1), per_sock[1]);
+    try testing.expect(per_sock[0] >= max_operations / 2);
 
-    _ = try sys.sendto(s, "hello", 0, &pa.any, sa_len);
-    const next = try loop.tick(&completions);
-    try testing.expectEqual(@as(usize, 1), next.len);
-    try testing.expectEqualStrings("hello", next[0].result.recv.data);
-    loop.releaseBuf(next[0].result.recv.buf_id.?);
+    // The flood's remainder is still readable: level-triggered.
+    try testing.expect((try loop.tick(&completions)).len > 0);
 }
