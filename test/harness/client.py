@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dns.edns
 import dns.flags
 import dns.message
 import dns.query
@@ -19,7 +20,7 @@ def send_query(entry: rpl.Entry, hark_addr: tuple[str, int], timeout: float = 5.
     if not entry.question:
         raise ValueError("STEP QUERY entry has no QUESTION section")
     q = entry.question[0]
-    msg = dns.message.make_query(q.name, q.rdtype, q.rdclass, want_dnssec=entry.want_dnssec)
+    msg = dns.message.make_query(q.name, q.rdtype, q.rdclass, use_edns=0 if entry.want_edns else None, want_dnssec=entry.want_dnssec)
     msg.flags = entry.reply_flags  # in QUERY entries, REPLY carries client flags
     return dns.query.udp(msg, hark_addr[0], port=hark_addr[1], timeout=timeout)
 
@@ -52,6 +53,11 @@ def assert_answer_matches(actual: dns.message.Message, expected: rpl.Entry) -> N
             f"rcode mismatch: expected {dns.rcode.to_text(expected.reply_rcode)} "
             f"got {dns.rcode.to_text(actual.rcode())}"
         )
+
+    if expected.ede is not None:
+        codes = [o.code for o in actual.options if o.otype == dns.edns.OptionType.EDE]
+        if expected.ede not in codes:
+            raise AssertionError(f"EDE mismatch: expected {expected.ede} got {codes}")
 
     if "flags" in checks:
         # Compare only the response-relevant flag bits. RD is set by the

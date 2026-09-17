@@ -67,7 +67,7 @@ RANGE_END
 
 STEP 1 QUERY
 ENTRY_BEGIN
-  REPLY RD
+  REPLY RD EDNS
   SECTION QUESTION
     attacker.com. IN A
 ENTRY_END
@@ -78,7 +78,7 @@ ENTRY_END
 ; on next config change instead of negative-caching a stale block.
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode answer question
+  MATCH rcode answer question ede=15
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     attacker.com. IN A

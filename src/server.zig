@@ -978,6 +978,7 @@ const WorkerState = struct {
         sock: posix.fd_t,
         query_msg: dns.Message,
         result_msg: dns.Message,
+        ede: ?dns.Ede,
         alloc: mem.Allocator,
         client_addr: na.Address,
     ) void {
@@ -996,6 +997,7 @@ const WorkerState = struct {
             var ctx = ResponseContext.fromQuery(query_msg, resolved_payload);
             ctx.minimal_responses = self.server.config.minimal_responses;
             ctx.rebinding = &self.server.config.rebinding;
+            ctx.ede = ede;
             if (buildResponseWire(buf, ctx, result_msg, alloc)) |wire| {
                 self.sendUdpResponse(sock, wire, client_addr);
                 return;
@@ -1082,7 +1084,7 @@ const WorkerState = struct {
             return false;
         };
 
-        self.sendUdpResponseFromResult(sock, query_msg, result.message, alloc, client_addr);
+        self.sendUdpResponseFromResult(sock, query_msg, result.message, result.ede, alloc, client_addr);
 
         self.recordClientOutcome(result.from_cache); // cache_only ⇒ always a hit
         self.dispatchPrefetches(result, name_str);
@@ -1224,18 +1226,23 @@ const WorkerState = struct {
             var qtype_buf: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, @errorName(err) });
             self.recordClientOutcome(false);
-            self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
+            const code: dns.Ede.Code = switch (err) {
+                error.Timeout, error.ResolveDeadline, error.NoGlueRecords => .no_reachable_authority,
+                else => .other,
+            };
+            const servfail = response.synthesizedMessage(&.{}, &.{}, .server_failure, false);
+            self.sendResponse(reply, query, servfail, .{ .code = code, .text = @errorName(err) }, alloc);
             return;
         };
         const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
         var qtype_buf: [24]u8 = undefined;
         var rcode_buf: [24]u8 = undefined;
         if (result.message.header.flags.rcode == .server_failure)
-            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, result.servfail_why orelse if (result.from_cache) "cached" else "upstream" })
+            log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, if (result.ede) |e| (if (e.text.len > 0) e.text else @tagName(e.code)) else "upstream" })
         else
             log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms{s}", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), rcodeSuffix(result.message.header.flags.rcode, &rcode_buf), elapsed_ms, tag });
 
-        self.sendResponse(reply, query, result.message, alloc);
+        self.sendResponse(reply, query, result.message, result.ede, alloc);
 
         self.recordClientOutcome(result.from_cache);
         self.dispatchPrefetches(result, name_str);
@@ -1252,9 +1259,9 @@ const WorkerState = struct {
         }
     }
 
-    fn sendResponse(self: *WorkerState, reply: Reply, query: dns.Message, result: dns.Message, alloc: mem.Allocator) void {
+    fn sendResponse(self: *WorkerState, reply: Reply, query: dns.Message, result: dns.Message, ede: ?dns.Ede, alloc: mem.Allocator) void {
         switch (reply) {
-            .udp => |u| self.sendUdpResponseFromResult(u.sock, query, result, alloc, u.addr),
+            .udp => |u| self.sendUdpResponseFromResult(u.sock, query, result, ede, alloc, u.addr),
             .tcp => |c| {
                 // Arena, not stack: inlined here it was 64 KiB under every resolution.
                 const buf = alloc.alloc(u8, dns.max_message_len) catch
@@ -1264,6 +1271,7 @@ const WorkerState = struct {
                 ctx.tcp_keepalive = @intCast(self.server.config.tcp_idle_timeout_ms / 100);
                 ctx.minimal_responses = self.server.config.minimal_responses;
                 ctx.rebinding = &self.server.config.rebinding;
+                ctx.ede = ede;
                 const wire = buildResponseWire(buf, ctx, result, alloc) orelse
                     return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
                 c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);

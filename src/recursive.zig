@@ -428,7 +428,7 @@ pub const RecursiveResolver = struct {
 
     pub const ResolveResult = struct {
         message: dns.Message,
-        servfail_why: ?[]const u8 = null,
+        ede: ?dns.Ede = null,
         prefetch_name: ?[]const u8 = null,
         prefetch_qtype: dns.RType = .a,
         /// DNSKEY zone needing async refresh (TTL < 10%). Server handles after responding.
@@ -959,23 +959,31 @@ pub const RecursiveResolver = struct {
                 } else |_| {}
             }
 
-            switch (result) {
-                .hit => |h| return .{
-                    .served = .{
-                        // RFC 4035 §5.3.1: RRSIGs travel in the same section as
-                        // their covered RRset. Concatenate sigs onto the answer-
-                        // section records so a DO=1 / CD=1 cache-served client
-                        // can validate; the wire shaper strips them for DO=0.
-                        // For wildcard-expanded answers, h.nsec_proofs carries
-                        // the §3.1.3.4 "no closer match" NSEC proofs from the
-                        // original response.
-                        .message = try withCnameChain(allocator, chain, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
-                        .prefetch_name = prefetch_out,
-                        .prefetch_qtype = qtype,
-                    },
+            var served: ResolveResult = switch (result) {
+                .hit => |h| .{
+                    // RFC 4035 §5.3.1: RRSIGs travel in the same section as
+                    // their covered RRset. Concatenate sigs onto the answer-
+                    // section records so a DO=1 / CD=1 cache-served client
+                    // can validate; the wire shaper strips them for DO=0.
+                    // For wildcard-expanded answers, h.nsec_proofs carries
+                    // the §3.1.3.4 "no closer match" NSEC proofs from the
+                    // original response.
+                    .message = try withCnameChain(allocator, chain, synthesizedMessage(try concatRRs(allocator, h.records, h.sigs), h.nsec_proofs, .no_error, h.security_status == .secure)),
+                    .prefetch_name = prefetch_out,
+                    .prefetch_qtype = qtype,
                 },
-                .negative => |n| return .{ .served = try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, chain) },
-            }
+                .negative => |n| try negativeResolveResult(allocator, n.soa, n.nsec_proofs, n.rcode, n.security_status == .secure, prefetch_out, qtype, chain),
+            };
+            served.ede = switch (result) {
+                .hit => if (meta.is_stale) .{ .code = .stale_answer } else null,
+                .negative => |n| if (n.rcode == .server_failure)
+                    .{ .code = if (n.security_status == .bogus) .dnssec_bogus else .cached_error }
+                else if (meta.is_stale)
+                    .{ .code = if (n.rcode == .name_error) .stale_nxdomain_answer else .stale_answer }
+                else
+                    null,
+            };
+            return .{ .served = served };
         }
 
         if (qtype == .cname) return .none;
@@ -1080,11 +1088,13 @@ pub const RecursiveResolver = struct {
         switch (synth.kind) {
             .nxdomain, .nodata => |rc| {
                 const rcode: dns.RCode = if (rc == .nxdomain) .name_error else .no_error;
-                return try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, chain);
+                var result = try negativeResolveResult(allocator, synth.soa, synth.proofs, rcode, true, null, qtype, chain);
+                result.ede = .{ .code = .synthesized };
+                return result;
             },
             .wildcard_match => {
                 if (try self.tryWildcardSynth(allocator, synth.ce_label_count, synth.soa, synth.proofs, target_name, qtype, chain)) |result| {
-                    return .{ .message = result };
+                    return .{ .message = result, .ede = .{ .code = .synthesized } };
                 }
                 return null;
             },
@@ -1195,7 +1205,7 @@ pub const RecursiveResolver = struct {
     fn loopServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, depth: usize) ResolveResult {
         @branchHint(.cold);
         self.cacheResolutionFailure(name, qtype, depth);
-        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .servfail_why = "cname loop" };
+        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .ede = .{ .code = .other, .text = "cname loop" } };
     }
 
     /// Any error rcode, or NOERROR with no answers and no referral. Under a
@@ -1231,8 +1241,10 @@ pub const RecursiveResolver = struct {
                 },
                 .bogus => |why| return self.bogusServfail(current_name, qtype, why),
             }
-        } else if (rcode == .server_failure or rcode == .refused) {
+        } else if (rcode.isServerError()) {
+            // Every sibling gave it (shouldTrySibling).
             self.cacheResolutionFailure(name, qtype, depth);
+            return .{ .message = try withCnameChain(allocator, chain, response.*), .ede = .{ .code = .no_reachable_authority } };
         }
         return .{ .message = try withCnameChain(allocator, chain, response.*) };
     }
@@ -1862,7 +1874,7 @@ pub const RecursiveResolver = struct {
     fn bogusServfail(self: *RecursiveResolver, name: []const u8, qtype: dns.RType, why: []const u8) ResolveResult {
         @branchHint(.cold);
         if (self.answerCache()) |c| c.storeNegativeBare(name, qtype, .in, .server_failure, dnssec_bogus_ttl, .bogus, .always);
-        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .servfail_why = why };
+        return .{ .message = synthesizedMessage(&.{}, &.{}, .server_failure, false), .ede = .{ .code = .dnssec_bogus, .text = why } };
     }
 
     /// Coalesce concurrent fetches for the same `(name, rtype)` through the

@@ -28,6 +28,8 @@ Hark-only extensions:
   - STEP n CHECK_MAX_QUERIES <N>            assert <= N total upstream queries
   - SECTION QUERY_LOG                       `<qname> <qtype> [<dest>]` rows
   - MATCH UDP / MATCH TCP                   per-transport entry discrimination
+  - MATCH ede=<code>                        CHECK_ANSWER: RFC 8914 option carries <code> (testbound)
+  - REPLY EDNS                              STEP QUERY: send an OPT without DO
 """
 
 from __future__ import annotations
@@ -128,6 +130,8 @@ class Entry:
     # No-op on response-template entries (the responder always returns
     # whatever records the scenario declared).
     want_dnssec: bool = False
+    want_edns: bool = False
+    ede: int | None = None
     # Parsed ADJUST flags the responder acts on (most are documentation-only).
     adjust: set[str] = dataclasses.field(default_factory=set)
     # SIGN_AS <zone>: force every signable RRset in this entry to be signed
@@ -413,6 +417,9 @@ class _Parser:
             head = tokens[0]
             if head == "MATCH":
                 flags = [t.lower() for t in tokens[1:]]
+                for f in [f for f in flags if f.startswith("ede=")]:
+                    entry.ede = int(f[4:])
+                    flags.remove(f)
                 self._validate_flags(flags, MATCH_VALID_FLAGS, "MATCH")
                 entry.match.update(flags)
             elif head == "ADJUST":
@@ -453,6 +460,8 @@ class _Parser:
                 entry.reply_opcode = REPLY_OPCODES[t]
             elif t == "DO":
                 entry.want_dnssec = True
+            elif t == "EDNS":
+                entry.want_edns = True
             else:
                 raise self.err(f"unknown REPLY token: {t!r}")
 

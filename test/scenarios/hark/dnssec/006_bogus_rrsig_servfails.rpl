@@ -54,7 +54,7 @@ STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   ; `MATCH flags` covers rcode + AD; the assertion fails if hark either
   ; returns NOERROR or sets AD=1 on this forged answer.
-  MATCH flags question
+  MATCH flags question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     example. IN A

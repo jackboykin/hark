@@ -497,6 +497,32 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
 pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
 const edns_opt_padding: u16 = 12; // RFC 7830
 
+pub const edns_opt_ede: u16 = 15; // RFC 8914
+
+/// RFC 8914 Extended DNS Error.
+pub const Ede = struct {
+    code: Code,
+    text: []const u8 = "",
+
+    pub const Code = enum(u16) {
+        other = 0,
+        stale_answer = 3,
+        dnssec_bogus = 6,
+        cached_error = 13,
+        blocked = 15,
+        stale_nxdomain_answer = 19,
+        no_reachable_authority = 22,
+        synthesized = 29,
+    };
+
+    pub fn option(self: Ede, buf: *[64]u8) EdnsOption {
+        mem.writeInt(u16, buf[0..2], @backingInt(self.code), .big);
+        const n = @min(self.text.len, buf.len - 2);
+        @memcpy(buf[2..][0..n], self.text[0..n]);
+        return .{ .code = edns_opt_ede, .data = buf[0 .. 2 + n] };
+    }
+};
+
 pub const EdnsOption = struct {
     code: u16,
     data: []const u8,

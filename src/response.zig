@@ -245,6 +245,7 @@ pub const ResponseContext = struct {
     /// this on stream transports.
     tcp_keepalive: ?u16 = null,
     rebinding: *const rebinding.Config = &rebinding.Config.off,
+    ede: ?dns.Ede = null,
 
     pub fn fromQuery(query: dns.Message, max_udp_payload: u16) ResponseContext {
         const client_do = query.opt != null and query.opt.?.do_bit;
@@ -269,28 +270,6 @@ pub fn buildResponseWire(
     response: dns.Message,
     alloc: mem.Allocator,
 ) ?[]const u8 {
-    // RFC 7828: emit the keepalive option (code 11) on TCP/DoT responses
-    // only — servers MUST NOT include it on UDP. Caller signals stream
-    // transport via ctx.tcp_keepalive being non-null.
-    var opt_options_buf: [1]dns.EdnsOption = undefined;
-    var keepalive_data: [2]u8 = undefined;
-    const opt_options: []const dns.EdnsOption = blk: {
-        if (ctx.tcp_keepalive) |timeout| {
-            std.mem.writeInt(u16, &keepalive_data, timeout, .big);
-            opt_options_buf[0] = .{ .code = dns.edns_opt_tcp_keepalive, .data = &keepalive_data };
-            break :blk opt_options_buf[0..1];
-        }
-        break :blk &.{};
-    };
-    const opt: ?dns.OptRecord = if (ctx.client_edns) .{
-        // RFC 6891 §6.2.3: our own receive limit, not the send budget.
-        .udp_payload_size = dns.edns_udp_payload,
-        .extended_rcode = 0,
-        .version = 0,
-        .do_bit = ctx.client_do,
-        .options = opt_options,
-    } else null;
-
     const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
 
     // Special-use answers are hark's own. Keyed on qname, so a CNAME
@@ -317,6 +296,26 @@ pub fn buildResponseWire(
     const answers = shaped.answers;
     const authorities = shaped.authorities;
     const additionals = shaped.additionals;
+
+    var options_buf: [3]dns.EdnsOption = undefined;
+    var options: std.ArrayList(dns.EdnsOption) = .initBuffer(&options_buf);
+    // RFC 7828: never over UDP.
+    var keepalive_data: [2]u8 = undefined;
+    if (ctx.tcp_keepalive) |timeout| {
+        std.mem.writeInt(u16, &keepalive_data, timeout, .big);
+        options.appendAssumeCapacity(.{ .code = dns.edns_opt_tcp_keepalive, .data = &keepalive_data });
+    }
+    var ede_bufs: [2][64]u8 = undefined;
+    if (ctx.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
+    if (shaped.scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
+    const opt: ?dns.OptRecord = if (ctx.client_edns) .{
+        // RFC 6891 §6.2.3: our own receive limit, not the send budget.
+        .udp_payload_size = dns.edns_udp_payload,
+        .extended_rcode = 0,
+        .version = 0,
+        .do_bit = ctx.client_do,
+        .options = options.items,
+    } else null;
 
     const msg = dns.Message{
         .header = .{
@@ -509,6 +508,36 @@ test "buildResponseWire sets correct header fields" {
     try testing.expectEqual(true, parsed.header.flags.ra);
     try testing.expectEqual(dns.RCode.server_failure, parsed.header.flags.rcode);
     try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
+}
+
+test "buildResponseWire carries EDE only to an EDNS client" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const questions = [_]dns.Question{.{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in }};
+    const servfail = synthesizedMessage(&.{}, &.{}, .server_failure, false);
+    var ctx: ResponseContext = .{
+        .query_id = 1,
+        .opcode = .query,
+        .rd = true,
+        .cd = false,
+        .questions = &questions,
+        .client_edns = true,
+        .client_do = false,
+        .client_wants_ad = false,
+        .max_udp_payload = dns.max_udp_payload,
+        .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" },
+    };
+
+    var buf: [dns.max_udp_payload]u8 = undefined;
+    const opt = (try dns.parseMessage(a, buildResponseWire(&buf, ctx, servfail, a).?)).opt.?;
+    try testing.expectEqual(@as(usize, 1), opt.options.len);
+    try testing.expectEqual(dns.edns_opt_ede, opt.options[0].code);
+    try testing.expectEqualSlices(u8, "\x00\x06rrsig failed to verify", opt.options[0].data);
+
+    ctx.client_edns = false;
+    try testing.expectEqual(null, (try dns.parseMessage(a, buildResponseWire(&buf, ctx, servfail, a).?)).opt);
 }
 
 test "buildResponseWire with EDNS0" {
