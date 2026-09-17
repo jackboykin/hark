@@ -1807,11 +1807,11 @@ pub const RecursiveResolver = struct {
         var last_server_failure: ?dns.Message = null;
 
         // RFC 9539 is per-address; steering to any live capable server over a
-        // faster Do53 one is hark's policy: encryption beats RTT. Discover on
-        // top candidates, not just responders (a capable one can lose the race
-        // forever). Surface: egress filter, damping, max_probes.
+        // faster Do53 one is hark's policy: encryption beats RTT. Probe the
+        // top unknown candidates, not just responders (a capable one can lose
+        // the race forever). Surface: egress filter, damping, max_probes.
         if (self.encrypted_ns) |oc| {
-            for (sel[0..@min(sel.len, max_staggered_legs)]) |idx| oc.discover(servers[idx]);
+            oc.discover(servers, sel);
             for (sel) |idx| {
                 if (oc.getStatus(servers[idx]) != .capable) continue;
                 if (try self.tryOpportunisticTls(allocator, query_name, query_type, servers[idx], oc)) |dot| {

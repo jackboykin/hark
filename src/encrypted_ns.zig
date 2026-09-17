@@ -19,6 +19,7 @@ const damping_base_sec: i64 = 60;
 const probe_timeout_sec: i64 = 30;
 const max_entries: usize = 8192;
 pub const max_probes: u32 = 8;
+const probe_width: usize = 3;
 
 pub const Status = enum { unknown, capable, damped };
 
@@ -62,11 +63,25 @@ pub const EncryptedNs = struct {
         return e.status(self.now_fn());
     }
 
-    pub fn discover(self: *EncryptedNs, server: na.Address) void {
-        if (!self.probes.tryClaim()) return;
-        if (!self.claim(AddressKey.fromAddress(server))) return self.probes.release();
+    /// Probe the first `probe_width` unknown servers in rank `order`; known
+    /// ones spend no slot, so a winner pinned at rank 0 can't starve the rest.
+    pub fn discover(self: *EncryptedNs, servers: []const na.Address, order: []const usize) void {
+        var left: usize = probe_width;
+        for (order) |idx| {
+            if (left == 0) return;
+            left -= @intFromBool(self.discoverOne(servers[idx]));
+        }
+    }
+
+    fn discoverOne(self: *EncryptedNs, server: na.Address) bool {
+        if (!self.probes.tryClaim()) return false;
+        if (!self.claim(AddressKey.fromAddress(server))) {
+            self.probes.release();
+            return false;
+        }
         // A failed spawn leaves the claim to expire.
         self.probes.spawn(self.pool.io, probe, .{ self, server }) catch self.probes.release();
+        return true;
     }
 
     fn claim(self: *EncryptedNs, key: AddressKey) bool {
@@ -221,6 +236,18 @@ test "claim gates on unknown, expires, and keeps the backoff" {
     ns.record(srv, .failed);
     en_test_now += 2 * damping_base_sec - 1;
     try testing.expectEqual(Status.damped, ns.getStatus(srv));
+}
+
+test "discover skips known servers down the rank order" {
+    var ns = testNs();
+    defer ns.deinit();
+    // Nothing listens on loopback 853, so the probes fail fast.
+    var servers: [5]na.Address = undefined;
+    for (&servers, 1..) |*a, i| a.* = na.initIp4(.{ 127, 0, 0, @intCast(i) }, 53);
+    ns.record(servers[0], .answered);
+    ns.discover(&servers, &.{ 0, 4, 1, 3, 2 });
+    for ([_]usize{ 4, 1, 3 }) |i| try testing.expect(ns.getStatus(servers[i]) != .unknown);
+    try testing.expectEqual(Status.unknown, ns.getStatus(servers[2]));
 }
 
 test "eviction spares capable entries" {
