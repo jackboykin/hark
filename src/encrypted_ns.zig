@@ -79,17 +79,21 @@ pub const EncryptedNs = struct {
         return true;
     }
 
-    pub fn record(self: *EncryptedNs, server: na.Address, ok: bool) void {
+    pub const Outcome = enum { answered, handshake, failed };
+
+    pub fn record(self: *EncryptedNs, server: na.Address, outcome: Outcome) void {
         self.mutex.lockUncancelable(self.pool.io);
         defer self.mutex.unlock(self.pool.io);
         const now = self.now_fn();
         const e = self.slot(AddressKey.fromAddress(server), now) orelse return;
-        if (ok) {
-            e.* = .{ .until = now + persistence_sec, .capable = true };
+        if (outcome == .failed) {
+            const damp = @min(@max(e.damp_sec * 2, damping_base_sec), damping_max_sec);
+            e.* = .{ .until = now + damp, .damp_sec = damp };
             return;
         }
-        const damp = @min(@max(e.damp_sec * 2, damping_base_sec), damping_max_sec);
-        e.* = .{ .until = now + damp, .damp_sec = damp };
+        // Only an answer clears the backoff: a handshake can front a dead backend.
+        const damp = if (outcome == .answered) 0 else e.damp_sec;
+        e.* = .{ .until = now + persistence_sec, .capable = true, .damp_sec = damp };
     }
 
     fn slot(self: *EncryptedNs, key: AddressKey, now: i64) ?*Entry {
@@ -138,9 +142,9 @@ pub const EncryptedNs = struct {
     fn probe(self: *EncryptedNs, server: na.Address) void {
         defer self.probes.release();
         const conn = tls_transport.dial(&self.pool, server, monotonic.nowNs() + dial_timeout_ns) catch
-            return self.record(server, false);
+            return self.record(server, .failed);
         self.pool.release(AddressKey.fromAddress(server), conn, true);
-        self.record(server, true);
+        self.record(server, .handshake);
         var buf: [64]u8 = undefined;
         log.info("server {s} supports DoT (RFC 9539)", .{na.format(tls_transport.tlsAddress(server), &buf)});
     }
@@ -164,7 +168,7 @@ test "capable persists then expires to unknown" {
     var ns = testNs();
     defer ns.deinit();
     try testing.expectEqual(Status.unknown, ns.getStatus(srv));
-    ns.record(srv, true);
+    ns.record(srv, .answered);
     try testing.expectEqual(Status.capable, ns.getStatus(srv));
     en_test_now += persistence_sec - 1;
     try testing.expectEqual(Status.capable, ns.getStatus(srv));
@@ -177,7 +181,7 @@ test "failures damp with doubling backoff, capped; success resets" {
     defer ns.deinit();
     var expect = damping_base_sec;
     for (0..12) |_| {
-        ns.record(srv, false);
+        ns.record(srv, .failed);
         try testing.expectEqual(Status.damped, ns.getStatus(srv));
         en_test_now += @min(expect, damping_max_sec) - 1;
         try testing.expectEqual(Status.damped, ns.getStatus(srv));
@@ -185,10 +189,21 @@ test "failures damp with doubling backoff, capped; success resets" {
         try testing.expectEqual(Status.unknown, ns.getStatus(srv));
         expect *= 2;
     }
-    ns.record(srv, true);
-    ns.record(srv, false);
+    ns.record(srv, .answered);
+    ns.record(srv, .failed);
     en_test_now += damping_base_sec;
     try testing.expectEqual(Status.unknown, ns.getStatus(srv));
+}
+
+test "a handshake alone keeps the backoff" {
+    var ns = testNs();
+    defer ns.deinit();
+    ns.record(srv, .failed);
+    ns.record(srv, .handshake);
+    try testing.expectEqual(Status.capable, ns.getStatus(srv));
+    ns.record(srv, .failed);
+    en_test_now += 2 * damping_base_sec - 1;
+    try testing.expectEqual(Status.damped, ns.getStatus(srv));
 }
 
 test "claim gates on unknown, expires, and keeps the backoff" {
@@ -200,10 +215,10 @@ test "claim gates on unknown, expires, and keeps the backoff" {
     try testing.expect(!ns.claim(key));
     en_test_now += probe_timeout_sec;
     try testing.expectEqual(Status.unknown, ns.getStatus(srv));
-    ns.record(srv, false);
+    ns.record(srv, .failed);
     en_test_now += damping_base_sec;
     try testing.expect(ns.claim(key));
-    ns.record(srv, false);
+    ns.record(srv, .failed);
     en_test_now += 2 * damping_base_sec - 1;
     try testing.expectEqual(Status.damped, ns.getStatus(srv));
 }
@@ -213,12 +228,12 @@ test "eviction spares capable entries" {
     defer ns.deinit();
     for (0..max_entries) |i| {
         const s = na.initIp4(.{ 10, 0, @intCast(i >> 8), @intCast(i & 0xff) }, 53);
-        ns.record(s, i % 2 == 0);
+        ns.record(s, if (i % 2 == 0) .answered else .failed);
     }
     try testing.expectEqual(@as(u32, max_entries / 2), ns.getStats().capable);
     for (0..max_entries / 2) |i| {
         const s = na.initIp4(.{ 10, 1, @intCast(i >> 8), @intCast(i & 0xff) }, 53);
-        ns.record(s, false);
+        ns.record(s, .failed);
     }
     try testing.expectEqual(@as(u32, max_entries / 2), ns.getStats().capable);
     try testing.expectEqual(max_entries, ns.entries.count());

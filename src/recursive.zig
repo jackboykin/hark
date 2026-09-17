@@ -1637,7 +1637,7 @@ pub const RecursiveResolver = struct {
             }
             break :blk .{ .message = r, .exchange_us = reply.exchange_us };
         };
-        oc.record(server, verdict != null);
+        oc.record(server, if (verdict != null) .answered else .failed);
         if (verdict != null) _ = oc.dot_answers.fetchAdd(1, .monotonic);
         return verdict;
     }
