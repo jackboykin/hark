@@ -1221,7 +1221,6 @@ const WorkerState = struct {
             const elapsed_ms: i64 = @intCast(@divFloor(monotonic.nowNs() - start_ns, 1_000_000));
             var qtype_buf: [24]u8 = undefined;
             log.warn("client={s} id=0x{x:0>4} {s} {s} SERVFAIL {d}ms{s} ({s})", .{ peer_str, query.header.id, name_str, dns.safeTagName(question.qtype, &qtype_buf), elapsed_ms, tag, @errorName(err) });
-            self.server.cache.cacheServfail(name_str, question.qtype);
             self.recordClientOutcome(false);
             self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
             return;
@@ -1311,15 +1310,15 @@ const WorkerState = struct {
     ) !recursive.RecursiveResolver.ResolveResult {
         // Dedup only prevents duplicate upstream queries. On a cache hit no
         // upstream I/O happens, so the InFlightTable mutex pair is pure
-        // overhead; a shared-lock existence probe skips it. On miss we fall
-        // through to the normal dedup + resolve path.
-        if (self.server.cache.containsFresh(name, qtype, .in)) {
-            return self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
-        }
-
+        // overhead; a shared-lock existence probe skips it.
         const cd_flag: u8 = if (cd) dedup_mod.flag_cd else 0;
-        const role = self.server.dedup.acquireOrWait(name, qtype, cd_flag);
+        const role: dedup_mod.AcquireResult = if (self.server.cache.containsFresh(name, qtype, .in))
+            .uncoordinated
+        else
+            self.server.dedup.acquireOrWait(name, qtype, cd_flag);
         defer if (role == .leader) self.server.dedup.releaseLeader(name, qtype, cd_flag);
+        // Before the release wakes followers, so they find the marker.
+        errdefer self.server.cache.cacheServfail(name, qtype);
         var result = try self.resolveQueryWith(alloc, name, qtype, cd, false, transports);
         // A follower's own resolve is a cache hit by construction (the
         // leader populated it), but the client still waited on the

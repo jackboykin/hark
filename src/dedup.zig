@@ -45,7 +45,7 @@ const IdentityContext = struct {
     }
 };
 
-const AcquireResult = enum { leader, follower, uncoordinated };
+pub const AcquireResult = enum { leader, follower, uncoordinated };
 
 /// The table's key for `(name, qtype, flags)`; callers use it as a compact
 /// stand-in. Never 0.
