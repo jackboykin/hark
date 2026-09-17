@@ -1652,6 +1652,12 @@ pub const RecursiveResolver = struct {
         std.debug.assert(max_staggered_legs <= BlockingUdpTransport.max_staggered_legs);
     }
 
+    // TODO(rewrite): replace the race with a hedge over the sequential loop.
+    // The stagger only starts the next ordinary attempt early, without
+    // cancelling the one in flight; each attempt keeps its own timeout and
+    // records exactly what it would alone, and an unusable answer ends only
+    // its own attempt. Losers record nothing, and this separate path (its own
+    // selection, window, TC and echo handling) goes away.
     fn tryStaggeredQuery(
         self: *RecursiveResolver,
         allocator: mem.Allocator,
@@ -1680,7 +1686,13 @@ pub const RecursiveResolver = struct {
         else
             self.stagger_ms;
 
-        const overall_timeout = @min(self.transports.?.udp.config.timeout_ms, self.remainingMs());
+        // Each leg waits its own timeout from its own launch.
+        var window: u32 = 0;
+        for (leg_idxs[0..leg_count], 0..) |idx, i| {
+            const own = self.coldTimeout(AddressKey.fromAddress(servers[idx]), false, .udp);
+            window = @max(window, @as(u32, @intCast(i)) * stagger + own);
+        }
+        const overall_timeout = @min(window, self.transports.?.udp.config.timeout_ms, self.remainingMs());
         if (overall_timeout == 0) return null;
 
         // Build leg 0 once, memcpy + patch ID for the rest. One stack buffer
