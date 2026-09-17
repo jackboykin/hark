@@ -126,30 +126,6 @@ pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
     }
 }
 
-pub fn open(path: [*:0]const u8, flags: std.posix.O, mode: std.posix.mode_t) !posix.fd_t {
-    const rc = linux.openat(@bitCast(@as(i32, linux.AT.FDCWD)), path, flags, mode);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .ACCES => error.AccessDenied,
-        .EXIST => error.PathAlreadyExists,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOENT => error.FileNotFound,
-        .NOMEM => error.SystemResources,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
-pub fn dup(fd: posix.fd_t) !posix.fd_t {
-    const rc = linux.dup(fd);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .BADF => unreachable,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        else => |e| posix.unexpectedErrno(e),
-    };
-}
-
 /// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`. The two are the
 /// same array only in a no-libc build; linking libc (which `-Dtsan` forces)
 /// widens the posix one to glibc's 128 bytes and the mismatch fails to compile.
