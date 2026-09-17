@@ -1252,13 +1252,15 @@ const WorkerState = struct {
         switch (reply) {
             .udp => |u| self.sendUdpResponseFromResult(u.sock, query, result, alloc, u.addr),
             .tcp => |c| {
-                var buf: [dns.max_message_len]u8 = undefined;
+                // Arena, not stack: inlined here it was 64 KiB under every resolution.
+                const buf = alloc.alloc(u8, dns.max_message_len) catch
+                    return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
                 var ctx = ResponseContext.fromQuery(query, dns.max_message_len);
                 // RFC 7828, units of 100 ms.
                 ctx.tcp_keepalive = @intCast(self.server.config.tcp_idle_timeout_ms / 100);
                 ctx.minimal_responses = self.server.config.minimal_responses;
                 ctx.rebinding = &self.server.config.rebinding;
-                const wire = buildResponseWire(&buf, ctx, result, alloc) orelse
+                const wire = buildResponseWire(buf, ctx, result, alloc) orelse
                     return self.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
                 c.write(self.server.io, wire, self.server.config.tcp_idle_timeout_ms);
             },
