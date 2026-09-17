@@ -1822,19 +1822,16 @@ pub const RecursiveResolver = struct {
             return .{ .message = response, .responding_server = server };
         }
 
+        var zb: [dns.max_dotted_len + 1]u8 = undefined;
+        const zone = if (parent_zone.labels.len == 0) "." else parent_zone.formatInto(&zb);
+        var tb: [24]u8 = undefined;
         if (last_server_failure) |sf| {
-            var zb: [dns.max_dotted_len + 1]u8 = undefined;
-            var tb: [24]u8 = undefined;
             var rb: [24]u8 = undefined;
-            log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), dns.safeTagName(sf.header.flags.rcode, &rb) });
+            log.debug("{s} {s}: every server for {s} answered {s}", .{ query_name, dns.safeTagName(query_type, &tb), zone, dns.safeTagName(sf.header.flags.rcode, &rb) });
             const message = if (delegation.failurePrecedence(sf.header.flags.rcode) == 0) synthesizedMessage(&.{}, &.{}, .server_failure, false) else sf;
             return .{ .message = message, .responding_server = null };
         }
-        {
-            var zb: [dns.max_dotted_len + 1]u8 = undefined;
-            var tb: [24]u8 = undefined;
-            log.debug("{s} {s}: no server for {s} answered ({d} candidates)", .{ query_name, dns.safeTagName(query_type, &tb), parent_zone.formatInto(&zb), sel.len });
-        }
+        log.debug("{s} {s}: no server for {s} answered ({d} candidates)", .{ query_name, dns.safeTagName(query_type, &tb), zone, sel.len });
         return error.Timeout;
     }
 
