@@ -1900,7 +1900,7 @@ pub const RecursiveResolver = struct {
         ctx: anytype,
     ) @TypeOf(ctx.fetch()) {
         const dedup = self.dedup orelse return ctx.fetch();
-        var budget = timeout_ns;
+        var budget = @min(timeout_ns, @as(u64, self.remainingMs()) * std.time.ns_per_ms);
         for (0..2) |_| {
             switch (dedup.acquireOrWaitWithTimeout(name, rtype, dedup_mod.flag_internal, self.now_ns_fn() + budget)) {
                 .leader => {
