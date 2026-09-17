@@ -453,10 +453,10 @@ pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rc
     if (query.header.flags.qr) return .{ .rcode = .format_error };
     if (query.header.flags.opcode != .query) return .{ .rcode = .not_implemented };
     if (query.questions.len != 1) return .{ .rcode = .format_error };
-    if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
     // RFC 6891 §6.1.3: BADVERS (extended RCODE 16) for unsupported EDNS
     // version. Header RCODE bits = 0; OPT extended_rcode field = 1.
     if (query.opt) |opt| if (opt.version != 0) return .{ .rcode = .no_error, .extended_rcode = 1 };
+    if (query.questions[0].qclass != .in) return .{ .rcode = .refused };
     return null;
 }
 
