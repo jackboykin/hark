@@ -82,8 +82,7 @@ comptime {
 }
 // Real depth tops out near 5; 16 covers QMIN-with-referrals stacks.
 const max_delegations = 16;
-// Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
-const max_cname_chain = 16;
+const max_cname_chain = cache_mod.max_cname_chain;
 
 /// Redirect records collected over one resolveImpl chain walk, plus the
 /// wildcard-expansion proofs authenticating them. Always paired and

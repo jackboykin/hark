@@ -17,6 +17,11 @@ const max_cache_ttl: u32 = 604_800;
 const negative_max_ttl: u32 = 10_800;
 /// RFC 9520 §3: resolution-failure cache MUST NOT exceed 5 minutes.
 const servfail_max_ttl: u32 = 300;
+/// RFC 8767 §5: BIND's stale-refresh-time.
+const stale_refresh_s: i64 = 30;
+
+/// Per resolveImpl call. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
+pub const max_cname_chain = 16;
 
 /// Max records per RRset in single-pass store (DNS wire format bounds the total).
 const max_rrset_collect: usize = 64;
@@ -208,6 +213,8 @@ fn buildPack(alloc: Allocator, records: []const dns.ResourceRecord, sigs: []cons
 const Lifetime = struct {
     stored_at: i64,
     ttl: u32,
+    /// Seconds past expiry a failed refresh holds.
+    hold: u32 = 0,
 
     fn expiresAt(self: Lifetime) i64 {
         return self.stored_at + self.ttl;
@@ -275,6 +282,7 @@ pub const CacheLookupResult = union(enum) {
         /// the serve-stale window. Resolvers SHOULD attempt fresh resolution
         /// before serving a stale answer.
         is_stale: bool = false,
+        refresh_failed: bool = false,
         steer: bool = false,
     },
     negative: struct {
@@ -286,6 +294,7 @@ pub const CacheLookupResult = union(enum) {
         needs_prefetch: bool = false,
         security_status: SecurityStatus = .unchecked,
         is_stale: bool = false,
+        refresh_failed: bool = false,
     },
 };
 
@@ -738,6 +747,7 @@ pub const RRsetCache = struct {
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = servedStatus(rrset.security_status, hit.is_stale),
                     .is_stale = hit.is_stale,
+                    .refresh_failed = hit.refresh_failed,
                     .steer = rrset.steer,
                 } };
             },
@@ -758,6 +768,7 @@ pub const RRsetCache = struct {
                     .needs_prefetch = hit.needs_prefetch,
                     .security_status = servedStatus(neg.security_status, hit.is_stale),
                     .is_stale = hit.is_stale,
+                    .refresh_failed = hit.refresh_failed,
                 } };
             },
         }
@@ -794,7 +805,7 @@ pub const RRsetCache = struct {
         life: Lifetime,
         now: i64,
         disable_stale: bool,
-    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, is_stale: bool } {
+    ) ?struct { remaining_ttl: u32, needs_prefetch: bool, is_stale: bool, refresh_failed: bool = false } {
         const cs = &self.read_counters[threadCounterSlot()];
         const expires_at = life.expiresAt();
         if (now < expires_at) {
@@ -813,8 +824,9 @@ pub const RRsetCache = struct {
         }
         _ = cs.hits.fetchAdd(1, .monotonic);
         _ = cs.stale_hits.fetchAdd(1, .monotonic);
-        _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
-        return .{ .remaining_ttl = 30, .needs_prefetch = true, .is_stale = true };
+        const held = now < expires_at + life.hold;
+        if (!held) _ = cs.prefetch_eligible.fetchAdd(1, .monotonic);
+        return .{ .remaining_ttl = 30, .needs_prefetch = !held, .is_stale = true, .refresh_failed = held };
     }
 
     /// `ttl` arrives floored and capped by config; `authenticated_ttl_max` is
@@ -1006,19 +1018,75 @@ pub const RRsetCache = struct {
     /// Cache a resolution failure per RFC 9520 §3. TTL chosen short (5 s)
     /// — long enough to absorb a misbehaving stub's retry storm, short
     /// enough that recovery from a transient upstream failure is fast.
-    /// Never displaces a fresh entry: a failure marker is the lowest-value
-    /// cache content, and any fresh entry here means a racing resolve
-    /// succeeded after this one started.
     pub fn cacheServfail(self: *RRsetCache, name: []const u8, rtype: dns.RType) void {
-        self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked, .unless_fresh);
+        self.storeNegativeBare(name, rtype, .in, .server_failure, 5, .unchecked, .unless_live);
+    }
+
+    /// RFC 8767 §4, §5: a refresh failed, so serve its stale data unasked for
+    /// `stale_refresh_s`. Walks the CNAME chain: any stale link re-arms the head.
+    pub fn holdStale(self: *RRsetCache, name: []const u8, rtype: dns.RType) void {
+        if (self.serve_stale_ttl == 0) return;
+        var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
+        var target_buf: [dns.max_dotted_len + 1]u8 = undefined;
+        var current = name;
+        // Bounds a cached loop.
+        for (0..max_cname_chain) |_| {
+            const lower_name = lowerNameBuf(&lower_buf, current) orelse return;
+            for ([_]dns.RType{ rtype, nxdomain_key, .cname }) |key_rtype| self.holdKey(lower_name, key_rtype);
+            current = self.redirectTarget(lower_name, &target_buf) orelse return;
+        }
+    }
+
+    fn holdKey(self: *RRsetCache, lower_name: []const u8, rtype: dns.RType) void {
+        const probe = CacheKey{ .name = lower_name, .rtype = rtype, .rclass = .in };
+        const shard, const h = self.shardWithHash(probe);
+        shard.write.lock.lockUncancelable(self.io);
+        defer shard.write.lock.unlock(self.io);
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return;
+        const entry = &shard.map.values()[idx];
+        const now = self.now_fn();
+        if (!self.servesStale(entry.*, now)) return;
+        const life = switch (entry.*) {
+            inline else => |*e| &e.life,
+        };
+        life.hold = @intCast(@min(now - life.expiresAt() + stale_refresh_s, std.math.maxInt(u32)));
+    }
+
+    fn redirectTarget(self: *RRsetCache, lower_name: []const u8, buf: *[dns.max_dotted_len + 1]u8) ?[]const u8 {
+        const probe = CacheKey{ .name = lower_name, .rtype = .cname, .rclass = .in };
+        const shard, const h = self.shardWithHash(probe);
+        shard.write.lock.lockSharedUncancelable(self.io);
+        defer shard.write.lock.unlockShared(self.io);
+        const idx = shard.map.getIndexAdapted(probe, PrecomputedCtx{ .precomputed = h }) orelse return null;
+        const entry = shard.map.values()[idx];
+        const now = self.now_fn();
+        if (entry != .positive or entry.positive.pack.n_records == 0) return null;
+        if (now >= entry.expiresAt() and !self.servesStale(entry, now)) return null;
+        const pack = entry.positive.pack;
+        const cr = pack.records()[0];
+        // Labels alias the wire; only the slice array allocates.
+        var fba_buf: [dns.max_label_count * @sizeOf([]const u8) + @alignOf([]const u8)]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+        const rdata = dns.parseRDataWire(fba.allocator(), pack.wire(cr), .cname, cr.wire_ttl_offset) catch return null;
+        return rdata.cname.formatInto(buf);
+    }
+
+    fn servesStale(self: *RRsetCache, entry: CacheEntry, now: i64) bool {
+        const servable = switch (entry) {
+            .positive => |p| p.security_status.answerable(),
+            .negative => |n| n.rcode != .server_failure,
+        };
+        const past = now - entry.expiresAt();
+        return servable and past >= 0 and past < self.serve_stale_ttl;
     }
 
     /// Displacement policy for a store finding a live entry in its slot.
-    /// `.unless_fresh` is for failure markers, which never displace a fresh
-    /// entry of any status; checked under the shard write lock so a
+    /// `.unless_live` is for failure markers, which never displace a fresh
+    /// entry of any status (a racing resolve won) nor a servable stale one
+    /// (RFC 8767 §4). Checked under the shard write lock so a
     /// concurrent successful store cannot be clobbered between a caller's
     /// freshness probe and the write (TOCTOU on the background-cousin path).
-    pub const Overwrite = enum { always, unless_fresh };
+    pub const Overwrite = enum { always, unless_live };
 
     /// One home for "may this write displace the existing entry": the RFC
     /// 9520 §3.4 anti-downgrade rank check plus the failure-marker policy.
@@ -1028,8 +1096,9 @@ pub const RRsetCache = struct {
     fn shouldBlockOverwrite(self: *RRsetCache, shard: *Shard, h: u32, key: CacheKey, new_status: SecurityStatus, overwrite: Overwrite) bool {
         const idx = shard.map.getIndexAdapted(key, PrecomputedCtx{ .precomputed = h }) orelse return false;
         const existing = shard.map.values()[idx];
-        if (self.now_fn() >= existing.expiresAt()) return false;
-        if (overwrite == .unless_fresh) return true;
+        const now = self.now_fn();
+        if (now >= existing.expiresAt()) return overwrite == .unless_live and self.servesStale(existing, now);
+        if (overwrite == .unless_live) return true;
         // A referral yields only to a live leased set.
         if (new_status == .glue and key.rtype == .ns and !(existing == .positive and existing.positive.steer)) return false;
         return @backingInt(new_status) < @backingInt(existing.status());
@@ -2364,6 +2433,46 @@ test "serve stale: fresh, inside the window, beyond it (RFC 8767)" {
 
     test_time = 1000 + 60 + 3601;
     try testing.expect(cache.lookup(arena.allocator(), "stale.test", .a, .in) == null);
+}
+
+test "a failed refresh holds stale data instead of erasing it (RFC 8767 §4, §5)" {
+    const alloc = testing.allocator;
+    test_time = 1000;
+    var cache = RRsetCache.init(.{ .backing = alloc, .max_bytes = 1024 * 1024, .io = testing.io, .serve_stale_ttl = 3600 });
+    cache.now_fn = &testNowSeconds;
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    try storeTestA(&cache, alloc, &.{ "held", "test" }, 60, .{ 1, 2, 3, 4 });
+    cache.storeNegativeBare("gone.test", nxdomain_key, .in, .name_error, 60, .unchecked, .always);
+    test_time = 1100;
+    // A marker leaves stale data alone.
+    cache.cacheServfail("held.test", .a);
+    const stale = (cache.lookup(arena.allocator(), "held.test", .a, .in) orelse return error.TestExpectedHit).hit;
+    try testing.expect(stale.is_stale and !stale.refresh_failed);
+    for ([_][]const u8{ "held.test", "gone.test" }) |name| {
+        cache.holdStale(name, .a);
+        const held = cache.lookup(arena.allocator(), name, .a, .in) orelse return error.TestExpectedHit;
+        switch (held) {
+            inline else => |h| try testing.expect(h.is_stale and h.refresh_failed and !h.needs_prefetch),
+        }
+    }
+
+    test_time = 1100 + 30;
+    const due = (cache.lookup(arena.allocator(), "held.test", .a, .in) orelse return error.TestExpectedHit).hit;
+    try testing.expect(due.is_stale and !due.refresh_failed and due.needs_prefetch);
+
+    // Bogus replaces held data.
+    cache.storeNegativeBare("held.test", .a, .in, .server_failure, 60, .bogus, .always);
+    const bogus = cache.lookup(arena.allocator(), "held.test", .a, .in) orelse return error.TestExpectedHit;
+    try testing.expectEqual(SecurityStatus.bogus, bogus.negative.security_status);
+
+    try storeTestA(&cache, alloc, &.{ "brief", "test" }, 10, .{ 1, 2, 3, 4 });
+    cache.holdStale("brief.test", .a);
+    test_time += 12;
+    const brief = (cache.lookup(arena.allocator(), "brief.test", .a, .in) orelse return error.TestExpectedHit).hit;
+    try testing.expect(brief.is_stale and !brief.refresh_failed);
 }
 
 test "SERVFAIL never serves stale" {
