@@ -3,7 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const testing = std.testing;
 const na = @import("net_address.zig");
-const sys = @import("sys.zig");
+const sys = @import("sys_union.zig");
 const log = std.log.scoped(.event_loop);
 
 pub const max_operations = 64;

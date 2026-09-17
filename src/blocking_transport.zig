@@ -6,7 +6,7 @@ const Io = std.Io;
 const dns = @import("dns.zig");
 const monotonic = @import("monotonic.zig");
 const na = @import("net_address.zig");
-const sys = @import("sys.zig");
+const sys = @import("sys_union.zig");
 const rand = @import("rand.zig");
 
 // UDP and TCP both flow through std.Io.net (Socket/Stream — reads via
@@ -328,7 +328,7 @@ pub fn connectTcp(server: na.Address, connect_timeout_ms: u32) !Io.net.Stream {
 }
 
 /// Length-prefixed DNS query/response on a connected TCP stream, via the
-/// deadline-bounded exact-I/O kernels in sys.zig (userspace deadline
+/// deadline-bounded exact-I/O kernels in sys_union.zig (userspace deadline
 /// enforcement — kernel-side SO_*TIMEO can't be used because Io.Threaded's
 /// netRead/netWrite treat EAGAIN as a bug). Timeout passes through;
 /// every other failure collapses to SendFailed on the write side,

@@ -1,10 +1,10 @@
 /// Address type and helpers, replacing std.net.Address with std.Io.net.IpAddress.
 /// Wraps std.Io.net.IpAddress with convenience constructors and sockaddr
-/// conversion for raw linux syscall usage (sys.zig).
+/// conversion for raw syscall usage (sys_union.zig).
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
-const sys = @import("sys.zig");
+const sys = @import("sys_union.zig");
 const rand = @import("rand.zig");
 
 /// Hash seed randomized at startup so an authoritative server serving crafted

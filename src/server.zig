@@ -31,7 +31,8 @@ const ResponseContext = response.ResponseContext;
 const buildResponseWire = response.buildResponseWire;
 const serializeErrorResponse = response.serializeErrorResponse;
 const validateQuery = response.validateQuery;
-const sys = @import("sys.zig");
+const sys = @import("sys_union.zig");
+const sys_linux = @import("sys_linux.zig");
 const monotonic = @import("monotonic.zig");
 const build_options = @import("build_options");
 
@@ -1402,7 +1403,7 @@ fn setupSignalFd() !posix.fd_t {
     // Create the reader before blocking, not after. Blocking first and then
     // failing here would leave the process with INT/TERM blocked and nothing
     // reading them — unkillable except by SIGKILL, for its whole life.
-    const fd = try sys.signalfd(-1, &mask, linux.SFD.NONBLOCK);
+    const fd = try sys_linux.signalfd(-1, &mask, linux.SFD.NONBLOCK);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
     return fd;
 }
