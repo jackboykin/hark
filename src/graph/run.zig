@@ -18,6 +18,8 @@ pub const Report = struct {
     /// The upstream query log, one `server <- qname qtype` per line,
     /// gpa-owned. Two runs of one seed must produce the same text.
     log: []const u8 = "",
+    tally: graph.Tally = .{},
+    cells: usize = 0,
 };
 
 pub const Options = struct {
@@ -41,6 +43,10 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .trace = opts.trace,
     }, &s);
     defer g.deinit();
+    defer {
+        report.tally = g.tally;
+        report.cells = g.cells.items.len;
+    }
 
     var drops: u32 = 0;
     for (scenario.steps) |st| drops += @intFromBool(st.kind == .timeout);
@@ -358,9 +364,11 @@ fn walkOnly(s: *const rpl.Scenario) bool {
     return s.dns64_prefix == null and s.serve_stale_ttl == null and s.rebinding_enabled == null;
 }
 
+const Replayed = struct { parsed: usize, ran: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
+
 /// Replay every walk-only scenario under `root` across `seeds`, checking
 /// that one seed replays to one upstream query log.
-fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { parsed: usize, ran: usize, failed: usize } {
+fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -369,9 +377,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
     defer dir.close(io);
     var walker = try dir.walk(testing.allocator);
     defer walker.deinit();
-    var parsed: usize = 0;
-    var ran: usize = 0;
-    var failed: usize = 0;
+    var r: Replayed = .{ .parsed = 0, .ran = 0, .failed = 0 };
     while (try walker.next(io)) |ent| {
         if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
         const text = try dir.readFileAlloc(io, ent.path, arena, .limited(1 << 20));
@@ -380,25 +386,36 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
             error.UnsupportedRType => continue,
             else => return err,
         };
-        parsed += 1;
+        r.parsed += 1;
         if (!walkOnly(&scenario)) continue;
         var expect_fail = false;
         for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
-        ran += 1;
+        r.ran += 1;
         var seed: u64 = 1;
         while (seed <= seeds) : (seed += 1) {
             var first: Report = .{};
             defer testing.allocator.free(first.log);
             const result = runScenario(testing.allocator, &scenario, .{ .seed = seed }, &first);
+            r.tally.runs += first.tally.runs;
+            r.tally.settles += first.tally.settles;
+            r.tally.parses += first.tally.parses;
+            r.tally.rule_ns += first.tally.rule_ns;
+            r.tally.send_ns += first.tally.send_ns;
+            r.tally.verify_ns += first.tally.verify_ns;
+            r.tally.parse_ns += first.tally.parse_ns;
+            r.tally.reruns += first.tally.reruns;
+            r.tally.rerun_ns += first.tally.rerun_ns;
+            r.cells += first.cells;
+            r.scenarios += 1;
             if (expect_fail) {
                 if (result) |_| {
-                    failed += 1;
+                    r.failed += 1;
                     std.debug.print("{s}: passed but is marked xfail\n", .{ent.path});
                 } else |_| {}
                 continue;
             }
             result catch |err| {
-                failed += 1;
+                r.failed += 1;
                 std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ ent.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
                 break;
             };
@@ -406,13 +423,29 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
             defer testing.allocator.free(second.log);
             runScenario(testing.allocator, &scenario, .{ .seed = seed }, &second) catch {};
             if (!mem.eql(u8, first.log, second.log)) {
-                failed += 1;
+                r.failed += 1;
                 std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ ent.path, seed });
                 break;
             }
         }
     }
-    return .{ .parsed = parsed, .ran = ran, .failed = failed };
+    // Debug numbers mean nothing.
+    if (@import("builtin").mode == .debug) return r;
+    const t = r.tally;
+    std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
+    std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries and {d} verifying) vs {d} ns per parse; {d:.0} cells per run\n", .{
+        root,
+        t.runs,
+        t.settles,
+        @as(f64, @floatFromInt(t.runs)) / @as(f64, @floatFromInt(@max(t.settles, 1))),
+        (t.rule_ns -| t.send_ns -| t.verify_ns) / @max(t.settles, 1),
+        t.rule_ns / @max(t.settles, 1),
+        t.send_ns / @max(t.settles, 1),
+        t.verify_ns / @max(t.settles, 1),
+        t.parse_ns / @max(t.parses, 1),
+        @as(f64, @floatFromInt(r.cells)) / @as(f64, @floatFromInt(@max(r.scenarios, 1))),
+    });
+    return r;
 }
 
 // `HARK_SCENARIO=path/to/x.rpl zig build test` replays one scenario with

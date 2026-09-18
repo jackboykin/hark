@@ -71,6 +71,8 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (!rs.settled) return;
     const r = rs.value.rrset;
     var budget: dnssec.ValidationBudget = .{};
+    const clock = graph.Tally.clock(&g.tally.verify_ns);
+    defer clock.stop();
     const now = g.wallNow();
     const expires = @min(rs.expires_ns, keys.expires_ns);
     switch (r.kind) {
@@ -111,6 +113,8 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.arena, rr.rdata.ds);
     var budget: dnssec.ValidationBudget = .{};
+    const clock = graph.Tally.clock(&g.tally.verify_ns);
+    defer clock.stop();
     const now = g.wallNow();
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, &budget) catch
         return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
@@ -194,6 +198,8 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 pending = pending or !g.cell(s.keys[groups].?).settled;
             }
             if (pending) return;
+            const clock = graph.Tally.clock(&g.tally.verify_ns);
+            defer clock.stop();
             // Signatures alone: a claim about an empty set.
             if (groups == 0) return settleSecure(g, id, .bogus);
             var status: Status = .secure;
@@ -230,6 +236,8 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 return settleSecure(g, id, .bogus);
             const kc = g.cell(s.keys[0].?);
             if (!kc.settled) return;
+            const clock = graph.Tally.clock(&g.tally.verify_ns);
+            defer clock.stop();
             if (kc.value.dnskey.status != .secure) return settleSecure(g, id, .bogus);
             expires = @min(expires, kc.expires_ns);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, &budget, &cap) != .secure) return settleSecure(g, id, .bogus);

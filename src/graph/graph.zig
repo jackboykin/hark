@@ -14,6 +14,7 @@ const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const delegation = @import("../delegation.zig");
 const dnssec = @import("../dnssec.zig");
+const monotonic = @import("../monotonic.zig");
 const ns_rtt = @import("../ns_rtt.zig");
 const sim = @import("sim.zig");
 const trust = @import("trust.zig");
@@ -142,6 +143,31 @@ pub const Value = union(Kind) {
 pub const Budget = struct {
     queries: u32 = 0,
     deadline_ns: i64 = 0,
+};
+
+/// The model should cost less than a parse.
+pub const Tally = struct {
+    runs: u64 = 0,
+    settles: u64 = 0,
+    parses: u64 = 0,
+    rule_ns: u64 = 0,
+    send_ns: u64 = 0,
+    verify_ns: u64 = 0,
+    parse_ns: u64 = 0,
+    reruns: u64 = 0,
+    rerun_ns: u64 = 0,
+
+    pub const Clock = struct {
+        t0: i128,
+        into: *u64,
+        pub fn stop(c: Clock) void {
+            c.into.* += @intCast(monotonic.nowNs() - c.t0);
+        }
+    };
+
+    pub fn clock(into: *u64) Clock {
+        return .{ .t0 = monotonic.nowNs(), .into = into };
+    }
 };
 
 // ── Scratch ────────────────────────────────────────────────────────────
@@ -314,6 +340,7 @@ pub const Graph = struct {
     ready: std.ArrayList(CellId) = .empty,
     /// Per-server estimate; the one state outliving a demand.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
+    tally: Tally = .{},
 
     pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: *sim.Sim) !Graph {
         var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge };
@@ -382,6 +409,9 @@ pub const Graph = struct {
             .wake => unreachable,
             .timeout => .timeout,
             .reply => |bytes| blk: {
+                const clock = Tally.clock(&g.tally.parse_ns);
+                defer clock.stop();
+                g.tally.parses += 1;
                 const msg = dns.parseMessage(g.arena, bytes) catch break :blk .mismatch;
                 if (msg.header.id != sc.id or !msg.header.flags.qr) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent_name, sc.qtype) catch break :blk .mismatch;
@@ -447,6 +477,7 @@ pub const Graph = struct {
 
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
+        g.tally.settles += 1;
         c.settled = true;
         c.value = value;
         c.expires_ns = expires_ns;
@@ -526,6 +557,15 @@ pub const Graph = struct {
 
     fn run(g: *Graph, id: CellId) !void {
         if (g.cell(id).settled) return;
+        g.tally.runs += 1;
+        const clock = Tally.clock(&g.tally.rule_ns);
+        defer clock.stop();
+        // Ended waiting and created nothing: the model's own cost.
+        const cells_before = g.cells.items.len;
+        defer if (!g.cell(id).settled and g.cells.items.len == cells_before) {
+            g.tally.reruns += 1;
+            g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
+        };
         switch (g.cell(id).key.kind) {
             .cut => try g.runCut(id),
             .rrset => try g.runRrset(id),
@@ -1186,6 +1226,8 @@ pub const Graph = struct {
             return id;
         }
         root.budget.queries += 1;
+        const clock = Tally.clock(&g.tally.send_ns);
+        defer clock.stop();
         const rng = g.edge.random();
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const qid = rng.int(u16);
