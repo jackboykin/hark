@@ -7,7 +7,7 @@ SCENARIO_BEGIN Mixed FORMERR + SERVFAIL siblings surface SERVFAIL deterministica
 ; SERVFAILs it — both trigger sibling-fallthrough, so hark queries both and
 ; ends with no usable answer. The surfaced rcode must NOT depend on which NS
 ; happened to be tried last (NS order is reputation/latency-randomized).
-; failurePrecedence (recursive.zig) keeps the highest-severity failure, so
+; failurePrecedence (delegation.zig) keeps the highest-severity failure, so
 ; SERVFAIL (> FORMERR) is surfaced regardless of order — no rcode-flip.
 ;
 ; `stagger-ms = 0` forces the sequential server loop so exactly one NS is

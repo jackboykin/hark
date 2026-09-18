@@ -1,6 +1,6 @@
 /// Wire-shaping for client-facing responses: header construction, EDNS0 OPT,
 /// truncation cascade, error responses, and per-RFC validation. Pure (no
-/// I/O); the I/O orchestrator lives in server.zig.
+/// I/O); serve.zig does the I/O.
 ///
 /// Response shaping policy is captured in `shapeResponse`: a per-section
 /// keep/strip matrix over (qtype, DO bit, rcode, answer-present). The cells

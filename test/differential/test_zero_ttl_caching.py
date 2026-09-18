@@ -16,8 +16,7 @@ Surviving divergence — the `cache-min-ttl` interpretation: both
 resolvers expose a min-TTL floor for upstream-load shaping. Unbound
 applies the floor uniformly; *including* records the auth marked TTL=0
 to prevent caching. Hark explicitly excludes TTL=0 from the bump
-(`storeNegative` for negative caching, `storeOneRRset` for positive
-RRsets, both in src/cache.zig). With the same 60s floor configured on both, the
+(walk.zig `replyTtl`). With the same 60s floor configured on both, the
 operator gets two RFC interpretations from one knob:
   hark    → 2 upstream queries (floor doesn't apply to TTL=0)
   Unbound → 1 upstream query  (floor applied; cache hit on the 2nd)

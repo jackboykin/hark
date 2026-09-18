@@ -103,7 +103,7 @@ query `_advance-clock.<N>.testharness.invalid.` on each `STEP n TIME_PASSES`
 
 The divergence is elsewhere: the scenarios' `MATCH all` also asserts the
 AUTHORITY section, and hark intentionally strips AUTHORITY NS records from
-*cached positive* responses (`src/cache.zig:storeResponse`) as the
+*cached positive* responses as the
 CVE-2025-11411 mitigation. Unbound caches and replays the authority section;
 hark does not. So the answer section matches but the authority section does
 not, and `MATCH all` fails.

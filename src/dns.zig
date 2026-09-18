@@ -1061,7 +1061,7 @@ fn skipWireName(wire: []const u8, start: usize) ?usize {
 /// non-zero values round up so a 100-ms hint doesn't evict the connection on
 /// the same tick. TIMEOUT=0 ("close ASAP" per RFC 7828 §3.3) passes through
 /// as 0; callers that pool a connection must clamp against weaponized 0
-/// before applying — see `connection_pool.applyKeepaliveHint`.
+/// before applying.
 pub fn keepaliveToSeconds(timeout_100ms: u16) i64 {
     return @divFloor(@as(i64, @intCast(timeout_100ms)) + 9, 10);
 }

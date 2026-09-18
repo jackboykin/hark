@@ -3,9 +3,8 @@
 
 SCENARIO_BEGIN aggressive NSEC synthesises NXDOMAIN for sibling in cached range (RFC 8198)
 
-; End-to-end coverage for `src/nsec_cache.zig`. The module has 15 unit
-; tests but no scenario asserting the synthesis path fires on a real
-; recursive resolution.
+; End-to-end coverage for aggressive use (denial.zig): the synthesis path
+; fires on a real recursive resolution.
 ;
 ; Zone layout (signed root, harness-generated key):
 ;   `.`  — apex (SOA + NS + DNSKEY)

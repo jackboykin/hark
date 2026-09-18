@@ -4,7 +4,7 @@
 SCENARIO_BEGIN FORMERR from every NS is tried before surfacing (RFC 1034 §4.3.5)
 
 ; Both authoritative servers for example.com FORMERR the leaf. Hark must try
-; BOTH (the FORMERR sibling-fallthrough path, recursive.zig server_loop) before
+; BOTH (the FORMERR sibling-fallthrough path, walk.zig `Ask`) before
 ; surfacing FORMERR to the stub. On code that does NOT treat FORMERR as a
 ; fallthrough signal, only the first-picked NS is queried — so the second
 ; QUERY_LOG row below is absent and STEP 3 fails. That is the deterministic

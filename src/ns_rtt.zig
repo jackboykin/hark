@@ -155,8 +155,8 @@ pub const RttState = struct {
 
 const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
 
-/// Shard count: same scheme as cache.zig — distribute lock + probe cost
-/// across N independent maps keyed on the high bits of AddressKey.HashCtx.
+/// Shard count: distribute lock + probe cost across N independent maps
+/// keyed on the high bits of AddressKey.HashCtx.
 /// The single-rwlock RttCache showed lock-acquire/release at ~5–8% of CPU
 /// on the miss workload at thread counts ≥ 32.
 const shard_count: u32 = 16;

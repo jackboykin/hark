@@ -4,14 +4,13 @@ SCENARIO_BEGIN glueless NS fan-out resolves within the tree-wide query budget
 ;
 ; NXNSAttack (CVE-2020-12667) regression. A delegation listing several glueless
 ; NS names forces the resolver to sub-resolve each NS address before it can ask
-; the child zone anything. The defense is `QueryBudget`
-; (src/recursive.zig:max_global_queries): one counter shared by pointer across
-; the whole resolution tree — including the concurrent NS-address fan-out
-; clones — and never reset on sub-resolution or CNAME.
+; the child zone anything. The defense is the resolution's budget
+; (graph.zig `Budget`, max-queries): one counter shared across the whole
+; resolution tree, including the NS-address fan-out, never reset on
+; sub-resolution or CNAME.
 ;
-; Before that counter, each `resolveImpl(depth+1)` got a fresh
-; `max_upstream_queries` budget, so glueless fan-out amplified one client query
-; into hundreds of upstream queries.
+; Before that counter, each sub-resolution got a fresh budget, so glueless
+; fan-out amplified one client query into hundreds of upstream queries.
 ;
 ; This scenario is the *economy* guard: a benign glueless two-NS delegation
 ; resolves in a handful of upstream queries (measured 15), and

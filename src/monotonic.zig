@@ -20,7 +20,7 @@ inline fn testOffsetSec() i64 {
 }
 
 /// Advance the synthetic test clock by `secs`. No-op in production builds.
-/// Driven from the scenario-control DNS-query intercept (see `server.zig`).
+/// Driven from the scenario-control DNS-query intercept (see `serve.zig`).
 pub fn advanceTestClock(secs: i64) void {
     if (!build_options.testing_enabled) return;
     _ = test_offset_secs.fetchAdd(secs, .monotonic);
