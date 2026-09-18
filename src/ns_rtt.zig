@@ -64,13 +64,94 @@ const hedge_decay_ms: i64 = 30_000;
 const hedge_cold_default_ms: u32 = initial_timeout_ms / 4;
 const max_hedge_stagger_ms: u32 = 300;
 
-const RttState = struct {
-    srtt_us: i64,
-    rttvar_us: i64,
-    consecutive_timeouts: u8,
-    dead_until_ms: i64,
-    min_rtt_us: i64, // Windowed minimum RTT (re-anchored after hedge_decay_ms)
-    min_rtt_stamp_ms: i64,
+/// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
+const failover_timeout_cap_ms: u32 = 2000;
+
+/// One server's estimate, pure; `RttCache` locks it for the pool.
+pub const RttState = struct {
+    /// 0 until the first observation.
+    srtt_us: i64 = 0,
+    rttvar_us: i64 = 0,
+    consecutive_timeouts: u8 = 0,
+    dead_until_ms: i64 = 0,
+    /// Windowed minimum; 0 until a reply.
+    min_rtt_us: i64 = 0,
+    min_rtt_stamp_ms: i64 = 0,
+
+    pub const unknown: RttState = .{};
+
+    /// A reply after `rtt_us`, whatever its rcode.
+    pub fn observe(s: *RttState, rtt_us: i64, now_ms: i64) void {
+        const rtt = @max(rtt_us, 1);
+        if (s.srtt_us == 0) {
+            s.srtt_us = rtt;
+            s.rttvar_us = @divTrunc(rtt, 2);
+        } else {
+            // RFC 6298 EWMA update
+            const delta: i64 = @intCast(@abs(s.srtt_us - rtt));
+            s.rttvar_us = 3 * @divTrunc(s.rttvar_us, 4) + @divTrunc(delta, 4);
+            s.srtt_us = 7 * @divTrunc(s.srtt_us, 8) + @divTrunc(rtt, 8);
+        }
+        // Re-anchoring lets the floor follow a route change upward.
+        if (s.min_rtt_us == 0 or rtt < s.min_rtt_us or now_ms - s.min_rtt_stamp_ms > hedge_decay_ms) {
+            s.min_rtt_us = rtt;
+            s.min_rtt_stamp_ms = now_ms;
+        }
+        s.consecutive_timeouts = 0;
+        s.dead_until_ms = 0;
+    }
+
+    /// True on the timeout that marks the server dead.
+    pub fn observeTimeout(s: *RttState, now_ms: i64) bool {
+        if (s.srtt_us == 0) {
+            s.srtt_us = @as(i64, initial_timeout_ms) * 1000;
+            s.rttvar_us = @as(i64, initial_timeout_ms) * 500;
+        }
+        if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
+        if (s.consecutive_timeouts < dead_threshold) return false;
+        s.dead_until_ms = now_ms + s.deadWindowMs();
+        return s.consecutive_timeouts == dead_threshold;
+    }
+
+    pub fn isDead(s: RttState, now_ms: i64) bool {
+        return s.consecutive_timeouts >= dead_threshold and s.dead_until_ms > now_ms;
+    }
+
+    /// What a cold exchange over `transport` needs. A non-last server is
+    /// capped so a walk can still fail over.
+    pub fn timeout(s: RttState, is_last: bool, transport: Transport) u32 {
+        const base = s.rto();
+        const want = if (is_last) base else @min(base, failover_timeout_cap_ms);
+        return want * transport.coldRtts();
+    }
+
+    /// Null until a reply.
+    pub fn hedgeStagger(s: RttState) ?u32 {
+        if (s.min_rtt_us <= 0) return null;
+        const stagger_ms: u32 = @intCast(@max(1, @divTrunc(@as(i64, hedge_multiplier) * s.min_rtt_us, 1000)));
+        return @max(min_stagger_ms, @min(stagger_ms, max_hedge_stagger_ms));
+    }
+
+    fn rto(s: RttState) u32 {
+        if (s.srtt_us == 0) return initial_timeout_ms;
+        // RTO = srtt + 4 * rttvar (RFC 6298), but never tighter than 2× the
+        // smoothed RTT. Without this floor, consistent RTTs drive rttvar → 0
+        // and the timeout converges to exactly the RTT — any jitter causes
+        // a timeout that cascades into repeated failures.
+        const base_us = @max(s.srtt_us + 4 * s.rttvar_us, 2 * s.srtt_us);
+        const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
+
+        const shift: u5 = @intCast(@min(s.consecutive_timeouts, max_backoff_shifts));
+        const backed_off = @as(u64, base_ms) << shift;
+
+        const cap = if (s.consecutive_timeouts >= dead_threshold) dead_probe_timeout_ms else max_timeout_ms;
+        return @intCast(@max(min_timeout_ms, @min(backed_off, cap)));
+    }
+
+    fn deadWindowMs(s: RttState) i64 {
+        const shift: u5 = @intCast(@min(s.consecutive_timeouts - dead_threshold, dead_max_shifts));
+        return dead_duration_ms << shift;
+    }
 };
 
 const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
@@ -136,19 +217,11 @@ pub const RttCache = struct {
         return &self.shards[h & shard_mask];
     }
 
-    /// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
-    const failover_timeout_cap_ms: u32 = 2000;
-
-    /// What `key` needs for a cold exchange over `transport`. A non-last
-    /// server is capped so a walk can still fail over.
     pub fn getTimeout(self: *RttCache, key: AddressKey, is_last: bool, transport: Transport) u32 {
         const shard = self.shardFor(key);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
-
-        const base = if (shard.entries.get(key)) |state| computeTimeout(state) else initial_timeout_ms;
-        const want = if (is_last) base else @min(base, failover_timeout_cap_ms);
-        return want * transport.coldRtts();
+        return (shard.entries.get(key) orelse RttState.unknown).timeout(is_last, transport);
     }
 
     pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
@@ -158,32 +231,8 @@ pub const RttCache = struct {
         defer shard.rwlock.unlock(self.io);
 
         const gop = shard.entries.getOrPut(key) catch return;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .srtt_us = rtt_us,
-                .rttvar_us = @divTrunc(rtt_us, 2),
-                .consecutive_timeouts = 0,
-                .dead_until_ms = 0,
-                .min_rtt_us = rtt_us,
-                .min_rtt_stamp_ms = now_ms,
-            };
-        } else {
-            // RFC 6298 EWMA update
-            const delta: i64 = @intCast(@abs(gop.value_ptr.srtt_us - rtt_us));
-            gop.value_ptr.rttvar_us = 3 * @divTrunc(gop.value_ptr.rttvar_us, 4) + @divTrunc(delta, 4);
-            gop.value_ptr.srtt_us = 7 * @divTrunc(gop.value_ptr.srtt_us, 8) + @divTrunc(rtt_us, 8);
-            revive(shard, gop.value_ptr);
-
-            // Min-RTT tracking: re-anchor if stale, else take the running min.
-            // Re-anchoring lets the floor track upward on route changes.
-            if (now_ms - gop.value_ptr.min_rtt_stamp_ms > hedge_decay_ms) {
-                gop.value_ptr.min_rtt_us = rtt_us;
-                gop.value_ptr.min_rtt_stamp_ms = now_ms;
-            } else if (rtt_us < gop.value_ptr.min_rtt_us) {
-                gop.value_ptr.min_rtt_us = rtt_us;
-                gop.value_ptr.min_rtt_stamp_ms = now_ms;
-            }
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .unknown else releaseGate(shard, gop.value_ptr.*);
+        gop.value_ptr.observe(rtt_us, now_ms);
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
     }
 
@@ -194,39 +243,19 @@ pub const RttCache = struct {
         const shard = self.shardFor(key);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
-
         const state = shard.entries.get(key) orelse return hedge_cold_default_ms;
-        if (state.min_rtt_us <= 0) return hedge_cold_default_ms;
-
-        const stagger_us = @as(i64, hedge_multiplier) * state.min_rtt_us;
-        const stagger_ms: u32 = @intCast(@max(1, @divTrunc(stagger_us, 1000)));
-        return @max(min_stagger_ms, @min(stagger_ms, max_hedge_stagger_ms));
+        return state.hedgeStagger() orelse hedge_cold_default_ms;
     }
 
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
+        const now_ms = self.now_fn();
         const shard = self.shardFor(key);
         shard.rwlock.lockUncancelable(self.io);
         defer shard.rwlock.unlock(self.io);
 
         const gop = shard.entries.getOrPut(key) catch return;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .srtt_us = @as(i64, initial_timeout_ms) * 1000,
-                .rttvar_us = @as(i64, initial_timeout_ms) * 500,
-                .consecutive_timeouts = 1,
-                .dead_until_ms = 0,
-                .min_rtt_us = 0, // Unset — getHedgeStagger returns cold default.
-                .min_rtt_stamp_ms = 0,
-            };
-        } else {
-            const state = gop.value_ptr;
-            if (state.consecutive_timeouts < 255) state.consecutive_timeouts += 1;
-            if (state.consecutive_timeouts >= dead_threshold) {
-                if (state.consecutive_timeouts == dead_threshold)
-                    _ = shard.dead_marked.v.fetchAdd(1, .monotonic);
-                state.dead_until_ms = self.now_fn() + deadWindowMs(state.*);
-            }
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .unknown;
+        if (gop.value_ptr.observeTimeout(now_ms)) _ = shard.dead_marked.v.fetchAdd(1, .monotonic);
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
     }
 
@@ -236,17 +265,14 @@ pub const RttCache = struct {
         var it = shard.entries.iterator();
         while (it.next()) |kv| {
             if (std.meta.eql(kv.key_ptr.*, protected)) continue;
-            revive(shard, kv.value_ptr);
+            releaseGate(shard, kv.value_ptr.*);
             shard.entries.removeByPtr(kv.key_ptr);
             return;
         }
     }
 
-    fn revive(shard: *Shard, state: *RttState) void {
-        if (state.consecutive_timeouts >= dead_threshold)
-            _ = shard.dead_marked.v.fetchSub(1, .monotonic);
-        state.consecutive_timeouts = 0;
-        state.dead_until_ms = 0;
+    fn releaseGate(shard: *Shard, state: RttState) void {
+        if (state.consecutive_timeouts >= dead_threshold) _ = shard.dead_marked.v.fetchSub(1, .monotonic);
     }
 
     pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
@@ -255,7 +281,7 @@ pub const RttCache = struct {
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
         const state = shard.entries.get(key) orelse return false;
-        return state.consecutive_timeouts >= dead_threshold and state.dead_until_ms > now_ms;
+        return state.isDead(now_ms);
     }
 
     /// A dead server admits one sender per lapsed window. Ask at send
@@ -268,7 +294,7 @@ pub const RttCache = struct {
         const state = shard.entries.getPtr(key) orelse return true;
         if (state.consecutive_timeouts < dead_threshold) return true;
         if (state.dead_until_ms > now_ms) return false;
-        state.dead_until_ms = now_ms + deadWindowMs(state.*);
+        state.dead_until_ms = now_ms + state.deadWindowMs();
         return true;
     }
 
@@ -282,26 +308,6 @@ pub const RttCache = struct {
         return total;
     }
 };
-
-fn computeTimeout(state: RttState) u32 {
-    // RTO = srtt + 4 * rttvar (RFC 6298), but never tighter than 2× the
-    // smoothed RTT. Without this floor, consistent RTTs drive rttvar → 0
-    // and the timeout converges to exactly the RTT — any jitter causes
-    // a timeout that cascades into repeated failures.
-    const base_us = @max(state.srtt_us + 4 * state.rttvar_us, 2 * state.srtt_us);
-    const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
-
-    const shift: u5 = @intCast(@min(state.consecutive_timeouts, max_backoff_shifts));
-    const backed_off = @as(u64, base_ms) << shift;
-
-    const cap = if (state.consecutive_timeouts >= dead_threshold) dead_probe_timeout_ms else max_timeout_ms;
-    return @intCast(@max(min_timeout_ms, @min(backed_off, cap)));
-}
-
-fn deadWindowMs(state: RttState) i64 {
-    const shift: u5 = @intCast(@min(state.consecutive_timeouts - dead_threshold, dead_max_shifts));
-    return dead_duration_ms << shift;
-}
 
 var test_now_ms: i64 = 1000;
 
@@ -545,7 +551,7 @@ test "dead window escalation caps and eviction releases the gate" {
 
     const key = testAddr(3);
     for (0..dead_threshold + dead_max_shifts + 3) |_| cache.recordTimeout(key);
-    try testing.expectEqual(dead_duration_ms << dead_max_shifts, deadWindowMs(cache.shardFor(key).entries.get(key).?));
+    try testing.expectEqual(dead_duration_ms << dead_max_shifts, cache.shardFor(key).entries.get(key).?.deadWindowMs());
 
     // per-shard cap 1: this insert evicts the dead entry
     const shard = cache.shardFor(key);
@@ -570,6 +576,6 @@ test "a cold exchange costs the transport's round trips of the estimate" {
 
     // The failover cap bounds one round trip; the cold total is above it.
     for (0..3) |_| cache.recordTimeout(key);
-    try testing.expect(cache.getTimeout(key, true, .udp) > RttCache.failover_timeout_cap_ms);
-    try testing.expectEqual(RttCache.failover_timeout_cap_ms * 2, cache.getTimeout(key, false, .tcp));
+    try testing.expect(cache.getTimeout(key, true, .udp) > failover_timeout_cap_ms);
+    try testing.expectEqual(failover_timeout_cap_ms * 2, cache.getTimeout(key, false, .tcp));
 }
