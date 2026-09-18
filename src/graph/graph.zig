@@ -248,6 +248,8 @@ const AddrScratch = struct {
     hopped: bool = false,
     a: ?CellId = null,
     aaaa: ?CellId = null,
+    judge_a: ?CellId = null,
+    judge_aaaa: ?CellId = null,
 };
 
 const NsScratch = struct {
@@ -684,18 +686,31 @@ pub const Graph = struct {
                 continue;
             }
             var n: usize = 0;
-            switch (c.value.rrset.kind) {
-                .answer => for (c.value.rrset.answers) |rr| {
-                    if (rr.rtype != rtype or !rr.name.eql(host)) continue;
-                    if (g.cfg.addr_policy.address(rr)) |a| {
-                        try addrs.append(g.arena, a);
-                        n += 1;
+            const r = c.value.rrset;
+            if (r.kind == .answer or r.kind == .alias) {
+                // A bogus answer is no address.
+                if (g.cfg.trust_anchor != null) {
+                    const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
+                    if (slot.* == null) slot.* = try trust.demandSecure(g, id, rid);
+                    const j = g.cell(slot.*.?);
+                    if (!j.settled) {
+                        pending = true;
+                        continue;
                     }
-                },
-                .alias => if (alias == null) {
-                    alias = c.value.rrset.target;
-                },
-                else => {},
+                    if (j.value.secure.status == .bogus) {
+                        denied = @min(denied, j.expires_ns);
+                        continue;
+                    }
+                }
+                if (r.kind == .answer) {
+                    for (r.answers) |rr| {
+                        if (rr.rtype != rtype or !rr.name.eql(host)) continue;
+                        if (g.cfg.addr_policy.address(rr)) |a| {
+                            try addrs.append(g.arena, a);
+                            n += 1;
+                        }
+                    }
+                } else if (alias == null) alias = r.target;
             }
             if (n > 0) expires = @min(expires, c.expires_ns) else denied = @min(denied, c.expires_ns);
         }

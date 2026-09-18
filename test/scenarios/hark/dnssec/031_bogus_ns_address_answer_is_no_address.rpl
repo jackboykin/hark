@@ -1,0 +1,89 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = sub.example.
+
+SCENARIO_BEGIN a bogus NS-address answer is no address
+
+; sub.example. is delegated, without glue, to bogus.example., whose A record
+; in the signed example. zone carries a forged RRSIG (key tag 1, zero bytes,
+; as in 006). Validation happens at every depth: the address is bogus, so
+; sub.example. has no reachable server and the client gets SERVFAIL. A
+; resolver that used the address as if the answer were unsigned would answer
+; www.sub.example. and stamp it AD.
+;
+; Topology
+;   root     127.0.10.1   delegates example. with a DS, glue for ns.example.
+;   example  127.0.10.2   delegates sub.example. with a DS to bogus.example.,
+;                         no glue; answers bogus.example. A with a forged sig
+;   sub      127.0.10.3   would answer the leaf, must never be reached
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      bogus.example. IN A
+    SECTION ANSWER
+      bogus.example. 3600 IN A 127.0.10.3
+      bogus.example. 3600 IN RRSIG A 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.example. IN A
+    SECTION AUTHORITY
+      sub.example. 3600 IN NS bogus.example.
+      sub.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example. IN A
+    SECTION ANSWER
+      www.sub.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.sub.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.sub.example. IN A
+ENTRY_END
+
+SCENARIO_END
