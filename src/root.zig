@@ -34,6 +34,7 @@ pub const graph = struct {
     pub const sign = @import("graph/sign.zig");
     pub const trust = @import("graph/trust.zig");
     pub const serve = @import("graph/serve.zig");
+    pub const edge = @import("graph/edge.zig");
 };
 
 /// This module's own optimize mode. The bench harness is pinned to ReleaseFast
@@ -74,6 +75,7 @@ test {
     _ = @import("graph/sign.zig");
     _ = @import("graph/trust.zig");
     _ = @import("graph/serve.zig");
+    _ = @import("graph/edge.zig");
     _ = @import("blocking_transport.zig");
     _ = @import("rand.zig");
     _ = @import("monotonic.zig");
