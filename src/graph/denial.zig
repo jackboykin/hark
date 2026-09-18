@@ -202,12 +202,13 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .stored_ns = now,
     };
     reply.ttl = @min(g.replyTtl(reply, zone, name), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
+    // The reply first, so the verdict lands on its bytes.
+    try g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
     const key = try g.keyFor(.secure, name, qtype);
     const sid = try g.newCell(key, name, g.cell(id).root, g.cell(id).depth);
     g.cell(sid).scratch.secure.target = id;
     try g.index.put(g.gpa, key, sid);
     try g.settle(sid, .{ .secure = .{ .status = .secure, .proven_until_ns = expires } }, expires);
-    try g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
     return true;
 }
 

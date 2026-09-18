@@ -345,6 +345,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
             r.tally.send_ns += first.tally.send_ns;
             r.tally.verify_ns += first.tally.verify_ns;
             r.tally.parse_ns += first.tally.parse_ns;
+            r.tally.store_ns += first.tally.store_ns;
             r.tally.reruns += first.tally.reruns;
             r.tally.rerun_ns += first.tally.rerun_ns;
             r.cells += first.cells;
@@ -375,15 +376,16 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
     std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
-    std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries and {d} verifying) vs {d} ns per parse; {d:.0} cells per run\n", .{
+    std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries, {d} verifying and {d} in the store) vs {d} ns per parse; {d:.0} cells per run\n", .{
         root,
         t.runs,
         t.settles,
         @as(f64, @floatFromInt(t.runs)) / @as(f64, @floatFromInt(@max(t.settles, 1))),
-        (t.rule_ns -| t.send_ns -| t.verify_ns) / @max(t.settles, 1),
+        (t.rule_ns -| t.send_ns -| t.verify_ns -| t.store_ns) / @max(t.settles, 1),
         t.rule_ns / @max(t.settles, 1),
         t.send_ns / @max(t.settles, 1),
         t.verify_ns / @max(t.settles, 1),
+        t.store_ns / @max(t.settles, 1),
         t.parse_ns / @max(t.parses, 1),
         @as(f64, @floatFromInt(r.cells)) / @as(f64, @floatFromInt(@max(r.scenarios, 1))),
     });

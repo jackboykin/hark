@@ -141,17 +141,22 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 }
 
 /// The judgement of one rrset version; a fresh cell per version, since
-/// the verdict is about those bytes.
+/// the verdict is about those bytes; one already stamped on them settles
+/// the cell without a rule.
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const t = g.cell(rid);
     const key = try g.keyFor(.secure, t.name, t.key.rtype);
-    if (g.lookup(key)) |sid| if (g.cell(sid).scratch.secure.target == rid) {
+    if (try g.lookup(key, t.name)) |sid| if (g.cell(sid).scratch.secure.target == rid) {
         if (!g.cell(sid).settled) try g.addWaiter(sid, by);
         return sid;
     };
     const sid = try g.newCell(key, t.name, g.cell(by).root, g.cell(by).depth);
     g.cell(sid).scratch.secure.target = rid;
     try g.index.put(g.gpa, key, sid);
+    if (t.blob) |b| if (b.verdict.until_ns > g.now()) {
+        try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
+        return sid;
+    };
     try g.ready.append(g.gpa, sid);
     try g.addWaiter(sid, by);
     return sid;

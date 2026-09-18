@@ -21,6 +21,14 @@ pub const Verdict = extern struct {
     _pad: [7]u8 = @splat(0),
     proven_until_ns: i64 = 0,
     until_ns: i64 = 0,
+
+    pub fn stamp(v: *Verdict, c: trust.Chain, until_ns: i64) void {
+        v.* = .{ .status = @backingInt(c.status), .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
+    }
+
+    pub fn chain(v: Verdict) trust.Chain {
+        return .{ .status = @fromBackingInt(@as(u2, @intCast(v.status))), .proven_until_ns = v.proven_until_ns };
+    }
 };
 
 pub const Blob = extern struct {
@@ -44,7 +52,7 @@ pub const Blob = extern struct {
     }
 };
 
-const Entry = struct { blob: *Blob, expires_ns: i64 };
+pub const Entry = struct { blob: *Blob, expires_ns: i64 };
 
 const KeyContext = struct {
     pub fn hash(_: KeyContext, k: Key) u32 {
@@ -83,10 +91,9 @@ pub const Store = struct {
         s.gpa.free(b.bytes());
     }
 
-    /// The fresh fact under `key`, borrowed.
-    pub fn get(s: *Store, key: Key, now_ns: i64) ?*Blob {
+    pub fn get(s: *Store, key: Key, now_ns: i64) ?Entry {
         const e = s.map.get(key) orelse return null;
-        return if (e.expires_ns > now_ns) e.blob else null;
+        return if (e.expires_ns > now_ns) e else null;
     }
 
     /// Takes one reference; replaces any older version.
@@ -306,7 +313,7 @@ test "a fact survives the blob byte for byte" {
 
     const blob = try s.build(.{ .rrset = reply });
     try s.put(key, blob, 1000);
-    try testing.expectEqual(blob, s.get(key, 999));
+    try testing.expectEqual(blob, s.get(key, 999).?.blob);
     try testing.expectEqual(null, s.get(key, 1000));
     try testing.expectEqual(blob.len, s.bytes);
 

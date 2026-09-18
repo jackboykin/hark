@@ -18,6 +18,7 @@ const monotonic = @import("../monotonic.zig");
 const ns_rtt = @import("../ns_rtt.zig");
 const trust = @import("trust.zig");
 const denial = @import("denial.zig");
+const store = @import("store.zig");
 
 const max_cname_chain = @import("../cache.zig").max_cname_chain;
 
@@ -201,6 +202,7 @@ pub const Tally = struct {
     send_ns: u64 = 0,
     verify_ns: u64 = 0,
     parse_ns: u64 = 0,
+    store_ns: u64 = 0,
     reruns: u64 = 0,
     rerun_ns: u64 = 0,
 
@@ -372,6 +374,7 @@ pub const Cell = struct {
     depth: u8,
     budget: Budget = .{},
     scratch: Scratch = .none,
+    blob: ?*store.Blob = null,
 };
 
 // ── Graph ──────────────────────────────────────────────────────────────
@@ -390,9 +393,11 @@ pub const Graph = struct {
     tally: Tally = .{},
     /// Verified NSEC facts in span order (denial.zig).
     denial: denial.Index = .{},
+    store: store.Store,
 
     pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge };
+        var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge, .store = try store.Store.init(gpa) };
+        errdefer g.store.deinit();
         // The root cut and NS set are axiomatic.
         const root: dns.Name = .{ .labels = &.{} };
         const cut = try g.newCell(.{ .kind = .cut, .name = "" }, root, 0, 0);
@@ -405,12 +410,16 @@ pub const Graph = struct {
     }
 
     pub fn deinit(g: *Graph) void {
-        for (g.cells.items) |c| c.waiters.deinit(g.gpa);
+        for (g.cells.items) |c| {
+            c.waiters.deinit(g.gpa);
+            if (c.blob) |b| g.store.unref(b);
+        }
         g.cells.deinit(g.gpa);
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
         g.denial.deinit(g.gpa);
+        g.store.deinit();
     }
 
     pub fn now(g: *const Graph) i64 {
@@ -435,7 +444,7 @@ pub const Graph = struct {
     /// cell with its own budget.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType) !CellId {
         const key = try g.keyFor(.answer, name, qtype);
-        if (g.lookup(key)) |id| return id;
+        if (try g.lookup(key, name)) |id| return id;
         const id: CellId = @intCast(g.cells.items.len);
         // The question outlives the client's bytes.
         _ = try g.newCell(key, try dns.cloneNameFlat(g.arena, name, false), id, 0);
@@ -526,8 +535,11 @@ pub const Graph = struct {
         return id;
     }
 
+    /// Copies out: the value becomes the blob's parse, the blob the store's
+    /// version while fresh; a verdict is stamped on the bytes it judged.
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
+        std.debug.assert(!c.settled);
         g.tally.settles += 1;
         if (g.cfg.trace) switch (value) {
             .ds, .dnskey, .secure => |chain| {
@@ -539,6 +551,18 @@ pub const Graph = struct {
         c.settled = true;
         c.value = value;
         c.expires_ns = expires_ns;
+        switch (value) {
+            .cut, .ns, .addr, .rrset, .ds, .dnskey => {
+                const clock = Tally.clock(&g.tally.store_ns);
+                defer clock.stop();
+                const blob = try g.store.build(value);
+                c.blob = blob;
+                c.value = try store.Store.parse(g.arena, blob);
+                if (expires_ns > g.now()) try g.store.put(c.key, blob.ref(), expires_ns);
+            },
+            .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
+            .answer, .exchange => {},
+        }
         try g.ready.appendSlice(g.gpa, c.waiters.items);
         c.waiters.clearRetainingCapacity();
     }
@@ -548,17 +572,31 @@ pub const Graph = struct {
         return c.settled and c.expires_ns > g.now();
     }
 
-    /// The newest fresh or pending version of `key`, if any.
-    pub fn lookup(g: *Graph, key: Key) ?CellId {
-        const id = g.index.get(key) orelse return null;
-        const c = g.cell(id);
-        return if (!c.settled or c.expires_ns > g.now()) id else null;
+    /// The live version of `key`: in progress, or settled and fresh. A
+    /// fresh fact in the store that no live cell holds is materialised
+    /// over the store's blob, settled without a rule.
+    pub fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
+        const live = g.index.get(key);
+        if (live) |id| if (!g.cell(id).settled) return id;
+        if (g.store.get(key, g.now())) |e| {
+            if (live) |id| if (g.cell(id).blob == e.blob) return id;
+            const id = try g.newCell(key, name, @intCast(g.cells.items.len), 0);
+            const c = g.cell(id);
+            c.settled = true;
+            c.blob = e.blob.ref();
+            c.value = try store.Store.parse(g.arena, e.blob);
+            c.expires_ns = e.expires_ns;
+            try g.index.put(g.gpa, key, id);
+            return id;
+        }
+        if (live) |id| if (g.cell(id).expires_ns > g.now()) return id;
+        return null;
     }
 
     /// Demand `key` for `by`. Null when `by` already (transitively) feeds
     /// the cell: a cycle, refused before any work.
     pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
-        if (g.lookup(key)) |id| {
+        if (try g.lookup(key, name)) |id| {
             if (g.fresh(id)) return id;
             if (g.reaches(by, id)) return null;
             try g.addWaiter(id, by);
@@ -596,10 +634,12 @@ pub const Graph = struct {
     }
 
     /// A settled version that ran no rule: evidence from a referral, or an
-    /// authoritative denial at a probe name.
+    /// authoritative denial at a probe name. The publisher's own key is
+    /// left to its rule, which settles once.
     pub fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !CellId {
         if (g.index.get(key)) |id| {
             const c = g.cell(id);
+            if (id == by) return id;
             if (!c.settled) {
                 try g.settle(id, value, expires_ns);
                 return id;
@@ -699,7 +739,7 @@ pub const Graph = struct {
         }
         // A fresh fact at the probe name answers it without a packet; a
         // denial there stops minimising.
-        if (g.lookup(try g.keyFor(.rrset, name, .a))) |rid| if (g.fresh(rid)) {
+        if (try g.lookup(try g.keyFor(.rrset, name, .a), name)) |rid| if (g.fresh(rid)) {
             const known = g.cell(rid).value.rrset;
             try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = known.kind == .nxdomain } }, @min(parent.expires_ns, g.cell(rid).expires_ns));
             return;
@@ -761,7 +801,7 @@ pub const Graph = struct {
         const s = &g.cell(id).scratch.addr;
         if (s.host == null) {
             s.host = g.cell(id).name;
-            if (g.lookup(try g.keyFor(.rrset, s.host.?, .cname))) |cid| if (g.fresh(cid) and g.cell(cid).value.rrset.kind == .alias) {
+            if (try g.lookup(try g.keyFor(.rrset, s.host.?, .cname), s.host.?)) |cid| if (g.fresh(cid) and g.cell(cid).value.rrset.kind == .alias) {
                 s.host = g.cell(cid).value.rrset.target;
                 s.hopped = true;
             };
@@ -837,7 +877,7 @@ pub const Graph = struct {
                 // otherwise start at the parent's. A DS always lives there.
                 const own = try g.keyFor(.cut, name, .a);
                 const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
-                const key = if (qtype != .ds and (g.lookup(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
+                const key = if (qtype != .ds and (try g.lookup(own, name) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
                 const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
                 s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
                     return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
@@ -928,7 +968,7 @@ pub const Graph = struct {
         var i: usize = 1;
         while (i < name.labels.len) : (i += 1) {
             const owner: dns.Name = .{ .labels = name.labels[i..] };
-            const did = g.lookup(try g.keyFor(.rrset, owner, .dname)) orelse continue;
+            const did = try g.lookup(try g.keyFor(.rrset, owner, .dname), owner) orelse continue;
             if (g.fresh(did) and g.cell(did).value.rrset.kind == .answer) return did;
         }
         return null;
@@ -989,7 +1029,7 @@ pub const Graph = struct {
             }
             if (addrs.items.len == 0) continue;
             const key = try g.keyFor(.addr, host, .a);
-            if (g.lookup(key)) |existing| if (g.fresh(existing) and !g.cell(existing).value.addr.provisional) continue;
+            if (try g.lookup(key, host)) |existing| if (g.fresh(existing) and !g.cell(existing).value.addr.provisional) continue;
             const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
             _ = try g.publish(key, host, by, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
         }
@@ -1219,7 +1259,7 @@ pub const Graph = struct {
             var pending = false;
             for (names) |host| {
                 const key = try g.keyFor(.addr, host, .a);
-                if (g.lookup(key)) |aid| {
+                if (try g.lookup(key, host)) |aid| {
                     const c = g.cell(aid);
                     if (!c.settled) {
                         // In progress for someone: wait, unless it is
