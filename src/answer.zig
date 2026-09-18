@@ -2,11 +2,11 @@
 //! sockets. The live server and the simulator both serve through it.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const dns = @import("../dns.zig");
+const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
-const dns64 = @import("../dns64.zig");
-const special_use = @import("../special_use.zig");
+const dns64 = @import("dns64.zig");
+const special_use = @import("special_use.zig");
 
 pub const Client = struct {
     rd: bool = true,

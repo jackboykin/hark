@@ -140,7 +140,7 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
     } else |_| {}
 
     defer cfg.deinit();
-    hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
+    hark.serve.run(allocator, &cfg, cli_verbose) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
     };

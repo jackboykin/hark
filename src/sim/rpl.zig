@@ -7,9 +7,9 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const testing = std.testing;
-const dns = @import("../../dns.zig");
-const na = @import("../../net_address.zig");
-const dns64 = @import("../../dns64.zig");
+const dns = @import("../dns.zig");
+const na = @import("../net_address.zig");
+const dns64 = @import("../dns64.zig");
 
 /// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
 /// to cache TTL 0.

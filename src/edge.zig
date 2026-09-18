@@ -5,11 +5,11 @@ const linux = std.os.linux;
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const dns = @import("../dns.zig");
-const na = @import("../net_address.zig");
-const sys = @import("../sys_union.zig");
-const monotonic = @import("../monotonic.zig");
-const rand = @import("../rand.zig");
+const dns = @import("dns.zig");
+const na = @import("net_address.zig");
+const sys = @import("sys_union.zig");
+const monotonic = @import("monotonic.zig");
+const rand = @import("rand.zig");
 const graph = @import("graph.zig");
 
 const CellId = graph.CellId;

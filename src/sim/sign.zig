@@ -6,9 +6,9 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const dns = @import("../../dns.zig");
-const dnssec = @import("../../dnssec.zig");
-const na = @import("../../net_address.zig");
+const dns = @import("../dns.zig");
+const dnssec = @import("../dnssec.zig");
+const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;

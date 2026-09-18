@@ -2,7 +2,7 @@
 //! Every policy that is not a cell and not answer shaping lives here.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const dns = @import("../dns.zig");
+const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const answer = @import("answer.zig");
 
@@ -10,15 +10,15 @@ const linux = std.os.linux;
 const posix = std.posix;
 const mem = std.mem;
 const build_options = @import("build_options");
-const na = @import("../net_address.zig");
-const sys = @import("../sys_union.zig");
-const acl = @import("../acl.zig");
-const config = @import("../config.zig");
-const monotonic = @import("../monotonic.zig");
-const response = @import("../response.zig");
-const sys_linux = @import("../sys_linux.zig");
+const na = @import("net_address.zig");
+const sys = @import("sys_union.zig");
+const acl = @import("acl.zig");
+const config = @import("config.zig");
+const monotonic = @import("monotonic.zig");
+const response = @import("response.zig");
+const sys_linux = @import("sys_linux.zig");
 const Edge = @import("edge.zig");
-const log = std.log.scoped(.graph);
+const log = std.log.scoped(.serve);
 
 const max_frame = 4096;
 const udp_recv_max = 4096;

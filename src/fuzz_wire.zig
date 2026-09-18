@@ -7,8 +7,8 @@ const Smith = testing.Smith;
 const dns = @import("dns.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
-const graph = @import("graph/graph.zig");
-const store = @import("graph/store.zig");
+const graph = @import("graph.zig");
+const store = @import("store.zig");
 const config = @import("config.zig");
 
 const types = [_]u16{ 1, 2, 5, 6, 12, 15, 16, 28, 39, 41, 43, 46, 47, 48, 50, 51, 64, 65, 99, 257, 0, 65535 };

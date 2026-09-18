@@ -11,12 +11,12 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const dns = @import("../dns.zig");
-const na = @import("../net_address.zig");
-const delegation = @import("../delegation.zig");
-const dnssec = @import("../dnssec.zig");
-const monotonic = @import("../monotonic.zig");
-const ns_rtt = @import("../ns_rtt.zig");
+const dns = @import("dns.zig");
+const na = @import("net_address.zig");
+const delegation = @import("delegation.zig");
+const dnssec = @import("dnssec.zig");
+const monotonic = @import("monotonic.zig");
+const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
@@ -893,7 +893,7 @@ test "a cell replacing an expired one takes over the index entry's key" {
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("../rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

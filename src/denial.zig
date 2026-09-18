@@ -5,8 +5,8 @@
 //! fetched by key. The index only finds candidates: the verdict is
 //! `validateNegativeProof`'s, and a proof gone from the store fails closed.
 const std = @import("std");
-const dns = @import("../dns.zig");
-const dnssec = @import("../dnssec.zig");
+const dns = @import("dns.zig");
+const dnssec = @import("dnssec.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
 
