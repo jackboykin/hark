@@ -1,0 +1,105 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a delegation added where the parent had an empty non-terminal is asked for its DS
+
+; Signed root, epoch one: `a.` and `x.b.` exist, so `b.` is an empty
+; non-terminal and `a. NSEC x.b.` is its NODATA proof. Step 1 caches it.
+;
+; Epoch two: `b.` is delegated, unsigned, and the root's referral carries
+; no DS and no proof. The resolver must ask the root for `b. DS` and take
+; the epoch-two answer (`b. NSEC c.` at the cut, no DS bit: insecure).
+;
+; The cached epoch-one span still covers `b.` with a next name below it,
+; the shape RFC 8198 may synthesise NODATA from. For a DS that would be
+; the parent's word about a cut it never proved (RFC 6840 §4.4): the
+; delegation would be judged on a stale proof and go bogus, SERVFAILing
+; the zone for as long as the span's signature holds. ip6.arpa nibbles
+; and `_tcp` labels are empty non-terminals that become delegations.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      a. 3600 IN NSEC x.b. A RRSIG NSEC
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      b. 3600 IN NSEC c. NS RRSIG NSEC
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      z.b. IN A
+    SECTION AUTHORITY
+      b. 3600 IN NS ns.b.
+    SECTION ADDITIONAL
+      ns.b. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      z.b. IN A
+    SECTION ANSWER
+      z.b. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    b. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    z.b. IN A
+ENTRY_END
+
+; NOERROR without AD: the epoch-two proof says insecure.
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    z.b. IN A
+  SECTION ANSWER
+    z.b. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

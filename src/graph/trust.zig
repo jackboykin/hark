@@ -6,6 +6,7 @@ const std = @import("std");
 const dns = @import("../dns.zig");
 const dnssec = @import("../dnssec.zig");
 const graph = @import("graph.zig");
+const denial = @import("denial.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
@@ -260,7 +261,11 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             expires = @min(expires, kc.expires_ns);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, &budget, &cap) != .secure) return settleSecure(g, id, .bogus);
             switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, &budget)) {
-                .secure => try g.settle(id, .{ .secure = .{ .status = .secure, .proven_until_ns = capExpiry(g, cap) } }, @min(expires, capExpiry(g, cap))),
+                .secure => {
+                    expires = @min(expires, capExpiry(g, cap));
+                    try denial.absorb(g, id, signer, r, expires);
+                    try g.settle(id, .{ .secure = .{ .status = .secure, .proven_until_ns = capExpiry(g, cap) } }, expires);
+                },
                 .insecure => try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
                 .bogus, .unchecked => try settleSecure(g, id, .bogus),
             }

@@ -53,6 +53,8 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
         .{ .code = .dnssec_bogus }
     else if (last.kind == .servfail)
         .{ .code = if (cached) .cached_error else last.ede orelse .no_reachable_authority }
+    else if (last.ede) |code|
+        .{ .code = code }
     else
         null;
     return .{ .cacheable = g.cell(root).expires_ns > g.now(), .ede = ede, .msg = .{

@@ -17,6 +17,7 @@ const dnssec = @import("../dnssec.zig");
 const monotonic = @import("../monotonic.zig");
 const ns_rtt = @import("../ns_rtt.zig");
 const trust = @import("trust.zig");
+const denial = @import("denial.zig");
 
 const max_cname_chain = @import("../cache.zig").max_cname_chain;
 
@@ -379,6 +380,8 @@ pub const Graph = struct {
     /// Per-server estimate; the one state outliving a demand.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
+    /// Verified NSEC facts in span order (denial.zig).
+    denial: denial.Index = .{},
 
     pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge };
@@ -399,6 +402,7 @@ pub const Graph = struct {
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
+        g.denial.deinit(g.gpa);
     }
 
     pub fn now(g: *const Graph) i64 {
@@ -531,7 +535,7 @@ pub const Graph = struct {
         c.waiters.clearRetainingCapacity();
     }
 
-    fn fresh(g: *Graph, id: CellId) bool {
+    pub fn fresh(g: *Graph, id: CellId) bool {
         const c = g.cell(id);
         return c.settled and c.expires_ns > g.now();
     }
@@ -585,7 +589,7 @@ pub const Graph = struct {
 
     /// A settled version that ran no rule: evidence from a referral, or an
     /// authoritative denial at a probe name.
-    fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !CellId {
+    pub fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !CellId {
         if (g.index.get(key)) |id| {
             const c = g.cell(id);
             if (!c.settled) {
@@ -819,6 +823,8 @@ pub const Graph = struct {
         const s = &g.cell(id).scratch.rrset;
         if (!s.started) {
             if (s.cut == null) {
+                // Indexed proofs deny the name without a packet.
+                if (try denial.deny(g, id)) return;
                 // A cut at the name itself exists only from a referral;
                 // otherwise start at the parent's. A DS always lives there.
                 const own = try g.keyFor(.cut, name, .a);
@@ -1066,7 +1072,7 @@ pub const Graph = struct {
     /// The answer's shortest TTL; for an authoritative denial, min of the
     /// SOA's TTL and MINIMUM (RFC 2308 §3) from an SOA above the name and
     /// inside the zone, nothing otherwise.
-    fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
+    pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
         var ttl: u32 = 0;
         switch (reply.kind) {
             .answer, .alias => {
@@ -1090,7 +1096,7 @@ pub const Graph = struct {
         return ttl;
     }
 
-    fn replyExpiry(g: *Graph, reply: Reply) i64 {
+    pub fn replyExpiry(g: *Graph, reply: Reply) i64 {
         _ = g;
         return reply.stored_ns + @as(i64, reply.ttl) * std.time.ns_per_s;
     }

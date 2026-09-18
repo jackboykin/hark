@@ -423,10 +423,9 @@ test "trace one scenario" {
 }
 
 test "hark walk scenarios settle to today's answers" {
-    // Aggressive NSEC synthesis (RFC 8198) is the NSEC-index rule, not built.
-    const r = try replayDir("test/scenarios/hark", 8, &.{"007_aggressive_nsec_synthesises_sibling_nxdomain.rpl"});
-    try testing.expectEqual(90, r.parsed);
-    try testing.expectEqual(78, r.ran);
+    const r = try replayDir("test/scenarios/hark", 8, &.{});
+    try testing.expectEqual(91, r.parsed);
+    try testing.expectEqual(79, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
