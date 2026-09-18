@@ -399,6 +399,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .store_bytes = cfg.cache_size,
         .serve_stale_ttl = cfg.serve_stale_ttl,
         .min_ttl = cfg.min_ttl,
+        .prefetch = cfg.prefetch,
         .max_in_flight = cfg.max_in_flight,
         .trace = trace,
     }, e.edge());
@@ -451,7 +452,7 @@ fn logFootprint(g: *graph.Graph) void {
     var it = mem.tokenizeScalar(u8, buf[0..n], ' ');
     _ = it.next();
     const rss_pages = std.fmt.parseInt(u64, it.next() orelse return, 10) catch return;
-    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells, {d} resolutions and {d} exchanges in flight, {d} clients turned away", .{
+    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells, {d} resolutions and {d} exchanges in flight, {d} clients turned away; {d} refreshes, {d} refused", .{
         rss_pages * std.heap.pageSize() / (1024 * 1024),
         g.store.held / 1024,
         g.store.map.count(),
@@ -462,5 +463,7 @@ fn logFootprint(g: *graph.Graph) void {
         g.budgets,
         g.flights,
         g.shed,
+        g.refreshes,
+        g.refreshes_refused,
     });
 }

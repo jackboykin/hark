@@ -63,7 +63,8 @@ pub const Edge = struct {
     }
 };
 
-pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange };
+/// `refresh`: `answer` derived again for the store; nobody waits.
+pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange, refresh };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -111,6 +112,8 @@ pub const Config = struct {
     serve_stale_ttl: u32 = 0,
     /// Floor for every TTL but zero (`walk.replyTtl`).
     min_ttl: u32 = 0,
+    /// Refresh a fact hit just before it expires.
+    prefetch: bool = false,
     /// Null: DNSSEC off, nothing is judged.
     trust_anchor: ?dns.DsData = null,
     store_bytes: usize = 12 << 20,
@@ -199,6 +202,7 @@ pub const Value = union(Kind) {
     dnskey: trust.Chain,
     secure: trust.Chain,
     exchange: Outcome,
+    refresh: void,
 };
 
 /// Referenced by every cell charged to it.
@@ -206,7 +210,14 @@ pub const Budget = struct {
     queries: u32 = 0,
     deadline_ns: i64,
     refs: u32 = 0,
+    /// When a refresh began; 0 for a client.
+    refresh_ns: i64 = 0,
 };
+
+/// BIND's `prefetch 2`.
+pub const refresh_window_ns = 2 * std.time.ns_per_s;
+/// So a refresh does not time the client.
+const refresh_jitter_ns = std.time.ns_per_s;
 
 /// The model should cost less than a parse.
 pub const Tally = struct {
@@ -262,6 +273,7 @@ pub const Scratch = union(enum) {
     fn init(kind: Kind, arena: Allocator) !Scratch {
         return switch (kind) {
             .exchange => .none,
+            .refresh => init(.answer, arena),
             inline else => |k| blk: {
                 const p = try arena.create(@typeInfo(@FieldType(Scratch, @tagName(k))).pointer.child);
                 p.* = .{};
@@ -325,6 +337,8 @@ pub const Graph = struct {
     flights: u32 = 0,
     /// Clients turned away at the door.
     shed: u64 = 0,
+    refreshes: u64 = 0,
+    refreshes_refused: u64 = 0,
     created: u64 = 0,
     /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
@@ -341,8 +355,8 @@ pub const Graph = struct {
         errdefer g.deinit();
         // The root cut and NS set are axiomatic facts.
         const root: dns.Name = .{ .labels = &.{} };
-        try g.store.put(.{ .kind = .cut, .name = "" }, try g.store.build(.{ .cut = .{ .zone = root } }), std.math.maxInt(i64));
-        try g.store.put(.{ .kind = .ns, .name = "" }, try g.store.build(.{ .ns = .{ .names = &.{} } }), std.math.maxInt(i64));
+        try g.store.put(.{ .kind = .cut, .name = "" }, try g.store.build(.{ .cut = .{ .zone = root } }), std.math.maxInt(i64), 0);
+        try g.store.put(.{ .kind = .ns, .name = "" }, try g.store.build(.{ .ns = .{ .names = &.{} } }), std.math.maxInt(i64), 0);
         return g;
     }
 
@@ -398,7 +412,6 @@ pub const Graph = struct {
             return id;
         };
         const budget = try g.gpa.create(Budget);
-        errdefer g.gpa.destroy(budget);
         budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         const memo = if (cd) null else g.store.get(key, g.now());
         if (memo == null and (g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
@@ -407,8 +420,8 @@ pub const Graph = struct {
             return null;
         }
         const id = if (memo) |e| try g.materialise(key, name, budget, e) else try g.newCell(key, name, budget, 0);
-        g.budgets += 1;
         g.cell(id).holds += 1;
+        errdefer g.unhold(id);
         if (memo == null) try g.ready.append(g.gpa, id);
         return id;
     }
@@ -416,6 +429,25 @@ pub const Graph = struct {
     pub fn unhold(g: *Graph, id: CellId) void {
         g.cell(id).holds -= 1;
         g.release(id);
+    }
+
+    /// One per key at a time; holds itself until it settles.
+    pub fn refresh(g: *Graph, key: Key, name: dns.Name) !void {
+        const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
+        if (g.index.contains(rkey)) return;
+        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2) {
+            g.refreshes_refused += 1;
+            return;
+        }
+        const budget = try g.gpa.create(Budget);
+        const at = g.now() + g.edge.rng.intRangeLessThan(i64, 0, refresh_jitter_ns);
+        budget.* = .{ .deadline_ns = 0, .refresh_ns = g.now() };
+        const id = try g.newCell(rkey, name, budget, 0);
+        g.cell(id).holds += 1;
+        errdefer g.unhold(id);
+        try g.wake(id, at);
+        g.refreshes += 1;
+        if (g.cfg.trace) std.debug.print("  refresh {s} {t} in {d} ms\n", .{ key.name, key.rtype, @divTrunc(at - g.now(), std.time.ns_per_ms) });
     }
 
     pub fn drain(g: *Graph) !void {
@@ -428,7 +460,11 @@ pub const Graph = struct {
 
     pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
         if (completion == .wake) {
-            if (g.cell(id).gen == completion.wake) try g.ready.append(g.gpa, id);
+            if (g.cell(id).gen == completion.wake) {
+                // A refresh's budget runs from its first wake.
+                if (g.cell(id).key.kind == .refresh and g.cell(id).budget.deadline_ns == 0) g.cell(id).budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
+                try g.ready.append(g.gpa, id);
+            }
             return g.drain();
         }
         const c = g.cell(id);
@@ -484,33 +520,44 @@ pub const Graph = struct {
 
     // ── Cells ──────────────────────────────────────────────────────────
 
+    /// Owns `budget` from the call; all or nothing.
     pub fn newCell(g: *Graph, key: Key, name: dns.Name, budget: *Budget, depth: u8) !CellId {
+        errdefer if (budget.refs == 0) g.gpa.destroy(budget);
         const reused = g.free_ids.pop();
+        errdefer if (reused) |r| g.free_ids.appendAssumeCapacity(r);
         const id: CellId = reused orelse @intCast(g.cells.items.len);
         const c = if (reused != null) g.cells.items[id] else try g.gpa.create(Cell);
         errdefer if (reused == null) g.gpa.destroy(c);
         var arena = std.heap.ArenaAllocator.init(g.gpa);
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
-        const gen = if (reused != null) c.gen +% 1 else 0;
+        const own_key: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) };
+        const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
+        if (reused == null) try g.cells.append(g.gpa, c);
+        errdefer if (reused == null) {
+            _ = g.cells.pop();
+        };
+        if (key.kind != .exchange) {
+            // In progress keeps the slot. A settled owner yields it, key too:
+            // its arena dies with it.
+            const gop = try g.index.getOrPut(g.gpa, own_key);
+            if (!gop.found_existing or g.cell(gop.value_ptr.*).settled) {
+                gop.key_ptr.* = own_key;
+                gop.value_ptr.* = id;
+            }
+        }
+        // Nothing fallible past here: the errdefers assume `c` unbuilt.
         c.* = .{
-            .gen = gen,
-            .key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) },
-            .name = try dns.cloneNameFlat(arena.allocator(), name, false),
+            .gen = if (reused != null) c.gen +% 1 else 0,
+            .key = own_key,
+            .name = own_name,
             .budget = budget,
             .depth = depth,
             .arena = arena,
             .scratch = scratch,
         };
-        if (reused == null) try g.cells.append(g.gpa, c);
-        if (key.kind != .exchange) {
-            // An expired cell may own the entry: take its key too, or the
-            // name the map compares against dies with that cell's arena.
-            const gop = try g.index.getOrPut(g.gpa, c.key);
-            gop.key_ptr.* = c.key;
-            gop.value_ptr.* = id;
-        }
         budget.refs += 1;
+        if (budget.refs == 1) g.budgets += 1;
         g.live += 1;
         g.created += 1;
         return id;
@@ -610,14 +657,14 @@ pub const Graph = struct {
                 const blob = try g.store.build(value);
                 c.blob = blob;
                 c.value = try store.Store.parse(c.arena.allocator(), blob);
-                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns) catch |err| switch (err) {
+                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns, g.now()) catch |err| switch (err) {
                     error.Refused => {},
                     else => return err,
                 };
             },
             .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
             .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
-            .exchange => {},
+            .exchange, .refresh => {},
         }
         try g.ready.appendSlice(g.gpa, c.waiters.items);
         // An answer serves from its hops; everything else has copied out.
@@ -625,6 +672,8 @@ pub const Graph = struct {
             for (c.inputs.items) |i| g.unpin(i, id);
             c.inputs.clearRetainingCapacity();
         }
+        // The run's hold still pins a refresh; one release, below.
+        if (c.key.kind == .refresh) c.holds -= 1;
         g.release(id);
     }
 
@@ -633,25 +682,35 @@ pub const Graph = struct {
         return c.settled and c.expires_ns > g.now();
     }
 
-    /// In progress, or settled and fresh; a store hit is materialised,
-    /// unpinned.
+    pub fn bound(g: *Graph, budget: *const Budget) i64 {
+        return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.refresh_ns + refresh_window_ns);
+    }
+
+    /// Stored since the refresh began counts, inclusive: the edge reads the
+    /// clock once per event, so a refresh shares an instant with what its
+    /// trigger stored.
     fn lookup(g: *Graph, key: Key, name: dns.Name, budget: *Budget) !?CellId {
         const live = g.index.get(key);
-        if (live) |id| if (!g.cell(id).settled) return id;
-        if (g.store.get(key, g.now())) |e| {
+        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(budget) or e.stored_ns >= budget.refresh_ns) {
             if (live) |id| if (g.cell(id).blob == e.blob) return id;
             return try g.materialise(key, name, budget, e);
+        };
+        if (live) |id| {
+            const c = g.cell(id);
+            if (!c.settled or c.expires_ns > g.bound(budget) or (c.budget == budget and c.expires_ns > g.now())) return id;
         }
-        if (live) |id| if (g.cell(id).expires_ns > g.now()) return id;
         return null;
     }
 
     fn materialise(g: *Graph, key: Key, name: dns.Name, budget: *Budget, e: store.Entry) !CellId {
         const id = try g.newCell(key, name, budget, 0);
         const c = g.cell(id);
+        c.value = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
+            g.free(id, c) catch {};
+            return err;
+        };
         c.settled = true;
         c.blob = e.blob.ref();
-        c.value = try store.Store.parse(c.arena.allocator(), e.blob);
         c.expires_ns = e.expires_ns;
         return id;
     }
@@ -713,7 +772,7 @@ pub const Graph = struct {
         if (expires_ns <= g.now()) return;
         const blob = try g.store.build(value);
         errdefer g.store.unref(blob);
-        g.store.put(key, blob, expires_ns) catch |err| switch (err) {
+        g.store.put(key, blob, expires_ns, g.now()) catch |err| switch (err) {
             error.Refused => {},
             else => return err,
         };
@@ -746,7 +805,7 @@ pub const Graph = struct {
             .rrset => try walk.runRrset(g, id),
             .ns => try walk.runNs(g, id),
             .addr => try walk.runAddr(g, id),
-            .answer => try walk.runAnswer(g, id),
+            .answer, .refresh => try walk.runAnswer(g, id),
             .ds => try trust.runDs(g, id),
             .dnskey => try trust.runDnskey(g, id),
             .secure => try trust.runSecure(g, id),

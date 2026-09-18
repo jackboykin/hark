@@ -1,0 +1,130 @@
+; hark: root-hints = 127.0.10.1
+; hark: prefetch = yes
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a lapsing trust chain is refreshed alone
+
+; The record and both DNSKEY sets have an hour; the DS has 60 s. A hit
+; with 1 s left refreshes the DS and nothing else, and the client at 61 s
+; is still AD=1 without a query of its own.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 60 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 59
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3541 IN A 192.0.2.1
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 2
+
+STEP 7 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 8 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 9 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    . IN DNSKEY
+ENTRY_END
+
+STEP 10 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN DNSKEY
+ENTRY_END
+
+STEP 11 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+STEP 12 CHECK_MAX_QUERIES 5
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3539 IN A 192.0.2.1
+ENTRY_END
+
+STEP 15 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

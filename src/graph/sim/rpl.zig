@@ -120,6 +120,7 @@ pub const Scenario = struct {
     dns64_prefix: ?dns64.Prefix = null,
     serve_stale_ttl: ?u32 = null,
     min_ttl: ?u32 = null,
+    prefetch: ?bool = null,
     client_timeout_ms: u32 = 5000,
     /// Zones the harness signs; the first must be the root.
     dnssec_zones: []const []const u8 = &.{},
@@ -246,6 +247,8 @@ const Parser = struct {
             s.serve_stale_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "min-ttl")) {
             s.min_ttl = try p.int(u32, val);
+        } else if (mem.eql(u8, key, "prefetch")) {
+            s.prefetch = yes(val);
         } else if (mem.eql(u8, key, "client-timeout")) {
             const secs = std.fmt.parseFloat(f64, val) catch return p.fail("client-timeout: not a number");
             s.client_timeout_ms = @intFromFloat(secs * 1000);

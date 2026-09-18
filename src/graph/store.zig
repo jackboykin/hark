@@ -55,6 +55,7 @@ pub const Blob = extern struct {
 pub const Entry = struct {
     blob: *Blob,
     expires_ns: i64,
+    stored_ns: i64 = 0,
     /// A failed refresh holds the expired fact until then (RFC 8767 §5).
     hold_until_ns: i64 = 0,
 };
@@ -130,7 +131,7 @@ pub const Store = struct {
     }
 
     /// Takes one reference. A new key over the cap must have knocked before.
-    pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64) !void {
+    pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
             s.held -= gop.value_ptr.blob.len;
@@ -146,7 +147,7 @@ pub const Store = struct {
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
         // A new version drops any hold.
-        gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns };
+        gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns, .stored_ns = now_ns };
         s.held += blob.len;
         s.visited.set(gop.index);
         while (s.held > s.cap and s.map.count() > 1) s.evict();
@@ -243,7 +244,7 @@ pub const Store = struct {
                 try w.int(u8, @backingInt(a.status));
                 try w.int(u8, @intFromBool(a.broken));
             },
-            .secure, .exchange => unreachable,
+            .secure, .exchange, .refresh => unreachable,
         }
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
@@ -302,7 +303,7 @@ pub const Store = struct {
                 const status: dnssec.SecurityStatus = @fromBackingInt(@as(u2, @intCast(try r.int(u8))));
                 break :blk .{ .answer = .{ .hops = &.{}, .status = status, .broken = try r.int(u8) != 0 } };
             },
-            .secure, .exchange => unreachable,
+            .secure, .exchange, .refresh => unreachable,
         };
     }
 };
@@ -431,7 +432,7 @@ test "a fact survives the blob byte for byte" {
     const key: Key = .{ .kind = .rrset, .rtype = .a, .name = "www.example.com" };
 
     const blob = try s.build(.{ .rrset = reply });
-    try s.put(key, blob, 1000);
+    try s.put(key, blob, 1000, 0);
     try testing.expectEqual(blob, s.get(key, 999).?.blob);
     try testing.expectEqual(null, s.get(key, 1000));
     try testing.expectEqual(blob.len, s.bytes);
@@ -456,7 +457,7 @@ test "a fact survives the blob byte for byte" {
 
     _ = blob.ref();
     const newer = try s.build(.{ .addr = .{ .addrs = &.{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) }, .provisional = true } });
-    try s.put(key, newer, 2000);
+    try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
     const addr = (try Store.parse(arena, newer)).addr;
     try testing.expect(addr.provisional and addr.addrs.len == 2 and na.ipEqual(addr.addrs[1], na.initIp6(@splat(1), 853, 0, 0)));
@@ -479,17 +480,17 @@ test "the cap holds by eviction and admission" {
         _ = try std.fmt.bufPrint(&names[i], "k{d}", .{i});
         const key: Key = .{ .kind = .cut, .name = std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3] };
         const blob = try s.build(.{ .cut = .{ .zone = zone } });
-        s.put(key, blob, 10) catch |err| {
+        s.put(key, blob, 10, 0) catch |err| {
             try testing.expectEqual(error.Refused, err);
-            try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10);
+            try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
         };
     }
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
     try testing.expect(s.refusals > 0);
     const key: Key = .{ .kind = .cut, .name = "again" };
-    try testing.expectError(error.Refused, s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10));
-    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10);
+    try testing.expectError(error.Refused, s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0));
+    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
     try testing.expect(s.get(key, 0) != null);
     try testing.expectEqual(s.held, s.bytes);
 }

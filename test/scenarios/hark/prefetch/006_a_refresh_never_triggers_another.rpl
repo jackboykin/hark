@@ -1,0 +1,143 @@
+; hark: root-hints = 127.0.10.1
+; hark: prefetch = yes
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a refresh never triggers another
+
+; A DS with 1 s of life binds the answer inside the window on every
+; derivation, and the floor reads hops alone. The client's hit refreshes
+; the DS once; the refresh's own answer, lapsing just the same, does not.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 1 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 10
+
+STEP 4 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 5 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    . IN DNSKEY
+ENTRY_END
+
+STEP 7 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN DNSKEY
+ENTRY_END
+
+STEP 8 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+STEP 9 CHECK_MAX_QUERIES 5
+
+; A DS this short is gone by now; the client that follows re-derives it,
+; and the harness's warm re-ask lands on that.
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3590 IN A 192.0.2.1
+ENTRY_END
+
+; The floor reads hops alone, so that hit asks for a refresh too; but
+; the DS it re-derived was stored as the refresh began, so the refresh
+; reuses it and fetches nothing: such a zone costs one DS per miss
+; upstream, and locally a cell, a wake and one re-verification per miss.
+STEP 12 TIME_PASSES ELAPSE 2
+
+STEP 13 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+STEP 14 CHECK_MAX_QUERIES 6
+
+; Lands the warm re-ask on a live DS.
+STEP 15 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 16 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3588 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

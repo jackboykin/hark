@@ -1,0 +1,110 @@
+; hark: root-hints = 127.0.10.1
+; hark: prefetch = yes
+
+SCENARIO_BEGIN a short TTL is never refreshed
+
+; A 5 s record hit with 1 s left is a miss at 5 s all the same:
+; refreshing it would double a steering zone's traffic (BIND's 9 s floor).
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 5 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 5 IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 4
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 1 IN A 10.20.30.40
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 2
+
+STEP 7 CHECK_MAX_QUERIES 3
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 5 IN A 10.20.30.40
+ENTRY_END
+
+STEP 10 CHECK_MAX_QUERIES 4
+
+SCENARIO_END

@@ -36,6 +36,7 @@ pub const SecureScratch = struct {
 };
 const max_groups = 8;
 
+/// Memoised from a refresh too: the marker bounds validation cost.
 fn bogusExpiry(g: *Graph) i64 {
     return g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
 }
@@ -146,14 +147,15 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const t = g.cell(rid);
     const key = try g.keyFor(.secure, t.name, t.key.rtype);
-    if (g.index.get(key)) |sid| if (g.cell(sid).scratch.secure.target == rid and (!g.cell(sid).settled or g.fresh(sid))) {
+    const budget = g.cell(by).budget;
+    if (g.index.get(key)) |sid| if (g.cell(sid).scratch.secure.target == rid and (!g.cell(sid).settled or g.cell(sid).expires_ns > g.bound(budget) or (g.cell(sid).budget == budget and g.fresh(sid)))) {
         try g.pin(sid, by);
         return sid;
     };
     const sid = try g.newCell(key, t.name, g.cell(by).budget, g.cell(by).depth);
     g.cell(sid).scratch.secure.target = rid;
     try g.pin(sid, by);
-    if (t.blob) |b| if (b.verdict.until_ns > g.now()) {
+    if (t.blob) |b| if (b.verdict.until_ns > g.bound(budget)) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
     };

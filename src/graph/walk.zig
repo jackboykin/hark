@@ -30,6 +30,8 @@ const max_hedge = 3;
 pub const stale_hold_s = 30;
 /// RFC 8767 §5: a refresh past a stub's patience answers stale instead.
 pub const stale_client_ms = 1800;
+/// BIND's `prefetch 2 9`, the 9: or steering zones double.
+pub const refresh_floor_s = 9;
 
 pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport };
 
@@ -194,6 +196,7 @@ pub const AnswerScratch = struct {
 // ── Rules ──────────────────────────────────────────────────────────────
 
 pub fn runAnswer(g: *Graph, id: CellId) !void {
+    const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
     if (s.stale_at == 0) s.stale_at = g.now() + stale_client_ms * std.time.ns_per_ms;
@@ -224,11 +227,11 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             next = r.target;
             var broken = s.n > max_cname_chain;
             for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
-            if (broken) return g.settle(id, .{ .answer = .{ .hops = try g.cell(id).arena.allocator().dupe(CellId, s.hops[0..s.n]), .broken = true } }, failureExpiry(g, id));
+            if (broken) return settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .broken = true }, failureExpiry(g, id));
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse
-            return g.settle(id, .{ .answer = .{ .hops = try g.cell(id).arena.allocator().dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.now());
+            return settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .broken = true }, g.now());
         s.n += 1;
     }
     var expires: i64 = std.math.maxInt(i64);
@@ -250,8 +253,28 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         }
         if (status == .bogus) expires = failureExpiry(g, id);
     }
+    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .status = status, .judged = s.judged[0..s.nj], .stale = s.stale[0..s.n] }, expires);
+    // Best effort.
+    if (kind == .answer and g.cfg.prefetch and !stale and refreshable(g, s, expires))
+        g.refresh(g.cell(id).key, g.cell(id).name) catch {};
+}
+
+/// A refresh's inputs are its point; its own answer is nobody's.
+fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
+    if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
-    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try arena.dupe(CellId, s.judged[0..s.nj]), .stale = try arena.dupe(?*const Reply, s.stale[0..s.n]) } }, expires);
+    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .broken = a.broken, .status = a.status, .judged = try arena.dupe(CellId, a.judged), .stale = try arena.dupe(?*const Reply, a.stale) } }, expires);
+}
+
+/// Lapses inside the window, and no lapsing hop was born short.
+fn refreshable(g: *Graph, s: *const AnswerScratch, expires: i64) bool {
+    const window = graph.refresh_window_ns;
+    if (expires <= g.now() or expires > g.now() + window) return false;
+    for (s.hops[0..s.n]) |h| {
+        const c = g.cell(h);
+        if (c.expires_ns <= g.now() + window and c.value.rrset.ttl <= refresh_floor_s) return false;
+    }
+    return true;
 }
 
 /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
@@ -578,10 +601,10 @@ fn servfail(ede: dns.Ede.Code) Reply {
     return .{ .kind = .servfail, .rcode = .server_failure, .aa = false, .ede = ede };
 }
 
-/// A failure is a fact only for the client's own question; a
-/// sub-resolution's is retried by the next asker.
+/// A fact for the client's SERVFAIL window alone.
 fn failureExpiry(g: *Graph, id: CellId) i64 {
-    return g.now() + if (g.cell(id).depth == 0) @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s else 0;
+    const c = g.cell(id);
+    return g.now() + if (c.depth == 0 and c.budget.refresh_ns == 0) @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s else 0;
 }
 
 /// Publish the child's cut, NS set and glue; returns the delegation's
