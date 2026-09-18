@@ -58,6 +58,8 @@ pub const Ask = struct {
     /// (`delegation.failurePrecedence`), served when every server fails
     /// with an rcode.
     held: ?CellId = null,
+    /// The zone's DS names ML-DSA-44, whose DO answers truncate: TCP from the start.
+    tcp_first: bool = false,
 
     comptime {
         std.debug.assert(max_servers < 32);
@@ -96,6 +98,7 @@ pub const Ask = struct {
         var live: usize = 0;
         for (addrs) |s| live += @intFromBool(!g.isDead(s));
         const from = a.nservers;
+        if (from == 0) a.tcp_first = g.cfg.trust_anchor != null and zoneTruncates(g, a.zone);
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
             if (live > 0 and g.isDead(s)) continue;
@@ -789,7 +792,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (a.next < a.nservers and (a.nattempts == 0 or early)) {
             const server = a.next;
             a.next += 1;
-            const state = try sendTo(g, id, a, server, .udp, qname, qtype);
+            const state = try sendTo(g, id, a, server, if (a.tcp_first) .tcp else .udp, qname, qtype);
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
             if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.wake(id, a.hedge_at);
             continue;
@@ -798,6 +801,12 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         // Every known server tried: gather again for what settled since.
         a.have_servers = false;
     }
+}
+
+fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
+    const key = g.keyFor(.rrset, zone, .ds) catch return false;
+    const ds = (g.peek(key) catch return false) orelse return false;
+    return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
 /// `delegation.recordFailure`'s rule: a later reply wins ties.
