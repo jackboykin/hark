@@ -16,12 +16,48 @@ const delegation = @import("../delegation.zig");
 const dnssec = @import("../dnssec.zig");
 const monotonic = @import("../monotonic.zig");
 const ns_rtt = @import("../ns_rtt.zig");
-const sim = @import("sim.zig");
 const trust = @import("trust.zig");
 
 const max_cname_chain = @import("../cache.zig").max_cname_chain;
 
 pub const CellId = u32;
+
+pub const Transport = ns_rtt.Transport;
+
+pub const Exchange = struct {
+    id: CellId,
+    server: na.Address,
+    transport: Transport,
+    wire: []const u8,
+    deadline_ns: i64,
+};
+
+pub const Completion = union(enum) {
+    /// Bytes the cell may hold: they are parsed in place.
+    reply: []const u8,
+    timeout,
+    /// The cell asked to run again at this time.
+    wake,
+};
+
+/// What the graph asks of the world; the simulator and the live edge
+/// both implement it.
+pub const Edge = struct {
+    ctx: *anyopaque,
+    now_ns: *const i64,
+    wall_sec: *const i64,
+    rng: std.Random,
+    sendFn: *const fn (*anyopaque, Exchange) anyerror!void,
+    wakeFn: *const fn (*anyopaque, CellId, i64) anyerror!void,
+
+    fn send(e: Edge, ex: Exchange) !void {
+        return e.sendFn(e.ctx, ex);
+    }
+
+    fn wake(e: Edge, id: CellId, at_ns: i64) !void {
+        return e.wakeFn(e.ctx, id, at_ns);
+    }
+};
 
 pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange };
 
@@ -176,7 +212,7 @@ const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
 
-const Attempt = struct { exchange: CellId, server: na.Address, transport: sim.Transport };
+const Attempt = struct { exchange: CellId, server: na.Address, transport: Transport };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
@@ -295,7 +331,7 @@ const ExchangeScratch = struct {
     sent_name: dns.Name,
     qtype: dns.RType,
     server: na.Address,
-    transport: sim.Transport,
+    transport: Transport,
     sent_ns: i64,
 };
 
@@ -333,7 +369,7 @@ pub const Graph = struct {
     arena: Allocator,
     gpa: Allocator,
     cfg: Config,
-    edge: *sim.Sim,
+    edge: Edge,
     /// Cells live in the arena so rule-held pointers survive appends.
     cells: std.ArrayList(*Cell) = .empty,
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
@@ -342,7 +378,7 @@ pub const Graph = struct {
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
 
-    pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: *sim.Sim) !Graph {
+    pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge };
         // The root cut and NS set are axiomatic.
         const root: dns.Name = .{ .labels = &.{} };
@@ -364,12 +400,12 @@ pub const Graph = struct {
     }
 
     pub fn now(g: *const Graph) i64 {
-        return g.edge.now_ns;
+        return g.edge.now_ns.*;
     }
 
     /// Wall seconds, for signature windows.
     pub fn wallNow(g: *const Graph) u32 {
-        return @intCast(g.edge.wall_sec);
+        return @intCast(g.edge.wall_sec.*);
     }
 
     pub fn cell(g: *Graph, id: CellId) *Cell {
@@ -398,7 +434,7 @@ pub const Graph = struct {
         while (g.ready.pop()) |id| try g.run(id);
     }
 
-    pub fn complete(g: *Graph, id: CellId, completion: sim.Completion) !void {
+    pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
         if (completion == .wake) {
             try g.ready.append(g.gpa, id);
             return g.drain();
@@ -820,7 +856,7 @@ pub const Graph = struct {
                             return g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
                         }
                         s2.ask.reset(ref.zone_cut);
-                        s2.ask.seed(ref.addrs[0..ref.addr_count], g.edge.random());
+                        s2.ask.seed(ref.addrs[0..ref.addr_count], g.edge.rng);
                         continue;
                     }
                     const reply = try g.classify(msg, zone, name, qtype);
@@ -1107,7 +1143,7 @@ pub const Graph = struct {
     }
 
     /// One attempt on the estimate's timeout; only the last of all is uncapped.
-    fn sendTo(g: *Graph, id: CellId, a: *Ask, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType) !ns_rtt.RttState {
+    fn sendTo(g: *Graph, id: CellId, a: *Ask, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType) !ns_rtt.RttState {
         if (!a.hasTried(server) and a.ntried < max_servers) {
             a.tried[a.ntried] = server;
             a.ntried += 1;
@@ -1184,7 +1220,7 @@ pub const Graph = struct {
                     1 => 2,
                     else => 1,
                 };
-                g.edge.random().shuffle(dns.Name, unknown.items);
+                g.edge.rng.shuffle(dns.Name, unknown.items);
                 var demanded = false;
                 for (unknown.items[0..@min(limit, unknown.items.len)]) |host| {
                     const aid = try g.demand(id, try g.keyFor(.addr, host, .a), host, g.cell(id).depth) orelse continue;
@@ -1207,7 +1243,7 @@ pub const Graph = struct {
         a.nservers = @intCast(@min(list.items.len, max_servers));
         @memcpy(a.servers[0..a.nservers], list.items[0..a.nservers]);
         for (0..a.nservers) |i| a.order[i] = @intCast(i);
-        g.edge.random().shuffle(u8, a.order[0..a.nservers]);
+        g.edge.rng.shuffle(u8, a.order[0..a.nservers]);
         a.next = 0;
         a.have_servers = true;
         return .ready;
@@ -1217,7 +1253,7 @@ pub const Graph = struct {
 
     /// One query to one server, charged to the root; `.budget` when the
     /// root's budget or deadline refuses it.
-    fn exchange(g: *Graph, by: CellId, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !CellId {
+    fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !CellId {
         const root = g.cell(g.cell(by).root);
         const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, g.cell(by).root, g.cell(by).depth);
         try g.addWaiter(id, by);
@@ -1228,7 +1264,7 @@ pub const Graph = struct {
         root.budget.queries += 1;
         const clock = Tally.clock(&g.tally.send_ns);
         defer clock.stop();
-        const rng = g.edge.random();
+        const rng = g.edge.rng;
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const qid = rng.int(u16);
         const msg = try dns.buildQuery(g.arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });

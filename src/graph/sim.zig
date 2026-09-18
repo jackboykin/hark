@@ -8,23 +8,11 @@ const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sign = @import("sign.zig");
+const graph = @import("graph.zig");
 
-pub const Transport = @import("../ns_rtt.zig").Transport;
-
-pub const Exchange = struct {
-    id: u32,
-    server: na.Address,
-    transport: Transport,
-    wire: []const u8,
-    deadline_ns: i64,
-};
-
-pub const Completion = union(enum) {
-    reply: []const u8,
-    timeout,
-    /// The cell asked to run again at this time.
-    wake,
-};
+const Transport = graph.Transport;
+const Exchange = graph.Exchange;
+const Completion = graph.Completion;
 
 pub const LogRow = struct {
     server: na.Address,
@@ -89,6 +77,18 @@ pub const Sim = struct {
 
     pub fn random(s: *Sim) std.Random {
         return s.prng.random();
+    }
+
+    pub fn edge(s: *Sim) graph.Edge {
+        return .{ .ctx = s, .now_ns = &s.now_ns, .wall_sec = &s.wall_sec, .rng = s.random(), .sendFn = sendErased, .wakeFn = wakeErased };
+    }
+
+    fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
+        return @as(*Sim, @ptrCast(@alignCast(ctx))).send(ex);
+    }
+
+    fn wakeErased(ctx: *anyopaque, id: u32, at_ns: i64) anyerror!void {
+        return @as(*Sim, @ptrCast(@alignCast(ctx))).wake(id, at_ns);
     }
 
     pub fn advance(s: *Sim, seconds: u32) void {
