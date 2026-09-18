@@ -7,6 +7,7 @@ allow-from = []               # client CIDR allowlist; empty = allow all.
 workers = 2                   # client event loops; raise for high QPS
 event-loop = "epoll"          # or "io_uring": ~7% more cache-hit qps; refused by default seccomp profiles
 resolution-threads = 4        # upstream query threads per worker
+max-in-flight = 1024          # resolutions or upstream queries live at once; past it UDP is dropped, TCP closed
 max-udp-payload = 1232        # advertised EDNS0 buffer size
 minimal-responses = true      # strip non-load-bearing authority/additional RRs
 tcp-idle-timeout-ms = 5000    # close idle TCP clients (RFC 7766 §6.2.3)

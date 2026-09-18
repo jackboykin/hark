@@ -107,8 +107,8 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     if (held) |h| g.unhold(h);
     held = null;
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
-    if (g.live != 0 or g.budgets != 0) {
-        report.msg = "cells or budgets outlived the scenario";
+    if (g.live != 0 or g.budgets != 0 or g.flights != 0) {
+        report.msg = "cells, budgets or flights outlived the scenario";
         return error.ScenarioFailed;
     }
 }
@@ -155,7 +155,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     if (held.*) |h| g.unhold(h);
     held.* = null;
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
-    const root = try g.demandRoot(q.name, q.qtype, client.cd);
+    const root = (try g.demandRoot(q.name, q.qtype, client.cd)).?;
     try g.drain();
     const cached = g.cell(root).settled;
     while (!g.cell(root).settled) {
@@ -530,7 +530,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
         defer g.deinit();
         const start = s.now_ns;
-        const root = try g.demandRoot(q.name, q.qtype, false);
+        const root = (try g.demandRoot(q.name, q.qtype, false)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -562,7 +562,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
-        const root = try g.demandRoot(q.name, q.qtype, false);
+        const root = (try g.demandRoot(q.name, q.qtype, false)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -574,4 +574,54 @@ test "a silent sibling is hedged past and still records its timeout" {
         for (s.log.items) |row| asked_ns1 = asked_ns1 or na.AddressKey.fromAddress(row.server).eql(ns1);
         if (!all_dead) try testing.expect(!asked_ns1);
     };
+}
+
+test "the door counts resolutions and exchanges in flight" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: rpl.Diag = .{};
+    const scenario = try rpl.parse(arena,
+        \\; hark: root-hints = 127.0.10.1
+        \\SCENARIO_BEGIN admission
+        \\RANGE_BEGIN 0 100
+        \\  ADDRESS 127.0.10.1
+        \\  ENTRY_BEGIN
+        \\    MATCH opcode
+        \\    ADJUST copy_id copy_query
+        \\    REPLY QR AA NOERROR
+        \\    SECTION QUESTION
+        \\      www.example.com. IN A
+        \\    SECTION ANSWER
+        \\      www.example.com. 60 IN A 10.20.30.40
+        \\  ENTRY_END
+        \\RANGE_END
+        \\STEP 1 QUERY
+        \\ENTRY_BEGIN
+        \\  REPLY RD
+        \\  SECTION QUESTION
+        \\    www.example.com. IN A
+        \\ENTRY_END
+        \\SCENARIO_END
+    , &diag);
+    const q = scenario.steps[0].entry.?.questions[0];
+    const other = try dns.parseDottedName(arena, "other.example.com.");
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
+    defer s.deinit();
+    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_in_flight = 1 }, s.edge());
+    defer g.deinit();
+    const root = (try g.demandRoot(q.name, q.qtype, false)).?;
+    try g.drain();
+    try testing.expectEqual(1, g.budgets);
+    try testing.expectEqual(1, g.flights);
+    // New work is turned away; the same question joins the one in progress.
+    try testing.expectEqual(null, try g.demandRoot(other, .a, false));
+    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, false)).?);
+    try testing.expectEqual(1, g.shed);
+    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    try testing.expectEqual(0, g.flights);
+    g.unhold(root);
+    g.unhold(root);
+    try testing.expectEqual(0, g.live);
+    try testing.expectEqual(0, g.budgets);
 }

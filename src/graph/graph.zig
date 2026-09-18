@@ -100,6 +100,8 @@ pub const Config = struct {
     /// The hedge stagger before a server has answered; 0: no hedge.
     stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
+    /// Resolutions, or exchanges, in flight at once; a client past either is turned away.
+    max_in_flight: u32 = 1024,
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     servfail_ttl: u32 = 5,
@@ -428,6 +430,10 @@ pub const Graph = struct {
     checks: u64 = 0,
     live: u32 = 0,
     budgets: u32 = 0,
+    /// Exchanges the edge holds.
+    flights: u32 = 0,
+    /// Clients turned away at the door.
+    shed: u64 = 0,
     created: u64 = 0,
     /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
@@ -492,7 +498,9 @@ pub const Graph = struct {
 
     /// Held for the client until `unhold`. A failed answer is memoised for
     /// its SERVFAIL window, not for a client with CD, who is owed the data.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool) !CellId {
+    /// Null: new work past `max_in_flight`; what is in progress or in the
+    /// store is always served.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool) !?CellId {
         const key = try g.keyFor(.answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled or g.fresh(id)) {
             g.cell(id).holds += 1;
@@ -502,6 +510,11 @@ pub const Graph = struct {
         errdefer g.gpa.destroy(budget);
         budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         const memo = if (cd) null else g.store.get(key, g.now());
+        if (memo == null and (g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
+            g.shed += 1;
+            g.gpa.destroy(budget);
+            return null;
+        }
         const id = if (memo) |e| try g.materialise(key, name, budget, e) else try g.newCell(key, name, budget, 0);
         g.budgets += 1;
         g.cell(id).holds += 1;
@@ -569,6 +582,7 @@ pub const Graph = struct {
             else => {},
         }
         c.holds -= 1;
+        g.flights -= 1;
         try g.settle(id, .{ .exchange = outcome }, g.now());
         try g.drain();
     }
@@ -1518,6 +1532,7 @@ pub const Graph = struct {
             .wire = wire,
             .deadline_ns = @min(budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
         });
+        g.flights += 1;
         return id;
     }
 };

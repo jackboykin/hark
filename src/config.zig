@@ -53,6 +53,9 @@ pub const ServerConfig = struct {
     workers: u16,
     event_loop: Backend,
     resolution_threads: u16,
+    /// Resolutions, or upstream queries, in flight at once; past either the
+    /// client is turned away (UDP silent, TCP closed).
+    max_in_flight: u32,
     stagger_ms: u32,
     log_queries: bool,
     max_udp_payload: u16,
@@ -181,6 +184,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .workers = 2,
         .event_loop = .epoll,
         .resolution_threads = 4,
+        .max_in_flight = 1024,
         .stagger_ms = 150,
         .log_queries = false,
         .max_udp_payload = @import("dns.zig").edns_udp_payload,
@@ -217,6 +221,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "workers", .kind = .integer },
         .{ .name = "event-loop", .kind = .string },
         .{ .name = "resolution-threads", .kind = .integer },
+        .{ .name = "max-in-flight", .kind = .integer },
         .{ .name = "max-udp-payload", .kind = .integer },
         .{ .name = "user", .kind = .integer },
         .{ .name = "group", .kind = .integer },
@@ -361,6 +366,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
                 return error.InvalidWorkerCount;
             }
             cfg.resolution_threads = @intCast(rt);
+        }
+        if (try nonNegative(u32, server, "max-in-flight")) |v| {
+            if (v == 0) {
+                errLog("config: max-in-flight must not be 0", .{});
+                return error.InvalidValue;
+            }
+            cfg.max_in_flight = v;
         }
         if (server.getInteger("max-udp-payload")) |m| {
             const dns_mod = @import("dns.zig");
@@ -690,6 +702,7 @@ test "parse full config" {
         \\[server]
         \\listen = ["127.0.0.1:8053"]
         \\workers = 2
+        \\max-in-flight = 64
         \\
         \\[resolver]
         \\dnssec = true
@@ -703,6 +716,7 @@ test "parse full config" {
     try testing.expectEqual(@as(usize, 1), cfg.listen.len);
     try testing.expectEqual(@as(u16, 8053), cfg.listen[0].getPort());
     try testing.expectEqual(@as(u16, 2), cfg.workers);
+    try testing.expectEqual(@as(u32, 64), cfg.max_in_flight);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(false, cfg.qname_minimization);
     try testing.expectEqual(@as(usize, 8388608), cfg.cache_size);

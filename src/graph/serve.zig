@@ -229,6 +229,7 @@ const Server = struct {
         }
         c.len += rc;
         c.last_ns = s.e.now_ns;
+        const tok = c.token;
         var start: usize = 0;
         while (c.len - start >= 2) {
             const flen: usize = mem.readInt(u16, c.buf[start..][0..2], .big);
@@ -237,6 +238,8 @@ const Server = struct {
             c.served += 1;
             c.owed += 1;
             try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c });
+            // Turned away, or a failed write: the connection is gone.
+            if (s.watched.items[tok] != .conn) return;
             start += 2 + flen;
         }
         mem.copyForwards(u8, c.buf[0 .. c.len - start], c.buf[start..c.len]);
@@ -297,7 +300,8 @@ const Server = struct {
         const action = special_use.classify(name, q.qtype);
         if (action != .none) return s.send(reply, query, try special_use.synthesize(arena, name, action), null);
         if (q.qtype == .any) return s.send(reply, query, (try hinfo(arena, q, client)).msg, null);
-        const root = try s.g.demandRoot(q.name, q.qtype, client.cd);
+        // BCP 140 again: turned away is silence on UDP, a close on TCP.
+        const root = try s.g.demandRoot(q.name, q.qtype, client.cd) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
         if (s.g.cell(root).settled) {
             defer s.g.unhold(root);
@@ -385,6 +389,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .stagger_ms = cfg.stagger_ms,
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,
         .store_bytes = cfg.cache_size,
+        .max_in_flight = cfg.max_in_flight,
         .trace = trace,
     }, e.edge());
     defer g.deinit();
@@ -431,7 +436,7 @@ fn logFootprint(g: *graph.Graph) void {
     var it = mem.tokenizeScalar(u8, buf[0..n], ' ');
     _ = it.next();
     const rss_pages = std.fmt.parseInt(u64, it.next() orelse return, 10) catch return;
-    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells", .{
+    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells, {d} resolutions and {d} exchanges in flight, {d} clients turned away", .{
         rss_pages * std.heap.pageSize() / (1024 * 1024),
         g.store.held / 1024,
         g.store.map.count(),
@@ -439,5 +444,8 @@ fn logFootprint(g: *graph.Graph) void {
         g.store.evictions,
         g.store.refusals,
         g.live,
+        g.budgets,
+        g.flights,
+        g.shed,
     });
 }
