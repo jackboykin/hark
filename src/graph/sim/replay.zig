@@ -4,12 +4,12 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const testing = std.testing;
-const dns = @import("../dns.zig");
-const na = @import("../net_address.zig");
+const dns = @import("../../dns.zig");
+const na = @import("../../net_address.zig");
 const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
-const graph = @import("graph.zig");
-const answer = @import("answer.zig");
+const graph = @import("../graph.zig");
+const answer = @import("../answer.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -561,7 +561,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         defer s.deinit();
         var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
         defer g.deinit();
-        const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
+        const dead: @import("../../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
         const root = (try g.demandRoot(q.name, q.qtype, false)).?;

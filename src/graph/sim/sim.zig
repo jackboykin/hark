@@ -4,11 +4,11 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const dns = @import("../dns.zig");
-const na = @import("../net_address.zig");
+const dns = @import("../../dns.zig");
+const na = @import("../../net_address.zig");
 const rpl = @import("rpl.zig");
 const sign = @import("sign.zig");
-const graph = @import("graph.zig");
+const graph = @import("../graph.zig");
 
 const Transport = graph.Transport;
 const Exchange = graph.Exchange;
