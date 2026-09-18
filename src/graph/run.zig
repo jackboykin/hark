@@ -329,9 +329,9 @@ fn walkOnly(s: *const rpl.Scenario) bool {
     return s.dnssec_zones.len == 0 and s.dns64_prefix == null and s.serve_stale_ttl == null and s.rebinding_enabled == null;
 }
 
-/// Replay every walk-only scenario under `root`, each under `seeds` seeds,
-/// and check that one seed replays to one upstream query log.
-fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { ran: usize, failed: usize } {
+/// Replay every walk-only scenario under `root` across `seeds`, checking
+/// that one seed replays to one upstream query log.
+fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { parsed: usize, ran: usize, failed: usize } {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -340,6 +340,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
     defer dir.close(io);
     var walker = try dir.walk(testing.allocator);
     defer walker.deinit();
+    var parsed: usize = 0;
     var ran: usize = 0;
     var failed: usize = 0;
     while (try walker.next(io)) |ent| {
@@ -350,6 +351,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
             error.UnsupportedRType => continue,
             else => return err,
         };
+        parsed += 1;
         if (!walkOnly(&scenario)) continue;
         var expect_fail = false;
         for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
@@ -381,11 +383,13 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
             }
         }
     }
-    return .{ .ran = ran, .failed = failed };
+    return .{ .parsed = parsed, .ran = ran, .failed = failed };
 }
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
+    // Every scenario loads; the walk-only ones replay.
+    try testing.expectEqual(88, r.parsed);
     try testing.expectEqual(44, r.ran);
     try testing.expectEqual(0, r.failed);
 }
@@ -403,6 +407,6 @@ test "lifted unbound walk scenarios settle to today's answers" {
         "iter_domain_sale.rpl",
         "iter_domain_sale_nschange.rpl",
     });
-    try testing.expectEqual(16, r.ran);
+    try testing.expectEqual(18, r.ran);
     try testing.expectEqual(0, r.failed);
 }

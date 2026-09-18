@@ -517,7 +517,17 @@ const Parser = struct {
     }
 
     /// `name [ttl] [class] type rdata…` in any of testbound's orders.
-    fn parseRr(p: *Parser, line: []const u8, ds_from: *std.ArrayList(DsFrom)) Error!dns.ResourceRecord {
+    fn parseRr(p: *Parser, raw: []const u8, ds_from: *std.ArrayList(DsFrom)) Error!dns.ResourceRecord {
+        // `;` ends the record unless quoted (`;{id = 2854}`).
+        var line = raw;
+        var quoted = false;
+        for (raw, 0..) |c, i| {
+            quoted = quoted != (c == '"');
+            if (c == ';' and !quoted) {
+                line = raw[0..i];
+                break;
+            }
+        }
         var toks = mem.tokenizeAny(u8, line, " \t");
         const owner = try p.name(toks.next().?);
         var ttl: u32 = default_ttl;
@@ -588,6 +598,27 @@ const Parser = struct {
                     .digest = try p.hex(toks),
                 } };
             },
+            .dnskey => return .{ .dnskey = .{
+                .flags = try p.int(u16, try p.word(toks)),
+                .protocol = try p.int(u8, try p.word(toks)),
+                .algorithm = try p.algorithm(try p.word(toks)),
+                .public_key = try p.base64(toks),
+            } },
+            .rrsig => return .{ .rrsig = .{
+                .type_covered = rtypeFromText(try p.word(toks)) orelse return p.fail("unknown RRSIG type covered"),
+                .algorithm = try p.algorithm(try p.word(toks)),
+                .labels = try p.int(u8, try p.word(toks)),
+                .original_ttl = try p.int(u32, try p.word(toks)),
+                .sig_expiration = try p.sigTime(try p.word(toks)),
+                .sig_inception = try p.sigTime(try p.word(toks)),
+                .key_tag = try p.int(u16, try p.word(toks)),
+                .signer_name = try p.name(try p.word(toks)),
+                .signature = try p.base64(toks),
+            } },
+            .nsec => return .{ .nsec = .{
+                .next_domain_name = try p.name(try p.word(toks)),
+                .type_bit_maps = try p.typeBitmap(toks),
+            } },
             else => {
                 if (rtype != hinfo) return error.UnsupportedRType;
                 // Wire form, as the resolver synthesises it (RFC 8482).
@@ -625,6 +656,69 @@ const Parser = struct {
         const out = try p.arena.alloc(u8, text.items.len / 2);
         _ = std.fmt.hexToBytes(out, text.items) catch return p.fail("bad hex");
         return out;
+    }
+
+    /// A number, or an IANA mnemonic as older corpus files spell it.
+    fn algorithm(p: *Parser, text: []const u8) Error!dns.DnssecAlgorithm {
+        if (isDigits(text)) return @fromBackingInt(try p.int(u8, text));
+        const table = .{
+            .{ "DSA", 3 },              .{ "RSASHA1", 5 },    .{ "RSASHA1-NSEC3-SHA1", 7 },
+            .{ "RSASHA256", 8 },        .{ "RSASHA512", 10 }, .{ "ECDSAP256SHA256", 13 },
+            .{ "ECDSAP384SHA384", 14 }, .{ "ED25519", 15 },   .{ "ED448", 16 },
+        };
+        inline for (table) |row| if (std.ascii.eqlIgnoreCase(text, row[0])) return @fromBackingInt(row[1]);
+        return p.fail("unknown DNSSEC algorithm");
+    }
+
+    /// Base64 that may span tokens, padded or not.
+    fn base64(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
+        var text: std.ArrayList(u8) = .empty;
+        while (toks.next()) |t| try text.appendSlice(p.arena, t);
+        const bare = mem.trimEnd(u8, text.items, "=");
+        const dec = std.base64.standard_no_pad.Decoder;
+        const out = try p.arena.alloc(u8, dec.calcSizeForSlice(bare) catch return p.fail("bad base64"));
+        dec.decode(out, bare) catch return p.fail("bad base64");
+        return out;
+    }
+
+    /// RFC 4034 §3.2: YYYYMMDDHHmmSS, or seconds since the epoch.
+    fn sigTime(p: *Parser, text: []const u8) Error!u32 {
+        if (text.len != 14) return p.int(u32, text);
+        const y = try p.int(i64, text[0..4]);
+        const m = try p.int(i64, text[4..6]);
+        const d = try p.int(i64, text[6..8]);
+        const secs = try p.int(i64, text[8..10]) * 3600 + try p.int(i64, text[10..12]) * 60 + try p.int(i64, text[12..14]);
+        // Hinnant's days-from-civil: era-based, no month table.
+        const yy = y - @intFromBool(m <= 2);
+        const era = @divFloor(yy, 400);
+        const yoe = yy - era * 400;
+        const doy = @divTrunc(153 * (m + (if (m > 2) @as(i64, -3) else 9)) + 2, 5) + d - 1;
+        const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+        const days = era * 146097 + doe - 719468;
+        return std.math.cast(u32, days * 86400 + secs) orelse p.fail("signature time out of range");
+    }
+
+    /// RFC 4034 §4.1.2 type bitmap from the remaining type mnemonics.
+    fn typeBitmap(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var window: [256]u8 = undefined;
+        var types: std.ArrayList(u16) = .empty;
+        while (toks.next()) |t| try types.append(p.arena, @backingInt(rtypeFromText(t) orelse return p.fail("unknown type in bitmap")));
+        mem.sortUnstable(u16, types.items, {}, std.sort.asc(u16));
+        var i: usize = 0;
+        while (i < types.items.len) {
+            const win: u8 = @intCast(types.items[i] >> 8);
+            @memset(&window, 0);
+            var len: u8 = 0;
+            while (i < types.items.len and types.items[i] >> 8 == win) : (i += 1) {
+                const low: u8 = @truncate(types.items[i]);
+                window[low >> 3] |= @as(u8, 0x80) >> @intCast(low & 7);
+                len = (low >> 3) + 1;
+            }
+            try out.appendSlice(p.arena, &.{ win, len });
+            try out.appendSlice(p.arena, window[0..len]);
+        }
+        return out.items;
     }
 
     fn word(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
@@ -895,8 +989,7 @@ test "every scenario on disk parses" {
             parsed += 1;
         }
     }
-    // DNSKEY, RRSIG, NSEC and NSEC3 text forms land with the DNSSEC cells;
-    // until then those scenarios are the unsupported count.
+    // NSEC3 text is not loaded yet; those scenarios are the unsupported count.
     try testing.expect(parsed >= 80);
     try testing.expect(unsupported <= 18);
 }
