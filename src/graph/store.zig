@@ -63,16 +63,31 @@ const KeyContext = struct {
     }
 };
 
+pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key) void };
+
 pub const Store = struct {
     gpa: Allocator,
     map: std.ArrayHashMapUnmanaged(Key, Entry, KeyContext, true) = .empty,
     /// Every live blob's bytes, whoever holds it.
     bytes: usize = 0,
-    /// A blob is built here and copied out at its exact size.
+    /// What the map holds; the cap is on this.
+    held: usize = 0,
+    cap: usize,
+    visited: std.DynamicBitSetUnmanaged = .{},
+    hand: usize = 0,
+    /// Over the cap a key is turned away the first time and admitted the
+    /// next, so a flood of names never seen twice evicts nothing.
+    door: [door_bits / 8]u8 = @splat(0),
+    door_set: u32 = 0,
+    evictions: u64 = 0,
+    refusals: u64 = 0,
+    on_evict: ?OnEvict = null,
     stage: []u8,
 
-    pub fn init(gpa: Allocator) !Store {
-        return .{ .gpa = gpa, .stage = try gpa.alloc(u8, 2 * @as(usize, dns.max_message_len)) };
+    const door_bits = 1 << 16;
+
+    pub fn init(gpa: Allocator, cap: usize) !Store {
+        return .{ .gpa = gpa, .cap = cap, .stage = try gpa.alloc(u8, 2 * @as(usize, dns.max_message_len)) };
     }
 
     pub fn deinit(s: *Store) void {
@@ -81,6 +96,7 @@ pub const Store = struct {
             s.unref(e.blob);
         }
         s.map.deinit(s.gpa);
+        s.visited.deinit(s.gpa);
         s.gpa.free(s.stage);
     }
 
@@ -92,28 +108,82 @@ pub const Store = struct {
     }
 
     pub fn get(s: *Store, key: Key, now_ns: i64) ?Entry {
-        const e = s.map.get(key) orelse return null;
-        return if (e.expires_ns > now_ns) e else null;
+        const i = s.map.getIndex(key) orelse return null;
+        const e = s.map.values()[i];
+        if (e.expires_ns <= now_ns) return null;
+        if (i < s.visited.capacity()) s.visited.set(i);
+        return e;
     }
 
-    /// Takes one reference; replaces any older version.
+    /// Takes one reference. A new key over the cap must have knocked before.
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
+            s.held -= gop.value_ptr.blob.len;
             s.unref(gop.value_ptr.blob);
         } else {
-            gop.key_ptr.name = s.gpa.dupe(u8, key.name) catch |e| {
-                s.map.swapRemoveAt(gop.index);
-                return e;
-            };
+            errdefer s.map.swapRemoveAt(gop.index);
+            if (s.held + blob.len > s.cap and !s.knock(key)) {
+                s.refusals += 1;
+                s.unref(blob);
+                return error.Refused;
+            }
+            gop.key_ptr.name = try s.gpa.dupe(u8, key.name);
+            if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
         gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns };
+        s.held += blob.len;
+        s.visited.set(gop.index);
+        while (s.held > s.cap and s.map.count() > 1) s.evict();
     }
 
     pub fn remove(s: *Store, key: Key) void {
-        const kv = s.map.fetchSwapRemove(key) orelse return;
-        s.gpa.free(kv.key.name);
-        s.unref(kv.value.blob);
+        const i = s.map.getIndex(key) orelse return;
+        s.removeAt(i);
+    }
+
+    fn removeAt(s: *Store, i: usize) void {
+        const last = s.map.count() - 1;
+        if (i != last) s.visited.setValue(i, s.visited.isSet(last));
+        const key = s.map.keys()[i];
+        const e = s.map.values()[i];
+        s.map.swapRemoveAt(i);
+        s.held -= e.blob.len;
+        s.gpa.free(key.name);
+        s.unref(e.blob);
+        if (s.hand > i) s.hand -= 1;
+    }
+
+    /// SIEVE, its scan capped; past the cap the entry at the hand goes.
+    fn evict(s: *Store) void {
+        const n = s.map.count();
+        var probes: usize = 0;
+        while (probes < @min(n, 64)) : (probes += 1) {
+            if (s.hand >= n) s.hand = 0;
+            if (!s.visited.isSet(s.hand)) break;
+            s.visited.unset(s.hand);
+            s.hand += 1;
+        }
+        if (s.hand >= n) s.hand = 0;
+        if (s.on_evict) |h| h.f(h.ctx, s.map.keys()[s.hand]);
+        s.removeAt(s.hand);
+        s.evictions += 1;
+    }
+
+    fn knock(s: *Store, key: Key) bool {
+        const h = key.hash();
+        const a: u32 = @truncate(h % door_bits);
+        const b: u32 = @truncate((h >> 32) % door_bits);
+        const seen = s.door[a / 8] & (@as(u8, 1) << @intCast(a % 8)) != 0 and s.door[b / 8] & (@as(u8, 1) << @intCast(b % 8)) != 0;
+        if (seen) return true;
+        if (s.door_set >= door_bits / 2) {
+            @memset(&s.door, 0);
+            s.door_set = 0;
+        }
+        s.door[a / 8] |= @as(u8, 1) << @intCast(a % 8);
+        s.door[b / 8] |= @as(u8, 1) << @intCast(b % 8);
+        s.door_set += 2;
+        return false;
     }
 
     /// One reference, the caller's.
@@ -289,7 +359,7 @@ test "a fact survives the blob byte for byte" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var s = try Store.init(testing.allocator);
+    var s = try Store.init(testing.allocator, 1 << 20);
     defer s.deinit();
 
     const owner = try dns.parseDottedName(arena, "www.example.com.");
@@ -357,4 +427,29 @@ test "a fact survives the blob byte for byte" {
     defer s.unref(cut_blob);
     const cut = (try Store.parse(arena, cut_blob)).cut;
     try testing.expect(cut.zone.eqlExact(zone) and cut.stop and !cut.failed and cut.probes == 3);
+}
+
+test "the cap holds by eviction and admission" {
+    const testing = std.testing;
+    var s = try Store.init(testing.allocator, 2048);
+    defer s.deinit();
+    const zone: dns.Name = .{ .labels = &.{"x"} };
+    var names: [64][8]u8 = undefined;
+    for (0..64) |i| {
+        _ = try std.fmt.bufPrint(&names[i], "k{d}", .{i});
+        const key: Key = .{ .kind = .cut, .name = std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3] };
+        const blob = try s.build(.{ .cut = .{ .zone = zone } });
+        s.put(key, blob, 10) catch |err| {
+            try testing.expectEqual(error.Refused, err);
+            try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10);
+        };
+    }
+    try testing.expect(s.held <= 2048);
+    try testing.expect(s.evictions > 0);
+    try testing.expect(s.refusals > 0);
+    const key: Key = .{ .kind = .cut, .name = "again" };
+    try testing.expectError(error.Refused, s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10));
+    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10);
+    try testing.expect(s.get(key, 0) != null);
+    try testing.expectEqual(s.held, s.bytes);
 }

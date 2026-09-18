@@ -93,6 +93,23 @@ pub const Index = struct {
     }
 };
 
+/// So the index cannot outgrow its facts.
+pub fn evicted(g: *Graph, key: graph.Key) void {
+    if (key.kind != .rrset or key.rtype != .nsec) return;
+    const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
+    for (0..owner.labels.len + 1) |i| {
+        var buf: [dns.max_dotted_len + 1]u8 = undefined;
+        const zone: dns.Name = .{ .labels = owner.labels[i..] };
+        const z = g.denial.zones.getPtr(zone.formatLower(&buf)) orelse continue;
+        const pos = z.position(owner);
+        if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(owner)) {
+            g.gpa.free(z.spans.items[pos].buf);
+            _ = z.spans.orderedRemove(pos);
+            return;
+        }
+    }
+}
+
 /// A proof carries at most this many NSECs (closest encloser, next closer,
 /// wildcard); the rest is stuffing.
 const max_proofs = 8;

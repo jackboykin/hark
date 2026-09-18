@@ -356,16 +356,23 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .addr_policy = .{ .upstream_port = cfg.upstream_port, .allow_loopback = cfg.allow_loopback_upstreams },
         .stagger_ms = cfg.stagger_ms,
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,
+        .store_bytes = cfg.cache_size,
         .trace = trace,
     }, e.edge());
     defer g.deinit();
+    g.attach();
     var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer s.scratch.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     log.info("graph server listening on {d} address(es)", .{cfg.listen.len});
+    var stats_at = e.now_ns + stats_every;
     while (true) {
         const ev = try e.next(e.now_ns + std.time.ns_per_s) orelse {
             s.sweep();
+            if (e.now_ns >= stats_at) {
+                stats_at = e.now_ns + stats_every;
+                logFootprint(&g);
+            }
             continue;
         };
         switch (ev) {
@@ -377,4 +384,28 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         }
         try s.settle();
     }
+}
+
+const stats_every = 60 * std.time.ns_per_s;
+
+fn logFootprint(g: *graph.Graph) void {
+    var buf: [128]u8 = undefined;
+    const rc = linux.open("/proc/self/statm", .{}, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd: posix.fd_t = @intCast(rc);
+    defer sys.close(fd);
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return;
+    var it = mem.tokenizeScalar(u8, buf[0..n], ' ');
+    _ = it.next();
+    const rss_pages = std.fmt.parseInt(u64, it.next() orelse return, 10) catch return;
+    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells", .{
+        rss_pages * std.heap.pageSize() / (1024 * 1024),
+        g.store.held / 1024,
+        g.store.map.count(),
+        (g.store.bytes - g.store.held) / 1024,
+        g.store.evictions,
+        g.store.refusals,
+        g.live,
+    });
 }

@@ -105,6 +105,7 @@ pub const Config = struct {
     servfail_ttl: u32 = 5,
     /// Null: DNSSEC off, nothing is judged.
     trust_anchor: ?dns.DsData = null,
+    store_bytes: usize = 12 << 20,
     trace: bool = false,
 };
 
@@ -422,13 +423,23 @@ pub const Graph = struct {
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa) };
+        var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
         // The root cut and NS set are axiomatic facts.
         const root: dns.Name = .{ .labels = &.{} };
         try g.store.put(.{ .kind = .cut, .name = "" }, try g.store.build(.{ .cut = .{ .zone = root } }), std.math.maxInt(i64));
         try g.store.put(.{ .kind = .ns, .name = "" }, try g.store.build(.{ .ns = .{ .names = &.{} } }), std.math.maxInt(i64));
         return g;
+    }
+
+    /// Pins the graph's address.
+    pub fn attach(g: *Graph) void {
+        g.store.on_evict = .{ .ctx = g, .f = evictedErased };
+    }
+
+    fn evictedErased(ctx: *anyopaque, key: Key) void {
+        const g: *Graph = @ptrCast(@alignCast(ctx));
+        denial.evicted(g, key);
     }
 
     pub fn deinit(g: *Graph) void {
@@ -668,7 +679,10 @@ pub const Graph = struct {
                 const blob = try g.store.build(value);
                 c.blob = blob;
                 c.value = try store.Store.parse(c.arena.allocator(), blob);
-                if (expires_ns > g.now()) try g.store.put(c.key, blob.ref(), expires_ns);
+                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns) catch |err| switch (err) {
+                    error.Refused => {},
+                    else => return err,
+                };
             },
             .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
             .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
@@ -767,7 +781,10 @@ pub const Graph = struct {
         if (expires_ns <= g.now()) return;
         const blob = try g.store.build(value);
         errdefer g.store.unref(blob);
-        try g.store.put(key, blob, expires_ns);
+        g.store.put(key, blob, expires_ns) catch |err| switch (err) {
+            error.Refused => {},
+            else => return err,
+        };
     }
 
     // ── Rules ──────────────────────────────────────────────────────────
