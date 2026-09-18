@@ -194,6 +194,7 @@ pub const Store = struct {
                 try w.name(c.zone);
                 try w.int(u8, @intFromBool(c.stop) | @as(u8, @intFromBool(c.failed)) << 1);
                 try w.int(u8, c.probes);
+                try w.addrs(c.addrs);
             },
             .ns => |n| {
                 try w.int(u16, @intCast(n.names.len));
@@ -201,13 +202,7 @@ pub const Store = struct {
             },
             .addr => |a| {
                 try w.int(u8, @intFromBool(a.provisional));
-                try w.int(u16, @intCast(a.addrs.len));
-                for (a.addrs) |addr| {
-                    const k = na.AddressKey.fromAddress(addr);
-                    try w.int(u8, k.family);
-                    try w.int(u16, k.port);
-                    try w.slice(&k.addr);
-                }
+                try w.addrs(a.addrs);
             },
             .rrset => |r| {
                 try w.int(u8, @backingInt(r.kind));
@@ -248,7 +243,7 @@ pub const Store = struct {
             .cut => blk: {
                 const zone = try r.name();
                 const flags = try r.int(u8);
-                break :blk .{ .cut = .{ .zone = zone, .stop = flags & 1 != 0, .failed = flags & 2 != 0, .probes = try r.int(u8) } };
+                break :blk .{ .cut = .{ .zone = zone, .stop = flags & 1 != 0, .failed = flags & 2 != 0, .probes = try r.int(u8), .addrs = try r.addrs() } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
@@ -257,14 +252,7 @@ pub const Store = struct {
             },
             .addr => blk: {
                 const provisional = try r.int(u8) != 0;
-                const addrs = try arena.alloc(na.Address, try r.int(u16));
-                for (addrs) |*a| {
-                    const family = try r.int(u8);
-                    const port = try r.int(u16);
-                    const raw = try r.slice(16);
-                    a.* = if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
-                }
-                break :blk .{ .addr = .{ .addrs = addrs, .provisional = provisional } };
+                break :blk .{ .addr = .{ .addrs = try r.addrs(), .provisional = provisional } };
             },
             .rrset => blk: {
                 var reply: graph.Reply = .{
@@ -323,6 +311,16 @@ const Writer = struct {
         w.pos += try dns.writeNameWire(w.buf[w.pos..], n);
     }
 
+    fn addrs(w: *Writer, list: []const na.Address) !void {
+        try w.int(u16, @intCast(list.len));
+        for (list) |addr| {
+            const k = na.AddressKey.fromAddress(addr);
+            try w.int(u8, k.family);
+            try w.int(u16, k.port);
+            try w.slice(&k.addr);
+        }
+    }
+
     fn records(w: *Writer, rrs: []const RR) !void {
         for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).bytes.len;
     }
@@ -347,6 +345,17 @@ const Reader = struct {
 
     fn name(r: *Reader) !dns.Name {
         return dns.readNameWire(r.arena, r.buf, &r.pos);
+    }
+
+    fn addrs(r: *Reader) ![]na.Address {
+        const list = try r.arena.alloc(na.Address, try r.int(u16));
+        for (list) |*a| {
+            const family = try r.int(u8);
+            const port = try r.int(u16);
+            const raw = try r.slice(16);
+            a.* = if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
+        }
+        return list;
     }
 
     fn records(r: *Reader, n: u16) ![]RR {

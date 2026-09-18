@@ -446,8 +446,8 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(91, r.parsed);
-    try testing.expectEqual(79, r.ran);
+    try testing.expectEqual(92, r.parsed);
+    try testing.expectEqual(80, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

@@ -1,0 +1,74 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a TTL-0 referral is walked on its own glue, not re-probed until the budget is spent
+
+; ── Fake root server ───────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ; QMIN probes the root for `com. A`. Root returns a referral to com.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; ── Fake .com authority ────────────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ; The qmin probe example.com. A gets a referral whose NS and glue carry
+  ; TTL 0: nothing here may be cached, so the walk must use the referral
+  ; in hand and finish in one probe.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 0 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 0 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ── Fake example.com authority ─────────────────────────────────────
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      qname.example.com. IN A
+    SECTION ANSWER
+      qname.example.com. 3600 IN A 93.184.216.34
+  ENTRY_END
+RANGE_END
+
+; ── Client interaction ─────────────────────────────────────────────
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    qname.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    qname.example.com. IN A
+  SECTION ANSWER
+    qname.example.com. 3600 IN A 93.184.216.34
+ENTRY_END
+
+SCENARIO_END
+

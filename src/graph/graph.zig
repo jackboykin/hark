@@ -121,6 +121,8 @@ pub const Cut = struct {
     probes: u8 = 0,
     /// Every parent server failed the probe.
     failed: bool = false,
+    /// The referral's glue: asked before the addr cells, whatever its TTL.
+    addrs: []const na.Address = &.{},
 };
 
 /// NS names from the parent referral. The root's is empty: hints carry
@@ -234,6 +236,8 @@ const Attempt = struct { exchange: CellId, server: na.Address, transport: Transp
 /// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
+    /// `ns(zone)`, held: a TTL-0 set answers this ask once, not a re-probe per pass.
+    ns: ?CellId = null,
     have_servers: bool = false,
     servers: [max_servers]na.Address = undefined,
     nservers: u8 = 0,
@@ -276,12 +280,19 @@ pub const Ask = struct {
         a.* = .{ .zone = zone };
     }
 
-    /// Referral glue, used before the addr cells whatever its TTL.
-    fn seed(a: *Ask, addrs: []const na.Address, rng: std.Random) void {
-        a.nservers = @intCast(@min(addrs.len, max_servers));
-        @memcpy(a.servers[0..a.nservers], addrs[0..a.nservers]);
+    /// Dead servers are skipped unless nothing else is left.
+    fn seed(a: *Ask, g: *Graph, addrs: []const na.Address) void {
+        var live: usize = 0;
+        for (addrs) |s| live += @intFromBool(!g.isDead(s));
+        a.nservers = 0;
+        for (addrs) |s| {
+            if (a.nservers == max_servers) break;
+            if (live > 0 and g.isDead(s)) continue;
+            a.servers[a.nservers] = s;
+            a.nservers += 1;
+        }
         for (0..a.nservers) |i| a.order[i] = @intCast(i);
-        rng.shuffle(u8, a.order[0..a.nservers]);
+        g.edge.rng.shuffle(u8, a.order[0..a.nservers]);
         a.next = 0;
         a.have_servers = a.nservers > 0;
     }
@@ -902,7 +913,7 @@ pub const Graph = struct {
                 switch (delegation.probeStep(msg, &walk, g.cfg.addr_policy)) {
                     .referral => |ref| {
                         const expires = try g.absorbReferral(id, ref, msg, pc.zone);
-                        try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1 } }, expires);
+                        try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
                     },
                     .nxdomain, .failed => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = true } }, g.now()),
                     .answered => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns),
@@ -1045,6 +1056,7 @@ pub const Graph = struct {
                 }
             }
             s.ask.reset(cut.value.cut.zone);
+            s.ask.seed(g, cut.value.cut.addrs);
             s.started = true;
         }
         while (true) {
@@ -1066,7 +1078,7 @@ pub const Graph = struct {
                             return g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
                         }
                         s2.ask.reset(ref.zone_cut);
-                        s2.ask.seed(ref.addrs[0..ref.addr_count], g.edge.rng);
+                        s2.ask.seed(g, ref.addrs[0..ref.addr_count]);
                         continue;
                     }
                     const reply = try g.classify(msg, zone, name, qtype);
@@ -1156,7 +1168,7 @@ pub const Graph = struct {
         };
         const expires = g.now() + @as(i64, ns_ttl) * std.time.ns_per_s;
         const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
-        try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, .{ .cut = .{ .zone = ref.zone_cut } }, expires);
+        try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, .{ .cut = .{ .zone = ref.zone_cut, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
         try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
         // The parent's word on the child's DS travels with the referral.
         if (g.cfg.trust_anchor != null) {
@@ -1401,8 +1413,8 @@ pub const Graph = struct {
         if (zone.labels.len == 0) {
             for (g.cfg.root_hints) |h| if (!a.hasTried(h)) try list.append(g.gpa, h);
         } else {
-            const ns_id = try g.demand(id, try g.keyFor(.ns, zone, .a), zone, g.cell(id).depth) orelse return .none;
-            const ns = g.cell(ns_id);
+            if (a.ns == null) a.ns = try g.demand(id, try g.keyFor(.ns, zone, .a), zone, g.cell(id).depth) orelse return .none;
+            const ns = g.cell(a.ns.?);
             if (!ns.settled) return .pending;
             const names = ns.value.ns.names;
             var unknown: std.ArrayList(dns.Name) = .empty;
@@ -1446,15 +1458,6 @@ pub const Graph = struct {
                 return g.gatherServers(id, a);
             }
         }
-        // Dead servers are skipped unless nothing else is left.
-        var live: usize = 0;
-        for (list.items) |s| live += @intFromBool(!g.isDead(s));
-        if (live > 0) {
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (g.isDead(list.items[i])) _ = list.swapRemove(i) else i += 1;
-            }
-        }
         if (list.items.len == 0) {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -1463,12 +1466,7 @@ pub const Graph = struct {
             }
             return .none;
         }
-        a.nservers = @intCast(@min(list.items.len, max_servers));
-        @memcpy(a.servers[0..a.nservers], list.items[0..a.nservers]);
-        for (0..a.nservers) |i| a.order[i] = @intCast(i);
-        g.edge.rng.shuffle(u8, a.order[0..a.nservers]);
-        a.next = 0;
-        a.have_servers = true;
+        a.seed(g, list.items);
         return .ready;
     }
 
