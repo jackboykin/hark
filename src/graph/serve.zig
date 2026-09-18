@@ -22,7 +22,7 @@ pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
 
 /// The answer cell shaped for a client: bogus is SERVFAIL unless CD, a
 /// verified hop's TTLs end with its proof, signatures only to DO, AD only
-/// when asked (RFC 6840 §5.7). `cached`: settled before the question came.
+/// when asked (RFC 6840 §5.7). `cached`: settled from memory alone.
 pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool, cached: bool) !Served {
     const a = g.cell(root).value.answer;
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -269,11 +269,11 @@ const Server = struct {
         const action = special_use.classify(name, q.qtype);
         if (action != .none) return s.send(reply, query, try special_use.synthesize(arena, name, action), null);
         if (q.qtype == .any) return s.send(reply, query, (try hinfo(arena, q, client)).msg, null);
-        const root = try s.g.demandRoot(q.name, q.qtype);
-        const cached = s.g.cell(root).settled;
+        const root = try s.g.demandRoot(q.name, q.qtype, client.cd);
         try s.g.drain();
         if (s.g.cell(root).settled) {
-            const served = try answer(arena, s.g, root, q, client, s.cfg.minimal_responses, cached);
+            defer s.g.unhold(root);
+            const served = try answer(arena, s.g, root, q, client, s.cfg.minimal_responses, true);
             return s.send(reply, query, served.msg, served.ede);
         }
         try s.pending.append(s.gpa, .{ .root = root, .wire = try s.gpa.dupe(u8, wire), .reply = reply });
@@ -294,6 +294,7 @@ const Server = struct {
             const client: Client = .{ .rd = query.header.flags.rd, .cd = query.header.flags.cd, .do_bit = query.opt != null and query.opt.?.do_bit, .ad = query.header.flags.ad };
             const served = try answer(arena, s.g, p.root, q, client, s.cfg.minimal_responses, false);
             s.send(p.reply, query, served.msg, served.ede);
+            s.g.unhold(p.root);
             s.gpa.free(p.wire);
             _ = s.pending.swapRemove(i);
         }

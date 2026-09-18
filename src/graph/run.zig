@@ -54,13 +54,16 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     s.pending_drops = drops;
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
+    // CHECK_ANSWER reads the held root's hops.
+    var held: ?graph.CellId = null;
+    defer if (held) |h| g.unhold(h);
     var last: ?dns.Message = null;
     var cursor: usize = 0;
     for (scenario.steps) |st| {
         s.step = st.n;
         report.step = st.n;
         switch (st.kind) {
-            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?) orelse {
+            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held) orelse {
                 report.msg = "client timed out";
                 return error.ScenarioFailed;
             }).msg,
@@ -99,7 +102,15 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         }
     }
     report.phase = .warm;
-    try requery(arena, &g, &s, scenario, report);
+    try requery(arena, &g, &s, scenario, report, &held);
+    // Quiescence: nothing outlives its demand.
+    if (held) |h| g.unhold(h);
+    held = null;
+    while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    if (g.live != 0 or g.budgets != 0) {
+        report.msg = "cells or budgets outlived the scenario";
+        return error.ScenarioFailed;
+    }
 }
 
 /// Every checked question, re-asked against the settled graph, must answer
@@ -107,7 +118,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared.
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report) !void {
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *?graph.CellId) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -120,7 +131,7 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const actual = try resolveClient(arena, g, s, scenario, query.entry.?) orelse {
+        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held) orelse {
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
@@ -135,19 +146,26 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
     }
 }
 
-/// Null when the client's timer fires first.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?serve.Served {
+/// Null when the client's timer fires first. The root stays in `held`,
+/// since the answer reads its hops, until the next question.
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *?graph.CellId) !?serve.Served {
     const q = entry.questions[0];
     const client: serve.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     if (q.qtype == .any) return try serve.hinfo(arena, q, client);
+    if (held.*) |h| g.unhold(h);
+    held.* = null;
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
-    const root = try g.demandRoot(q.name, q.qtype);
-    const cached = g.cell(root).settled;
+    const root = try g.demandRoot(q.name, q.qtype, client.cd);
     try g.drain();
+    const cached = g.cell(root).settled;
     while (!g.cell(root).settled) {
-        const ev = s.next(client_deadline) orelse return null;
+        const ev = s.next(client_deadline) orelse {
+            g.unhold(root);
+            return null;
+        };
         try g.complete(ev.id, ev.completion);
     }
+    held.* = root;
     return try serve.answer(arena, g, root, q, client, scenario.minimal_responses orelse true, cached);
 }
 
@@ -312,6 +330,8 @@ const Replayed = struct { parsed: usize, ran: usize, failed: usize, tally: graph
 /// that one seed replays to one upstream query log.
 fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
     const io = testing.io;
+    // Debug catches leaks; the tally wants the production allocator.
+    const gpa = if (@import("builtin").mode == .debug) testing.allocator else std.heap.smp_allocator;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -336,8 +356,8 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         var seed: u64 = 1;
         while (seed <= seeds) : (seed += 1) {
             var first: Report = .{};
-            defer testing.allocator.free(first.log);
-            const result = runScenario(testing.allocator, &scenario, .{ .seed = seed }, &first);
+            defer gpa.free(first.log);
+            const result = runScenario(gpa, &scenario, .{ .seed = seed }, &first);
             r.tally.runs += first.tally.runs;
             r.tally.settles += first.tally.settles;
             r.tally.parses += first.tally.parses;
@@ -363,8 +383,8 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
                 break;
             };
             var second: Report = .{};
-            defer testing.allocator.free(second.log);
-            runScenario(testing.allocator, &scenario, .{ .seed = seed }, &second) catch {};
+            defer gpa.free(second.log);
+            runScenario(gpa, &scenario, .{ .seed = seed }, &second) catch {};
             if (!mem.eql(u8, first.log, second.log)) {
                 r.failed += 1;
                 std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ ent.path, seed });
@@ -518,15 +538,17 @@ test "a silent sibling is hedged past and still records its timeout" {
         var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
         defer g.deinit();
         const start = s.now_ns;
-        const root = try g.demandRoot(q.name, q.qtype);
+        const root = try g.demandRoot(q.name, q.qtype, false);
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
             try g.complete(ev.id, ev.completion);
         }
         try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        g.unhold(root);
         const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
         while (s.next(start + 5 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+        try testing.expectEqual(0, g.live);
         try testing.expect(s.log.items[2].qname.eql(q.name));
         const ns1_first = na.AddressKey.fromAddress(s.log.items[2].server).eql(ns1);
         ns1_first_seen = ns1_first_seen or ns1_first;
@@ -548,13 +570,14 @@ test "a silent sibling is hedged past and still records its timeout" {
         const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
-        const root = try g.demandRoot(q.name, q.qtype);
+        const root = try g.demandRoot(q.name, q.qtype, false);
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
             try g.complete(ev.id, ev.completion);
         }
         try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        g.unhold(root);
         var asked_ns1 = false;
         for (s.log.items) |row| asked_ns1 = asked_ns1 or na.AddressKey.fromAddress(row.server).eql(ns1);
         if (!all_dead) try testing.expect(!asked_ns1);

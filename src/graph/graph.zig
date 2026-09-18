@@ -188,9 +188,11 @@ pub const Value = union(Kind) {
     exchange: Outcome,
 };
 
+/// Referenced by every cell charged to it.
 pub const Budget = struct {
     queries: u32 = 0,
-    deadline_ns: i64 = 0,
+    deadline_ns: i64,
+    refs: u32 = 0,
 };
 
 /// The model should cost less than a parse.
@@ -361,22 +363,36 @@ pub const Scratch = union(enum) {
     exchange: ExchangeScratch,
 };
 
+/// Alive while pinned, by demanders (`waiters`) or clients and the edge
+/// (`holds`). Orphaned, it spends nothing more; freed once nothing holds
+/// it and nothing of its own is in flight, its id recycled.
 pub const Cell = struct {
     key: Key,
     name: dns.Name,
+    live: bool = true,
     settled: bool = false,
+    orphan: bool = false,
     value: Value = undefined,
     expires_ns: i64 = 0,
     waiters: std.ArrayList(CellId) = .empty,
-    /// The client demand paying for this cell's exchanges.
-    root: CellId,
+    /// Unpinned at settle; an answer's at free.
+    inputs: std.ArrayList(CellId) = .empty,
+    holds: u32 = 0,
+    budget: *Budget,
     /// Demand-chain length through NS-address sub-resolutions.
     depth: u8,
-    budget: Budget = .{},
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
     /// Everything the cell owns; freed with it.
     arena: std.heap.ArenaAllocator,
+
+    fn inFlight(c: *const Cell, g: *Graph) bool {
+        for (c.inputs.items) |i| {
+            const in = g.cell(i);
+            if (in.key.kind == .exchange and !in.settled) return true;
+        }
+        return false;
+    }
 };
 
 // ── Graph ──────────────────────────────────────────────────────────────
@@ -387,8 +403,13 @@ pub const Graph = struct {
     edge: Edge,
     /// One run's transients, reset at every run.
     scratch: std.heap.ArenaAllocator,
-    /// Heap cells: rule-held pointers survive appends.
+    /// Rule-held pointers survive appends; a freed slot is reused.
     cells: std.ArrayList(*Cell) = .empty,
+    free_ids: std.ArrayList(CellId) = .empty,
+    live: u32 = 0,
+    budgets: u32 = 0,
+    created: u64 = 0,
+    /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
     ready: std.ArrayList(CellId) = .empty,
     /// Per-server estimate; the one state outliving a demand.
@@ -401,23 +422,18 @@ pub const Graph = struct {
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa) };
         errdefer g.deinit();
-        // The root cut and NS set are axiomatic.
+        // The root cut and NS set are axiomatic facts.
         const root: dns.Name = .{ .labels = &.{} };
-        const cut = try g.newCell(.{ .kind = .cut, .name = "" }, root, 0, 0);
-        try g.settle(cut, .{ .cut = .{ .zone = root } }, std.math.maxInt(i64));
-        const ns = try g.newCell(.{ .kind = .ns, .name = "" }, root, 0, 0);
-        try g.settle(ns, .{ .ns = .{ .names = &.{} } }, std.math.maxInt(i64));
+        try g.store.put(.{ .kind = .cut, .name = "" }, try g.store.build(.{ .cut = .{ .zone = root } }), std.math.maxInt(i64));
+        try g.store.put(.{ .kind = .ns, .name = "" }, try g.store.build(.{ .ns = .{ .names = &.{} } }), std.math.maxInt(i64));
         return g;
     }
 
     pub fn deinit(g: *Graph) void {
-        for (g.cells.items) |c| {
-            c.waiters.deinit(g.gpa);
-            if (c.blob) |b| g.store.unref(b);
-            c.arena.deinit();
-            g.gpa.destroy(c);
-        }
+        for (g.cells.items, 0..) |c, i| if (c.live) g.free(@intCast(i), c) catch {};
+        for (g.cells.items) |c| g.gpa.destroy(c);
         g.cells.deinit(g.gpa);
+        g.free_ids.deinit(g.gpa);
         g.scratch.deinit();
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
@@ -444,15 +460,28 @@ pub const Graph = struct {
         return .{ .kind = kind, .rtype = rtype, .name = try g.scratch.allocator().dupe(u8, name.formatLower(&buf)) };
     }
 
-    /// A client question: memoised if fresh or in progress, else a new
-    /// cell with its own budget.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType) !CellId {
+    /// Held for the client until `unhold`. A failed answer is memoised for
+    /// its SERVFAIL window, not for a client with CD, who is owed the data.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool) !CellId {
         const key = try g.keyFor(.answer, name, qtype);
-        if (try g.lookup(key, name)) |id| return id;
-        const id = try g.newCell(key, name, @intCast(g.cells.items.len), 0);
-        g.cell(id).budget = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
-        try g.ready.append(g.gpa, id);
+        if (g.index.get(key)) |id| if (!g.cell(id).settled or g.fresh(id)) {
+            g.cell(id).holds += 1;
+            return id;
+        };
+        const budget = try g.gpa.create(Budget);
+        errdefer g.gpa.destroy(budget);
+        budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
+        const memo = if (cd) null else g.store.get(key, g.now());
+        const id = if (memo) |e| try g.materialise(key, name, budget, e) else try g.newCell(key, name, budget, 0);
+        g.budgets += 1;
+        g.cell(id).holds += 1;
+        if (memo == null) try g.ready.append(g.gpa, id);
         return id;
+    }
+
+    pub fn unhold(g: *Graph, id: CellId) void {
+        g.cell(id).holds -= 1;
+        g.release(id);
     }
 
     pub fn drain(g: *Graph) !void {
@@ -465,6 +494,7 @@ pub const Graph = struct {
             return g.drain();
         }
         const c = g.cell(id);
+        std.debug.assert(c.live and c.key.kind == .exchange);
         const sc = c.scratch.exchange;
         const arena = c.arena.allocator();
         const outcome: Outcome = switch (completion) {
@@ -505,27 +535,27 @@ pub const Graph = struct {
         // A timeout the root's deadline cut short says nothing about the server.
         switch (outcome) {
             .reply => |r| try g.observe(sc.server, r.rtt_ns),
-            .timeout => if (g.now() < g.cell(c.root).budget.deadline_ns) try g.observeTimeout(sc.server),
+            .timeout => if (g.now() < c.budget.deadline_ns) try g.observeTimeout(sc.server),
             else => {},
         }
+        c.holds -= 1;
         try g.settle(id, .{ .exchange = outcome }, g.now());
         try g.drain();
     }
 
     // ── Cells ──────────────────────────────────────────────────────────
 
-    /// A cell over its own copies of `key` and `name`, indexed under the
-    /// key unless it is an exchange.
-    pub fn newCell(g: *Graph, key: Key, name: dns.Name, root: CellId, depth: u8) !CellId {
-        const id: CellId = @intCast(g.cells.items.len);
-        const c = try g.gpa.create(Cell);
-        errdefer g.gpa.destroy(c);
+    pub fn newCell(g: *Graph, key: Key, name: dns.Name, budget: *Budget, depth: u8) !CellId {
+        const reused = g.free_ids.pop();
+        const id: CellId = reused orelse @intCast(g.cells.items.len);
+        const c = if (reused != null) g.cells.items[id] else try g.gpa.create(Cell);
+        errdefer if (reused == null) g.gpa.destroy(c);
         var arena = std.heap.ArenaAllocator.init(g.gpa);
         errdefer arena.deinit();
         c.* = .{
             .key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) },
             .name = try dns.cloneNameFlat(arena.allocator(), name, false),
-            .root = root,
+            .budget = budget,
             .depth = depth,
             .arena = arena,
             .scratch = switch (key.kind) {
@@ -540,9 +570,77 @@ pub const Graph = struct {
                 .exchange => .none,
             },
         };
-        try g.cells.append(g.gpa, c);
+        if (reused == null) try g.cells.append(g.gpa, c);
         if (key.kind != .exchange) try g.index.put(g.gpa, c.key, id);
+        budget.refs += 1;
+        g.live += 1;
+        g.created += 1;
         return id;
+    }
+
+    // ── Pins ───────────────────────────────────────────────────────────
+
+    pub fn pin(g: *Graph, id: CellId, by: CellId) !void {
+        const c = g.cell(id);
+        for (c.waiters.items) |w| if (w == by) return;
+        try c.waiters.append(g.gpa, by);
+        try g.cell(by).inputs.append(g.gpa, id);
+        if (c.orphan and !g.cell(by).orphan) g.adopt(id);
+    }
+
+    fn unpin(g: *Graph, id: CellId, by: CellId) void {
+        const c = g.cell(id);
+        for (c.waiters.items, 0..) |w, i| if (w == by) {
+            _ = c.waiters.swapRemove(i);
+            break;
+        };
+        g.release(id);
+    }
+
+    fn pins(g: *Graph, id: CellId) u32 {
+        const c = g.cell(id);
+        var n = c.holds;
+        for (c.waiters.items) |w| n += @intFromBool(!g.cell(w).orphan);
+        return n;
+    }
+
+    /// Nothing live pins it: an orphan, and so is everything it waits on.
+    fn release(g: *Graph, id: CellId) void {
+        const c = g.cell(id);
+        if (!c.live or g.pins(id) > 0) return;
+        if (!c.orphan) {
+            c.orphan = true;
+            for (c.inputs.items) |i| g.release(i);
+        }
+        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled or !c.inFlight(g))) g.free(id, c) catch {};
+    }
+
+    fn adopt(g: *Graph, id: CellId) void {
+        const c = g.cell(id);
+        if (!c.orphan) return;
+        c.orphan = false;
+        for (c.inputs.items) |i| g.adopt(i);
+    }
+
+    fn free(g: *Graph, id: CellId, c: *Cell) !void {
+        std.debug.assert(c.live);
+        c.live = false;
+        g.live -= 1;
+        for (c.inputs.items) |i| g.unpin(i, id);
+        c.inputs.deinit(g.gpa);
+        c.waiters.deinit(g.gpa);
+        if (c.blob) |b| g.store.unref(b);
+        if (g.index.get(c.key)) |i| if (i == id) {
+            _ = g.index.remove(c.key);
+        };
+        c.budget.refs -= 1;
+        if (c.budget.refs == 0) {
+            g.gpa.destroy(c.budget);
+            g.budgets -= 1;
+        }
+        c.arena.deinit();
+        c.arena = std.heap.ArenaAllocator.init(g.gpa);
+        try g.free_ids.append(g.gpa, id);
     }
 
     /// Copies out: the value becomes the blob's parse, the blob the store's
@@ -571,10 +669,16 @@ pub const Graph = struct {
                 if (expires_ns > g.now()) try g.store.put(c.key, blob.ref(), expires_ns);
             },
             .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
-            .answer, .exchange => {},
+            .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
+            .exchange => {},
         }
         try g.ready.appendSlice(g.gpa, c.waiters.items);
-        c.waiters.clearRetainingCapacity();
+        // An answer serves from its hops; everything else has copied out.
+        if (value != .answer) {
+            for (c.inputs.items) |i| g.unpin(i, id);
+            c.inputs.clearRetainingCapacity();
+        }
+        g.release(id);
     }
 
     pub fn fresh(g: *Graph, id: CellId) bool {
@@ -582,54 +686,54 @@ pub const Graph = struct {
         return c.settled and c.expires_ns > g.now();
     }
 
-    /// The live version of `key`: in progress, or settled and fresh. A
-    /// fresh fact in the store that no live cell holds is materialised
-    /// over the store's blob, settled without a rule.
-    pub fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
+    /// In progress, or settled and fresh; a store hit is materialised,
+    /// unpinned.
+    fn lookup(g: *Graph, key: Key, name: dns.Name, budget: *Budget) !?CellId {
         const live = g.index.get(key);
         if (live) |id| if (!g.cell(id).settled) return id;
         if (g.store.get(key, g.now())) |e| {
             if (live) |id| if (g.cell(id).blob == e.blob) return id;
-            const id = try g.newCell(key, name, @intCast(g.cells.items.len), 0);
-            const c = g.cell(id);
-            c.settled = true;
-            c.blob = e.blob.ref();
-            c.value = try store.Store.parse(c.arena.allocator(), e.blob);
-            c.expires_ns = e.expires_ns;
-            return id;
+            return try g.materialise(key, name, budget, e);
         }
         if (live) |id| if (g.cell(id).expires_ns > g.now()) return id;
         return null;
     }
 
-    pub const Fact = struct { value: Value, expires_ns: i64 };
-
-    /// A fresh fact's value now, without waiting: `demand` is the only pin.
-    pub fn peek(g: *Graph, key: Key, name: dns.Name) !?Fact {
-        const id = try g.lookup(key, name) orelse return null;
+    fn materialise(g: *Graph, key: Key, name: dns.Name, budget: *Budget, e: store.Entry) !CellId {
+        const id = try g.newCell(key, name, budget, 0);
         const c = g.cell(id);
-        return if (g.fresh(id)) .{ .value = c.value, .expires_ns = c.expires_ns } else null;
-    }
-
-    /// Demand `key` for `by`. Null when `by` already (transitively) feeds
-    /// the cell: a cycle, refused before any work.
-    pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
-        if (try g.lookup(key, name)) |id| {
-            if (g.fresh(id)) return id;
-            if (g.reaches(by, id)) return null;
-            try g.addWaiter(id, by);
-            return id;
-        }
-        const id = try g.newCell(key, name, g.cell(by).root, depth);
-        try g.ready.append(g.gpa, id);
-        try g.addWaiter(id, by);
+        c.settled = true;
+        c.blob = e.blob.ref();
+        c.value = try store.Store.parse(c.arena.allocator(), e.blob);
+        c.expires_ns = e.expires_ns;
         return id;
     }
 
-    pub fn addWaiter(g: *Graph, id: CellId, by: CellId) !void {
-        const c = g.cell(id);
-        for (c.waiters.items) |w| if (w == by) return;
-        try c.waiters.append(g.gpa, by);
+    pub const Fact = struct { value: Value, expires_ns: i64 };
+
+    /// No cell, no wait: `demand` is the only pin.
+    pub fn peek(g: *Graph, key: Key) !?Fact {
+        const live = g.index.get(key);
+        if (g.store.get(key, g.now())) |e| {
+            if (live) |id| if (g.cell(id).blob == e.blob) return .{ .value = g.cell(id).value, .expires_ns = e.expires_ns };
+            return .{ .value = try store.Store.parse(g.scratch.allocator(), e.blob), .expires_ns = e.expires_ns };
+        }
+        if (live) |id| if (g.fresh(id)) return .{ .value = g.cell(id).value, .expires_ns = g.cell(id).expires_ns };
+        return null;
+    }
+
+    /// Null on a cycle, or on new work for an orphan.
+    pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
+        if (try g.lookup(key, name, g.cell(by).budget)) |id| {
+            if (!g.fresh(id) and g.reaches(by, id)) return null;
+            try g.pin(id, by);
+            return id;
+        }
+        if (g.cell(by).orphan) return null;
+        const id = try g.newCell(key, name, g.cell(by).budget, depth);
+        try g.ready.append(g.gpa, id);
+        try g.pin(id, by);
+        return id;
     }
 
     /// Does settling `from` transitively wake `target`? Then `from`
@@ -650,34 +754,39 @@ pub const Graph = struct {
         return false;
     }
 
-    /// A settled version that ran no rule: evidence from a referral, or an
-    /// authoritative denial at a probe name. The publisher's own key is
-    /// left to its rule, which settles once.
-    pub fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !CellId {
-        if (g.index.get(key)) |id| {
-            const c = g.cell(id);
-            if (id == by) return id;
-            if (!c.settled) {
-                try g.settle(id, value, expires_ns);
-                return id;
-            }
-        }
-        const id = try g.newCell(key, name, g.cell(by).root, g.cell(by).depth);
-        try g.settle(id, value, expires_ns);
-        return id;
+    /// Evidence from a referral or a denial at a probe name: settles a
+    /// cell in progress for the key, except the publisher's own; else a fact.
+    pub fn publish(g: *Graph, key: Key, by: CellId, value: Value, expires_ns: i64) !void {
+        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled) return g.settle(id, value, expires_ns);
+        try g.fact(key, value, expires_ns);
+    }
+
+    fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !void {
+        if (expires_ns <= g.now()) return;
+        const blob = try g.store.build(value);
+        errdefer g.store.unref(blob);
+        try g.store.put(key, blob, expires_ns);
     }
 
     // ── Rules ──────────────────────────────────────────────────────────
 
+    /// Held for the run: what it publishes may settle and free its own
+    /// readers while the rule still has the cell in hand.
     fn run(g: *Graph, id: CellId) !void {
-        if (g.cell(id).settled) return;
+        const c = g.cell(id);
+        if (!c.live or c.settled) return;
+        c.holds += 1;
+        defer {
+            c.holds -= 1;
+            g.release(id);
+        }
         _ = g.scratch.reset(.retain_capacity);
         g.tally.runs += 1;
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
         // Ended waiting and created nothing: the model's own cost.
-        const cells_before = g.cells.items.len;
-        defer if (!g.cell(id).settled and g.cells.items.len == cells_before) {
+        const created_before = g.created;
+        defer if (g.cell(id).live and !g.cell(id).settled and g.created == created_before) {
             g.tally.reruns += 1;
             g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
         };
@@ -713,8 +822,9 @@ pub const Graph = struct {
                 for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
                 if (broken) return g.settle(id, .{ .answer = .{ .hops = try g.cell(id).arena.allocator().dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.failureExpiry(id));
             }
-            // Nothing waits on an answer cell, so its demands cannot cycle.
-            s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse unreachable;
+            // Nothing waits on an answer, so only an orphaned root is refused.
+            s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse
+                return g.settle(id, .{ .answer = .{ .hops = try g.cell(id).arena.allocator().dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.now());
             s.n += 1;
         }
         var expires: i64 = std.math.maxInt(i64);
@@ -757,11 +867,10 @@ pub const Graph = struct {
         }
         // A fresh fact at the probe name answers it without a packet; a
         // denial there stops minimising.
-        if (try g.lookup(try g.keyFor(.rrset, name, .a), name)) |rid| if (g.fresh(rid)) {
-            const known = g.cell(rid).value.rrset;
-            try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = known.kind == .nxdomain } }, @min(parent.expires_ns, g.cell(rid).expires_ns));
+        if (try g.peek(try g.keyFor(.rrset, name, .a))) |known| {
+            try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = known.value.rrset.kind == .nxdomain } }, @min(parent.expires_ns, known.expires_ns));
             return;
-        };
+        }
         if (!s.started) {
             s.ask.reset(pc.zone);
             s.started = true;
@@ -785,7 +894,7 @@ pub const Graph = struct {
                         // (bailiwick/006).
                         if (msg.header.flags.aa) {
                             const reply = try g.classify(msg, pc.zone, name, .a);
-                            _ = try g.publish(try g.keyFor(.rrset, name, .a), name, id, .{ .rrset = reply }, g.replyExpiry(reply));
+                            try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, g.replyExpiry(reply));
                         }
                         try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns);
                     },
@@ -819,7 +928,7 @@ pub const Graph = struct {
         const s = &g.cell(id).scratch.addr;
         if (s.host == null) {
             s.host = g.cell(id).name;
-            if (try g.peek(try g.keyFor(.rrset, s.host.?, .cname), s.host.?)) |cname| if (cname.value.rrset.kind == .alias) {
+            if (try g.peek(try g.keyFor(.rrset, s.host.?, .cname))) |cname| if (cname.value.rrset.kind == .alias) {
                 s.host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), cname.value.rrset.target, false);
                 s.hopped = true;
             };
@@ -895,7 +1004,7 @@ pub const Graph = struct {
                 // otherwise start at the parent's. A DS always lives there.
                 const own = try g.keyFor(.cut, name, .a);
                 const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
-                const key = if (qtype != .ds and (try g.lookup(own, name) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
+                const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
                 const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
                 s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
                     return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
@@ -906,7 +1015,7 @@ pub const Graph = struct {
             // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
             if (!s.dname_checked) {
                 s.dname_checked = true;
-                s.dname = try g.dnameAbove(name);
+                if (try g.dnameAbove(name)) |owner| s.dname = try g.demand(id, try g.keyFor(.rrset, owner, .dname), owner, g.cell(id).depth);
                 if (s.dname) |did| s.dname_judge = try trust.demandSecure(g, id, did);
             }
             if (s.dname_judge) |jid| {
@@ -965,7 +1074,7 @@ pub const Graph = struct {
             .stored_ns = reply.stored_ns,
             .ttl = first.ttl,
         };
-        _ = try g.publish(try g.keyFor(.rrset, name, .cname), name, by, .{ .rrset = hop }, g.replyExpiry(hop));
+        try g.publish(try g.keyFor(.rrset, name, .cname), by, .{ .rrset = hop }, g.replyExpiry(hop));
     }
 
     /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
@@ -976,18 +1085,18 @@ pub const Graph = struct {
             var keep: std.ArrayList(dns.ResourceRecord) = .empty;
             try keep.append(g.scratch.allocator(), d);
             try keepSigs(g, &keep, reply.answers, d.name, .dname);
-            const fact: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
-            _ = try g.publish(try g.keyFor(.rrset, d.name, .dname), d.name, by, .{ .rrset = fact }, g.replyExpiry(fact));
+            const dname: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+            try g.publish(try g.keyFor(.rrset, d.name, .dname), by, .{ .rrset = dname }, g.replyExpiry(dname));
         }
     }
 
-    /// The closest fresh DNAME fact above `name` (RFC 6672 §3.2).
-    fn dnameAbove(g: *Graph, name: dns.Name) !?CellId {
+    /// The owner of the closest fresh DNAME fact above `name` (RFC 6672 §3.2).
+    fn dnameAbove(g: *Graph, name: dns.Name) !?dns.Name {
         var i: usize = 1;
         while (i < name.labels.len) : (i += 1) {
             const owner: dns.Name = .{ .labels = name.labels[i..] };
-            const did = try g.lookup(try g.keyFor(.rrset, owner, .dname), owner) orelse continue;
-            if (g.fresh(did) and g.cell(did).value.rrset.kind == .answer) return did;
+            const d = try g.peek(try g.keyFor(.rrset, owner, .dname)) orelse continue;
+            if (d.value.rrset.kind == .answer) return owner;
         }
         return null;
     }
@@ -1028,14 +1137,15 @@ pub const Graph = struct {
         };
         const expires = g.now() + @as(i64, ns_ttl) * std.time.ns_per_s;
         const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
-        _ = try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), ref.zone_cut, by, .{ .cut = .{ .zone = ref.zone_cut } }, expires);
-        _ = try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), ref.zone_cut, by, .{ .ns = .{ .names = names } }, expires);
+        try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, .{ .cut = .{ .zone = ref.zone_cut } }, expires);
+        try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
         // The parent's word on the child's DS travels with the referral.
         if (g.cfg.trust_anchor != null) {
             const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-            if (ds.ttl > 0) _ = try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, g.replyExpiry(ds));
+            if (ds.ttl > 0) try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, g.replyExpiry(ds));
         }
-        // Glue: provisional addresses, never displacing a fresh authoritative set.
+        // Glue is only a fact: never displacing an authoritative set, nor
+        // pre-empting a walk for one in progress.
         for (names[0..ref.glued]) |host| {
             var addrs: std.ArrayList(na.Address) = .empty;
             var ttl: u32 = std.math.maxInt(u32);
@@ -1047,9 +1157,9 @@ pub const Graph = struct {
             }
             if (addrs.items.len == 0) continue;
             const key = try g.keyFor(.addr, host, .a);
-            if (try g.lookup(key, host)) |existing| if (g.fresh(existing) and !g.cell(existing).value.addr.provisional) continue;
+            if (try g.peek(key)) |existing| if (!existing.value.addr.provisional) continue;
             const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
-            _ = try g.publish(key, host, by, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
+            try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
         }
         return expires;
     }
@@ -1277,16 +1387,17 @@ pub const Graph = struct {
             var pending = false;
             for (names) |host| {
                 const key = try g.keyFor(.addr, host, .a);
-                if (try g.lookup(key, host)) |aid| {
-                    const c = g.cell(aid);
-                    if (!c.settled) {
-                        // In progress for someone: wait, unless it is
-                        // transitively waiting on us.
-                        if (try g.demand(id, key, host, g.cell(id).depth) != null) pending = true;
-                        continue;
-                    }
-                    try list.appendSlice(g.gpa, c.value.addr.addrs);
-                } else try unknown.append(g.gpa, host);
+                if (try g.peek(key)) |known| {
+                    try list.appendSlice(g.gpa, known.value.addr.addrs);
+                    continue;
+                }
+                if (g.index.get(key)) |aid| if (!g.cell(aid).settled) {
+                    // In progress for someone: wait, unless it is
+                    // transitively waiting on us.
+                    if (try g.demand(id, key, host, g.cell(id).depth) != null) pending = true;
+                    continue;
+                };
+                try unknown.append(g.gpa, host);
             }
             var i: usize = 0;
             while (i < list.items.len) {
@@ -1333,17 +1444,17 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
-    /// One query to one server, charged to the root; `.budget` when the
-    /// root's budget or deadline refuses it.
+    /// `.budget` when the asker's budget, deadline or orphaning refuses it.
     fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !CellId {
-        const root = g.cell(g.cell(by).root);
-        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, g.cell(by).root, g.cell(by).depth);
-        try g.addWaiter(id, by);
-        if (g.now() >= root.budget.deadline_ns or root.budget.queries >= g.cfg.max_queries) {
+        const budget = g.cell(by).budget;
+        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, budget, g.cell(by).depth);
+        try g.pin(id, by);
+        if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
             try g.settle(id, .{ .exchange = .budget }, g.now());
             return id;
         }
-        root.budget.queries += 1;
+        budget.queries += 1;
+        g.cell(id).holds += 1;
         const clock = Tally.clock(&g.tally.send_ns);
         defer clock.stop();
         const rng = g.edge.rng;
@@ -1366,7 +1477,7 @@ pub const Graph = struct {
             .server = server,
             .transport = transport,
             .wire = wire,
-            .deadline_ns = @min(root.budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
+            .deadline_ns = @min(budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
         });
         return id;
     }

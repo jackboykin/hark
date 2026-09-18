@@ -104,7 +104,7 @@ pub const Sim = struct {
         const q = query.questions[0];
         // RFC 8109 root priming is not logged, as in the Python responder.
         if (!(q.name.labels.len == 0 and q.qtype == .ns))
-            try s.log.append(s.gpa, .{ .server = ex.server, .qname = q.name, .qtype = q.qtype, .transport = ex.transport });
+            try s.log.append(s.gpa, .{ .server = ex.server, .qname = try dns.cloneNameFlat(s.arena, q.name, false), .qtype = q.qtype, .transport = ex.transport });
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;
             return s.schedule(ex.id, ex.deadline_ns, .timeout);

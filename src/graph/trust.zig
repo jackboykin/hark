@@ -146,18 +146,19 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const t = g.cell(rid);
     const key = try g.keyFor(.secure, t.name, t.key.rtype);
-    if (try g.lookup(key, t.name)) |sid| if (g.cell(sid).scratch.secure.target == rid) {
-        if (!g.cell(sid).settled) try g.addWaiter(sid, by);
+    if (g.index.get(key)) |sid| if (g.cell(sid).scratch.secure.target == rid and (!g.cell(sid).settled or g.fresh(sid))) {
+        try g.pin(sid, by);
         return sid;
     };
-    const sid = try g.newCell(key, t.name, g.cell(by).root, g.cell(by).depth);
+    const sid = try g.newCell(key, t.name, g.cell(by).budget, g.cell(by).depth);
     g.cell(sid).scratch.secure.target = rid;
+    try g.pin(sid, by);
     if (t.blob) |b| if (b.verdict.until_ns > g.now()) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
     };
+    try g.pin(rid, sid);
     try g.ready.append(g.gpa, sid);
-    try g.addWaiter(sid, by);
     return sid;
 }
 

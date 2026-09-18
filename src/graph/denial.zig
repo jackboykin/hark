@@ -121,7 +121,7 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        _ = try g.publish(try g.keyFor(.rrset, rr.name, rr.rtype), rr.name, by, .{ .rrset = fact }, expires);
+        try g.publish(try g.keyFor(.rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires);
         if (rr.rtype == .soa) continue;
         proofs += 1;
         const sp = try Span.init(g.gpa, rr, expires);
@@ -156,8 +156,8 @@ fn withSigs(g: *Graph, rrs: []const RR, rr: RR) ![]const RR {
 /// closest zone holding any can prove one: a span covering the name with
 /// the wildcard at its closest encloser matched (NODATA) or covered
 /// (NXDOMAIN), an exact owner (NODATA), or a span whose next name descends
-/// below it (an empty non-terminal, NODATA). The verdict is published with
-/// the reply; nothing is re-verified. Never for a DS: that is the parent's
+/// below it (an empty non-terminal, NODATA). The verdict is stamped on the
+/// reply; nothing is re-verified. Never for a DS: that is the parent's
 /// word at the cut alone (RFC 6840 §4.4), and it travels with the referral;
 /// a span from before the delegation existed would judge it (dnssec/033).
 /// Keys are only ever wanted positive.
@@ -178,7 +178,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const now = g.now();
-    const soa = try g.peek(try g.keyFor(.rrset, zone, .soa), zone) orelse return false;
+    const soa = try g.peek(try g.keyFor(.rrset, zone, .soa)) orelse return false;
     var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
@@ -202,7 +202,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     var authorities: std.ArrayList(RR) = .empty;
     try aged(g, &authorities, soa.value.rrset.answers, soa.value.rrset.stored_ns);
     for (proofs[0..n]) |p| {
-        const fact = try g.peek(try g.keyFor(.rrset, p.owner, .nsec), p.owner) orelse return false;
+        const fact = try g.peek(try g.keyFor(.rrset, p.owner, .nsec)) orelse return false;
         expires = @min(expires, fact.expires_ns);
         try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
     }
@@ -219,12 +219,8 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .stored_ns = now,
     };
     reply.ttl = @min(g.replyTtl(reply, zone, name), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
-    // The reply first, so the verdict lands on its bytes.
     try g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
-    const key = try g.keyFor(.secure, name, qtype);
-    const sid = try g.newCell(key, name, g.cell(id).root, g.cell(id).depth);
-    g.cell(sid).scratch.secure.target = id;
-    try g.settle(sid, .{ .secure = .{ .status = .secure, .proven_until_ns = expires } }, expires);
+    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires);
     return true;
 }
 

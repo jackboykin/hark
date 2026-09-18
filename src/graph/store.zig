@@ -157,7 +157,12 @@ pub const Store = struct {
                 try w.int(u16, @intCast(c.records.len));
                 try w.records(c.records);
             },
-            .answer, .secure, .exchange => unreachable,
+            // A failed answer alone, for its SERVFAIL window.
+            .answer => |a| {
+                try w.int(u8, @backingInt(a.status));
+                try w.int(u8, @intFromBool(a.broken));
+            },
+            .secure, .exchange => unreachable,
         }
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
@@ -219,7 +224,11 @@ pub const Store = struct {
                 c.records = try r.records(try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
-            .answer, .secure, .exchange => unreachable,
+            .answer => blk: {
+                const status: dnssec.SecurityStatus = @fromBackingInt(@as(u2, @intCast(try r.int(u8))));
+                break :blk .{ .answer = .{ .hops = &.{}, .status = status, .broken = try r.int(u8) != 0 } };
+            },
+            .secure, .exchange => unreachable,
         };
     }
 };
