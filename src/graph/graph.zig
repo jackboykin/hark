@@ -210,6 +210,9 @@ pub const Tally = struct {
     store_ns: u64 = 0,
     reruns: u64 = 0,
     rerun_ns: u64 = 0,
+    /// Cycle checks, and cells they walked.
+    reaches: u64 = 0,
+    reaches_visits: u64 = 0,
 
     pub const Clock = struct {
         t0: i128,
@@ -386,6 +389,8 @@ pub const Cell = struct {
     live: bool = true,
     settled: bool = false,
     orphan: bool = false,
+    /// The cycle check that last walked through here.
+    seen: u64 = 0,
     value: Value = undefined,
     expires_ns: i64 = 0,
     waiters: std.ArrayList(CellId) = .empty,
@@ -420,6 +425,7 @@ pub const Graph = struct {
     /// Rule-held pointers survive appends; a freed slot is reused.
     cells: std.ArrayList(*Cell) = .empty,
     free_ids: std.ArrayList(CellId) = .empty,
+    checks: u64 = 0,
     live: u32 = 0,
     budgets: u32 = 0,
     created: u64 = 0,
@@ -764,19 +770,20 @@ pub const Graph = struct {
     }
 
     /// Does settling `from` transitively wake `target`? Then `from`
-    /// demanding `target` would be a cycle.
+    /// demanding `target` would be a cycle. Walks the waiters above
+    /// `from`: the demand chain, not the graph.
     fn reaches(g: *Graph, from: CellId, target: CellId) bool {
+        g.checks += 1;
+        g.tally.reaches += 1;
         var stack: std.ArrayList(CellId) = .empty;
-        defer stack.deinit(g.gpa);
-        var seen: std.DynamicBitSetUnmanaged = .{};
-        defer seen.deinit(g.gpa);
-        seen.resize(g.gpa, g.cells.items.len, false) catch return true;
-        stack.append(g.gpa, from) catch return true;
+        stack.append(g.scratch.allocator(), from) catch return true;
         while (stack.pop()) |id| {
             if (id == target) return true;
-            if (seen.isSet(id)) continue;
-            seen.set(id);
-            for (g.cell(id).waiters.items) |w| stack.append(g.gpa, w) catch return true;
+            const c = g.cell(id);
+            if (c.seen == g.checks) continue;
+            c.seen = g.checks;
+            g.tally.reaches_visits += 1;
+            stack.appendSlice(g.scratch.allocator(), c.waiters.items) catch return true;
         }
         return false;
     }

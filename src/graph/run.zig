@@ -358,16 +358,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
             var first: Report = .{};
             defer gpa.free(first.log);
             const result = runScenario(gpa, &scenario, .{ .seed = seed }, &first);
-            r.tally.runs += first.tally.runs;
-            r.tally.settles += first.tally.settles;
-            r.tally.parses += first.tally.parses;
-            r.tally.rule_ns += first.tally.rule_ns;
-            r.tally.send_ns += first.tally.send_ns;
-            r.tally.verify_ns += first.tally.verify_ns;
-            r.tally.parse_ns += first.tally.parse_ns;
-            r.tally.store_ns += first.tally.store_ns;
-            r.tally.reruns += first.tally.reruns;
-            r.tally.rerun_ns += first.tally.rerun_ns;
+            inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(r.tally, f) += @field(first.tally, f);
             r.cells += first.cells;
             r.scenarios += 1;
             if (expect_fail) {
@@ -395,6 +386,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     // Debug numbers mean nothing.
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
+    std.debug.print("  {d} cycle checks walked {d} cells ({d:.1} each) over {d} cell slots\n", .{ t.reaches, t.reaches_visits, @as(f64, @floatFromInt(t.reaches_visits)) / @as(f64, @floatFromInt(@max(t.reaches, 1))), r.cells });
     std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
     std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries, {d} verifying and {d} in the store) vs {d} ns per parse; {d:.0} cells per run\n", .{
         root,
