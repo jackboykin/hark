@@ -423,7 +423,8 @@ pub const Graph = struct {
         const key = try g.keyFor(.answer, name, qtype);
         if (g.lookup(key)) |id| return id;
         const id: CellId = @intCast(g.cells.items.len);
-        _ = try g.newCell(key, name, id, 0);
+        // The question outlives the client's bytes.
+        _ = try g.newCell(key, try dns.cloneNameFlat(g.arena, name, false), id, 0);
         g.cell(id).budget = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         try g.index.put(g.gpa, key, id);
         try g.ready.append(g.gpa, id);
