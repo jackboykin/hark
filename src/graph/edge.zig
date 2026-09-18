@@ -28,6 +28,8 @@ const Timer = struct {
     at_ns: i64,
     seq: u32,
     id: CellId,
+    /// The cell's generation for a wake, the flight's sequence for a timeout.
+    gen: u32,
     kind: enum { timeout, wake },
 
     fn before(_: void, a: Timer, b: Timer) std.math.Order {
@@ -90,8 +92,8 @@ fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
     return @as(*Edge, @ptrCast(@alignCast(ctx))).send(ex);
 }
 
-fn wakeErased(ctx: *anyopaque, id: CellId, at_ns: i64) anyerror!void {
-    _ = try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, .wake);
+fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) anyerror!void {
+    _ = try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, gen, .wake);
 }
 
 /// Time is read once per event: rules see one instant.
@@ -118,7 +120,8 @@ fn send(e: *Edge, ex: Exchange) !void {
         // No socket: a timeout now.
         return e.push(.{ .exchange = .{ .id = ex.id, .completion = .timeout } });
     };
-    flight.seq = try e.schedule(ex.deadline_ns, ex.id, .timeout);
+    flight.seq = e.seq + 1;
+    _ = try e.schedule(ex.deadline_ns, ex.id, flight.seq, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);
 }
 
@@ -160,9 +163,9 @@ fn finish(e: *Edge, id: CellId, completion: Completion) !void {
     try e.push(.{ .exchange = .{ .id = id, .completion = completion } });
 }
 
-fn schedule(e: *Edge, at_ns: i64, id: CellId, kind: @FieldType(Timer, "kind")) !u32 {
+fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: @FieldType(Timer, "kind")) !u32 {
     e.seq += 1;
-    try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .kind = kind });
+    try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .gen = gen, .kind = kind });
     return e.seq;
 }
 
@@ -206,14 +209,14 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
 }
 
 /// A timeout for a finished flight, or a later one under its recycled id,
-/// is stale; a wake on a recycled id is harmless.
+/// is stale; a wake carries its cell's generation for the graph to check.
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
         _ = e.timers.pop();
         switch (t.kind) {
-            .wake => try e.push(.{ .exchange = .{ .id = t.id, .completion = .wake } }),
-            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.seq) try e.finish(t.id, .timeout),
+            .wake => try e.push(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
+            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) try e.finish(t.id, .timeout),
         }
     }
 }

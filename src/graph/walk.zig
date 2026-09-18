@@ -28,6 +28,8 @@ const max_hedge = 3;
 
 /// BIND's stale-refresh-time (RFC 8767 §5).
 pub const stale_hold_s = 30;
+/// RFC 8767 §5: a refresh past a stub's patience answers stale instead.
+pub const stale_client_ms = 1800;
 
 pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport };
 
@@ -181,6 +183,9 @@ pub const AnswerScratch = struct {
     nj: u8 = 0,
     stale: [max_cname_chain + 1]?*const Reply = @splat(null),
     stale_checked: [max_cname_chain + 1]bool = @splat(false),
+    /// Where the client's patience ends; one wake.
+    stale_at: i64 = 0,
+    armed: bool = false,
 };
 
 // ── Rules ──────────────────────────────────────────────────────────────
@@ -188,13 +193,26 @@ pub const AnswerScratch = struct {
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
+    if (s.stale_at == 0) s.stale_at = g.now() + stale_client_ms * std.time.ns_per_ms;
     var next = g.cell(id).name;
     while (true) {
         if (s.n > 0) {
             const i = s.n - 1;
             const last = g.cell(s.hops[i]);
-            if (!last.settled) return;
-            if (!s.stale_checked[i]) {
+            if (!last.settled) {
+                // Past the client's patience: stale answers and holds; the refresh is orphaned.
+                const until = staleWindow(g, last.key) orelse return;
+                if (g.store.any(last.key).?.hold_until_ns <= g.now()) {
+                    if (g.now() < s.stale_at) {
+                        if (!s.armed) try g.wake(id, s.stale_at);
+                        s.armed = true;
+                        return;
+                    }
+                    holdStale(g, last.key, until);
+                }
+                s.stale[i] = try staleReply(g, last.key, g.cell(id).arena.allocator());
+                s.stale_checked[i] = true;
+            } else if (!s.stale_checked[i]) {
                 s.stale_checked[i] = true;
                 if (last.value.rrset.kind == .servfail) s.stale[i] = try staleReply(g, last.key, g.cell(id).arena.allocator());
             }
@@ -465,16 +483,20 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
 /// substitute the stale reply, so DS and DNSKEY fail for the hold.
 fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
     const key = g.cell(id).key;
-    if (reply.kind == .servfail and reply.rcode == .server_failure) if (g.store.any(key)) |e| if (staleUntil(g, e)) |until| {
-        g.store.hold(key, @min(g.now() + stale_hold_s * std.time.ns_per_s, until));
+    if (reply.kind == .servfail and reply.rcode == .server_failure) if (staleWindow(g, key)) |until| {
+        holdStale(g, key, until);
         return g.settle(id, .{ .rrset = reply }, g.now());
     };
     try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) failureExpiry(g, id) else replyExpiry(g, reply));
 }
 
-/// The stale window's end; null while fresh, too old, or a failure.
-fn staleUntil(g: *Graph, e: store.Entry) ?i64 {
+fn holdStale(g: *Graph, key: Key, until: i64) void {
+    g.store.hold(key, @min(g.now() + stale_hold_s * std.time.ns_per_s, until));
+}
+
+fn staleWindow(g: *Graph, key: Key) ?i64 {
     if (g.cfg.serve_stale_ttl == 0) return null;
+    const e = g.store.any(key) orelse return null;
     const life = store.rrsetLife(e.blob) catch return null;
     const until = life.expires_ns + @as(i64, g.cfg.serve_stale_ttl) * std.time.ns_per_s;
     if (life.servfail or g.now() < life.expires_ns or g.now() >= until) return null;
@@ -482,8 +504,8 @@ fn staleUntil(g: *Graph, e: store.Entry) ?i64 {
 }
 
 fn staleReply(g: *Graph, key: Key, arena: Allocator) !?*const Reply {
-    const e = g.store.any(key) orelse return null;
-    if (staleUntil(g, e) == null) return null;
+    if (staleWindow(g, key) == null) return null;
+    const e = g.store.any(key).?;
     const held = try arena.create(Reply);
     held.* = (try store.Store.parse(arena, e.blob)).rrset;
     held.ede = .stale_answer;
@@ -760,7 +782,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             a.next += 1;
             const state = try sendTo(g, id, a, server, .udp, qname, qtype);
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
-            if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.edge.wake(id, a.hedge_at);
+            if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.wake(id, a.hedge_at);
             continue;
         }
         if (a.nattempts > 0) return .pending;

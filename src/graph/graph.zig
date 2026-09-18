@@ -40,8 +40,8 @@ pub const Completion = union(enum) {
     /// Bytes the cell may hold: they are parsed in place.
     reply: []const u8,
     timeout,
-    /// The cell asked to run again at this time.
-    wake,
+    /// Run again at this time; carries the cell's generation, since ids recycle.
+    wake: u32,
 };
 
 /// What the graph asks of the world; the simulator and the live edge
@@ -52,14 +52,14 @@ pub const Edge = struct {
     wall_sec: *const i64,
     rng: std.Random,
     sendFn: *const fn (*anyopaque, Exchange) anyerror!void,
-    wakeFn: *const fn (*anyopaque, CellId, i64) anyerror!void,
+    wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
 
     pub fn send(e: Edge, ex: Exchange) !void {
         return e.sendFn(e.ctx, ex);
     }
 
-    pub fn wake(e: Edge, id: CellId, at_ns: i64) !void {
-        return e.wakeFn(e.ctx, id, at_ns);
+    pub fn wake(e: Edge, id: CellId, gen: u32, at_ns: i64) !void {
+        return e.wakeFn(e.ctx, id, gen, at_ns);
     }
 };
 
@@ -278,6 +278,8 @@ pub const Cell = struct {
     live: bool = true,
     settled: bool = false,
     orphan: bool = false,
+    /// Bumped each time the slot is reused.
+    gen: u32 = 0,
     /// The cycle check that last walked through here.
     seen: u64 = 0,
     value: Value = undefined,
@@ -418,9 +420,13 @@ pub const Graph = struct {
         while (g.ready.pop()) |id| try g.run(id);
     }
 
+    pub fn wake(g: *Graph, id: CellId, at_ns: i64) !void {
+        return g.edge.wake(id, g.cell(id).gen, at_ns);
+    }
+
     pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
         if (completion == .wake) {
-            try g.ready.append(g.gpa, id);
+            if (g.cell(id).gen == completion.wake) try g.ready.append(g.gpa, id);
             return g.drain();
         }
         const c = g.cell(id);
@@ -484,7 +490,9 @@ pub const Graph = struct {
         var arena = std.heap.ArenaAllocator.init(g.gpa);
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
+        const gen = if (reused != null) c.gen +% 1 else 0;
         c.* = .{
+            .gen = gen,
             .key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) },
             .name = try dns.cloneNameFlat(arena.allocator(), name, false),
             .budget = budget,

@@ -87,8 +87,8 @@ pub const Sim = struct {
         return @as(*Sim, @ptrCast(@alignCast(ctx))).send(ex);
     }
 
-    fn wakeErased(ctx: *anyopaque, id: u32, at_ns: i64) anyerror!void {
-        return @as(*Sim, @ptrCast(@alignCast(ctx))).wake(id, at_ns);
+    fn wakeErased(ctx: *anyopaque, id: u32, gen: u32, at_ns: i64) anyerror!void {
+        return @as(*Sim, @ptrCast(@alignCast(ctx))).schedule(id, at_ns, .{ .wake = gen });
     }
 
     pub fn advance(s: *Sim, seconds: u32) void {
@@ -159,10 +159,6 @@ pub const Sim = struct {
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         return s.schedule(ex.id, at, .{ .reply = try s.arena.dupe(u8, wire) });
-    }
-
-    pub fn wake(s: *Sim, id: u32, at_ns: i64) !void {
-        return s.schedule(id, at_ns, .wake);
     }
 
     fn schedule(s: *Sim, id: u32, at_ns: i64, completion: Completion) !void {
