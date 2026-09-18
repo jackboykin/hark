@@ -763,8 +763,6 @@ pub const Graph = struct {
         return state.isDead(g.nowMs());
     }
 
-    /// The server set for `a.zone`: hints at the root, else the addresses
-    /// already known for the NS names. Only when none are known, or all
     // ── Exchanges ──────────────────────────────────────────────────────
 
     /// `.budget` when the asker's budget, deadline or orphaning refuses it.

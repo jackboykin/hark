@@ -78,6 +78,10 @@ pub const AddressKey = struct {
         return key;
     }
 
+    pub fn toAddress(k: AddressKey) Address {
+        return if (k.family == posix.AF.INET) initIp4(k.addr[0..4].*, k.port) else initIp6(k.addr, k.port, 0, 0);
+    }
+
     /// Hash context tuned for AddressKey: reads the 16-byte addr as two u64s
     /// and mixes via FNV-1a-style multiply, avoiding Wyhash's variable-length
     /// dispatch + final mixing chain. Wyhash showed at ~20% of CPU on miss

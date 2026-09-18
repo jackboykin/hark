@@ -29,7 +29,7 @@ const max_hedge = 3;
 /// BIND's stale-refresh-time (RFC 8767 §5).
 pub const stale_hold_s = 30;
 
-pub const Attempt = struct { exchange: CellId, server: na.Address, transport: Transport };
+pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
@@ -38,12 +38,12 @@ pub const Ask = struct {
     /// `ns(zone)`, held: a TTL-0 set answers this ask once, not a re-probe per pass.
     ns: ?CellId = null,
     have_servers: bool = false,
-    servers: [max_servers]na.Address = undefined,
+    /// Every address gathered so far; a later gather appends what is new.
+    servers: [max_servers]na.AddressKey = undefined,
     nservers: u8 = 0,
-    order: [max_servers]u8 = undefined,
     next: u8 = 0,
-    tried: [max_servers]na.Address = undefined,
-    ntried: u8 = 0,
+    /// Bit i: `servers[i]` has been sent to.
+    tried: u32 = 0,
     fetched_unglued: bool = false,
     /// Every server silent once: one more attempt each, at the backed-off timeout.
     retried: bool = false,
@@ -52,9 +52,14 @@ pub const Ask = struct {
     nattempts: u8 = 0,
     /// When the next attempt may start early.
     hedge_at: i64 = 0,
-    /// Best failing reply (`delegation.failurePrecedence`), served when
-    /// every server fails with an rcode.
-    held: ?dns.Message = null,
+    /// The exchange whose failing reply ranks best
+    /// (`delegation.failurePrecedence`), served when every server fails
+    /// with an rcode.
+    held: ?CellId = null,
+
+    comptime {
+        std.debug.assert(max_servers < 32);
+    }
 
     const Result = union(enum) {
         pending,
@@ -63,8 +68,13 @@ pub const Ask = struct {
         exhausted,
     };
 
-    fn hasTried(a: *const Ask, server: na.Address) bool {
-        for (a.tried[0..a.ntried]) |t| if (na.ipEqual(t, server)) return true;
+    fn bit(i: anytype) u32 {
+        return @as(u32, 1) << @intCast(i);
+    }
+
+    fn knows(a: *const Ask, server: na.Address) bool {
+        const key = na.AddressKey.fromAddress(server);
+        for (a.servers[0..a.nservers]) |s| if (s.eql(key)) return true;
         return false;
     }
 
@@ -79,28 +89,43 @@ pub const Ask = struct {
         a.* = .{ .zone = zone };
     }
 
-    /// Dead servers are skipped unless nothing else is left.
-    fn seed(a: *Ask, g: *Graph, addrs: []const na.Address) void {
+    /// Appends, shuffled. Dead servers are skipped unless nothing else is left.
+    fn add(a: *Ask, g: *Graph, addrs: []const na.Address) void {
         var live: usize = 0;
         for (addrs) |s| live += @intFromBool(!g.isDead(s));
-        a.nservers = 0;
+        const from = a.nservers;
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
             if (live > 0 and g.isDead(s)) continue;
-            a.servers[a.nservers] = s;
+            a.servers[a.nservers] = na.AddressKey.fromAddress(s);
             a.nservers += 1;
         }
-        for (0..a.nservers) |i| a.order[i] = @intCast(i);
-        g.edge.rng.shuffle(u8, a.order[0..a.nservers]);
+        g.edge.rng.shuffle(na.AddressKey, a.servers[from..a.nservers]);
+        a.have_servers = a.next < a.nservers;
+    }
+
+    /// Once more from the top in a fresh order, skipping the dead unless all are.
+    fn retry(a: *Ask, g: *Graph) void {
+        a.retried = true;
+        g.edge.rng.shuffle(na.AddressKey, a.servers[0..a.nservers]);
+        a.tried = 0;
+        for (a.servers[0..a.nservers], 0..) |s, i| if (g.isDead(s.toAddress())) {
+            a.tried |= bit(i);
+        };
+        if (a.tried == bit(a.nservers) - 1) a.tried = 0;
         a.next = 0;
         a.have_servers = a.nservers > 0;
     }
 
+    fn heldMsg(a: *const Ask, g: *Graph) ?dns.Message {
+        return g.cell(a.held orelse return null).value.exchange.reply.msg;
+    }
+
     /// A rank-0 reply (lame, recursor) leaves as bare SERVFAIL so the
     /// randomised server order cannot change what the stub sees.
-    fn giveUp(a: *Ask) Result {
+    fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
-        var msg = a.held orelse return .exhausted;
+        var msg = a.heldMsg(g) orelse return .exhausted;
         if (delegation.failurePrecedence(msg.header.flags.rcode) == 0) {
             msg.header.flags.rcode = .server_failure;
             msg.answers = &.{};
@@ -401,7 +426,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             }
         }
         s.ask.reset(cut.value.cut.zone);
-        s.ask.seed(g, cut.value.cut.addrs);
+        s.ask.add(g, cut.value.cut.addrs);
         s.started = true;
     }
     while (true) {
@@ -423,7 +448,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(g, reply));
                     }
                     s2.ask.reset(ref.zone_cut);
-                    s2.ask.seed(g, ref.addrs[0..ref.addr_count]);
+                    s2.ask.add(g, ref.addrs[0..ref.addr_count]);
                     continue;
                 }
                 const reply = try classify(g, msg, zone, name, qtype);
@@ -690,9 +715,8 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (!a.have_servers) switch (try gatherServers(g, id, a)) {
             .pending => return .pending,
             .none => {
-                if (a.retried or a.held != null) return a.giveUp();
-                a.retried = true;
-                a.ntried = 0;
+                if (a.retried or a.held != null) return a.giveUp(g);
+                a.retry(g);
                 continue;
             },
             .ready => {},
@@ -725,13 +749,14 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                     } else if (!delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) {
                         a.nattempts = 0;
                         return .{ .reply = r.msg };
-                    } else delegation.recordFailure(&a.held, r.msg);
+                    } else if (outranks(r.msg, a.heldMsg(g))) a.held = at.exchange;
                 },
             }
         }
+        while (a.next < a.nservers and a.tried & Ask.bit(a.next) != 0) a.next += 1;
         const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
         if (a.next < a.nservers and (a.nattempts == 0 or early)) {
-            const server = a.servers[a.order[a.next]];
+            const server = a.next;
             a.next += 1;
             const state = try sendTo(g, id, a, server, .udp, qname, qtype);
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
@@ -744,26 +769,32 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
     }
 }
 
+/// `delegation.recordFailure`'s rule: a later reply wins ties.
+fn outranks(msg: dns.Message, held: ?dns.Message) bool {
+    const h = held orelse return true;
+    return delegation.failurePrecedence(msg.header.flags.rcode) >= delegation.failurePrecedence(h.header.flags.rcode);
+}
+
 /// One attempt on the estimate's timeout; only the last of all is uncapped.
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType) !ns_rtt.RttState {
-    if (!a.hasTried(server) and a.ntried < max_servers) {
-        a.tried[a.ntried] = server;
-        a.ntried += 1;
-    }
-    const state = g.rtt.get(na.AddressKey.fromAddress(server)) orelse ns_rtt.RttState.unknown;
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, transport: Transport, qname: dns.Name, qtype: dns.RType) !ns_rtt.RttState {
+    a.tried |= Ask.bit(server);
+    const key = a.servers[server];
+    const state = g.rtt.get(key) orelse ns_rtt.RttState.unknown;
     const timeout_ms = state.timeout(a.nattempts == 0 and a.next >= a.nservers, transport);
-    a.attempts[a.nattempts] = .{ .exchange = try g.exchange(id, server, transport, qname, qtype, timeout_ms), .server = server, .transport = transport };
+    a.attempts[a.nattempts] = .{ .exchange = try g.exchange(id, key.toAddress(), transport, qname, qtype, timeout_ms), .server = server, .transport = transport };
     a.nattempts += 1;
     return state;
 }
 
+/// The server set for `a.zone`: hints at the root, else the addresses
+/// already known for the NS names. Only when none are known, or all
 /// have failed, are unglued names resolved, up to a per-depth limit.
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
     var list: std.ArrayList(na.Address) = .empty;
     defer list.deinit(g.gpa);
     const zone = a.zone;
     if (zone.labels.len == 0) {
-        for (g.cfg.root_hints) |h| if (!a.hasTried(h)) try list.append(g.gpa, h);
+        for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
     } else {
         if (a.ns == null) a.ns = try g.demand(id, try g.keyFor(.ns, zone, .a), zone, g.cell(id).depth) orelse return .none;
         const ns = g.cell(a.ns.?);
@@ -797,7 +828,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         }
         var i: usize = 0;
         while (i < list.items.len) {
-            if (a.hasTried(list.items[i])) _ = list.swapRemove(i) else i += 1;
+            if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
         }
         // A sibling still resolving is waited for only when nothing
         // else is left.
@@ -819,20 +850,18 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             return gatherServers(g, id, a);
         }
     }
-    if (list.items.len == 0) {
-        if (g.cfg.trace) {
-            var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            var zb: [dns.max_dotted_len + 1]u8 = undefined;
-            std.debug.print("  {s} at {s}: {d} servers tried, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.ntried, if (a.held != null) "best failure held" else "no reply at all" });
-        }
-        return .none;
+    a.add(g, list.items);
+    if (a.have_servers) return .ready;
+    if (g.cfg.trace) {
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        var zb: [dns.max_dotted_len + 1]u8 = undefined;
+        std.debug.print("  {s} at {s}: {d} servers tried, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), @popCount(a.tried), if (a.held != null) "best failure held" else "no reply at all" });
     }
-    a.seed(g, list.items);
-    return .ready;
+    return .none;
 }
 
 test "an ask has a static bound" {
-    // A waiting walk's scratch is a comptime constant, not a stack. Ask's
-    // two address arrays are most of it.
-    try std.testing.expect(@sizeOf(Ask) <= 2048);
+    // A waiting walk's scratch is a comptime constant, not a stack; the
+    // server list is most of it.
+    try std.testing.expect(@sizeOf(Ask) <= 640);
 }
