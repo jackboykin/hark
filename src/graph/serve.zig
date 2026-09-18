@@ -120,8 +120,7 @@ const Server = struct {
         if (linux.errno(rc) != .SUCCESS) return;
         const data = buf[0..rc];
         const from = na.fromSockaddr(&pa);
-        // BCP 140: a silent drop is the only non-amplifying refusal.
-        if (data.len < 12 or data[2] & 0x80 != 0 or !acl.allow(s.cfg.allow_from, from)) return;
+        if (!acl.allow(s.cfg.allow_from, from)) return;
         try s.ask(data, .{ .udp = .{ .fd = fd, .addr = from } });
     }
 
@@ -217,6 +216,8 @@ const Server = struct {
     fn ask(s: *Server, wire: []const u8, reply: Reply) !void {
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
+        // BCP 140: a UDP reply is dropped silently; over TCP `validateQuery` answers it.
+        if (wire.len < 12 or (reply == .udp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         const query = dns.parseMessage(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
             return s.sendError(reply, id, .query, .format_error, 0, wire[2] & 1 != 0, &.{}, null);
