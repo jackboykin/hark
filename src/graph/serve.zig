@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const dns = @import("../dns.zig");
 const graph = @import("graph.zig");
+const walk = @import("walk.zig");
 
 pub const Client = struct { rd: bool = true, cd: bool = false, do_bit: bool = false, ad: bool = false };
 
@@ -44,7 +45,7 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
         // A denial's life is the reply's, not a record's.
         if (hop_stale and last.kind != .answer and last.kind != .alias) {
             age = 0;
-            life = graph.stale_hold_s;
+            life = walk.stale_hold_s;
         }
         try appendAged(arena, &chain, last.answers, age, life, c.do_bit, hop_stale);
     };
@@ -93,7 +94,7 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []
     for (rrs) |rr| {
         if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
-        aged.ttl = if (stale and rr.ttl <= age) graph.stale_hold_s else @min(rr.ttl -| age, life);
+        aged.ttl = if (stale and rr.ttl <= age) walk.stale_hold_s else @min(rr.ttl -| age, life);
         try out.append(arena, aged);
     }
 }

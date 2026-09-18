@@ -8,6 +8,7 @@ const std = @import("std");
 const dns = @import("../dns.zig");
 const dnssec = @import("../dnssec.zig");
 const graph = @import("graph.zig");
+const walk = @import("walk.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
@@ -235,8 +236,8 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .ede = .synthesized,
         .stored_ns = now,
     };
-    reply.ttl = @min(g.replyTtl(reply, zone, name), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
-    try g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
+    reply.ttl = @min(walk.replyTtl(g, reply, zone, name), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
+    try g.settle(id, .{ .rrset = reply }, walk.replyExpiry(g, reply));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires);
     return true;
 }

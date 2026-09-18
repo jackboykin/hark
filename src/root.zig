@@ -30,6 +30,7 @@ pub const graph = struct {
     pub const rpl = @import("graph/rpl.zig");
     pub const sim = @import("graph/sim.zig");
     pub const graph = @import("graph/graph.zig");
+    pub const walk = @import("graph/walk.zig");
     pub const run = @import("graph/run.zig");
     pub const sign = @import("graph/sign.zig");
     pub const trust = @import("graph/trust.zig");
@@ -72,6 +73,7 @@ test {
     _ = @import("graph/rpl.zig");
     _ = @import("graph/sim.zig");
     _ = @import("graph/graph.zig");
+    _ = @import("graph/walk.zig");
     _ = @import("graph/run.zig");
     _ = @import("graph/sign.zig");
     _ = @import("graph/trust.zig");
