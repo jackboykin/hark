@@ -20,7 +20,7 @@ pub const Chain = struct {
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
-pub const DsScratch = struct { parent: ?CellId = null, keys: ?CellId = null, rrset: ?CellId = null };
+pub const DsScratch = struct { parent: ?CellId = null, keys: ?CellId = null, rrset: ?CellId = null, signer: ?CellId = null };
 pub const DnskeyScratch = struct { ds: ?CellId = null, rrset: ?CellId = null };
 pub const SecureScratch = struct {
     /// The rrset version under judgement.
@@ -44,9 +44,11 @@ fn capExpiry(g: *Graph, cap: u32) i64 {
 }
 
 /// `ds(zone)`: the anchor at the root; below it, `rrset(zone, DS)` judged
-/// under `dnskey(parent)`. A signed set with a usable algorithm is secure,
-/// a proven absence or unusable set insecure, anything else bogus. An
-/// insecure or bogus parent is inherited.
+/// under the keys of whatever signed it, a proper ancestor of the zone:
+/// the walked parent may hide a signed cut on its own servers, or fold
+/// one (901). A signed set with a usable algorithm is secure, a proven
+/// absence or unusable set insecure, anything else bogus. An insecure or
+/// bogus parent is inherited.
 pub fn runDs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = &g.cell(id).scratch.ds;
@@ -64,14 +66,25 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const parent_zone = parent.value.cut.zone;
     if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, parent_zone, .a), parent_zone, g.cell(id).depth) orelse
         return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
-    const keys = g.cell(s.keys.?);
-    if (!keys.settled) return;
-    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = keys.value.dnskey.status } }, keys.expires_ns);
+    const parent_keys = g.cell(s.keys.?);
+    if (!parent_keys.settled) return;
+    if (parent_keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.value.dnskey.status } }, parent_keys.expires_ns);
     if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .ds), zone, g.cell(id).depth) orelse
         return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
     const rs = g.cell(s.rrset.?);
     if (!rs.settled) return;
     const r = rs.value.rrset;
+    const signer = switch (r.kind) {
+        .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
+        .nodata, .nxdomain => dnssec.authoritySigner(r.authorities),
+        .alias, .servfail => null,
+    } orelse return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+    if (!dnssec.isProperAncestor(signer, zone)) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+    if (s.signer == null) s.signer = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, g.cell(id).depth) orelse
+        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+    const keys = g.cell(s.signer.?);
+    if (!keys.settled) return;
+    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
     var budget: dnssec.ValidationBudget = .{};
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -85,15 +98,18 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
         },
         .nodata, .nxdomain => {
+            // RFC 4034 §3.1.3.
+            for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
+                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
             var cap: u32 = std.math.maxInt(u32);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.value.dnskey.records, now, &budget, &cap) != .secure)
                 return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
-            switch (dnssec.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, parent_zone, &budget)) {
-                .secure, .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
-                .bogus, .unchecked => try g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g)),
+            switch (dnssec.classifyDelegation(r.authorities, zone, signer, &budget)) {
+                .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
+                else => try g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g)),
             }
         },
-        .alias, .servfail => try g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g)),
+        .alias, .servfail => unreachable,
     }
 }
 
