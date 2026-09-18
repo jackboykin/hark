@@ -442,16 +442,19 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
     log.info("listening on {d} address(es)", .{cfg.listen.len});
+    var sweep_at = e.now_ns + std.time.ns_per_s;
     var stats_at = e.now_ns + stats_every;
     while (!s.stopping) {
-        const ev = try e.next(e.now_ns + std.time.ns_per_s) orelse {
+        // Under load `next` always has an event; the timers run here, not on idle.
+        if (e.now_ns >= sweep_at) {
+            sweep_at = e.now_ns + std.time.ns_per_s;
             s.sweep();
-            if (e.now_ns >= stats_at) {
-                stats_at = e.now_ns + stats_every;
-                logStats(&g);
-            }
-            continue;
-        };
+        }
+        if (e.now_ns >= stats_at) {
+            stats_at = e.now_ns + stats_every;
+            logStats(&g);
+        }
+        const ev = try e.next(e.now_ns + std.time.ns_per_s) orelse continue;
         switch (ev) {
             .exchange => |x| {
                 defer if (x.completion == .reply) gpa.free(x.completion.reply);
