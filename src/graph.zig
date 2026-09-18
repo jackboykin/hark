@@ -215,6 +215,13 @@ pub const Budget = struct {
     refresh_ns: i64 = 0,
 };
 
+/// Cumulative since start; `serve.zig` prints them.
+pub const Stats = struct {
+    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, hit: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
+    resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, retry: u64 = 0, refresh: u64 = 0, refused: u64 = 0 } = .{},
+    trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
+};
+
 /// BIND's `prefetch 2`.
 pub const refresh_window_ns = 2 * std.time.ns_per_s;
 /// So a refresh does not time the client.
@@ -336,10 +343,7 @@ pub const Graph = struct {
     budgets: u32 = 0,
     /// Exchanges the edge holds.
     flights: u32 = 0,
-    /// Clients turned away at the door.
-    shed: u64 = 0,
-    refreshes: u64 = 0,
-    refreshes_refused: u64 = 0,
+    stats: Stats = .{},
     created: u64 = 0,
     /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
@@ -416,7 +420,7 @@ pub const Graph = struct {
         budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         const memo = if (cd) null else g.store.get(key, g.now());
         if (memo == null and (g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
-            g.shed += 1;
+            g.stats.clients.dropped += 1;
             g.gpa.destroy(budget);
             return null;
         }
@@ -437,7 +441,7 @@ pub const Graph = struct {
         const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
         if (g.index.contains(rkey)) return;
         if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2) {
-            g.refreshes_refused += 1;
+            g.stats.resolver.refused += 1;
             return;
         }
         const budget = try g.gpa.create(Budget);
@@ -447,7 +451,7 @@ pub const Graph = struct {
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.wake(id, at);
-        g.refreshes += 1;
+        g.stats.resolver.refresh += 1;
         if (g.cfg.trace) std.debug.print("  refresh {s} {t} in {d} ms\n", .{ key.name, key.rtype, @divTrunc(at - g.now(), std.time.ns_per_ms) });
     }
 
@@ -510,7 +514,10 @@ pub const Graph = struct {
         // A timeout the root's deadline cut short says nothing about the server.
         switch (outcome) {
             .reply => |r| try g.observe(sc.server, r.rtt_ns),
-            .timeout => if (g.now() < c.budget.deadline_ns) try g.observeTimeout(sc.server),
+            .timeout => {
+                g.stats.resolver.timeout += 1;
+                if (g.now() < c.budget.deadline_ns) try g.observeTimeout(sc.server);
+            },
             else => {},
         }
         c.holds -= 1;
@@ -663,7 +670,14 @@ pub const Graph = struct {
                     if (err != error.Refused) return err;
                 };
             },
-            .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
+            .secure => |v| {
+                switch (v.status) {
+                    .secure => g.stats.trust.secure += 1,
+                    .insecure => g.stats.trust.insecure += 1,
+                    .bogus, .unchecked => g.stats.trust.bogus += 1,
+                }
+                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns);
+            },
             .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
             .exchange, .refresh => {},
         }
@@ -875,6 +889,7 @@ pub const Graph = struct {
             .deadline_ns = @min(budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
         });
         g.flights += 1;
+        if (transport == .udp) g.stats.resolver.udp += 1 else g.stats.resolver.tcp += 1;
         return id;
     }
 };

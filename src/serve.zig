@@ -82,7 +82,7 @@ const Server = struct {
         return @intCast(s.watched.items.len - 1);
     }
 
-    /// TERM and INT stop the loop; USR1 and HUP print the footprint line.
+    /// TERM and INT stop the loop; USR1 and HUP print the stats.
     /// A handler is not optional: as PID 1 of a container the kernel drops
     /// every signal the process has no disposition for, TERM included.
     fn onSignal(s: *Server, fd: posix.fd_t) void {
@@ -91,7 +91,7 @@ const Server = struct {
         if (linux.errno(rc) != .SUCCESS) return;
         for (infos[0 .. rc / @sizeOf(linux.signalfd_siginfo)]) |info| switch (@as(linux.SIG, @fromBackingInt(@intCast(info.signo)))) {
             .TERM, .INT => s.stopping = true,
-            else => logFootprint(s.g),
+            else => logStats(s.g),
         };
     }
 
@@ -214,6 +214,7 @@ const Server = struct {
     }
 
     fn ask(s: *Server, wire: []const u8, reply: Reply) !void {
+        if (reply == .udp) s.g.stats.clients.udp += 1 else s.g.stats.clients.tcp += 1;
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         // BCP 140: a UDP reply is dropped silently; over TCP `validateQuery` answers it.
@@ -241,6 +242,7 @@ const Server = struct {
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply };
         errdefer s.release(p);
         if (p.cached) if (try s.finish(arena, &p, query)) |served| {
+            s.g.stats.clients.hit += 1;
             s.send(reply, query, served.msg, served.ede);
             return s.release(p);
         };
@@ -256,6 +258,12 @@ const Server = struct {
                 i += 1;
                 continue;
             }
+            if (p.reply == .udp and p.reply.udp.fd == -1) {
+                s.g.stats.clients.abandoned += 1;
+                s.release(p.*);
+                _ = s.pending.swapRemove(i);
+                continue;
+            }
             _ = s.scratch.reset(.retain_capacity);
             const arena = s.scratch.allocator();
             const query = try dns.parseMessage(arena, p.wire);
@@ -263,6 +271,7 @@ const Server = struct {
                 i += 1;
                 continue;
             };
+            s.g.stats.clients.miss += 1;
             s.send(p.reply, query, served.msg, served.ede);
             s.release(p.*);
             _ = s.pending.swapRemove(i);
@@ -293,6 +302,20 @@ const Server = struct {
         s.gpa.free(p.wire);
     }
 
+    fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {
+        const c = &s.g.stats.clients;
+        switch (rcode) {
+            .no_error => {},
+            .name_error => c.nxdomain += 1,
+            .server_failure => c.servfail += 1,
+            .refused => c.refused += 1,
+            else => c.other += 1,
+        }
+        if (ede) |e| if (e.code == .stale_answer) {
+            c.stale += 1;
+        };
+    }
+
     fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede) void {
         const arena = s.scratch.allocator();
         var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
@@ -321,12 +344,14 @@ const Server = struct {
             };
             log.debug("client={s} id=0x{x:0>4} {s} {s} {t}", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), msg.header.flags.rcode });
         }
+        s.count(msg.header.flags.rcode, ede);
         s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
     fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, questions: []const dns.Question, opt: ?dns.OptRecord) void {
         var buf: [2 + @as(usize, dns.max_udp_payload)]u8 = undefined;
         const wire = response.serializeErrorResponse(buf[2..], id, opcode, rcode, extended, rd, questions, opt) orelse return;
+        s.count(rcode, null);
         s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
@@ -423,7 +448,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             s.sweep();
             if (e.now_ns >= stats_at) {
                 stats_at = e.now_ns + stats_every;
-                logFootprint(&g);
+                logStats(&g);
             }
             continue;
         };
@@ -436,36 +461,44 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         }
         try s.settle();
     }
+    logStats(&g);
     log.info("shutting down", .{});
 }
 
-const stats_every = 60 * std.time.ns_per_s;
+const stats_every = 5 * std.time.ns_per_min;
 
-fn logFootprint(g: *graph.Graph) void {
+/// Cumulative since start, one line per plane. Every five minutes, on
+/// USR1/HUP, and at exit.
+fn logStats(g: *graph.Graph) void {
+    const c = g.stats.clients;
+    const r = g.stats.resolver;
+    const t = g.stats.trust;
+    const served = c.hit + c.miss;
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d} | resolved {d}  hit {d}%  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, served, if (served > 0) c.hit * 100 / served else 0, c.stale,
+    });
+    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  retry {d} | refresh {d}  refused {d}", .{
+        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.retry, r.refresh, r.refused,
+    });
+    log.info("stats trust     secure {d}  insecure {d}  bogus {d}", .{ t.secure, t.insecure, t.bogus });
+    log.info("stats store     {d} KiB in {d} facts  in cells {d} KiB | evicted {d}  refused {d}", .{
+        g.store.held / 1024, g.store.map.count(), (g.store.bytes - g.store.held) / 1024, g.store.evictions, g.store.refusals,
+    });
+    log.info("stats process   rss {d} MiB  live cells {d}  in flight {d}", .{ rssMiB() orelse 0, g.live, g.flights });
+}
+
+fn rssMiB() ?u64 {
     var buf: [128]u8 = undefined;
     const rc = linux.open("/proc/self/statm", .{}, 0);
-    if (linux.errno(rc) != .SUCCESS) return;
+    if (linux.errno(rc) != .SUCCESS) return null;
     const fd: posix.fd_t = @intCast(rc);
     defer sys.close(fd);
     const n = linux.read(fd, &buf, buf.len);
-    if (linux.errno(n) != .SUCCESS) return;
+    if (linux.errno(n) != .SUCCESS) return null;
     var it = mem.tokenizeScalar(u8, buf[0..n], ' ');
     _ = it.next();
-    const rss_pages = std.fmt.parseInt(u64, it.next() orelse return, 10) catch return;
-    log.info("footprint: rss {d} MiB; store {d} KiB in {d} facts, {d} KiB more held by cells, {d} evicted, {d} refused; {d} live cells, {d} resolutions and {d} exchanges in flight, {d} clients turned away; {d} refreshes, {d} refused", .{
-        rss_pages * std.heap.pageSize() / (1024 * 1024),
-        g.store.held / 1024,
-        g.store.map.count(),
-        (g.store.bytes - g.store.held) / 1024,
-        g.store.evictions,
-        g.store.refusals,
-        g.live,
-        g.budgets,
-        g.flights,
-        g.shed,
-        g.refreshes,
-        g.refreshes_refused,
-    });
+    const pages = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    return pages * std.heap.pageSize() / (1024 * 1024);
 }
 
 fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {

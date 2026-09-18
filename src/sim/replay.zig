@@ -652,7 +652,7 @@ test "the door counts resolutions and exchanges in flight" {
     // New work is turned away; the same question joins the one in progress.
     try testing.expectEqual(null, try g.demandRoot(other, .a, false));
     try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, false)).?);
-    try testing.expectEqual(1, g.shed);
+    try testing.expectEqual(1, g.stats.clients.dropped);
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.flights);
     g.unhold(root);
