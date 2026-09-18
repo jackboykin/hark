@@ -22,7 +22,8 @@ const denial = @import("denial.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
 
-const max_cname_chain = @import("../cache.zig").max_cname_chain;
+/// Hops an answer may follow. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
+pub const max_cname_chain = 16;
 
 pub const CellId = u32;
 

@@ -20,7 +20,7 @@ const Key = graph.Key;
 const Transport = graph.Transport;
 const Reply = graph.Reply;
 
-const max_cname_chain = @import("../cache.zig").max_cname_chain;
+const max_cname_chain = graph.max_cname_chain;
 
 const max_servers = delegation.max_servers_per_level;
 
