@@ -38,9 +38,11 @@ const Timer = struct {
     }
 };
 
+/// Ids recycle: a flight is told from its predecessors by its timer's sequence.
 const Flight = struct {
     fd: posix.fd_t,
     tcp: ?*Tcp = null,
+    seq: u32,
 };
 
 const Tcp = struct {
@@ -89,7 +91,7 @@ fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
 }
 
 fn wakeErased(ctx: *anyopaque, id: CellId, at_ns: i64) anyerror!void {
-    return @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, .wake);
+    _ = try @as(*Edge, @ptrCast(@alignCast(ctx))).schedule(at_ns, id, .wake);
 }
 
 /// Time is read once per event: rules see one instant.
@@ -112,12 +114,12 @@ fn ctl(e: *Edge, op: u32, fd: posix.fd_t, events: u32, data: u64) !void {
 }
 
 fn send(e: *Edge, ex: Exchange) !void {
-    const flight = e.open(ex) catch {
+    var flight = e.open(ex) catch {
         // No socket: a timeout now.
         return e.push(.{ .exchange = .{ .id = ex.id, .completion = .timeout } });
     };
+    flight.seq = try e.schedule(ex.deadline_ns, ex.id, .timeout);
     try e.flights.put(e.gpa, ex.id, flight);
-    try e.schedule(ex.deadline_ns, ex.id, .timeout);
 }
 
 fn open(e: *Edge, ex: Exchange) !Flight {
@@ -128,7 +130,7 @@ fn open(e: *Edge, ex: Exchange) !Flight {
         try na.connectTo(fd, &ex.server);
         _ = try sys.sendto(fd, ex.wire, 0, null, 0);
         try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.IN, ex.id);
-        return .{ .fd = fd };
+        return .{ .fd = fd, .seq = 0 };
     }
     const t = try e.gpa.create(Tcp);
     errdefer e.gpa.destroy(t);
@@ -141,7 +143,7 @@ fn open(e: *Edge, ex: Exchange) !Flight {
         else => return err,
     };
     try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.OUT, ex.id);
-    return .{ .fd = fd, .tcp = t };
+    return .{ .fd = fd, .tcp = t, .seq = 0 };
 }
 
 fn close(e: *Edge, f: Flight) void {
@@ -158,9 +160,10 @@ fn finish(e: *Edge, id: CellId, completion: Completion) !void {
     try e.push(.{ .exchange = .{ .id = id, .completion = completion } });
 }
 
-fn schedule(e: *Edge, at_ns: i64, id: CellId, kind: @FieldType(Timer, "kind")) !void {
+fn schedule(e: *Edge, at_ns: i64, id: CellId, kind: @FieldType(Timer, "kind")) !u32 {
     e.seq += 1;
     try e.timers.push(e.gpa, .{ .at_ns = at_ns, .seq = e.seq, .id = id, .kind = kind });
+    return e.seq;
 }
 
 fn push(e: *Edge, ev: Event) !void {
@@ -202,14 +205,15 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
     }
 }
 
-/// A timeout for a finished flight is stale.
+/// A timeout for a finished flight, or a later one under its recycled id,
+/// is stale; a wake on a recycled id is harmless.
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
         _ = e.timers.pop();
         switch (t.kind) {
             .wake => try e.push(.{ .exchange = .{ .id = t.id, .completion = .wake } }),
-            .timeout => try e.finish(t.id, .timeout),
+            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.seq) try e.finish(t.id, .timeout),
         }
     }
 }
