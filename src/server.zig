@@ -53,7 +53,7 @@ fn rcodeSuffix(rcode: dns.RCode, buf: []u8) []const u8 {
 /// trailing dot). RFC 6761 reserves `invalid.` so the name is unrouted in
 /// production; gating on `build_options.testing_enabled` compiles the
 /// intercept out of release builds entirely.
-inline fn parseAdvanceClockQname(name: []const u8) ?i64 {
+pub inline fn parseAdvanceClockQname(name: []const u8) ?i64 {
     const prefix = "_advance-clock.";
     const suffix = ".testharness.invalid";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
@@ -1364,7 +1364,7 @@ fn isNonLoopback(a: na.Address) bool {
     }
 }
 
-fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: bool) !posix.fd_t {
+pub fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_flag: bool) !posix.fd_t {
     const af = na.afU32(addr);
     const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK, 0);
     errdefer sys.close(sock);

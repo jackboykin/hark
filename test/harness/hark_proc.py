@@ -138,7 +138,8 @@ class HarkProcess(ServerProcess):
         self.config_path.write_text(self.config.to_toml())
         self.log_path = self.tmpdir / "hark.log"
         self._log_fd = self.log_path.open("wb")
-        argv = [str(self.binary), "serve", "--config", str(self.config_path)]
+        # HARK_ENGINE=graph runs the suite against the graph proof of concept.
+        argv = [str(self.binary), os.environ.get("HARK_ENGINE", "serve"), "--config", str(self.config_path)]
         if self.config.verbose:
             argv.append("--verbose")
         # Hark logs to stderr; capture both streams in one log file.

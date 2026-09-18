@@ -77,7 +77,10 @@ pub fn main(init: std.process.Init) !void {
         stdout_writer.interface.flush() catch std.process.exit(1);
         return;
     } else if (std.mem.eql(u8, command, "serve")) {
-        return runServe(allocator, args[2..], io);
+        return runServe(allocator, args[2..], io, .pool);
+    } else if (std.mem.eql(u8, command, "graph")) {
+        // Proof of concept; serve's options.
+        return runServe(allocator, args[2..], io, .graph);
     } else {
         log.err("unknown command: {s}", .{command});
         printUsage();
@@ -100,7 +103,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
+fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io, engine: enum { pool, graph }) !void {
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
     var i: usize = 0;
@@ -139,6 +142,11 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         if (lim.cur < lim.max) std.posix.setrlimit(.NOFILE, .{ .cur = lim.max, .max = lim.max }) catch |err|
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
+
+    if (engine == .graph) return hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
+        log.err("graph server error: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     var server = Server.init(allocator, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
