@@ -439,7 +439,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     }
 
     if (parsed.table.getTable("cache")) |cache| {
-        if (try nonNegative(usize, cache, "size")) |v| cfg.cache_size = v;
+        if (try nonNegative(usize, cache, "size")) |v| {
+            if (v == 0) {
+                errLog("config: cache size must not be 0", .{});
+                return error.InvalidValue;
+            }
+            cfg.cache_size = v;
+        }
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
