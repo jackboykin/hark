@@ -152,11 +152,8 @@ const max_hedge = 3;
 
 const Attempt = struct { exchange: CellId, server: na.Address, transport: sim.Transport };
 
-/// The sibling loop: one question to ns(zone), one server after another,
-/// hedged: the next attempt starts early, a stagger after the last one,
-/// and each keeps its own timeout and records what it would alone. A
-/// usable reply ends the rest, which record nothing. Shared by the cut
-/// probe and the rrset rule.
+/// The sibling loop, hedged: the next server starts a stagger after the
+/// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
     have_servers: bool = false,
@@ -409,6 +406,12 @@ pub const Graph = struct {
                 const m = outcome.reply.msg;
                 std.debug.print("      aa={} tc={} ra={} rcode={t} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, m.header.flags.rcode, m.answers.len, m.authorities.len, m.additionals.len });
             }
+        }
+        // A timeout the root's deadline cut short says nothing about the server.
+        switch (outcome) {
+            .reply => |r| try g.observe(sc.server, r.rtt_ns),
+            .timeout => if (g.now() < g.cell(c.root).budget.deadline_ns) try g.observeTimeout(sc.server),
+            else => {},
         }
         try g.settle(id, .{ .exchange = outcome }, g.now());
         try g.drain();
@@ -1000,8 +1003,6 @@ pub const Graph = struct {
                 .none => return a.giveUp(),
                 .ready => {},
             };
-            // An attempt ends on its own terms; a usable reply ends the
-            // rest, which record nothing.
             var i: u8 = 0;
             while (i < a.nattempts) {
                 const ex = g.cell(a.attempts[i].exchange);
@@ -1011,7 +1012,7 @@ pub const Graph = struct {
                 }
                 const at = a.end(i);
                 switch (ex.value.exchange) {
-                    .timeout => try g.observeTimeout(id, at.server),
+                    .timeout => {},
                     .mismatch => {},
                     // Launch nothing more; what is in flight may still answer.
                     .budget => {
@@ -1022,7 +1023,6 @@ pub const Graph = struct {
                         _ = try g.sendTo(id, a, at.server, .tcp, qname, qtype);
                     },
                     .reply => |r| {
-                        try g.observe(at.server, r.rtt_ns);
                         if (r.msg.header.flags.tc) {
                             // TC over TCP: a broken server, as good as a timeout.
                             if (at.transport == .udp) {
@@ -1070,9 +1070,7 @@ pub const Graph = struct {
         gop.value_ptr.observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
     }
 
-    /// A timeout the root's deadline cut short says nothing about the server.
-    fn observeTimeout(g: *Graph, by: CellId, server: na.Address) !void {
-        if (g.now() >= g.cell(g.cell(by).root).budget.deadline_ns) return;
+    fn observeTimeout(g: *Graph, server: na.Address) !void {
         const gop = try g.rtt.getOrPut(g.gpa, na.AddressKey.fromAddress(server));
         if (!gop.found_existing) gop.value_ptr.* = .unknown;
         _ = gop.value_ptr.observeTimeout(g.nowMs());
@@ -1080,6 +1078,11 @@ pub const Graph = struct {
 
     fn nowMs(g: *const Graph) i64 {
         return @divTrunc(g.now(), std.time.ns_per_ms);
+    }
+
+    fn isDead(g: *Graph, server: na.Address) bool {
+        const state = g.rtt.get(na.AddressKey.fromAddress(server)) orelse return false;
+        return state.isDead(g.nowMs());
     }
 
     /// The server set for `a.zone`: hints at the root, else the addresses
@@ -1134,6 +1137,15 @@ pub const Graph = struct {
                 }
                 if (demanded) return .pending;
                 return g.gatherServers(id, a);
+            }
+        }
+        // Dead servers are skipped unless nothing else is left.
+        var live: usize = 0;
+        for (list.items) |s| live += @intFromBool(!g.isDead(s));
+        if (live > 0) {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (g.isDead(list.items[i])) _ = list.swapRemove(i) else i += 1;
             }
         }
         if (list.items.len == 0) return .none;

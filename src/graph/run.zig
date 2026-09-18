@@ -472,12 +472,12 @@ test "lifted unbound walk scenarios settle to today's answers" {
     try testing.expectEqual(0, r.failed);
 }
 
-test "a silent sibling is hedged past and records nothing" {
+test "a silent sibling is hedged past and still records its timeout" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // example.com has two servers: ns1 (127.0.10.3) listens nowhere, ns2
-    // answers. Cold, ns1 is given 400 ms; the hedge asks ns2 at 150.
+    // ns1 (127.0.10.3) listens nowhere, ns2 answers: cold, ns1 gets 400 ms
+    // and the hedge asks ns2 at 150.
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena,
         \\; hark: root-hints = 127.0.10.1
@@ -550,19 +550,37 @@ test "a silent sibling is hedged past and records nothing" {
         }
         try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
         const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
+        while (s.next(start + 5 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
         try testing.expect(s.log.items[2].qname.eql(q.name));
         const ns1_first = na.AddressKey.fromAddress(s.log.items[2].server).eql(ns1);
         ns1_first_seen = ns1_first_seen or ns1_first;
         try testing.expect(g.rtt.get(ns2) != null);
+        if (ns1_first) try testing.expectEqual(1, g.rtt.get(ns1).?.consecutive_timeouts) else try testing.expect(g.rtt.get(ns1) == null);
         if (stagger > 0) {
             // Walk (≤ 2 × 50 ms), the stagger, then ns2 (≤ 50 ms).
             try testing.expect(took_ms < 400);
             if (ns1_first) try testing.expect(took_ms >= 150);
-            try testing.expect(g.rtt.get(ns1) == null);
-        } else if (ns1_first) {
-            try testing.expect(took_ms >= 400);
-            try testing.expectEqual(1, g.rtt.get(ns1).?.consecutive_timeouts);
-        }
+        } else if (ns1_first) try testing.expect(took_ms >= 400);
     };
     try testing.expect(ns1_first_seen);
+
+    for (1..9) |seed| for ([_]bool{ false, true }) |all_dead| {
+        var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
+        defer s.deinit();
+        var g = try graph.Graph.init(arena, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, &s);
+        defer g.deinit();
+        const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
+        try g.rtt.put(testing.allocator, ns1, dead);
+        if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
+        const root = try g.demandRoot(q.name, q.qtype);
+        try g.drain();
+        while (!g.cell(root).settled) {
+            const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
+            try g.complete(ev.id, ev.completion);
+        }
+        try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        var asked_ns1 = false;
+        for (s.log.items) |row| asked_ns1 = asked_ns1 or na.AddressKey.fromAddress(row.server).eql(ns1);
+        if (!all_dead) try testing.expect(!asked_ns1);
+    };
 }
