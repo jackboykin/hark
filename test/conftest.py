@@ -16,6 +16,7 @@ import ipaddress
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,8 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.dns64_prefix = scenario.dns64_prefix
     if scenario.serve_stale_ttl is not None:
         cfg.serve_stale_ttl = scenario.serve_stale_ttl
+    if scenario.prefetch is not None:
+        cfg.prefetch = scenario.prefetch
     if scenario.min_ttl is not None:
         cfg.cache_min_ttl = scenario.min_ttl
     if scenario.rebinding_enabled is not None:
@@ -244,6 +247,10 @@ def _run_steps(
         elif step.kind == "CHECK_OUT_QUERY":
             # Strictly positional, distinct from CHECK_QUERY_LOG's set-style check.
             assert step.entry is not None
+            # Due work leaves on the next loop turn.
+            deadline = time.monotonic() + 3.0
+            while out_query_cursor >= len(resp.query_log) and time.monotonic() < deadline:
+                time.sleep(0.005)
             if out_query_cursor >= len(resp.query_log):
                 raise _step_failure(
                     path, step.n,
@@ -266,5 +273,7 @@ def _run_steps(
                 f"_advance-clock.{step.time_seconds}.testharness.invalid.",
                 "TXT", HARK_LISTEN,
             )
+            # Let due work reach the responder.
+            time.sleep(0.1)
         else:
             raise AssertionError(f"unknown STEP kind: {step.kind}")
