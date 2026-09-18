@@ -501,7 +501,13 @@ pub const Graph = struct {
             .scratch = scratch,
         };
         if (reused == null) try g.cells.append(g.gpa, c);
-        if (key.kind != .exchange) try g.index.put(g.gpa, c.key, id);
+        if (key.kind != .exchange) {
+            // An expired cell may own the entry: take its key too, or the
+            // name the map compares against dies with that cell's arena.
+            const gop = try g.index.getOrPut(g.gpa, c.key);
+            gop.key_ptr.* = c.key;
+            gop.value_ptr.* = id;
+        }
         budget.refs += 1;
         g.live += 1;
         g.created += 1;
@@ -815,4 +821,31 @@ pub const Graph = struct {
 test "a cell is a few words" {
     // Scratch is a pointer: the slot bound is not the largest kind's.
     try std.testing.expect(@sizeOf(Cell) <= 384);
+}
+
+test "a cell replacing an expired one takes over the index entry's key" {
+    const testing = std.testing;
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    const Stub = struct {
+        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    };
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("../rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const name = try dns.parseDottedName(arena.allocator(), "example.");
+    const first = (try g.demandRoot(name, .a, false)).?;
+    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now);
+    const second = (try g.demandRoot(name, .a, false)).?;
+    try testing.expect(first != second);
+    g.unhold(first);
+    try testing.expect(!g.cell(first).live);
+    // The entry's key must be the survivor's.
+    const key = try g.keyFor(.answer, name, .a);
+    try testing.expectEqual(second, g.index.get(key).?);
+    try testing.expectEqual(g.cell(second).key.name.ptr, g.index.getKey(key).?.name.ptr);
+    g.unhold(second);
 }
