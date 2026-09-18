@@ -30,22 +30,30 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
     var age: u32 = 0;
     var life: u32 = std.math.maxInt(u32);
     const served = !a.broken and (a.status != .bogus or c.cd);
+    var stale = false;
     if (served) for (a.hops, 0..) |h, i| {
-        last = g.cell(h).value.rrset;
+        last = if (a.stale.len > i and a.stale[i] != null) a.stale[i].?.* else g.cell(h).value.rrset;
         age = @intCast(@divTrunc(g.now() - last.stored_ns, std.time.ns_per_s));
         life = std.math.maxInt(u32);
         if (i < a.judged.len) {
             const proven = g.cell(a.judged[i]).value.secure.proven_until_ns;
             life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
         }
-        try appendAged(arena, &chain, last.answers, age, life, c.do_bit);
+        const hop_stale = last.ede == .stale_answer;
+        stale = stale or hop_stale;
+        // A denial's life is the reply's, not a record's.
+        if (hop_stale and last.kind != .answer and last.kind != .alias) {
+            age = 0;
+            life = graph.stale_hold_s;
+        }
+        try appendAged(arena, &chain, last.answers, age, life, c.do_bit, hop_stale);
     };
     const positive = last.kind == .answer or last.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, last.authorities, age, life, c.do_bit);
-        try appendAged(arena, &additionals, last.additionals, age, life, c.do_bit);
+        try appendAged(arena, &authorities, last.authorities, age, life, c.do_bit, last.ede == .stale_answer);
+        try appendAged(arena, &additionals, last.additionals, age, life, c.do_bit, last.ede == .stale_answer);
     }
     const ede: ?dns.Ede = if (a.broken)
         .{ .code = .other, .text = "cname loop" }
@@ -53,6 +61,8 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
         .{ .code = .dnssec_bogus }
     else if (last.kind == .servfail)
         .{ .code = if (cached) .cached_error else last.ede orelse .no_reachable_authority }
+    else if (stale) // any hop: a stale alias still redirected
+        .{ .code = if (last.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
     else if (last.ede) |code|
         .{ .code = code }
     else
@@ -78,12 +88,12 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
 }
 
 /// TTLs less the time since the reply was taken, at most `life`;
-/// signatures only when wanted.
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, sigs: bool) !void {
+/// signatures only when wanted; stale records get the hold (RFC 8767 §4).
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, sigs: bool, stale: bool) !void {
     for (rrs) |rr| {
         if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
-        aged.ttl = @min(rr.ttl -| age, life);
+        aged.ttl = if (stale and rr.ttl <= age) graph.stale_hold_s else @min(rr.ttl -| age, life);
         try out.append(arena, aged);
     }
 }
@@ -389,6 +399,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .stagger_ms = cfg.stagger_ms,
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,
         .store_bytes = cfg.cache_size,
+        .serve_stale_ttl = cfg.serve_stale_ttl,
         .max_in_flight = cfg.max_in_flight,
         .trace = trace,
     }, e.edge());

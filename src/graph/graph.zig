@@ -105,6 +105,8 @@ pub const Config = struct {
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     servfail_ttl: u32 = 5,
+    /// Serve an expired fact this long past expiry while its refresh fails; 0: never.
+    serve_stale_ttl: u32 = 0,
     /// Null: DNSSEC off, nothing is judged.
     trust_anchor: ?dns.DsData = null,
     store_bytes: usize = 12 << 20,
@@ -168,6 +170,8 @@ pub const Answer = struct {
     status: dnssec.SecurityStatus = .unchecked,
     /// `secure(hop)` per hop; empty with DNSSEC off.
     judged: []const CellId = &.{},
+    /// Per hop, a stale stand-in for a failed one; this cell's alone.
+    stale: []const ?*const Reply = &.{},
 };
 
 pub const Outcome = union(enum) {
@@ -234,6 +238,9 @@ pub const Tally = struct {
 const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
+
+/// BIND's stale-refresh-time (RFC 8767 §5).
+pub const stale_hold_s = 30;
 
 const Attempt = struct { exchange: CellId, server: na.Address, transport: Transport };
 
@@ -346,6 +353,8 @@ const AddrScratch = struct {
     aaaa: ?CellId = null,
     judge_a: ?CellId = null,
     judge_aaaa: ?CellId = null,
+    stale: [2]?*const Reply = .{ null, null },
+    stale_checked: [2]bool = .{ false, false },
 };
 
 const NsScratch = struct {
@@ -358,6 +367,8 @@ const AnswerScratch = struct {
     /// `secure(hop)` per hop.
     judged: [max_cname_chain + 1]CellId = undefined,
     nj: u8 = 0,
+    stale: [max_cname_chain + 1]?*const Reply = @splat(null),
+    stale_checked: [max_cname_chain + 1]bool = @splat(false),
 };
 
 const ExchangeScratch = struct {
@@ -632,6 +643,11 @@ pub const Graph = struct {
         if (c.orphan and !g.cell(by).orphan) g.adopt(id);
     }
 
+    fn holdsInput(g: *Graph, by: CellId, id: CellId) bool {
+        for (g.cell(by).inputs.items) |i| if (i == id) return true;
+        return false;
+    }
+
     fn unpin(g: *Graph, id: CellId, by: CellId) void {
         const c = g.cell(id);
         for (c.waiters.items, 0..) |w, i| if (w == by) {
@@ -864,9 +880,14 @@ pub const Graph = struct {
         var next = g.cell(id).name;
         while (true) {
             if (s.n > 0) {
-                const last = g.cell(s.hops[s.n - 1]);
+                const i = s.n - 1;
+                const last = g.cell(s.hops[i]);
                 if (!last.settled) return;
-                const r = last.value.rrset;
+                if (!s.stale_checked[i]) {
+                    s.stale_checked[i] = true;
+                    if (last.value.rrset.kind == .servfail) s.stale[i] = try g.staleReply(last.key, g.cell(id).arena.allocator());
+                }
+                const r = if (s.stale[i]) |st| st.* else last.value.rrset;
                 if (r.kind != .alias or qtype == .cname) break;
                 next = r.target;
                 var broken = s.n > max_cname_chain;
@@ -879,9 +900,14 @@ pub const Graph = struct {
             s.n += 1;
         }
         var expires: i64 = std.math.maxInt(i64);
-        for (s.hops[0..s.n]) |h| expires = @min(expires, g.cell(h).expires_ns);
+        var stale = false;
+        for (s.hops[0..s.n], s.stale[0..s.n]) |h, st| {
+            expires = @min(expires, g.cell(h).expires_ns);
+            stale = stale or st != null;
+        }
+        // Stale hops go unjudged: their signatures may have expired.
         var status: dnssec.SecurityStatus = .unchecked;
-        if (g.cfg.trust_anchor != null) {
+        if (g.cfg.trust_anchor != null and !stale) {
             while (s.nj < s.n) : (s.nj += 1) s.judged[s.nj] = try trust.demandSecure(g, id, s.hops[s.nj]);
             status = .secure;
             for (s.judged[0..s.nj]) |j| {
@@ -893,7 +919,7 @@ pub const Graph = struct {
             if (status == .bogus) expires = g.failureExpiry(id);
         }
         const arena = g.cell(id).arena.allocator();
-        try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try arena.dupe(CellId, s.judged[0..s.nj]) } }, expires);
+        try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try arena.dupe(CellId, s.judged[0..s.nj]), .stale = try arena.dupe(?*const Reply, s.stale[0..s.n]) } }, expires);
     }
 
     /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
@@ -994,6 +1020,7 @@ pub const Graph = struct {
         // empty set lives only as long as the shortest denial.
         var expires: i64 = std.math.maxInt(i64);
         var denied: i64 = std.math.maxInt(i64);
+        var provisional = false;
         for ([_]dns.RType{ .a, .aaaa }) |rtype| {
             const rid = (if (rtype == .a) s.a else s.aaaa) orelse continue;
             const c = g.cell(rid);
@@ -1002,10 +1029,17 @@ pub const Graph = struct {
                 continue;
             }
             var n: usize = 0;
-            const r = c.value.rrset;
+            const fi: usize = @intFromBool(rtype == .aaaa);
+            if (c.value.rrset.kind == .servfail and !s.stale_checked[fi]) {
+                s.stale_checked[fi] = true;
+                s.stale[fi] = try g.staleReply(c.key, g.cell(id).arena.allocator());
+            }
+            // Stale addresses are glue-grade: unverified.
+            const stale_hop = s.stale[fi] != null;
+            const r = if (s.stale[fi]) |st| st.* else c.value.rrset;
             if (r.kind == .answer or r.kind == .alias) {
                 // A bogus answer is no address.
-                if (g.cfg.trust_anchor != null) {
+                if (g.cfg.trust_anchor != null and !stale_hop) {
                     const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
                     if (slot.* == null) slot.* = try trust.demandSecure(g, id, rid);
                     const j = g.cell(slot.*.?);
@@ -1028,6 +1062,7 @@ pub const Graph = struct {
                     }
                 } else if (alias == null) alias = r.target;
             }
+            provisional = provisional or (stale_hop and n > 0);
             if (n > 0) expires = @min(expires, c.expires_ns) else denied = @min(denied, c.expires_ns);
         }
         if (pending) return;
@@ -1038,7 +1073,7 @@ pub const Graph = struct {
             };
             expires = if (denied == std.math.maxInt(i64)) g.now() else denied;
         }
-        try g.settle(id, .{ .addr = .{ .addrs = addrs.items, .provisional = false } }, expires);
+        try g.settle(id, .{ .addr = .{ .addrs = addrs.items, .provisional = provisional } }, expires);
     }
 
     /// `rrset(name, type)`: from the deepest known cut at or above the name,
@@ -1051,6 +1086,9 @@ pub const Graph = struct {
             if (s.cut == null) {
                 // Indexed proofs deny the name without a packet.
                 if (try denial.deny(g, id)) return;
+                // Held: SERVFAIL, asking nobody.
+                if (g.store.any(g.cell(id).key)) |e| if (e.hold_until_ns > g.now())
+                    return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.now());
                 // A cut at the name itself exists only from a referral;
                 // otherwise start at the parent's. A DS always lives there.
                 const own = try g.keyFor(.cut, name, .a);
@@ -1058,11 +1096,11 @@ pub const Graph = struct {
                 const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
                 const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
                 s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
-                    return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
+                    return g.settleRrset(id, servfail(.no_reachable_authority));
             }
             const cut = g.cell(s.cut.?);
             if (!cut.settled) return;
-            if (cut.value.cut.failed) return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
+            if (cut.value.cut.failed) return g.settleRrset(id, servfail(.no_reachable_authority));
             // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
             if (!s.dname_checked) {
                 s.dname_checked = true;
@@ -1083,13 +1121,13 @@ pub const Graph = struct {
         while (true) {
             switch (try g.ask(id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
                 .pending => return,
-                .exhausted => return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id)),
+                .exhausted => return g.settleRrset(id, servfail(.no_reachable_authority)),
                 .reply => |msg| {
                     const zone = g.cell(id).scratch.rrset.ask.zone;
                     if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
                         const s2 = &g.cell(id).scratch.rrset;
                         if (s2.delegations >= g.cfg.max_delegations)
-                            return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
+                            return g.settleRrset(id, servfail(.no_reachable_authority));
                         s2.delegations += 1;
                         _ = try g.absorbReferral(id, ref, msg, zone);
                         // The parent's referral to the zone itself is its
@@ -1105,10 +1143,40 @@ pub const Graph = struct {
                     const reply = try g.classify(msg, zone, name, qtype);
                     try g.publishAlias(id, name, qtype, reply);
                     try g.publishDnames(id, reply);
-                    return g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) g.failureExpiry(id) else g.replyExpiry(reply));
+                    return g.settleRrset(id, reply);
                 },
             }
         }
+    }
+
+    /// A SERVFAIL inside the stale window holds the fact instead of
+    /// replacing it; the failure is no fact. Only the answer and addr rules
+    /// substitute the stale reply, so DS and DNSKEY fail for the hold.
+    fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
+        const key = g.cell(id).key;
+        if (reply.kind == .servfail and reply.rcode == .server_failure) if (g.store.any(key)) |e| if (g.staleUntil(e)) |until| {
+            g.store.hold(key, @min(g.now() + stale_hold_s * std.time.ns_per_s, until));
+            return g.settle(id, .{ .rrset = reply }, g.now());
+        };
+        try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) g.failureExpiry(id) else g.replyExpiry(reply));
+    }
+
+    /// The stale window's end; null while fresh, too old, or a failure.
+    fn staleUntil(g: *Graph, e: store.Entry) ?i64 {
+        if (g.cfg.serve_stale_ttl == 0) return null;
+        const life = store.rrsetLife(e.blob) catch return null;
+        const until = life.expires_ns + @as(i64, g.cfg.serve_stale_ttl) * std.time.ns_per_s;
+        if (life.servfail or g.now() < life.expires_ns or g.now() >= until) return null;
+        return until;
+    }
+
+    fn staleReply(g: *Graph, key: Key, arena: Allocator) !?*const Reply {
+        const e = g.store.any(key) orelse return null;
+        if (g.staleUntil(e) == null) return null;
+        const held = try arena.create(Reply);
+        held.* = (try store.Store.parse(arena, e.blob)).rrset;
+        held.ede = .stale_answer;
+        return held;
     }
 
     /// A chain starting with a CNAME at `name` is also the fact
@@ -1447,12 +1515,21 @@ pub const Graph = struct {
                     try list.appendSlice(g.gpa, known.value.addr.addrs);
                     continue;
                 }
-                if (g.index.get(key)) |aid| if (!g.cell(aid).settled) {
-                    // In progress for someone: wait, unless it is
-                    // transitively waiting on us.
-                    if (try g.demand(id, key, host, g.cell(id).depth) != null) pending = true;
-                    continue;
-                };
+                if (g.index.get(key)) |aid| {
+                    if (g.cell(aid).settled) {
+                        // Ours, settled TTL-0 (stale-backed, or failed and
+                        // empty): a fact serves its demander.
+                        if (g.holdsInput(id, aid)) {
+                            try list.appendSlice(g.gpa, g.cell(aid).value.addr.addrs);
+                            continue;
+                        }
+                    } else {
+                        // In progress for someone: wait, unless it is
+                        // transitively waiting on us.
+                        if (try g.demand(id, key, host, g.cell(id).depth) != null) pending = true;
+                        continue;
+                    }
+                }
                 try unknown.append(g.gpa, host);
             }
             var i: usize = 0;

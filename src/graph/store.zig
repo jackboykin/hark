@@ -52,7 +52,12 @@ pub const Blob = extern struct {
     }
 };
 
-pub const Entry = struct { blob: *Blob, expires_ns: i64 };
+pub const Entry = struct {
+    blob: *Blob,
+    expires_ns: i64,
+    /// A failed refresh holds the expired fact until then (RFC 8767 §5).
+    hold_until_ns: i64 = 0,
+};
 
 const KeyContext = struct {
     pub fn hash(_: KeyContext, k: Key) u32 {
@@ -115,6 +120,15 @@ pub const Store = struct {
         return e;
     }
 
+    /// Any age; not a SIEVE hit.
+    pub fn any(s: *Store, key: Key) ?Entry {
+        return s.map.get(key);
+    }
+
+    pub fn hold(s: *Store, key: Key, until_ns: i64) void {
+        if (s.map.getPtr(key)) |e| e.hold_until_ns = until_ns;
+    }
+
     /// Takes one reference. A new key over the cap must have knocked before.
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
@@ -131,6 +145,7 @@ pub const Store = struct {
             gop.key_ptr.name = try s.gpa.dupe(u8, key.name);
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
+        // A new version drops any hold.
         gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns };
         s.held += blob.len;
         s.visited.set(gop.index);
@@ -205,6 +220,7 @@ pub const Store = struct {
                 try w.addrs(a.addrs);
             },
             .rrset => |r| {
+                // `rrsetLife` reads these in place.
                 try w.int(u8, @backingInt(r.kind));
                 try w.int(u8, @backingInt(r.rcode));
                 try w.int(u8, @intFromBool(r.aa) | @as(u8, @intFromBool(r.ede != null)) << 1);
@@ -325,6 +341,21 @@ const Writer = struct {
         for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).bytes.len;
     }
 };
+
+/// Read in place, no parse.
+pub const RrsetLife = struct { servfail: bool, expires_ns: i64 };
+
+pub fn rrsetLife(b: *Blob) !RrsetLife {
+    if (b.kind != @backingInt(Kind.rrset)) return error.EndOfData;
+    var r: Reader = .{ .buf = b.payload(), .arena = undefined };
+    const kind = try r.int(u8);
+    _ = try r.int(u8);
+    _ = try r.int(u8);
+    _ = try r.int(u16);
+    const ttl = try r.int(u32);
+    const stored_ns = try r.int(i64);
+    return .{ .servfail = kind == @backingInt(@as(@FieldType(graph.Reply, "kind"), .servfail)), .expires_ns = stored_ns + @as(i64, ttl) * std.time.ns_per_s };
+}
 
 const Reader = struct {
     buf: []const u8,

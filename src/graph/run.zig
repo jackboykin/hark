@@ -41,6 +41,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .addr_policy = .{ .allow_loopback = true },
         .stagger_ms = scenario.stagger_ms orelse 150,
         .trust_anchor = s.signer.anchor(),
+        .serve_stale_ttl = scenario.serve_stale_ttl orelse 0,
         .trace = opts.trace,
     }, s.edge());
     defer g.deinit();
@@ -319,9 +320,9 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-/// The graph has no DNS64, stale serving or rebinding policy yet.
+/// The graph has no DNS64 or rebinding policy yet.
 fn walkOnly(s: *const rpl.Scenario) bool {
-    return s.dns64_prefix == null and s.serve_stale_ttl == null and s.rebinding_enabled == null;
+    return s.dns64_prefix == null and s.rebinding_enabled == null;
 }
 
 const Replayed = struct { parsed: usize, ran: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
@@ -437,9 +438,10 @@ test "trace one scenario" {
 }
 
 test "hark walk scenarios settle to today's answers" {
-    const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(92, r.parsed);
-    try testing.expectEqual(80, r.ran);
+    // Stale at the client timer is the edge's, not a rule's (2½).
+    const r = try replayDir("test/scenarios/hark", 8, &.{"005_blackholed_refresh_serves_stale.rpl"});
+    try testing.expectEqual(96, r.parsed);
+    try testing.expectEqual(89, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

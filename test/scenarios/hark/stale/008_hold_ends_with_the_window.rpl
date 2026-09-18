@@ -1,12 +1,11 @@
 ; hark: root-hints = 127.0.10.1
-; hark: serve-stale-ttl = 3600
+; hark: serve-stale-ttl = 100
 
-SCENARIO_BEGIN A held stale CNAME whose target fails still caches the failure
+SCENARIO_BEGIN A hold ends with the stale window, so a refresh follows at once
 
-; At 3700 s www CNAME is stale and web A gone. The held redirect leads to a
-; failed walk, and the retry hits its RFC 9520 marker.
-; (The graph keeps the chain as one reply that expired past the window,
-; so it fails without the redirect; the contract is the same.)
+; RFC 8767 §5: the 30 s hold set at t=153 would outlast the window (t=160,
+; serve-stale-ttl = 100 past the t=60 expiry); a query at t=161 asks the
+; recovered authority instead of sitting on the hold.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -53,13 +52,13 @@ RANGE_BEGIN 0 100
     ADJUST copy_id copy_query
     REPLY QR AA NOERROR
     SECTION QUESTION
-      web.example.com. IN AAAA
+      www.example.com. IN AAAA
     SECTION AUTHORITY
       example.com. 86400 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
   ENTRY_END
 RANGE_END
 
-; ── Healthy chain, then every name SERVFAILs ────────────────────────
+; ── www A: healthy, then failing, then healthy with new data ───────
 RANGE_BEGIN 0 4
   ADDRESS 127.0.10.3
   ENTRY_BEGIN
@@ -69,12 +68,11 @@ RANGE_BEGIN 0 4
     SECTION QUESTION
       www.example.com. IN A
     SECTION ANSWER
-      www.example.com. 3600 IN CNAME web.example.com.
-      web.example.com. 10 IN A 10.20.30.40
+      www.example.com. 60 IN A 10.20.30.40
   ENTRY_END
 RANGE_END
 
-RANGE_BEGIN 5 100
+RANGE_BEGIN 5 11
   ADDRESS 127.0.10.3
   ENTRY_BEGIN
     MATCH opcode qname qtype
@@ -83,12 +81,18 @@ RANGE_BEGIN 5 100
     SECTION QUESTION
       www.example.com. IN A
   ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 12 100
+  ADDRESS 127.0.10.3
   ENTRY_BEGIN
     MATCH opcode qname qtype
     ADJUST copy_id copy_query
-    REPLY QR AA SERVFAIL
+    REPLY QR AA NOERROR
     SECTION QUESTION
-      web.example.com. IN A
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 60 IN A 10.20.30.41
   ENTRY_END
 RANGE_END
 
@@ -101,13 +105,15 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH flags question answer ttl
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN A 10.20.30.40
 ENTRY_END
 
-STEP 3 TIME_PASSES ELAPSE 3700
+STEP 3 TIME_PASSES ELAPSE 120
 
 STEP 5 QUERY
 ENTRY_BEGIN
@@ -118,28 +124,51 @@ ENTRY_END
 
 STEP 6 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
-  REPLY QR RD RA SERVFAIL
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
   SECTION QUESTION
     www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN A 10.20.30.40
 ENTRY_END
 
-STEP 7 QUERY
+STEP 7 TIME_PASSES ELAPSE 33
+
+STEP 9 QUERY
 ENTRY_BEGIN
   REPLY RD EDNS
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END
 
-STEP 8 CHECK_ANSWER
+STEP 10 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
-  REPLY QR RD RA SERVFAIL
+  MATCH flags question answer ttl ede=3
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 11 TIME_PASSES ELAPSE 8
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END
 
-; Root, com, www A, its cousin, the refresh, web A. Step 7 asks nobody.
-STEP 9 CHECK_MAX_QUERIES 6
+; Authority is healthy again from step 12, but the hold outlives the window.
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 60 IN A 10.20.30.41
+ENTRY_END
 
 SCENARIO_END
