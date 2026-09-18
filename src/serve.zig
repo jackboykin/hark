@@ -70,6 +70,7 @@ const Pending = struct {
     cached: bool,
     wire: []u8,
     reply: Reply,
+    asked_ns: i64,
 };
 
 const Server = struct {
@@ -111,6 +112,8 @@ const Server = struct {
         try s.e.watch(udp, try s.token(.{ .udp = udp }), linux.EPOLL.IN);
         const tcp = try listenOn(addr, posix.SOCK.STREAM);
         try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN);
+        var ab: [64]u8 = undefined;
+        log.info("listening on {s}", .{na.format(addr, &ab)});
     }
 
     fn onClient(s: *Server, tok: u32, events: u32) !void {
@@ -243,20 +246,20 @@ const Server = struct {
         const name = q.name.formatInto(&name_buf);
         if (build_options.testing_enabled) if (advanceClockSeconds(dns.stripTrailingDot(name))) |secs| {
             monotonic.advanceTestClock(secs);
-            return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null);
+            return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null, s.e.now_ns);
         };
         const d64 = answer.Dns64.on(s.cfg.dns64, client);
-        if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null);
-        if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null);
+        if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null, s.e.now_ns);
+        if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null, s.e.now_ns);
         const asked = if (d64) |d| try d.asked(arena, q) else q;
         // BCP 140 again: turned away is silence on UDP, a close on TCP.
         const root = try s.g.demandRoot(asked.name, asked.qtype, client.cd) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
-        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply };
+        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
         if (p.cached) if (try s.finish(arena, &p, query)) |served| {
             s.g.stats.clients.hit += 1;
-            s.send(reply, query, served.msg, served.ede);
+            s.send(reply, query, served.msg, served.ede, p.asked_ns);
             return s.release(p);
         };
         p.wire = try s.gpa.dupe(u8, wire);
@@ -285,7 +288,7 @@ const Server = struct {
                 continue;
             };
             s.g.stats.clients.miss += 1;
-            s.send(p.reply, query, served.msg, served.ede);
+            s.send(p.reply, query, served.msg, served.ede, p.asked_ns);
             s.release(p.*);
             _ = s.pending.swapRemove(i);
         }
@@ -329,7 +332,7 @@ const Server = struct {
         };
     }
 
-    fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede) void {
+    fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede, asked_ns: i64) void {
         const arena = s.scratch.allocator();
         var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
@@ -355,7 +358,10 @@ const Server = struct {
                 .udp => |u| u.addr,
                 .tcp => |c| c.addr,
             };
-            log.debug("client={s} id=0x{x:0>4} {s} {s} {t}", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), msg.header.flags.rcode });
+            const rcode = msg.header.flags.rcode;
+            var rb: [24]u8 = undefined;
+            const outcome = if (rcode == .no_error) "" else std.fmt.bufPrint(&rb, " {t}", .{rcode}) catch "";
+            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
         s.count(msg.header.flags.rcode, ede);
         s.write(reply, buf[0 .. 2 + wire.len]);
@@ -454,7 +460,6 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     const sig = try signalFd();
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
-    log.info("listening on {d} address(es)", .{cfg.listen.len});
     var sweep_at = e.now_ns + std.time.ns_per_s;
     var stats_at = e.now_ns + stats_every;
     while (!s.stopping) {
