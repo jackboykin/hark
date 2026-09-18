@@ -33,6 +33,9 @@ const Conn = struct {
     /// Answers owed; a half-closed client waits for them.
     owed: u32 = 0,
     eof: bool = false,
+    /// Reply bytes the socket has not taken; while any wait, nothing more is asked.
+    out: std.ArrayList(u8) = .empty,
+    blocked_ns: i64 = 0,
 };
 
 const Reply = union(enum) {
@@ -102,7 +105,7 @@ const Server = struct {
         switch (s.watched.items[tok]) {
             .udp => |fd| try s.readUdp(fd),
             .listen => |fd| try s.accept(fd),
-            .conn => |c| try s.readTcp(c, events),
+            .conn => |c| if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c, events),
             .signal => |fd| s.onSignal(fd),
             .free => {},
         }
@@ -125,8 +128,11 @@ const Server = struct {
         while (true) {
             const rc = linux.accept4(fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             if (linux.errno(rc) != .SUCCESS) return;
+            const cfd: posix.fd_t = @intCast(rc);
+            // A small kernel queue, so write progress measures the client.
+            posix.setsockopt(cfd, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(client_sndbuf)) catch {};
             const c = try s.gpa.create(Conn);
-            c.* = .{ .fd = @intCast(rc), .token = 0, .last_ns = s.e.now_ns };
+            c.* = .{ .fd = cfd, .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
             try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
         }
@@ -147,9 +153,13 @@ const Server = struct {
         }
         c.len += rc;
         c.last_ns = s.e.now_ns;
+        try s.frames(c);
+    }
+
+    fn frames(s: *Server, c: *Conn) !void {
         const tok = c.token;
         var start: usize = 0;
-        while (c.len - start >= 2) {
+        while (c.len - start >= 2 and c.out.items.len == 0) {
             const flen: usize = mem.readInt(u16, c.buf[start..][0..2], .big);
             if (flen == 0 or flen > max_frame or c.served >= s.cfg.tcp_queries_per_conn) return s.drop(c);
             if (c.len - start < 2 + flen) break;
@@ -179,10 +189,12 @@ const Server = struct {
         };
         sys.close(c.fd);
         s.watched.items[c.token] = .free;
+        c.out.deinit(s.gpa);
         s.gpa.destroy(c);
     }
 
     const c_addr_none = na.initIp4(.{ 0, 0, 0, 0 }, 0);
+    const client_sndbuf: c_int = 64 * 1024;
 
     fn sweep(s: *Server) void {
         const idle_ns = @as(i64, s.cfg.tcp_idle_timeout_ms) * std.time.ns_per_ms;
@@ -192,7 +204,10 @@ const Server = struct {
                 .conn => |c| c,
                 else => continue,
             };
-            if (c.owed == 0 and s.e.now_ns - c.last_ns >= idle_ns) s.drop(c);
+            // A client owed an answer gets the resolve deadline on top.
+            const since = if (c.out.items.len != 0) c.blocked_ns else c.last_ns;
+            const owed_ns = if (c.owed > 0 and c.out.items.len == 0) @as(i64, s.g.cfg.resolve_ms) * std.time.ns_per_ms else 0;
+            if (s.e.now_ns - since >= idle_ns + owed_ns) s.drop(c);
         }
     }
 
@@ -276,7 +291,7 @@ const Server = struct {
 
     fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede) void {
         const arena = s.scratch.allocator();
-        var buf: [dns.max_message_len]u8 = undefined;
+        var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
             .udp => blk: {
                 const claimed = if (query.opt) |o| o.udp_payload_size else dns.max_udp_payload;
@@ -289,34 +304,70 @@ const Server = struct {
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
         ctx.ede = ede;
-        const wire = response.buildResponseWire(&buf, ctx, msg, arena) orelse
+        const wire = response.buildResponseWire(buf[2..], ctx, msg, arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
-        s.write(reply, wire);
+        s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
     fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, questions: []const dns.Question, opt: ?dns.OptRecord) void {
-        var buf: [dns.max_udp_payload]u8 = undefined;
-        const wire = response.serializeErrorResponse(&buf, id, opcode, rcode, extended, rd, questions, opt) orelse return;
-        s.write(reply, wire);
+        var buf: [2 + @as(usize, dns.max_udp_payload)]u8 = undefined;
+        const wire = response.serializeErrorResponse(buf[2..], id, opcode, rcode, extended, rd, questions, opt) orelse return;
+        s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
-    fn write(s: *Server, reply: Reply, wire: []const u8) void {
+    /// `framed`: two bytes of room, then the wire.
+    fn write(s: *Server, reply: Reply, framed: []u8) void {
         switch (reply) {
             .udp => |u| {
                 if (u.fd < 0) return;
                 var pa: na.PosixAddress = undefined;
                 const len = na.toSockaddr(&u.addr, &pa);
-                _ = sys.sendto(u.fd, wire, linux.MSG.DONTWAIT, &pa.any, len) catch {};
+                _ = sys.sendto(u.fd, framed[2..], linux.MSG.DONTWAIT, &pa.any, len) catch {};
             },
             .tcp => |c| {
-                var hdr: [2]u8 = undefined;
-                mem.writeInt(u16, &hdr, @intCast(wire.len), .big);
+                mem.writeInt(u16, framed[0..2], @intCast(framed.len - 2), .big);
                 c.owed -= 1;
                 c.last_ns = s.e.now_ns;
-                const ok = (sys.write(c.fd, &hdr) catch 0) == 2 and (sys.write(c.fd, wire) catch 0) == wire.len;
-                if (!ok or (c.eof and c.owed == 0)) s.drop(c);
+                var rest: []const u8 = framed;
+                if (c.out.items.len == 0) {
+                    const n = s.take(c, rest) orelse return;
+                    rest = rest[n..];
+                }
+                if (rest.len == 0) return s.closeIfDone(c);
+                c.out.appendSlice(s.gpa, rest) catch return s.drop(c);
+                if (c.out.items.len == rest.len) {
+                    c.blocked_ns = s.e.now_ns;
+                    s.e.rewatch(c.fd, c.token, linux.EPOLL.OUT) catch s.drop(c);
+                }
             },
         }
+    }
+
+    fn flush(s: *Server, c: *Conn) !void {
+        const n = s.take(c, c.out.items) orelse return;
+        if (n == 0) return;
+        c.last_ns = s.e.now_ns;
+        mem.copyForwards(u8, c.out.items, c.out.items[n..]);
+        c.out.shrinkRetainingCapacity(c.out.items.len - n);
+        if (c.out.items.len != 0) return;
+        s.e.rewatch(c.fd, c.token, linux.EPOLL.IN) catch return s.drop(c);
+        if (c.eof and c.owed == 0) return s.drop(c);
+        try s.frames(c);
+    }
+
+    /// Null: the connection is gone.
+    fn take(s: *Server, c: *Conn, bytes: []const u8) ?usize {
+        return sys.write(c.fd, bytes) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => {
+                s.drop(c);
+                return null;
+            },
+        };
+    }
+
+    fn closeIfDone(s: *Server, c: *Conn) void {
+        if (c.eof and c.owed == 0) s.drop(c);
     }
 };
 
