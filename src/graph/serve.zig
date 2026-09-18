@@ -16,7 +16,7 @@ const acl = @import("../acl.zig");
 const config = @import("../config.zig");
 const monotonic = @import("../monotonic.zig");
 const response = @import("../response.zig");
-const server = @import("../server.zig");
+const sys_linux = @import("../sys_linux.zig");
 const Edge = @import("edge.zig");
 const log = std.log.scoped(.graph);
 
@@ -96,9 +96,9 @@ const Server = struct {
     }
 
     fn listen(s: *Server, addr: na.Address) !void {
-        const udp = try server.createSocket(addr, posix.SOCK.DGRAM, false, false);
+        const udp = try listenOn(addr, posix.SOCK.DGRAM);
         try s.e.watch(udp, try s.token(.{ .udp = udp }), linux.EPOLL.IN);
-        const tcp = try server.createSocket(addr, posix.SOCK.STREAM, false, true);
+        const tcp = try listenOn(addr, posix.SOCK.STREAM);
         try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN);
     }
 
@@ -227,7 +227,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name = q.name.formatInto(&name_buf);
-        if (build_options.testing_enabled) if (server.parseAdvanceClockQname(dns.stripTrailingDot(name))) |secs| {
+        if (build_options.testing_enabled) if (advanceClockSeconds(dns.stripTrailingDot(name))) |secs| {
             monotonic.advanceTestClock(secs);
             return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null);
         };
@@ -409,11 +409,11 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
-        try server.dropPrivileges(cfg.drop_gid, cfg.drop_uid);
+        try dropPrivileges(cfg.drop_gid, cfg.drop_uid);
         log.info("dropped to uid={?d} gid={?d}", .{ cfg.drop_uid, cfg.drop_gid });
     }
     if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
-    const sig = try server.setupSignalFd();
+    const sig = try signalFd();
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
     log.info("listening on {d} address(es)", .{cfg.listen.len});
@@ -466,4 +466,57 @@ fn logFootprint(g: *graph.Graph) void {
         g.refreshes,
         g.refreshes_refused,
     });
+}
+
+fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
+    const af = na.afU32(addr);
+    const sock = try sys.socket(af, sock_type | posix.SOCK.NONBLOCK, 0);
+    errdefer sys.close(sock);
+    const one: c_int = 1;
+    // V6ONLY keeps the families disjoint: the ACL is family-strict, and a
+    // v4-mapped-v6 peer would otherwise bypass every v4 allow rule.
+    if (af == posix.AF.INET6) try posix.setsockopt(sock, posix.SOL.IPV6, linux.IPV6.V6ONLY, &mem.toBytes(one));
+    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(one));
+    if (sock_type == posix.SOCK.DGRAM) {
+        const bufsize: c_int = 1024 * 1024;
+        posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.RCVBUF, &mem.toBytes(bufsize)) catch {};
+        posix.setsockopt(sock, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(bufsize)) catch {};
+    }
+    try na.bindTo(sock, &addr);
+    if (sock_type == posix.SOCK.STREAM) try sys.listen(sock, 128);
+    return sock;
+}
+
+/// INT/TERM stop, USR1/HUP print stats. The reader exists before the signals
+/// are blocked: blocked with nothing reading them is unkillable but by KILL.
+fn signalFd() !posix.fd_t {
+    var mask = linux.sigemptyset();
+    linux.sigaddset(&mask, linux.SIG.INT);
+    linux.sigaddset(&mask, linux.SIG.TERM);
+    linux.sigaddset(&mask, linux.SIG.HUP);
+    linux.sigaddset(&mask, linux.SIG.USR1);
+    const fd = try sys_linux.signalfd(-1, &mask, linux.SFD.NONBLOCK);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
+    return fd;
+}
+
+/// Raw syscalls credential the calling thread only (no libc, no SIGSETXID
+/// broadcast), so this runs before any thread exists. Clears supplementary
+/// groups, then r/e/s gid, then r/e/s uid; euid 0 → non-zero drops the
+/// permitted caps. Ambient caps and the bounding set are systemd's job.
+fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
+    if (linux.geteuid() == 0) {
+        const rc = if (@hasField(linux.SYS, "setgroups32")) linux.syscall2(.setgroups32, 0, 0) else linux.syscall2(.setgroups, 0, 0);
+        if (@as(isize, @bitCast(rc)) != 0) return error.SetGroupsFailed;
+    }
+    if (gid) |g| if (linux.setresgid(g, g, g) != 0) return error.SetGidFailed;
+    if (uid) |u| if (linux.setresuid(u, u, u) != 0) return error.SetUidFailed;
+}
+
+/// `_advance-clock.<seconds>.testharness.invalid`, the harness's clock jump.
+fn advanceClockSeconds(name: []const u8) ?i64 {
+    const prefix = "_advance-clock.";
+    const suffix = ".testharness.invalid";
+    if (!mem.startsWith(u8, name, prefix) or !mem.endsWith(u8, name, suffix)) return null;
+    return std.fmt.parseInt(i64, name[prefix.len .. name.len - suffix.len], 10) catch null;
 }
