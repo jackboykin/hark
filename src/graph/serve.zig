@@ -25,6 +25,7 @@ const udp_recv_max = 4096;
 
 const Conn = struct {
     fd: posix.fd_t,
+    addr: na.Address,
     token: u32,
     buf: [2 + max_frame]u8 = undefined,
     len: usize = 0,
@@ -126,13 +127,15 @@ const Server = struct {
 
     fn accept(s: *Server, fd: posix.fd_t) !void {
         while (true) {
-            const rc = linux.accept4(fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
+            var pa: na.PosixAddress = undefined;
+            var len: posix.socklen_t = @sizeOf(na.PosixAddress);
+            const rc = linux.accept4(fd, &pa.any, &len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             if (linux.errno(rc) != .SUCCESS) return;
             const cfd: posix.fd_t = @intCast(rc);
             // A small kernel queue, so write progress measures the client.
             posix.setsockopt(cfd, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(client_sndbuf)) catch {};
             const c = try s.gpa.create(Conn);
-            c.* = .{ .fd = cfd, .token = 0, .last_ns = s.e.now_ns };
+            c.* = .{ .fd = cfd, .addr = na.fromSockaddr(&pa), .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
             try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
         }
@@ -306,6 +309,17 @@ const Server = struct {
         ctx.ede = ede;
         const wire = response.buildResponseWire(buf[2..], ctx, msg, arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
+        if (s.cfg.log_queries) {
+            var ab: [64]u8 = undefined;
+            var nb: [dns.max_dotted_len + 1]u8 = undefined;
+            var tb: [24]u8 = undefined;
+            const q = query.questions[0];
+            const peer = switch (reply) {
+                .udp => |u| u.addr,
+                .tcp => |c| c.addr,
+            };
+            log.debug("client={s} id=0x{x:0>4} {s} {s} {t}", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), msg.header.flags.rcode });
+        }
         s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
