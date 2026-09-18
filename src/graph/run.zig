@@ -9,7 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
 const graph = @import("graph.zig");
-const serve = @import("serve.zig");
+const answer = @import("answer.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -149,10 +149,10 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
 
 /// Null when the client's timer fires first. The root stays in `held`,
 /// since the answer reads its hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *?graph.CellId) !?serve.Served {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *?graph.CellId) !?answer.Served {
     const q = entry.questions[0];
-    const client: serve.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
-    if (q.qtype == .any) return try serve.hinfo(arena, q, client);
+    const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
+    if (q.qtype == .any) return try answer.hinfo(arena, q, client);
     if (held.*) |h| g.unhold(h);
     held.* = null;
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
@@ -167,7 +167,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         try g.complete(ev.id, ev.completion);
     }
     held.* = root;
-    return try serve.answer(arena, g, root, q, client, scenario.minimal_responses orelse true, cached);
+    return try answer.build(arena, g, root, q, client, scenario.minimal_responses orelse true, cached);
 }
 
 fn printSections(m: dns.Message) void {
