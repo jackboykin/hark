@@ -391,6 +391,11 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
+    if (cfg.drop_gid != null or cfg.drop_uid != null) {
+        try server.dropPrivileges(cfg.drop_gid, cfg.drop_uid);
+        log.info("dropped to uid={?d} gid={?d}", .{ cfg.drop_uid, cfg.drop_gid });
+    }
+    if (linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0) return error.NoNewPrivsFailed;
     const sig = try server.setupSignalFd();
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);

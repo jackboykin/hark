@@ -1458,7 +1458,7 @@ fn classifySignalRead(result: anytype) SignalAction {
 /// covered: ambient capabilities and the bounding set. Operators wanting
 /// full credential hygiene should prefer systemd User= /
 /// CapabilityBoundingSet= over this in-process drop.
-fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
+pub fn dropPrivileges(gid: ?u32, uid: ?u32) !void {
     // Clear supplementary groups while we still have CAP_SETGID. Without
     // this, a process launched as root inherits root's groups (wheel, adm,
     // disk, …) and keeps them after the uid drop. Skip when not root:
