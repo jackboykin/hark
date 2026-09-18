@@ -1,0 +1,145 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN partial glue: a minimised probe below the cut widens to the glueless NS once, not per retry
+;
+; The question sits two labels under ntp.org, so the QNAME-minimised probe
+; for a.ntp.org runs at ntp.org's servers before the final query does. The
+; only glued NS (127.0.10.3) is dead; the glueless one (anyns.pch.net) is
+; reachable. The probe must widen to it, and the dead server must not be
+; asked again after the widening: CHECK_MAX_QUERIES pins the count.
+;
+; Topology
+;   root  127.0.10.1   org -> 127.0.10.5, net -> 127.0.10.6
+;   org   127.0.10.5   ntp.org NS ns1.everett.org (glue 127.0.10.3, dead), anyns.pch.net (no glue)
+;   net   127.0.10.6   pch.net NS anyns.pch.net (glue 127.0.10.4)
+;   pch   127.0.10.4   anyns.pch.net A/AAAA, and authoritative for ntp.org
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      org. IN A
+    SECTION AUTHORITY
+      org. 86400 IN NS a.org-tld.fake.
+    SECTION ADDITIONAL
+      a.org-tld.fake. 86400 IN A 127.0.10.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      net. IN A
+    SECTION AUTHORITY
+      net. 86400 IN NS a.net-tld.fake.
+    SECTION ADDITIONAL
+      a.net-tld.fake. 86400 IN A 127.0.10.6
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ntp.org. IN A
+    SECTION AUTHORITY
+      ntp.org. 86400 IN NS ns1.everett.org.
+      ntp.org. 86400 IN NS anyns.pch.net.
+    SECTION ADDITIONAL
+      ns1.everett.org. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      pch.net. IN A
+    SECTION AUTHORITY
+      pch.net. 86400 IN NS anyns.pch.net.
+    SECTION ADDITIONAL
+      anyns.pch.net. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      anyns.pch.net. IN A
+    SECTION ANSWER
+      anyns.pch.net. 3600 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      anyns.pch.net. IN AAAA
+    SECTION AUTHORITY
+      pch.net. 3600 IN SOA anyns.pch.net. hostmaster.pch.net. 1 7200 3600 1209600 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.ntp.org. IN A
+    SECTION AUTHORITY
+      ntp.org. 3600 IN SOA anyns.pch.net. hostmaster.ntp.org. 1 7200 3600 1209600 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      pool.a.ntp.org. IN A
+    SECTION ANSWER
+      pool.a.ntp.org. 130 IN A 198.137.202.32
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    pool.a.ntp.org. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    pool.a.ntp.org. IN A
+  SECTION ANSWER
+    pool.a.ntp.org. 130 IN A 198.137.202.32
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    anyns.pch.net. A 127.0.10.4
+    pool.a.ntp.org. A 127.0.10.4
+ENTRY_END
+
+; org, ntp.org, a.ntp.org (dead), net, pch.net, anyns A, anyns AAAA,
+; a.ntp.org (widened), pool.a.ntp.org: nine on a single path. The A and
+; AAAA fan-out each walk net and pch.net, and the answer prefetches its
+; AAAA: eleven. A walk that re-probes the dead server after every widening
+; runs far past that.
+STEP 4 CHECK_MAX_QUERIES 11
+
+SCENARIO_END
