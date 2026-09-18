@@ -35,6 +35,9 @@ const Event = struct {
     }
 };
 
+const now0_ns: i64 = 1_000_000_000_000;
+const wall0_sec: i64 = 1_800_000_000;
+
 pub const Sim = struct {
     arena: Allocator,
     gpa: Allocator,
@@ -44,9 +47,9 @@ pub const Sim = struct {
     ranges: []const rpl.Range,
     prng: std.Random.DefaultPrng,
     /// Monotonic; starts well above zero so deadlines never wrap negative.
-    now_ns: i64 = 1_000_000_000_000,
+    now_ns: i64 = now0_ns,
     /// Wall seconds, for RRSIG windows.
-    wall_sec: i64 = 1_800_000_000,
+    wall_sec: i64 = wall0_sec,
     /// The scenario step in effect, for RANGE windows.
     step: u32 = 0,
     /// `STEP n TIMEOUT`: drop this many of the next upstream queries.
@@ -89,11 +92,6 @@ pub const Sim = struct {
 
     fn wakeErased(ctx: *anyopaque, id: u32, gen: u32, at_ns: i64) anyerror!void {
         return @as(*Sim, @ptrCast(@alignCast(ctx))).schedule(id, at_ns, .{ .wake = gen });
-    }
-
-    pub fn advance(s: *Sim, seconds: u32) void {
-        s.now_ns += @as(i64, seconds) * std.time.ns_per_s;
-        s.wall_sec += seconds;
     }
 
     /// One upstream query. Its reply or absence is scheduled now; nothing
@@ -171,15 +169,23 @@ pub const Sim = struct {
     pub fn next(s: *Sim, until_ns: i64) ?struct { id: u32, completion: Completion } {
         const ev = s.events.peek() orelse {
             s.now_ns = @max(s.now_ns, until_ns);
+            s.syncWall();
             return null;
         };
         if (ev.at_ns > until_ns) {
             s.now_ns = @max(s.now_ns, until_ns);
+            s.syncWall();
             return null;
         }
         _ = s.events.pop();
         s.now_ns = @max(s.now_ns, ev.at_ns);
+        s.syncWall();
         return .{ .id = ev.id, .completion = ev.completion };
+    }
+
+    /// A rule run mid-window judges signatures at its own time.
+    fn syncWall(s: *Sim) void {
+        s.wall_sec = wall0_sec + @divFloor(s.now_ns - now0_ns, std.time.ns_per_s);
     }
 
     /// Per-server: 2–40 ms base, ±25% jitter, so seeds exercise different

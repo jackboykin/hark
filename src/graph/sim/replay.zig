@@ -100,7 +100,11 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
                 return error.ScenarioFailed;
             },
             .timeout => cursor += 1,
-            .time_passes => s.advance(st.seconds),
+            // What was due arrives on the way.
+            .time_passes => {
+                const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
+                while (s.next(until)) |ev| try g.complete(ev.id, ev.completion);
+            },
         }
     }
     report.phase = .warm;
