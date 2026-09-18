@@ -55,9 +55,9 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     s.pending_drops = drops;
 
     defer report.log = formatLog(gpa, s.log.items) catch "";
-    // CHECK_ANSWER reads the held root's hops.
-    var held: ?graph.CellId = null;
-    defer if (held) |h| g.unhold(h);
+    // CHECK_ANSWER reads the held roots' hops.
+    var held: Held = .{ null, null };
+    defer unholdAll(&g, &held);
     var last: ?dns.Message = null;
     var cursor: usize = 0;
     for (scenario.steps) |st| {
@@ -105,8 +105,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     report.phase = .warm;
     try requery(arena, &g, &s, scenario, report, &held);
     // Quiescence: nothing outlives its demand.
-    if (held) |h| g.unhold(h);
-    held = null;
+    unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     if (g.live != 0 or g.budgets != 0 or g.flights != 0) {
         report.msg = "cells, budgets or flights outlived the scenario";
@@ -119,7 +118,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared.
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *?graph.CellId) !void {
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -147,27 +146,55 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
     }
 }
 
-/// Null when the client's timer fires first. The root stays in `held`,
-/// since the answer reads its hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *?graph.CellId) !?answer.Served {
+const Held = [2]?graph.CellId;
+
+fn unholdAll(g: *graph.Graph, held: *Held) void {
+    for (held) |*h| if (h.*) |id| {
+        g.unhold(id);
+        h.* = null;
+    };
+}
+
+/// Null when the client's timer fires first. The roots stay in `held`,
+/// since the answer reads their hops, until the next question.
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held) !?answer.Served {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
+    const d64 = answer.Dns64.on(scenario.dns64_prefix, client);
+    if (try answer.special(arena, q, client, d64)) |served| return served;
     if (q.qtype == .any) return try answer.hinfo(arena, q, client);
-    if (held.*) |h| g.unhold(h);
-    held.* = null;
-    const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
+    unholdAll(g, held);
+    const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
+    const minimal = scenario.minimal_responses orelse true;
+    const asked = if (d64) |d| try d.asked(arena, q) else q;
+    const root = try resolveRoot(g, s, asked, client, deadline) orelse return null;
+    held[0] = root.id;
+    const served = try answer.build(arena, g, root.id, asked, client, minimal, root.cached);
+    const d = d64 orelse return served;
+    var a: ?answer.Served = null;
+    if (answer.Dns64.wantsA(q, served)) {
+        const aq: dns.Question = .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
+        const ar = try resolveRoot(g, s, aq, client, deadline) orelse return null;
+        held[1] = ar.id;
+        a = try answer.build(arena, g, ar.id, aq, client, minimal, ar.cached);
+    }
+    return try d.shape(arena, q, served, a);
+}
+
+const Root = struct { id: graph.CellId, cached: bool };
+
+fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, client: answer.Client, deadline: i64) !?Root {
     const root = (try g.demandRoot(q.name, q.qtype, client.cd)).?;
     try g.drain();
     const cached = g.cell(root).settled;
     while (!g.cell(root).settled) {
-        const ev = s.next(client_deadline) orelse {
+        const ev = s.next(deadline) orelse {
             g.unhold(root);
             return null;
         };
         try g.complete(ev.id, ev.completion);
     }
-    held.* = root;
-    return try answer.build(arena, g, root, q, client, scenario.minimal_responses orelse true, cached);
+    return .{ .id = root, .cached = cached };
 }
 
 fn printSections(m: dns.Message) void {
@@ -320,9 +347,9 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-/// The graph has no DNS64 or rebinding policy yet.
+/// The rebinding scrub runs on the wire, which the replay never builds.
 fn walkOnly(s: *const rpl.Scenario) bool {
-    return s.dns64_prefix == null and s.rebinding_enabled == null;
+    return s.rebinding_enabled == null;
 }
 
 const Replayed = struct { parsed: usize, ran: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
@@ -441,7 +468,7 @@ test "hark walk scenarios settle to today's answers" {
     // Stale at the client timer is the edge's, not a rule's (2½).
     const r = try replayDir("test/scenarios/hark", 8, &.{"005_blackholed_refresh_serves_stale.rpl"});
     try testing.expectEqual(96, r.parsed);
-    try testing.expectEqual(89, r.ran);
+    try testing.expectEqual(92, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

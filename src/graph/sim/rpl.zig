@@ -9,6 +9,7 @@ const Allocator = mem.Allocator;
 const testing = std.testing;
 const dns = @import("../../dns.zig");
 const na = @import("../../net_address.zig");
+const dns64 = @import("../../dns64.zig");
 
 /// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
 /// to cache TTL 0.
@@ -116,7 +117,7 @@ pub const Scenario = struct {
     rebinding_extra_allow: []const []const u8 = &.{},
     stagger_ms: ?u32 = null,
     workers: ?u32 = null,
-    dns64_prefix: ?[]const u8 = null,
+    dns64_prefix: ?dns64.Prefix = null,
     serve_stale_ttl: ?u32 = null,
     client_timeout_ms: u32 = 5000,
     /// Zones the harness signs; the first must be the root.
@@ -239,7 +240,7 @@ const Parser = struct {
         } else if (mem.eql(u8, key, "workers")) {
             s.workers = try p.int(u32, val);
         } else if (mem.eql(u8, key, "dns64-prefix")) {
-            s.dns64_prefix = val;
+            s.dns64_prefix = dns64.Prefix.parse(val) orelse return p.fail("dns64-prefix: not an RFC 6052 prefix");
         } else if (mem.eql(u8, key, "serve-stale-ttl")) {
             s.serve_stale_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "client-timeout")) {

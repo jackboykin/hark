@@ -16,7 +16,6 @@ const acl = @import("../acl.zig");
 const config = @import("../config.zig");
 const monotonic = @import("../monotonic.zig");
 const response = @import("../response.zig");
-const special_use = @import("../special_use.zig");
 const server = @import("../server.zig");
 const Edge = @import("edge.zig");
 const log = std.log.scoped(.graph);
@@ -52,6 +51,10 @@ const Watched = union(enum) {
 /// Re-read at answer time: the graph never holds client bytes.
 const Pending = struct {
     root: graph.CellId,
+    /// Under DNS64, the A behind an empty AAAA.
+    a: ?graph.CellId = null,
+    /// Settled from memory alone.
+    cached: bool,
     wire: []u8,
     reply: Reply,
 };
@@ -164,10 +167,7 @@ const Server = struct {
     /// Clients still waiting get nothing; the graph frees their roots.
     fn deinit(s: *Server) void {
         for (s.watched.items) |w| if (w == .conn) s.drop(w.conn);
-        for (s.pending.items) |p| {
-            s.g.unhold(p.root);
-            s.gpa.free(p.wire);
-        }
+        for (s.pending.items) |p| s.release(p);
         s.pending.deinit(s.gpa);
         s.watched.deinit(s.gpa);
         s.scratch.deinit();
@@ -205,31 +205,34 @@ const Server = struct {
         };
         if (response.validateQuery(query)) |v| return s.sendError(reply, query.header.id, query.header.flags.opcode, v.rcode, v.extended_rcode, query.header.flags.rd, query.questions, query.opt);
         const q = query.questions[0];
-        const client: answer.Client = .{ .rd = query.header.flags.rd, .cd = query.header.flags.cd, .do_bit = query.opt != null and query.opt.?.do_bit, .ad = query.header.flags.ad };
+        const client = answer.Client.fromQuery(query);
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const name = q.name.formatInto(&name_buf);
         if (build_options.testing_enabled) if (server.parseAdvanceClockQname(dns.stripTrailingDot(name))) |secs| {
             monotonic.advanceTestClock(secs);
             return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null);
         };
-        const action = special_use.classify(name, q.qtype);
-        if (action != .none) return s.send(reply, query, try special_use.synthesize(arena, name, action), null);
+        const d64 = answer.Dns64.on(s.cfg.dns64, client);
+        if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null);
         if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null);
+        const asked = if (d64) |d| try d.asked(arena, q) else q;
         // BCP 140 again: turned away is silence on UDP, a close on TCP.
-        const root = try s.g.demandRoot(q.name, q.qtype, client.cd) orelse return if (reply == .tcp) s.drop(reply.tcp);
+        const root = try s.g.demandRoot(asked.name, asked.qtype, client.cd) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
-        if (s.g.cell(root).settled) {
-            defer s.g.unhold(root);
-            const served = try answer.build(arena, s.g, root, q, client, s.cfg.minimal_responses, true);
-            return s.send(reply, query, served.msg, served.ede);
-        }
-        try s.pending.append(s.gpa, .{ .root = root, .wire = try s.gpa.dupe(u8, wire), .reply = reply });
+        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply };
+        errdefer s.release(p);
+        if (p.cached) if (try s.finish(arena, &p, query)) |served| {
+            s.send(reply, query, served.msg, served.ede);
+            return s.release(p);
+        };
+        p.wire = try s.gpa.dupe(u8, wire);
+        try s.pending.append(s.gpa, p);
     }
 
     fn settle(s: *Server) !void {
         var i: usize = 0;
         while (i < s.pending.items.len) {
-            const p = s.pending.items[i];
+            const p = &s.pending.items[i];
             if (!s.g.cell(p.root).settled) {
                 i += 1;
                 continue;
@@ -237,14 +240,38 @@ const Server = struct {
             _ = s.scratch.reset(.retain_capacity);
             const arena = s.scratch.allocator();
             const query = try dns.parseMessage(arena, p.wire);
-            const q = query.questions[0];
-            const client: answer.Client = .{ .rd = query.header.flags.rd, .cd = query.header.flags.cd, .do_bit = query.opt != null and query.opt.?.do_bit, .ad = query.header.flags.ad };
-            const served = try answer.build(arena, s.g, p.root, q, client, s.cfg.minimal_responses, false);
+            const served = try s.finish(arena, p, query) orelse {
+                i += 1;
+                continue;
+            };
             s.send(p.reply, query, served.msg, served.ede);
-            s.g.unhold(p.root);
-            s.gpa.free(p.wire);
+            s.release(p.*);
             _ = s.pending.swapRemove(i);
         }
+    }
+
+    /// The reply once every root it needs has settled.
+    fn finish(s: *Server, arena: Allocator, p: *Pending, query: dns.Message) !?answer.Served {
+        const q = query.questions[0];
+        const client = answer.Client.fromQuery(query);
+        const d64 = answer.Dns64.on(s.cfg.dns64, client) orelse return try answer.build(arena, s.g, p.root, q, client, s.cfg.minimal_responses, p.cached);
+        const served = try answer.build(arena, s.g, p.root, try d64.asked(arena, q), client, s.cfg.minimal_responses, p.cached);
+        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, client.cd)) |a| {
+            p.a = a;
+            try s.g.drain();
+        };
+        var a: ?answer.Served = null;
+        if (p.a) |id| {
+            if (!s.g.cell(id).settled) return null;
+            a = try answer.build(arena, s.g, id, .{ .name = q.name, .qtype = .a, .qclass = q.qclass }, client, s.cfg.minimal_responses, p.cached);
+        }
+        return try d64.shape(arena, q, served, a);
+    }
+
+    fn release(s: *Server, p: Pending) void {
+        s.g.unhold(p.root);
+        if (p.a) |a| s.g.unhold(a);
+        s.gpa.free(p.wire);
     }
 
     fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede) void {

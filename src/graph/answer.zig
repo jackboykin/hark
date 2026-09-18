@@ -5,12 +5,83 @@ const Allocator = std.mem.Allocator;
 const dns = @import("../dns.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
+const dns64 = @import("../dns64.zig");
+const special_use = @import("../special_use.zig");
 
-pub const Client = struct { rd: bool = true, cd: bool = false, do_bit: bool = false, ad: bool = false };
+pub const Client = struct {
+    rd: bool = true,
+    cd: bool = false,
+    do_bit: bool = false,
+    ad: bool = false,
+
+    pub fn fromQuery(m: dns.Message) Client {
+        return .{ .rd = m.header.flags.rd, .cd = m.header.flags.cd, .do_bit = m.opt != null and m.opt.?.do_bit, .ad = m.header.flags.ad };
+    }
+};
+
+/// RFC 6147 at the client's edge, off under CD (§5.5); the cells stay
+/// what the authorities said.
+pub const Dns64 = struct {
+    prefix: dns64.Prefix,
+
+    pub fn on(prefix: ?dns64.Prefix, c: Client) ?Dns64 {
+        return if (prefix) |p| if (c.cd) null else .{ .prefix = p } else null;
+    }
+
+    /// A PTR under the prefix becomes the embedded IPv4's in-addr.arpa PTR (§5.3.1).
+    pub fn asked(d: Dns64, arena: Allocator, q: dns.Question) !dns.Question {
+        if (q.qtype != .ptr) return q;
+        var buf: [dns.max_dotted_len + 1]u8 = undefined;
+        const v6 = dns64.parseIp6Arpa(q.name.formatInto(&buf)) orelse return q;
+        if (!d.prefix.contains(&v6)) return q;
+        const v4 = d.prefix.extract(&v6);
+        const in_addr = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}.in-addr.arpa.", .{ v4[3], v4[2], v4[1], v4[0] });
+        return .{ .name = try dns.parseDottedName(arena, in_addr), .qtype = .ptr, .qclass = q.qclass };
+    }
+
+    /// §5.1.2: an AAAA that came back empty wants the A too.
+    pub fn wantsA(q: dns.Question, served: Served) bool {
+        return q.qtype == .aaaa and dns64.wantsSynthesis(served.msg);
+    }
+
+    /// PTRs re-owned under the client's name; AAAA embedded from `a` (§5.1.6).
+    pub fn shape(d: Dns64, arena: Allocator, q: dns.Question, served: Served, a: ?Served) !Served {
+        var out = served;
+        if (q.qtype == .ptr and !served.msg.questions[0].name.eql(q.name)) {
+            var buf: [dns.max_dotted_len + 1]u8 = undefined;
+            try dns64.renamePtr(arena, &out.msg, q.name.formatInto(&buf));
+            // A denial there proves a name the client never asked about.
+            out.msg.authorities = &.{};
+            out.msg.additionals = &.{};
+        } else if (a) |from| if (try dns64.synthesizeAaaa(arena, d.prefix, from.msg, served.msg)) |msg| {
+            out = .{ .msg = msg, .cacheable = served.cacheable and from.cacheable, .ede = from.ede };
+        };
+        out.msg.questions = try arena.dupe(dns.Question, &.{q});
+        return out;
+    }
+};
 
 /// A reply, and whether it is a fact past this instant (TTL 0 is served
 /// but never memoised).
 pub const Served = struct { msg: dns.Message, cacheable: bool, ede: ?dns.Ede = null };
+
+/// RFC 6761 names, answered asking nobody; null: ask the graph.
+pub fn special(arena: Allocator, q: dns.Question, c: Client, d64: ?Dns64) !?Served {
+    var buf: [dns.max_dotted_len + 1]u8 = undefined;
+    const name = q.name.formatInto(&buf);
+    const action = special_use.classify(name, q.qtype);
+    if (action == .none) return null;
+    var msg = try special_use.synthesize(arena, name, action);
+    // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
+    if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(msg)) {
+        const a = try special_use.synthesize(arena, name, special_use.classify(name, .a));
+        msg = try dns64.synthesizeAaaa(arena, d.prefix, a, msg) orelse msg;
+    };
+    msg.header.flags.rd = c.rd;
+    msg.header.flags.cd = c.cd;
+    msg.questions = try arena.dupe(dns.Question, &.{q});
+    return .{ .msg = msg, .cacheable = false };
+}
 
 /// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
 pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
