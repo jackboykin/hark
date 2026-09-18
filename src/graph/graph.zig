@@ -593,6 +593,15 @@ pub const Graph = struct {
         return null;
     }
 
+    pub const Fact = struct { value: Value, expires_ns: i64 };
+
+    /// A fresh fact's value now, without waiting: `demand` is the only pin.
+    pub fn peek(g: *Graph, key: Key, name: dns.Name) !?Fact {
+        const id = try g.lookup(key, name) orelse return null;
+        const c = g.cell(id);
+        return if (g.fresh(id)) .{ .value = c.value, .expires_ns = c.expires_ns } else null;
+    }
+
     /// Demand `key` for `by`. Null when `by` already (transitively) feeds
     /// the cell: a cycle, refused before any work.
     pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {

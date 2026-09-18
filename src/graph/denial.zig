@@ -1,9 +1,9 @@
 //! RFC 8198 aggressive use. Every NSEC a secure negative carried is the
-//! fact `rrset(owner, NSEC)`, and this index orders those facts by owner
-//! within their signing zone, so a later question inside a known span is
-//! denied from memory with the proofs attached, asking nobody. The index
-//! only finds candidates; the verdict is `validateNegativeProof`'s, the
-//! same oracle a live denial faces.
+//! fact `rrset(owner, NSEC)`, its SOA the fact `rrset(zone, SOA)`; this
+//! index orders the spans by owner within their signing zone, so a later
+//! question inside a known span is denied from memory with the proofs
+//! fetched by key. The index only finds candidates: the verdict is
+//! `validateNegativeProof`'s, and a proof gone from the store fails closed.
 const std = @import("std");
 const dns = @import("../dns.zig");
 const dnssec = @import("../dnssec.zig");
@@ -13,68 +13,82 @@ const Graph = graph.Graph;
 const CellId = graph.CellId;
 const RR = dns.ResourceRecord;
 
-/// Records from one section, aged from when it was taken.
-const Taken = struct { rrs: []const RR, stored_ns: i64, expires_ns: i64 };
+/// One NSEC's geometry; the record lives in the store.
+const Span = struct {
+    owner: dns.Name,
+    nsec: dns.NsecData,
+    expires_ns: i64,
+    buf: []align(8) u8,
+
+    fn init(gpa: std.mem.Allocator, rr: RR, expires_ns: i64) !Span {
+        const n = rr.rdata.nsec;
+        const owner_len = std.mem.alignForward(usize, dns.nameFlatSize(rr.name), 8);
+        const next_len = std.mem.alignForward(usize, dns.nameFlatSize(n.next_domain_name), 8);
+        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(8), owner_len + next_len + n.type_bit_maps.len);
+        const owner = dns.writeNameFlat(buf[0..owner_len], rr.name, false);
+        const next = dns.writeNameFlat(@alignCast(buf[owner_len..][0..next_len]), n.next_domain_name, false);
+        const bits = buf[owner_len + next_len ..];
+        @memcpy(bits, n.type_bit_maps);
+        return .{ .owner = owner, .nsec = .{ .next_domain_name = next, .type_bit_maps = bits }, .expires_ns = expires_ns, .buf = buf };
+    }
+};
 
 const Zone = struct {
-    /// `rrset(owner, NSEC)` cells in canonical owner order.
-    nsecs: std.ArrayList(CellId) = .empty,
-    /// The apex SOA and its signatures: the synthesised authority section
-    /// starts with it (RFC 2308 §3).
-    soa: ?Taken = null,
+    /// In canonical owner order.
+    spans: std.ArrayList(Span) = .empty,
 
     /// Drop what has expired, so the neighbour of a name is a live proof.
     fn prune(z: *Zone, g: *Graph) void {
         var w: usize = 0;
-        for (z.nsecs.items) |id| if (g.fresh(id)) {
-            z.nsecs.items[w] = id;
+        for (z.spans.items) |sp| if (sp.expires_ns > g.now()) {
+            z.spans.items[w] = sp;
             w += 1;
-        };
-        z.nsecs.shrinkRetainingCapacity(w);
+        } else g.gpa.free(sp.buf);
+        z.spans.shrinkRetainingCapacity(w);
     }
 
     /// Where `name` sorts among the owners.
-    fn position(z: *const Zone, g: *Graph, name: dns.Name) usize {
+    fn position(z: *const Zone, name: dns.Name) usize {
         var lo: usize = 0;
-        var hi: usize = z.nsecs.items.len;
+        var hi: usize = z.spans.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (dnssec.canonicalNameOrder(g.cell(z.nsecs.items[mid]).name, name) == .lt) lo = mid + 1 else hi = mid;
+            if (dnssec.canonicalNameOrder(z.spans.items[mid].owner, name) == .lt) lo = mid + 1 else hi = mid;
         }
         return lo;
     }
 
-    fn exact(z: *const Zone, g: *Graph, name: dns.Name) ?CellId {
-        const pos = z.position(g, name);
-        if (pos == z.nsecs.items.len) return null;
-        const id = z.nsecs.items[pos];
-        return if (g.cell(id).name.eql(name) and g.fresh(id)) id else null;
+    fn exact(z: *const Zone, g: *Graph, name: dns.Name) ?*const Span {
+        const pos = z.position(name);
+        if (pos == z.spans.items.len) return null;
+        const sp = &z.spans.items[pos];
+        return if (sp.owner.eql(name) and sp.expires_ns > g.now()) sp else null;
     }
 
-    /// The fresh NSEC whose range holds `name` (RFC 6840 §4.1 geometry); the
+    /// The live span whose range holds `name` (RFC 6840 §4.1 geometry); the
     /// last owner wraps to cover what sorts before the first.
-    fn span(z: *const Zone, g: *Graph, name: dns.Name) ?CellId {
-        const n = z.nsecs.items.len;
+    fn span(z: *const Zone, g: *Graph, name: dns.Name) ?*const Span {
+        const n = z.spans.items.len;
         if (n == 0) return null;
-        const pos = z.position(g, name);
+        const pos = z.position(name);
         for ([_]usize{ if (pos > 0) pos - 1 else n - 1, n - 1 }) |i| {
-            const id = z.nsecs.items[i];
-            if (g.fresh(id) and dnssec.nsecCovers(g.cell(id).name, nsecOf(g, id), name)) return id;
+            const sp = &z.spans.items[i];
+            if (sp.expires_ns > g.now() and dnssec.nsecCovers(sp.owner, sp.nsec, name)) return sp;
         }
         return null;
     }
 };
 
-fn nsecOf(g: *Graph, id: CellId) dns.NsecData {
-    return g.cell(id).value.rrset.answers[0].rdata.nsec;
-}
-
 pub const Index = struct {
     zones: std.StringHashMapUnmanaged(Zone) = .empty,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator) void {
-        var it = ix.zones.valueIterator();
-        while (it.next()) |z| z.nsecs.deinit(gpa);
+        var it = ix.zones.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.spans.items) |sp| gpa.free(sp.buf);
+            e.value_ptr.spans.deinit(gpa);
+            gpa.free(e.key_ptr.*);
+        }
         ix.zones.deinit(gpa);
     }
 };
@@ -83,16 +97,15 @@ pub const Index = struct {
 /// wildcard); the rest is stuffing.
 const max_proofs = 8;
 
-/// A secure negative's proofs, verified under `signer`, become facts: each
-/// NSEC with its signatures as `rrset(owner, NSEC)`, for as long as the
-/// verdict holds, its own TTL runs and the negative cap allows (RFC 8198
-/// §5.4).
+/// A secure negative's SOA and NSECs, verified under `signer`, become
+/// facts for as long as the verdict holds, their TTL runs and the negative
+/// cap allows (RFC 8198 §5.4).
 pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     const gop = try g.denial.zones.getOrPut(g.gpa, signer.formatLower(&buf));
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
-        gop.key_ptr.* = g.arena.dupe(u8, gop.key_ptr.*) catch |e| {
+        gop.key_ptr.* = g.gpa.dupe(u8, gop.key_ptr.*) catch |e| {
             g.denial.zones.removeByPtr(gop.key_ptr);
             return e;
         };
@@ -102,19 +115,24 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
     var proofs: usize = 0;
     for (r.authorities) |rr| {
         if ((rr.rtype != .nsec and rr.rtype != .soa) or !rr.name.isSubdomainOf(signer)) continue;
+        if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
         const rrs = try withSigs(g, r.authorities, rr);
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
-        if (rr.rtype == .soa) {
-            if (rr.name.eql(signer)) z.soa = .{ .rrs = rrs, .stored_ns = r.stored_ns, .expires_ns = expires };
-            continue;
-        }
-        proofs += 1;
         const fact: graph.Reply = .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        const id = try g.publish(try g.keyFor(.rrset, rr.name, .nsec), rr.name, by, .{ .rrset = fact }, expires);
-        const pos = z.position(g, rr.name);
-        if (pos < z.nsecs.items.len and g.cell(z.nsecs.items[pos]).name.eql(rr.name)) z.nsecs.items[pos] = id else try z.nsecs.insert(g.gpa, pos, id);
+        _ = try g.publish(try g.keyFor(.rrset, rr.name, rr.rtype), rr.name, by, .{ .rrset = fact }, expires);
+        if (rr.rtype == .soa) continue;
+        proofs += 1;
+        const sp = try Span.init(g.gpa, rr, expires);
+        const pos = z.position(rr.name);
+        if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(rr.name)) {
+            g.gpa.free(z.spans.items[pos].buf);
+            z.spans.items[pos] = sp;
+        } else z.spans.insert(g.gpa, pos, sp) catch |e| {
+            g.gpa.free(sp.buf);
+            return e;
+        };
     }
 }
 
@@ -160,15 +178,14 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const now = g.now();
-    const soa = z.soa orelse return false;
-    if (soa.expires_ns <= now) return false;
-    var proofs: [2]CellId = undefined;
+    const soa = try g.peek(try g.keyFor(.rrset, zone, .soa), zone) orelse return false;
+    var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
     if (z.span(g, name)) |cover| {
         proofs[0] = cover;
-        if (dnssec.nsecProvesNameNonexistence(g.cell(cover).name, nsecOf(g, cover), name)) {
-            const ce = dnssec.closestEncloser(name, g.cell(cover).name, nsecOf(g, cover).next_domain_name) orelse return false;
+        if (dnssec.nsecProvesNameNonexistence(cover.owner, cover.nsec, name)) {
+            const ce = dnssec.closestEncloser(name, cover.owner, cover.nsec.next_domain_name) orelse return false;
             var wc_buf: [dns.max_label_count + 1][]const u8 = undefined;
             const wildcard = dns.makeWildcardName(&wc_buf, ce) orelse return false;
             if (z.exact(g, wildcard)) |wc| {
@@ -183,11 +200,11 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
 
     var expires = soa.expires_ns;
     var authorities: std.ArrayList(RR) = .empty;
-    try aged(g, &authorities, soa.rrs, soa.stored_ns);
+    try aged(g, &authorities, soa.value.rrset.answers, soa.value.rrset.stored_ns);
     for (proofs[0..n]) |p| {
-        const c = g.cell(p);
-        expires = @min(expires, c.expires_ns);
-        try aged(g, &authorities, c.value.rrset.answers, c.value.rrset.stored_ns);
+        const fact = try g.peek(try g.keyFor(.rrset, p.owner, .nsec), p.owner) orelse return false;
+        expires = @min(expires, fact.expires_ns);
+        try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
     }
     var budget: dnssec.ValidationBudget = .{};
     if (dnssec.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, &budget) != .secure) return false;
