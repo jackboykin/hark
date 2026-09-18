@@ -1,13 +1,13 @@
-//! The simulator: network, clock and randomness from a seed. Stands in for
-//! the edge. Serves a scenario's RANGE entries the way test/harness/
-//! responder.py does, delivers replies after a seeded per-server latency,
-//! drops for blackholes, and logs every upstream query for CHECK_QUERY_LOG.
+//! The simulator: network, clock and randomness from a seed; stands in for
+//! the edge. Serves RANGE entries as test/harness/responder.py does, after
+//! a seeded per-server latency, and logs every upstream query.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
+const sign = @import("sign.zig");
 
 pub const Transport = enum { udp, tcp };
 
@@ -49,6 +49,9 @@ pub const Sim = struct {
     arena: Allocator,
     gpa: Allocator,
     scenario: *const rpl.Scenario,
+    signer: sign.Signer,
+    /// Signed.
+    ranges: []const rpl.Range,
     prng: std.Random.DefaultPrng,
     /// Monotonic; starts well above zero so deadlines never wrap negative.
     now_ns: i64 = 1_000_000_000_000,
@@ -63,13 +66,18 @@ pub const Sim = struct {
     log: std.ArrayList(LogRow) = .empty,
     reply_buf: [65535]u8 = undefined,
 
-    pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, seed: u64) Sim {
-        return .{
+    pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, seed: u64) !Sim {
+        var s: Sim = .{
             .arena = arena,
             .scenario = scenario,
+            .signer = undefined,
+            .ranges = undefined,
             .prng = std.Random.DefaultPrng.init(seed),
             .gpa = gpa,
         };
+        s.signer = try sign.Signer.init(arena, scenario, seed, s.wall_sec);
+        s.ranges = try s.signer.bake(scenario.ranges);
+        return s;
     }
 
     pub fn deinit(s: *Sim) void {
@@ -103,11 +111,17 @@ pub const Sim = struct {
         const entry = s.findEntry(ex.server, q, ex.transport) orelse {
             // No RANGE for this address: nothing listens there.
             if (!s.serves(ex.server)) return s.schedule(ex.id, ex.deadline_ns, .timeout);
-            // An unmatched query is REFUSED, so a coverage gap surfaces
-            // instead of looking like a blackhole.
             var msg = query;
             msg.header.flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = query.header.flags.rd, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .refused };
             msg.answers = &.{};
+            // A signed zone's DNSKEY is answered where it signs; anything
+            // else unmatched is REFUSED so a coverage gap surfaces instead
+            // of looking like a blackhole.
+            if (try s.signer.dnskeyAnswer(ex.server, q)) |rrs| {
+                msg.header.flags.aa = true;
+                msg.header.flags.rcode = .no_error;
+                msg.answers = rrs;
+            }
             msg.authorities = &.{};
             msg.additionals = &.{};
             msg.opt = null;
@@ -184,12 +198,12 @@ pub const Sim = struct {
     }
 
     fn serves(s: *const Sim, server: na.Address) bool {
-        for (s.scenario.ranges) |r| if (na.ipEqual(r.address, server)) return true;
+        for (s.ranges) |r| if (na.ipEqual(r.address, server)) return true;
         return false;
     }
 
     fn findEntry(s: *const Sim, server: na.Address, q: dns.Question, transport: Transport) ?*const rpl.Entry {
-        for (s.scenario.ranges) |*r| {
+        for (s.ranges) |*r| {
             if (!na.ipEqual(r.address, server)) continue;
             if (s.step < r.start or s.step > r.end) continue;
             for (r.entries) |*e| if (entryMatches(e, q, transport)) return e;

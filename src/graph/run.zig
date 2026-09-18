@@ -30,7 +30,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var s = sim.Sim.init(arena, gpa, scenario, opts.seed);
+    var s = try sim.Sim.init(arena, gpa, scenario, opts.seed);
     defer s.deinit();
     var g = try graph.Graph.init(arena, gpa, .{
         .qmin = scenario.qmin orelse true,

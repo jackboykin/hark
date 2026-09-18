@@ -315,7 +315,7 @@ pub fn classifyDelegation(
 
 /// Compute the key tag for a DNSKEY record per RFC 4034 Appendix B.
 /// The key tag is a checksum over the DNSKEY RDATA wire format.
-fn keyTag(dnskey: dns.DnskeyData) u16 {
+pub fn keyTag(dnskey: dns.DnskeyData) u16 {
     var ac: u32 = 0;
 
     // DNSKEY RDATA wire: flags(2) + protocol(1) + algorithm(1) + public_key
@@ -360,7 +360,7 @@ fn writeNameWire(buf: []u8, name: dns.Name, comptime lower: bool) error{BufferTo
 }
 
 /// RFC 4034 §5.1.4: digest of canonical owner name || DNSKEY RDATA.
-fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) error{BufferTooSmall}![Hash.digest_length]u8 {
+pub fn dsDigest(comptime Hash: type, owner: dns.Name, dnskey: dns.DnskeyData) error{BufferTooSmall}![Hash.digest_length]u8 {
     var name_buf: [255]u8 = undefined;
     const name_len = try writeCanonicalNameWire(&name_buf, owner);
     var h = Hash.init(.{});
@@ -402,9 +402,9 @@ fn writeRrsigHeaderWire(buf: []u8, rrsig: dns.RrsigData) error{BufferTooSmall}!u
 /// RFC 4034 §3.1.8.1 signed data: RRSIG_RDATA (sans signature) followed by
 /// the RRset in canonical form sorted by RDATA. Held as parts so verifiers
 /// stream it into their hash; nothing needs it contiguous.
-const SignedData = struct {
+pub const SignedData = struct {
     const Entry = struct { wire: []const u8, rdata: []const u8 };
-    const max_entries = 64;
+    pub const max_entries = 64;
 
     header: []const u8,
     entries: [max_entries]Entry = undefined,
@@ -414,7 +414,7 @@ const SignedData = struct {
         return .{ .header = bytes };
     }
 
-    fn feed(self: *const SignedData, hasher: anytype) void {
+    pub fn feed(self: *const SignedData, hasher: anytype) void {
         hasher.update(self.header);
         for (self.entries[0..self.len]) |e| hasher.update(e.wire);
     }
@@ -422,7 +422,7 @@ const SignedData = struct {
 
 /// Canonical entries are written into `buf` in RRset order and sorted by
 /// slice, so the buffer only ever holds one copy.
-fn buildSignedData(
+pub fn buildSignedData(
     buf: []u8,
     rrsig: dns.RrsigData,
     rrset: []const dns.ResourceRecord,
