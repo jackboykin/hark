@@ -69,15 +69,23 @@ pub const Key = struct {
     rtype: dns.RType = .a,
     name: []const u8,
 
+    pub fn hash(k: Key) u64 {
+        var h = std.hash.Wyhash.init(@backingInt(k.kind));
+        h.update(mem.asBytes(&k.rtype));
+        h.update(k.name);
+        return h.final();
+    }
+
+    pub fn eql(a: Key, b: Key) bool {
+        return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
+    }
+
     const Context = struct {
         pub fn hash(_: Context, k: Key) u64 {
-            var h = std.hash.Wyhash.init(@backingInt(k.kind));
-            h.update(mem.asBytes(&k.rtype));
-            h.update(k.name);
-            return h.final();
+            return k.hash();
         }
         pub fn eql(_: Context, a: Key, b: Key) bool {
-            return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
+            return a.eql(b);
         }
     };
 };

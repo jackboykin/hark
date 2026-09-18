@@ -1544,6 +1544,29 @@ pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
     return .{ .bytes = ser.buf[0..ser.pos], .ttl_offset = ttl_offset };
 }
 
+/// Uncompressed, as a stored fact holds names and records.
+pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
+    var ser = Serializer.init(buf);
+    try ser.writeName(name, false);
+    return ser.pos;
+}
+
+/// Labels alias `bytes`.
+pub fn readNameWire(allocator: Allocator, bytes: []const u8, pos: *usize) Error!Name {
+    var parser = Parser{ .msg = bytes, .pos = pos.* };
+    const name = try parser.parseName(allocator);
+    pos.* = parser.pos;
+    return name;
+}
+
+/// Names and rdata alias `bytes`.
+pub fn readRecordsWire(allocator: Allocator, bytes: []const u8, pos: *usize, count: u16) Error![]ResourceRecord {
+    var parser = Parser{ .msg = bytes, .pos = pos.* };
+    const rrs = try parseRRSection(allocator, &parser, count, count, null);
+    pos.* = parser.pos;
+    return rrs;
+}
+
 /// Where each section ended, filled progressively by `serializeMessageEnds`
 /// so a caller can rewind to a completed boundary after an overflow.
 /// 0 = never reached.
