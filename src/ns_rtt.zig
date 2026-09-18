@@ -61,7 +61,6 @@ const hedge_multiplier: u32 = 3;
 /// track upward on route changes that move the path's true floor.
 const hedge_decay_ms: i64 = 30_000;
 
-const hedge_cold_default_ms: u32 = initial_timeout_ms / 4;
 const max_hedge_stagger_ms: u32 = 300;
 
 /// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
@@ -236,15 +235,13 @@ pub const RttCache = struct {
         if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
     }
 
-    /// Hedge stagger for the leading-leg server, in ms. Callers must filter
-    /// dead servers (via `isDead`) before calling — this returns a stagger
-    /// even for entries with stale samples.
-    pub fn getHedgeStagger(self: *RttCache, key: AddressKey) u32 {
+    /// Null until the server has answered; a dead one still gets a stagger,
+    /// filter with `isDead` first.
+    pub fn getHedgeStagger(self: *RttCache, key: AddressKey) ?u32 {
         const shard = self.shardFor(key);
         shard.rwlock.lockSharedUncancelable(self.io);
         defer shard.rwlock.unlockShared(self.io);
-        const state = shard.entries.get(key) orelse return hedge_cold_default_ms;
-        return state.hedgeStagger() orelse hedge_cold_default_ms;
+        return (shard.entries.get(key) orelse return null).hedgeStagger();
     }
 
     pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
@@ -417,12 +414,12 @@ test "concurrent inserts under cap pressure stay bounded" {
     try testing.expect(cache.count() >= cache.max_entries / 2);
 }
 
-test "getHedgeStagger returns cold default for unknown server" {
+test "getHedgeStagger is null for an unknown server" {
     var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
     defer cache.deinit();
     cache.now_fn = &testNowMs;
 
-    try testing.expectEqual(hedge_cold_default_ms, cache.getHedgeStagger(testAddr(1)));
+    try testing.expectEqual(null, cache.getHedgeStagger(testAddr(1)));
 }
 
 test "getHedgeStagger uses 3x min_rtt clamped to [50, 300]" {

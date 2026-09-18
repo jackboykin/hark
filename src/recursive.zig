@@ -269,9 +269,8 @@ pub const RecursiveResolver = struct {
     /// below the 2 MiB wire ceiling (32 upstream × 64 KiB) — a stuffing
     /// tripwire. Mirrors config.zig defaultConfig.
     query_memory_limit: usize = 1024 * 1024,
-    /// Enables staggered NS racing when nonzero (0 = disabled). The live
-    /// interval is RTT-adaptive via `rtt_cache.getHedgeStagger`; this value
-    /// is the interval only when no RTT cache is wired (tests).
+    /// 0 disables NS racing; else the stagger until the leading server has
+    /// answered, then RTT-adaptive (`getHedgeStagger`).
     stagger_ms: u32 = 0,
 
     /// QNAME 0x20 case randomization (RFC draft Vixie/Dagon).
@@ -1681,10 +1680,7 @@ pub const RecursiveResolver = struct {
         }
         if (leg_count < 2) return null;
 
-        const stagger = if (self.rtt_cache) |rc|
-            rc.getHedgeStagger(AddressKey.fromAddress(servers[leg_idxs[0]]))
-        else
-            self.stagger_ms;
+        const stagger = (if (self.rtt_cache) |rc| rc.getHedgeStagger(AddressKey.fromAddress(servers[leg_idxs[0]])) else null) orelse self.stagger_ms;
 
         // Each leg waits its own timeout from its own launch.
         var window: u32 = 0;
