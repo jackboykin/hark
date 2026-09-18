@@ -28,6 +28,9 @@ pub const dns64 = @import("dns64.zig");
 pub const response = @import("response.zig");
 pub const graph = struct {
     pub const rpl = @import("graph/rpl.zig");
+    pub const sim = @import("graph/sim.zig");
+    pub const graph = @import("graph/graph.zig");
+    pub const run = @import("graph/run.zig");
 };
 
 /// This module's own optimize mode. The bench harness is pinned to ReleaseFast
@@ -62,6 +65,9 @@ test {
     _ = @import("counting_allocator.zig");
     _ = @import("bg_group.zig");
     _ = @import("graph/rpl.zig");
+    _ = @import("graph/sim.zig");
+    _ = @import("graph/graph.zig");
+    _ = @import("graph/run.zig");
     _ = @import("blocking_transport.zig");
     _ = @import("rand.zig");
     _ = @import("monotonic.zig");
