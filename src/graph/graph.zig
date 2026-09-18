@@ -517,6 +517,13 @@ pub const Graph = struct {
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
         g.tally.settles += 1;
+        if (g.cfg.trace) switch (value) {
+            .ds, .dnskey, .secure => |chain| {
+                var nb: [dns.max_dotted_len + 1]u8 = undefined;
+                std.debug.print("  {t}({s}) -> {t} for {d} s\n", .{ std.meta.activeTag(value), c.name.formatInto(&nb), chain.status, @divTrunc(expires_ns - g.now(), std.time.ns_per_s) });
+            },
+            else => {},
+        };
         c.settled = true;
         c.value = value;
         c.expires_ns = expires_ns;
