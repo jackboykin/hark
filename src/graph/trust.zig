@@ -275,11 +275,12 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 .bogus, .unchecked => try settleSecure(g, id, .bogus),
             }
         },
-        .servfail => try settleSecure(g, id, .bogus),
+        // A resolution failure is no verdict on the zone.
+        .servfail => try settleSecure(g, id, .unchecked),
     }
 }
 
-/// Bogus is a fact for the SERVFAIL window.
+/// A fact for the SERVFAIL window.
 fn settleSecure(g: *Graph, id: CellId, status: Status) !void {
     try g.settle(id, .{ .secure = .{ .status = status } }, bogusExpiry(g));
 }

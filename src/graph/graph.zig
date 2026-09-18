@@ -241,6 +241,8 @@ pub const Ask = struct {
     tried: [max_servers]na.Address = undefined,
     ntried: u8 = 0,
     fetched_unglued: bool = false,
+    /// Every server silent once: one more attempt each, at the backed-off timeout.
+    retried: bool = false,
     /// In flight, oldest first.
     attempts: [max_hedge]Attempt = undefined,
     nattempts: u8 = 0,
@@ -1283,7 +1285,12 @@ pub const Graph = struct {
         while (true) {
             if (!a.have_servers) switch (try g.gatherServers(id, a)) {
                 .pending => return .pending,
-                .none => return a.giveUp(),
+                .none => {
+                    if (a.retried or a.held != null) return a.giveUp();
+                    a.retried = true;
+                    a.ntried = 0;
+                    continue;
+                },
                 .ready => {},
             };
             var i: u8 = 0;
@@ -1328,8 +1335,7 @@ pub const Graph = struct {
                 continue;
             }
             if (a.nattempts > 0) return .pending;
-            // Every known server tried: pay for the unglued names once.
-            if (a.fetched_unglued or a.zone.labels.len == 0) return a.giveUp();
+            // Every known server tried: gather again for what settled since.
             a.have_servers = false;
         }
     }
@@ -1432,7 +1438,14 @@ pub const Graph = struct {
                 if (g.isDead(list.items[i])) _ = list.swapRemove(i) else i += 1;
             }
         }
-        if (list.items.len == 0) return .none;
+        if (list.items.len == 0) {
+            if (g.cfg.trace) {
+                var nb: [dns.max_dotted_len + 1]u8 = undefined;
+                var zb: [dns.max_dotted_len + 1]u8 = undefined;
+                std.debug.print("  {s} at {s}: {d} servers tried, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.ntried, if (a.held != null) "best failure held" else "no reply at all" });
+            }
+            return .none;
+        }
         a.nservers = @intCast(@min(list.items.len, max_servers));
         @memcpy(a.servers[0..a.nservers], list.items[0..a.nservers]);
         for (0..a.nservers) |i| a.order[i] = @intCast(i);
@@ -1450,6 +1463,10 @@ pub const Graph = struct {
         const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, budget, g.cell(by).depth);
         try g.pin(id, by);
         if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
+            if (g.cfg.trace) {
+                var nb: [dns.max_dotted_len + 1]u8 = undefined;
+                std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, if (g.cell(by).orphan) "orphan" else if (g.now() >= budget.deadline_ns) "past the deadline" else "query budget spent" });
+            }
             try g.settle(id, .{ .exchange = .budget }, g.now());
             return id;
         }
