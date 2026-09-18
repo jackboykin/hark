@@ -2,7 +2,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const hark = @import("hark");
 const Io = std.Io;
-const Server = hark.server.Server;
 
 var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -77,10 +76,7 @@ pub fn main(init: std.process.Init) !void {
         stdout_writer.interface.flush() catch std.process.exit(1);
         return;
     } else if (std.mem.eql(u8, command, "serve")) {
-        return runServe(allocator, args[2..], io, .pool);
-    } else if (std.mem.eql(u8, command, "graph")) {
-        // Proof of concept; serve's options.
-        return runServe(allocator, args[2..], io, .graph);
+        return runServe(allocator, args[2..], io);
     } else {
         log.err("unknown command: {s}", .{command});
         printUsage();
@@ -103,7 +99,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io, engine: enum { pool, graph }) !void {
+fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !void {
     var config_path: ?[]const u8 = null;
     var cli_verbose = false;
     var i: usize = 0;
@@ -137,26 +133,14 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io, engi
         log_verbose.store(true, .release);
     }
 
-    // The source-port pools alone can exceed systemd's default 1024 soft cap.
+    // A socket per exchange in flight can exceed systemd's default 1024 soft cap.
     if (std.posix.getrlimit(.NOFILE)) |lim| {
         if (lim.cur < lim.max) std.posix.setrlimit(.NOFILE, .{ .cur = lim.max, .max = lim.max }) catch |err|
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    if (engine == .graph) {
-        defer cfg.deinit();
-        return hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
-            log.err("graph server error: {s}", .{@errorName(err)});
-            std.process.exit(1);
-        };
-    }
-
-    var server = Server.init(allocator, cfg, io) catch |err| {
-        log.err("initializing server: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-
-    server.run() catch |err| {
+    defer cfg.deinit();
+    hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
         log.err("server error: {s}", .{@errorName(err)});
         std.process.exit(1);
     };

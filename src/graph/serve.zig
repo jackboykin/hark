@@ -1,4 +1,4 @@
-//! The proof-of-concept server: one thread, one graph, the live edge.
+//! The server: one thread, one graph, the live edge.
 //! Every policy that is not a cell and not answer shaping lives here.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -416,7 +416,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     const sig = try server.setupSignalFd();
     defer sys.close(sig);
     try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
-    log.info("graph server listening on {d} address(es)", .{cfg.listen.len});
+    log.info("listening on {d} address(es)", .{cfg.listen.len});
     var stats_at = e.now_ns + stats_every;
     while (!s.stopping) {
         const ev = try e.next(e.now_ns + std.time.ns_per_s) orelse {
