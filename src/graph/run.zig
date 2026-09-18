@@ -14,6 +14,7 @@ pub const Report = struct {
     /// The failing step and why.
     step: u32 = 0,
     msg: []const u8 = "",
+    phase: enum { steps, warm } = .steps,
     /// The upstream query log, one `server <- qname qtype` per line,
     /// gpa-owned. Two runs of one seed must produce the same text.
     log: []const u8 = "",
@@ -50,16 +51,16 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         s.step = st.n;
         report.step = st.n;
         switch (st.kind) {
-            .query => last = try resolveClient(arena, &g, &s, scenario, st.entry.?) orelse {
+            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?) orelse {
                 report.msg = "client timed out";
                 return error.ScenarioFailed;
-            },
+            }).msg,
             .check_answer => {
                 const actual = last orelse {
                     report.msg = "CHECK_ANSWER before any QUERY";
                     return error.ScenarioFailed;
                 };
-                if (answerMismatch(actual, st.entry.?)) |why| {
+                if (answerMismatch(actual, st.entry.?, true)) |why| {
                     report.msg = why;
                     return error.ScenarioFailed;
                 }
@@ -87,11 +88,50 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
             .time_passes => s.advance(st.seconds),
         }
     }
+    report.phase = .warm;
+    try requery(arena, &g, &s, scenario, report);
 }
+
+/// Every checked question, re-asked against the settled graph, must answer
+/// the same and from memory alone unless the answer was never a fact (TTL
+/// 0). A cell that expired as it settled, or a memoised head that lost its
+/// chain, shows up as an upstream query or a different answer. The last
+/// check of a question is in force; TTLs have aged and are not compared.
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report) !void {
+    const steps = scenario.steps;
+    for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
+        if (query.kind != .query or check.kind != .check_answer) continue;
+        const q = query.entry.?.questions[0];
+        var superseded = false;
+        for (steps[i + 2 ..]) |st| if (st.kind == .query) {
+            const lq = st.entry.?.questions[0];
+            superseded = superseded or (lq.name.eql(q.name) and lq.qtype == q.qtype);
+        };
+        if (superseded) continue;
+        report.step = query.n;
+        const before = s.log.items.len;
+        const actual = try resolveClient(arena, g, s, scenario, query.entry.?) orelse {
+            report.msg = "client timed out";
+            return error.ScenarioFailed;
+        };
+        if (answerMismatch(actual.msg, check.entry.?, false)) |why| {
+            report.msg = why;
+            return error.ScenarioFailed;
+        }
+        if (s.log.items.len != before and actual.ttl > 0) {
+            report.msg = "went upstream";
+            return error.ScenarioFailed;
+        }
+    }
+}
+
+/// A reply and how long it stays one: the shortest TTL over the facts it
+/// was assembled from.
+const Answer = struct { msg: dns.Message, ttl: u32 };
 
 /// A client question: demand the RRset, follow aliases, shape the reply.
 /// Null when the client's timer fires first.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?dns.Message {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?Answer {
     const q = entry.questions[0];
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -99,6 +139,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     var seen: [17]dns.Name = undefined;
     var hops: usize = 0;
     var payer: ?graph.CellId = null;
+    var ttl: u32 = std.math.maxInt(u32);
     while (true) {
         const root = try g.demandRoot(name, q.qtype, payer);
         payer = g.cell(root).root;
@@ -108,6 +149,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
             try g.complete(ev.id, ev.completion);
         }
         var r = g.cell(root).value.rrset;
+        ttl = @min(ttl, r.ttl);
         const age: u32 = @intCast(@divTrunc(s.now_ns - r.stored_ns, std.time.ns_per_s));
         // A CNAME question is answered by the alias itself.
         if (r.kind == .alias and q.qtype != .cname) {
@@ -134,7 +176,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
             try appendAged(arena, &additionals, r.additionals, age);
         }
         try appendAged(arena, &chain, r.answers, age);
-        return .{
+        return .{ .ttl = ttl, .msg = .{
             .header = .{ .id = 0, .flags = .{
                 .qr = true,
                 .opcode = .query,
@@ -151,7 +193,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
             .answers = chain.items,
             .authorities = authorities.items,
             .additionals = additionals.items,
-        };
+        } };
     }
 }
 
@@ -177,9 +219,10 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []
 
 // ── CHECK_ANSWER ───────────────────────────────────────────────────────
 
-fn answerMismatch(actual: dns.Message, e: rpl.Entry) ?[]const u8 {
+fn answerMismatch(actual: dns.Message, e: rpl.Entry, compare_ttl: bool) ?[]const u8 {
     var m = e.match;
     if (m.isEmpty()) m.all = true;
+    m.ttl = m.ttl and compare_ttl;
     if (m.all) {
         m.rcode = true;
         m.flags = true;
@@ -345,7 +388,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
             }
             result catch |err| {
                 failed += 1;
-                std.debug.print("{s} (seed {d}): step {d}: {s} ({s})\n{s}", .{ ent.path, seed, first.step, first.msg, @errorName(err), first.log });
+                std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ ent.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
                 break;
             };
             var second: Report = .{};
