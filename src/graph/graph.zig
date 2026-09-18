@@ -14,6 +14,7 @@ const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const delegation = @import("../delegation.zig");
 const dnssec = @import("../dnssec.zig");
+const ns_rtt = @import("../ns_rtt.zig");
 const sim = @import("sim.zig");
 const trust = @import("trust.zig");
 
@@ -49,8 +50,8 @@ pub const Config = struct {
     addr_policy: delegation.AddrPolicy = .{},
     max_queries: u32 = 100,
     resolve_ms: u32 = 7000,
-    udp_timeout_ms: u32 = 1000,
-    tcp_timeout_ms: u32 = 2000,
+    /// The hedge stagger before a server has answered; 0: no hedge.
+    stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
@@ -147,8 +148,15 @@ pub const Budget = struct {
 
 const max_servers = delegation.max_servers_per_level;
 
-/// The sibling loop: one question to ns(zone), one server at a time.
-/// Shared by the cut probe and the rrset rule.
+const max_hedge = 3;
+
+const Attempt = struct { exchange: CellId, server: na.Address, transport: sim.Transport };
+
+/// The sibling loop: one question to ns(zone), one server after another,
+/// hedged: the next attempt starts early, a stagger after the last one,
+/// and each keeps its own timeout and records what it would alone. A
+/// usable reply ends the rest, which record nothing. Shared by the cut
+/// probe and the rrset rule.
 pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
     have_servers: bool = false,
@@ -159,16 +167,18 @@ pub const Ask = struct {
     tried: [max_servers]na.Address = undefined,
     ntried: u8 = 0,
     fetched_unglued: bool = false,
-    exchange: ?CellId = null,
-    server: na.Address = undefined,
-    transport: sim.Transport = .udp,
+    /// In flight, oldest first.
+    attempts: [max_hedge]Attempt = undefined,
+    nattempts: u8 = 0,
+    /// When the next attempt may start early.
+    hedge_at: i64 = 0,
     /// Best failing reply (`delegation.failurePrecedence`), served when
     /// every server fails with an rcode.
     held: ?dns.Message = null,
 
     const Result = union(enum) {
         pending,
-        reply: struct { msg: dns.Message, server: na.Address },
+        reply: dns.Message,
         /// No reply from anyone: no rcode to surface.
         exhausted,
     };
@@ -176,6 +186,13 @@ pub const Ask = struct {
     fn hasTried(a: *const Ask, server: na.Address) bool {
         for (a.tried[0..a.ntried]) |t| if (na.ipEqual(t, server)) return true;
         return false;
+    }
+
+    fn end(a: *Ask, i: u8) Attempt {
+        const at = a.attempts[i];
+        mem.copyForwards(Attempt, a.attempts[i .. a.nattempts - 1], a.attempts[i + 1 .. a.nattempts]);
+        a.nattempts -= 1;
+        return at;
     }
 
     fn reset(a: *Ask, zone: dns.Name) void {
@@ -195,6 +212,7 @@ pub const Ask = struct {
     /// A rank-0 reply (lame, recursor) leaves as bare SERVFAIL so the
     /// randomised server order cannot change what the stub sees.
     fn giveUp(a: *Ask) Result {
+        std.debug.assert(a.nattempts == 0);
         var msg = a.held orelse return .exhausted;
         if (delegation.failurePrecedence(msg.header.flags.rcode) == 0) {
             msg.header.flags.rcode = .server_failure;
@@ -202,7 +220,7 @@ pub const Ask = struct {
             msg.authorities = &.{};
             msg.additionals = &.{};
         }
-        return .{ .reply = .{ .msg = msg, .server = a.server } };
+        return .{ .reply = msg };
     }
 };
 
@@ -295,6 +313,8 @@ pub const Graph = struct {
     cells: std.ArrayList(*Cell) = .empty,
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
     ready: std.ArrayList(CellId) = .empty,
+    /// Per-server estimate; the one state outliving a demand.
+    rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
 
     pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: *sim.Sim) !Graph {
         var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge };
@@ -314,6 +334,7 @@ pub const Graph = struct {
         g.cells.deinit(g.gpa);
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
+        g.rtt.deinit(g.gpa);
     }
 
     pub fn now(g: *const Graph) i64 {
@@ -352,9 +373,14 @@ pub const Graph = struct {
     }
 
     pub fn complete(g: *Graph, id: CellId, completion: sim.Completion) !void {
+        if (completion == .wake) {
+            try g.ready.append(g.gpa, id);
+            return g.drain();
+        }
         const c = g.cell(id);
         const sc = c.scratch.exchange;
         const outcome: Outcome = switch (completion) {
+            .wake => unreachable,
             .timeout => .timeout,
             .reply => |bytes| blk: {
                 const msg = dns.parseMessage(g.arena, bytes) catch break :blk .mismatch;
@@ -582,11 +608,11 @@ pub const Graph = struct {
         switch (try g.ask(id, &g.cell(id).scratch.cut.ask, name, .a)) {
             .pending => return,
             .exhausted => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .failed = true } }, g.now()),
-            .reply => |r| {
+            .reply => |msg| {
                 const walk: delegation.Walk = .{ .name = "", .target = name, .zone = pc.zone };
-                switch (delegation.probeStep(r.msg, &walk, g.cfg.addr_policy)) {
+                switch (delegation.probeStep(msg, &walk, g.cfg.addr_policy)) {
                     .referral => |ref| {
-                        const expires = try g.absorbReferral(id, ref, r.msg, pc.zone);
+                        const expires = try g.absorbReferral(id, ref, msg, pc.zone);
                         try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1 } }, expires);
                     },
                     .nxdomain, .failed => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = true } }, g.now()),
@@ -596,8 +622,8 @@ pub const Graph = struct {
                         // fact. A positive answer is not: the parent may
                         // serve occluded data for a name it delegated
                         // (bailiwick/006).
-                        if (r.msg.header.flags.aa) {
-                            const reply = try g.classify(r.msg, pc.zone, name, .a);
+                        if (msg.header.flags.aa) {
+                            const reply = try g.classify(msg, pc.zone, name, .a);
                             _ = try g.publish(try g.keyFor(.rrset, name, .a), name, id, .{ .rrset = reply }, g.replyExpiry(reply));
                         }
                         try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns);
@@ -721,25 +747,25 @@ pub const Graph = struct {
             switch (try g.ask(id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
                 .pending => return,
                 .exhausted => return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id)),
-                .reply => |r| {
+                .reply => |msg| {
                     const zone = g.cell(id).scratch.rrset.ask.zone;
-                    if (delegation.extractReferral(r.msg, name, zone, g.cfg.addr_policy)) |ref| {
+                    if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
                         const s2 = &g.cell(id).scratch.rrset;
                         if (s2.delegations >= g.cfg.max_delegations)
                             return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
                         s2.delegations += 1;
-                        _ = try g.absorbReferral(id, ref, r.msg, zone);
+                        _ = try g.absorbReferral(id, ref, msg, zone);
                         // The parent's referral to the zone itself is its
                         // answer about the zone's DS (RFC 4035 §3.1.4.1).
                         if (qtype == .ds and ref.zone_cut.eql(name)) {
-                            const reply = try trust.referralDs(g, r.msg, zone, name);
+                            const reply = try trust.referralDs(g, msg, zone, name);
                             return g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
                         }
                         s2.ask.reset(ref.zone_cut);
                         s2.ask.seed(ref.addrs[0..ref.addr_count], g.edge.random());
                         continue;
                     }
-                    const reply = try g.classify(r.msg, zone, name, qtype);
+                    const reply = try g.classify(msg, zone, name, qtype);
                     try g.publishAlias(id, name, qtype, reply);
                     try g.publishDnames(id, reply);
                     return g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) g.failureExpiry(id) else g.replyExpiry(reply));
@@ -974,50 +1000,86 @@ pub const Graph = struct {
                 .none => return a.giveUp(),
                 .ready => {},
             };
-            if (a.exchange) |exid| {
-                const ex = g.cell(exid);
-                if (!ex.settled) return .pending;
-                a.exchange = null;
+            // An attempt ends on its own terms; a usable reply ends the
+            // rest, which record nothing.
+            var i: u8 = 0;
+            while (i < a.nattempts) {
+                const ex = g.cell(a.attempts[i].exchange);
+                if (!ex.settled) {
+                    i += 1;
+                    continue;
+                }
+                const at = a.end(i);
                 switch (ex.value.exchange) {
-                    .timeout, .mismatch => {},
-                    .budget => return a.giveUp(),
-                    .mangled => if (a.transport == .udp) {
-                        try g.sendTo(id, a, a.server, .tcp, qname, qtype);
-                        return .pending;
+                    .timeout => try g.observeTimeout(id, at.server),
+                    .mismatch => {},
+                    // Launch nothing more; what is in flight may still answer.
+                    .budget => {
+                        a.next = a.nservers;
+                        a.fetched_unglued = true;
+                    },
+                    .mangled => if (at.transport == .udp) {
+                        _ = try g.sendTo(id, a, at.server, .tcp, qname, qtype);
                     },
                     .reply => |r| {
+                        try g.observe(at.server, r.rtt_ns);
                         if (r.msg.header.flags.tc) {
                             // TC over TCP: a broken server, as good as a timeout.
-                            if (a.transport == .udp) {
-                                try g.sendTo(id, a, a.server, .tcp, qname, qtype);
-                                return .pending;
+                            if (at.transport == .udp) {
+                                _ = try g.sendTo(id, a, at.server, .tcp, qname, qtype);
                             }
                         } else if (!delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) {
-                            return .{ .reply = .{ .msg = r.msg, .server = a.server } };
+                            a.nattempts = 0;
+                            return .{ .reply = r.msg };
                         } else delegation.recordFailure(&a.held, r.msg);
                     },
                 }
             }
-            if (a.next < a.nservers) {
+            const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
+            if (a.next < a.nservers and (a.nattempts == 0 or early)) {
                 const server = a.servers[a.order[a.next]];
                 a.next += 1;
-                try g.sendTo(id, a, server, .udp, qname, qtype);
-                return .pending;
+                const state = try g.sendTo(id, a, server, .udp, qname, qtype);
+                a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
+                if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.edge.wake(id, a.hedge_at);
+                continue;
             }
+            if (a.nattempts > 0) return .pending;
             // Every known server tried: pay for the unglued names once.
             if (a.fetched_unglued or a.zone.labels.len == 0) return a.giveUp();
             a.have_servers = false;
         }
     }
 
-    fn sendTo(g: *Graph, id: CellId, a: *Ask, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType) !void {
-        a.server = server;
-        a.transport = transport;
+    /// One attempt on the estimate's timeout; only the last of all is uncapped.
+    fn sendTo(g: *Graph, id: CellId, a: *Ask, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType) !ns_rtt.RttState {
         if (!a.hasTried(server) and a.ntried < max_servers) {
             a.tried[a.ntried] = server;
             a.ntried += 1;
         }
-        a.exchange = try g.exchange(id, server, transport, qname, qtype);
+        const state = g.rtt.get(na.AddressKey.fromAddress(server)) orelse ns_rtt.RttState.unknown;
+        const timeout_ms = state.timeout(a.nattempts == 0 and a.next >= a.nservers, transport);
+        a.attempts[a.nattempts] = .{ .exchange = try g.exchange(id, server, transport, qname, qtype, timeout_ms), .server = server, .transport = transport };
+        a.nattempts += 1;
+        return state;
+    }
+
+    fn observe(g: *Graph, server: na.Address, rtt_ns: i64) !void {
+        const gop = try g.rtt.getOrPut(g.gpa, na.AddressKey.fromAddress(server));
+        if (!gop.found_existing) gop.value_ptr.* = .unknown;
+        gop.value_ptr.observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
+    }
+
+    /// A timeout the root's deadline cut short says nothing about the server.
+    fn observeTimeout(g: *Graph, by: CellId, server: na.Address) !void {
+        if (g.now() >= g.cell(g.cell(by).root).budget.deadline_ns) return;
+        const gop = try g.rtt.getOrPut(g.gpa, na.AddressKey.fromAddress(server));
+        if (!gop.found_existing) gop.value_ptr.* = .unknown;
+        _ = gop.value_ptr.observeTimeout(g.nowMs());
+    }
+
+    fn nowMs(g: *const Graph) i64 {
+        return @divTrunc(g.now(), std.time.ns_per_ms);
     }
 
     /// The server set for `a.zone`: hints at the root, else the addresses
@@ -1088,7 +1150,7 @@ pub const Graph = struct {
 
     /// One query to one server, charged to the root; `.budget` when the
     /// root's budget or deadline refuses it.
-    fn exchange(g: *Graph, by: CellId, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType) !CellId {
+    fn exchange(g: *Graph, by: CellId, server: na.Address, transport: sim.Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !CellId {
         const root = g.cell(g.cell(by).root);
         const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, g.cell(by).root, g.cell(by).depth);
         try g.addWaiter(id, by);
@@ -1103,10 +1165,6 @@ pub const Graph = struct {
         const msg = try dns.buildQuery(g.arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
         var wire_buf: [512]u8 = undefined;
         const wire = try g.arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
-        const timeout_ms: i64 = switch (transport) {
-            .udp => g.cfg.udp_timeout_ms,
-            .tcp => g.cfg.tcp_timeout_ms,
-        };
         g.cell(id).scratch = .{ .exchange = .{
             .id = qid,
             .sent_name = msg.questions[0].name,
@@ -1120,7 +1178,7 @@ pub const Graph = struct {
             .server = server,
             .transport = transport,
             .wire = wire,
-            .deadline_ns = @min(root.budget.deadline_ns, g.now() + timeout_ms * std.time.ns_per_ms),
+            .deadline_ns = @min(root.budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
         });
         return id;
     }

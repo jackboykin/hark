@@ -9,7 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sign = @import("sign.zig");
 
-pub const Transport = enum { udp, tcp };
+pub const Transport = @import("../ns_rtt.zig").Transport;
 
 pub const Exchange = struct {
     id: u32,
@@ -22,6 +22,8 @@ pub const Exchange = struct {
 pub const Completion = union(enum) {
     reply: []const u8,
     timeout,
+    /// The cell asked to run again at this time.
+    wake,
 };
 
 pub const LogRow = struct {
@@ -157,6 +159,10 @@ pub const Sim = struct {
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         return s.schedule(ex.id, at, .{ .reply = try s.arena.dupe(u8, wire) });
+    }
+
+    pub fn wake(s: *Sim, id: u32, at_ns: i64) !void {
+        return s.schedule(id, at_ns, .wake);
     }
 
     fn schedule(s: *Sim, id: u32, at_ns: i64, completion: Completion) !void {

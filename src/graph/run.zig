@@ -36,6 +36,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
         .addr_policy = .{ .allow_loopback = true },
+        .stagger_ms = scenario.stagger_ms orelse 150,
         .trust_anchor = s.signer.anchor(),
         .trace = opts.trace,
     }, &s);
@@ -469,4 +470,99 @@ test "lifted unbound walk scenarios settle to today's answers" {
     });
     try testing.expectEqual(18, r.ran);
     try testing.expectEqual(0, r.failed);
+}
+
+test "a silent sibling is hedged past and records nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // example.com has two servers: ns1 (127.0.10.3) listens nowhere, ns2
+    // answers. Cold, ns1 is given 400 ms; the hedge asks ns2 at 150.
+    var diag: rpl.Diag = .{};
+    const scenario = try rpl.parse(arena,
+        \\; hark: root-hints = 127.0.10.1
+        \\SCENARIO_BEGIN hedge
+        \\RANGE_BEGIN 0 100
+        \\  ADDRESS 127.0.10.1
+        \\  ENTRY_BEGIN
+        \\    MATCH opcode qname
+        \\    ADJUST copy_id copy_query
+        \\    REPLY QR NOERROR
+        \\    SECTION QUESTION
+        \\      com. IN A
+        \\    SECTION AUTHORITY
+        \\      com. 86400 IN NS a.gtld.fake.
+        \\    SECTION ADDITIONAL
+        \\      a.gtld.fake. 86400 IN A 127.0.10.2
+        \\  ENTRY_END
+        \\RANGE_END
+        \\RANGE_BEGIN 0 100
+        \\  ADDRESS 127.0.10.2
+        \\  ENTRY_BEGIN
+        \\    MATCH opcode qname
+        \\    ADJUST copy_id copy_query
+        \\    REPLY QR NOERROR
+        \\    SECTION QUESTION
+        \\      example.com. IN A
+        \\    SECTION AUTHORITY
+        \\      example.com. 86400 IN NS ns1.example.com.
+        \\      example.com. 86400 IN NS ns2.example.com.
+        \\    SECTION ADDITIONAL
+        \\      ns1.example.com. 86400 IN A 127.0.10.3
+        \\      ns2.example.com. 86400 IN A 127.0.10.4
+        \\  ENTRY_END
+        \\RANGE_END
+        \\RANGE_BEGIN 0 100
+        \\  ADDRESS 127.0.10.4
+        \\  ENTRY_BEGIN
+        \\    MATCH opcode qname qtype
+        \\    ADJUST copy_id copy_query
+        \\    REPLY QR AA NOERROR
+        \\    SECTION QUESTION
+        \\      www.example.com. IN A
+        \\    SECTION ANSWER
+        \\      www.example.com. 60 IN A 10.20.30.40
+        \\  ENTRY_END
+        \\RANGE_END
+        \\STEP 1 QUERY
+        \\ENTRY_BEGIN
+        \\  REPLY RD
+        \\  SECTION QUESTION
+        \\    www.example.com. IN A
+        \\ENTRY_END
+        \\SCENARIO_END
+    , &diag);
+    const q = scenario.steps[0].entry.?.questions[0];
+    const ns1 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 3 }, 53));
+    const ns2 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 4 }, 53));
+    var ns1_first_seen = false;
+    for (1..9) |seed| for ([_]u32{ 150, 0 }) |stagger| {
+        var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
+        defer s.deinit();
+        var g = try graph.Graph.init(arena, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, &s);
+        defer g.deinit();
+        const start = s.now_ns;
+        const root = try g.demandRoot(q.name, q.qtype);
+        try g.drain();
+        while (!g.cell(root).settled) {
+            const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
+            try g.complete(ev.id, ev.completion);
+        }
+        try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
+        try testing.expect(s.log.items[2].qname.eql(q.name));
+        const ns1_first = na.AddressKey.fromAddress(s.log.items[2].server).eql(ns1);
+        ns1_first_seen = ns1_first_seen or ns1_first;
+        try testing.expect(g.rtt.get(ns2) != null);
+        if (stagger > 0) {
+            // Walk (≤ 2 × 50 ms), the stagger, then ns2 (≤ 50 ms).
+            try testing.expect(took_ms < 400);
+            if (ns1_first) try testing.expect(took_ms >= 150);
+            try testing.expect(g.rtt.get(ns1) == null);
+        } else if (ns1_first) {
+            try testing.expect(took_ms >= 400);
+            try testing.expectEqual(1, g.rtt.get(ns1).?.consecutive_timeouts);
+        }
+    };
+    try testing.expect(ns1_first_seen);
 }
