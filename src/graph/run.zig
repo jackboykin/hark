@@ -142,12 +142,13 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     if (q.qtype == .any) return try serve.hinfo(arena, q, client);
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const root = try g.demandRoot(q.name, q.qtype);
+    const cached = g.cell(root).settled;
     try g.drain();
     while (!g.cell(root).settled) {
         const ev = s.next(client_deadline) orelse return null;
         try g.complete(ev.id, ev.completion);
     }
-    return try serve.answer(arena, g, root, q, client, scenario.minimal_responses orelse true);
+    return try serve.answer(arena, g, root, q, client, scenario.minimal_responses orelse true, cached);
 }
 
 fn printSections(m: dns.Message) void {

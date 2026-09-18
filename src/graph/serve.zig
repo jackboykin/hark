@@ -8,7 +8,7 @@ pub const Client = struct { rd: bool = true, cd: bool = false, do_bit: bool = fa
 
 /// A reply, and whether it is a fact past this instant (TTL 0 is served
 /// but never memoised).
-pub const Served = struct { msg: dns.Message, cacheable: bool };
+pub const Served = struct { msg: dns.Message, cacheable: bool, ede: ?dns.Ede = null };
 
 /// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
 pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
@@ -20,12 +20,10 @@ pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
     } };
 }
 
-/// The settled answer cell `root`, its chain aged to now and shaped for
-/// the client. A bogus chain is SERVFAIL unless CD; a verified hop's TTLs
-/// are bounded by its proof's remaining validity; signatures only to a DO
-/// client; AD claims the whole chain, set only when asked for (RFC 6840
-/// §5.7).
-pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
+/// The answer cell shaped for a client: bogus is SERVFAIL unless CD, a
+/// verified hop's TTLs end with its proof, signatures only to DO, AD only
+/// when asked (RFC 6840 §5.7). `cached`: settled before the question came.
+pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool, cached: bool) !Served {
     const a = g.cell(root).value.answer;
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
     var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
@@ -49,7 +47,15 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
         try appendAged(arena, &authorities, last.authorities, age, life, c.do_bit);
         try appendAged(arena, &additionals, last.additionals, age, life, c.do_bit);
     }
-    return .{ .cacheable = g.cell(root).expires_ns > g.now(), .msg = .{
+    const ede: ?dns.Ede = if (a.broken)
+        .{ .code = .other, .text = "cname loop" }
+    else if (!served)
+        .{ .code = .dnssec_bogus }
+    else if (last.kind == .servfail)
+        .{ .code = if (cached) .cached_error else last.ede orelse .no_reachable_authority }
+    else
+        null;
+    return .{ .cacheable = g.cell(root).expires_ns > g.now(), .ede = ede, .msg = .{
         .header = .{ .id = 0, .flags = .{
             .qr = true,
             .opcode = .query,
@@ -79,3 +85,4 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []
         try out.append(arena, aged);
     }
 }
+
