@@ -19,6 +19,7 @@ const Exchange = graph.Exchange;
 const Edge = @This();
 
 pub const Event = union(enum) {
+    /// Reply bytes are the consumer's to free.
     exchange: struct { id: CellId, completion: Completion },
     client: struct { token: u32, events: u32 },
 };
@@ -52,8 +53,6 @@ const Tcp = struct {
 /// Tells a token from a cell id.
 const client_tag: u64 = 1 << 32;
 
-/// Reply bytes live here as long as the cells that parse them.
-arena: Allocator,
 gpa: Allocator,
 epfd: posix.fd_t,
 now_ns: i64 = 0,
@@ -64,10 +63,10 @@ flights: std.AutoHashMapUnmanaged(CellId, Flight) = .empty,
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
 
-pub fn init(arena: Allocator, gpa: Allocator) !Edge {
+pub fn init(gpa: Allocator) !Edge {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
     if (linux.errno(rc) != .SUCCESS) return error.EpollCreateFailed;
-    var e: Edge = .{ .arena = arena, .gpa = gpa, .epfd = @intCast(rc) };
+    var e: Edge = .{ .gpa = gpa, .epfd = @intCast(rc) };
     e.tick();
     return e;
 }
@@ -224,7 +223,7 @@ fn ready(e: *Edge, ev: linux.epoll_event) !void {
     var buf: [dns.max_message_len]u8 = undefined;
     const rc = linux.recvfrom(f.fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
     switch (linux.errno(rc)) {
-        .SUCCESS => try e.finish(id, .{ .reply = try e.arena.dupe(u8, buf[0..rc]) }),
+        .SUCCESS => try e.finish(id, .{ .reply = try e.gpa.dupe(u8, buf[0..rc]) }),
         .AGAIN, .INTR => {},
         // ICMP unreachable and kin: nobody there.
         else => try e.finish(id, .timeout),
@@ -253,5 +252,5 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !void {
     }
     if (t.got < 2) return;
     const len = mem.readInt(u16, t.reply[0..2], .big);
-    if (t.got >= 2 + @as(usize, len)) try e.finish(id, .{ .reply = try e.arena.dupe(u8, t.reply[2..][0..len]) });
+    if (t.got >= 2 + @as(usize, len)) try e.finish(id, .{ .reply = try e.gpa.dupe(u8, t.reply[2..][0..len]) });
 }

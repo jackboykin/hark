@@ -346,13 +346,10 @@ const Server = struct {
 };
 
 pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var e = try Edge.init(arena, gpa);
+    var e = try Edge.init(gpa);
     defer e.deinit();
     const anchors = cfg.trustAnchors();
-    var g = try graph.Graph.init(arena, gpa, .{
+    var g = try graph.Graph.init(gpa, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),
         .addr_policy = .{ .upstream_port = cfg.upstream_port, .allow_loopback = cfg.allow_loopback_upstreams },
@@ -371,7 +368,10 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             continue;
         };
         switch (ev) {
-            .exchange => |x| try g.complete(x.id, x.completion),
+            .exchange => |x| {
+                defer if (x.completion == .reply) gpa.free(x.completion.reply);
+                try g.complete(x.id, x.completion);
+            },
             .client => |c| try s.onClient(c.token, c.events),
         }
         try s.settle();

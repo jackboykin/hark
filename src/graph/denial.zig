@@ -147,8 +147,8 @@ fn minimal(rr: RR) bool {
 /// rollover's ceiling (RFC 6781 §4.1.4).
 fn withSigs(g: *Graph, rrs: []const RR, rr: RR) ![]const RR {
     var keep: std.ArrayList(RR) = .empty;
-    try keep.append(g.arena, rr);
-    for (rrs) |s| if (keep.items.len <= 4 and s.rtype == .rrsig and s.name.eql(rr.name) and s.rdata.rrsig.type_covered == rr.rtype) try keep.append(g.arena, s);
+    try keep.append(g.scratch.allocator(), rr);
+    for (rrs) |s| if (keep.items.len <= 4 and s.rtype == .rrsig and s.name.eql(rr.name) and s.rdata.rrsig.type_covered == rr.rtype) try keep.append(g.scratch.allocator(), s);
     return keep.items;
 }
 
@@ -224,7 +224,6 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     const key = try g.keyFor(.secure, name, qtype);
     const sid = try g.newCell(key, name, g.cell(id).root, g.cell(id).depth);
     g.cell(sid).scratch.secure.target = id;
-    try g.index.put(g.gpa, key, sid);
     try g.settle(sid, .{ .secure = .{ .status = .secure, .proven_until_ns = expires } }, expires);
     return true;
 }
@@ -235,6 +234,6 @@ fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !vo
     for (rrs) |rr| {
         var a = rr;
         a.ttl = rr.ttl -| age;
-        try out.append(g.arena, a);
+        try out.append(g.scratch.allocator(), a);
     }
 }

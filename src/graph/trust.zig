@@ -56,7 +56,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const anchor = g.cfg.trust_anchor orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
     if (zone.labels.len == 0) {
         const rr: RR = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = anchor } };
-        return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.arena.dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
+        return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.scratch.allocator().dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
     }
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
@@ -130,7 +130,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const r = rs.value.rrset;
     if (r.kind != .answer) return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
     var ds_data: std.ArrayList(dns.DsData) = .empty;
-    for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.arena, rr.rdata.ds);
+    for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
     var budget: dnssec.ValidationBudget = .{};
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -152,7 +152,6 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     };
     const sid = try g.newCell(key, t.name, g.cell(by).root, g.cell(by).depth);
     g.cell(sid).scratch.secure.target = rid;
-    try g.index.put(g.gpa, key, sid);
     if (t.blob) |b| if (b.verdict.until_ns > g.now()) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
@@ -234,7 +233,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 defer groups += 1;
                 defer prev_dname = if (rr.rtype == .dname) rr else null;
                 if (synthesisedUnder(rr, prev_dname)) {
-                    const target = try dns.substituteSuffix(g.arena, rr.name, prev_dname.?.name, prev_dname.?.rdata.dname) orelse return settleSecure(g, id, .bogus);
+                    const target = try dns.substituteSuffix(g.scratch.allocator(), rr.name, prev_dname.?.name, prev_dname.?.rdata.dname) orelse return settleSecure(g, id, .bogus);
                     if (!target.eql(rr.rdata.cname)) return settleSecure(g, id, .bogus);
                     continue;
                 }
@@ -308,7 +307,7 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     var keep: std.ArrayList(RR) = .empty;
     var ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.name.eql(child) and (rr.rtype == .ds or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds))) {
-        try keep.append(g.arena, rr);
+        try keep.append(g.scratch.allocator(), rr);
         if (rr.rtype == .ds) ttl = @min(ttl, rr.ttl);
     };
     if (keep.items.len > 0) return .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };

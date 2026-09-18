@@ -375,16 +375,19 @@ pub const Cell = struct {
     budget: Budget = .{},
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
+    /// Everything the cell owns; freed with it.
+    arena: std.heap.ArenaAllocator,
 };
 
 // ── Graph ──────────────────────────────────────────────────────────────
 
 pub const Graph = struct {
-    arena: Allocator,
     gpa: Allocator,
     cfg: Config,
     edge: Edge,
-    /// Cells live in the arena so rule-held pointers survive appends.
+    /// One run's transients, reset at every run.
+    scratch: std.heap.ArenaAllocator,
+    /// Heap cells: rule-held pointers survive appends.
     cells: std.ArrayList(*Cell) = .empty,
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
     ready: std.ArrayList(CellId) = .empty,
@@ -395,17 +398,15 @@ pub const Graph = struct {
     denial: denial.Index = .{},
     store: store.Store,
 
-    pub fn init(arena: Allocator, gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .arena = arena, .gpa = gpa, .cfg = cfg, .edge = edge, .store = try store.Store.init(gpa) };
-        errdefer g.store.deinit();
+    pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
+        var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa) };
+        errdefer g.deinit();
         // The root cut and NS set are axiomatic.
         const root: dns.Name = .{ .labels = &.{} };
         const cut = try g.newCell(.{ .kind = .cut, .name = "" }, root, 0, 0);
         try g.settle(cut, .{ .cut = .{ .zone = root } }, std.math.maxInt(i64));
-        try g.index.put(gpa, g.cell(cut).key, cut);
         const ns = try g.newCell(.{ .kind = .ns, .name = "" }, root, 0, 0);
         try g.settle(ns, .{ .ns = .{ .names = &.{} } }, std.math.maxInt(i64));
-        try g.index.put(gpa, g.cell(ns).key, ns);
         return g;
     }
 
@@ -413,8 +414,11 @@ pub const Graph = struct {
         for (g.cells.items) |c| {
             c.waiters.deinit(g.gpa);
             if (c.blob) |b| g.store.unref(b);
+            c.arena.deinit();
+            g.gpa.destroy(c);
         }
         g.cells.deinit(g.gpa);
+        g.scratch.deinit();
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
@@ -437,7 +441,7 @@ pub const Graph = struct {
 
     pub fn keyFor(g: *Graph, kind: Kind, name: dns.Name, rtype: dns.RType) !Key {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        return .{ .kind = kind, .rtype = rtype, .name = try g.arena.dupe(u8, name.formatLower(&buf)) };
+        return .{ .kind = kind, .rtype = rtype, .name = try g.scratch.allocator().dupe(u8, name.formatLower(&buf)) };
     }
 
     /// A client question: memoised if fresh or in progress, else a new
@@ -445,11 +449,8 @@ pub const Graph = struct {
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType) !CellId {
         const key = try g.keyFor(.answer, name, qtype);
         if (try g.lookup(key, name)) |id| return id;
-        const id: CellId = @intCast(g.cells.items.len);
-        // The question outlives the client's bytes.
-        _ = try g.newCell(key, try dns.cloneNameFlat(g.arena, name, false), id, 0);
+        const id = try g.newCell(key, name, @intCast(g.cells.items.len), 0);
         g.cell(id).budget = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
-        try g.index.put(g.gpa, key, id);
         try g.ready.append(g.gpa, id);
         return id;
     }
@@ -465,14 +466,16 @@ pub const Graph = struct {
         }
         const c = g.cell(id);
         const sc = c.scratch.exchange;
+        const arena = c.arena.allocator();
         const outcome: Outcome = switch (completion) {
             .wake => unreachable,
             .timeout => .timeout,
-            .reply => |bytes| blk: {
+            .reply => |borrowed| blk: {
                 const clock = Tally.clock(&g.tally.parse_ns);
                 defer clock.stop();
                 g.tally.parses += 1;
-                const msg = dns.parseMessage(g.arena, bytes) catch break :blk .mismatch;
+                const bytes = try arena.dupe(u8, borrowed);
+                const msg = dns.parseMessage(arena, bytes) catch break :blk .mismatch;
                 if (msg.header.id != sc.id or !msg.header.flags.qr) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent_name, sc.qtype) catch break :blk .mismatch;
                 switch (dns.checkEcho(msg, sc.sent_name, sc.qtype)) {
@@ -483,8 +486,8 @@ pub const Graph = struct {
                 // 0x20 case checked; every name is a lowercase fact from here.
                 inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
                     for (@constCast(section)) |*rr| {
-                        rr.name = try dns.cloneNameLower(g.arena, rr.name);
-                        try dns.lowercaseRDataNames(g.arena, &rr.rdata);
+                        rr.name = try dns.cloneNameLower(arena, rr.name);
+                        try dns.lowercaseRDataNames(arena, &rr.rdata);
                     }
                 }
                 break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
@@ -511,14 +514,20 @@ pub const Graph = struct {
 
     // ── Cells ──────────────────────────────────────────────────────────
 
+    /// A cell over its own copies of `key` and `name`, indexed under the
+    /// key unless it is an exchange.
     pub fn newCell(g: *Graph, key: Key, name: dns.Name, root: CellId, depth: u8) !CellId {
         const id: CellId = @intCast(g.cells.items.len);
-        const c = try g.arena.create(Cell);
+        const c = try g.gpa.create(Cell);
+        errdefer g.gpa.destroy(c);
+        var arena = std.heap.ArenaAllocator.init(g.gpa);
+        errdefer arena.deinit();
         c.* = .{
-            .key = key,
-            .name = name,
+            .key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) },
+            .name = try dns.cloneNameFlat(arena.allocator(), name, false),
             .root = root,
             .depth = depth,
+            .arena = arena,
             .scratch = switch (key.kind) {
                 .cut => .{ .cut = .{} },
                 .ns => .{ .ns = .{} },
@@ -532,6 +541,7 @@ pub const Graph = struct {
             },
         };
         try g.cells.append(g.gpa, c);
+        if (key.kind != .exchange) try g.index.put(g.gpa, c.key, id);
         return id;
     }
 
@@ -557,7 +567,7 @@ pub const Graph = struct {
                 defer clock.stop();
                 const blob = try g.store.build(value);
                 c.blob = blob;
-                c.value = try store.Store.parse(g.arena, blob);
+                c.value = try store.Store.parse(c.arena.allocator(), blob);
                 if (expires_ns > g.now()) try g.store.put(c.key, blob.ref(), expires_ns);
             },
             .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
@@ -584,9 +594,8 @@ pub const Graph = struct {
             const c = g.cell(id);
             c.settled = true;
             c.blob = e.blob.ref();
-            c.value = try store.Store.parse(g.arena, e.blob);
+            c.value = try store.Store.parse(c.arena.allocator(), e.blob);
             c.expires_ns = e.expires_ns;
-            try g.index.put(g.gpa, key, id);
             return id;
         }
         if (live) |id| if (g.cell(id).expires_ns > g.now()) return id;
@@ -612,7 +621,6 @@ pub const Graph = struct {
             return id;
         }
         const id = try g.newCell(key, name, g.cell(by).root, depth);
-        try g.index.put(g.gpa, key, id);
         try g.ready.append(g.gpa, id);
         try g.addWaiter(id, by);
         return id;
@@ -655,7 +663,6 @@ pub const Graph = struct {
             }
         }
         const id = try g.newCell(key, name, g.cell(by).root, g.cell(by).depth);
-        try g.index.put(g.gpa, key, id);
         try g.settle(id, value, expires_ns);
         return id;
     }
@@ -664,6 +671,7 @@ pub const Graph = struct {
 
     fn run(g: *Graph, id: CellId) !void {
         if (g.cell(id).settled) return;
+        _ = g.scratch.reset(.retain_capacity);
         g.tally.runs += 1;
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
@@ -703,7 +711,7 @@ pub const Graph = struct {
                 next = r.target;
                 var broken = s.n > max_cname_chain;
                 for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
-                if (broken) return g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.failureExpiry(id));
+                if (broken) return g.settle(id, .{ .answer = .{ .hops = try g.cell(id).arena.allocator().dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.failureExpiry(id));
             }
             // Nothing waits on an answer cell, so its demands cannot cycle.
             s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse unreachable;
@@ -723,7 +731,8 @@ pub const Graph = struct {
             }
             if (status == .bogus) expires = g.failureExpiry(id);
         }
-        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try g.arena.dupe(CellId, s.judged[0..s.nj]) } }, expires);
+        const arena = g.cell(id).arena.allocator();
+        try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try arena.dupe(CellId, s.judged[0..s.nj]) } }, expires);
     }
 
     /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
@@ -810,8 +819,8 @@ pub const Graph = struct {
         const s = &g.cell(id).scratch.addr;
         if (s.host == null) {
             s.host = g.cell(id).name;
-            if (try g.lookup(try g.keyFor(.rrset, s.host.?, .cname), s.host.?)) |cid| if (g.fresh(cid) and g.cell(cid).value.rrset.kind == .alias) {
-                s.host = g.cell(cid).value.rrset.target;
+            if (try g.peek(try g.keyFor(.rrset, s.host.?, .cname), s.host.?)) |cname| if (cname.value.rrset.kind == .alias) {
+                s.host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), cname.value.rrset.target, false);
                 s.hopped = true;
             };
         }
@@ -853,7 +862,7 @@ pub const Graph = struct {
                     for (r.answers) |rr| {
                         if (rr.rtype != rtype or !rr.name.eql(host)) continue;
                         if (g.cfg.addr_policy.address(rr)) |a| {
-                            try addrs.append(g.arena, a);
+                            try addrs.append(g.scratch.allocator(), a);
                             n += 1;
                         }
                     }
@@ -864,7 +873,7 @@ pub const Graph = struct {
         if (pending) return;
         if (addrs.items.len == 0) {
             if (alias) |target| if (!s.hopped) {
-                s.* = .{ .host = target, .hopped = true };
+                s.* = .{ .host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), target, false), .hopped = true };
                 return g.runAddr(id);
             };
             expires = if (denied == std.math.maxInt(i64)) g.now() else denied;
@@ -965,7 +974,7 @@ pub const Graph = struct {
         for (reply.answers) |d| {
             if (d.rtype != .dname) continue;
             var keep: std.ArrayList(dns.ResourceRecord) = .empty;
-            try keep.append(g.arena, d);
+            try keep.append(g.scratch.allocator(), d);
             try keepSigs(g, &keep, reply.answers, d.name, .dname);
             const fact: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
             _ = try g.publish(try g.keyFor(.rrset, d.name, .dname), d.name, by, .{ .rrset = fact }, g.replyExpiry(fact));
@@ -991,9 +1000,9 @@ pub const Graph = struct {
             if (rr.rtype == .dname) break rr;
         } else unreachable;
         var keep: std.ArrayList(dns.ResourceRecord) = .empty;
-        try keep.appendSlice(g.arena, d.answers);
-        if (try dns.substituteSuffix(g.arena, name, dname.name, dname.rdata.dname)) |target| {
-            try keep.append(g.arena, .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
+        try keep.appendSlice(g.scratch.allocator(), d.answers);
+        if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.rdata.dname)) |target| {
+            try keep.append(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
             return .{ .kind = .alias, .rcode = .no_error, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
         }
         // RFC 6672 §3.3: the substituted name is too long; YXDOMAIN.
@@ -1018,7 +1027,7 @@ pub const Graph = struct {
             ns_ttl = @min(ns_ttl, rr.ttl);
         };
         const expires = g.now() + @as(i64, ns_ttl) * std.time.ns_per_s;
-        const names = try g.arena.dupe(dns.Name, ref.nsNames());
+        const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
         _ = try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), ref.zone_cut, by, .{ .cut = .{ .zone = ref.zone_cut } }, expires);
         _ = try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), ref.zone_cut, by, .{ .ns = .{ .names = names } }, expires);
         // The parent's word on the child's DS travels with the referral.
@@ -1033,7 +1042,7 @@ pub const Graph = struct {
             for (msg.additionals) |rr| {
                 if (!rr.name.eql(host) or (rr.rtype != .a and rr.rtype != .aaaa)) continue;
                 const a = g.cfg.addr_policy.address(rr) orelse continue;
-                try addrs.append(g.arena, a);
+                try addrs.append(g.scratch.allocator(), a);
                 ttl = @min(ttl, rr.ttl);
             }
             if (addrs.items.len == 0) continue;
@@ -1063,7 +1072,7 @@ pub const Graph = struct {
             seen[hops] = cur;
             for (msg.answers) |rr| {
                 if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and (rr.rtype == qtype or qtype == .any)) {
-                    try keep.append(g.arena, rr);
+                    try keep.append(g.scratch.allocator(), rr);
                     answered = true;
                 }
             }
@@ -1084,15 +1093,15 @@ pub const Graph = struct {
                 if (dname == null or rr.name.labels.len > dname.?.name.labels.len) dname = rr;
             }
             if (dname) |d| {
-                try keep.append(g.arena, d);
+                try keep.append(g.scratch.allocator(), d);
                 try keepSigs(g, &keep, msg.answers, d.name, .dname);
                 if (cname == null) {
-                    const target = try dns.substituteSuffix(g.arena, cur, d.name, d.rdata.dname) orelse break;
+                    const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse break;
                     cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
                 }
             }
             const c = cname orelse break;
-            try keep.append(g.arena, c);
+            try keep.append(g.scratch.allocator(), c);
             try keepSigs(g, &keep, msg.answers, cur, .cname);
             cur = c.rdata.cname;
         }
@@ -1123,7 +1132,7 @@ pub const Graph = struct {
     }
 
     fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
-        for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.arena, rr);
+        for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
     }
 
     /// The answer's shortest TTL; for an authoritative denial, min of the
@@ -1340,9 +1349,10 @@ pub const Graph = struct {
         const rng = g.edge.rng;
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const qid = rng.int(u16);
-        const msg = try dns.buildQuery(g.arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
+        const arena = g.cell(id).arena.allocator();
+        const msg = try dns.buildQuery(arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
         var wire_buf: [512]u8 = undefined;
-        const wire = try g.arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
+        const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         g.cell(id).scratch = .{ .exchange = .{
             .id = qid,
             .sent_name = msg.questions[0].name,

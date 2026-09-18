@@ -35,7 +35,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 
     var s = try sim.Sim.init(arena, gpa, scenario, opts.seed);
     defer s.deinit();
-    var g = try graph.Graph.init(arena, gpa, .{
+    var g = try graph.Graph.init(gpa, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
         .addr_policy = .{ .allow_loopback = true },
@@ -515,7 +515,7 @@ test "a silent sibling is hedged past and still records its timeout" {
     for (1..9) |seed| for ([_]u32{ 150, 0 }) |stagger| {
         var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
         defer s.deinit();
-        var g = try graph.Graph.init(arena, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
+        var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
         defer g.deinit();
         const start = s.now_ns;
         const root = try g.demandRoot(q.name, q.qtype);
@@ -543,7 +543,7 @@ test "a silent sibling is hedged past and still records its timeout" {
     for (1..9) |seed| for ([_]bool{ false, true }) |all_dead| {
         var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
         defer s.deinit();
-        var g = try graph.Graph.init(arena, testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
+        var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
         defer g.deinit();
         const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
