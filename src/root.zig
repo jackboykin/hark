@@ -26,6 +26,9 @@ pub const acl = @import("acl.zig");
 pub const rebinding = @import("rebinding.zig");
 pub const dns64 = @import("dns64.zig");
 pub const response = @import("response.zig");
+pub const graph = struct {
+    pub const rpl = @import("graph/rpl.zig");
+};
 
 /// This module's own optimize mode. The bench harness is pinned to ReleaseFast
 /// so the instrument stays constant while `-Doptimize` varies the subject, which
@@ -58,6 +61,7 @@ test {
     _ = @import("nsec_cache.zig");
     _ = @import("counting_allocator.zig");
     _ = @import("bg_group.zig");
+    _ = @import("graph/rpl.zig");
     _ = @import("blocking_transport.zig");
     _ = @import("rand.zig");
     _ = @import("monotonic.zig");
