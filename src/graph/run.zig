@@ -9,6 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
 const graph = @import("graph.zig");
+const serve = @import("serve.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -134,23 +135,11 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
     }
 }
 
-/// A reply, and whether it is a fact past this instant (TTL 0 is served
-/// but never memoised).
-const Served = struct { msg: dns.Message, cacheable: bool };
-
-/// Demand the answer, wait for it, age and shape it. Null when the
-/// client's timer fires first.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?Served {
+/// Null when the client's timer fires first.
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?serve.Served {
     const q = entry.questions[0];
-    // RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
-    if (q.qtype == .any) {
-        const hinfo: dns.ResourceRecord = .{ .name = q.name, .rtype = @fromBackingInt(13), .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } };
-        return .{ .cacheable = false, .msg = .{
-            .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = entry.flags.rd, .ra = true, .z = 0, .ad = false, .cd = entry.flags.cd, .rcode = .no_error } },
-            .questions = try arena.dupe(dns.Question, &.{q}),
-            .answers = try arena.dupe(dns.ResourceRecord, &.{hinfo}),
-        } };
-    }
+    const client: serve.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
+    if (q.qtype == .any) return try serve.hinfo(arena, q, client);
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const root = try g.demandRoot(q.name, q.qtype);
     try g.drain();
@@ -158,44 +147,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         const ev = s.next(client_deadline) orelse return null;
         try g.complete(ev.id, ev.completion);
     }
-    const a = g.cell(root).value.answer;
-    var chain: std.ArrayList(dns.ResourceRecord) = .empty;
-    var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
-    var age: u32 = 0;
-    // A bogus chain is SERVFAIL unless CD; signatures only to a DO client;
-    // AD claims the whole chain, set only when asked for (RFC 6840 §5.7).
-    const served = !a.broken and (a.status != .bogus or entry.flags.cd);
-    if (served) for (a.hops) |h| {
-        last = g.cell(h).value.rrset;
-        age = @intCast(@divTrunc(s.now_ns - last.stored_ns, std.time.ns_per_s));
-        try appendAged(arena, &chain, last.answers, age, entry.do_bit);
-    };
-    const positive = last.kind == .answer or last.kind == .alias;
-    const minimal = scenario.minimal_responses orelse true;
-    var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
-    var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
-    if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, last.authorities, age, entry.do_bit);
-        try appendAged(arena, &additionals, last.additionals, age, entry.do_bit);
-    }
-    return .{ .cacheable = g.cell(root).expires_ns > s.now_ns, .msg = .{
-        .header = .{ .id = 0, .flags = .{
-            .qr = true,
-            .opcode = .query,
-            .aa = false,
-            .tc = false,
-            .rd = entry.flags.rd,
-            .ra = true,
-            .z = 0,
-            .ad = served and a.status == .secure and (entry.do_bit or entry.flags.ad),
-            .cd = entry.flags.cd,
-            .rcode = if (last.kind == .servfail) last.rcode else if (last.kind == .nxdomain) .name_error else .no_error,
-        } },
-        .questions = try arena.dupe(dns.Question, &.{q}),
-        .answers = chain.items,
-        .authorities = authorities.items,
-        .additionals = additionals.items,
-    } };
+    return try serve.answer(arena, g, root, q, client, scenario.minimal_responses orelse true);
 }
 
 fn printSections(m: dns.Message) void {
@@ -215,17 +167,6 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
         try out.print(gpa, "    {s} <- {s} {t}\n", .{ na.format(row.server, &ab), row.qname.formatInto(&nb), row.qtype });
     }
     return out.toOwnedSlice(gpa);
-}
-
-/// TTLs less the time since the reply was taken; signatures only when
-/// wanted.
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, sigs: bool) !void {
-    for (rrs) |rr| {
-        if (rr.rtype == .rrsig and !sigs) continue;
-        var aged = rr;
-        aged.ttl = rr.ttl -| age;
-        try out.append(arena, aged);
-    }
 }
 
 // ── CHECK_ANSWER ───────────────────────────────────────────────────────
