@@ -1,0 +1,116 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a parent's AA answer for a name it delegated away is not the answer
+
+; The example. server has an occluded A at sub.example. and a delegation
+; for it. The qmin probe for sub.example. A gets the occluded answer (AA,
+; no referral); the walk for www.sub.example. then gets the referral and
+; the child's answer. A later question for sub.example. A itself must go
+; to the child, not be served the parent's occluded record from the probe.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sub.example. IN A
+    SECTION ANSWER
+      sub.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.example. IN A
+    SECTION AUTHORITY
+      sub.example. 86400 IN NS ns.sub.example.
+    SECTION ADDITIONAL
+      ns.sub.example. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example. IN A
+    SECTION ANSWER
+      www.sub.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sub.example. IN A
+    SECTION ANSWER
+      sub.example. 3600 IN A 192.0.2.3
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.sub.example. IN A
+  SECTION ANSWER
+    www.sub.example. 3600 IN A 192.0.2.10
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    sub.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    sub.example. IN A
+  SECTION ANSWER
+    sub.example. 3600 IN A 192.0.2.3
+ENTRY_END
+
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    sub.example. A 127.0.10.2
+    www.sub.example. A 127.0.10.2
+    www.sub.example. A 127.0.10.3
+    sub.example. A 127.0.10.3
+ENTRY_END
+
+SCENARIO_END

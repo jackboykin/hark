@@ -424,8 +424,8 @@ pub const Graph = struct {
         return false;
     }
 
-    /// A settled version that ran no rule: evidence from a referral, or a
-    /// probe reply that is also an answer.
+    /// A settled version that ran no rule: evidence from a referral, or an
+    /// authoritative denial at a probe name.
     fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !CellId {
         if (g.index.get(key)) |id| {
             const c = g.cell(id);
@@ -495,9 +495,12 @@ pub const Graph = struct {
                         try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1 } }, expires);
                     },
                     .nxdomain, .failed => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = true } }, g.now()),
-                    .nodata, .answered => {
-                        // An authoritative probe reply is the answer for
-                        // (name, A) from a server in ns(zone).
+                    .answered => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns),
+                    .nodata => {
+                        // An authoritative denial at the probe name is a
+                        // fact. A positive answer is not: the parent may
+                        // serve occluded data for a name it delegated
+                        // (bailiwick/006).
                         if (r.msg.header.flags.aa) {
                             const reply = try g.classify(r.msg, pc.zone, name, .a);
                             _ = try g.publish(try g.keyFor(.rrset, name, .a), name, id, .{ .rrset = reply }, g.replyExpiry(reply));

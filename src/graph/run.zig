@@ -362,7 +362,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(43, r.ran);
+    try testing.expectEqual(44, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
