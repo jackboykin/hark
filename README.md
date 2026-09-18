@@ -3,10 +3,8 @@
 hark is a modern recursive resolver.
 
 Distinctive features:
-- Opportunistic encryption to authoritative servers (TLS)
 - Post-quantum DNSSEC with downgrade refusal (ML-DSA-44)
 - One-shot TCP for zones signed with large algorithms
-- Thompson sampling nameserver selection
 - Hedged queries across nameservers
 
 ## Building

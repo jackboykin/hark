@@ -138,8 +138,6 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.minimal_responses = scenario.minimal_responses
     if scenario.stagger_ms is not None:
         cfg.stagger_ms = scenario.stagger_ms
-    if scenario.workers is not None:
-        cfg.workers = scenario.workers
     if scenario.dns64_prefix is not None:
         cfg.dns64_prefix = scenario.dns64_prefix
     if scenario.serve_stale_ttl is not None:

@@ -24,11 +24,6 @@ class HarkConfig:
     listen_port: int = 5354
     upstream_port: int = 5353
     root_hints: list[str] = dataclasses.field(default_factory=list)
-    workers: int = 1
-    # `HARK_EVENT_LOOP=io_uring pytest` runs the suite on io_uring.
-    event_loop: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("HARK_EVENT_LOOP", "epoll")
-    )
     qname_minimization: bool = True
     dnssec: bool = False
     cache_min_ttl: int = 0
@@ -66,15 +61,9 @@ class HarkConfig:
         # Root hints are passed in "ip:port" form so the existing parseAddress
         # path lifts them; the upstream-port knob covers glue records, which
         # have no port.
-        # `opportunistic` is explicitly off: hark's TLS transport hardcodes
-        # port 853 (src/tls_transport.zig) and would bypass `upstream_port`,
-        # silently mis-targeting the responder. Future scenarios needing
-        # encrypted upstreams will require threading a `tls_port` knob first.
         lines = [
             "[server]",
             f'listen = ["{self.listen_ip}:{self.listen_port}"]',
-            f"workers = {self.workers}",
-            f'event-loop = "{self.event_loop}"',
             f"minimal-responses = {str(self.minimal_responses).lower()}",
         ]
         if self.tcp_idle_timeout_ms is not None:
@@ -84,7 +73,6 @@ class HarkConfig:
             "[resolver]",
             f"qname-minimization = {str(self.qname_minimization).lower()}",
             f"dnssec = {str(self.dnssec).lower()}",
-            "opportunistic = false",
             f"upstream-port = {self.upstream_port}",
             "allow-loopback-upstreams = true",
         ]

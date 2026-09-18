@@ -50,8 +50,7 @@ pub fn fmix64(h0: u64) u64 {
     return h;
 }
 
-/// Hashable, equality-comparable address-with-port. Used as a key in caches
-/// (RTT, NS-selector, encrypted_ns, connection pools).
+/// Hashable, equality-comparable address-with-port; the key for per-server state.
 pub const AddressKey = struct {
     family: u8,
     addr: [16]u8,

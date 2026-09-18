@@ -173,10 +173,8 @@ else fails fast.
   hark, `-c 4-7` for `replay.py`. Not currently automated by `run.sh`.
 - **Pellet bias.** Your local-capture pellet reflects whatever you browsed.
   For trends, hold the pellet constant across runs.
-- **`hark.toml` is config-tunable.** `case-randomization=true` is on (raises
-  upstream auth load — production-realistic, but BIND/Unbound defaults
-  differ). The cache is sized so the entries cap (200k) is the binding
-  constraint, not bytes — intentional for top-1M workloads.
+- **`hark.toml` is config-tunable.** The cache is sized so pellet replay
+  never churns on capacity eviction.
 - **Privacy.** Captured pellets contain real DNS queries from real clients
   on your machine — yours and whoever else uses it. Treat the resulting
   PCAP as PII; don't email, paste, or upload it. `.gitignore` excludes

@@ -10,9 +10,7 @@ pub fn build(b: *std.Build) void {
     // pytest harness runs `zig build -Dtesting=true`.
     const testing_enabled = b.option(bool, "testing", "Enable test-only config knobs") orelse false;
     // TSan pulls in libc, which reshapes std.posix.sigset_t — see sys.signalfd.
-    // It cannot model io_uring's kernel-shared rings, so the signal is in the
-    // cache/resolver/DNSSEC layers, not the client plane. `?bool` matches
-    // sanitize_thread: unspecified leaves every module on its default.
+    // `?bool` matches sanitize_thread: unspecified leaves every module on its default.
     const tsan = b.option(bool, "tsan", "Build with ThreadSanitizer");
     const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse
         (optimize != .debug);

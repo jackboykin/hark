@@ -116,7 +116,6 @@ pub const Scenario = struct {
     rebinding_extra_block: []const []const u8 = &.{},
     rebinding_extra_allow: []const []const u8 = &.{},
     stagger_ms: ?u32 = null,
-    workers: ?u32 = null,
     dns64_prefix: ?dns64.Prefix = null,
     serve_stale_ttl: ?u32 = null,
     min_ttl: ?u32 = null,
@@ -239,8 +238,6 @@ const Parser = struct {
             s.rebinding_extra_allow = try appendStr(p.arena, s.rebinding_extra_allow, val);
         } else if (mem.eql(u8, key, "stagger-ms")) {
             s.stagger_ms = try p.int(u32, val);
-        } else if (mem.eql(u8, key, "workers")) {
-            s.workers = try p.int(u32, val);
         } else if (mem.eql(u8, key, "dns64-prefix")) {
             s.dns64_prefix = dns64.Prefix.parse(val) orelse return p.fail("dns64-prefix: not an RFC 6052 prefix");
         } else if (mem.eql(u8, key, "serve-stale-ttl")) {

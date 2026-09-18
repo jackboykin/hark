@@ -16,28 +16,12 @@ pub const Benchmark = struct {
 
 const self_test = @import("bench_self_test.zig");
 const arena = @import("bench_arena.zig");
-const sieve = @import("bench_sieve.zig");
-const cache_hit = @import("bench_cache_hit.zig");
-const cache_mem = @import("bench_cache_mem.zig");
-const dedup = @import("bench_dedup.zig");
-const upstream = @import("bench_upstream.zig");
-const delegation = @import("bench_delegation.zig");
-const cache_contention = @import("bench_cache_contention.zig");
-const cache_write = @import("bench_cache_write.zig");
 
 const benchmarks = [_]Benchmark{
     .{ .name = "self_test", .run = self_test.run },
     .{ .name = "arena_fresh", .run = arena.runFreshArena },
     .{ .name = "arena_reset", .run = arena.runResetArena },
-    .{ .name = "sieve_worst", .run = sieve.runWorstCase },
-    .{ .name = "cache_hit", .run = cache_hit.run },
-    .{ .name = "cache_mem", .run = cache_mem.run },
-    .{ .name = "dedup_with", .run = dedup.runWithDedup },
-    .{ .name = "dedup_without", .run = dedup.runWithoutDedup },
-    .{ .name = "dedup_f01", .run = dedup.runF01 },
-    .{ .name = "upstream", .run = upstream.run },
-    .{ .name = "delegation", .run = delegation.run },
-} ++ cache_contention.benchmarks ++ cache_write.benchmarks;
+};
 
 fn percentile(sorted: []const i64, p: f64) i64 {
     const idx_f = @as(f64, @floatFromInt(sorted.len)) * p;

@@ -224,13 +224,10 @@ const config_seed = std.mem.toBytes(@as(u32, config_toml.len)) ++ config_toml.*;
 const config_toml =
     \\[server]
     \\listen = ["127.0.0.1:5354"]
-    \\workers = 4
-    \\resolution-threads = 16
     \\
     \\[resolver]
     \\dnssec = true
     \\qname-minimization = true
-    \\case-randomization = true
     \\
     \\[cache]
     \\size = 268435456

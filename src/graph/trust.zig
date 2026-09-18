@@ -1,7 +1,6 @@
 //! The chain of trust as cells: `ds(zone)`, `dnskey(zone)` and
-//! `secure(rrset)`. Verdicts follow recursive.zig (validateAnswer,
-//! verifiedNegativeResponse, fetchAndValidateDnskey, probeParentChildCut);
-//! the verification itself is dnssec.zig's.
+//! `secure(rrset)`. The verdicts are decided here; the verification itself
+//! is dnssec.zig's.
 const std = @import("std");
 const dns = @import("../dns.zig");
 const dnssec = @import("../dnssec.zig");

@@ -4,13 +4,10 @@
 
 [server]
 listen = ["127.0.0.1:5354"]
-workers = 2
-resolution-threads = 4
 
 [resolver]
 dnssec = false
 qname-minimization = false
-case-randomization = false
 
 [cache]
 size = 16777216

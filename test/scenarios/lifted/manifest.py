@@ -100,6 +100,6 @@ MANIFEST: list[LiftedEntry] = [
     # AUTHORITY section, which hark intentionally strips from cached
     # positive responses per CVE-2025-11411 — Unbound caches authority,
     # we don't. Defensible difference.
-    LiftedEntry("iter_domain_sale.rpl",                   "iter_domain_sale", "hark behaviour diverges: cached positive responses don't carry AUTHORITY NS records (CVE-2025-11411 mitigation; see src/cache.zig:storeResponse). TTL expiry itself works correctly."),
+    LiftedEntry("iter_domain_sale.rpl",                   "iter_domain_sale", "hark behaviour diverges: cached positive responses don't carry AUTHORITY NS records (CVE-2025-11411 mitigation). TTL expiry itself works correctly."),
     LiftedEntry("iter_domain_sale_nschange.rpl",          "iter_domain_sale", "hark behaviour diverges: see iter_domain_sale (CVE-2025-11411 mitigation)"),
 ]

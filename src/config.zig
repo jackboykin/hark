@@ -9,7 +9,6 @@ const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
-const Backend = @import("event_loop.zig").Backend;
 const build_options = @import("build_options");
 
 /// Error variants can't carry the offending key name, so log it at rejection
@@ -20,10 +19,42 @@ fn errLog(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
 }
 
+// IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
+// Source: https://www.internic.net/domain/named.root
+
+pub const root_hints_default: [26]Address = .{
+    net_addr.initIp4(.{ 198, 41, 0, 4 }, 53), // a
+    net_addr.initIp4(.{ 170, 247, 170, 2 }, 53), // b
+    net_addr.initIp4(.{ 192, 33, 4, 12 }, 53), // c
+    net_addr.initIp4(.{ 199, 7, 91, 13 }, 53), // d
+    net_addr.initIp4(.{ 192, 203, 230, 10 }, 53), // e
+    net_addr.initIp4(.{ 192, 5, 5, 241 }, 53), // f
+    net_addr.initIp4(.{ 192, 112, 36, 4 }, 53), // g
+    net_addr.initIp4(.{ 198, 97, 190, 53 }, 53), // h
+    net_addr.initIp4(.{ 192, 36, 148, 17 }, 53), // i
+    net_addr.initIp4(.{ 192, 58, 128, 30 }, 53), // j
+    net_addr.initIp4(.{ 193, 0, 14, 129 }, 53), // k
+    net_addr.initIp4(.{ 199, 7, 83, 42 }, 53), // l
+    net_addr.initIp4(.{ 202, 12, 27, 33 }, 53), // m
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0xba, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // a
+    net_addr.initIp6(.{ 0x28, 0x01, 0x01, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b }, 53, 0, 0), // b
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c }, 53, 0, 0), // c
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d }, 53, 0, 0), // d
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0e }, 53, 0, 0), // e
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f }, 53, 0, 0), // f
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0x0d, 0x0d }, 53, 0, 0), // g
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // h
+    net_addr.initIp6(.{ 0x20, 0x01, 0x07, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }, 53, 0, 0), // i
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x03, 0x0c, 0x27, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x30 }, 53, 0, 0), // j
+    net_addr.initIp6(.{ 0x20, 0x01, 0x07, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 }, 53, 0, 0), // k
+    net_addr.initIp6(.{ 0x20, 0x01, 0x05, 0x00, 0, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 }, 53, 0, 0), // l
+    net_addr.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
+};
+
 pub const ServerConfig = struct {
     listen: []Address,
     /// Override IANA root hints. Empty means "use the compile-time
-    /// defaults from recursive.root_hints_default". Tests redirect at
+    /// defaults from root_hints_default". Tests redirect at
     /// scripted authoritatives via this; operators in split-horizon
     /// deployments point at private roots. Applied at boot — hark does
     /// not hot-reload config, and the cache starts empty on restart, so
@@ -39,20 +70,12 @@ pub const ServerConfig = struct {
     /// behind `-Dtesting=true`; production binaries reject the key.
     allow_loopback_upstreams: bool,
     cache_size: usize,
-    key_cache_size: usize,
     prefetch: bool,
-    prefetch_cousin: bool,
     serve_stale_ttl: u32,
     min_ttl: u32,
     dnssec: bool,
     qname_minimization: bool,
-    case_randomization: bool,
-    query_memory_limit: usize,
-    opportunistic: bool,
     dns64: ?dns64.Prefix,
-    workers: u16,
-    event_loop: Backend,
-    resolution_threads: u16,
     /// Resolutions, or upstream queries, in flight at once; past either the
     /// client is turned away (UDP silent, TCP closed).
     max_in_flight: u32,
@@ -86,10 +109,6 @@ pub const ServerConfig = struct {
     /// Cap on queries served over a single TCP connection before the
     /// server closes it (load-shedding + memory bound).
     tcp_queries_per_conn: u32,
-    /// Upstream DoT connection-pool idle timeout (seconds). Closes
-    /// pooled connections to authoritatives after this much inactivity.
-    upstream_tcp_idle_sec: i64,
-
     /// Override the IANA root trust anchors. Empty falls back to
     /// `dnssec.root_ds_records`. Test-only; `-Dtesting=true` gates the
     /// `[resolver] trust-anchors` config key.
@@ -119,12 +138,9 @@ pub const ServerConfig = struct {
         self.allocator.free(self.rebinding.extra_allow);
     }
 
-    /// Effective root-hints slice for the recursor: config-supplied if any,
-    /// else the compile-time IANA defaults. Centralized so every
-    /// RecursiveResolver construction site picks the same fallback.
+    /// Config-supplied if any, else the compile-time IANA defaults.
     pub fn rootHints(self: ServerConfig) []const Address {
-        const recursive = @import("recursive.zig");
-        return if (self.root_hints.len > 0) self.root_hints else &recursive.root_hints_default;
+        return if (self.root_hints.len > 0) self.root_hints else &root_hints_default;
     }
 
     /// Effective root trust anchors: config-supplied if any, else the
@@ -166,24 +182,12 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
         .cache_size = 12 * 1024 * 1024,
-        .key_cache_size = 4 * 1024 * 1024,
         .prefetch = false,
-        .prefetch_cousin = true,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
         .dnssec = true,
         .qname_minimization = true,
-        .case_randomization = true,
-        .query_memory_limit = 1024 * 1024,
-        .opportunistic = false,
         .dns64 = null,
-        // 2 workers is enough for most deployments. Each worker is one
-        // event loop; per-worker resolution-threads handle upstream
-        // concurrency. Raise this for high-QPS edge resolvers — client-plane
-        // drainage is rarely the bottleneck; resolution work dominates.
-        .workers = 2,
-        .event_loop = .epoll,
-        .resolution_threads = 4,
         .max_in_flight = 1024,
         .stagger_ms = 150,
         .log_queries = false,
@@ -194,7 +198,6 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .minimal_responses = true,
         .tcp_idle_timeout_ms = 5_000,
         .tcp_queries_per_conn = 128,
-        .upstream_tcp_idle_sec = 30,
         .trust_anchors = &.{},
         .rebinding = .{
             .enabled = true,
@@ -218,9 +221,6 @@ const SectionSpec = struct { name: []const u8, keys: []const KeySpec };
 const config_schema = [_]SectionSpec{
     .{ .name = "server", .keys = &.{
         .{ .name = "listen", .kind = .string_array },
-        .{ .name = "workers", .kind = .integer },
-        .{ .name = "event-loop", .kind = .string },
-        .{ .name = "resolution-threads", .kind = .integer },
         .{ .name = "max-in-flight", .kind = .integer },
         .{ .name = "max-udp-payload", .kind = .integer },
         .{ .name = "user", .kind = .integer },
@@ -228,7 +228,6 @@ const config_schema = [_]SectionSpec{
         .{ .name = "allow-from", .kind = .string_array },
         .{ .name = "tcp-idle-timeout-ms", .kind = .integer },
         .{ .name = "tcp-queries-per-conn", .kind = .integer },
-        .{ .name = "upstream-tcp-idle-sec", .kind = .integer },
         .{ .name = "minimal-responses", .kind = .boolean },
     } },
     .{ .name = "resolver", .keys = &.{
@@ -238,17 +237,12 @@ const config_schema = [_]SectionSpec{
         .{ .name = "trust-anchors", .kind = .string_array },
         .{ .name = "dnssec", .kind = .boolean },
         .{ .name = "qname-minimization", .kind = .boolean },
-        .{ .name = "case-randomization", .kind = .boolean },
-        .{ .name = "opportunistic", .kind = .boolean },
         .{ .name = "dns64-prefix", .kind = .string },
-        .{ .name = "query-memory-limit", .kind = .integer },
         .{ .name = "stagger-ms", .kind = .integer },
     } },
     .{ .name = "cache", .keys = &.{
         .{ .name = "size", .kind = .integer },
-        .{ .name = "key-cache-size", .kind = .integer },
         .{ .name = "prefetch", .kind = .boolean },
-        .{ .name = "prefetch-cousin", .kind = .boolean },
         .{ .name = "serve-stale-ttl", .kind = .integer },
         .{ .name = "min-ttl", .kind = .integer },
     } },
@@ -353,20 +347,6 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.listen);
             cfg.listen = new_listen;
         }
-        if (server.getInteger("workers")) |w| {
-            if (w < 1 or w > 65535) {
-                errLog("config: workers must be 1-65535, got {d}", .{w});
-                return error.InvalidWorkerCount;
-            }
-            cfg.workers = @intCast(w);
-        }
-        if (server.getInteger("resolution-threads")) |rt| {
-            if (rt < 1 or rt > 256) {
-                errLog("config: resolution-threads must be 1-256, got {d}", .{rt});
-                return error.InvalidWorkerCount;
-            }
-            cfg.resolution_threads = @intCast(rt);
-        }
         if (try nonNegative(u32, server, "max-in-flight")) |v| {
             if (v == 0) {
                 errLog("config: max-in-flight must not be 0", .{});
@@ -405,12 +385,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             }
             cfg.tcp_queries_per_conn = v;
         }
-        if (try nonNegative(u32, server, "upstream-tcp-idle-sec")) |v| cfg.upstream_tcp_idle_sec = @intCast(v);
         if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
-        if (server.getString("event-loop")) |s| cfg.event_loop = std.meta.stringToEnum(Backend, s) orelse {
-            errLog("config: event-loop '{s}' is not io_uring or epoll", .{s});
-            return error.InvalidValue;
-        };
     }
 
     if (parsed.table.getTable("resolver")) |resolver| {
@@ -445,20 +420,12 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
         if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
-        if (resolver.getBool("case-randomization")) |c| cfg.case_randomization = c;
-        if (resolver.getBool("opportunistic")) |o| cfg.opportunistic = o;
         if (resolver.getString("dns64-prefix")) |s| if (s.len > 0) {
             cfg.dns64 = dns64.Prefix.parse(s) orelse {
                 errLog("config: dns64-prefix '{s}' is not an IPv6 /32, /40, /48, /56, /64 or /96 (RFC 6052 §2.2)", .{s});
                 return error.InvalidValue;
             };
         };
-        if (try nonNegative(usize, resolver, "query-memory-limit")) |val| {
-            if (val != 0 and val < 65536) return error.InvalidQueryMemoryLimit;
-            // 0 = unlimited. Resolve the sentinel here so every cap site (worker
-            // arena, NS-fanout helpers, bg-prefetch) honors it uniformly.
-            cfg.query_memory_limit = if (val == 0) std.math.maxInt(usize) else val;
-        }
         if (try nonNegative(u32, resolver, "stagger-ms")) |v| {
             // Rejected rather than clamped, for the same reason as the range
             // check itself: `stagger-ms = 5000` meant 5 seconds to whoever
@@ -473,9 +440,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 
     if (parsed.table.getTable("cache")) |cache| {
         if (try nonNegative(usize, cache, "size")) |v| cfg.cache_size = v;
-        if (try nonNegative(usize, cache, "key-cache-size")) |v| cfg.key_cache_size = v;
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
-        if (cache.getBool("prefetch-cousin")) |p| cfg.prefetch_cousin = p;
         if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
     }
@@ -694,14 +659,12 @@ test "default config" {
     try testing.expectEqual(@as(usize, 12 * 1024 * 1024), cfg.cache_size);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(true, cfg.qname_minimization);
-    try testing.expect(cfg.workers >= 1);
 }
 
 test "parse full config" {
     var cfg = try parseConfig(testing.allocator,
         \\[server]
         \\listen = ["127.0.0.1:8053"]
-        \\workers = 2
         \\max-in-flight = 64
         \\
         \\[resolver]
@@ -715,7 +678,6 @@ test "parse full config" {
 
     try testing.expectEqual(@as(usize, 1), cfg.listen.len);
     try testing.expectEqual(@as(u16, 8053), cfg.listen[0].getPort());
-    try testing.expectEqual(@as(u16, 2), cfg.workers);
     try testing.expectEqual(@as(u32, 64), cfg.max_in_flight);
     try testing.expectEqual(true, cfg.dnssec);
     try testing.expectEqual(false, cfg.qname_minimization);
@@ -758,14 +720,6 @@ test "bracketed address needs a colon before its port" {
     try testing.expectEqual(@as(?Address, null), parseAddress("[::1]5353", 53));
 }
 
-test "invalid worker count" {
-    const result = parseConfig(testing.allocator,
-        \\[server]
-        \\workers = 0
-    );
-    try testing.expectError(error.InvalidWorkerCount, result);
-}
-
 // Regression: parseConfig used to free `cfg.listen` then `try parseAddressList`,
 // so a malformed address left a dangling slice that cfg.deinit double-freed.
 // `listen` is the only field with a non-empty default, so it's the only site
@@ -792,30 +746,15 @@ test "cache prefetch and stale config" {
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
 }
 
-test "event-loop defaults to epoll, parses io_uring, refuses the rest" {
-    var default = try parseConfig(testing.allocator, "");
-    defer default.deinit();
-    try testing.expectEqual(Backend.epoll, default.event_loop);
-    var uring = try parseConfig(testing.allocator,
-        \\[server]
-        \\event-loop = "io_uring"
-    );
-    defer uring.deinit();
-    try testing.expectEqual(Backend.io_uring, uring.event_loop);
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, "[server]\nevent-loop = \"io-uring\"\n"));
-}
-
-test "tcp idle/queries/upstream knobs parse and validate" {
+test "tcp idle and queries knobs parse and validate" {
     var cfg = try parseConfig(testing.allocator,
         \\[server]
         \\tcp-idle-timeout-ms = 8000
         \\tcp-queries-per-conn = 64
-        \\upstream-tcp-idle-sec = 45
     );
     defer cfg.deinit();
     try testing.expectEqual(@as(u32, 8000), cfg.tcp_idle_timeout_ms);
     try testing.expectEqual(@as(u32, 64), cfg.tcp_queries_per_conn);
-    try testing.expectEqual(@as(i64, 45), cfg.upstream_tcp_idle_sec);
 
     // Zero queries-per-conn would loop forever; parser must reject.
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
@@ -829,19 +768,6 @@ test "tcp idle/queries/upstream knobs parse and validate" {
         \\[server]
         \\tcp-idle-timeout-ms = 7000000
     ));
-}
-
-test "prefetch-cousin defaults on and parses" {
-    var cfg1 = try parseConfig(testing.allocator, "");
-    defer cfg1.deinit();
-    try testing.expectEqual(true, cfg1.prefetch_cousin);
-
-    var cfg2 = try parseConfig(testing.allocator,
-        \\[cache]
-        \\prefetch-cousin = false
-    );
-    defer cfg2.deinit();
-    try testing.expectEqual(false, cfg2.prefetch_cousin);
 }
 
 test "rebinding defaults are safe (enabled, empty extras)" {
@@ -898,7 +824,7 @@ test "wrong-typed key rejected, default must not silently win" {
     ));
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
         \\[server]
-        \\workers = "2"
+        \\max-in-flight = "2"
     ));
 }
 

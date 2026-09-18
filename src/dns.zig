@@ -2467,8 +2467,8 @@ test "checkEcho: only a same-name case mismatch marks mangling" {
 
 test "validateResponse accepts a question-less error reply but rejects question-less NOERROR" {
     // RFC 9619: error rcodes may omit the question; NOERROR may not. An error
-    // reply with QDCOUNT=0 thus passes here with empty questions — recursive.zig's
-    // 0x20-echo checks must gate on questions.len==1 before indexing questions[0].
+    // reply with QDCOUNT=0 thus passes here with empty questions — every
+    // question-echo check must gate on questions.len==1 before indexing questions[0].
     const qname = Name{ .labels = &.{ "example", "com" } };
     const base_flags = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .refused };
 

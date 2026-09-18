@@ -3,13 +3,12 @@
 A malicious authoritative server (hark's only configured root) answers every
 query with a GLUELESS delegation to fresh, globally-unique NS names. Each NS
 name forces its own delegation walk, so one client query fans out across a tree
-of `resolveImpl` calls.
+of resolutions.
 
-Before the tree-wide `QueryBudget` (src/recursive.zig), each sub-resolution got
-a fresh `max_upstream_queries` budget and a single client query amplified into
-~500 upstream queries (measured 488-575). The shared, never-reset counter caps
-that. This test asserts the resolver stays an order of magnitude below the old
-behaviour for one client query.
+Before the tree-wide query budget, each sub-resolution got a fresh budget and a
+single client query amplified into ~500 upstream queries (measured 488-575). The
+shared, never-reset counter caps that. This test asserts the resolver stays an
+order of magnitude below the old behaviour for one client query.
 
 A static `.rpl` can't express this — the amplification needs an unbounded supply
 of distinct NS names — so it lives as a dynamic harness test around
@@ -79,5 +78,5 @@ def test_glueless_ns_fanout_is_bounded(tmp_path: Path) -> None:
     assert evil.total <= AMPLIFICATION_BOUND, (
         f"NXNSAttack amplification: one client query produced {evil.total} "
         f"upstream queries (bound {AMPLIFICATION_BOUND}). The tree-wide "
-        f"QueryBudget regressed — see src/recursive.zig:max_global_queries."
+        f"query budget regressed (graph Budget, max-queries)."
     )

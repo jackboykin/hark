@@ -1,5 +1,5 @@
-//! RFC 6147 DNS64, on when `dns64-prefix` is set; hooked in
-//! `RecursiveResolver.resolve`. AAAA NODATA → resolve A and embed. PTR under
+//! RFC 6147 DNS64, on when `dns64-prefix` is set; applied by answer.zig.
+//! AAAA NODATA → resolve A and embed. PTR under
 //! the prefix → the in-addr.arpa PTRs re-owned (Unbound's rename, not the
 //! §5.3.1 CNAME). CD=1 disables it. A SERVFAILed AAAA stays SERVFAIL: §5.1.2
 //! says treat as empty, §5.5 forbids laundering a bogus one, and bogus is

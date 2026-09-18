@@ -36,9 +36,8 @@ const max_sig_verify_per_resolution: u32 = 96;
 /// CLOSED to `.bogus`; the per-record `max_nsec3_iterations` cap fails OPEN.
 const max_nsec3_hashes_per_resolution: u32 = 96;
 
-/// Per-query DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes), shared tree-wide
-/// by pointer across `cloneForThread` like `recursive.Budget`. Atomic
-/// spent-up against a fixed ceiling: exactly `max` draws succeed then refuse
+/// Per-query DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes), shared
+/// tree-wide by pointer. Atomic spent-up against a fixed ceiling: exactly `max` draws succeed then refuse
 /// forever — never re-arms (a `fetchSub` down-counter would wrap u32 and silently
 /// re-grant). Two separate counters so sig and NSEC3-hash exhaustion are independent.
 pub const ValidationBudget = struct {
@@ -263,8 +262,7 @@ pub fn isProperAncestor(zone: dns.Name, name: dns.Name) bool {
 ///
 /// `.secure` here does NOT mean "validated": it means "treat as signed,
 /// proceed to DNSKEY/DS validation" — and an unsigned-but-unproven delegation
-/// also returns `.secure`, so the validator (recursive.zig) fails closed to
-/// SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation.
+/// also returns `.secure`, so the validator fails closed to SERVFAIL. Only `.insecure` asserts a proven (opt-out / no-DS) delegation.
 ///
 /// `zone` is the signer the caller verified the section under. The §8.6
 /// closest-encloser walk stops a genuine Opt-Out span of `com` covering
@@ -889,8 +887,7 @@ fn wrongSideOfCut(type_bit_maps: []const u8, qname: dns.Name, qtype: dns.RType) 
 }
 
 /// Whether `qname` falls in the open range (owner, next) of an NSEC allowed
-/// to speak for it (RFC 6840 §4.1). Geometry only; meaning is decided below,
-/// except where geometry is the whole question (nsec_cache's depth guard).
+/// to speak for it (RFC 6840 §4.1). Geometry only; meaning is decided below.
 pub fn nsecCovers(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) bool {
     // Strictly below only: a range starting at an ancestor still legitimately
     // denies siblings in the same zone.
@@ -908,7 +905,7 @@ pub fn nsecCovers(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) boo
 }
 
 /// Whether an NSEC proves `qname` does not exist. One home for every consumer
-/// (NXDOMAIN, wildcard denial, no-closer-match, nsec_cache) so the ENT rule
+/// (NXDOMAIN, wildcard denial, no-closer-match, aggressive use) so the ENT rule
 /// can't be missing at one of them: an ENT denied under NXDOMAIN has its
 /// whole subtree dropped by RFC 8020 caches.
 pub fn nsecProvesNameNonexistence(
@@ -928,7 +925,7 @@ fn nsecProvesEnt(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) bool
 
 /// RFC 4035 §5.4 + RFC 6840 §4.3: a NODATA proof fails if the bitmap
 /// asserts qtype — or a CNAME, which would have answered the query —
-/// exists at the owner. Also gates nsec_cache's aggressive synthesis.
+/// exists at the owner. Also gates aggressive-use synthesis.
 pub fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
     return dns.typeBitmapContains(type_bit_maps, qtype) or
         dns.typeBitmapContains(type_bit_maps, .cname);

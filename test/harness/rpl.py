@@ -17,7 +17,6 @@ a "drop the next incoming query" on the responder before the QUERY fires.
 Hark-only extensions:
   - ; hark: root-hints = <ip> [, <ip>...]   header directive (required)
   - ; hark: qname-minimisation = no         header directive (optional)
-  - ; hark: workers = <n>                   header directive (optional)
   - ; hark: dns64-prefix = <pref64/n>       header directive (optional)
   - ; hark: serve-stale-ttl = <seconds>     header directive (optional)
   - ; hark: min-ttl = <seconds>             header directive (optional)
@@ -207,7 +206,6 @@ class Scenario:
     # deterministic sequential server loop so a fallthrough scenario can pin a
     # specific NS-failure order. None = harness/hark default.
     stagger_ms: int | None = None
-    workers: int | None = None
     dns64_prefix: str | None = None
     serve_stale_ttl: int | None = None
     prefetch: bool | None = None
@@ -282,8 +280,6 @@ class _Parser:
             self.scenario.rebinding_extra_allow.append(val.strip())
         elif key == "stagger-ms":
             self.scenario.stagger_ms = int(val.strip())
-        elif key == "workers":
-            self.scenario.workers = int(val.strip())
         elif key == "dns64-prefix":
             self.scenario.dns64_prefix = val.strip()
         elif key == "serve-stale-ttl":

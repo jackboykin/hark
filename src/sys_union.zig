@@ -2,9 +2,6 @@
 //! lives here; syscall wrappers come from the per-OS file and are re-exported,
 //! so the list below is what a new platform has to provide.
 //!
-//! Used by the TCP/TLS path and the inbound server/event-loop sockets.
-//! Outbound UDP uses std.Io.net.Socket directly; do not add new callers
-//! here for paths that have an Io alternative.
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
