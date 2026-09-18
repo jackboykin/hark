@@ -52,7 +52,7 @@ fn capExpiry(g: *Graph, cap: u32) i64 {
 /// bogus parent is inherited.
 pub fn runDs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
-    const s = &g.cell(id).scratch.ds;
+    const s = g.cell(id).scratch.ds;
     const anchor = g.cfg.trust_anchor orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
     if (zone.labels.len == 0) {
         const rr: RR = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = anchor } };
@@ -117,7 +117,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
 /// `dnskey(zone)`: `rrset(zone, DNSKEY)` verified under `ds(zone)`.
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
-    const s = &g.cell(id).scratch.dnskey;
+    const s = g.cell(id).scratch.dnskey;
     if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, g.cell(id).depth) orelse
         return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
     const ds = g.cell(s.ds.?);
@@ -170,7 +170,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
 /// from a signed zone may sit below a hidden insecure cut, probed one
 /// label at a time.
 pub fn runSecure(g: *Graph, id: CellId) !void {
-    const s = &g.cell(id).scratch.secure;
+    const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
     const r = t.value.rrset;
     const zone = r.zone;

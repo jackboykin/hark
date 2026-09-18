@@ -244,17 +244,29 @@ const ExchangeScratch = struct {
     sent_ns: i64,
 };
 
+/// In the cell's arena: a cell pays for its own kind's, not the largest.
 pub const Scratch = union(enum) {
     none,
-    cut: walk.CutScratch,
-    ns: walk.NsScratch,
-    addr: walk.AddrScratch,
-    rrset: walk.RrsetScratch,
-    answer: walk.AnswerScratch,
-    ds: trust.DsScratch,
-    dnskey: trust.DnskeyScratch,
-    secure: trust.SecureScratch,
-    exchange: ExchangeScratch,
+    cut: *walk.CutScratch,
+    ns: *walk.NsScratch,
+    addr: *walk.AddrScratch,
+    rrset: *walk.RrsetScratch,
+    answer: *walk.AnswerScratch,
+    ds: *trust.DsScratch,
+    dnskey: *trust.DnskeyScratch,
+    secure: *trust.SecureScratch,
+    exchange: *ExchangeScratch,
+
+    fn init(kind: Kind, arena: Allocator) !Scratch {
+        return switch (kind) {
+            .exchange => .none,
+            inline else => |k| blk: {
+                const p = try arena.create(@typeInfo(@FieldType(Scratch, @tagName(k))).pointer.child);
+                p.* = .{};
+                break :blk @unionInit(Scratch, @tagName(k), p);
+            },
+        };
+    }
 };
 
 /// Alive while pinned, by demanders (`waiters`) or clients and the edge
@@ -471,23 +483,14 @@ pub const Graph = struct {
         errdefer if (reused == null) g.gpa.destroy(c);
         var arena = std.heap.ArenaAllocator.init(g.gpa);
         errdefer arena.deinit();
+        const scratch = try Scratch.init(key.kind, arena.allocator());
         c.* = .{
             .key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) },
             .name = try dns.cloneNameFlat(arena.allocator(), name, false),
             .budget = budget,
             .depth = depth,
             .arena = arena,
-            .scratch = switch (key.kind) {
-                .cut => .{ .cut = .{} },
-                .ns => .{ .ns = .{} },
-                .addr => .{ .addr = .{} },
-                .rrset => .{ .rrset = .{} },
-                .answer => .{ .answer = .{} },
-                .ds => .{ .ds = .{} },
-                .dnskey => .{ .dnskey = .{} },
-                .secure => .{ .secure = .{} },
-                .exchange => .none,
-            },
+            .scratch = scratch,
         };
         if (reused == null) try g.cells.append(g.gpa, c);
         if (key.kind != .exchange) try g.index.put(g.gpa, c.key, id);
@@ -564,6 +567,7 @@ pub const Graph = struct {
         }
         c.arena.deinit();
         c.arena = std.heap.ArenaAllocator.init(g.gpa);
+        c.scratch = .none;
         try g.free_ids.append(g.gpa, id);
     }
 
@@ -787,14 +791,9 @@ pub const Graph = struct {
         const msg = try dns.buildQuery(arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
-        g.cell(id).scratch = .{ .exchange = .{
-            .id = qid,
-            .sent_name = msg.questions[0].name,
-            .qtype = qtype,
-            .server = server,
-            .transport = transport,
-            .sent_ns = g.now(),
-        } };
+        const sc = try arena.create(ExchangeScratch);
+        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .sent_ns = g.now() };
+        g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
             .server = server,
@@ -807,7 +806,7 @@ pub const Graph = struct {
     }
 };
 
-test "per-cell state has a static bound" {
-    // A waiting resolution's scratch is a comptime constant, not a stack.
-    try std.testing.expect(@sizeOf(Cell) <= 2560);
+test "a cell is a few words" {
+    // Scratch is a pointer: the slot bound is not the largest kind's.
+    try std.testing.expect(@sizeOf(Cell) <= 384);
 }

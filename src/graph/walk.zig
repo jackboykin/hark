@@ -162,7 +162,7 @@ pub const AnswerScratch = struct {
 
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     const qtype = g.cell(id).key.rtype;
-    const s = &g.cell(id).scratch.answer;
+    const s = g.cell(id).scratch.answer;
     var next = g.cell(id).name;
     while (true) {
         if (s.n > 0) {
@@ -216,7 +216,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     std.debug.assert(name.labels.len > 0);
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
-    const s = &g.cell(id).scratch.cut;
+    const s = g.cell(id).scratch.cut;
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse {
         try g.settle(id, .{ .cut = .{ .zone = .{ .labels = &.{} }, .failed = true } }, g.now());
         return;
@@ -270,7 +270,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 /// unsettled one re-probes the cut, whose referral publishes both.
 pub fn runNs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
-    const s = &g.cell(id).scratch.ns;
+    const s = g.cell(id).scratch.ns;
     if (s.cut == null) s.cut = try g.demand(id, try g.keyFor(.cut, zone, .a), zone, g.cell(id).depth) orelse {
         try g.settle(id, .{ .ns = .{ .names = &.{} } }, g.now());
         return;
@@ -288,7 +288,7 @@ pub fn runNs(g: *Graph, id: CellId) !void {
 pub fn runAddr(g: *Graph, id: CellId) !void {
     const depth = g.cell(id).depth + 1;
     if (depth > g.cfg.max_resolve_depth) return g.settle(id, .{ .addr = .{ .addrs = &.{}, .provisional = false } }, g.now());
-    const s = &g.cell(id).scratch.addr;
+    const s = g.cell(id).scratch.addr;
     if (s.host == null) {
         s.host = g.cell(id).name;
         if (try g.peek(try g.keyFor(.rrset, s.host.?, .cname))) |cname| if (cname.value.rrset.kind == .alias) {
@@ -367,7 +367,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
 pub fn runRrset(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
-    const s = &g.cell(id).scratch.rrset;
+    const s = g.cell(id).scratch.rrset;
     if (!s.started) {
         if (s.cut == null) {
             // Indexed proofs deny the name without a packet.
@@ -411,7 +411,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .reply => |msg| {
                 const zone = g.cell(id).scratch.rrset.ask.zone;
                 if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
-                    const s2 = &g.cell(id).scratch.rrset;
+                    const s2 = g.cell(id).scratch.rrset;
                     if (s2.delegations >= g.cfg.max_delegations)
                         return settleRrset(g, id, servfail(.no_reachable_authority));
                     s2.delegations += 1;
