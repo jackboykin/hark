@@ -108,7 +108,16 @@ pub const Ask = struct {
             a.nservers += 1;
         }
         g.edge.rng.shuffle(na.AddressKey, a.servers[from..a.nservers]);
+        // Fastest band first, random within it; a server never timed sorts as fast.
+        std.sort.insertion(na.AddressKey, a.servers[from..a.nservers], g, rttBand);
         a.have_servers = a.next < a.nservers;
+    }
+
+    fn rttBand(g: *Graph, x: na.AddressKey, y: na.AddressKey) bool {
+        const band_us = 50 * std.time.us_per_ms;
+        const bx = @divTrunc((g.rtt.get(x) orelse ns_rtt.RttState.unknown).srtt_us, band_us);
+        const by = @divTrunc((g.rtt.get(y) orelse ns_rtt.RttState.unknown).srtt_us, band_us);
+        return bx < by;
     }
 
     /// Once more from the top in a fresh order, skipping the dead unless all are.
