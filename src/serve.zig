@@ -52,6 +52,15 @@ const Watched = union(enum) {
     free,
 };
 
+/// A token is a slot and its generation: an event queued for a dropped
+/// connection must not land on the slot's next tenant.
+const Slot = struct {
+    gen: u32 = 0,
+    w: Watched = .free,
+};
+const slot_bits = 20;
+const slot_mask = (1 << slot_bits) - 1;
+
 /// Re-read at answer time: the graph never holds client bytes.
 const Pending = struct {
     root: graph.CellId,
@@ -68,17 +77,19 @@ const Server = struct {
     cfg: *const config.ServerConfig,
     e: *Edge,
     g: *graph.Graph,
-    watched: std.ArrayList(Watched) = .empty,
+    watched: std.ArrayList(Slot) = .empty,
     pending: std.ArrayList(Pending) = .empty,
     scratch: std.heap.ArenaAllocator,
     stopping: bool = false,
 
     fn token(s: *Server, w: Watched) !u32 {
-        for (s.watched.items, 0..) |x, i| if (x == .free) {
-            s.watched.items[i] = w;
-            return @intCast(i);
+        for (s.watched.items, 0..) |*x, i| if (x.w == .free) {
+            x.gen +%= 1;
+            x.w = w;
+            return @intCast(i | (x.gen << slot_bits));
         };
-        try s.watched.append(s.gpa, w);
+        std.debug.assert(s.watched.items.len <= slot_mask);
+        try s.watched.append(s.gpa, .{ .w = w });
         return @intCast(s.watched.items.len - 1);
     }
 
@@ -103,7 +114,9 @@ const Server = struct {
     }
 
     fn onClient(s: *Server, tok: u32, events: u32) !void {
-        switch (s.watched.items[tok]) {
+        const x = s.watched.items[tok & slot_mask];
+        if (x.gen << slot_bits != tok & ~@as(u32, slot_mask)) return;
+        switch (x.w) {
             .udp => |fd| try s.readUdp(fd),
             .listen => |fd| try s.accept(fd),
             .conn => |c| if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c, events),
@@ -169,7 +182,7 @@ const Server = struct {
             c.owed += 1;
             try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c });
             // Turned away, or a failed write: the connection is gone.
-            if (s.watched.items[tok] != .conn) return;
+            if (s.watched.items[tok & slot_mask].w != .conn) return;
             start += 2 + flen;
         }
         mem.copyForwards(u8, c.buf[0 .. c.len - start], c.buf[start..c.len]);
@@ -178,7 +191,7 @@ const Server = struct {
 
     /// Clients still waiting get nothing; the graph frees their roots.
     fn deinit(s: *Server) void {
-        for (s.watched.items) |w| if (w == .conn) s.drop(w.conn);
+        for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
         for (s.pending.items) |p| s.release(p);
         s.pending.deinit(s.gpa);
         s.watched.deinit(s.gpa);
@@ -190,7 +203,7 @@ const Server = struct {
             p.reply = .{ .udp = .{ .fd = -1, .addr = c_addr_none } };
         };
         sys.close(c.fd);
-        s.watched.items[c.token] = .free;
+        s.watched.items[c.token & slot_mask].w = .free;
         c.out.deinit(s.gpa);
         s.gpa.destroy(c);
     }
@@ -202,7 +215,7 @@ const Server = struct {
         const idle_ns = @as(i64, s.cfg.tcp_idle_timeout_ms) * std.time.ns_per_ms;
         var i: usize = 0;
         while (i < s.watched.items.len) : (i += 1) {
-            const c = switch (s.watched.items[i]) {
+            const c = switch (s.watched.items[i].w) {
                 .conn => |c| c,
                 else => continue,
             };
