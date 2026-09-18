@@ -118,83 +118,63 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
             report.msg = why;
             return error.ScenarioFailed;
         }
-        if (s.log.items.len != before and actual.ttl > 0) {
+        if (s.log.items.len != before and actual.cacheable) {
             report.msg = "went upstream";
             return error.ScenarioFailed;
         }
     }
 }
 
-/// A reply and how long it stays one: the shortest TTL over the facts it
-/// was assembled from.
-const Answer = struct { msg: dns.Message, ttl: u32 };
+/// A reply, and whether it is a fact past this instant (TTL 0 is served
+/// but never memoised).
+const Served = struct { msg: dns.Message, cacheable: bool };
 
-/// A client question: demand the RRset, follow aliases, shape the reply.
-/// Null when the client's timer fires first.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?Answer {
+/// Demand the answer, wait for it, age and shape it. Null when the
+/// client's timer fires first.
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?Served {
     const q = entry.questions[0];
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
-    var chain: std.ArrayList(dns.ResourceRecord) = .empty;
-    var name = q.name;
-    var seen: [17]dns.Name = undefined;
-    var hops: usize = 0;
-    var payer: ?graph.CellId = null;
-    var ttl: u32 = std.math.maxInt(u32);
-    while (true) {
-        const root = try g.demandRoot(name, q.qtype, payer);
-        payer = g.cell(root).root;
-        try g.drain();
-        while (!g.cell(root).settled) {
-            const ev = s.next(client_deadline) orelse return null;
-            try g.complete(ev.id, ev.completion);
-        }
-        var r = g.cell(root).value.rrset;
-        ttl = @min(ttl, r.ttl);
-        const age: u32 = @intCast(@divTrunc(s.now_ns - r.stored_ns, std.time.ns_per_s));
-        // A CNAME question is answered by the alias itself.
-        if (r.kind == .alias and q.qtype != .cname) {
-            // A chain revisiting an owner, or past max_cname_chain, is a
-            // resolution failure (today's loopServfail / CnameChainTooLong).
-            seen[hops] = name;
-            var looped = hops >= 16;
-            for (seen[0..hops]) |n| looped = looped or n.eql(r.target);
-            if (!looped) {
-                try appendAged(arena, &chain, r.answers, age);
-                name = r.target;
-                hops += 1;
-                continue;
-            }
-            r = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
-            chain.clearRetainingCapacity();
-        }
-        const positive = r.kind == .answer or r.kind == .alias;
-        const minimal = scenario.minimal_responses orelse true;
-        var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
-        var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
-        if (!(positive and minimal and q.qtype != .ns)) {
-            try appendAged(arena, &authorities, r.authorities, age);
-            try appendAged(arena, &additionals, r.additionals, age);
-        }
-        try appendAged(arena, &chain, r.answers, age);
-        return .{ .ttl = ttl, .msg = .{
-            .header = .{ .id = 0, .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = entry.flags.rd,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = entry.flags.cd,
-                .rcode = if (r.kind == .servfail) r.rcode else if (r.kind == .nxdomain) .name_error else .no_error,
-            } },
-            .questions = try arena.dupe(dns.Question, &.{q}),
-            .answers = chain.items,
-            .authorities = authorities.items,
-            .additionals = additionals.items,
-        } };
+    const root = try g.demandRoot(q.name, q.qtype);
+    try g.drain();
+    while (!g.cell(root).settled) {
+        const ev = s.next(client_deadline) orelse return null;
+        try g.complete(ev.id, ev.completion);
     }
+    const a = g.cell(root).value.answer;
+    var chain: std.ArrayList(dns.ResourceRecord) = .empty;
+    var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
+    var age: u32 = 0;
+    if (!a.broken) for (a.hops) |h| {
+        last = g.cell(h).value.rrset;
+        age = @intCast(@divTrunc(s.now_ns - last.stored_ns, std.time.ns_per_s));
+        try appendAged(arena, &chain, last.answers, age);
+    };
+    const positive = last.kind == .answer or last.kind == .alias;
+    const minimal = scenario.minimal_responses orelse true;
+    var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
+    var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
+    if (!(positive and minimal and q.qtype != .ns)) {
+        try appendAged(arena, &authorities, last.authorities, age);
+        try appendAged(arena, &additionals, last.additionals, age);
+    }
+    return .{ .cacheable = g.cell(root).expires_ns > s.now_ns, .msg = .{
+        .header = .{ .id = 0, .flags = .{
+            .qr = true,
+            .opcode = .query,
+            .aa = false,
+            .tc = false,
+            .rd = entry.flags.rd,
+            .ra = true,
+            .z = 0,
+            .ad = false,
+            .cd = entry.flags.cd,
+            .rcode = if (last.kind == .servfail) last.rcode else if (last.kind == .nxdomain) .name_error else .no_error,
+        } },
+        .questions = try arena.dupe(dns.Question, &.{q}),
+        .answers = chain.items,
+        .authorities = authorities.items,
+        .additionals = additionals.items,
+    } };
 }
 
 fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {

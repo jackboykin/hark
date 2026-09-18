@@ -6,8 +6,7 @@
 //! Rules are pure over their inputs, scratch, now and rng; the exchange cell
 //! is the only impure leaf, settled by the edge.
 //!
-//! Step 1 scope: the delegation walk. No DNSSEC, no CNAME chase (the client
-//! root assembles chains), one core, one thread.
+//! Step 1 scope: the delegation walk. No DNSSEC, one core, one thread.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -16,9 +15,11 @@ const na = @import("../net_address.zig");
 const delegation = @import("../delegation.zig");
 const sim = @import("sim.zig");
 
+const max_cname_chain = @import("../cache.zig").max_cname_chain;
+
 pub const CellId = u32;
 
-pub const Kind = enum(u8) { cut, ns, addr, rrset, exchange };
+pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, exchange };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -98,6 +99,15 @@ pub const Reply = struct {
     ttl: u32 = 0,
 };
 
+/// A client question: the alias chain from `rrset(name, type)` to the
+/// RRset that ends it.
+pub const Answer = struct {
+    /// In chain order; every one but the last is an alias.
+    hops: []const CellId,
+    /// Looped or outran `max_cname_chain`: served as SERVFAIL.
+    broken: bool = false,
+};
+
 pub const Outcome = union(enum) {
     reply: struct { msg: dns.Message, rtt_ns: i64 },
     timeout,
@@ -114,6 +124,7 @@ pub const Value = union(Kind) {
     ns: Ns,
     addr: Addr,
     rrset: Reply,
+    answer: Answer,
     exchange: Outcome,
 };
 
@@ -204,6 +215,11 @@ const NsScratch = struct {
     cut: ?CellId = null,
 };
 
+const AnswerScratch = struct {
+    hops: [max_cname_chain + 1]CellId = undefined,
+    n: u8 = 0,
+};
+
 const ExchangeScratch = struct {
     id: u16,
     sent_name: dns.Name,
@@ -219,6 +235,7 @@ pub const Scratch = union(enum) {
     ns: NsScratch,
     addr: AddrScratch,
     rrset: RrsetScratch,
+    answer: AnswerScratch,
     exchange: ExchangeScratch,
 };
 
@@ -282,26 +299,14 @@ pub const Graph = struct {
         return .{ .kind = kind, .rtype = rtype, .name = try g.arena.dupe(u8, name.formatLower(&buf)) };
     }
 
-    /// A client's question: the memoised answer if one is fresh, else a new
-    /// cell. One payer per client question: the first cell created for it
-    /// carries the budget, and later CNAME hops (`under`) charge to it. A
-    /// memoised head or a cell some sub-resolution made never pays; its
-    /// budget is spent or absent.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, under: ?CellId) !CellId {
-        const key = try g.keyFor(.rrset, name, qtype);
-        if (g.index.get(key)) |id| {
-            const c = g.cell(id);
-            if (!c.settled or c.expires_ns > g.now()) return id;
-        }
-        const payer: ?CellId = if (under) |u| blk: {
-            const p = g.cell(g.cell(u).root);
-            break :blk if (g.cell(u).root == u and p.budget.deadline_ns > g.now()) u else null;
-        } else null;
-        const id = try g.newCell(key, name, payer orelse undefined, 0);
-        if (payer == null) {
-            g.cell(id).root = id;
-            g.cell(id).budget = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
-        }
+    /// A client question: memoised if fresh or in progress, else a new
+    /// cell with its own budget.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType) !CellId {
+        const key = try g.keyFor(.answer, name, qtype);
+        if (g.lookup(key)) |id| return id;
+        const id: CellId = @intCast(g.cells.items.len);
+        _ = try g.newCell(key, name, id, 0);
+        g.cell(id).budget = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         try g.index.put(g.gpa, key, id);
         try g.ready.append(g.gpa, id);
         return id;
@@ -356,6 +361,7 @@ pub const Graph = struct {
                 .ns => .{ .ns = .{} },
                 .addr => .{ .addr = .{} },
                 .rrset => .{ .rrset = .{} },
+                .answer => .{ .answer = .{} },
                 .exchange => .none,
             },
         };
@@ -449,8 +455,37 @@ pub const Graph = struct {
             .rrset => try g.runRrset(id),
             .ns => try g.runNs(id),
             .addr => try g.runAddr(id),
+            .answer => try g.runAnswer(id),
             .exchange => {},
         }
+    }
+
+    /// `answer(name, type)`: `rrset(name, type)`, then each alias's target
+    /// until an RRset ends the chain. Length and loop checks run at demand
+    /// time; a chain that fails them is a resolution failure, a fact for
+    /// the SERVFAIL window like any other.
+    fn runAnswer(g: *Graph, id: CellId) !void {
+        const qtype = g.cell(id).key.rtype;
+        const s = &g.cell(id).scratch.answer;
+        var next = g.cell(id).name;
+        while (true) {
+            if (s.n > 0) {
+                const last = g.cell(s.hops[s.n - 1]);
+                if (!last.settled) return;
+                const r = last.value.rrset;
+                if (r.kind != .alias or qtype == .cname) break;
+                next = r.target;
+                var broken = s.n > max_cname_chain;
+                for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
+                if (broken) return g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .broken = true } }, g.failureExpiry(id));
+            }
+            // Nothing waits on an answer cell, so its demands cannot cycle.
+            s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse unreachable;
+            s.n += 1;
+        }
+        var expires: i64 = std.math.maxInt(i64);
+        for (s.hops[0..s.n]) |h| expires = @min(expires, g.cell(h).expires_ns);
+        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]) } }, expires);
     }
 
     /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
