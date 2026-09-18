@@ -16,6 +16,8 @@ const Status = dnssec.SecurityStatus;
 pub const Chain = struct {
     status: Status,
     records: []const RR = &.{},
+    /// `secure` only: where the signatures' validity ends (`rrsigTtlCap`).
+    proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
 pub const DsScratch = struct { parent: ?CellId = null, keys: ?CellId = null, rrset: ?CellId = null };
@@ -228,7 +230,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 }
                 status = dnssec.weakest(status, verdict);
             }
-            try g.settle(id, .{ .secure = .{ .status = status } }, @min(expires, capExpiry(g, cap)));
+            try g.settle(id, .{ .secure = .{ .status = status, .proven_until_ns = if (status == .secure) capExpiry(g, cap) else std.math.maxInt(i64) } }, @min(expires, capExpiry(g, cap)));
         },
         .nodata, .nxdomain => {
             const signer = dnssec.authoritySigner(r.authorities) orelse return settleSecure(g, id, .bogus);
@@ -242,7 +244,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             expires = @min(expires, kc.expires_ns);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, &budget, &cap) != .secure) return settleSecure(g, id, .bogus);
             switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, &budget)) {
-                .secure => try g.settle(id, .{ .secure = .{ .status = .secure } }, @min(expires, capExpiry(g, cap))),
+                .secure => try g.settle(id, .{ .secure = .{ .status = .secure, .proven_until_ns = capExpiry(g, cap) } }, @min(expires, capExpiry(g, cap))),
                 .insecure => try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
                 .bogus, .unchecked => try settleSecure(g, id, .bogus),
             }

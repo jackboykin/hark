@@ -21,26 +21,33 @@ pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
 }
 
 /// The settled answer cell `root`, its chain aged to now and shaped for
-/// the client. A bogus chain is SERVFAIL unless CD; signatures only to a
-/// DO client; AD claims the whole chain, set only when asked for (RFC
-/// 6840 §5.7).
+/// the client. A bogus chain is SERVFAIL unless CD; a verified hop's TTLs
+/// are bounded by its proof's remaining validity; signatures only to a DO
+/// client; AD claims the whole chain, set only when asked for (RFC 6840
+/// §5.7).
 pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
     const a = g.cell(root).value.answer;
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
     var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
     var age: u32 = 0;
+    var life: u32 = std.math.maxInt(u32);
     const served = !a.broken and (a.status != .bogus or c.cd);
-    if (served) for (a.hops) |h| {
+    if (served) for (a.hops, 0..) |h, i| {
         last = g.cell(h).value.rrset;
         age = @intCast(@divTrunc(g.now() - last.stored_ns, std.time.ns_per_s));
-        try appendAged(arena, &chain, last.answers, age, c.do_bit);
+        life = std.math.maxInt(u32);
+        if (i < a.judged.len) {
+            const proven = g.cell(a.judged[i]).value.secure.proven_until_ns;
+            life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
+        }
+        try appendAged(arena, &chain, last.answers, age, life, c.do_bit);
     };
     const positive = last.kind == .answer or last.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, last.authorities, age, c.do_bit);
-        try appendAged(arena, &additionals, last.additionals, age, c.do_bit);
+        try appendAged(arena, &authorities, last.authorities, age, life, c.do_bit);
+        try appendAged(arena, &additionals, last.additionals, age, life, c.do_bit);
     }
     return .{ .cacheable = g.cell(root).expires_ns > g.now(), .msg = .{
         .header = .{ .id = 0, .flags = .{
@@ -62,13 +69,13 @@ pub fn answer(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Ques
     } };
 }
 
-/// TTLs less the time since the reply was taken; signatures only when
-/// wanted.
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, sigs: bool) !void {
+/// TTLs less the time since the reply was taken, at most `life`;
+/// signatures only when wanted.
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, sigs: bool) !void {
     for (rrs) |rr| {
         if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
-        aged.ttl = rr.ttl -| age;
+        aged.ttl = @min(rr.ttl -| age, life);
         try out.append(arena, aged);
     }
 }

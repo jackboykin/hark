@@ -151,6 +151,8 @@ pub const Answer = struct {
     broken: bool = false,
     /// The weakest `secure(hop)` verdict; `.unchecked` with DNSSEC off.
     status: dnssec.SecurityStatus = .unchecked,
+    /// `secure(hop)` per hop; empty with DNSSEC off.
+    judged: []const CellId = &.{},
 };
 
 pub const Outcome = union(enum) {
@@ -653,7 +655,7 @@ pub const Graph = struct {
             }
             if (status == .bogus) expires = g.failureExpiry(id);
         }
-        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .status = status } }, expires);
+        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .status = status, .judged = try g.arena.dupe(CellId, s.judged[0..s.nj]) } }, expires);
     }
 
     /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
