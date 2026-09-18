@@ -356,8 +356,8 @@ pub const Graph = struct {
         errdefer g.deinit();
         // The root cut and NS set are axiomatic facts.
         const root: dns.Name = .{ .labels = &.{} };
-        try g.store.put(.{ .kind = .cut, .name = "" }, try g.store.build(.{ .cut = .{ .zone = root } }), std.math.maxInt(i64), 0);
-        try g.store.put(.{ .kind = .ns, .name = "" }, try g.store.build(.{ .ns = .{ .names = &.{} } }), std.math.maxInt(i64), 0);
+        try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = root } }, std.math.maxInt(i64));
+        try g.fact(.{ .kind = .ns, .name = "" }, .{ .ns = .{ .names = &.{} } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -658,9 +658,9 @@ pub const Graph = struct {
                 const blob = try g.store.build(value);
                 c.blob = blob;
                 c.value = try store.Store.parse(c.arena.allocator(), blob);
-                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns, g.now()) catch |err| switch (err) {
-                    error.Refused => {},
-                    else => return err,
+                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns, g.now()) catch |err| {
+                    g.store.unref(blob);
+                    if (err != error.Refused) return err;
                 };
             },
             .secure => |v| if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns),
@@ -772,10 +772,9 @@ pub const Graph = struct {
     pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !void {
         if (expires_ns <= g.now()) return;
         const blob = try g.store.build(value);
-        errdefer g.store.unref(blob);
-        g.store.put(key, blob, expires_ns, g.now()) catch |err| switch (err) {
-            error.Refused => {},
-            else => return err,
+        g.store.put(key, blob, expires_ns, g.now()) catch |err| {
+            g.store.unref(blob);
+            if (err != error.Refused) return err;
         };
     }
 

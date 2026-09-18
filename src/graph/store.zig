@@ -131,6 +131,7 @@ pub const Store = struct {
     }
 
     /// Takes one reference. A new key over the cap must have knocked before.
+    /// Takes the caller's reference on success; on any error it stays theirs.
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
@@ -140,10 +141,11 @@ pub const Store = struct {
             errdefer s.map.swapRemoveAt(gop.index);
             if (s.held + blob.len > s.cap and !s.knock(key)) {
                 s.refusals += 1;
-                s.unref(blob);
                 return error.Refused;
             }
             gop.key_ptr.name = try s.gpa.dupe(u8, key.name);
+            // Runs before the swapRemoveAt above, while the key is still in place.
+            errdefer s.gpa.free(gop.key_ptr.name);
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
         // A new version drops any hold.
@@ -482,15 +484,16 @@ test "the cap holds by eviction and admission" {
         const blob = try s.build(.{ .cut = .{ .zone = zone } });
         s.put(key, blob, 10, 0) catch |err| {
             try testing.expectEqual(error.Refused, err);
-            try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+            try s.put(key, blob, 10, 0);
         };
     }
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
     try testing.expect(s.refusals > 0);
     const key: Key = .{ .kind = .cut, .name = "again" };
-    try testing.expectError(error.Refused, s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0));
-    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+    const again = try s.build(.{ .cut = .{ .zone = zone } });
+    try testing.expectError(error.Refused, s.put(key, again, 10, 0));
+    try s.put(key, again, 10, 0);
     try testing.expect(s.get(key, 0) != null);
     try testing.expectEqual(s.held, s.bytes);
 }
