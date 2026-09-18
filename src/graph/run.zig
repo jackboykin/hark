@@ -109,7 +109,8 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         }
         var r = g.cell(root).value.rrset;
         const age: u32 = @intCast(@divTrunc(s.now_ns - r.stored_ns, std.time.ns_per_s));
-        if (r.kind == .alias) {
+        // A CNAME question is answered by the alias itself.
+        if (r.kind == .alias and q.qtype != .cname) {
             // A chain revisiting an owner, or past max_cname_chain, is a
             // resolution failure (today's loopServfail / CnameChainTooLong).
             seen[hops] = name;
@@ -124,7 +125,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
             r = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
             chain.clearRetainingCapacity();
         }
-        const positive = r.kind == .answer;
+        const positive = r.kind == .answer or r.kind == .alias;
         const minimal = scenario.minimal_responses orelse true;
         var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
         var additionals: std.ArrayList(dns.ResourceRecord) = .empty;

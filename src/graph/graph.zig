@@ -746,6 +746,12 @@ pub const Graph = struct {
             .target = cur,
             .stored_ns = g.now(),
         };
+        // A CNAME question is answered by the alias itself, the fact
+        // `publishAlias` records for every other type.
+        if (qtype == .cname and answered) {
+            reply.kind = .alias;
+            reply.target = keep.items[0].rdata.cname;
+        }
         switch (msg.header.flags.rcode) {
             .no_error => {},
             .name_error => reply.kind = .nxdomain,
