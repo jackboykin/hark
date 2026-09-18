@@ -7,7 +7,8 @@ const Smith = testing.Smith;
 const dns = @import("dns.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
-const cache = @import("cache.zig");
+const graph = @import("graph/graph.zig");
+const store = @import("graph/store.zig");
 const config = @import("config.zig");
 
 const types = [_]u16{ 1, 2, 5, 6, 12, 15, 16, 28, 39, 41, 43, 46, 47, 48, 50, 51, 64, 65, 99, 257, 0, 65535 };
@@ -173,11 +174,11 @@ test "fuzz: wire message chain" {
     }.one, .{});
 }
 
-// Global so state accumulates across inputs; the small budget keeps eviction
-// and the counting allocator's refusal path hot.
-var shared_cache: ?cache.RRsetCache = null;
+// Global so state accumulates across inputs; the small cap keeps eviction
+// and admission hot.
+var shared_store: ?store.Store = null;
 
-test "fuzz: cache store and lookup" {
+test "fuzz: store round trip" {
     try testing.fuzz({}, struct {
         fn one(_: void, s: *Smith) anyerror!void {
             var w: Wire = .{};
@@ -185,17 +186,24 @@ test "fuzz: cache store and lookup" {
             defer arena.deinit();
             const alloc = arena.allocator();
             const msg = dns.parseMessage(alloc, genMessage(s, &w)) catch return;
-            if (shared_cache == null) shared_cache = cache.RRsetCache.init(.{ .backing = std.heap.smp_allocator, .max_bytes = 64 * 1024, .io = testing.io });
-            const c = &shared_cache.?;
+            if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
+            const st = &shared_store.?;
+            const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name{ .labels = &.{} };
+            const reply: graph.Reply = .{ .kind = .answer, .rcode = msg.header.flags.rcode, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             var buf: [dns.max_dotted_len + 1]u8 = undefined;
-            for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities }) |sec| for (sec) |rr| {
-                c.storeResponse(msg, rr.name, .unchecked, std.math.maxInt(u32));
-                const name = rr.name.formatLower(&buf);
-                c.storeNegative(name, rr.rtype, .in, .name_error, msg.authorities, rr.name, .unchecked, std.math.maxInt(u32));
-                if (c.lookup(alloc, name, rr.rtype, .in)) |_| {}
-                _ = c.containsFresh(name, rr.rtype, .in);
-            };
-            for (msg.questions) |q| if (c.lookup(alloc, q.name.formatLower(&buf), q.qtype, .in)) |_| {};
+            const key: graph.Key = .{ .kind = .rrset, .rtype = if (msg.questions.len > 0) msg.questions[0].qtype else .a, .name = owner.formatLower(&buf) };
+            const blob = st.build(.{ .rrset = reply }) catch return;
+            st.put(key, blob, 10, 0) catch st.unref(blob);
+            const got = st.get(key, 0) orelse return;
+            const back = (try store.Store.parse(alloc, got.blob)).rrset;
+            for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities, reply.additionals }, [_][]const dns.ResourceRecord{ back.answers, back.authorities, back.additionals }) |want, have| {
+                try testing.expectEqual(want.len, have.len);
+                for (want, have) |a, b| {
+                    var wa: [4096]u8 = undefined;
+                    var wb: [4096]u8 = undefined;
+                    try testing.expectEqualSlices(u8, (try dns.buildResourceRecordWire(&wa, a)).bytes, (try dns.buildResourceRecordWire(&wb, b)).bytes);
+                }
+            }
         }
     }.one, .{});
 }
