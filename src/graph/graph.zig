@@ -6,20 +6,22 @@
 //! Rules are pure over their inputs, scratch, now and rng; the exchange cell
 //! is the only impure leaf, settled by the edge.
 //!
-//! Step 1 scope: the delegation walk. No DNSSEC, one core, one thread.
+//! So far: the delegation walk and the chain of trust (trust.zig); one core.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const delegation = @import("../delegation.zig");
+const dnssec = @import("../dnssec.zig");
 const sim = @import("sim.zig");
+const trust = @import("trust.zig");
 
 const max_cname_chain = @import("../cache.zig").max_cname_chain;
 
 pub const CellId = u32;
 
-pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, exchange };
+pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -53,7 +55,8 @@ pub const Config = struct {
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     servfail_ttl: u32 = 5,
-    /// Print every exchange completion; for reading a failing scenario.
+    /// Null: DNSSEC off, nothing is judged.
+    trust_anchor: ?dns.DsData = null,
     trace: bool = false,
 };
 
@@ -92,6 +95,8 @@ pub const Reply = struct {
     additionals: []const dns.ResourceRecord = &.{},
     /// `.alias` only: where the chain in `answers` ends.
     target: dns.Name = .{ .labels = &.{} },
+    /// The zone whose servers answered; what `secure` judges it against.
+    zone: dns.Name = .{ .labels = &.{} },
     ede: ?dns.Ede.Code = null,
     /// TTLs age from here.
     stored_ns: i64 = 0,
@@ -106,6 +111,8 @@ pub const Answer = struct {
     hops: []const CellId,
     /// Looped or outran `max_cname_chain`: served as SERVFAIL.
     broken: bool = false,
+    /// The weakest `secure(hop)` verdict; `.unchecked` with DNSSEC off.
+    status: dnssec.SecurityStatus = .unchecked,
 };
 
 pub const Outcome = union(enum) {
@@ -125,6 +132,9 @@ pub const Value = union(Kind) {
     addr: Addr,
     rrset: Reply,
     answer: Answer,
+    ds: trust.Chain,
+    dnskey: trust.Chain,
+    secure: trust.Chain,
     exchange: Outcome,
 };
 
@@ -172,9 +182,18 @@ pub const Ask = struct {
         a.* = .{ .zone = zone };
     }
 
-    /// No server left. The best failing reply is the answer; a lame or
-    /// recursor reply (rank 0) leaves as a bare SERVFAIL so the randomised
-    /// order cannot flip what the stub sees.
+    /// Referral glue, used before the addr cells whatever its TTL.
+    fn seed(a: *Ask, addrs: []const na.Address, rng: std.Random) void {
+        a.nservers = @intCast(@min(addrs.len, max_servers));
+        @memcpy(a.servers[0..a.nservers], addrs[0..a.nservers]);
+        for (0..a.nservers) |i| a.order[i] = @intCast(i);
+        rng.shuffle(u8, a.order[0..a.nservers]);
+        a.next = 0;
+        a.have_servers = a.nservers > 0;
+    }
+
+    /// A rank-0 reply (lame, recursor) leaves as bare SERVFAIL so the
+    /// randomised server order cannot change what the stub sees.
     fn giveUp(a: *Ask) Result {
         var msg = a.held orelse return .exhausted;
         if (delegation.failurePrecedence(msg.header.flags.rcode) == 0) {
@@ -189,6 +208,11 @@ pub const Ask = struct {
 
 const RrsetScratch = struct {
     cut: ?CellId = null,
+    /// A fresh DNAME above the name; only a secure one redirects from
+    /// memory (Unbound's rule; dnssec/023).
+    dname: ?CellId = null,
+    dname_judge: ?CellId = null,
+    dname_checked: bool = false,
     started: bool = false,
     ask: Ask = .{},
     delegations: u8 = 0,
@@ -218,6 +242,9 @@ const NsScratch = struct {
 const AnswerScratch = struct {
     hops: [max_cname_chain + 1]CellId = undefined,
     n: u8 = 0,
+    /// `secure(hop)` per hop.
+    judged: [max_cname_chain + 1]CellId = undefined,
+    nj: u8 = 0,
 };
 
 const ExchangeScratch = struct {
@@ -236,6 +263,9 @@ pub const Scratch = union(enum) {
     addr: AddrScratch,
     rrset: RrsetScratch,
     answer: AnswerScratch,
+    ds: trust.DsScratch,
+    dnskey: trust.DnskeyScratch,
+    secure: trust.SecureScratch,
     exchange: ExchangeScratch,
 };
 
@@ -290,6 +320,11 @@ pub const Graph = struct {
         return g.edge.now_ns;
     }
 
+    /// Wall seconds, for signature windows.
+    pub fn wallNow(g: *const Graph) u32 {
+        return @intCast(g.edge.wall_sec);
+    }
+
     pub fn cell(g: *Graph, id: CellId) *Cell {
         return g.cells.items[id];
     }
@@ -330,6 +365,13 @@ pub const Graph = struct {
                     .mangled => break :blk .mangled,
                     .ok => {},
                 }
+                // 0x20 case checked; every name is a lowercase fact from here.
+                inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
+                    for (@constCast(section)) |*rr| {
+                        rr.name = try dns.cloneNameLower(g.arena, rr.name);
+                        try dns.lowercaseRDataNames(g.arena, &rr.rdata);
+                    }
+                }
                 break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
             },
         };
@@ -348,7 +390,7 @@ pub const Graph = struct {
 
     // ── Cells ──────────────────────────────────────────────────────────
 
-    fn newCell(g: *Graph, key: Key, name: dns.Name, root: CellId, depth: u8) !CellId {
+    pub fn newCell(g: *Graph, key: Key, name: dns.Name, root: CellId, depth: u8) !CellId {
         const id: CellId = @intCast(g.cells.items.len);
         const c = try g.arena.create(Cell);
         c.* = .{
@@ -362,6 +404,9 @@ pub const Graph = struct {
                 .addr => .{ .addr = .{} },
                 .rrset => .{ .rrset = .{} },
                 .answer => .{ .answer = .{} },
+                .ds => .{ .ds = .{} },
+                .dnskey => .{ .dnskey = .{} },
+                .secure => .{ .secure = .{} },
                 .exchange => .none,
             },
         };
@@ -369,7 +414,7 @@ pub const Graph = struct {
         return id;
     }
 
-    fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
+    pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
         c.settled = true;
         c.value = value;
@@ -384,15 +429,15 @@ pub const Graph = struct {
     }
 
     /// The newest fresh or pending version of `key`, if any.
-    fn lookup(g: *Graph, key: Key) ?CellId {
+    pub fn lookup(g: *Graph, key: Key) ?CellId {
         const id = g.index.get(key) orelse return null;
         const c = g.cell(id);
         return if (!c.settled or c.expires_ns > g.now()) id else null;
     }
 
-    /// Demand `key` on behalf of `by`. Returns null when `by` already
-    /// (transitively) feeds the cell: a cycle, refused before any work.
-    fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
+    /// Demand `key` for `by`. Null when `by` already (transitively) feeds
+    /// the cell: a cycle, refused before any work.
+    pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
         if (g.lookup(key)) |id| {
             if (g.fresh(id)) return id;
             if (g.reaches(by, id)) return null;
@@ -406,7 +451,7 @@ pub const Graph = struct {
         return id;
     }
 
-    fn addWaiter(g: *Graph, id: CellId, by: CellId) !void {
+    pub fn addWaiter(g: *Graph, id: CellId, by: CellId) !void {
         const c = g.cell(id);
         for (c.waiters.items) |w| if (w == by) return;
         try c.waiters.append(g.gpa, by);
@@ -456,6 +501,9 @@ pub const Graph = struct {
             .ns => try g.runNs(id),
             .addr => try g.runAddr(id),
             .answer => try g.runAnswer(id),
+            .ds => try trust.runDs(g, id),
+            .dnskey => try trust.runDnskey(g, id),
+            .secure => try trust.runSecure(g, id),
             .exchange => {},
         }
     }
@@ -485,7 +533,19 @@ pub const Graph = struct {
         }
         var expires: i64 = std.math.maxInt(i64);
         for (s.hops[0..s.n]) |h| expires = @min(expires, g.cell(h).expires_ns);
-        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]) } }, expires);
+        var status: dnssec.SecurityStatus = .unchecked;
+        if (g.cfg.trust_anchor != null) {
+            while (s.nj < s.n) : (s.nj += 1) s.judged[s.nj] = try trust.demandSecure(g, id, s.hops[s.nj]);
+            status = .secure;
+            for (s.judged[0..s.nj]) |j| {
+                const c = g.cell(j);
+                if (!c.settled) return;
+                status = dnssec.weakest(status, c.value.secure.status);
+                expires = @min(expires, c.expires_ns);
+            }
+            if (status == .bogus) expires = g.failureExpiry(id);
+        }
+        try g.settle(id, .{ .answer = .{ .hops = try g.arena.dupe(CellId, s.hops[0..s.n]), .status = status } }, expires);
     }
 
     /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
@@ -526,7 +586,7 @@ pub const Graph = struct {
                 const walk: delegation.Walk = .{ .name = "", .target = name, .zone = pc.zone };
                 switch (delegation.probeStep(r.msg, &walk, g.cfg.addr_policy)) {
                     .referral => |ref| {
-                        const expires = try g.absorbReferral(id, ref, r.msg);
+                        const expires = try g.absorbReferral(id, ref, r.msg, pc.zone);
                         try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1 } }, expires);
                     },
                     .nxdomain, .failed => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = true } }, g.now()),
@@ -629,11 +689,11 @@ pub const Graph = struct {
         const s = &g.cell(id).scratch.rrset;
         if (!s.started) {
             if (s.cut == null) {
-                // A cut at the name itself exists only from a referral to
-                // it; otherwise the walk starts at the parent's cut.
+                // A cut at the name itself exists only from a referral;
+                // otherwise start at the parent's. A DS always lives there.
                 const own = try g.keyFor(.cut, name, .a);
                 const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
-                const key = if (g.lookup(own) != null or name.labels.len == 0) own else try g.keyFor(.cut, parent_name, .a);
+                const key = if (qtype != .ds and (g.lookup(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
                 const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
                 s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
                     return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
@@ -641,6 +701,19 @@ pub const Graph = struct {
             const cut = g.cell(s.cut.?);
             if (!cut.settled) return;
             if (cut.value.cut.failed) return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
+            // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
+            if (!s.dname_checked) {
+                s.dname_checked = true;
+                s.dname = try g.dnameAbove(name);
+                if (s.dname) |did| s.dname_judge = try trust.demandSecure(g, id, did);
+            }
+            if (s.dname_judge) |jid| {
+                if (!g.cell(jid).settled) return;
+                if (g.cell(jid).value.secure.status == .secure) {
+                    const reply = try g.dnameRedirect(name, s.dname.?);
+                    return g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
+                }
+            }
             s.ask.reset(cut.value.cut.zone);
             s.started = true;
         }
@@ -655,12 +728,20 @@ pub const Graph = struct {
                         if (s2.delegations >= g.cfg.max_delegations)
                             return g.settle(id, .{ .rrset = servfail(.no_reachable_authority) }, g.failureExpiry(id));
                         s2.delegations += 1;
-                        _ = try g.absorbReferral(id, ref, r.msg);
+                        _ = try g.absorbReferral(id, ref, r.msg, zone);
+                        // The parent's referral to the zone itself is its
+                        // answer about the zone's DS (RFC 4035 §3.1.4.1).
+                        if (qtype == .ds and ref.zone_cut.eql(name)) {
+                            const reply = try trust.referralDs(g, r.msg, zone, name);
+                            return g.settle(id, .{ .rrset = reply }, g.replyExpiry(reply));
+                        }
                         s2.ask.reset(ref.zone_cut);
+                        s2.ask.seed(ref.addrs[0..ref.addr_count], g.edge.random());
                         continue;
                     }
                     const reply = try g.classify(r.msg, zone, name, qtype);
                     try g.publishAlias(id, name, qtype, reply);
+                    try g.publishDnames(id, reply);
                     return g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) g.failureExpiry(id) else g.replyExpiry(reply));
                 },
             }
@@ -685,6 +766,47 @@ pub const Graph = struct {
         _ = try g.publish(try g.keyFor(.rrset, name, .cname), name, by, .{ .rrset = hop }, g.replyExpiry(hop));
     }
 
+    /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
+    /// so later names under it redirect from memory.
+    fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
+        for (reply.answers) |d| {
+            if (d.rtype != .dname) continue;
+            var keep: std.ArrayList(dns.ResourceRecord) = .empty;
+            try keep.append(g.arena, d);
+            try keepSigs(g, &keep, reply.answers, d.name, .dname);
+            const fact: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+            _ = try g.publish(try g.keyFor(.rrset, d.name, .dname), d.name, by, .{ .rrset = fact }, g.replyExpiry(fact));
+        }
+    }
+
+    /// The closest fresh DNAME fact above `name` (RFC 6672 §3.2).
+    fn dnameAbove(g: *Graph, name: dns.Name) !?CellId {
+        var i: usize = 1;
+        while (i < name.labels.len) : (i += 1) {
+            const owner: dns.Name = .{ .labels = name.labels[i..] };
+            const did = g.lookup(try g.keyFor(.rrset, owner, .dname)) orelse continue;
+            if (g.fresh(did) and g.cell(did).value.rrset.kind == .answer) return did;
+        }
+        return null;
+    }
+
+    /// The alias a DNAME fact synthesises for `name`, aged from when the
+    /// DNAME was taken.
+    fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
+        const d = g.cell(did).value.rrset;
+        const dname = for (d.answers) |rr| {
+            if (rr.rtype == .dname) break rr;
+        } else unreachable;
+        var keep: std.ArrayList(dns.ResourceRecord) = .empty;
+        try keep.appendSlice(g.arena, d.answers);
+        if (try dns.substituteSuffix(g.arena, name, dname.name, dname.rdata.dname)) |target| {
+            try keep.append(g.arena, .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
+            return .{ .kind = .alias, .rcode = .no_error, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+        }
+        // RFC 6672 §3.3: the substituted name is too long; YXDOMAIN.
+        return .{ .kind = .servfail, .rcode = .yx_domain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+    }
+
     fn servfail(ede: dns.Ede.Code) Reply {
         return .{ .kind = .servfail, .rcode = .server_failure, .aa = false, .ede = ede };
     }
@@ -695,9 +817,9 @@ pub const Graph = struct {
         return g.now() + if (g.cell(id).depth == 0) @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s else 0;
     }
 
-    /// A referral from a server in ns(parent): the child's cut, NS set and
-    /// glue. Returns the delegation's expiry.
-    fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message) !i64 {
+    /// Publish the child's cut, NS set and glue; returns the delegation's
+    /// expiry.
+    fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !i64 {
         var ns_ttl: u32 = std.math.maxInt(u32);
         for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
             ns_ttl = @min(ns_ttl, rr.ttl);
@@ -706,6 +828,11 @@ pub const Graph = struct {
         const names = try g.arena.dupe(dns.Name, ref.nsNames());
         _ = try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), ref.zone_cut, by, .{ .cut = .{ .zone = ref.zone_cut } }, expires);
         _ = try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), ref.zone_cut, by, .{ .ns = .{ .names = names } }, expires);
+        // The parent's word on the child's DS travels with the referral.
+        if (g.cfg.trust_anchor != null) {
+            const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
+            if (ds.ttl > 0) _ = try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, g.replyExpiry(ds));
+        }
         // Glue: provisional addresses, never displacing a fresh authoritative set.
         for (names[0..ref.glued]) |host| {
             var addrs: std.ArrayList(na.Address) = .empty;
@@ -747,7 +874,10 @@ pub const Graph = struct {
                     answered = true;
                 }
             }
-            if (answered) break;
+            if (answered) {
+                try keepSigs(g, &keep, msg.answers, cur, qtype);
+                break;
+            }
             var cname: ?dns.ResourceRecord = null;
             for (msg.answers) |rr| if (rr.rtype == .cname and rr.name.eql(cur) and rr.name.isSubdomainOf(zone)) {
                 cname = rr;
@@ -762,6 +892,7 @@ pub const Graph = struct {
             }
             if (dname) |d| {
                 try keep.append(g.arena, d);
+                try keepSigs(g, &keep, msg.answers, d.name, .dname);
                 if (cname == null) {
                     const target = try dns.substituteSuffix(g.arena, cur, d.name, d.rdata.dname) orelse break;
                     cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
@@ -769,6 +900,7 @@ pub const Graph = struct {
             }
             const c = cname orelse break;
             try keep.append(g.arena, c);
+            try keepSigs(g, &keep, msg.answers, cur, .cname);
             cur = c.rdata.cname;
         }
         var reply: Reply = .{
@@ -779,6 +911,7 @@ pub const Graph = struct {
             .authorities = msg.authorities,
             .additionals = msg.additionals,
             .target = cur,
+            .zone = zone,
             .stored_ns = g.now(),
         };
         // A CNAME question is answered by the alias itself, the fact
@@ -796,15 +929,21 @@ pub const Graph = struct {
         return reply;
     }
 
-    /// How long a reply stays a fact: the answer's shortest TTL; for an
-    /// authoritative denial, the SOA's TTL and MINIMUM (RFC 2308 §3), from
-    /// an SOA above the name and inside the zone, nothing otherwise.
+    fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
+        for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.arena, rr);
+    }
+
+    /// The answer's shortest TTL; for an authoritative denial, min of the
+    /// SOA's TTL and MINIMUM (RFC 2308 §3) from an SOA above the name and
+    /// inside the zone, nothing otherwise.
     fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
         var ttl: u32 = 0;
         switch (reply.kind) {
             .answer, .alias => {
                 ttl = std.math.maxInt(u32);
-                for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
+                for (reply.answers) |rr| if (rr.rtype != .rrsig) {
+                    ttl = @min(ttl, rr.ttl);
+                };
             },
             .nodata, .nxdomain => if (reply.aa) {
                 ttl = g.cfg.max_negative_ttl;
@@ -961,7 +1100,7 @@ pub const Graph = struct {
         const rng = g.edge.random();
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const qid = rng.int(u16);
-        const msg = try dns.buildQuery(g.arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{}, .case_rng = rng });
+        const msg = try dns.buildQuery(g.arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
         var wire_buf: [512]u8 = undefined;
         const wire = try g.arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const timeout_ms: i64 = switch (transport) {

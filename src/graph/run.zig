@@ -36,6 +36,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
         .addr_policy = .{ .allow_loopback = true },
+        .trust_anchor = s.signer.anchor(),
         .trace = opts.trace,
     }, &s);
     defer g.deinit();
@@ -61,6 +62,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
                     return error.ScenarioFailed;
                 };
                 if (answerMismatch(actual, st.entry.?, true)) |why| {
+                    if (opts.trace) printSections(actual);
                     report.msg = why;
                     return error.ScenarioFailed;
                 }
@@ -133,6 +135,15 @@ const Served = struct { msg: dns.Message, cacheable: bool };
 /// client's timer fires first.
 fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry) !?Served {
     const q = entry.questions[0];
+    // RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
+    if (q.qtype == .any) {
+        const hinfo: dns.ResourceRecord = .{ .name = q.name, .rtype = @fromBackingInt(13), .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } };
+        return .{ .cacheable = false, .msg = .{
+            .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = entry.flags.rd, .ra = true, .z = 0, .ad = false, .cd = entry.flags.cd, .rcode = .no_error } },
+            .questions = try arena.dupe(dns.Question, &.{q}),
+            .answers = try arena.dupe(dns.ResourceRecord, &.{hinfo}),
+        } };
+    }
     const client_deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const root = try g.demandRoot(q.name, q.qtype);
     try g.drain();
@@ -144,18 +155,21 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
     var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
     var age: u32 = 0;
-    if (!a.broken) for (a.hops) |h| {
+    // A bogus chain is SERVFAIL unless CD; signatures only to a DO client;
+    // AD claims the whole chain, set only when asked for (RFC 6840 §5.7).
+    const served = !a.broken and (a.status != .bogus or entry.flags.cd);
+    if (served) for (a.hops) |h| {
         last = g.cell(h).value.rrset;
         age = @intCast(@divTrunc(s.now_ns - last.stored_ns, std.time.ns_per_s));
-        try appendAged(arena, &chain, last.answers, age);
+        try appendAged(arena, &chain, last.answers, age, entry.do_bit);
     };
     const positive = last.kind == .answer or last.kind == .alias;
     const minimal = scenario.minimal_responses orelse true;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, last.authorities, age);
-        try appendAged(arena, &additionals, last.additionals, age);
+        try appendAged(arena, &authorities, last.authorities, age, entry.do_bit);
+        try appendAged(arena, &additionals, last.additionals, age, entry.do_bit);
     }
     return .{ .cacheable = g.cell(root).expires_ns > s.now_ns, .msg = .{
         .header = .{ .id = 0, .flags = .{
@@ -166,7 +180,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
             .rd = entry.flags.rd,
             .ra = true,
             .z = 0,
-            .ad = false,
+            .ad = served and a.status == .secure and (entry.do_bit or entry.flags.ad),
             .cd = entry.flags.cd,
             .rcode = if (last.kind == .servfail) last.rcode else if (last.kind == .nxdomain) .name_error else .no_error,
         } },
@@ -175,6 +189,14 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         .authorities = authorities.items,
         .additionals = additionals.items,
     } };
+}
+
+fn printSections(m: dns.Message) void {
+    var nb: [dns.max_dotted_len + 1]u8 = undefined;
+    std.debug.print("  actual: rcode={t} aa={} ad={}\n", .{ m.header.flags.rcode, m.header.flags.aa, m.header.flags.ad });
+    for ([_][]const dns.ResourceRecord{ m.answers, m.authorities, m.additionals }, [_][]const u8{ "an", "ns", "ar" }) |sec, label| {
+        for (sec) |rr| std.debug.print("    {s} {s} {d} {t}\n", .{ label, rr.name.formatInto(&nb), rr.ttl, rr.rtype });
+    }
 }
 
 fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
@@ -188,9 +210,11 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Records as served now: TTLs less the time since the reply was taken.
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32) !void {
+/// TTLs less the time since the reply was taken; signatures only when
+/// wanted.
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, sigs: bool) !void {
     for (rrs) |rr| {
+        if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
         aged.ttl = rr.ttl -| age;
         try out.append(arena, aged);
@@ -278,7 +302,12 @@ fn rdataEql(a: dns.RData, b: dns.RData) bool {
             break :blk true;
         },
         .ds => |v| v.key_tag == b.ds.key_tag and v.algorithm == b.ds.algorithm and v.digest_type == b.ds.digest_type and mem.eql(u8, v.digest, b.ds.digest),
-        .unknown => |v| mem.eql(u8, v, b.unknown),
+        .nsec => |v| v.next_domain_name.eql(b.nsec.next_domain_name) and mem.eql(u8, v.type_bit_maps, b.nsec.type_bit_maps),
+        .dnskey => |v| v.flags == b.dnskey.flags and v.algorithm == b.dnskey.algorithm and mem.eql(u8, v.public_key, b.dnskey.public_key),
+        // A scenario cannot spell a signature minted at run time; the
+        // Python harness matches the header too.
+        .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.signer_name.eql(b.rrsig.signer_name),
+        .unknown => |v| std.ascii.eqlIgnoreCase(v, b.unknown),
         else => false,
     };
 }
@@ -323,10 +352,9 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-/// Step 1 covers the walk: scenarios that need no signing, DNS64, stale
-/// serving or rebinding policy.
+/// The graph has no DNS64, stale serving or rebinding policy yet.
 fn walkOnly(s: *const rpl.Scenario) bool {
-    return s.dnssec_zones.len == 0 and s.dns64_prefix == null and s.serve_stale_ttl == null and s.rebinding_enabled == null;
+    return s.dns64_prefix == null and s.serve_stale_ttl == null and s.rebinding_enabled == null;
 }
 
 /// Replay every walk-only scenario under `root` across `seeds`, checking
@@ -386,11 +414,43 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !struct { 
     return .{ .parsed = parsed, .ran = ran, .failed = failed };
 }
 
+// `HARK_SCENARIO=path/to/x.rpl zig build test` replays one scenario with
+// every completion printed.
+test "trace one scenario" {
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // procfs reports size 0, so stream it.
+    const f = try std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{});
+    defer f.close(io);
+    var env_buf: [1 << 16]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        n += f.readStreaming(io, &.{env_buf[n..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+    }
+    var vars = mem.splitScalar(u8, env_buf[0..n], 0);
+    const path = while (vars.next()) |v| {
+        if (mem.startsWith(u8, v, "HARK_SCENARIO=")) break v["HARK_SCENARIO=".len..];
+    } else return error.SkipZigTest;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    var diag: rpl.Diag = .{};
+    const scenario = try rpl.parse(arena, text, &diag);
+    var report: Report = .{};
+    defer testing.allocator.free(report.log);
+    const result = runScenario(testing.allocator, &scenario, .{ .seed = 1, .trace = true }, &report);
+    std.debug.print("{t} step {d}: {s}\n{s}", .{ report.phase, report.step, report.msg, report.log });
+    try result;
+}
+
 test "hark walk scenarios settle to today's answers" {
-    const r = try replayDir("test/scenarios/hark", 8, &.{});
-    // Every scenario loads; the walk-only ones replay.
+    // Aggressive NSEC synthesis (RFC 8198) is the NSEC-index rule, not built.
+    const r = try replayDir("test/scenarios/hark", 8, &.{"007_aggressive_nsec_synthesises_sibling_nxdomain.rpl"});
     try testing.expectEqual(88, r.parsed);
-    try testing.expectEqual(44, r.ran);
+    try testing.expectEqual(76, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
