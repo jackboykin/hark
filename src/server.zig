@@ -1395,7 +1395,7 @@ pub fn createSocket(addr: na.Address, sock_type: u32, reuseport: bool, listen_fl
     return sock;
 }
 
-fn setupSignalFd() !posix.fd_t {
+pub fn setupSignalFd() !posix.fd_t {
     // Mask size is load-bearing: standard signals coalesce to one pending
     // signalfd_siginfo per signo, so event_loop.zig sizes its read buffer
     // (`read_buf_size`) to hold exactly this many records. Adding a signo

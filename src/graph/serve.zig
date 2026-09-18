@@ -130,6 +130,7 @@ const Watched = union(enum) {
     udp: posix.fd_t,
     listen: posix.fd_t,
     conn: *Conn,
+    signal: posix.fd_t,
     free,
 };
 
@@ -148,6 +149,7 @@ const Server = struct {
     watched: std.ArrayList(Watched) = .empty,
     pending: std.ArrayList(Pending) = .empty,
     scratch: std.heap.ArenaAllocator,
+    stopping: bool = false,
 
     fn token(s: *Server, w: Watched) !u32 {
         for (s.watched.items, 0..) |x, i| if (x == .free) {
@@ -156,6 +158,19 @@ const Server = struct {
         };
         try s.watched.append(s.gpa, w);
         return @intCast(s.watched.items.len - 1);
+    }
+
+    /// TERM and INT stop the loop; USR1 and HUP print the footprint line.
+    /// A handler is not optional: as PID 1 of a container the kernel drops
+    /// every signal the process has no disposition for, TERM included.
+    fn onSignal(s: *Server, fd: posix.fd_t) void {
+        var infos: [4]linux.signalfd_siginfo = undefined;
+        const rc = linux.read(fd, @ptrCast(&infos), @sizeOf(@TypeOf(infos)));
+        if (linux.errno(rc) != .SUCCESS) return;
+        for (infos[0 .. rc / @sizeOf(linux.signalfd_siginfo)]) |info| switch (@as(linux.SIG, @fromBackingInt(@intCast(info.signo)))) {
+            .TERM, .INT => s.stopping = true,
+            else => logFootprint(s.g),
+        };
     }
 
     fn listen(s: *Server, addr: na.Address) !void {
@@ -170,6 +185,7 @@ const Server = struct {
             .udp => |fd| try s.readUdp(fd),
             .listen => |fd| try s.accept(fd),
             .conn => |c| try s.readTcp(c, events),
+            .signal => |fd| s.onSignal(fd),
             .free => {},
         }
     }
@@ -225,6 +241,18 @@ const Server = struct {
         }
         mem.copyForwards(u8, c.buf[0 .. c.len - start], c.buf[start..c.len]);
         c.len -= start;
+    }
+
+    /// Clients still waiting get nothing; the graph frees their roots.
+    fn deinit(s: *Server) void {
+        for (s.watched.items) |w| if (w == .conn) s.drop(w.conn);
+        for (s.pending.items) |p| {
+            s.g.unhold(p.root);
+            s.gpa.free(p.wire);
+        }
+        s.pending.deinit(s.gpa);
+        s.watched.deinit(s.gpa);
+        s.scratch.deinit();
     }
 
     fn drop(s: *Server, c: *Conn) void {
@@ -362,11 +390,14 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer g.deinit();
     g.attach();
     var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .scratch = std.heap.ArenaAllocator.init(gpa) };
-    defer s.scratch.deinit();
+    defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
+    const sig = try server.setupSignalFd();
+    defer sys.close(sig);
+    try e.watch(sig, try s.token(.{ .signal = sig }), linux.EPOLL.IN);
     log.info("graph server listening on {d} address(es)", .{cfg.listen.len});
     var stats_at = e.now_ns + stats_every;
-    while (true) {
+    while (!s.stopping) {
         const ev = try e.next(e.now_ns + std.time.ns_per_s) orelse {
             s.sweep();
             if (e.now_ns >= stats_at) {
@@ -384,6 +415,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         }
         try s.settle();
     }
+    log.info("shutting down", .{});
 }
 
 const stats_every = 60 * std.time.ns_per_s;

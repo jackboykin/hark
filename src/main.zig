@@ -125,7 +125,7 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io, engi
 
     // Load config: explicit --config path → /etc/hark/hark.toml → defaults.
     // Only fall through on FileNotFound; surface any other error (parse, I/O).
-    const cfg = if (config_path) |path|
+    var cfg = if (config_path) |path|
         hark.config.parseConfigFile(allocator, io, path) catch |err| {
             log.err("loading config '{s}': {s}", .{ path, @errorName(err) });
             std.process.exit(1);
@@ -143,10 +143,13 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io, engi
             log.warn("raising fd limit {d} -> {d}: {s}", .{ lim.cur, lim.max, @errorName(err) });
     } else |_| {}
 
-    if (engine == .graph) return hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
-        log.err("graph server error: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
+    if (engine == .graph) {
+        defer cfg.deinit();
+        return hark.graph.serve.run(allocator, &cfg, cli_verbose) catch |err| {
+            log.err("graph server error: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
 
     var server = Server.init(allocator, cfg, io) catch |err| {
         log.err("initializing server: {s}", .{@errorName(err)});
