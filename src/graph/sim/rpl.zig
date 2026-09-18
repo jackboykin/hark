@@ -119,6 +119,7 @@ pub const Scenario = struct {
     workers: ?u32 = null,
     dns64_prefix: ?dns64.Prefix = null,
     serve_stale_ttl: ?u32 = null,
+    min_ttl: ?u32 = null,
     client_timeout_ms: u32 = 5000,
     /// Zones the harness signs; the first must be the root.
     dnssec_zones: []const []const u8 = &.{},
@@ -243,6 +244,8 @@ const Parser = struct {
             s.dns64_prefix = dns64.Prefix.parse(val) orelse return p.fail("dns64-prefix: not an RFC 6052 prefix");
         } else if (mem.eql(u8, key, "serve-stale-ttl")) {
             s.serve_stale_ttl = try p.int(u32, val);
+        } else if (mem.eql(u8, key, "min-ttl")) {
+            s.min_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "client-timeout")) {
             const secs = std.fmt.parseFloat(f64, val) catch return p.fail("client-timeout: not a number");
             s.client_timeout_ms = @intFromFloat(secs * 1000);

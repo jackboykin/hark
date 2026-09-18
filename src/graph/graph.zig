@@ -109,6 +109,8 @@ pub const Config = struct {
     servfail_ttl: u32 = 5,
     /// Serve an expired fact this long past expiry while its refresh fails; 0: never.
     serve_stale_ttl: u32 = 0,
+    /// Floor for every TTL but zero (`walk.replyTtl`).
+    min_ttl: u32 = 0,
     /// Null: DNSSEC off, nothing is judged.
     trust_anchor: ?dns.DsData = null,
     store_bytes: usize = 12 << 20,

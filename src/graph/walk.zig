@@ -300,7 +300,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     // (bailiwick/006).
                     if (msg.header.flags.aa) {
                         const reply = try classify(g, msg, pc.zone, name, .a);
-                        try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(g, reply));
+                        try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns);
                 },
@@ -440,7 +440,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             if (!g.cell(jid).settled) return;
             if (g.cell(jid).value.secure.status == .secure) {
                 const reply = try dnameRedirect(g, name, s.dname.?);
-                return g.settle(id, .{ .rrset = reply }, replyExpiry(g, reply));
+                return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
             }
         }
         s.ask.reset(cut.value.cut.zone);
@@ -463,7 +463,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
                         const reply = try trust.referralDs(g, msg, zone, name);
-                        return g.settle(id, .{ .rrset = reply }, replyExpiry(g, reply));
+                        return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     s2.ask.reset(ref.zone_cut);
                     s2.ask.add(g, ref.addrs[0..ref.addr_count]);
@@ -487,7 +487,7 @@ fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
         holdStale(g, key, until);
         return g.settle(id, .{ .rrset = reply }, g.now());
     };
-    try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) failureExpiry(g, id) else replyExpiry(g, reply));
+    try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) failureExpiry(g, id) else replyExpiry(reply));
 }
 
 fn holdStale(g: *Graph, key: Key, until: i64) void {
@@ -527,7 +527,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .stored_ns = reply.stored_ns,
         .ttl = first.ttl,
     };
-    try g.publish(try g.keyFor(.rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(g, hop));
+    try g.publish(try g.keyFor(.rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
 /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
@@ -539,7 +539,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
         const dname: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
-        try g.publish(try g.keyFor(.rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(g, dname));
+        try g.publish(try g.keyFor(.rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
 
@@ -595,7 +595,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-        if (ds.ttl > 0) try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(g, ds));
+        if (ds.ttl > 0) try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
     }
     // Glue is only a fact: never displacing an authoritative set, nor
     // pre-empting a walk for one in progress.
@@ -700,7 +700,8 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
 
 /// The answer's shortest TTL; for an authoritative denial, min of the
 /// SOA's TTL and MINIMUM (RFC 2308 §3) from an SOA above the name and
-/// inside the zone, nothing otherwise.
+/// inside the zone, nothing otherwise. `min-ttl` floors the rest under the
+/// negative cap and the signatures' validity; by-products keep their own.
 pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
     var ttl: u32 = 0;
     switch (reply.kind) {
@@ -722,11 +723,19 @@ pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
         },
         .servfail => {},
     }
-    return ttl;
+    if (ttl == 0 or ttl >= g.cfg.min_ttl) return ttl;
+    var floor = g.cfg.min_ttl;
+    if (reply.kind == .nodata or reply.kind == .nxdomain) floor = @min(floor, g.cfg.max_negative_ttl);
+    const now = g.wallNow();
+    for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities }) |section| {
+        for (section) |rr| if (rr.rtype == .rrsig) {
+            floor = @min(floor, rr.rdata.rrsig.secondsUntilExpiry(now));
+        };
+    }
+    return @max(ttl, floor);
 }
 
-pub fn replyExpiry(g: *Graph, reply: Reply) i64 {
-    _ = g;
+pub fn replyExpiry(reply: Reply) i64 {
     return reply.stored_ns + @as(i64, reply.ttl) * std.time.ns_per_s;
 }
 

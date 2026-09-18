@@ -119,14 +119,15 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
             age = 0;
             life = walk.stale_hold_s;
         }
-        try appendAged(arena, &chain, last.answers, age, life, c.do_bit, hop_stale);
+        try appendAged(arena, &chain, last.answers, age, life, @min(g.cfg.min_ttl, last.ttl), c.do_bit, hop_stale);
     };
     const positive = last.kind == .answer or last.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, last.authorities, age, life, c.do_bit, last.ede == .stale_answer);
-        try appendAged(arena, &additionals, last.additionals, age, life, c.do_bit, last.ede == .stale_answer);
+        const floor = @min(g.cfg.min_ttl, last.ttl);
+        try appendAged(arena, &authorities, last.authorities, age, life, floor, c.do_bit, last.ede == .stale_answer);
+        try appendAged(arena, &additionals, last.additionals, age, life, floor, c.do_bit, last.ede == .stale_answer);
     }
     const ede: ?dns.Ede = if (a.broken)
         .{ .code = .other, .text = "cname loop" }
@@ -160,13 +161,13 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
     } };
 }
 
-/// TTLs less the time since the reply was taken, at most `life`;
-/// signatures only when wanted; stale records get the hold (RFC 8767 §4).
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, sigs: bool, stale: bool) !void {
+/// TTLs aged since the reply, floored to `floor` and capped by `life`; a
+/// record past its TTL in a stale reply gets the hold (RFC 8767 §4).
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, floor: u32, sigs: bool, stale: bool) !void {
     for (rrs) |rr| {
         if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
-        aged.ttl = if (stale and rr.ttl <= age) walk.stale_hold_s else @min(rr.ttl -| age, life);
+        aged.ttl = if (stale and rr.ttl <= age) walk.stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
     }
 }

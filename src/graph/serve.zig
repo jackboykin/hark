@@ -383,6 +383,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,
         .store_bytes = cfg.cache_size,
         .serve_stale_ttl = cfg.serve_stale_ttl,
+        .min_ttl = cfg.min_ttl,
         .max_in_flight = cfg.max_in_flight,
         .trace = trace,
     }, e.edge());

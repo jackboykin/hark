@@ -20,6 +20,7 @@ Hark-only extensions:
   - ; hark: workers = <n>                   header directive (optional)
   - ; hark: dns64-prefix = <pref64/n>       header directive (optional)
   - ; hark: serve-stale-ttl = <seconds>     header directive (optional)
+  - ; hark: min-ttl = <seconds>             header directive (optional)
   - ; hark: client-timeout = <seconds>      header directive: how long each QUERY waits (default 5)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
@@ -208,6 +209,7 @@ class Scenario:
     workers: int | None = None
     dns64_prefix: str | None = None
     serve_stale_ttl: int | None = None
+    min_ttl: int | None = None
     client_timeout: float = 5.0
 
 
@@ -284,6 +286,8 @@ class _Parser:
             self.scenario.dns64_prefix = val.strip()
         elif key == "serve-stale-ttl":
             self.scenario.serve_stale_ttl = int(val.strip())
+        elif key == "min-ttl":
+            self.scenario.min_ttl = int(val.strip())
         elif key == "client-timeout":
             self.scenario.client_timeout = float(val.strip())
         elif key == "dnssec-zone":
