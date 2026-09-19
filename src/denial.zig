@@ -1,9 +1,10 @@
-//! RFC 8198 aggressive use. Every NSEC a secure negative carried is the
-//! fact `rrset(owner, NSEC)`, its SOA the fact `rrset(zone, SOA)`; this
-//! index orders the spans by owner within their signing zone, so a later
-//! question inside a known span is denied from memory with the proofs
-//! fetched by key. The index only finds candidates: the verdict is
-//! `validateNegativeProof`'s, and a proof gone from the store fails closed.
+//! RFC 8198 aggressive use, NSEC only. Every NSEC a secure negative
+//! carried is the fact `rrset(owner, NSEC)`, its SOA the fact
+//! `rrset(zone, SOA)`; this index orders the spans by owner within their
+//! signing zone, so a later question inside a known span is denied from
+//! memory with the proofs fetched by key. The index only finds
+//! candidates: the verdict is `validateNegativeProof`'s, and a proof gone
+//! from the store fails closed.
 const std = @import("std");
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
