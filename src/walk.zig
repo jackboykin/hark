@@ -622,13 +622,17 @@ fn failureExpiry(g: *Graph, id: CellId) i64 {
 }
 
 /// Publish the child's cut, NS set and glue; returns the delegation's
-/// expiry.
+/// expiry, never past the referring zone's own: a delegation outliving its
+/// parent's is a ghost (Jiang et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !i64 {
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
     };
-    const expires = g.now() + @as(i64, ns_ttl) * std.time.ns_per_s;
+    // Looked up, not taken from the asking cell: a qmin stop marker names
+    // the zone but expires at once. Null: the delegation is gone already.
+    const parent = try g.peek(try g.keyFor(.cut, zone, .a));
+    const expires = @min(if (parent) |p| p.expires_ns else g.now(), g.now() + @as(i64, ns_ttl) * std.time.ns_per_s);
     const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
     try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, .{ .cut = .{ .zone = ref.zone_cut, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
     try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);

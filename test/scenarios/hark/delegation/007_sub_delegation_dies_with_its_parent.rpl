@@ -1,0 +1,117 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a delegation learned below a zone lapses with that zone's
+;
+; Ghost domain names (Jiang et al., NDSS 2012). com. delegates ghost.com.
+; for 100 s; ghost.com.'s own servers delegate sub.ghost.com. for a day.
+; After com. revokes ghost.com. and 200 s pass, names under sub.ghost.com.
+; must go through com. again and meet the NXDOMAIN, not ride the day-long
+; sub-delegation to servers the parent no longer vouches for.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 3
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ghost.com. IN A
+    SECTION AUTHORITY
+      ghost.com. 100 IN NS ns.ghost.com.
+    SECTION ADDITIONAL
+      ns.ghost.com. 100 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; ghost.com. is revoked.
+RANGE_BEGIN 4 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      ghost.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.com. 1 3600 900 604800 900
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.ghost.com. IN A
+    SECTION AUTHORITY
+      sub.ghost.com. 86400 IN NS ns.sub.ghost.com.
+    SECTION ADDITIONAL
+      ns.sub.ghost.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.ghost.com. IN A
+    SECTION ANSWER
+      www.sub.ghost.com. 30 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.ghost.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.sub.ghost.com. IN A
+  SECTION ANSWER
+    www.sub.ghost.com. 30 IN A 10.20.30.40
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 200
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.ghost.com. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    www.sub.ghost.com. IN A
+ENTRY_END
+
+SCENARIO_END
