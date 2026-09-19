@@ -1,9 +1,5 @@
 const std = @import("std");
-const mem = std.mem;
 const testing = std.testing;
-const Allocator = mem.Allocator;
-const na = @import("net_address.zig");
-const AddressKey = na.AddressKey;
 
 /// Initial timeout for unknown servers (Unbound 376, Knot 400).
 const initial_timeout_ms: u32 = 400;
@@ -49,9 +45,9 @@ const dead_probe_timeout_ms: u32 = 2_000;
 /// Maximum backoff doublings (Knot: cap at 256x initial).
 const max_backoff_shifts: u8 = 8;
 
-/// Cap on tracked nameserver entries; bounds memory under random-server
-/// load. Dropped entries revert to `initial_timeout_ms` next observation.
-const default_max_entries: u32 = 4_096;
+/// Servers tracked at once; past it an arbitrary one is forgotten and
+/// reverts to `initial_timeout_ms`. Every glue address is attacker-chosen.
+pub const max_entries: u32 = 4_096;
 
 /// Hedge stagger = `hedge_multiplier × min_rtt`. 3× lands roughly at p95 for
 /// well-behaved RTT distributions (Dean–Barroso "Tail at Scale", CACM 2013).
@@ -66,7 +62,7 @@ const max_hedge_stagger_ms: u32 = 300;
 /// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
 const failover_timeout_cap_ms: u32 = 2000;
 
-/// One server's estimate, pure; `RttCache` locks it for the pool.
+/// One server's estimate.
 pub const RttState = struct {
     /// 0 until the first observation.
     srtt_us: i64 = 0,
@@ -153,426 +149,62 @@ pub const RttState = struct {
     }
 };
 
-const EntryMap = std.HashMap(AddressKey, RttState, AddressKey.HashCtx, std.hash_map.default_max_load_percentage);
-
-/// Shard count: distribute lock + probe cost across N independent maps
-/// keyed on the high bits of AddressKey.HashCtx.
-/// The single-rwlock RttCache showed lock-acquire/release at ~5–8% of CPU
-/// on the miss workload at thread counts ≥ 32.
-const shard_count: u32 = 16;
-const shard_mask: u32 = shard_count - 1;
-
-/// `align` sets where a field starts, not how much it reserves, and auto-layout
-/// sorts by descending alignment — a bare aligned atomic lands at offset 0 with
-/// the rwlock behind it. Wrapping rounds `@sizeOf` to a full line, which works.
-const DeathGate = struct {
-    v: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-};
-
-const Shard = struct {
-    entries: EntryMap,
-    rwlock: std.Io.RwLock,
-    /// Lock-free gate; a count so a lapsed window still takes the lock.
-    dead_marked: DeathGate = .{},
-};
-
-pub const RttCache = struct {
-    shards: [shard_count]Shard,
-    io: std.Io,
-    now_fn: *const fn () i64,
-    /// Caller-visible global cap (referenced in tests as the saturation point).
-    max_entries: u32,
-    /// Precomputed `ceilDiv(max_entries, shard_count)`. Each insert checks it
-    /// against the local shard count, so storing it avoids a redundant divide.
-    per_shard_cap: u32,
-
-    pub const Config = struct {
-        allocator: Allocator,
-        io: std.Io,
-        max_entries: u32 = default_max_entries,
-    };
-
-    pub fn init(cfg: Config) RttCache {
-        var shards: [shard_count]Shard = undefined;
-        for (&shards) |*s| s.* = .{
-            .entries = EntryMap.init(cfg.allocator),
-            .rwlock = .init,
-        };
-        return .{
-            .shards = shards,
-            .io = cfg.io,
-            .now_fn = &@import("monotonic.zig").nowMs,
-            .max_entries = cfg.max_entries,
-            .per_shard_cap = (cfg.max_entries + shard_count - 1) / shard_count,
-        };
-    }
-
-    pub fn deinit(self: *RttCache) void {
-        for (&self.shards) |*s| s.entries.deinit();
-    }
-
-    fn shardFor(self: *RttCache, key: AddressKey) *Shard {
-        const h: u32 = @truncate(AddressKey.HashCtx.hash(.{}, key) >> 32);
-        return &self.shards[h & shard_mask];
-    }
-
-    pub fn getTimeout(self: *RttCache, key: AddressKey, is_last: bool, transport: Transport) u32 {
-        const shard = self.shardFor(key);
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
-        return (shard.entries.get(key) orelse RttState.unknown).timeout(is_last, transport);
-    }
-
-    pub fn recordSuccess(self: *RttCache, key: AddressKey, rtt_us: i64) void {
-        const now_ms = self.now_fn();
-        const shard = self.shardFor(key);
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-
-        const gop = shard.entries.getOrPut(key) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .unknown else releaseGate(shard, gop.value_ptr.*);
-        gop.value_ptr.observe(rtt_us, now_ms);
-        if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
-    }
-
-    /// Null until the server has answered; a dead one still gets a stagger,
-    /// filter with `isDead` first.
-    pub fn getHedgeStagger(self: *RttCache, key: AddressKey) ?u32 {
-        const shard = self.shardFor(key);
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
-        return (shard.entries.get(key) orelse return null).hedgeStagger();
-    }
-
-    pub fn recordTimeout(self: *RttCache, key: AddressKey) void {
-        const now_ms = self.now_fn();
-        const shard = self.shardFor(key);
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-
-        const gop = shard.entries.getOrPut(key) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .unknown;
-        if (gop.value_ptr.observeTimeout(now_ms)) _ = shard.dead_marked.v.fetchAdd(1, .monotonic);
-        if (shard.entries.count() > self.per_shard_cap) evictOneFrom(shard, key);
-    }
-
-    /// Evict one non-`protected` entry; a flood across many servers must not
-    /// erase healthy root/TLD scoring all at once. Lock is held by caller.
-    fn evictOneFrom(shard: *Shard, protected: AddressKey) void {
-        var it = shard.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.meta.eql(kv.key_ptr.*, protected)) continue;
-            releaseGate(shard, kv.value_ptr.*);
-            shard.entries.removeByPtr(kv.key_ptr);
-            return;
-        }
-    }
-
-    fn releaseGate(shard: *Shard, state: RttState) void {
-        if (state.consecutive_timeouts >= dead_threshold) _ = shard.dead_marked.v.fetchSub(1, .monotonic);
-    }
-
-    pub fn isDead(self: *RttCache, key: AddressKey, now_ms: i64) bool {
-        const shard = self.shardFor(key);
-        if (shard.dead_marked.v.load(.monotonic) == 0) return false;
-        shard.rwlock.lockSharedUncancelable(self.io);
-        defer shard.rwlock.unlockShared(self.io);
-        const state = shard.entries.get(key) orelse return false;
-        return state.isDead(now_ms);
-    }
-
-    /// A dead server admits one sender per lapsed window. Ask at send
-    /// time, not ranking, or the claim is wasted on a skipped server.
-    pub fn admit(self: *RttCache, key: AddressKey, now_ms: i64) bool {
-        const shard = self.shardFor(key);
-        if (shard.dead_marked.v.load(.monotonic) == 0) return true;
-        shard.rwlock.lockUncancelable(self.io);
-        defer shard.rwlock.unlock(self.io);
-        const state = shard.entries.getPtr(key) orelse return true;
-        if (state.consecutive_timeouts < dead_threshold) return true;
-        if (state.dead_until_ms > now_ms) return false;
-        state.dead_until_ms = now_ms + state.deadWindowMs();
-        return true;
-    }
-
-    pub fn nowMs(self: *const RttCache) i64 {
-        return self.now_fn();
-    }
-
-    fn count(self: *const RttCache) usize {
-        var total: usize = 0;
-        for (&self.shards) |*s| total += s.entries.count();
-        return total;
-    }
-};
-
-var test_now_ms: i64 = 1000;
-
-fn testNowMs() i64 {
-    return test_now_ms;
-}
-
-fn testAddr(last_octet: u8) AddressKey {
-    return AddressKey.fromAddress(na.initIp4(.{ 10, 0, 0, last_octet }, 53));
-}
-
-test "getTimeout returns initial for unknown server" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-
-    try testing.expectEqual(initial_timeout_ms, cache.getTimeout(testAddr(1), true, .udp));
-}
-
-test "recordSuccess updates EWMA" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-
-    const key = testAddr(1);
-
-    // First sample: srtt = 100ms, rttvar = 50ms → RTO = 300
-    // rttvar floor = srtt/4 = 25ms, actual rttvar = 50ms > 25ms, no effect
-    cache.recordSuccess(key, 100_000);
-    try testing.expectEqual(@as(u32, 300), cache.getTimeout(key, true, .udp)); // 100 + 4*50
-
-    // Second sample: 200ms → srtt moves toward 200, variance adjusts
-    cache.recordSuccess(key, 200_000);
-    const t2 = cache.getTimeout(key, true, .udp);
-    try testing.expect(t2 > 0);
-    try testing.expect(t2 <= max_timeout_ms);
-}
-
-test "entries map is bounded under random-server load" {
-    // Saturates AT the cap (single-entry eviction); does not oscillate to 0.
-    var cache = RttCache.init(.{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .max_entries = 32,
-    });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-
-    var i: u32 = 0;
-    while (i < 512) : (i += 1) {
-        const key = AddressKey.fromAddress(na.initIp4(.{
-            @intCast((i >> 16) & 0xff),
-            @intCast((i >> 8) & 0xff),
-            @intCast(i & 0xff),
-            1,
-        }, 53));
-        if (i & 1 == 0) cache.recordSuccess(key, 50_000) else cache.recordTimeout(key);
-        try testing.expect(cache.count() <= cache.max_entries);
-    }
-    // With sharded per-shard caps the steady-state count depends on hash
-    // distribution; floor at half to catch entry loss without flaking on
-    // legitimate distribution variance.
-    try testing.expect(cache.count() >= cache.max_entries / 2);
-}
-
-test "concurrent inserts under cap pressure stay bounded" {
-    // Pins the lock invariant for evictOne: if the cap-check or eviction
-    // were ever moved outside the rwlock, two threads racing inside
-    // evictOne could invalidate each other's iterator and corrupt the map.
-    var cache = RttCache.init(.{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .max_entries = 64,
-    });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-
-    const Worker = struct {
-        const inserts = 512;
-        cache: *RttCache,
-        thread_id: u8,
-
-        fn run(self: *@This()) void {
-            var i: u32 = 0;
-            while (i < inserts) : (i += 1) {
-                const k = AddressKey.fromAddress(na.initIp4(.{
-                    self.thread_id,
-                    @intCast((i >> 8) & 0xff),
-                    @intCast(i & 0xff),
-                    1,
-                }, 53));
-                if (i & 1 == 0) self.cache.recordSuccess(k, 50_000) else self.cache.recordTimeout(k);
-            }
-        }
-    };
-
-    const num_threads = 4;
-    var workers: [num_threads]Worker = undefined;
-    var threads: [num_threads]std.Thread = undefined;
-    for (0..num_threads) |i| {
-        workers[i] = .{ .cache = &cache, .thread_id = @intCast(i + 1) };
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
-    }
-    for (threads) |t| t.join();
-
-    try testing.expect(cache.count() <= cache.max_entries);
-    try testing.expect(cache.count() >= cache.max_entries / 2);
-}
-
-test "getHedgeStagger is null for an unknown server" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-
-    try testing.expectEqual(null, cache.getHedgeStagger(testAddr(1)));
-}
-
-test "getHedgeStagger uses 3x min_rtt clamped to [50, 300]" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(1);
-
-    // 80ms, 60ms, 90ms — minimum is 60ms → stagger = 180ms
-    cache.recordSuccess(key, 80_000);
-    cache.recordSuccess(key, 60_000);
-    cache.recordSuccess(key, 90_000);
-    try testing.expectEqual(@as(u32, 180), cache.getHedgeStagger(key));
-
-    // Floor: 5ms → 3*5=15 → clamped to 50ms
-    const key_low = testAddr(2);
-    cache.recordSuccess(key_low, 5_000);
-    try testing.expectEqual(@as(u32, 50), cache.getHedgeStagger(key_low));
-
-    // Ceiling: 200ms → 3*200=600 → clamped to 300ms
-    const key_high = testAddr(3);
-    cache.recordSuccess(key_high, 200_000);
-    try testing.expectEqual(@as(u32, 300), cache.getHedgeStagger(key_high));
+test "hedge stagger is 3x min_rtt clamped to [50, 300]" {
+    var s: RttState = .unknown;
+    for ([_]i64{ 80_000, 60_000, 90_000 }) |rtt| s.observe(rtt, 1000);
+    try testing.expectEqual(@as(u32, 180), s.hedgeStagger());
+    var low: RttState = .unknown;
+    low.observe(5_000, 1000);
+    try testing.expectEqual(@as(u32, 50), low.hedgeStagger());
+    var high: RttState = .unknown;
+    high.observe(200_000, 1000);
+    try testing.expectEqual(@as(u32, 300), high.hedgeStagger());
 }
 
 test "min_rtt re-anchors after hedge_decay_ms" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(1);
-
-    cache.recordSuccess(key, 20_000);
-    try testing.expectEqual(@as(u32, 60), cache.getHedgeStagger(key));
-
-    // Within decay window, 100ms doesn't move the floor.
-    test_now_ms = 1000 + hedge_decay_ms - 1;
-    cache.recordSuccess(key, 100_000);
-    try testing.expectEqual(@as(u32, 60), cache.getHedgeStagger(key));
-
-    // Past decay window, 100ms re-anchors → 3*100=300 (at the ceiling).
-    test_now_ms = 1000 + hedge_decay_ms + 1;
-    cache.recordSuccess(key, 100_000);
-    try testing.expectEqual(@as(u32, 300), cache.getHedgeStagger(key));
+    var s: RttState = .unknown;
+    s.observe(20_000, 1000);
+    try testing.expectEqual(@as(u32, 60), s.hedgeStagger());
+    s.observe(100_000, 1000 + hedge_decay_ms - 1);
+    try testing.expectEqual(@as(u32, 60), s.hedgeStagger());
+    s.observe(100_000, 1000 + hedge_decay_ms + 1);
+    try testing.expectEqual(@as(u32, 300), s.hedgeStagger());
 }
 
-test "hedge stagger survives transient timeouts that inflate RTO" {
-    // The win: hedge fires at p95 even when one timeout has doubled the RTO.
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(1);
-    cache.recordSuccess(key, 20_000);
-    const rto_clean = cache.getTimeout(key, true, .udp);
-    const hedge = cache.getHedgeStagger(key);
-
-    cache.recordTimeout(key);
-
-    try testing.expect(cache.getTimeout(key, true, .udp) > rto_clean);
-    try testing.expectEqual(hedge, cache.getHedgeStagger(key));
+test "timeouts inflate the RTO but leave the hedge stagger" {
+    var s: RttState = .unknown;
+    s.observe(20_000, 1000);
+    const rto_clean = s.timeout(true, .udp);
+    const hedge = s.hedgeStagger();
+    for (0..dead_threshold) |_| _ = s.observeTimeout(1000);
+    try testing.expect(s.timeout(true, .udp) > rto_clean);
+    try testing.expectEqual(hedge, s.hedgeStagger());
 }
 
-test "recordTimeout does not disturb min_rtt" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(1);
-    cache.recordSuccess(key, 50_000);
-    const before = cache.getHedgeStagger(key);
-
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-
-    try testing.expectEqual(before, cache.getHedgeStagger(key));
-}
-
-test "recordTimeout increments consecutive count and marks dead" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(2);
-
-    cache.recordSuccess(key, 100_000);
-    try testing.expect(!cache.isDead(key, cache.nowMs()));
-
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-    cache.recordTimeout(key);
-    try testing.expect(cache.isDead(key, cache.nowMs()));
-    try testing.expectEqual(dead_probe_timeout_ms, cache.getTimeout(key, true, .udp));
-
-    test_now_ms = 1000 + dead_duration_ms + 1;
-    try testing.expect(!cache.isDead(key, cache.nowMs()));
-    try testing.expect(cache.admit(key, cache.nowMs()));
-    try testing.expect(!cache.admit(key, cache.nowMs()));
-    try testing.expect(cache.isDead(key, cache.nowMs()));
-
-    cache.recordTimeout(key);
-    test_now_ms += 2 * dead_duration_ms - 1;
-    try testing.expect(!cache.admit(key, cache.nowMs()));
-    test_now_ms += 2;
-    try testing.expect(cache.admit(key, cache.nowMs()));
-    cache.recordSuccess(key, 100_000);
-    try testing.expect(cache.admit(key, cache.nowMs()));
-    try testing.expect(cache.admit(key, cache.nowMs()));
-    try testing.expectEqual(@as(u32, 0), cache.shardFor(key).dead_marked.v.load(.monotonic));
-}
-
-test "dead window escalation caps and eviction releases the gate" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io, .max_entries = shard_count });
-    defer cache.deinit();
-    cache.now_fn = &testNowMs;
-    test_now_ms = 1000;
-
-    const key = testAddr(3);
-    for (0..dead_threshold + dead_max_shifts + 3) |_| cache.recordTimeout(key);
-    try testing.expectEqual(dead_duration_ms << dead_max_shifts, cache.shardFor(key).entries.get(key).?.deadWindowMs());
-
-    // per-shard cap 1: this insert evicts the dead entry
-    const shard = cache.shardFor(key);
-    var octet: u8 = 4;
-    while (cache.shardFor(testAddr(octet)) != shard) octet += 1;
-    cache.recordSuccess(testAddr(octet), 100_000);
-    try testing.expectEqual(@as(u32, 0), shard.dead_marked.v.load(.monotonic));
-    try testing.expect(!cache.isDead(key, cache.nowMs()));
+test "the threshold timeout marks dead; the window lapses and escalates to a cap" {
+    var s: RttState = .unknown;
+    s.observe(100_000, 1000);
+    for (0..dead_threshold - 1) |_| try testing.expect(!s.observeTimeout(1000));
+    try testing.expect(s.observeTimeout(1000));
+    try testing.expect(s.isDead(1000));
+    try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, .udp));
+    try testing.expect(!s.isDead(1000 + dead_duration_ms));
+    for (0..dead_max_shifts + 3) |_| try testing.expect(!s.observeTimeout(1000));
+    try testing.expectEqual(dead_duration_ms << dead_max_shifts, s.deadWindowMs());
+    s.observe(100_000, 1000);
+    try testing.expect(!s.isDead(1000));
 }
 
 test "a cold exchange costs the transport's round trips of the estimate" {
-    var cache = RttCache.init(.{ .allocator = testing.allocator, .io = testing.io, .max_entries = 16 });
-    defer cache.deinit();
-    const key = testAddr(1);
-    try testing.expectEqual(initial_timeout_ms * 2, cache.getTimeout(key, true, .tcp));
-
-    for (0..8) |_| cache.recordSuccess(key, 150_000);
-    const udp = cache.getTimeout(key, true, .udp);
+    var s: RttState = .unknown;
+    try testing.expectEqual(initial_timeout_ms * 2, s.timeout(true, .tcp));
+    for (0..8) |_| s.observe(150_000, 1000);
+    const udp = s.timeout(true, .udp);
     try testing.expect(udp > min_timeout_ms);
-    try testing.expectEqual(udp * 2, cache.getTimeout(key, true, .tcp));
-    try testing.expectEqual(udp * 3, cache.getTimeout(key, true, .dot));
-
+    try testing.expectEqual(udp * 2, s.timeout(true, .tcp));
+    try testing.expectEqual(udp * 3, s.timeout(true, .dot));
     // The failover cap bounds one round trip; the cold total is above it.
-    for (0..3) |_| cache.recordTimeout(key);
-    try testing.expect(cache.getTimeout(key, true, .udp) > failover_timeout_cap_ms);
-    try testing.expectEqual(failover_timeout_cap_ms * 2, cache.getTimeout(key, false, .tcp));
+    for (0..3) |_| _ = s.observeTimeout(1000);
+    try testing.expect(s.timeout(true, .udp) > failover_timeout_cap_ms);
+    try testing.expectEqual(failover_timeout_cap_ms * 2, s.timeout(false, .tcp));
 }
