@@ -205,6 +205,10 @@ pub const AnswerScratch = struct {
 
 // ── Rules ──────────────────────────────────────────────────────────────
 
+/// `answer(name, type)`: `rrset(name, type)`, then each alias's target
+/// until an RRset ends the chain. Length and loop checks run at demand
+/// time; a chain that fails them is a resolution failure, a fact for
+/// the SERVFAIL window like any other.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
