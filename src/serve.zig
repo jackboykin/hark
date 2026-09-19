@@ -111,7 +111,8 @@ const Server = struct {
         const udp = try listenOn(addr, posix.SOCK.DGRAM);
         try s.e.watch(udp, try s.token(.{ .udp = udp }), linux.EPOLL.IN);
         const tcp = try listenOn(addr, posix.SOCK.STREAM);
-        try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN);
+        // Edge-triggered: an EMFILE accept must not re-fire until the next arrival.
+        try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN | linux.EPOLL.ET);
         var ab: [64]u8 = undefined;
         log.info("listening on {s}", .{na.format(addr, &ab)});
     }
@@ -145,7 +146,11 @@ const Server = struct {
             var pa: na.PosixAddress = undefined;
             var len: posix.socklen_t = @sizeOf(na.PosixAddress);
             const rc = linux.accept4(fd, &pa.any, &len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
-            if (linux.errno(rc) != .SUCCESS) return;
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .CONNABORTED, .INTR => continue,
+                else => return,
+            }
             const cfd: posix.fd_t = @intCast(rc);
             const addr = na.fromSockaddr(&pa);
             if (!acl.allow(s.cfg.allow_from, addr)) {
