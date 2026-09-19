@@ -410,18 +410,22 @@ pub const Graph = struct {
 
     /// Held for the client until `unhold`. A failed answer is memoised for
     /// its SERVFAIL window, not for a client with CD, who is owed the data.
-    /// Null: new work past `max_in_flight`; what is in progress or in the
-    /// store is always served.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool) !?CellId {
+    /// Null: new work past `max_in_flight`, or anything unsettled for a
+    /// caller that cannot `wait`; what is in the store is always served.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool, wait: bool) !?CellId {
         const key = try g.keyFor(.answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled or g.fresh(id)) {
+            if (!wait and !g.cell(id).settled) {
+                g.stats.clients.dropped += 1;
+                return null;
+            }
             g.cell(id).holds += 1;
             return id;
         };
         const budget = try g.gpa.create(Budget);
         budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
         const memo = if (cd) null else g.store.get(key, g.now());
-        if (memo == null and (g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
+        if (memo == null and (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
             g.stats.clients.dropped += 1;
             g.gpa.destroy(budget);
             return null;
@@ -920,9 +924,9 @@ test "a cell replacing an expired one takes over the index entry's key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    const first = (try g.demandRoot(name, .a, false)).?;
+    const first = (try g.demandRoot(name, .a, false, true)).?;
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now);
-    const second = (try g.demandRoot(name, .a, false)).?;
+    const second = (try g.demandRoot(name, .a, false, true)).?;
     try testing.expect(first != second);
     g.unhold(first);
     try testing.expect(!g.cell(first).live);
@@ -931,4 +935,28 @@ test "a cell replacing an expired one takes over the index entry's key" {
     try testing.expectEqual(second, g.index.get(key).?);
     try testing.expectEqual(g.cell(second).key.name.ptr, g.index.getKey(key).?.name.ptr);
     g.unhold(second);
+}
+
+test "a caller that cannot wait gets only what is settled" {
+    const testing = std.testing;
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    const Stub = struct {
+        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    };
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const name = try dns.parseDottedName(arena.allocator(), "example.");
+    try testing.expectEqual(null, try g.demandRoot(name, .a, false, false));
+    const first = (try g.demandRoot(name, .a, false, true)).?;
+    try testing.expectEqual(null, try g.demandRoot(name, .a, false, false));
+    try testing.expectEqual(@as(u64, 2), g.stats.clients.dropped);
+    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now + std.time.ns_per_s);
+    try testing.expectEqual(first, (try g.demandRoot(name, .a, false, false)).?);
+    g.unhold(first);
+    g.unhold(first);
 }

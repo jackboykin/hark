@@ -263,8 +263,10 @@ const Server = struct {
         if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null, s.e.now_ns);
         if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null, s.e.now_ns);
         const asked = if (d64) |d| try d.asked(arena, q) else q;
-        // BCP 140 again: turned away is silence on UDP, a close on TCP.
-        const root = try s.g.demandRoot(asked.name, asked.qtype, client.cd) orelse return if (reply == .tcp) s.drop(reply.tcp);
+        // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
+        // `max_in_flight` waiters only what is known is served (DNSBomb).
+        const wait = s.pending.items.len < s.g.cfg.max_in_flight;
+        const root = try s.g.demandRoot(asked.name, asked.qtype, client.cd, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
@@ -311,7 +313,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         const d64 = answer.Dns64.on(s.cfg.dns64, client) orelse return try answer.build(arena, s.g, p.root, q, client, s.cfg.minimal_responses, p.cached);
         const served = try answer.build(arena, s.g, p.root, try d64.asked(arena, q), client, s.cfg.minimal_responses, p.cached);
-        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, client.cd)) |a| {
+        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, client.cd, true)) |a| {
             p.a = a;
             try s.g.drain();
         };

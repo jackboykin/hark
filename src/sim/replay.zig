@@ -190,7 +190,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
 const Root = struct { id: graph.CellId, cached: bool };
 
 fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, client: answer.Client, deadline: i64) !?Root {
-    const root = (try g.demandRoot(q.name, q.qtype, client.cd)).?;
+    const root = (try g.demandRoot(q.name, q.qtype, client.cd, true)).?;
     try g.drain();
     const cached = g.cell(root).settled;
     while (!g.cell(root).settled) {
@@ -565,7 +565,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
         defer g.deinit();
         const start = s.now_ns;
-        const root = (try g.demandRoot(q.name, q.qtype, false)).?;
+        const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -597,7 +597,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
-        const root = (try g.demandRoot(q.name, q.qtype, false)).?;
+        const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -645,13 +645,13 @@ test "the door counts resolutions and exchanges in flight" {
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_in_flight = 1 }, s.edge());
     defer g.deinit();
-    const root = (try g.demandRoot(q.name, q.qtype, false)).?;
+    const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
     try g.drain();
     try testing.expectEqual(1, g.budgets);
     try testing.expectEqual(1, g.flights);
     // New work is turned away; the same question joins the one in progress.
-    try testing.expectEqual(null, try g.demandRoot(other, .a, false));
-    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, false)).?);
+    try testing.expectEqual(null, try g.demandRoot(other, .a, false, true));
+    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, false, true)).?);
     try testing.expectEqual(1, g.stats.clients.dropped);
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.flights);
