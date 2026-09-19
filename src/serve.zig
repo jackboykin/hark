@@ -174,8 +174,8 @@ const Server = struct {
             if (c.owed == 0) s.drop(c);
             return;
         }
+        // Only a whole frame resets the idle clock.
         c.len += rc;
-        c.last_ns = s.e.now_ns;
         try s.frames(c);
     }
 
@@ -188,6 +188,7 @@ const Server = struct {
             if (c.len - start < 2 + flen) break;
             c.served += 1;
             c.owed += 1;
+            c.last_ns = s.e.now_ns;
             try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c });
             // Turned away, or a failed write: the connection is gone.
             if (s.watched.items[tok & slot_mask].w != .conn) return;

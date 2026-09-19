@@ -117,6 +117,28 @@ def test_idle_connection_is_closed(hark: HarkProcess) -> None:
     assert IDLE_MS / 1000 - 0.2 <= elapsed <= IDLE_MS / 1000 + 2
 
 
+def test_dripped_frame_is_closed_at_idle(hark: HarkProcess) -> None:
+    """A byte at a time never completes a frame, so never resets the idle clock."""
+    with connect() as s:
+        s.sendall(struct.pack("!H", 512))
+        t0 = time.monotonic()
+        s.settimeout(0.4)
+        while time.monotonic() - t0 < IDLE_MS / 1000 + 3:
+            try:
+                s.sendall(b"\0")
+            except OSError:
+                break
+            try:
+                if s.recv(16) == b"":
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+        elapsed = time.monotonic() - t0
+    assert elapsed <= IDLE_MS / 1000 + 2
+
+
 def test_allow_from_refuses_tcp(tmp_path: Path) -> None:
     cfg = HarkConfig(listen_port=HARK_PORT + 1, allow_from=["192.0.2.0/24"])
     with HarkProcess(find_hark_binary(), cfg, tmp_path):
