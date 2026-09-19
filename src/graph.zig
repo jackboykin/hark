@@ -213,6 +213,8 @@ pub const Budget = struct {
     refs: u32 = 0,
     /// When a refresh began; 0 for a client.
     refresh_ns: i64 = 0,
+    /// KeyTrap: every verify the resolution does, whichever cell does it.
+    validation: dnssec.ValidationBudget = .{},
 };
 
 /// Cumulative since start; `serve.zig` prints them.

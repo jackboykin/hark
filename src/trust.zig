@@ -36,8 +36,11 @@ pub const SecureScratch = struct {
 };
 const max_groups = 8;
 
-/// Memoised from a refresh too: the marker bounds validation cost.
-fn bogusExpiry(g: *Graph) i64 {
+/// Memoised from a refresh too: the marker bounds validation cost. Not with
+/// the budget spent: that verdict may be the spending's, and the cell is
+/// shared, so a zone draining its own budget would mark a victim's keys.
+fn bogusExpiry(g: *Graph, id: CellId) i64 {
+    if (g.cell(id).budget.validation.exhausted()) return g.now();
     return g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
 }
 
@@ -61,18 +64,18 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     }
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
-        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const parent = g.cell(s.parent.?);
     if (!parent.settled) return;
-    if (parent.value.cut.failed) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+    if (parent.value.cut.failed) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const parent_zone = parent.value.cut.zone;
     if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, parent_zone, .a), parent_zone, g.cell(id).depth) orelse
-        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const parent_keys = g.cell(s.keys.?);
     if (!parent_keys.settled) return;
     if (parent_keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.value.dnskey.status } }, parent_keys.expires_ns);
     if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .ds), zone, g.cell(id).depth) orelse
-        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const rs = g.cell(s.rrset.?);
     if (!rs.settled) return;
     const r = rs.value.rrset;
@@ -80,35 +83,35 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
         .nodata, .nxdomain => dnssec.authoritySigner(r.authorities),
         .alias, .servfail => null,
-    } orelse return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
-    if (!dnssec.isProperAncestor(signer, zone)) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+    } orelse return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
+    if (!dnssec.isProperAncestor(signer, zone)) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     if (s.signer == null) s.signer = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, g.cell(id).depth) orelse
-        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const keys = g.cell(s.signer.?);
     if (!keys.settled) return;
-    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
-    var budget: dnssec.ValidationBudget = .{};
+    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
+    const budget = &g.cell(id).budget.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
     const expires = @min(rs.expires_ns, keys.expires_ns);
     switch (r.kind) {
         .answer => {
-            const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.value.dnskey.records, now, &budget) orelse
-                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+            const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.value.dnskey.records, now, budget) orelse
+                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
             const status: Status = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
         },
         .nodata, .nxdomain => {
             // RFC 4034 §3.1.3.
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
-                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
+                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
             var cap: u32 = std.math.maxInt(u32);
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.value.dnskey.records, now, &budget, &cap) != .secure)
-                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g));
-            switch (dnssec.classifyDelegation(r.authorities, zone, signer, &budget)) {
+            if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.value.dnskey.records, now, budget, &cap) != .secure)
+                return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
+            switch (dnssec.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
-                else => try g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g)),
+                else => try g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id)),
             }
         },
         .alias, .servfail => unreachable,
@@ -120,24 +123,24 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
     if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, g.cell(id).depth) orelse
-        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id));
     const ds = g.cell(s.ds.?);
     if (!ds.settled) return;
     if (ds.value.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.value.ds.status } }, ds.expires_ns);
     if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth) orelse
-        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
+        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id));
     const rs = g.cell(s.rrset.?);
     if (!rs.settled) return;
     const r = rs.value.rrset;
-    if (r.kind != .answer) return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
+    if (r.kind != .answer) return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id));
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
-    var budget: dnssec.ValidationBudget = .{};
+    const budget = &g.cell(id).budget.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
-    const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, &budget) catch
-        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g));
+    const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget) catch
+        return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id));
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = r.answers } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
 }
 
@@ -187,7 +190,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     if (!zd.settled) return;
     if (zd.value.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.value.ds.status } }, zd.expires_ns);
     var expires = @min(t.expires_ns, zd.expires_ns);
-    var budget: dnssec.ValidationBudget = .{};
+    const budget = &g.cell(id).budget.validation;
     const now = g.wallNow();
     var cap: u32 = std.math.maxInt(u32);
     switch (r.kind) {
@@ -247,13 +250,13 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 const kc = g.cell(s.keys[groups].?);
                 if (kc.value.dnskey.status != .secure) return settleSecure(g, id, .bogus);
                 expires = @min(expires, kc.expires_ns);
-                const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.value.dnskey.records, now, &budget) orelse
+                const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.value.dnskey.records, now, budget) orelse
                     return settleSecure(g, id, .bogus);
                 cap = @min(cap, dnssec.rrsigTtlCap(verified, now));
                 var verdict: Status = .secure;
                 if (verified.labels < dnssec.signedLabels(rr.name)) {
-                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, &budget, &cap) != .secure) return settleSecure(g, id, .bogus);
-                    verdict = dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, &budget);
+                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, budget, &cap) != .secure) return settleSecure(g, id, .bogus);
+                    verdict = dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget);
                     if (verdict == .bogus or verdict == .unchecked) return settleSecure(g, id, .bogus);
                 }
                 status = dnssec.weakest(status, verdict);
@@ -270,8 +273,8 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             defer clock.stop();
             if (kc.value.dnskey.status != .secure) return settleSecure(g, id, .bogus);
             expires = @min(expires, kc.expires_ns);
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, &budget, &cap) != .secure) return settleSecure(g, id, .bogus);
-            switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, &budget)) {
+            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, budget, &cap) != .secure) return settleSecure(g, id, .bogus);
+            switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
                 .secure => {
                     expires = @min(expires, capExpiry(g, cap));
                     try denial.absorb(g, id, signer, r, expires);
@@ -288,7 +291,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
 
 /// A fact for the SERVFAIL window.
 fn settleSecure(g: *Graph, id: CellId, status: Status) !void {
-    try g.settle(id, .{ .secure = .{ .status = status } }, bogusExpiry(g));
+    try g.settle(id, .{ .secure = .{ .status = status } }, bogusExpiry(g, id));
 }
 
 /// A CNAME directly under the DNAME group before it.

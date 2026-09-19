@@ -225,8 +225,8 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         expires = @min(expires, fact.expires_ns);
         try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
     }
-    var budget: dnssec.ValidationBudget = .{};
-    if (dnssec.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, &budget) != .secure) return false;
+    const budget = &g.cell(id).budget.validation;
+    if (dnssec.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, budget) != .secure) return false;
 
     var reply: graph.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,

@@ -36,24 +36,26 @@ const max_sig_verify_per_resolution: u32 = 96;
 /// CLOSED to `.bogus`; the per-record `max_nsec3_iterations` cap fails OPEN.
 const max_nsec3_hashes_per_resolution: u32 = 96;
 
-/// Per-query DNSSEC CPU budget (RRSIG verifies + NSEC3 hashes), shared
-/// tree-wide by pointer. Atomic spent-up against a fixed ceiling: exactly `max` draws succeed then refuse
-/// forever — never re-arms (a `fetchSub` down-counter would wrap u32 and silently
-/// re-grant). Two separate counters so sig and NSEC3-hash exhaustion are independent.
+/// Per-resolution DNSSEC CPU budget, shared by every cell a client question
+/// demands (`graph.Budget`). Exactly `max` draws succeed; the rest refuse.
 pub const ValidationBudget = struct {
-    sig_verify_spent: std.atomic.Value(u32) = .init(0),
+    sig_verify_spent: u32 = 0,
     max_sig_verify: u32 = max_sig_verify_per_resolution,
-    nsec3_hash_spent: std.atomic.Value(u32) = .init(0),
+    nsec3_hash_spent: u32 = 0,
     max_nsec3_hash: u32 = max_nsec3_hashes_per_resolution,
 
     pub fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.sig_verify_spent.fetchAdd(1, .monotonic) >= self.max_sig_verify)
-            return error.ValidationBudgetExhausted;
+        if (self.sig_verify_spent >= self.max_sig_verify) return error.ValidationBudgetExhausted;
+        self.sig_verify_spent += 1;
+    }
+
+    pub fn exhausted(self: *const ValidationBudget) bool {
+        return self.sig_verify_spent >= self.max_sig_verify or self.nsec3_hash_spent >= self.max_nsec3_hash;
     }
 
     fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.nsec3_hash_spent.fetchAdd(1, .monotonic) >= self.max_nsec3_hash)
-            return error.ValidationBudgetExhausted;
+        if (self.nsec3_hash_spent >= self.max_nsec3_hash) return error.ValidationBudgetExhausted;
+        self.nsec3_hash_spent += 1;
     }
 };
 
@@ -660,8 +662,8 @@ fn verifyRsa(signature: []const u8, data: *const SignedData, key_data: []const u
     // bit length. Measured on a 4096-bit modulus: e=65537 costs 0.8 ms and a
     // 511-byte exponent costs 31.6 ms. The KeyTrap budget caps the verify
     // *count* at 96, not the cost of each, so a fat exponent multiplies the
-    // whole budget — 96 x 31.6 ms = 3.0 s of CPU for one query, against 4
-    // resolution threads per worker. That is under 2 QPS to saturate.
+    // whole budget — 96 x 31.6 ms = 3.0 s of CPU for one query on the one
+    // graph thread.
     //
     // 8 bytes admits xelerance.com's 5-byte e = 2^32+1 with room;
     // RsaFe.fromBytes alone only bounds it below the modulus (511 bytes).
@@ -948,19 +950,16 @@ fn nsec3FlagsReserved(nsec3: dns.Nsec3Data) bool {
     return nsec3.flags & ~nsec3_opt_out != 0;
 }
 
-/// Per-proof NSEC3 record ceiling (Knot Resolver 5.7.1). An honest proof needs
-/// ≤3 (closest-encloser + next-closer + wildcard); more is the CVE-2023-50868
-/// flood shape, refused CLOSED to `.bogus` before any hashing.
-const max_nsec3_records_per_proof: usize = 8;
+/// Per-message NSEC/NSEC3 ceiling (Knot 5.7.1, Unbound NsecTrap). An honest
+/// proof needs ≤3; more is refused `.bogus` before any hashing or verifying.
+const max_proof_records: usize = 8;
 
-/// True when an authority section holds more NSEC3 records than any honest proof
-/// needs — the flood shape. NSEC3-only count, so NSEC proofs are unaffected.
-fn nsec3Flood(authorities: []const dns.ResourceRecord) bool {
+fn proofFlood(authorities: []const dns.ResourceRecord) bool {
     var n: usize = 0;
     for (authorities) |rr| {
-        if (rr.rtype == .nsec3) n += 1;
+        if (rr.rtype == .nsec or rr.rtype == .nsec3) n += 1;
     }
-    return n > max_nsec3_records_per_proof;
+    return n > max_proof_records;
 }
 
 pub fn nsec3Hash(
@@ -1186,7 +1185,7 @@ const Nsec3ChainParams = union(enum) {
 };
 
 fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3ChainParams {
-    if (nsec3Flood(authorities)) return .{ .verdict = .bogus };
+    if (proofFlood(authorities)) return .{ .verdict = .bogus };
 
     var salt: []const u8 = &.{};
     var iterations: u16 = 0;
@@ -1440,18 +1439,35 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
     return false;
 }
 
+/// Zone keys with tags computed once per call, not per RRSIG tried (TagTrap).
+const Keyset = struct {
+    keys: [64]dns.DnskeyData = undefined,
+    tags: [64]u16 = undefined,
+    len: usize = 0,
+
+    /// Null past 64 keys, the ceiling `validateDnskeyRrset` admits.
+    fn init(records: []const dns.ResourceRecord) ?Keyset {
+        var k: Keyset = .{};
+        for (records) |rr| {
+            if (rr.rtype != .dnskey or !isValidZoneKey(rr.rdata.dnskey)) continue;
+            if (k.len == k.keys.len) return null;
+            k.keys[k.len] = rr.rdata.dnskey;
+            k.tags[k.len] = keyTag(rr.rdata.dnskey);
+            k.len += 1;
+        }
+        return k;
+    }
+};
+
 fn rrsetVerifiesWithAnyKey(
     rrsig: dns.RrsigData,
-    dnskey_records: []const dns.ResourceRecord,
+    keyset: *const Keyset,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
 ) error{ValidationBudgetExhausted}!bool {
-    for (dnskey_records) |dk_rr| {
-        if (dk_rr.rtype != .dnskey) continue;
-        const dk = dk_rr.rdata.dnskey;
-        if (!isValidZoneKey(dk)) continue;
-        if (keyTag(dk) != rrsig.key_tag) continue;
+    for (keyset.keys[0..keyset.len], keyset.tags[0..keyset.len]) |dk, tag| {
+        if (tag != rrsig.key_tag) continue;
         if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
     }
     return false;
@@ -1516,6 +1532,7 @@ pub fn validateRrset(
         count += 1;
     }
     if (count == 0) return null;
+    const keyset = Keyset.init(dnskey_records) orelse return null;
 
     for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
@@ -1524,7 +1541,7 @@ pub fn validateRrset(
         if (!sig_rr.name.eql(owner)) continue;
         if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
-        if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, filtered[0..count], now_u32, budget) catch return null) return rrsig;
+        if (rrsetVerifiesWithAnyKey(rrsig, &keyset, filtered[0..count], now_u32, budget) catch return null) return rrsig;
     }
     // Nothing verified on a zone already proven secure — bogus, even when
     // every candidate RRSIG used an unsupported algorithm: real supported
@@ -1566,11 +1583,16 @@ pub fn verifyAuthorityProofSigs(
     for (authorities) |rr| {
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
     } else return .unchecked;
+    if (proofFlood(authorities)) return .bogus;
+    const keyset = Keyset.init(dnskey_records) orelse return .bogus;
 
-    // NSEC/NSEC3 records have unique owners per RFC 4034/5155,
-    // so no dedup is needed.
-    for (authorities) |rr| {
+    for (authorities, 0..) |rr, i| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
+        // A duplicated owner re-collects the same set; verify it once.
+        const seen = for (authorities[0..i]) |prev| {
+            if (prev.rtype == rr.rtype and prev.name.eql(rr.name)) break true;
+        } else false;
+        if (seen) continue;
 
         // Collect the RRset (all records with same owner+type). Overflow is
         // .bogus, not a truncated collect: verifying a sig over the first 16
@@ -1596,7 +1618,7 @@ pub fn verifyAuthorityProofSigs(
             // as served: a real `*.zone NSEC` signature would verify under any.
             if (rrsig.labels != signedLabels(rr.name)) return .bogus;
 
-            if (rrsetVerifiesWithAnyKey(rrsig, dnskey_records, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
+            if (rrsetVerifiesWithAnyKey(rrsig, &keyset, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
                 if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
                 sig_verified = true;
                 break;
@@ -1957,9 +1979,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
         error.ValidationBudgetExhausted,
         validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
     );
-    // cap draws succeed, the next trips exhaustion → spent == cap+1: proof the
-    // walk stopped at the ceiling and never touched all 120 attempts.
-    try testing.expectEqual(cap + 1, budget.sig_verify_spent.load(.monotonic));
+    try testing.expectEqual(cap, budget.sig_verify_spent);
 }
 
 test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
@@ -3713,13 +3733,11 @@ test "classifyDelegation refuses mixed NSEC3 parameter sets before hashing (RFC 
 
     var b: ValidationBudget = .{};
     try testing.expectEqual(SecurityStatus.bogus, classifyDelegation(&rrs, child_zone, .{ .labels = zone_labels }, &b));
-    try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent);
 }
 
-test "refuses NSEC3 floods before hashing (Knot >8-record cap)" {
-    // >8 NSEC3 records is the flood shape: refused .bogus before any hashing, on
-    // both paths, so the hash budget is untouched (spent == 0).
-    const N: usize = max_nsec3_records_per_proof + 1;
+test "refuses NSEC3 floods before hashing or verifying (Knot >8-record cap)" {
+    const N: usize = max_proof_records + 1;
     const zone_labels: []const []const u8 = &.{ "example", "com" };
     const salt: []const u8 = &.{};
     const next_owner: [20]u8 = @splat(0xFF);
@@ -3737,7 +3755,38 @@ test "refuses NSEC3 floods before hashing (Knot >8-record cap)" {
     try testing.expectEqual(SecurityStatus.bogus, classifyDelegation(&rrs, child_zone, .{ .labels = zone_labels }, &b));
     const qname = dns.Name{ .labels = &.{ "absent", "example", "com" } };
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&rrs, qname, .a, true, test_root, &b));
-    try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), b.nsec3_hash_spent);
+}
+
+test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
+    // Every RRSIG's tag matches the key, so each one tried draws on the budget.
+    const zone_labels: []const []const u8 = &.{ "example", "com" };
+    const next_owner: [20]u8 = @splat(0xFF);
+    const key: dns.ResourceRecord = .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = test_dnskey } };
+    var bufs: [2 * (max_proof_records + 1)]Nsec3OwnerBufs = undefined;
+    var rrs: [2 * (max_proof_records + 1)]dns.ResourceRecord = undefined;
+    for (0..max_proof_records + 1) |i| {
+        bufs[i] = .{};
+        const owner = makeNsec3OwnerName(@as([20]u8, @splat(@as(u8, @intCast(i ^ 0xA5)))), zone_labels, &bufs[i]);
+        rrs[2 * i] = makeNsec3Rr(owner, &.{}, &next_owner, &.{});
+        rrs[2 * i + 1] = .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = .{
+            .type_covered = .nsec3,
+            .algorithm = .rsasha256,
+            .labels = 3,
+            .original_ttl = 300,
+            .sig_expiration = 0xFFFFFFFF,
+            .sig_inception = 0,
+            .key_tag = keyTag(test_dnskey),
+            .signer_name = test_owner,
+            .signature = &.{ 0xDE, 0xAD },
+        } } };
+    }
+    var at_cap: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(rrs[0 .. 2 * max_proof_records], &.{key}, 1700000000, &at_cap, null));
+    try testing.expect(at_cap.sig_verify_spent > 0);
+    var past: ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&rrs, &.{key}, 1700000000, &past, null));
+    try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
 test "NSEC3 budget accumulates across negative-proof calls" {
@@ -3756,7 +3805,7 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     var b: ValidationBudget = .{ .max_nsec3_hash = 2 };
     const first = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.unchecked, first);
-    try testing.expectEqual(@as(u32, 2), b.nsec3_hash_spent.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), b.nsec3_hash_spent);
     const second = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.bogus, second);
 }
@@ -3843,7 +3892,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
             &budget,
         ));
     }
-    try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent);
     try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
         test_window_rrsig,
         test_window_dnskey,
