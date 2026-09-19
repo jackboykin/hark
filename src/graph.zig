@@ -348,7 +348,7 @@ pub const Graph = struct {
     /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
     ready: std.ArrayList(CellId) = .empty,
-    /// Per-server estimate; the one state outliving a demand.
+    /// Per-server estimate, capped; the one state outliving a demand.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
     /// Verified NSEC facts in span order (denial.zig).
@@ -827,20 +827,25 @@ pub const Graph = struct {
         }
     }
 
-    /// `answer(name, type)`: `rrset(name, type)`, then each alias's target
-    /// until an RRset ends the chain. Length and loop checks run at demand
-    /// time; a chain that fails them is a resolution failure, a fact for
-    /// the SERVFAIL window like any other.
     pub fn observe(g: *Graph, server: na.Address, rtt_ns: i64) !void {
-        const gop = try g.rtt.getOrPut(g.gpa, na.AddressKey.fromAddress(server));
-        if (!gop.found_existing) gop.value_ptr.* = .unknown;
-        gop.value_ptr.observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
+        (try g.estimate(server)).observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
     }
 
     pub fn observeTimeout(g: *Graph, server: na.Address) !void {
-        const gop = try g.rtt.getOrPut(g.gpa, na.AddressKey.fromAddress(server));
-        if (!gop.found_existing) gop.value_ptr.* = .unknown;
-        _ = gop.value_ptr.observeTimeout(g.nowMs());
+        _ = (try g.estimate(server)).observeTimeout(g.nowMs());
+    }
+
+    /// Past `ns_rtt.max_entries` servers, an arbitrary other one is forgotten.
+    fn estimate(g: *Graph, server: na.Address) !*ns_rtt.RttState {
+        const key = na.AddressKey.fromAddress(server);
+        if (g.rtt.getPtr(key)) |s| return s;
+        if (g.rtt.count() >= ns_rtt.max_entries) {
+            var it = g.rtt.keyIterator();
+            g.rtt.removeByPtr(it.next().?);
+        }
+        const gop = try g.rtt.getOrPut(g.gpa, key);
+        gop.value_ptr.* = .unknown;
+        return gop.value_ptr;
     }
 
     pub fn nowMs(g: *const Graph) i64 {
