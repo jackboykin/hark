@@ -137,7 +137,7 @@ pub const Cut = struct {
     addrs: []const na.Address = &.{},
 };
 
-/// NS names from the parent referral. The root's is empty: hints carry
+/// NS names from the parent referral. The root has none: hints carry
 /// addresses, not names.
 pub const Ns = struct { names: []const dns.Name };
 
@@ -360,10 +360,8 @@ pub const Graph = struct {
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
-        // The root cut and NS set are axiomatic facts.
-        const root: dns.Name = .{ .labels = &.{} };
-        try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = root } }, std.math.maxInt(i64));
-        try g.fact(.{ .kind = .ns, .name = "" }, .{ .ns = .{ .names = &.{} } }, std.math.maxInt(i64));
+        // The root cut is an axiom; `runCut` re-derives it if evicted.
+        try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -959,4 +957,25 @@ test "a caller that cannot wait gets only what is settled" {
     try testing.expectEqual(first, (try g.demandRoot(name, .a, false, false)).?);
     g.unhold(first);
     g.unhold(first);
+}
+
+test "an evicted root cut is re-derived, not walked" {
+    const testing = std.testing;
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    const Stub = struct {
+        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    };
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    defer g.deinit();
+    const root_cut: Key = .{ .kind = .cut, .name = "" };
+    g.store.remove(root_cut);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, false, true)).?;
+    try g.drain();
+    try testing.expect(g.store.get(root_cut, now) != null);
+    g.unhold(root);
 }

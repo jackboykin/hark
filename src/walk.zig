@@ -297,7 +297,8 @@ fn refreshable(g: *Graph, s: *const AnswerScratch, expires: i64) bool {
 /// question are probed; the question itself goes out as `rrset`.
 pub fn runCut(g: *Graph, id: CellId) !void {
     const name = g.cell(id).name;
-    std.debug.assert(name.labels.len > 0);
+    // The axiom, re-derived after eviction.
+    if (name.labels.len == 0) return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse {
