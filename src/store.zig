@@ -169,7 +169,8 @@ pub const Store = struct {
         s.held -= e.blob.len;
         s.gpa.free(key.name);
         s.unref(e.blob);
-        if (s.hand > i) s.hand -= 1;
+        // Swap-remove moved only the last entry, into `i`.
+        if (s.hand == last) s.hand = i;
     }
 
     /// SIEVE, its scan capped; past the cap the entry at the hand goes.
