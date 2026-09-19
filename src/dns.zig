@@ -30,6 +30,8 @@ pub const max_name_len = 253;
 pub const max_dotted_len = 4 * max_name_len;
 pub const header_len = 12;
 pub const max_udp_payload = 512;
+/// A week (BIND's max-cache-ttl): a chosen 0xFFFFFFFF would outlive its delegation.
+pub const max_ttl: u32 = 604_800;
 pub const edns_udp_payload: u16 = 1232;
 /// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
 /// message can be at most 65535 bytes. Also the ceiling for any DNS
@@ -856,7 +858,9 @@ const Parser = struct {
         errdefer freeWireParsedName(allocator, name);
         const rtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const rclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
-        const ttl = try self.readU32();
+        // RFC 2181 §8: top bit set is zero. OPT's field is not a TTL (RFC 6891 §6.1.3).
+        const raw_ttl = try self.readU32();
+        const ttl = if (rtype == .opt) raw_ttl else if (raw_ttl > std.math.maxInt(i32)) 0 else @min(raw_ttl, max_ttl);
         const rdlength: usize = try self.readU16();
 
         if (self.pos + rdlength > self.msg.len) return error.EndOfData;
@@ -2712,6 +2716,25 @@ pub fn freeMessage(allocator: Allocator, msg: Message) void {
     freeResourceRecords(allocator, msg.authorities);
     freeResourceRecords(allocator, msg.additionals);
     if (msg.opt) |opt| freeOpt(allocator, opt);
+}
+
+test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a week" {
+    const ttls = [_]u32{ 300, max_ttl, max_ttl + 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF };
+    const want = [_]u32{ 300, max_ttl, max_ttl, max_ttl, 0, 0 };
+    var pkt: [12 + ttls.len * 15]u8 = undefined;
+    @memcpy(pkt[0..12], &[_]u8{ 0, 1, 0x81, 0x80, 0, 0, 0, ttls.len, 0, 0, 0, 0 });
+    var pos: usize = 12;
+    for (ttls) |ttl| {
+        // root owner, A IN, ttl, 4-byte rdata
+        @memcpy(pkt[pos..][0..5], &[_]u8{ 0, 0, 1, 0, 1 });
+        mem.writeInt(u32, pkt[pos + 5 ..][0..4], ttl, .big);
+        @memcpy(pkt[pos + 9 ..][0..6], &[_]u8{ 0, 4, 192, 0, 2, 1 });
+        pos += 15;
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const msg = try parseMessage(arena.allocator(), &pkt);
+    for (msg.answers, want) |rr, w| try testing.expectEqual(w, rr.ttl);
 }
 
 test "parseDottedName basic" {
