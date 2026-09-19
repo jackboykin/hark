@@ -1,4 +1,4 @@
-"""TCP clients: pipelining, many concurrent connections, idle close.
+"""TCP clients: pipelining, many concurrent connections, idle close, ACL.
 
 `.invalid` is RFC 6761 special-use: hark synthesises NXDOMAIN with zero
 upstream work, so no responder is needed.
@@ -115,3 +115,14 @@ def test_idle_connection_is_closed(hark: HarkProcess) -> None:
         elapsed = time.monotonic() - t0
     # Sweep runs once a second on top of the configured idle timeout.
     assert IDLE_MS / 1000 - 0.2 <= elapsed <= IDLE_MS / 1000 + 2
+
+
+def test_allow_from_refuses_tcp(tmp_path: Path) -> None:
+    cfg = HarkConfig(listen_port=HARK_PORT + 1, allow_from=["192.0.2.0/24"])
+    with HarkProcess(find_hark_binary(), cfg, tmp_path):
+        with socket.create_connection(("127.0.0.1", HARK_PORT + 1), timeout=5) as s:
+            s.sendall(framed("acl.invalid.", 1))
+            try:
+                assert s.recv(16) == b""
+            except ConnectionResetError:
+                pass

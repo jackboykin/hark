@@ -147,10 +147,15 @@ const Server = struct {
             const rc = linux.accept4(fd, &pa.any, &len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             if (linux.errno(rc) != .SUCCESS) return;
             const cfd: posix.fd_t = @intCast(rc);
+            const addr = na.fromSockaddr(&pa);
+            if (!acl.allow(s.cfg.allow_from, addr)) {
+                sys.close(cfd);
+                continue;
+            }
             // A small kernel queue, so write progress measures the client.
             posix.setsockopt(cfd, posix.SOL.SOCKET, linux.SO.SNDBUF, &mem.toBytes(client_sndbuf)) catch {};
             const c = try s.gpa.create(Conn);
-            c.* = .{ .fd = cfd, .addr = na.fromSockaddr(&pa), .token = 0, .last_ns = s.e.now_ns };
+            c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
             try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
         }

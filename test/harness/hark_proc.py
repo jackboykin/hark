@@ -47,6 +47,7 @@ class HarkConfig:
     rebinding_extra_allow: list[str] = dataclasses.field(default_factory=list)
     # None = hark default (5000).
     tcp_idle_timeout_ms: int | None = None
+    allow_from: list[str] = dataclasses.field(default_factory=list)
     dns64_prefix: str | None = None
     # Pass `--verbose` so per-query debug lines reach the test log.
     # Cheap; failing-scenario triage is impossible without them.
@@ -68,6 +69,9 @@ class HarkConfig:
         ]
         if self.tcp_idle_timeout_ms is not None:
             lines.append(f"tcp-idle-timeout-ms = {self.tcp_idle_timeout_ms}")
+        if self.allow_from:
+            cidrs = ", ".join(f'"{c}"' for c in self.allow_from)
+            lines.append(f"allow-from = [{cidrs}]")
         lines += [
             "",
             "[resolver]",
