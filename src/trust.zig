@@ -23,8 +23,9 @@ pub const Chain = struct {
 pub const DsScratch = struct { parent: ?CellId = null, keys: ?CellId = null, rrset: ?CellId = null, signer: ?CellId = null };
 pub const DnskeyScratch = struct { ds: ?CellId = null, rrset: ?CellId = null };
 pub const SecureScratch = struct {
-    /// The rrset version under judgement.
+    /// The rrset version under judgement; ids recycle, so its generation too.
     target: CellId = 0,
+    target_gen: u32 = 0,
     /// `ds(zone)`: is the answering zone expected to sign at all.
     zone_ds: ?CellId = null,
     /// `dnskey(signer)` per RRset group, in section order.
@@ -147,12 +148,16 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const t = g.cell(rid);
     const key = try g.keyFor(.secure, t.name, t.key.rtype);
     const budget = g.cell(by).budget;
-    if (g.index.get(key)) |sid| if (g.cell(sid).scratch.secure.target == rid and (!g.cell(sid).settled or g.cell(sid).expires_ns > g.bound(budget) or (g.cell(sid).budget == budget and g.fresh(sid)))) {
-        try g.pin(sid, by);
-        return sid;
-    };
+    if (g.index.get(key)) |sid| {
+        const c = g.cell(sid);
+        const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == t.gen;
+        if (same and (!c.settled or c.expires_ns > g.bound(budget) or (c.budget == budget and g.fresh(sid)))) {
+            try g.pin(sid, by);
+            return sid;
+        }
+    }
     const sid = try g.newCell(key, t.name, g.cell(by).budget, g.cell(by).depth);
-    g.cell(sid).scratch.secure.target = rid;
+    g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = t.gen };
     try g.pin(sid, by);
     if (t.blob) |b| if (b.verdict.until_ns > g.bound(budget)) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
