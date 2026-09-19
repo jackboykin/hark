@@ -340,10 +340,9 @@ pub fn buildResponseWire(
         .opt = opt,
     };
 
+    // Nothing past the client's payload is sent, so none is built; the rewind drops an overrun.
     var ends: dns.SectionEnds = .{};
-    if (dns.serializeMessageEnds(wire_buf, msg, &ends)) |wire| {
-        if (wire.len <= ctx.max_udp_payload) return wire;
-    } else |_| {}
+    if (dns.serializeMessageEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], msg, &ends) catch null) |wire| return wire;
 
     // Sections are laid down in order and a name pointer only reaches
     // backward (RFC 1035 §4.1.4), so a response minus its tail sections is a

@@ -1287,14 +1287,19 @@ fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
 }
 
 /// RFC 1035 §4.1.4 targets. Byte-exact: a pointer must not change a name's case.
+/// A candidate entry spends its label count from `work`; once gone, names go
+/// out whole (Unbound CVE-2024-8508: labels² × entries per name).
 pub const NameTable = struct {
     const Entry = struct { labels: []const []const u8, offset: u16 };
     entries: [64]Entry = undefined,
     len: usize = 0,
+    work: u32 = 1 << 16,
 
-    fn find(self: *const NameTable, labels: []const []const u8) ?u16 {
+    fn find(self: *NameTable, labels: []const []const u8) ?u16 {
         for (self.entries[0..self.len]) |e| {
             if (e.labels.len != labels.len) continue;
+            if (self.work < labels.len) return null;
+            self.work -= @intCast(labels.len);
             for (e.labels, labels) |a, b| {
                 if (!mem.eql(u8, a, b)) break;
             } else return e.offset;
@@ -2735,6 +2740,27 @@ test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a wee
     defer arena.deinit();
     const msg = try parseMessage(arena.allocator(), &pkt);
     for (msg.answers, want) |rr, w| try testing.expectEqual(w, rr.ttl);
+}
+
+test "compression past its work budget writes names whole, and they read back" {
+    // 126-label names differing only nearest the root: a compare per suffix per entry.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rrs: [60]ResourceRecord = undefined;
+    const owner: Name = .{ .labels = &.{"x"} };
+    for (&rrs, 0..) |*rr, i| {
+        const labels = try a.alloc([]const u8, 126);
+        for (labels[0..125]) |*l| l.* = "a";
+        labels[125] = try std.fmt.allocPrint(a, "b{d}", .{i});
+        rr.* = .{ .name = owner, .rtype = .ptr, .rclass = .in, .ttl = 60, .rdata = .{ .ptr = .{ .labels = labels } } };
+    }
+    const q = [_]Question{.{ .name = owner, .qtype = .ptr, .qclass = .in }};
+    var buf: [max_message_len]u8 = undefined;
+    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .questions = &q, .answers = &rrs });
+    const back = try parseMessage(a, wire);
+    try testing.expectEqual(rrs.len, back.answers.len);
+    for (rrs, back.answers) |want, got| try testing.expect(want.rdata.ptr.eql(got.rdata.ptr));
 }
 
 test "parseDottedName basic" {
