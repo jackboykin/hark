@@ -669,10 +669,10 @@ fn verifyRsa(signature: []const u8, data: *const SignedData, key_data: []const u
     // RsaFe.fromBytes alone only bounds it below the modulus (511 bytes).
     if (exponent.len > 8) return error.InvalidKey;
 
-    // Require 1024-bit minimum modulus, 8-byte step (1024/2048/3072/4096 are
-    // the only sizes generated in practice). RFC 6781 recommends 2048 but
-    // 1024-bit ZSKs are still common, including in TLDs like .org.
-    if (modulus.len < 128 or modulus.len > 512 or modulus.len % 8 != 0) return error.InvalidKey;
+    // 1024-bit minimum (RFC 6781 recommends 2048, but 1024-bit ZSKs are still
+    // common, TLDs included). No step: RFC 3110 fixes no size and the wild
+    // has odd ones (gob.cl's KSK is 2024 bits; an 8-byte step SERVFAILed it).
+    if (modulus.len < 128 or modulus.len > 512) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
     // ff.Modulus is what Certificate.rsa wraps; calling it directly sidesteps
