@@ -538,6 +538,8 @@ fn holdStale(g: *Graph, key: Key, until: i64) void {
 fn staleWindow(g: *Graph, key: Key) ?i64 {
     if (g.cfg.serve_stale_ttl == 0) return null;
     const e = g.store.any(key) orelse return null;
+    // Stale hops go unjudged, so bytes already judged bogus never qualify.
+    if (e.blob.verdict.chain().status == .bogus) return null;
     const life = store.rrsetLife(e.blob) catch return null;
     const until = life.expires_ns + @as(i64, g.cfg.serve_stale_ttl) * std.time.ns_per_s;
     if (life.servfail or g.now() < life.expires_ns or g.now() >= until) return null;
