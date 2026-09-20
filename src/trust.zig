@@ -193,23 +193,16 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const budget = &g.cell(id).budget.validation;
     const now = g.wallNow();
     var cap: u32 = std.math.maxInt(u32);
+    // An unsigned AA reply from a zone expected to sign: the answering
+    // zone may be an unsigned child folded onto the parent's servers
+    // (tld-servers.ru on the ru servers), which only its DS can say.
+    if (r.aa and !hasSignature(r)) switch (try probeHiddenCut(g, id, s, zone, t, depth)) {
+        .pending => return,
+        .insecure => |until| return g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
+        .none => {},
+    };
     switch (r.kind) {
         .answer, .alias => {
-            if (r.aa and !hasSignature(r) and t.name.labels.len > zone.labels.len) {
-                // Today's probeParentChildCut.
-                while (true) {
-                    if (s.probe) |pid| {
-                        const p = g.cell(pid);
-                        if (!p.settled) return;
-                        if (p.value.ds.status == .insecure) return g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, p.expires_ns));
-                        s.probe = null;
-                    }
-                    s.probe_depth = @max(s.probe_depth, @as(u8, @intCast(zone.labels.len))) + 1;
-                    if (s.probe_depth > t.name.labels.len) break;
-                    const candidate: dns.Name = .{ .labels = t.name.labels[t.name.labels.len - s.probe_depth ..] };
-                    s.probe = try g.demand(id, try g.keyFor(.ds, candidate, .a), candidate, depth) orelse break;
-                }
-            }
             // Pass one demands every signer's keys, pass two verifies. A
             // CNAME synthesised under the DNAME before it is proven by the
             // derivation (RFC 6672 §5.3.1).
@@ -286,6 +279,30 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         },
         // A resolution failure is no verdict on the zone.
         .servfail => try settleSecure(g, id, .unchecked),
+    }
+}
+
+/// `ds(candidate)` one label at a time below `zone`, down to the name for
+/// a positive, or to the SOA owner for a negative. Once (`probe_depth`).
+fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell, depth: u8) !union(enum) { pending, insecure: i64, none } {
+    var deepest = t.name;
+    if (t.value.rrset.kind == .nodata or t.value.rrset.kind == .nxdomain) {
+        deepest = zone;
+        for (t.value.rrset.authorities) |rr| if (rr.rtype == .soa and t.name.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
+            deepest = rr.name;
+        };
+    }
+    while (true) {
+        if (s.probe) |pid| {
+            const p = g.cell(pid);
+            if (!p.settled) return .pending;
+            if (p.value.ds.status == .insecure) return .{ .insecure = p.expires_ns };
+            s.probe = null;
+        }
+        s.probe_depth = @max(s.probe_depth, @as(u8, @intCast(zone.labels.len))) + 1;
+        if (s.probe_depth > deepest.labels.len) return .none;
+        const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - s.probe_depth ..] };
+        s.probe = try g.demand(id, try g.keyFor(.ds, candidate, .a), candidate, depth) orelse return .none;
     }
 }
 

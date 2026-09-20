@@ -79,6 +79,7 @@ pub const Signer = struct {
     /// responder.py `_delegation_cuts`: a DS owner is a cut; a referral
     /// (empty answer, NS and no SOA in authority) cuts at the NS owner too.
     fn bakeEntry(self: *Signer, e: *rpl.Entry, address: na.Address) !void {
+        if (e.unsigned) return;
         const forced = if (e.sign_as) |z| self.keyNamed(z) else null;
         var cuts: std.ArrayList(dns.Name) = .empty;
         for ([_][]const RR{ e.answers, e.authorities, e.additionals }) |sec| for (sec) |rr| if (rr.rtype == .ds) try addName(self.arena, &cuts, rr.name);

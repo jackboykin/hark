@@ -1,0 +1,75 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN an unsigned child served from its signed parent's address answers negatives without AD, not SERVFAIL
+
+; Live shape: tld-servers.ru, an unsigned zone hosted on the ru servers.
+; The walk reaches example.'s server expecting example. to sign, and gets
+; an unsigned AA NODATA whose SOA names child.example.: a delegation the
+; walk never saw. Positives already probe ds() down the name for such a
+; hidden cut; negatives went straight to bogus. The SOA owner bounds the
+; probe, and the parent's signed NSEC says no DS: insecure, NOERROR, no AD.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ; The parent's word on the cut: a signed NODATA for the DS, NSEC without
+  ; the DS bit.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      child.example. 3600 IN NSEC z.example. NS RRSIG NSEC
+  ENTRY_END
+
+  ; The child's own negative, unsigned.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN AAAA
+    SECTION AUTHORITY
+      child.example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.child.example. IN AAAA
+ENTRY_END
+
+SCENARIO_END

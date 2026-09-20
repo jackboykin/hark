@@ -295,6 +295,8 @@ class Responder:
         """
         for rng in self.scenario.ranges:
             for entry in rng.entries:
+                if "unsigned" in entry.adjust:
+                    continue
                 forced = self._signer_named(entry.sign_as) if entry.sign_as else None
                 cuts = _delegation_cuts(entry)
                 for section in (entry.answer, entry.authority, entry.additional):

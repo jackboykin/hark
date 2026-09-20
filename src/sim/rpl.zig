@@ -64,6 +64,9 @@ pub const Entry = struct {
     drop: bool = false,
     /// ADJUST force_lower_qname: the responder lowercases the echoed question.
     force_lower_qname: bool = false,
+    /// ADJUST unsigned: the signer leaves the entry alone (an unsigned zone
+    /// served from a signed zone's address).
+    unsigned: bool = false,
     sign_as: ?dns.Name = null,
     wildcard: ?dns.Name = null,
     ds_from: []const DsFrom = &.{},
@@ -400,6 +403,8 @@ const Parser = struct {
                         e.drop = true;
                     } else if (eqlLower(t, "force_lower_qname")) {
                         e.force_lower_qname = true;
+                    } else if (eqlLower(t, "unsigned")) {
+                        e.unsigned = true;
                     } else if (!eqlLower(t, "copy_id") and !eqlLower(t, "copy_query")) {
                         return p.fail("unknown ADJUST flag");
                     }
