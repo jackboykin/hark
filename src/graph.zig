@@ -113,6 +113,9 @@ pub const Config = struct {
     serve_stale_ttl: u32 = 0,
     /// Floor for every TTL but zero (`walk.replyTtl`).
     min_ttl: u32 = 0,
+    /// Lifetime of an RRset judged bogus: its own TTL is untrusted, so one
+    /// is assigned (RFC 4035 §4.7).
+    bogus_ttl: u32 = 5,
     /// Refresh a fact hit just before it expires.
     prefetch: bool = false,
     /// Null: DNSSEC off, nothing is judged.
@@ -680,7 +683,15 @@ pub const Graph = struct {
                     .insecure => g.stats.trust.insecure += 1,
                     .bogus, .unchecked => g.stats.trust.bogus += 1,
                 }
-                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, expires_ns);
+                // Bogus bytes carry no trustworthy TTL: the fact they are
+                // now lives on the assigned one, and so does its verdict.
+                const t = g.cell(c.scratch.secure.target);
+                if (v.status == .bogus) {
+                    c.expires_ns = @min(expires_ns, g.now() + @as(i64, g.cfg.bogus_ttl) * std.time.ns_per_s);
+                    t.expires_ns = @min(t.expires_ns, c.expires_ns);
+                    if (t.blob) |b| g.store.shorten(t.key, b, c.expires_ns);
+                }
+                if (t.blob) |b| b.verdict.stamp(v, c.expires_ns);
             },
             .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
             .exchange, .refresh => {},

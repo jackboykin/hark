@@ -27,6 +27,7 @@ size = 12582912               # answer cache, bytes
 prefetch = false              # refresh popular entries before they expire
 serve-stale-ttl = 0           # serve expired answers for N seconds
 min-ttl = 0                   # floor for very short TTLs
+bogus-ttl = 5                 # lifetime assigned to answers that fail DNSSEC validation
 
 [rebinding]
 enabled = true                # scrub private addresses from public-zone answers

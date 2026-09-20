@@ -130,6 +130,13 @@ pub const Store = struct {
         if (s.map.getPtr(key)) |e| e.hold_until_ns = until_ns;
     }
 
+    /// Ends this version of a fact sooner; a newer version is not its business.
+    pub fn shorten(s: *Store, key: Key, blob: *Blob, until_ns: i64) void {
+        if (s.map.getPtr(key)) |e| if (e.blob == blob) {
+            e.expires_ns = @min(e.expires_ns, until_ns);
+        };
+    }
+
     /// Takes one reference. A new key over the cap must have knocked before.
     /// Takes the caller's reference on success; on any error it stays theirs.
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {

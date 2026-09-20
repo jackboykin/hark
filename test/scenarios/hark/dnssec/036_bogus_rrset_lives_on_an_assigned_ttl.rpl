@@ -1,0 +1,124 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN an RRset that fails validation keeps a small assigned TTL, not its own
+
+; RFC 4035 §4.7: RRsets that fail to validate do not have trustworthy TTLs,
+; so the resolver MUST assign one, and it SHOULD be small. A forged reply
+; carrying a week-long TTL and a bad signature must not SERVFAIL the name
+; from memory for a week; hark assigns bogus-ttl (5 s by default).
+;
+; The child serves the forgery through step 4 and the genuine, signed
+; record from step 5 on. Every query inside the assigned lifetime is
+; answered from memory, so a re-query at 3 s still SERVFAILs even though
+; the server has mended; a re-query at 6 s must go upstream and validate.
+; Both directions are pinned by rcode alone, no absence check needed.
+;
+; Topology
+;   root     127.0.10.1   delegates example. with a DS
+;   example  127.0.10.2   forgery through step 4, real answer from step 5
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 604800 IN A 192.0.2.66
+      ; Hand-declared, so the harness does not sign over it: key_tag 1
+      ; matches no DNSKEY in example.'s generated set.
+      www.example. 604800 IN RRSIG A 13 2 604800 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 604800 IN A 192.0.2.66
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+; Inside the assigned lifetime: served from memory, so the mended server
+; is never asked and the forgery still SERVFAILs.
+STEP 3 TIME_PASSES ELAPSE 3
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+; Past it, well inside the forged TTL: the fact is gone, hark asks again.
+STEP 6 TIME_PASSES ELAPSE 3
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 604800 IN A 192.0.2.66
+ENTRY_END
+
+SCENARIO_END

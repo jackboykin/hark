@@ -457,6 +457,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .store_bytes = cfg.cache_size,
         .serve_stale_ttl = cfg.serve_stale_ttl,
         .min_ttl = cfg.min_ttl,
+        .bogus_ttl = cfg.bogus_ttl,
         .prefetch = cfg.prefetch,
         .max_in_flight = cfg.max_in_flight,
         .trace = trace,
