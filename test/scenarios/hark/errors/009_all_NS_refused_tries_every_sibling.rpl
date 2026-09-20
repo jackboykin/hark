@@ -96,12 +96,12 @@ ENTRY_BEGIN
     www.example.com. IN A
 ENTRY_END
 
-; Both NSes REFUSE, so hark exhausts and surfaces REFUSED verbatim (002 pins
-; the passthrough; same rcode either way — no order dependence).
+; Both NSes REFUSE, so hark exhausts and leaves as SERVFAIL (002 pins the
+; rewrite; same rcode either way — no order dependence).
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH rcode question
-  REPLY QR RD RA REFUSED
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END

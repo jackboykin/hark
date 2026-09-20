@@ -56,9 +56,7 @@ pub const Ask = struct {
     nattempts: u8 = 0,
     /// When the next attempt may start early.
     hedge_at: i64 = 0,
-    /// The exchange whose failing reply ranks best
-    /// (`delegation.failurePrecedence`), served when every server fails
-    /// with an rcode.
+    /// The first failing reply: an rcode from someone, as opposed to silence.
     held: ?CellId = null,
     /// The zone's DS names ML-DSA-44, whose DO answers truncate: TCP from the start.
     tcp_first: bool = false,
@@ -138,17 +136,16 @@ pub const Ask = struct {
         return g.cell(a.held orelse return null).value.exchange.reply.msg;
     }
 
-    /// A rank-0 reply (lame, recursor) leaves as bare SERVFAIL so the
-    /// randomised server order cannot change what the stub sees.
+    /// Every server failed: bare SERVFAIL. An authority's REFUSED or
+    /// FORMERR passed through reads as hark's own policy at the stub, and
+    /// the randomised server order must not change what the stub sees.
     fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
         var msg = a.heldMsg(g) orelse return .exhausted;
-        if (delegation.failurePrecedence(msg.header.flags.rcode) == 0) {
-            msg.header.flags.rcode = .server_failure;
-            msg.answers = &.{};
-            msg.authorities = &.{};
-            msg.additionals = &.{};
-        }
+        msg.header.flags.rcode = .server_failure;
+        msg.answers = &.{};
+        msg.authorities = &.{};
+        msg.additionals = &.{};
         return .{ .reply = msg };
     }
 };
@@ -825,7 +822,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                     } else if (!delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) {
                         a.nattempts = 0;
                         return .{ .reply = r.msg };
-                    } else if (outranks(r.msg, a.heldMsg(g))) a.held = at.exchange;
+                    } else if (a.held == null) a.held = at.exchange;
                 },
             }
         }
@@ -849,12 +846,6 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
     const key = g.keyFor(.rrset, zone, .ds) catch return false;
     const ds = (g.peek(key) catch return false) orelse return false;
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
-}
-
-/// `delegation.recordFailure`'s rule: a later reply wins ties.
-fn outranks(msg: dns.Message, held: ?dns.Message) bool {
-    const h = held orelse return true;
-    return delegation.failurePrecedence(msg.header.flags.rcode) >= delegation.failurePrecedence(h.header.flags.rcode);
 }
 
 /// One attempt on the estimate's timeout; only the last of all is uncapped.

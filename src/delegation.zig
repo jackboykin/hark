@@ -230,29 +230,6 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: Ad
     return extractReferral(response, response.questions[0].name, parent_zone, policy) == null;
 }
 
-/// Which all-siblings-failed rcode a stub deserves: the most
-/// resolver-meaningful one wins, so the randomized NS order can't flip
-/// the surfaced answer. SERVFAIL ("I couldn't resolve this") outranks
-/// REFUSED (a policy stance) outranks FORMERR — a FORMERR only means an
-/// upstream couldn't parse *hark's* query, never the stub's. Rank 0 is a
-/// lame or recursor reply and leaves as SERVFAIL.
-pub fn failurePrecedence(rcode: dns.RCode) u8 {
-    return switch (rcode) {
-        .server_failure => 3,
-        .refused => 2,
-        .format_error => 1,
-        else => 0,
-    };
-}
-
-/// Keep `response` as the fallback failure only if it ranks at least as
-/// high as the one already held; ties keep the later server.
-pub fn recordFailure(held: *?dns.Message, response: dns.Message) void {
-    if (held.* == null or
-        failurePrecedence(response.header.flags.rcode) >= failurePrecedence(held.*.?.header.flags.rcode))
-        held.* = response;
-}
-
 const test_header: dns.Header = .{
     .id = 0x1234,
     .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error },

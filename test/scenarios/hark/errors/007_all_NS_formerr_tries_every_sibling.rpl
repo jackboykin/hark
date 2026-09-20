@@ -5,7 +5,7 @@ SCENARIO_BEGIN FORMERR from every NS is tried before surfacing (RFC 1034 §4.3.5
 
 ; Both authoritative servers for example.com FORMERR the leaf. Hark must try
 ; BOTH (the FORMERR sibling-fallthrough path, walk.zig `Ask`) before
-; surfacing FORMERR to the stub. On code that does NOT treat FORMERR as a
+; giving up with SERVFAIL. On code that does NOT treat FORMERR as a
 ; fallthrough signal, only the first-picked NS is queried — so the second
 ; QUERY_LOG row below is absent and STEP 3 fails. That is the deterministic
 ; teeth this scenario provides (006 covers the happy-path recovery; cold NS
@@ -95,11 +95,11 @@ ENTRY_BEGIN
     www.example.com. IN A
 ENTRY_END
 
-; Both NSes FORMERR, so hark exhausts and surfaces the last FORMERR.
+; Both NSes FORMERR, so hark exhausts and leaves as SERVFAIL.
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH rcode question
-  REPLY QR RD RA FORMERR
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END

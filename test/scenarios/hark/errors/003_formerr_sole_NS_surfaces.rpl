@@ -1,6 +1,6 @@
 ; hark: root-hints = 127.0.10.1
 
-SCENARIO_BEGIN FORMERR from sole authority surfaces (does not hang)
+SCENARIO_BEGIN FORMERR from sole authority leaves as SERVFAIL (does not hang)
 
 ; The single listed NS for example.com returns FORMERR (RFC 1035 §4.1.1,
 ; "the name server was unable to interpret the query"). Real-world causes:
@@ -80,14 +80,12 @@ ENTRY_BEGIN
     www.example.com. IN A
 ENTRY_END
 
-; Hark currently passes FORMERR through to the client. A future change
-; that maps it to SERVFAIL (FORMERR semantically means "the server
-; couldn't parse the stub's query", which is false from the stub's
-; perspective) would need to flip this.
+; An authority's FORMERR leaves as SERVFAIL: passed through it reads as
+; hark's own verdict on the stub's query.
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   MATCH rcode question
-  REPLY QR RD RA FORMERR
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example.com. IN A
 ENTRY_END
