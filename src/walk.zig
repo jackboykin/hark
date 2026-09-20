@@ -51,6 +51,8 @@ pub const Ask = struct {
     fetched_unglued: bool = false,
     /// Every server silent once: one more attempt each, at the backed-off timeout.
     retried: bool = false,
+    /// An exchange refused for the asker's budget, deadline or orphaning.
+    starved: bool = false,
     /// In flight, oldest first.
     attempts: [max_hedge]Attempt = undefined,
     nattempts: u8 = 0,
@@ -238,7 +240,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             next = r.target;
             var broken = s.n > max_cname_chain;
             for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
-            if (broken) return settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .broken = true }, failureExpiry(g, id));
+            if (broken) return settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .broken = true }, failureExpiry(g, id, false));
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse
@@ -262,8 +264,9 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             status = dnssec.weakest(status, c.value.secure.status);
             expires = @min(expires, c.expires_ns);
         }
-        if (status == .bogus) expires = failureExpiry(g, id);
     }
+    // The SERVFAIL window is the answer's; a helper's failure dissolves at once.
+    if (status == .bogus or g.cell(s.hops[s.n - 1]).value.rrset.kind == .servfail) expires = failureExpiry(g, id, false);
     try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .status = status, .judged = s.judged[0..s.nj], .stale = s.stale[0..s.n] }, expires);
     // Best effort.
     if (kind == .answer and g.cfg.prefetch and !stale and refreshable(g, s, expires))
@@ -525,7 +528,7 @@ fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
         holdStale(g, key, until);
         return g.settle(id, .{ .rrset = reply }, g.now());
     };
-    try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) failureExpiry(g, id) else replyExpiry(reply));
+    try g.settle(id, .{ .rrset = reply }, if (reply.kind == .servfail) failureExpiry(g, id, g.cell(id).scratch.rrset.ask.starved) else replyExpiry(reply));
 }
 
 fn holdStale(g: *Graph, key: Key, until: i64) void {
@@ -613,10 +616,13 @@ fn servfail(ede: dns.Ede.Code) Reply {
     return .{ .kind = .servfail, .rcode = .server_failure, .aa = false, .ede = ede };
 }
 
-/// A fact for the client's SERVFAIL window alone.
-fn failureExpiry(g: *Graph, id: CellId) i64 {
+/// A fact for the client's SERVFAIL window alone. A failure the asker's
+/// own budget or orphaning caused says nothing about the zone: a shared
+/// cell (a TLD's DNSKEY) memoising it would fail every name under it.
+fn failureExpiry(g: *Graph, id: CellId, starved: bool) i64 {
     const c = g.cell(id);
-    return g.now() + if (c.depth == 0 and c.budget.refresh_ns == 0) @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s else 0;
+    if (starved or c.orphan or c.depth != 0 or c.budget.refresh_ns != 0) return g.now();
+    return g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
 }
 
 /// Publish the child's cut, NS set and glue; returns the delegation's
@@ -807,6 +813,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                 .mismatch => {},
                 // Launch nothing more; what is in flight may still answer.
                 .budget => {
+                    a.starved = true;
                     a.next = a.nservers;
                     a.fetched_unglued = true;
                 },

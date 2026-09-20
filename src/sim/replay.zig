@@ -40,6 +40,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .root_hints = scenario.root_hints,
         .addr_policy = .{ .allow_loopback = true },
         .stagger_ms = scenario.stagger_ms orelse 150,
+        .max_queries = scenario.max_queries orelse 100,
         .trust_anchor = s.signer.anchor(),
         .serve_stale_ttl = scenario.serve_stale_ttl orelse 0,
         .min_ttl = scenario.min_ttl orelse 0,
@@ -473,8 +474,8 @@ test "trace one scenario" {
 test "hark walk scenarios settle to today's answers" {
     // Stale at the client timer is the edge's, not a rule's (2½).
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(106, r.parsed);
-    try testing.expectEqual(102, r.ran);
+    try testing.expectEqual(107, r.parsed);
+    try testing.expectEqual(103, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

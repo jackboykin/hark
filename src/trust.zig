@@ -79,6 +79,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const rs = g.cell(s.rrset.?);
     if (!rs.settled) return;
     const r = rs.value.rrset;
+    if (r.kind == .servfail) return g.settle(id, .{ .ds = .{ .status = .bogus } }, @min(rs.expires_ns, bogusExpiry(g, id)));
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
         .nodata, .nxdomain => dnssec.authoritySigner(r.authorities),
@@ -89,7 +90,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
     const keys = g.cell(s.signer.?);
     if (!keys.settled) return;
-    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = .bogus } }, bogusExpiry(g, id));
+    if (keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = .bogus } }, @min(keys.expires_ns, bogusExpiry(g, id)));
     const budget = &g.cell(id).budget.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -132,6 +133,8 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const rs = g.cell(s.rrset.?);
     if (!rs.settled) return;
     const r = rs.value.rrset;
+    // A failed fetch is not a fact about the zone; it lasts as long as the failure.
+    if (r.kind == .servfail) return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, @min(rs.expires_ns, bogusExpiry(g, id)));
     if (r.kind != .answer) return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id));
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
@@ -241,7 +244,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                     continue;
                 }
                 const kc = g.cell(s.keys[groups].?);
-                if (kc.value.dnskey.status != .secure) return settleSecure(g, id, .bogus);
+                if (kc.value.dnskey.status != .secure) return g.settle(id, .{ .secure = .{ .status = .bogus } }, @min(kc.expires_ns, bogusExpiry(g, id)));
                 expires = @min(expires, kc.expires_ns);
                 const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.value.dnskey.records, now, budget) orelse
                     return settleSecure(g, id, .bogus);
@@ -264,7 +267,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             if (!kc.settled) return;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
-            if (kc.value.dnskey.status != .secure) return settleSecure(g, id, .bogus);
+            if (kc.value.dnskey.status != .secure) return g.settle(id, .{ .secure = .{ .status = .bogus } }, @min(kc.expires_ns, bogusExpiry(g, id)));
             expires = @min(expires, kc.expires_ns);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, budget, &cap) != .secure) return settleSecure(g, id, .bogus);
             switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
@@ -278,7 +281,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             }
         },
         // A resolution failure is no verdict on the zone.
-        .servfail => try settleSecure(g, id, .unchecked),
+        .servfail => try g.settle(id, .{ .secure = .{ .status = .unchecked } }, @min(t.expires_ns, bogusExpiry(g, id))),
     }
 }
 

@@ -80,6 +80,8 @@ pub const ServerConfig = struct {
     /// client is turned away (UDP silent, TCP closed).
     max_in_flight: u32,
     stagger_ms: u32,
+    /// Upstream exchanges one resolution may spend.
+    max_queries: u32,
     log_queries: bool,
     max_udp_payload: u16,
     /// uid to drop to after binding privileged ports. Numeric only — looking
@@ -190,6 +192,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .dns64 = null,
         .max_in_flight = 1024,
         .stagger_ms = 150,
+        .max_queries = 100,
         .log_queries = false,
         .max_udp_payload = @import("dns.zig").edns_udp_payload,
         .drop_uid = null,
@@ -239,6 +242,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "qname-minimization", .kind = .boolean },
         .{ .name = "dns64-prefix", .kind = .string },
         .{ .name = "stagger-ms", .kind = .integer },
+        .{ .name = "max-queries", .kind = .integer },
     } },
     .{ .name = "cache", .keys = &.{
         .{ .name = "size", .kind = .integer },
@@ -435,6 +439,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
                 return error.InvalidValue;
             }
             cfg.stagger_ms = v;
+        }
+        if (try nonNegative(u32, resolver, "max-queries")) |v| {
+            if (v == 0) {
+                errLog("config: max-queries must not be 0", .{});
+                return error.InvalidValue;
+            }
+            cfg.max_queries = v;
         }
     }
 

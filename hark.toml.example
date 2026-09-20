@@ -18,6 +18,7 @@ dnssec = true
 qname-minimization = true     # RFC 9156
 dns64-prefix = ""             # NAT64 Pref64::/n, e.g. "64:ff9b::/96" (RFC 6147); "" = off
 stagger-ms = 150              # nameserver racing delay; 0 disables
+max-queries = 100             # upstream exchanges one resolution may spend
 root-hints = []               # override IANA roots ("ip" or "ip:port");
                               # empty = compiled-in defaults
 

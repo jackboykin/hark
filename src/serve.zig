@@ -452,6 +452,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .root_hints = cfg.rootHints(),
         .addr_policy = .{ .upstream_port = cfg.upstream_port, .allow_loopback = cfg.allow_loopback_upstreams },
         .stagger_ms = cfg.stagger_ms,
+        .max_queries = cfg.max_queries,
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,
         .store_bytes = cfg.cache_size,
         .serve_stale_ttl = cfg.serve_stale_ttl,

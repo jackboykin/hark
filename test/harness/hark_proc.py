@@ -33,6 +33,7 @@ class HarkConfig:
     # NS-racing stagger in ms; None = hark default (150). 0 disables the
     # staggered race, forcing the deterministic sequential server loop.
     stagger_ms: int | None = None
+    max_queries: int | None = None
     # Each entry is a `"<key-tag> <alg> <dtype> <hex>"` string fed to
     # hark's test-only `[resolver] trust-anchors = [...]` knob. Requires
     # `dnssec = true`; to_toml enforces that pairing.
@@ -82,6 +83,8 @@ class HarkConfig:
         ]
         if self.stagger_ms is not None:
             lines.append(f"stagger-ms = {self.stagger_ms}")
+        if self.max_queries is not None:
+            lines.append(f"max-queries = {self.max_queries}")
         if self.dns64_prefix is not None:
             lines.append(f'dns64-prefix = "{self.dns64_prefix}"')
         if self.root_hints:
