@@ -275,8 +275,13 @@ const Server = struct {
         const c = &s.g.stats.clients;
         switch (try s.desk.early(arena, q, client)) {
             .synthesized => |served| return s.send(reply, query, served.msg, served.ede, s.e.now_ns),
-            .replayed, .recalled, .floored => |served| {
+            .replayed => |served| {
                 c.hit += 1;
+                return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
+            },
+            .recalled, .floored => |served| {
+                c.hit += 1;
+                c.recalled += 1;
                 return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
             },
             .graph => {},
@@ -289,6 +294,8 @@ const Server = struct {
         try s.g.drain();
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled(), .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
+        // Recall declined what the graph holds: inside the refresh window, a
+        // verdict it could not stamp, a put the store refused, DNS64's A.
         if (p.cached) if (try s.shape(arena, &p, q, client)) |served| {
             c.hit += 1;
             try s.answered(reply, query, served, p.asked_ns);
@@ -561,8 +568,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d} | resolved {d}  hit {d}%  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, served, if (served > 0) c.hit * 100 / served else 0, c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d} | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.retry, r.refresh, r.keys, r.refused,
@@ -572,6 +579,10 @@ fn logStats(g: *graph.Graph) void {
         g.store.held / 1024, g.store.map.count(), (g.store.bytes - g.store.held) / 1024, g.store.evictions, g.store.refusals,
     });
     log.info("stats process   rss {d} MiB  live cells {d}  in flight {d}", .{ rssMiB() orelse 0, g.live, g.flights });
+}
+
+fn pct(n: u64, of: u64) u64 {
+    return if (of > 0) n * 100 / of else 0;
 }
 
 fn rssMiB() ?u64 {
