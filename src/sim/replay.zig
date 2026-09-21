@@ -175,24 +175,45 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         .stale_answer, .stale_nxdomain_answer => if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| return served,
         else => return try answer.servfail(arena, q, client, ede),
     };
+    if (try memory(arena, g, scenario, q, client, d64, .fresh)) |served| {
+        try agrees(arena, g, s, scenario, q, client, d64, held, served);
+        try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
+        return served;
+    }
     const served = try memory(arena, g, scenario, q, client, d64, .floored) orelse
         try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
     try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
     return served;
 }
 
+/// `recall`'s backstop: what it serves from the store, the graph builds
+/// too, asking nobody, to the byte.
+fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held, recalled: answer.Served) !void {
+    const before = s.log.items.len;
+    const built = try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return error.RecallDisagrees;
+    if (s.log.items.len != before) return error.RecallDisagrees;
+    const a = try dns.serializeMessage(try arena.alloc(u8, 65535), recalled.msg);
+    const b = try dns.serializeMessage(try arena.alloc(u8, 65535), built.msg);
+    const ea: ?dns.Ede.Code = if (recalled.ede) |e| e.code else null;
+    const eb: ?dns.Ede.Code = if (built.ede) |e| e.code else null;
+    if (!mem.eql(u8, a, b) or ea != eb) return error.RecallDisagrees;
+}
+
 fn retention(scenario: *const rpl.Scenario) answer.Retention {
     return .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 };
 }
 
-fn memory(arena: Allocator, g: *graph.Graph, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, how: enum { floored, stale }) !?answer.Served {
+fn memory(arena: Allocator, g: *graph.Graph, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, how: enum { fresh, floored, stale }) !?answer.Served {
     const minimal = scenario.minimal_responses orelse true;
     const asked = if (d64) |d| try d.asked(arena, q) else q;
     const served = try switch (how) {
+        .fresh => answer.fresh(arena, g, retention(scenario), asked, client, minimal),
         .floored => answer.floored(arena, g, retention(scenario), asked, client, minimal),
         .stale => answer.stale(arena, g, retention(scenario), asked, client, minimal),
     } orelse return null;
-    return if (d64) |d| try d.shape(arena, q, served, null) else served;
+    const d = d64 orelse return served;
+    if (how == .fresh and answer.Dns64.wantsA(q, served)) return null;
+    return try d.shape(arena, q, served, null);
 }
 
 fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held) !?answer.Served {

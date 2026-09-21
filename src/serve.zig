@@ -287,7 +287,7 @@ const Server = struct {
                 return s.send(reply, query, (try answer.servfail(arena, q, client, ede)).msg, ede, s.e.now_ns);
             },
         };
-        if (try s.memory(arena, q, client, .floored)) |served| {
+        if (try s.memory(arena, q, client, .fresh) orelse try s.memory(arena, q, client, .floored)) |served| {
             s.g.stats.clients.hit += 1;
             return s.answered(reply, query, served, s.e.now_ns);
         }
@@ -370,14 +370,18 @@ const Server = struct {
     }
 
     /// An answer from what the store still holds, asking nobody.
-    fn memory(s: *Server, arena: Allocator, q: dns.Question, client: answer.Client, how: enum { floored, stale }) !?answer.Served {
+    fn memory(s: *Server, arena: Allocator, q: dns.Question, client: answer.Client, how: enum { fresh, floored, stale }) !?answer.Served {
         const d64 = answer.Dns64.on(s.cfg.dns64, client);
         const asked = if (d64) |d| try d.asked(arena, q) else q;
         const served = try switch (how) {
+            .fresh => answer.fresh(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
             .floored => answer.floored(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
             .stale => answer.stale(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
         } orelse return null;
-        return if (d64) |d| try d.shape(arena, q, served, null) else served;
+        const d = d64 orelse return served;
+        // Synthesis needs the A: the graph's to fetch.
+        if (how == .fresh and answer.Dns64.wantsA(q, served)) return null;
+        return try d.shape(arena, q, served, null);
     }
 
     /// A reply the resolver derived, noted in the failure cache: a failure

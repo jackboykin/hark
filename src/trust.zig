@@ -232,7 +232,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const sid = try g.newCell(key, t.name);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = t.gen };
     try g.pin(sid, by);
-    if (t.blob) |b| if (b.verdict.until_ns > g.bound(g.payer)) {
+    if (t.blob) |b| if (b.verdict.serves(g.bound(g.payer))) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
     };

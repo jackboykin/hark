@@ -859,6 +859,36 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
+    /// A hop of a recalled answer: its reply, when its fact lapses, and its verdict.
+    pub const Recalled = struct { reply: Reply, expires_ns: i64, verdict: store.Verdict };
+
+    /// The answer rule read against the store, building no cell: the
+    /// question's chain as stored, into `arena`. `.fresh` is what the rule
+    /// would settle on for a client, whose bound is now; `.any` is every
+    /// age, for the callers that decide what age serves. Null where the
+    /// rule would have work to do: a hop not stored, not judged or no
+    /// longer proven (DNSSEC on), or a broken chain.
+    pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: enum { fresh, any }) !?[]const Recalled {
+        var hops: std.ArrayList(Recalled) = .empty;
+        var seen: [max_cname_chain + 1]dns.Name = undefined;
+        var next = name;
+        while (true) {
+            var kb: KeyBuf = undefined;
+            const key = Key.of(&kb, .rrset, next, qtype);
+            const e = (if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key)) orelse return null;
+            // A bound of 0 asks only that it was ever judged.
+            if (g.cfg.trust_anchor != null and !e.blob.verdict.serves(if (age == .fresh) g.now() else 0)) return null;
+            const r = (try store.Store.parse(arena, e.blob)).rrset;
+            try hops.append(arena, .{ .reply = r, .expires_ns = e.expires_ns, .verdict = e.blob.verdict });
+            seen[hops.items.len - 1] = next;
+            switch (walk.chain(r, qtype, seen[0..hops.items.len])) {
+                .done => return hops.items,
+                .next => |n| next = n,
+                .broken => return null,
+            }
+        }
+    }
+
     /// No cell, no wait: `demand` is the only pin.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.index.get(key);
