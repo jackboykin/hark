@@ -175,8 +175,8 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         .stale_answer, .stale_nxdomain_answer => if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| return served,
         else => return try answer.servfail(arena, q, client, ede),
     };
-    if (try memory(arena, g, scenario, q, client, d64, .floored)) |served| return served;
-    const served = try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
+    const served = try memory(arena, g, scenario, q, client, d64, .floored) orelse
+        try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
     try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
     return served;
 }
@@ -511,8 +511,8 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(125, r.parsed);
-    try testing.expectEqual(121, r.ran);
+    try testing.expectEqual(126, r.parsed);
+    try testing.expectEqual(122, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

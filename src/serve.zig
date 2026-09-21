@@ -289,7 +289,7 @@ const Server = struct {
         };
         if (try s.memory(arena, q, client, .floored)) |served| {
             s.g.stats.clients.hit += 1;
-            return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
+            return s.answered(reply, query, served, s.e.now_ns);
         }
         const asked = if (d64) |d| try d.asked(arena, q) else q;
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
@@ -299,9 +299,9 @@ const Server = struct {
         try s.g.drain();
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled(), .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
-        if (p.cached) if (try s.finish(arena, &p, query)) |served| {
+        if (p.cached) if (try s.shape(arena, &p, q, client)) |served| {
             s.g.stats.clients.hit += 1;
-            s.send(reply, query, served.msg, served.ede, p.asked_ns);
+            try s.answered(reply, query, served, p.asked_ns);
             return s.release(p);
         };
         p.wire = try s.gpa.dupe(u8, wire);
@@ -328,12 +328,12 @@ const Server = struct {
             _ = s.scratch.reset(.retain_capacity);
             const arena = s.scratch.allocator();
             const query = try dns.parseMessage(arena, p.wire);
-            const served = try s.finish(arena, p, query) orelse {
+            const served = try s.shape(arena, p, query.questions[0], answer.Client.fromQuery(query)) orelse {
                 i += 1;
                 continue;
             };
             s.g.stats.clients.miss += 1;
-            s.send(p.reply, query, served.msg, served.ede, p.asked_ns);
+            try s.answered(p.reply, query, served, p.asked_ns);
             s.release(p.*);
             _ = s.pending.swapRemove(i);
         }
@@ -350,9 +350,8 @@ const Server = struct {
         const q = query.questions[0];
         const client = answer.Client.fromQuery(query);
         const served = try s.memory(arena, q, client, .stale) orelse return false;
-        try s.failures.note(s.gpa, q, client.cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
         s.g.stats.clients.miss += 1;
-        s.send(p.reply, query, served.msg, served.ede, p.asked_ns);
+        try s.answered(p.reply, query, served, p.asked_ns);
         return true;
     }
 
@@ -381,13 +380,12 @@ const Server = struct {
         return if (d64) |d| try d.shape(arena, q, served, null) else served;
     }
 
-    /// The reply once every root it needs has settled, noted in the failure cache.
-    fn finish(s: *Server, arena: Allocator, p: *Pending, query: dns.Message) !?answer.Served {
-        const q = query.questions[0];
-        const client = answer.Client.fromQuery(query);
-        const served = try s.shape(arena, p, q, client) orelse return null;
-        try s.failures.note(s.gpa, q, client.cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
-        return served;
+    /// A reply the resolver derived, noted in the failure cache: a failure
+    /// opens or widens its window, stale holds it, an answer forgets it.
+    /// What the cache replays is its own note, sent as is.
+    fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
+        try s.failures.note(s.gpa, query.questions[0], answer.Client.fromQuery(query).cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
+        s.send(reply, query, served.msg, served.ede, asked_ns);
     }
 
     fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
