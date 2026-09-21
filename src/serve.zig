@@ -509,6 +509,7 @@ const Server = struct {
 };
 
 pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
+    na.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
     const anchors = cfg.trustAnchors();
