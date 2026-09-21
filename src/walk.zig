@@ -235,6 +235,13 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 s.stale_checked[i] = true;
                 if (last.value.rrset.kind == .servfail) s.stale[i] = try staleReply(g, last.key, g.cell(id).arena.allocator());
             }
+            // Judged as it lands, so its zone's chain of trust overlaps the
+            // rest of the walk. Stale hops go unjudged: their signatures
+            // may have expired, and the answer is then unchecked.
+            if (g.cfg.trust_anchor != null and s.stale[i] == null and s.nj == i) {
+                s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
+                s.nj += 1;
+            }
             const r = if (s.stale[i]) |st| st.* else last.value.rrset;
             if (r.kind != .alias or qtype == .cname) break;
             next = r.target;
@@ -253,10 +260,8 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         expires = @min(expires, g.cell(h).expires_ns);
         stale = stale or st != null;
     }
-    // Stale hops go unjudged: their signatures may have expired.
     var status: dnssec.SecurityStatus = .unchecked;
     if (g.cfg.trust_anchor != null and !stale) {
-        while (s.nj < s.n) : (s.nj += 1) s.judged[s.nj] = try trust.demandSecure(g, id, s.hops[s.nj]);
         status = .secure;
         for (s.judged[0..s.nj]) |j| {
             const c = g.cell(j);
@@ -267,7 +272,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     }
     // The SERVFAIL window is the answer's; a helper's failure dissolves at once.
     if (status == .bogus or g.cell(s.hops[s.n - 1]).value.rrset.kind == .servfail) expires = failureExpiry(g, id, false);
-    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .status = status, .judged = s.judged[0..s.nj], .stale = s.stale[0..s.n] }, expires);
+    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .status = status, .judged = if (stale) &.{} else s.judged[0..s.nj], .stale = s.stale[0..s.n] }, expires);
     // Best effort.
     if (kind == .answer and g.cfg.prefetch and !stale and refreshable(g, s, expires))
         g.refresh(g.cell(id).key, g.cell(id).name) catch {};
