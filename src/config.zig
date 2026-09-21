@@ -163,8 +163,6 @@ const ConfigError = error{
     InvalidRootHintAddress,
     TooManyRootHints,
     InvalidValue,
-    InvalidWorkerCount,
-    InvalidQueryMemoryLimit,
     InvalidAclEntry,
     /// Operator set a key gated behind `-Dtesting=true` in a production build.
     TestOnlyConfigKey,
