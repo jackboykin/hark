@@ -2,7 +2,7 @@
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
 
-SCENARIO_BEGIN an RRset that fails validation keeps a small assigned TTL, not its own
+SCENARIO_BEGIN an RRset that fails validation is asked again after the failure window, not its TTL
 
 ; RFC 4035 §4.7: RRsets that fail to validate do not have trustworthy TTLs.
 ; A forged reply carrying a week-long TTL and a bad signature must not
@@ -10,7 +10,7 @@ SCENARIO_BEGIN an RRset that fails validation keeps a small assigned TTL, not it
 ; and the failure cache answers for servfail-ttl (5 s by default; RFC 9520).
 ;
 ; The child serves the forgery through step 4 and the genuine, signed
-; record from step 5 on. Every query inside the assigned lifetime is
+; record from step 5 on. Every query inside the failure window is
 ; answered from memory, so a re-query at 3 s still SERVFAILs even though
 ; the server has mended; a re-query at 6 s must go upstream and validate.
 ; Both directions are pinned by rcode alone, no absence check needed.
@@ -82,7 +82,7 @@ ENTRY_BEGIN
     www.example. IN A
 ENTRY_END
 
-; Inside the assigned lifetime: served from memory, so the mended server
+; Inside the failure window: served from memory, so the mended server
 ; is never asked and the forgery still SERVFAILs.
 STEP 3 TIME_PASSES ELAPSE 3
 
