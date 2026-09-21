@@ -860,8 +860,8 @@ pub const Graph = struct {
         return id;
     }
 
-    /// The first question waiting on `id`, oldest demand first, whose budget
-    /// has room; else the first one at all. None for an orphan.
+    /// The first question waiting on `id`, depth first in pin order, whose
+    /// budget has room; else the first one at all. None for an orphan.
     fn payerOf(g: *Graph, id: CellId) ?*Budget {
         g.checks += 1;
         var first: ?*Budget = null;
@@ -896,8 +896,8 @@ pub const Graph = struct {
         return g.now() >= b.deadline_ns or b.queries >= g.cfg.max_queries or b.validation.exhausted();
     }
 
-    /// NS-address sub-resolutions between `id` and its nearest question,
-    /// along the shortest demand chain; 0 for an orphan.
+    /// NS-address sub-resolutions (an addr's own rrsets) between `id` and
+    /// its nearest question, along the shortest demand chain; 0 for an orphan.
     pub fn level(g: *Graph, id: CellId) u8 {
         g.checks += 1;
         const gpa = g.scratch.allocator();
@@ -912,7 +912,7 @@ pub const Graph = struct {
                 c.seen = g.checks;
                 if (budgetOf(c) != null) return d;
                 for (c.waiters.items) |w| {
-                    const list = if (g.cell(w).key.kind == .addr) &next else &here;
+                    const list = if (c.key.kind == .rrset and g.cell(w).key.kind == .addr) &next else &here;
                     list.append(gpa, w) catch return d;
                 }
             }
@@ -971,6 +971,7 @@ pub const Graph = struct {
         _ = g.scratch.reset(.retain_capacity);
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_hash = 0 } };
         g.payer = g.payerOf(id) orelse &g.unpaid;
+        defer g.payer = &g.unpaid;
         g.tally.runs += 1;
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
