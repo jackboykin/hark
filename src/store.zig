@@ -6,7 +6,6 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
-const dnssec = @import("dnssec.zig");
 const graph = @import("graph.zig");
 const trust = @import("trust.zig");
 
@@ -17,7 +16,7 @@ const RR = dns.ResourceRecord;
 
 /// `secure(rrset)` over exactly these bytes.
 pub const Verdict = extern struct {
-    status: u8 = @backingInt(dnssec.SecurityStatus.unchecked),
+    status: u8 = 0,
     _pad: [7]u8 = @splat(0),
     proven_until_ns: i64 = 0,
     until_ns: i64 = 0,
@@ -27,7 +26,7 @@ pub const Verdict = extern struct {
     }
 
     pub fn chain(v: Verdict) trust.Chain {
-        return .{ .status = @fromBackingInt(@as(u2, @intCast(v.status))), .proven_until_ns = v.proven_until_ns };
+        return .{ .status = @fromBackingInt(v.status), .proven_until_ns = v.proven_until_ns };
     }
 };
 
@@ -293,7 +292,7 @@ pub const Store = struct {
                 break :blk .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
-                var c: trust.Chain = .{ .status = @fromBackingInt(@as(u2, @intCast(try r.int(u8)))) };
+                var c: trust.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
                 c.proven_until_ns = try r.int(i64);
                 c.records = try r.records(try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };

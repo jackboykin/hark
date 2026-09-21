@@ -11,11 +11,13 @@ const Graph = graph.Graph;
 const CellId = graph.CellId;
 const Failure = graph.Failure;
 const RR = dns.ResourceRecord;
-const Status = dnssec.SecurityStatus;
+
+/// Proven signed, or proven unsigned. Bogus is no fact: it fails.
+pub const Proof = enum(u8) { secure, insecure };
 
 /// A verdict and what it rests on: the verified DS set or keys.
 pub const Chain = struct {
-    status: Status,
+    status: Proof,
     records: []const RR = &.{},
     /// `secure` only: where the signatures' validity ends (`rrsigTtlCap`).
     proven_until_ns: i64 = std.math.maxInt(i64),
@@ -123,7 +125,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .answer => {
             const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget) orelse
                 return failChain(g, id, s.rrset.?);
-            const status: Status = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
+            const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
         },
         .nodata, .nxdomain => {
@@ -261,7 +263,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             defer clock.stop();
             // Signatures alone: a claim about an empty set.
             if (groups == 0) return failBogus(g, id, s.target);
-            var status: Status = .secure;
+            var status: Proof = .secure;
             groups = 0;
             prev_dname = null;
             for (r.answers, 0..) |rr, i| {
@@ -280,13 +282,14 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget) orelse
                     return failBogus(g, id, s.target);
                 cap = @min(cap, dnssec.rrsigTtlCap(verified, now));
-                var verdict: Status = .secure;
                 if (verified.labels < dnssec.signedLabels(rr.name)) {
                     if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &cap) != .secure) return failBogus(g, id, s.target);
-                    verdict = dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget);
-                    if (verdict == .bogus or verdict == .unchecked) return failBogus(g, id, s.target);
+                    switch (dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget)) {
+                        .secure => {},
+                        .insecure => status = .insecure,
+                        .bogus, .unchecked => return failBogus(g, id, s.target),
+                    }
                 }
-                status = dnssec.weakest(status, verdict);
             }
             try g.settle(id, .{ .secure = .{ .status = status, .proven_until_ns = if (status == .secure) capExpiry(g, cap) else std.math.maxInt(i64) } }, @min(expires, capExpiry(g, cap)));
         },
