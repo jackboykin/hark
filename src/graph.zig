@@ -711,7 +711,7 @@ pub const Graph = struct {
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
         }
-        if (c.key.kind == .secure) g.stats.trust.bogus += 1;
+        if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
         c.state = .{ .failure = why };
         c.expires_ns = g.now();
         try g.woken(id, false);
