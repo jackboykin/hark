@@ -876,8 +876,8 @@ pub const Graph = struct {
             var kb: KeyBuf = undefined;
             const key = Key.of(&kb, .rrset, next, qtype);
             const e = (if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key)) orelse return null;
-            // A bound of 0 asks only that it was ever judged.
-            if (g.cfg.trust_anchor != null and !e.blob.verdict.serves(if (age == .fresh) g.now() else 0)) return null;
+            const v = e.blob.verdict;
+            if (g.cfg.trust_anchor != null and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
             const r = (try store.Store.parse(arena, e.blob)).rrset;
             try hops.append(arena, .{ .reply = r, .expires_ns = e.expires_ns, .verdict = e.blob.verdict });
             seen[hops.items.len - 1] = next;

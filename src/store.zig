@@ -25,6 +25,11 @@ pub const Verdict = extern struct {
         v.* = .{ .status = @backingInt(c.status), .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
     }
 
+    /// Zeroed is never judged.
+    pub fn judged(v: Verdict) bool {
+        return v.until_ns != 0;
+    }
+
     /// Stands for a demander bounded at `bound_ns` (`Graph.bound`).
     pub fn serves(v: Verdict, bound_ns: i64) bool {
         return v.until_ns > bound_ns;
