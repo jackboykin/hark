@@ -22,7 +22,7 @@ fn errLog(comptime fmt: []const u8, args: anytype) void {
 // IPv4 + IPv6 addresses for a.root-servers.net through m.root-servers.net.
 // Source: https://www.internic.net/domain/named.root
 
-pub const root_hints_default: [26]Address = .{
+const root_hints_default: [26]Address = .{
     net_addr.initIp4(.{ 198, 41, 0, 4 }, 53), // a
     net_addr.initIp4(.{ 170, 247, 170, 2 }, 53), // b
     net_addr.initIp4(.{ 192, 33, 4, 12 }, 53), // c

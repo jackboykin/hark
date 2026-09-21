@@ -44,7 +44,7 @@ pub const ValidationBudget = struct {
     nsec3_hash_spent: u32 = 0,
     max_nsec3_hash: u32 = max_nsec3_hashes_per_resolution,
 
-    pub fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
+    fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.sig_verify_spent >= self.max_sig_verify) return error.ValidationBudgetExhausted;
         self.sig_verify_spent += 1;
     }
@@ -204,7 +204,7 @@ fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
 /// answer from a zone signed with it truncates. Transport only: no
 /// eligibility filter, the zone signs with it whether or not the DS
 /// digest is one hark can use.
-pub fn signatureExceedsUdp(alg: dns.DnssecAlgorithm) bool {
+fn signatureExceedsUdp(alg: dns.DnssecAlgorithm) bool {
     return alg == .mldsa44; // 2420 B
 }
 
@@ -788,7 +788,7 @@ pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
 
 /// Number of trailing labels shared between two names (case-insensitive).
 /// Used to derive the closest encloser from an NSEC that covers qname.
-pub fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
+fn commonSuffixLabels(a: dns.Name, b: dns.Name) usize {
     const min_labels = @min(a.labels.len, b.labels.len);
     for (0..min_labels) |i| {
         const al = a.labels[a.labels.len - 1 - i];
@@ -923,7 +923,7 @@ fn nsecProvesEnt(nsec_owner: dns.Name, nsec: dns.NsecData, qname: dns.Name) bool
 /// RFC 4035 §5.4 + RFC 6840 §4.3: a NODATA proof fails if the bitmap
 /// asserts qtype — or a CNAME, which would have answered the query —
 /// exists at the owner. Also gates aggressive-use synthesis.
-pub fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
+fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
     return dns.typeBitmapContains(type_bit_maps, qtype) or
         dns.typeBitmapContains(type_bit_maps, .cname);
 }

@@ -19,7 +19,7 @@ pub const Transport = enum {
     tcp,
 
     /// Round trips a cold exchange costs, handshake included.
-    pub fn coldRtts(t: Transport) u32 {
+    fn coldRtts(t: Transport) u32 {
         return switch (t) {
             .udp => 1,
             .tcp => 2,

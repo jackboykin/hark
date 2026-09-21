@@ -19,10 +19,10 @@ pub const max_name_len = 253;
 /// Presentation-format ceiling: every content byte can escape to `\DDD`
 /// (4 chars), separators are free relative to the wire length budget.
 pub const max_dotted_len = 4 * max_name_len;
-pub const header_len = 12;
+const header_len = 12;
 pub const max_udp_payload = 512;
 /// A week (BIND's max-cache-ttl): a chosen 0xFFFFFFFF would outlive its delegation.
-pub const max_ttl: u32 = 604_800;
+const max_ttl: u32 = 604_800;
 pub const edns_udp_payload: u16 = 1232;
 /// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
 /// message can be at most 65535 bytes. Also the ceiling for any DNS
@@ -589,7 +589,7 @@ pub const Message = struct {
 /// Index of the first label-separating `.` at or after `start`, skipping
 /// escaped bytes. Works on any well-formed presentation string; `\DDD`
 /// digits can never be `.` so skipping one byte after `\` suffices.
-pub fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
+fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
     var i = start;
     while (i < s.len) : (i += 1) switch (s[i]) {
         '\\' => i += 1,
@@ -1337,13 +1337,13 @@ pub const Serializer = struct {
         try self.writeU16(@backingInt(q.qclass));
     }
 
-    pub fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
+    fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeRecordFields(rr);
     }
 
     /// Names compressed as `writeResourceRecord` would, the rest copied,
     /// `r.ttl` written over the stored TTL.
-    pub fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
+    fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
         if (self.names != null) try self.writeWireName(r.owner) else try self.writeSlice(r.owner);
         const at = self.pos;
         try self.writeSlice(r.rest[0..10]);
@@ -1505,7 +1505,7 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     return serializeMessageEnds(buf, msg, &ends);
 }
 
-pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
+fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
     const sections: Sections(ResourceRecord) = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
     return serializeEnds(buf, msg.header, msg.questions, ResourceRecord, sections, msg.opt, ends);
 }
@@ -2075,7 +2075,7 @@ pub fn lowerNameIntoBuf(buf: []u8, name: []const u8) []const u8 {
     return buf[0..name.len];
 }
 
-pub fn cloneName(allocator: Allocator, name: Name) !Name {
+fn cloneName(allocator: Allocator, name: Name) !Name {
     const labels = try allocator.alloc([]const u8, name.labels.len);
     errdefer allocator.free(labels);
     var initialized: usize = 0;
@@ -2101,7 +2101,7 @@ pub fn cloneNameLower(allocator: Allocator, name: Name) !Name {
     return cloneNameFlat(allocator, name, true);
 }
 
-pub const name_flat_align: std.mem.Alignment = .fromByteUnits(@alignOf([]const u8));
+const name_flat_align: std.mem.Alignment = .fromByteUnits(@alignOf([]const u8));
 
 pub fn nameFlatSize(name: Name) usize {
     var total: usize = @sizeOf([]const u8) * name.labels.len;
@@ -2159,7 +2159,7 @@ pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target:
 
 /// RFC 5452 §9.1 / RFC 9619: verify response question section echoes the
 /// original query. QDCOUNT must be exactly 1 for standard queries (OPCODE=0).
-pub fn validateQuestionMatch(response: Message, expected_name: Name, expected_type: RType) bool {
+fn validateQuestionMatch(response: Message, expected_name: Name, expected_type: RType) bool {
     if (response.questions.len != 1) return false;
     const q = response.questions[0];
     return q.qtype == expected_type and q.qclass == .in and q.name.eql(expected_name);
@@ -2225,7 +2225,7 @@ test "validateResponse accepts a question-less error reply but rejects question-
     try std.testing.expectError(error.FormatError, validateResponse(noerror_no_question, qname, .a));
 }
 
-pub fn freeName(allocator: Allocator, name: Name) void {
+fn freeName(allocator: Allocator, name: Name) void {
     for (name.labels) |l| allocator.free(l);
     allocator.free(name.labels);
 }
@@ -2243,7 +2243,7 @@ fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
     return allocator.dupe(u8, slice);
 }
 
-pub fn freeRData(allocator: Allocator, rdata: RData) void {
+fn freeRData(allocator: Allocator, rdata: RData) void {
     switch (rdata) {
         .a, .aaaa => {},
         .ns, .cname, .dname, .ptr => |name| freeName(allocator, name),
@@ -2275,7 +2275,7 @@ pub fn freeRData(allocator: Allocator, rdata: RData) void {
     }
 }
 
-pub fn cloneRData(allocator: Allocator, rdata: RData) !RData {
+fn cloneRData(allocator: Allocator, rdata: RData) !RData {
     return switch (rdata) {
         .a => |v| .{ .a = v },
         .aaaa => |v| .{ .aaaa = v },
@@ -2446,7 +2446,7 @@ fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
 /// alias the wire buffer, so `allocator.free` on them is only sound when
 /// it is a no-op. For manually-built or `cloneRData`'d Messages (e.g.
 /// cache-owned records), any allocator that owns the contents works.
-pub fn freeMessage(allocator: Allocator, msg: Message) void {
+fn freeMessage(allocator: Allocator, msg: Message) void {
     for (msg.questions) |q| freeName(allocator, q.name);
     allocator.free(msg.questions);
     freeResourceRecords(allocator, msg.answers);

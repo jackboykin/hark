@@ -31,7 +31,7 @@ const max_servers = delegation.max_servers_per_level;
 const max_hedge = 3;
 
 /// BIND's `prefetch 2 9`, the 9: or steering zones double.
-pub const refresh_floor_s = 9;
+const refresh_floor_s = 9;
 
 pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport };
 

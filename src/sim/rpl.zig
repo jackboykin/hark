@@ -13,7 +13,7 @@ const dns64 = @import("../dns64.zig");
 
 /// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
 /// to cache TTL 0.
-pub const default_ttl: u32 = 3600;
+const default_ttl: u32 = 3600;
 
 /// MATCH flags from every context; which ones a context honours is the
 /// runner's business. An unknown flag is a parse error, as in Python.
@@ -129,7 +129,7 @@ pub const Scenario = struct {
     dnssec_zones: []const []const u8 = &.{},
 };
 
-pub const no_flags: dns.Header.Flags = .{
+const no_flags: dns.Header.Flags = .{
     .rcode = .no_error,
     .cd = false,
     .ad = false,
@@ -789,7 +789,7 @@ fn appendStr(arena: Allocator, list: []const []const u8, s: []const u8) Allocato
     return out;
 }
 
-pub fn rcodeFromText(t: []const u8) ?dns.RCode {
+fn rcodeFromText(t: []const u8) ?dns.RCode {
     const table = .{
         .{ "NOERROR", dns.RCode.no_error },
         .{ "FORMERR", dns.RCode.format_error },
@@ -803,7 +803,7 @@ pub fn rcodeFromText(t: []const u8) ?dns.RCode {
     return null;
 }
 
-pub fn rtypeFromText(t: []const u8) ?dns.RType {
+fn rtypeFromText(t: []const u8) ?dns.RType {
     var buf: [16]u8 = undefined;
     if (t.len > buf.len) return null;
     const u = std.ascii.upperString(&buf, t);

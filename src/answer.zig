@@ -227,7 +227,7 @@ pub const Desk = struct {
 
 /// BIND's stale-refresh-time (RFC 8767 §5): after serving stale, how long
 /// the question is answered stale without asking.
-pub const stale_hold_s = 30;
+const stale_hold_s = 30;
 /// RFC 8767 §5: a resolution past a stub's patience answers stale instead.
 pub const stale_client_ms = 1800;
 
