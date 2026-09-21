@@ -220,13 +220,16 @@ fn digestSupported(digest_type: dns.DigestType) bool {
     };
 }
 
-/// A keyset whose DS advertises ML-DSA-44, reduced to the keys that may
-/// validate under it. The apex already refused every other signature;
-/// below it verifyRrsig binds an RRSIG to a key of its own algorithm, so
-/// with the classical keys gone a classical RRSIG has nothing to verify
-/// against. No per-RRset check, no flag. The apex RRSIGs are dropped too:
-/// no keyset consumer reads them and they would not verify over the subset.
-pub fn postQuantumKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
+/// The keys a verified keyset may validate with below the apex. Under a
+/// DS advertising ML-DSA-44 only the ML-DSA-44 keys survive: the apex
+/// already refused every other signature, and verifyRrsig binds an RRSIG
+/// to a key of its own algorithm, so a classical RRSIG has nothing left to
+/// verify against. No per-RRset check, no flag. The apex RRSIGs are dropped
+/// too: no keyset consumer reads them and they would not verify over the
+/// subset. Any other DS set leaves the keyset whole (RFC 6840 §5.11). The
+/// result borrows `records` or lives in `allocator`; free it with an arena.
+pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord, ds_records: []const dns.DsData) ![]const dns.ResourceRecord {
+    if (!hasMlDsaDs(ds_records)) return records;
     const keep = struct {
         fn f(rr: dns.ResourceRecord) bool {
             return rr.rtype == .dnskey and rr.rdata.dnskey.algorithm == .mldsa44;
@@ -4240,9 +4243,12 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     const sha1_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
     try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, sha1_ds }, test_owner, 1_700_000_000, &b4)).algorithm);
 
-    // Only the ML-DSA-44 key survives into the keyset used below the apex.
-    const kept = try postQuantumKeys(testing.allocator, &dual);
-    defer testing.allocator.free(kept);
+    // Only the ML-DSA-44 key survives into the keyset used below the apex;
+    // without an ML-DSA-44 DS the keyset stays whole.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(dual.len, (try usableKeys(arena.allocator(), &dual, &.{ed_ds})).len);
+    const kept = try usableKeys(arena.allocator(), &dual, &.{ ed_ds, pq_ds });
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, kept[0].rdata.dnskey.algorithm);
 

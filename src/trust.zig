@@ -211,7 +211,8 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const now = g.wallNow();
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget) catch
         return failChain(g, id, s.rrset.?);
-    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = r.answers } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
+    const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
+    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
 }
 
 /// The judgement of one rrset version; a fresh cell per version, since
