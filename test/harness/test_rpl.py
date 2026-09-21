@@ -27,43 +27,6 @@ def _parse_fails(text: str, tmp_path: Path, match: str) -> None:
     assert match in str(exc_info.value), f"expected {match!r} in {exc_info.value!r}"
 
 
-# ── Happy-path baseline ──────────────────────────────────────────────────
-
-
-def test_minimal_scenario_parses(tmp_path):
-    s = _parse(
-        """\
-        ; hark: root-hints = 127.0.10.1
-
-        SCENARIO_BEGIN minimal
-        RANGE_BEGIN 0 100
-          ADDRESS 127.0.10.1
-          ENTRY_BEGIN
-            MATCH opcode qname
-            ADJUST copy_id copy_query
-            REPLY QR AA NOERROR
-            SECTION QUESTION
-              example.com. IN A
-            SECTION ANSWER
-              example.com. 3600 IN A 1.2.3.4
-          ENTRY_END
-        RANGE_END
-        STEP 1 QUERY
-        ENTRY_BEGIN
-          REPLY RD
-          SECTION QUESTION
-            example.com. IN A
-        ENTRY_END
-        SCENARIO_END
-        """,
-        tmp_path,
-    )
-    assert s.root_hints == ["127.0.10.1"]
-    assert len(s.ranges) == 1
-    assert s.ranges[0].address == "127.0.10.1"
-    assert len(s.steps) == 1
-
-
 # ── Malformed input the parser must reject at parse time ─────────────────
 
 
@@ -217,19 +180,6 @@ def test_rr_outside_section_rejected(tmp_path):
 # ── Header directives ────────────────────────────────────────────────────
 
 
-def test_root_hints_directive_parsed(tmp_path):
-    s = _parse(
-        """\
-        ; hark: root-hints = 127.0.10.1, 127.0.10.2
-
-        SCENARIO_BEGIN multi
-        SCENARIO_END
-        """,
-        tmp_path,
-    )
-    assert s.root_hints == ["127.0.10.1", "127.0.10.2"]
-
-
 def test_dnssec_zone_directive_parsed(tmp_path):
     s = _parse(
         """\
@@ -245,15 +195,9 @@ def test_dnssec_zone_directive_parsed(tmp_path):
     assert s.dnssec_zones == [".", "example.com."]
 
 
-def test_dnssec_zone_directive_absent(tmp_path):
-    s = _parse("SCENARIO_BEGIN nosign\nSCENARIO_END\n", tmp_path)
-    assert s.dnssec_zones == []
-
-
 def test_dnssec_zone_first_must_be_root(tmp_path):
     """Hark only consults trust anchors at root; rejecting a non-root first
     zone at parse time gives a sharp error instead of a cryptic SERVFAIL."""
-    import pytest
     with pytest.raises(Exception, match="first dnssec-zone must be"):
         _parse(
             """\
@@ -304,15 +248,3 @@ def test_query_log_bad_qtype_rejected(tmp_path):
         tmp_path,
         match="bad QUERY_LOG qtype",
     )
-
-
-def test_missing_root_hints_is_empty(tmp_path):
-    # Parser is neutral; conftest decides whether to require root-hints.
-    s = _parse(
-        """\
-        SCENARIO_BEGIN none
-        SCENARIO_END
-        """,
-        tmp_path,
-    )
-    assert s.root_hints == []

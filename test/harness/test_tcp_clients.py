@@ -86,7 +86,7 @@ def test_oversized_frame_closes(hark: HarkProcess) -> None:
 
 
 def test_slots_recycle(hark: HarkProcess) -> None:
-    # One worker, 64 ring slots: a leaked slot or client shows up here.
+    # A leaked connection slot or client shows up here.
     for i in range(200):
         with connect() as s:
             s.sendall(framed(f"r{i}.invalid.", i))
@@ -113,7 +113,6 @@ def test_idle_connection_is_closed(hark: HarkProcess) -> None:
         t0 = time.monotonic()
         assert s.recv(16) == b""
         elapsed = time.monotonic() - t0
-    # Sweep runs once a second on top of the configured idle timeout.
     assert IDLE_MS / 1000 - 0.2 <= elapsed <= IDLE_MS / 1000 + 2
 
 

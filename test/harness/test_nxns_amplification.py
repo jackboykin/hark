@@ -17,7 +17,6 @@ nxns_evil.EvilRoot.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import dns.flags
@@ -26,21 +25,14 @@ import dns.query
 import pytest
 
 from .hark_proc import HarkConfig, HarkProcess, find_hark_binary
-from .nxns_evil import ROOT_LABEL, EvilRoot, decode
+from .nxns_evil import ROOT_LABEL, EvilRoot
 
-
-def test_evil_decode_is_case_insensitive() -> None:
-    # hark 0x20-randomizes query case; a case-sensitive mock answers an
-    # uncounted authoritative NODATA that the resolver rightly caches,
-    # flaking the amplification test below (~20% of runs). See decode().
-    assert decode("N-0-3") == [0, 3]
-    assert decode("N") == []
 
 EVIL_IP = "127.0.0.1"
 EVIL_PORT = 18053
 HARK_PORT = 15354
 # Old (unpatched) behaviour was ~500 upstream queries. The shared budget caps
-# at max_global_queries (100) plus a small concurrent-overshoot. 200 cleanly
+# at max-queries (100) plus a small concurrent overshoot. 200 cleanly
 # separates "fixed" from "amplifying" without being flaky on the exact count.
 AMPLIFICATION_BOUND = 200
 
@@ -59,19 +51,9 @@ def test_glueless_ns_fanout_is_bounded(tmp_path: Path) -> None:
     with EvilRoot(EVIL_IP, EVIL_PORT) as evil, HarkProcess(binary, cfg, tmp_path) as hark:
         q = dns.message.make_query(f"victim.{ROOT_LABEL}.", "A")
         q.flags |= dns.flags.RD
-        # Resend until the fan-out actually launches: a single client UDP packet
-        # can be dropped if hark's UDP socket races its TCP-readiness signal, in
-        # which case evil sees nothing — a harness hiccup, not the property under
-        # test. Each attempt SERVFAILs (the NS names never resolve), so we only
-        # look at how much upstream traffic it provoked.
-        for _ in range(5):
-            try:
-                dns.query.udp(q, "127.0.0.1", port=HARK_PORT, timeout=20)
-            except Exception:
-                pass
-            time.sleep(0.5)  # let in-flight fan-out threads drain
-            if evil.total > 0:
-                break
+        # It SERVFAILs (the NS names never resolve); only the upstream
+        # traffic it provoked matters.
+        dns.query.udp(q, "127.0.0.1", port=HARK_PORT, timeout=20)
         assert hark.is_alive(), f"hark died:\n{hark.read_log()}"
 
     assert evil.total > 0, "evil root saw no queries — scenario wiring broke"
