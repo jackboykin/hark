@@ -188,9 +188,8 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
     return @intCast(@min(@max(@divTrunc(proven_until_ns - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
 }
 
-/// A question whose chain is fresh in the store and, with DNSSEC on, still
-/// proven: served from memory, no cell built. Null: the graph's to answer,
-/// as is a chain inside the refresh window, where it decides on prefetch.
+/// Null inside the refresh window, where the graph decides on prefetch:
+/// a hop born too short to refresh declines its last 2 s.
 pub fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
     const judged = g.cfg.trust_anchor != null;

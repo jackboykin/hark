@@ -386,7 +386,8 @@ const Server = struct {
 
     /// A reply the resolver derived, noted in the failure cache: a failure
     /// opens or widens its window, stale holds it, an answer forgets it.
-    /// What the cache replays is its own note, sent as is.
+    /// What the cache replays is its own note, sent as is: noted, a
+    /// replayed hold would extend itself.
     fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
         try s.failures.note(s.gpa, query.questions[0], answer.Client.fromQuery(query).cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
         s.send(reply, query, served.msg, served.ede, asked_ns);

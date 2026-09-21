@@ -197,9 +197,6 @@ pub const AnswerScratch = struct {
 
 // ── Rules ──────────────────────────────────────────────────────────────
 
-/// `answer(name, type)`: `rrset(name, type)`, then each alias's target
-/// until an RRset ends the chain. Length and loop checks run at demand
-/// time; a chain that fails them is a resolution failure, like a failed hop.
 /// Where an answer's chain goes after `r`, the last of the hops `seen`:
 /// it ends, goes on to the alias target, or is broken by a loop or by
 /// passing `max_cname_chain`.
@@ -210,6 +207,9 @@ pub fn chain(r: graph.Reply, qtype: dns.RType, seen: []const dns.Name) union(enu
     return .{ .next = r.target };
 }
 
+/// `answer(name, type)`: `rrset(name, type)`, then each alias's target
+/// until an RRset ends the chain. Length and loop checks run at demand
+/// time; a chain that fails them is a resolution failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
