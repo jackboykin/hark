@@ -262,20 +262,13 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         expires = @min(expires, g.cell(h).expires_ns);
         stale = stale or st != null;
     }
-    var status: dnssec.SecurityStatus = .unchecked;
-    var why: ?Failure = null;
-    if (g.cfg.trust_anchor != null and !stale) {
-        status = .secure;
-        for (s.judged[0..s.nj]) |j| {
-            const c = g.cell(j);
-            if (!c.settled()) return;
-            // A verdict that failed is bogus, and lives no longer.
-            if (c.failure()) |f| why = why orelse f;
-            status = dnssec.weakest(status, if (c.failure() != null) .bogus else c.state.fact.secure.status);
-            expires = @min(expires, c.expires_ns);
-        }
+    const judged = if (stale) &.{} else s.judged[0..s.nj];
+    // A verdict that failed is bogus, and lives no longer.
+    for (judged) |j| {
+        if (!g.cell(j).settled()) return;
+        expires = @min(expires, g.cell(j).expires_ns);
     }
-    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .status = status, .why = why, .judged = if (stale) &.{} else s.judged[0..s.nj], .stale = s.stale[0..s.n] }, expires);
+    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .judged = judged, .stale = s.stale[0..s.n] }, expires);
     // Best effort.
     if (kind == .answer and g.cfg.prefetch and !stale and refreshable(g, s, expires))
         g.refresh(g.cell(id).key, g.cell(id).name) catch {};
@@ -285,7 +278,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
 fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
-    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .status = a.status, .why = a.why, .judged = try arena.dupe(CellId, a.judged), .stale = try arena.dupe(?*const Reply, a.stale) } }, expires);
+    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .judged = try arena.dupe(CellId, a.judged), .stale = try arena.dupe(?*const Reply, a.stale) } }, expires);
 }
 
 fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {

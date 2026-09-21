@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
+const dnssec = @import("dnssec.zig");
 const walk = @import("walk.zig");
 const dns64 = @import("dns64.zig");
 const special_use = @import("special_use.zig");
@@ -107,10 +108,15 @@ pub fn servfail(arena: Allocator, q: dns.Question, c: Client, ede: dns.Ede) !Ser
 pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
     if (g.cell(root).failure()) |why| return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
     const a = g.cell(root).state.fact.answer;
-    if (a.status == .bogus and !c.cd) {
-        const why = a.why orelse graph.Failure{ .code = .dnssec_bogus };
-        return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
-    }
+    // The weakest verdict; one that failed is bogus (RFC 4035 §4.3).
+    var status: dnssec.SecurityStatus = if (a.judged.len == 0) .unchecked else .secure;
+    for (a.judged) |j| switch (g.cell(j).state) {
+        .fact => |v| status = dnssec.weakest(status, v.secure.status),
+        .failure => |why| if (c.cd) {
+            status = .bogus;
+        } else return servfail(arena, q, c, .{ .code = why.code, .text = why.text }),
+        .pending => unreachable,
+    };
     std.debug.assert(a.hops.len > 0);
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
     var last: graph.Reply = undefined;
@@ -158,7 +164,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
             .rd = c.rd,
             .ra = true,
             .z = 0,
-            .ad = a.status == .secure and (c.do_bit or c.ad),
+            .ad = status == .secure and (c.do_bit or c.ad),
             .cd = c.cd,
             .rcode = last.rcode,
         } },

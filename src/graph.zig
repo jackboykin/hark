@@ -173,11 +173,7 @@ pub const Reply = struct {
 pub const Answer = struct {
     /// In chain order; every one but the last is an alias.
     hops: []const CellId,
-    /// The weakest `secure(hop)` verdict; `.unchecked` with DNSSEC off.
-    /// `.bogus` is a verdict that failed (RFC 4035 §4.3), for `why`.
-    status: dnssec.SecurityStatus = .unchecked,
-    why: ?Failure = null,
-    /// `secure(hop)` per hop; empty with DNSSEC off.
+    /// `secure(hop)` per hop, held; empty with DNSSEC off or served stale.
     judged: []const CellId = &.{},
     /// Per hop, a stale stand-in for a failed one; this cell's alone.
     stale: []const ?*const Reply = &.{},
