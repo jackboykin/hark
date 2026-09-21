@@ -200,6 +200,16 @@ pub const AnswerScratch = struct {
 /// `answer(name, type)`: `rrset(name, type)`, then each alias's target
 /// until an RRset ends the chain. Length and loop checks run at demand
 /// time; a chain that fails them is a resolution failure, like a failed hop.
+/// Where an answer's chain goes after `r`, the last of the hops `seen`:
+/// it ends, goes on to the alias target, or is broken by a loop or by
+/// passing `max_cname_chain`.
+pub fn chain(r: graph.Reply, qtype: dns.RType, seen: []const dns.Name) union(enum) { done, next: dns.Name, broken } {
+    if (r.kind != .alias or qtype == .cname) return .done;
+    if (seen.len > max_cname_chain) return .broken;
+    for (seen) |n| if (n.eql(r.target)) return .broken;
+    return .{ .next = r.target };
+}
+
 pub fn runAnswer(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
@@ -218,12 +228,13 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
                 s.nj += 1;
             }
-            const r = last.state.fact.rrset;
-            if (r.kind != .alias or qtype == .cname) break;
-            next = r.target;
-            var broken = s.n > max_cname_chain;
-            for (s.hops[0..s.n]) |h| broken = broken or g.cell(h).name.eql(next);
-            if (broken) return failAnswer(g, id, .{ .code = .other, .text = "cname loop" });
+            var seen: [max_cname_chain + 1]dns.Name = undefined;
+            for (seen[0..s.n], s.hops[0..s.n]) |*n, h| n.* = g.cell(h).name;
+            switch (chain(last.state.fact.rrset, qtype, seen[0..s.n])) {
+                .done => break,
+                .next => |n| next = n,
+                .broken => return failAnswer(g, id, .{ .code = .other, .text = "cname loop" }),
+            }
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = try g.demand(id, Key.of(&kb, .rrset, next, qtype), next) orelse

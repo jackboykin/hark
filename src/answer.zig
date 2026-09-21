@@ -192,16 +192,20 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
 fn past(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question) !?[]Past {
     var kb: graph.KeyBuf = undefined;
     var list: std.ArrayList(Past) = .empty;
+    var seen: std.ArrayList(dns.Name) = .empty;
     var name = q.name;
-    for (0..graph.max_cname_chain + 1) |_| {
+    while (true) {
         const e = g.store.any(graph.Key.of(&kb, .rrset, name, q.qtype)) orelse return null;
         if (g.cfg.trust_anchor != null and e.blob.verdict.until_ns == 0) return null;
         const r = (try store.Store.parse(arena, e.blob)).rrset;
         try list.append(arena, .{ .reply = r, .until = retainedUntil(g, ret, r) });
-        if (r.kind != .alias or q.qtype == .cname) return list.items;
-        name = r.target;
+        try seen.append(arena, name);
+        switch (walk.chain(r, q.qtype, seen.items)) {
+            .done => return list.items,
+            .next => |n| name = n,
+            .broken => return null,
+        }
     }
-    return null;
 }
 
 const Past = struct { reply: graph.Reply, until: i64 };
