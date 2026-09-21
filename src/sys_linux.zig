@@ -122,10 +122,10 @@ pub fn write(fd: posix.fd_t, buf: []const u8) !usize {
 }
 
 /// Takes the kernel's `linux.sigset_t`, not `posix.sigset_t`. The two are the
-/// same array only in a no-libc build; linking libc (which `-Dtsan` forces)
-/// widens the posix one to glibc's 128 bytes and the mismatch fails to compile.
-/// Every caller already builds its mask with `linux.sigemptyset`, so stay on
-/// the kernel ABI end to end.
+/// same array only in a no-libc build; linking libc widens the posix one to
+/// glibc's 128 bytes and the mismatch fails to compile. Every caller
+/// already builds its mask with `linux.sigemptyset`, so stay on the kernel ABI
+/// end to end.
 pub fn signalfd(fd: posix.fd_t, mask: *const linux.sigset_t, flags: u32) !posix.fd_t {
     const rc = linux.signalfd(fd, mask, flags);
     return switch (linux.errno(rc)) {

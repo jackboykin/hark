@@ -12,7 +12,7 @@
 #
 # Env vars:
 #   LATENCY_MS        netem one-way delay on lo (each TX adds this once)
-#   HARK_CONFIG       override config path (used by sweep.sh)
+#   HARK_CONFIG       override config path
 #   PROFILE_OUT_DIR   where `profile` writes flame.svg / perf-top.txt / .data
 #
 # Re-execs itself inside `unshare -Urn` if not already namespaced, signalled by
@@ -161,7 +161,7 @@ case "$CMD" in
         WORKLOAD="${2:-miss}"
         DURATION="${3:-15}"
         INFLIGHT="${4:-$DEFAULT_INFLIGHT}"
-        OUT_DIR="${PROFILE_OUT_DIR:-$REPO_ROOT/bench/baselines}"
+        OUT_DIR="${PROFILE_OUT_DIR:-$PWD}"
         TAG="${WORKLOAD}${LATENCY_MS:+-rtt${LATENCY_MS}ms}"
         QFILE="$TMPDIR/queries.txt"
         generate_queries "$WORKLOAD" "$QFILE"
@@ -173,7 +173,7 @@ case "$CMD" in
             sleep "$DURATION" &
         PERF_PID=$!
         # Verify perf actually attached — if it died immediately, abort before
-        # running the load and burning a slot in baselines/.
+        # running the load.
         sleep 0.2
         if ! kill -0 "$PERF_PID" 2>/dev/null; then
             echo "perf record exited immediately — check perf_event_paranoid" >&2
@@ -243,16 +243,9 @@ case "$CMD" in
         dnsperf -s 127.0.0.1 -p 5354 -d "$QFILE" -l "$DURATION" -c 1 -q "$INFLIGHT" -t "$(dnsperf_timeout)" \
             2>&1 | tee "$TMPDIR/dnsperf.out"
 
-        # Exit stats say where lost queries went.
+        # The exit stats block says where lost queries went.
         kill "$HARK_PID"; wait "$HARK_PID" 2>/dev/null || true; HARK_PID=""
-        echo ">>> hark log: $(wc -l < "$HARK_LOG") lines"
-        grep -E 'drop' "$HARK_LOG" || true
-        if grep -q SERVFAIL "$HARK_LOG"; then
-            echo ">>> SERVFAIL error-name distribution (top 10):"
-            grep SERVFAIL "$HARK_LOG" \
-                | sed -nE 's/.*SERVFAIL [0-9]+ms \(([^)]+)\).*/\1/p' \
-                | sort | uniq -c | sort -rn | head -10
-        fi
+        grep 'stats ' "$HARK_LOG" || true
         ;;
     *)
         echo "unknown command: $CMD" >&2
