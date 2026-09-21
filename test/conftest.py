@@ -86,6 +86,12 @@ class LiftedManifestCollector(pytest.Module):
             yield item
 
 
+def pytest_sessionstart(session):
+    # Outside every test's timeout: a cold zig cache would otherwise kill
+    # the build inside each test in turn.
+    hark_proc.find_hark_binary()
+
+
 def pytest_collect_file(parent, file_path: Path):
     if file_path.suffix == ".rpl":
         return RplFile.from_parent(parent, path=file_path)
