@@ -129,8 +129,19 @@ pub const Config = struct {
 /// The zone cut above a name, as learned from the parent's servers.
 pub const Cut = struct {
     zone: dns.Name,
-    /// The referral's glue: asked before the addr cells, whatever its TTL.
-    addrs: []const na.Address = &.{},
+    /// The referral's glue, asked before the addr cells.
+    glue: []const Glue = &.{},
+};
+
+/// A glue address lives on its own TTL, never past its delegation's.
+pub const Glue = struct {
+    addr: na.Address,
+    expires_ns: i64,
+
+    /// Inclusive: a TTL-0 address serves the instant it lands.
+    pub fn live(gl: Glue, now_ns: i64) bool {
+        return gl.expires_ns >= now_ns;
+    }
 };
 
 /// NS names from the parent referral. The root has none: hints carry

@@ -211,7 +211,11 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
-                try w.addrs(c.addrs);
+                try w.int(u16, @intCast(c.glue.len));
+                for (c.glue) |gl| {
+                    try w.addr(gl.addr);
+                    try w.int(i64, gl.expires_ns);
+                }
             },
             .ns => |n| {
                 try w.int(u16, @intCast(n.names.len));
@@ -255,7 +259,9 @@ pub const Store = struct {
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name();
-                break :blk .{ .cut = .{ .zone = zone, .addrs = try r.addrs() } };
+                const glue = try arena.alloc(graph.Glue, try r.int(u16));
+                for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
+                break :blk .{ .cut = .{ .zone = zone, .glue = glue } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
@@ -321,12 +327,14 @@ const Writer = struct {
 
     fn addrs(w: *Writer, list: []const na.Address) !void {
         try w.int(u16, @intCast(list.len));
-        for (list) |addr| {
-            const k = na.AddressKey.fromAddress(addr);
-            try w.int(u8, k.family);
-            try w.int(u16, k.port);
-            try w.slice(&k.addr);
-        }
+        for (list) |a| try w.addr(a);
+    }
+
+    fn addr(w: *Writer, a: na.Address) !void {
+        const k = na.AddressKey.fromAddress(a);
+        try w.int(u8, k.family);
+        try w.int(u16, k.port);
+        try w.slice(&k.addr);
     }
 
     fn records(w: *Writer, rrs: []const RR) !void {
@@ -367,13 +375,15 @@ const Reader = struct {
 
     fn addrs(r: *Reader) ![]na.Address {
         const list = try r.arena.alloc(na.Address, try r.int(u16));
-        for (list) |*a| {
-            const family = try r.int(u8);
-            const port = try r.int(u16);
-            const raw = try r.slice(16);
-            a.* = if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
-        }
+        for (list) |*a| a.* = try r.addr();
         return list;
+    }
+
+    fn addr(r: *Reader) !na.Address {
+        const family = try r.int(u8);
+        const port = try r.int(u16);
+        const raw = try r.slice(16);
+        return if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
     }
 
     fn records(r: *Reader, n: u16) ![]RR {

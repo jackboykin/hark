@@ -1,0 +1,109 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a delegation's glue expires on its own TTL, not the NS set's
+
+; The root delegates com for a day with glue for ten seconds. Twenty
+; seconds on, the delegation still stands but its glue does not: the
+; server's address is asked afresh, and it has moved.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.gtld.fake. IN A
+    SECTION ANSWER
+      a.gtld.fake. 86400 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      fake. IN AAAA
+    SECTION AUTHORITY
+      . 86400 IN SOA a.root.fake. hostmaster.root.fake. 1 1800 900 604800 86400
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 10 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.com. IN A
+    SECTION ANSWER
+      www.com. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.com. IN A
+    SECTION ANSWER
+      mail.com. 300 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.com. IN A
+  SECTION ANSWER
+    www.com. 300 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 20
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.com. IN A
+  SECTION ANSWER
+    mail.com. 300 IN A 192.0.2.2
+ENTRY_END
+
+; www.com at the root and at .2; the server's A and AAAA at the root, and
+; mail.com at .3. Nothing goes to the expired glue.
+STEP 6 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

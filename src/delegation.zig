@@ -90,6 +90,7 @@ pub const Referral = struct {
     ns_count: usize,
     glued: usize,
     addrs: [max_servers_per_level]na.Address,
+    ttls: [max_servers_per_level]u32,
     addr_count: usize,
 
     pub fn nsNames(r: *const Referral) []const dns.Name {
@@ -155,6 +156,7 @@ pub fn extractReferral(
     }
 
     var glue_addrs: [max_servers_per_level]na.Address = undefined;
+    var glue_ttls: [max_servers_per_level]u32 = undefined;
     var glue_count: usize = 0;
     var glued: usize = 0;
     for (response.additionals) |rr| {
@@ -169,6 +171,7 @@ pub fn extractReferral(
             if (ns_name.eql(rr.name)) {
                 if (glue_count < max_servers_per_level) {
                     glue_addrs[glue_count] = policy.address(rr) orelse break;
+                    glue_ttls[glue_count] = rr.ttl;
                     glue_count += 1;
                     if (i >= glued) {
                         mem.swap(dns.Name, &ns_names[i], &ns_names[glued]);
@@ -185,6 +188,7 @@ pub fn extractReferral(
         .ns_count = ns_count,
         .glued = glued,
         .addrs = glue_addrs,
+        .ttls = glue_ttls,
         .addr_count = glue_count,
     };
 }

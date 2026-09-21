@@ -333,8 +333,8 @@ pub fn runCut(g: *Graph, id: CellId) !void {
             const walk: delegation.Walk = .{ .name = "", .target = name, .zone = pc.zone };
             switch (delegation.probeStep(msg, &walk, g.cfg.addr_policy)) {
                 .referral => |ref| {
-                    const expires = try absorbReferral(g, id, ref, msg, pc.zone);
-                    try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
+                    const cut = try absorbReferral(g, id, ref, msg, pc.zone);
+                    try g.settle(id, cut.value, cut.expires_ns);
                 },
                 .answered => try g.settle(id, inside, parent.expires_ns),
                 // An authoritative denial is a fact; NXDOMAIN ends minimising
@@ -542,7 +542,9 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             }
         }
         s.ask.reset(cut.state.fact.cut.zone);
-        s.ask.add(g, cut.state.fact.cut.addrs);
+        var glue: std.ArrayList(na.Address) = .empty;
+        for (cut.state.fact.cut.glue) |gl| if (gl.live(g.now())) try glue.append(g.scratch.allocator(), gl.addr);
+        s.ask.add(g, glue.items);
         s.started = true;
     }
     while (true) {
@@ -689,10 +691,10 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     return .{ .kind = .yxdomain, .rcode = .yx_domain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
-/// Publish the child's cut, NS set and glue; returns the delegation's
-/// expiry, never past the referring zone's own: a delegation outliving its
-/// parent's is a ghost (Jiang et al., NDSS 2012).
-fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !i64 {
+/// Publish the child's cut, NS set and glue, and return the cut. The
+/// delegation never outlives the referring zone's: that is a ghost (Jiang
+/// et al., NDSS 2012).
+fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !Graph.Fact {
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
@@ -702,7 +704,11 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     const parent = try g.peek(try g.keyFor(.cut, zone, .a));
     const expires = @min(if (parent) |p| p.expires_ns else g.now(), g.now() + @as(i64, ns_ttl) * std.time.ns_per_s);
     const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
-    try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, .{ .cut = .{ .zone = ref.zone_cut, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
+    const glue = try g.scratch.allocator().alloc(graph.Glue, ref.addr_count);
+    for (glue, ref.addrs[0..ref.addr_count], ref.ttls[0..ref.addr_count]) |*gl, a, ttl|
+        gl.* = .{ .addr = a, .expires_ns = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s) };
+    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .glue = glue } };
+    try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, cut, expires);
     try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
@@ -726,7 +732,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
         try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
     }
-    return expires;
+    return .{ .value = cut, .expires_ns = expires };
 }
 
 /// What a kept, non-referral reply says about (name, type). The answer

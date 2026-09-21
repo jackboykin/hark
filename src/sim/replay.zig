@@ -480,8 +480,8 @@ test "trace one scenario" {
 test "hark walk scenarios settle to today's answers" {
     // Stale at the client timer is the edge's, not a rule's (2½).
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(117, r.parsed);
-    try testing.expectEqual(113, r.ran);
+    try testing.expectEqual(118, r.parsed);
+    try testing.expectEqual(114, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
