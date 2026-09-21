@@ -350,13 +350,16 @@ pub const Failures = struct {
     /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
     /// stale one holds the question, anything else closes it.
     pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
+        // An answer with nothing to forget costs no key: the common case.
+        const forgets = served.hold_until_ns == 0 and served.msg.header.flags.rcode != .server_failure;
+        if (forgets and f.map.count() == 0) return;
         var buf: [dns.max_dotted_len + 4]u8 = undefined;
         const k = key(&buf, q, cd);
-        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .window_s = first_s, .ede = served.ede.? });
-        if (served.msg.header.flags.rcode != .server_failure) {
-            if (f.map.count() > 0) if (f.map.fetchRemove(k)) |kv| gpa.free(kv.key);
+        if (forgets) {
+            if (f.map.fetchRemove(k)) |kv| gpa.free(kv.key);
             return;
         }
+        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .window_s = first_s, .ede = served.ede.? });
         const ede = served.ede orelse dns.Ede{ .code = .other };
         if (f.map.getPtr(k)) |e| {
             // Every client waiting on one failure notes it: once is enough.
