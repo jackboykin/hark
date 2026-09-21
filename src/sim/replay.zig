@@ -11,6 +11,8 @@ const sim = @import("sim.zig");
 const graph = @import("../graph.zig");
 const answer = @import("../answer.zig");
 const response = @import("../response.zig");
+const rebinding = @import("../rebinding.zig");
+const config = @import("../config.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -52,6 +54,14 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         report.cells = g.cells.items.len;
     }
 
+    // Off unless the scenario turns it on, as the harness runs serve.
+    const rb: rebinding.Config = .{
+        .enabled = scenario.rebinding_enabled orelse false,
+        .allow_zones = try config.parseZoneList(arena, scenario.rebinding_allow_zones),
+        .extra_block = try config.parseCidrList(arena, scenario.rebinding_extra_block),
+        .extra_allow = try config.parseCidrList(arena, scenario.rebinding_extra_allow),
+        .nat64 = scenario.dns64_prefix,
+    };
     var drops: u32 = 0;
     for (scenario.steps) |st| drops += @intFromBool(st.kind == .timeout);
     s.pending_drops = drops;
@@ -73,7 +83,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         s.step = st.n;
         report.step = st.n;
         switch (st.kind) {
-            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk) orelse {
+            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb) orelse {
                 report.msg = "client timed out";
                 return error.ScenarioFailed;
             }).msg,
@@ -116,7 +126,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         }
     }
     report.phase = .warm;
-    try requery(arena, &g, &s, scenario, report, &held, &desk);
+    try requery(arena, &g, &s, scenario, report, &held, &desk, &rb);
     // Quiescence: nothing outlives its demand.
     unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
@@ -131,7 +141,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared.
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, desk: *answer.Desk) !void {
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -144,7 +154,7 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk) orelse {
+        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk, rb) orelse {
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
@@ -173,25 +183,24 @@ const Sent = struct { msg: dns.Message, cacheable: bool };
 
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk) !?Sent {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !?Sent {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     const served = switch (try desk.early(arena, q, client)) {
         .synthesized, .replayed, .floored => |served| served,
         .recalled => |served| blk: {
             errdefer served.release(&g.store);
-            try agrees(arena, g, s, scenario, q, client, held, desk, served);
+            try agrees(arena, g, s, scenario, q, client, held, desk, rb, served);
             break :blk served;
         },
         .graph => try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null),
     };
     defer served.release(&g.store);
-    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, served)), .cacheable = served.cacheable };
+    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, rb, served)), .cacheable = served.cacheable };
 }
 
-/// The bytes serve would send `client` for `served`, bar the query id,
-/// OPT and the rebinding scrub.
-fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, served: answer.Served) ![]const u8 {
+/// The bytes serve would send `client` for `served`, bar the query id and OPT.
+fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, rb: *const rebinding.Config, served: answer.Served) ![]const u8 {
     const ctx: response.ResponseContext = .{
         .query_id = 0,
         .opcode = .query,
@@ -202,6 +211,7 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, served: answ
         .client_do = client.do_bit,
         .client_wants_ad = client.do_bit or client.ad,
         .max_udp_payload = dns.max_message_len,
+        .rebinding = rb,
     };
     const reply: response.Reply = .{ .rcode = served.rcode, .ad = served.ad, .answers = served.answers, .authorities = served.authorities, .additionals = served.additionals };
     return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, reply, arena) orelse error.OutOfMemory;
@@ -209,13 +219,13 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, served: answ
 
 /// `recall`'s backstop: what it serves from the store, the graph builds
 /// too, asking nobody, to the byte.
-fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, recalled: answer.Served) !void {
+fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config, recalled: answer.Served) !void {
     const before = s.log.items.len;
     const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
     defer built.release(&g.store);
     if (s.log.items.len != before) return error.RecallDisagrees;
-    const a = try wireOf(arena, q, client, recalled);
-    const b = try wireOf(arena, q, client, built);
+    const a = try wireOf(arena, q, client, rb, recalled);
+    const b = try wireOf(arena, q, client, rb, built);
     const ede_eq = if (recalled.ede) |x| if (built.ede) |y| x.code == y.code and mem.eql(u8, x.text, y.text) else false else built.ede == null;
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
@@ -412,14 +422,9 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-/// The rebinding scrub runs on the wire, which the replay never builds.
-fn walkOnly(s: *const rpl.Scenario) bool {
-    return s.rebinding_enabled == null;
-}
+const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
 
-const Replayed = struct { parsed: usize, ran: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
-
-/// Replay every walk-only scenario under `root` across `seeds`, checking
+/// Replay every scenario under `root` across `seeds`, checking
 /// that one seed replays to one upstream query log.
 fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
     const io = testing.io;
@@ -432,7 +437,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     defer dir.close(io);
     var walker = try dir.walk(testing.allocator);
     defer walker.deinit();
-    var r: Replayed = .{ .parsed = 0, .ran = 0, .failed = 0 };
+    var r: Replayed = .{ .parsed = 0, .failed = 0 };
     while (try walker.next(io)) |ent| {
         if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
         const text = try dir.readFileAlloc(io, ent.path, arena, .limited(1 << 20));
@@ -442,10 +447,8 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
             else => return err,
         };
         r.parsed += 1;
-        if (!walkOnly(&scenario)) continue;
         var expect_fail = false;
         for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
-        r.ran += 1;
         var seed: u64 = 1;
         while (seed <= seeds) : (seed += 1) {
             var first: Report = .{};
@@ -532,7 +535,6 @@ test "trace one scenario" {
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
     try testing.expectEqual(127, r.parsed);
-    try testing.expectEqual(123, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
@@ -549,7 +551,7 @@ test "lifted unbound walk scenarios settle to today's answers" {
         "iter_domain_sale.rpl",
         "iter_domain_sale_nschange.rpl",
     });
-    try testing.expectEqual(18, r.ran);
+    try testing.expectEqual(18, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 

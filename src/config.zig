@@ -583,7 +583,7 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     };
 }
 
-fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
+pub fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
     const list = try allocator.alloc(dns.Name, strs.len);
     var i: usize = 0;
     errdefer {
@@ -616,7 +616,7 @@ fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]d
     return list;
 }
 
-fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
+pub fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
     const list = try allocator.alloc(acl.Cidr, strs.len);
     errdefer allocator.free(list);
     for (strs, 0..) |s, i| {
