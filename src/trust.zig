@@ -45,17 +45,13 @@ const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validati
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
-/// to set (RFC 4035 §4.7), and the stamp keeps serve-stale off them. With
-/// the budget spent nothing was proven: the cell is shared, and a zone
-/// draining its own budget must not mark a victim's bytes.
+/// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
+/// zone draining its own budget must not drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (g.cell(id).budget.validation.exhausted()) return g.fail(id, .{ .code = .dnssec_bogus, .text = "validation budget spent" });
     const t = g.cell(rid);
     t.expires_ns = @min(t.expires_ns, g.now());
-    if (t.blob) |b| {
-        b.verdict.stamp(.{ .status = .bogus }, g.now());
-        g.store.shorten(t.key, b, g.now());
-    }
+    if (t.blob) |b| g.store.drop(t.key, b);
     try g.fail(id, .{ .code = .dnssec_bogus });
 }
 

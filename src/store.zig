@@ -130,11 +130,10 @@ pub const Store = struct {
         if (s.map.getPtr(key)) |e| e.hold_until_ns = until_ns;
     }
 
-    /// Ends this version of a fact sooner; a newer version is not its business.
-    pub fn shorten(s: *Store, key: Key, blob: *Blob, until_ns: i64) void {
-        if (s.map.getPtr(key)) |e| if (e.blob == blob) {
-            e.expires_ns = @min(e.expires_ns, until_ns);
-        };
+    /// Forgets this version of a fact; a newer version is not its business.
+    pub fn drop(s: *Store, key: Key, blob: *Blob) void {
+        const i = s.map.getIndex(key) orelse return;
+        if (s.map.values()[i].blob == blob) s.removeAt(i);
     }
 
     /// Takes one reference. A new key over the cap must have knocked before.
@@ -162,16 +161,12 @@ pub const Store = struct {
         while (s.held > s.cap and s.map.count() > 1) s.evict();
     }
 
-    pub fn remove(s: *Store, key: Key) void {
-        const i = s.map.getIndex(key) orelse return;
-        s.removeAt(i);
-    }
-
     fn removeAt(s: *Store, i: usize) void {
         const last = s.map.count() - 1;
         if (i != last) s.visited.setValue(i, s.visited.isSet(last));
         const key = s.map.keys()[i];
         const e = s.map.values()[i];
+        if (s.on_evict) |h| h.f(h.ctx, key);
         s.map.swapRemoveAt(i);
         s.held -= e.blob.len;
         s.gpa.free(key.name);
@@ -191,7 +186,6 @@ pub const Store = struct {
             s.hand += 1;
         }
         if (s.hand >= n) s.hand = 0;
-        if (s.on_evict) |h| h.f(h.ctx, s.map.keys()[s.hand]);
         s.removeAt(s.hand);
         s.evictions += 1;
     }

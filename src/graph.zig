@@ -1030,7 +1030,7 @@ test "an evicted root cut is re-derived, not walked" {
     var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     const root_cut: Key = .{ .kind = .cut, .name = "" };
-    g.store.remove(root_cut);
+    g.store.drop(root_cut, g.store.any(root_cut).?.blob);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, true)).?;
