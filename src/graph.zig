@@ -129,11 +129,6 @@ pub const Config = struct {
 /// The zone cut above a name, as learned from the parent's servers.
 pub const Cut = struct {
     zone: dns.Name,
-    /// RFC 9156 relaxed mode: the probe got NXDOMAIN or an error rcode, so
-    /// deeper names skip probing and ask in full here.
-    stop: bool = false,
-    /// Minimised steps so far (`max_minimize_count`).
-    probes: u8 = 0,
     /// The referral's glue: asked before the addr cells, whatever its TTL.
     addrs: []const na.Address = &.{},
 };
@@ -216,6 +211,7 @@ pub const Budget = struct {
     refs: u32 = 0,
     /// When a refresh began; 0 for a client.
     refresh_ns: i64 = 0,
+    unminimised: walk.Unminimised = .{},
     /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: dnssec.ValidationBudget = .{},
 };

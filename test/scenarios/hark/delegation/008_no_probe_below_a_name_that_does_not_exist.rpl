@@ -1,0 +1,55 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a minimised probe's NXDOMAIN ends probing below it
+
+; RFC 8020: nothing exists below a name that does not exist, so no zone
+; cut does either. The probe at gone.com draws an authoritative NXDOMAIN,
+; which is a fact; b.gone.com is not probed, and the question goes out in
+; full. Three queries: com at the root, the gone.com probe, the question.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.com. 1 1800 900 604800 900
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.b.gone.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    a.b.gone.com. IN A
+ENTRY_END
+
+STEP 3 CHECK_MAX_QUERIES 3
+
+SCENARIO_END

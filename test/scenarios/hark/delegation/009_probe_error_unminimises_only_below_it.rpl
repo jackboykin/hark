@@ -1,0 +1,64 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a minimised probe's error sends the names below it in full
+
+; RFC 9156 §2.3 relaxed mode. The com server refuses the probe at err.com
+; but answers the full question. The error is no fact about any cut: the
+; resolution asks every name below err.com in full, so b.err.com is not
+; probed. Three queries: com at the root, the err.com probe, the question.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.b.err.com. IN A
+    SECTION ANSWER
+      a.b.err.com. 300 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      err.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.b.err.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.b.err.com. IN A
+  SECTION ANSWER
+    a.b.err.com. 300 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 CHECK_MAX_QUERIES 3
+
+SCENARIO_END

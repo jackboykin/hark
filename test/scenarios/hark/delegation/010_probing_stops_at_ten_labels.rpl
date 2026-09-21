@@ -1,0 +1,73 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN minimised probes stop at ten labels
+
+; RFC 9156 MAX_MINIMISE_COUNT. A twelve-label question: com is probed at
+; the root, the names of two to ten labels at the com server, and the
+; eleven-label name is not probed, so the question goes out from there in
+; full. Eleven queries.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.b.c.d.e.f.g.h.i.j.k.com. IN A
+    SECTION ANSWER
+      a.b.c.d.e.f.g.h.i.j.k.com. 300 IN A 192.0.2.1
+  ENTRY_END
+  ; Every probe on the way is an empty non-terminal.
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.com. 1 1800 900 604800 900
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.b.c.d.e.f.g.h.i.j.k.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.b.c.d.e.f.g.h.i.j.k.com. IN A
+  SECTION ANSWER
+    a.b.c.d.e.f.g.h.i.j.k.com. 300 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    c.d.e.f.g.h.i.j.k.com. A 127.0.10.2
+ENTRY_END
+
+STEP 4 CHECK_MAX_QUERIES 11
+
+SCENARIO_END

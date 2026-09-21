@@ -313,16 +313,15 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
-    if (!g.cfg.qmin or pc.stop or pc.probes >= delegation.max_minimize_count) {
-        try g.settle(id, .{ .cut = pc }, parent.expires_ns);
-        return;
-    }
-    // A fresh fact at the probe name answers it without a packet; a
-    // denial there stops minimising.
-    if (try g.peek(try g.keyFor(.rrset, name, .a))) |known| {
-        try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = known.value.rrset.kind == .nxdomain } }, @min(parent.expires_ns, known.expires_ns));
-        return;
-    }
+    const inside: graph.Value = .{ .cut = .{ .zone = pc.zone } };
+    if (!g.cfg.qmin or name.labels.len > delegation.max_minimize_count) return g.settle(id, inside, parent.expires_ns);
+    // Not a fact: the cut is unknown, and only this instant's demanders read it.
+    if (g.cell(id).budget.unminimised.covers(name)) return g.settle(id, inside, g.now());
+    // No cut below a name that does not exist (RFC 8020).
+    if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
+    // A fresh fact at the probe name answers it without a packet.
+    if (try g.peek(try g.keyFor(.rrset, name, .a))) |known|
+        return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
     if (!s.started) {
         s.ask.reset(pc.zone);
         s.started = true;
@@ -335,22 +334,70 @@ pub fn runCut(g: *Graph, id: CellId) !void {
             switch (delegation.probeStep(msg, &walk, g.cfg.addr_policy)) {
                 .referral => |ref| {
                     const expires = try absorbReferral(g, id, ref, msg, pc.zone);
-                    try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .probes = pc.probes + 1, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
+                    try g.settle(id, .{ .cut = .{ .zone = ref.zone_cut, .addrs = ref.addrs[0..ref.addr_count] } }, expires);
                 },
-                .nxdomain, .failed => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1, .stop = true } }, g.now()),
-                .answered => try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns),
+                .answered => try g.settle(id, inside, parent.expires_ns),
+                // An authoritative denial is a fact; NXDOMAIN ends minimising
+                // below it. A positive answer is not: the parent may serve
+                // occluded data for a name it delegated (bailiwick/006).
                 .nodata => {
-                    // An authoritative denial at the probe name is a
-                    // fact. A positive answer is not: the parent may
-                    // serve occluded data for a name it delegated
-                    // (bailiwick/006).
-                    if (msg.header.flags.aa) if (try classify(g, msg, pc.zone, name, .a)) |reply|
-                        try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
-                    try g.settle(id, .{ .cut = .{ .zone = pc.zone, .probes = pc.probes + 1 } }, parent.expires_ns);
+                    _ = try publishDenial(g, id, msg, pc.zone, name);
+                    try g.settle(id, inside, parent.expires_ns);
                 },
+                .nxdomain => {
+                    const until = try publishDenial(g, id, msg, pc.zone, name) orelse return unminimised(g, id, inside);
+                    try g.settle(id, inside, @min(parent.expires_ns, until));
+                },
+                .failed => try unminimised(g, id, inside),
             }
         },
     }
+}
+
+/// An authoritative denial at a probe name, published; when it lapses.
+fn publishDenial(g: *Graph, id: CellId, msg: dns.Message, zone: dns.Name, name: dns.Name) !?i64 {
+    if (!msg.header.flags.aa) return null;
+    const reply = try classify(g, msg, zone, name, .a) orelse return null;
+    try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
+    return replyExpiry(reply);
+}
+
+/// RFC 9156 §2.3: a probe drew an error, or an NXDOMAIN nobody vouches
+/// for, so this resolution asks names below it in full. Policy, keyed by
+/// the resolution, never a fact about the cut.
+pub const Unminimised = struct {
+    labels: u8 = 0,
+    len: u8 = 0,
+    /// Wire form, 255 octets at most; length octets are below 'A', so case
+    /// folding spares them.
+    below: [dns.max_name_len + 2]u8 = undefined,
+
+    fn covers(u: *const Unminimised, name: dns.Name) bool {
+        if (u.labels == 0 or name.labels.len <= u.labels) return false;
+        var buf: [dns.max_name_len + 2]u8 = undefined;
+        const above: dns.Name = .{ .labels = name.labels[name.labels.len - u.labels ..] };
+        const n = dns.writeNameWire(&buf, above) catch return false;
+        return std.ascii.eqlIgnoreCase(buf[0..n], u.below[0..u.len]);
+    }
+};
+
+fn unminimised(g: *Graph, id: CellId, inside: graph.Value) !void {
+    const u = &g.cell(id).budget.unminimised;
+    const name = g.cell(id).name;
+    u.len = @intCast(try dns.writeNameWire(&u.below, name));
+    u.labels = @intCast(name.labels.len);
+    try g.settle(id, inside, g.now());
+}
+
+/// When the closest name from `from` up to (not including) `zone` known
+/// not to exist stops being known.
+fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
+    var n = from;
+    while (n.labels.len > zone.labels.len) : (n = .{ .labels = n.labels[1..] }) {
+        const f = try g.peek(try g.keyFor(.rrset, n, .a)) orelse continue;
+        if (f.value.rrset.kind == .nxdomain) return f.expires_ns;
+    }
+    return null;
 }
 
 /// `ns(zone)`: only a parent referral settles it. Demanding an

@@ -211,8 +211,6 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
-                try w.int(u8, @intFromBool(c.stop));
-                try w.int(u8, c.probes);
                 try w.addrs(c.addrs);
             },
             .ns => |n| {
@@ -257,8 +255,7 @@ pub const Store = struct {
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name();
-                const flags = try r.int(u8);
-                break :blk .{ .cut = .{ .zone = zone, .stop = flags & 1 != 0, .probes = try r.int(u8), .addrs = try r.addrs() } };
+                break :blk .{ .cut = .{ .zone = zone, .addrs = try r.addrs() } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
@@ -453,10 +450,10 @@ test "a fact survives the blob byte for byte" {
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
 
-    const cut_blob = try s.build(.{ .cut = .{ .zone = zone, .stop = true, .probes = 3 } });
+    const cut_blob = try s.build(.{ .cut = .{ .zone = zone } });
     defer s.unref(cut_blob);
     const cut = (try Store.parse(arena, cut_blob)).cut;
-    try testing.expect(cut.zone.eqlExact(zone) and cut.stop and cut.probes == 3);
+    try testing.expect(cut.zone.eqlExact(zone));
 }
 
 test "the cap holds by eviction and admission" {
