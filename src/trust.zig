@@ -126,6 +126,11 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.dnskey;
     if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, g.cell(id).depth) orelse
         return g.settle(id, .{ .dnskey = .{ .status = .bogus } }, bogusExpiry(g, id, g.now()));
+    // A DS on record, proven or not, says the keys will be needed: fetch
+    // them alongside the proof instead of a round trip per level after it.
+    if (s.rrset == null) if (try g.peek(try g.keyFor(.rrset, zone, .ds))) |f| if (f.value.rrset.kind == .answer) {
+        s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth);
+    };
     const ds = g.cell(s.ds.?);
     if (!ds.settled) return;
     if (ds.value.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.value.ds.status } }, ds.expires_ns);
