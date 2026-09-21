@@ -22,9 +22,11 @@ const log = std.log.scoped(.serve);
 
 const max_frame = 4096;
 const udp_recv_max = 4096;
-/// Measured knee: 8 takes the hit-path win of skipping epoll; past it,
-/// admitting clients starves upstream replies and misses fall (64: -13%).
-const udp_per_wake = 8;
+/// Reads per wake. A hit answers inline, so only the cap on misses, which
+/// start upstream work, keeps replies from starving: at 64 misses per
+/// wake they fell 13%, at 8 they held.
+const udp_per_wake = 64;
+const udp_misses_per_wake = 8;
 
 const Conn = struct {
     fd: posix.fd_t,
@@ -136,11 +138,13 @@ const Server = struct {
         }
     }
 
-    /// Drains up to `udp_per_wake` datagrams: one epoll wake per query cost
-    /// a third of the syscall time under load.
+    /// Drains the socket in one wake: an epoll call per query cost a third
+    /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t) !void {
         var buf: [udp_recv_max]u8 = undefined;
+        const parked = s.pending.items.len;
         for (0..udp_per_wake) |_| {
+            if (s.pending.items.len - parked == udp_misses_per_wake) return;
             var pa: na.PosixAddress = undefined;
             var len: posix.socklen_t = @sizeOf(na.PosixAddress);
             const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, &pa.any, &len);
