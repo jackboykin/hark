@@ -159,8 +159,8 @@ else fails fast.
 - **dnssim's realtime pacer batches.** dnsjit re-syncs to the clock once per
   batch (default 128 packets) and sends the batch at full speed, so a
   uniform pellet arrives as ~1 s bursts. `run.sh` patches the batch to 1;
-  a fixed-size thread pool (hark) queues under bursts where an async
-  resolver does not, and that showed up as +25 ms p50 before the patch.
+  before the patch, a resolver that queues under bursts showed it as
+  +25 ms p50.
 - **Internet weather.** Authoritative RTT, transient SERVFAILs, and your own
   upstream connectivity dominate the long tail. The same pellet on the same
   network at 3am and 3pm produces different p99s.
