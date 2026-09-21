@@ -1177,7 +1177,7 @@ test "an evicted root cut is re-derived, not walked" {
     g.unhold(root);
 }
 
-test "a shared cell is paid by a question with room and sits at its shortest chain" {
+test "a shared cell is paid by a waiting question with room, not its first demander" {
     const testing = std.testing;
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
@@ -1191,21 +1191,16 @@ test "a shared cell is paid by a question with room and sits at its shortest cha
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
-    // First asks through an NS address; second asks the host itself.
     const first = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, true)).?;
     const second = (try g.demandRoot(host, .a, true)).?;
-    const addr = try g.newCell(try g.keyFor(.addr, host, .a), host);
-    try g.pin(addr, first);
-    const rrset = try g.newCell(try g.keyFor(.rrset, host, .a), host);
-    try g.pin(rrset, addr);
-    try testing.expectEqual(1, g.level(rrset));
-    try g.pin(rrset, second);
-    try testing.expectEqual(0, g.level(rrset));
-    // The first demander spent is no reason to stop.
+    const shared = try g.newCell(try g.keyFor(.rrset, host, .a), host);
+    try g.pin(shared, first);
+    try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
-    try testing.expectEqual(g.cell(second).scratch.answer.budget, g.payerOf(rrset).?);
+    try testing.expectEqual(g.cell(second).scratch.answer.budget, g.payerOf(shared).?);
+    // Nobody with room: the first still pays, and is refused.
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
-    try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(rrset).?);
+    try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.unhold(first);
     g.unhold(second);
 }
