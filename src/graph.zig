@@ -77,10 +77,7 @@ pub const Key = struct {
     name: []const u8,
 
     pub fn hash(k: Key) u64 {
-        var h = std.hash.Wyhash.init(@backingInt(k.kind));
-        h.update(mem.asBytes(&k.rtype));
-        h.update(k.name);
-        return h.final();
+        return std.hash.Wyhash.hash(@as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype), k.name);
     }
 
     pub fn eql(a: Key, b: Key) bool {
