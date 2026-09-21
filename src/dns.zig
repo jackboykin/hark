@@ -1290,29 +1290,49 @@ fn castOrRDataErr(comptime T: type, val: anytype) Error!T {
 /// A candidate entry spends its label count from `work`; once gone, names go
 /// out whole (Unbound CVE-2024-8508: labels² × entries per name).
 pub const NameTable = struct {
-    const Entry = struct { labels: []const []const u8, offset: u16 };
+    /// A name written at `offset`, `labels` long.
+    const Entry = struct { offset: u16, labels: u8 };
     entries: [64]Entry = undefined,
     len: usize = 0,
     work: u32 = 1 << 16,
 
-    fn find(self: *NameTable, labels: []const []const u8) ?u16 {
+    /// `suffix` is an uncompressed wire name `labels` long; `out` holds
+    /// every entry's name.
+    fn find(self: *NameTable, out: []const u8, suffix: []const u8, labels: u8) ?u16 {
         for (self.entries[0..self.len]) |e| {
-            if (e.labels.len != labels.len) continue;
-            if (self.work < labels.len) return null;
-            self.work -= @intCast(labels.len);
-            for (e.labels, labels) |a, b| {
-                if (!mem.eql(u8, a, b)) break;
-            } else return e.offset;
+            if (e.labels != labels) continue;
+            if (self.work < labels) return null;
+            self.work -= labels;
+            if (sameWireName(out, e.offset, suffix)) return e.offset;
         }
         return null;
     }
 
-    fn add(self: *NameTable, labels: []const []const u8, offset: usize) void {
+    fn add(self: *NameTable, offset: usize, labels: u8) void {
         if (self.len == self.entries.len or offset >= 0x4000) return;
-        self.entries[self.len] = .{ .labels = labels, .offset = @intCast(offset) };
+        self.entries[self.len] = .{ .offset = @intCast(offset), .labels = labels };
         self.len += 1;
     }
 };
+
+/// The name at `out[at..]`, its pointers followed, is `wire` to the byte.
+/// Pointers the serializer wrote only reach back, so the walk ends.
+fn sameWireName(out: []const u8, at: u16, wire: []const u8) bool {
+    var p: usize = at;
+    var q: usize = 0;
+    while (true) {
+        const len = out[p];
+        if (len & 0xC0 == 0xC0) {
+            p = @as(usize, len & 0x3F) << 8 | out[p + 1];
+            continue;
+        }
+        if (len != wire[q]) return false;
+        if (len == 0) return true;
+        if (!mem.eql(u8, out[p + 1 ..][0..len], wire[q + 1 ..][0..len])) return false;
+        p += 1 + len;
+        q += 1 + len;
+    }
+}
 
 pub const Serializer = struct {
     buf: []u8,
@@ -1359,17 +1379,45 @@ pub const Serializer = struct {
 
     /// `compress` only for owner names and RFC 1035 rdata (RFC 3597 §4).
     fn writeName(self: *Serializer, name: Name, compress: bool) Error!void {
-        const table = if (compress) self.names else null;
-        for (name.labels, 0..) |label, i| {
-            if (table) |t| if (t.find(name.labels[i..])) |off| {
-                return self.writeU16(0xC000 | off);
-            };
+        if (compress and self.names != null) {
+            var wire: [max_name_len + 2]u8 = undefined;
+            var n: usize = 0;
+            for (name.labels) |label| {
+                if (label.len > max_label_len) return error.LabelTooLong;
+                if (n + 1 + label.len >= wire.len) return error.NameTooLong;
+                wire[n] = @intCast(label.len);
+                @memcpy(wire[n + 1 ..][0..label.len], label);
+                n += 1 + label.len;
+            }
+            wire[n] = 0;
+            return self.writeWireName(wire[0 .. n + 1]);
+        }
+        for (name.labels) |label| {
             if (label.len > max_label_len) return error.LabelTooLong;
-            if (table) |t| t.add(name.labels[i..], self.pos);
             try self.writeU8(@intCast(label.len));
             try self.writeSlice(label);
         }
         try self.writeU8(0);
+    }
+
+    /// An uncompressed wire name, compressed against what is written.
+    fn writeWireName(self: *Serializer, wire: []const u8) Error!void {
+        const t = self.names.?;
+        var labels: u8 = 0;
+        var i: usize = 0;
+        while (wire[i] != 0) : (i += 1 + wire[i]) labels += 1;
+        i = 0;
+        while (wire[i] != 0) : ({
+            i += 1 + wire[i];
+            labels -= 1;
+        }) {
+            if (t.find(self.buf, wire[i..], labels)) |off| {
+                try self.writeSlice(wire[0..i]);
+                return self.writeU16(0xC000 | off);
+            }
+            t.add(self.pos + i, labels);
+        }
+        try self.writeSlice(wire);
     }
 
     fn writeQuestion(self: *Serializer, q: Question) Error!void {
@@ -2054,6 +2102,21 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
     var buf2: [512]u8 = undefined;
     const wire2 = try serializeMessage(&buf2, .{ .header = msg.header, .questions = msg.questions, .answers = &.{blob_rr} });
     try testing.expectEqualSlices(u8, wire[12 .. 12 + 21 + 16], wire2[12..]);
+}
+
+test "name compression follows a pointer inside an earlier name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const www = try parseDottedName(a, "www.example.com");
+    const mail = try parseDottedName(a, "mail.example.com");
+    const rr: ResourceRecord = .{ .name = mail, .rtype = .a, .rclass = .in, .ttl = 1, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
+    var buf: [512]u8 = undefined;
+    const wire = try serializeMessage(&buf, .{ .header = mem.zeroes(Header), .questions = &.{.{ .name = www, .qtype = .a, .qclass = .in }}, .answers = &.{ rr, rr } });
+    // The second owner is one pointer to "mail" + a pointer, itself.
+    try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
+    const back = try parseMessage(a, wire);
+    for (back.answers) |got| try testing.expect(got.name.eqlExact(mail));
 }
 
 test "edge case: empty message (too short)" {
