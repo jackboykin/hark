@@ -233,6 +233,8 @@ pub const Stats = struct {
 
 const max_failed = 4096;
 
+const Refusal = struct { until_ns: i64, why: Failure };
+
 /// BIND's `prefetch 2`.
 pub const refresh_window_ns = 2 * std.time.ns_per_s;
 /// So a refresh does not time the client.
@@ -363,10 +365,10 @@ pub const Graph = struct {
     budgets: u32 = 0,
     /// Exchanges the edge holds.
     flights: u32 = 0,
-    /// Work that failed, until when it is refused rather than tried again
-    /// (RFC 9520 §3.2): an upstream fetch by its `rrset` key, a zone's
-    /// chain of trust by its `ds` key. Policy, outside cells.
-    failed: std.HashMapUnmanaged(Key, i64, Key.Context, 80) = .empty,
+    /// Work that failed, refused at `demand` rather than tried again
+    /// (RFC 9520 §3.2): an upstream fetch, a zone's DS or keys. Policy,
+    /// outside cells.
+    failed: std.HashMapUnmanaged(Key, Refusal, Key.Context, 80) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
     /// Live cells only.
@@ -732,12 +734,12 @@ pub const Graph = struct {
         g.release(id);
     }
 
-    /// Refuse `key`'s work for `servfail_ttl`; past `max_failed` keys an
-    /// arbitrary other one is forgotten.
-    pub fn remember(g: *Graph, key: Key) !void {
-        const until = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
+    /// Refuse new work for `key` with `why` for `servfail_ttl`; past
+    /// `max_failed` keys an arbitrary other one is forgotten.
+    pub fn remember(g: *Graph, key: Key, why: Failure) !void {
+        const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why };
         if (g.failed.getPtr(key)) |u| {
-            u.* = until;
+            u.* = r;
             return;
         }
         if (g.failed.count() >= max_failed) {
@@ -748,12 +750,13 @@ pub const Graph = struct {
         }
         const own: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try g.gpa.dupe(u8, key.name) };
         errdefer g.gpa.free(own.name);
-        try g.failed.put(g.gpa, own, until);
+        try g.failed.put(g.gpa, own, r);
     }
 
-    pub fn refusing(g: *Graph, key: Key) bool {
-        if (g.failed.count() == 0) return false;
-        return (g.failed.get(key) orelse return false) > g.now();
+    fn refused(g: *Graph, key: Key) ?Failure {
+        if (g.failed.count() == 0) return null;
+        const r = g.failed.get(key) orelse return null;
+        return if (r.until_ns > g.now()) r.why else null;
     }
 
     pub fn fresh(g: *Graph, id: CellId) bool {
@@ -806,7 +809,8 @@ pub const Graph = struct {
         return null;
     }
 
-    /// Null on a cycle, or on new work for an orphan.
+    /// Null on a cycle, or on new work for an orphan. New work that failed
+    /// recently settles as that failure, its rule never run.
     pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
         if (try g.lookup(key, name, g.cell(by).budget)) |id| {
             if (!g.fresh(id) and g.reaches(by, id)) return null;
@@ -815,8 +819,8 @@ pub const Graph = struct {
         }
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name, g.cell(by).budget, depth);
-        try g.ready.append(g.gpa, id);
         try g.pin(id, by);
+        if (g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
         return id;
     }
 

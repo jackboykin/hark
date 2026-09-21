@@ -476,7 +476,6 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             // Held, or failed just now: SERVFAIL, asking nobody.
             if (g.store.any(g.cell(id).key)) |e| if (e.hold_until_ns > g.now())
                 return g.fail(id, unreachable_authority);
-            if (g.refusing(g.cell(id).key)) return g.fail(id, .{ .code = .no_reachable_authority, .text = "failed recently" });
             // A cut at the name itself exists only from a referral;
             // otherwise start at the parent's. A DS always lives there.
             const own = try g.keyFor(.cut, name, .a);
@@ -551,10 +550,12 @@ fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
 /// (RFC 9520 §3.2), unless the failure may be the asker's own: a spent
 /// budget or deadline (here or in a sub-resolution), an orphan, an address
 /// sub-resolution's depth, or a refresh.
+const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "failed recently" };
+
 fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
     const c = g.cell(id);
     const spent = g.now() >= c.budget.deadline_ns or c.budget.queries >= g.cfg.max_queries;
-    if (!spent and !c.orphan and c.depth == 0 and c.budget.refresh_ns == 0) try g.remember(c.key);
+    if (!spent and !c.orphan and c.depth == 0 and c.budget.refresh_ns == 0) try g.remember(c.key, failed_recently);
     try failRrset(g, id, why);
 }
 

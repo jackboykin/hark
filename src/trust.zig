@@ -55,21 +55,16 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, .{ .code = .dnssec_bogus });
 }
 
-/// A zone's DS or keys proven bogus: its chain work is refused for
+/// A zone's DS or keys proven bogus: demanding them again is refused for
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (!g.cell(id).budget.validation.exhausted()) try g.remember(chainKey(g, id));
+    if (!g.cell(id).budget.validation.exhausted()) try g.remember(g.cell(id).key, refused);
     try failBogus(g, id, rid);
 }
 
 fn capExpiry(g: *Graph, cap: u32) i64 {
     return g.now() + @as(i64, cap) * std.time.ns_per_s;
-}
-
-/// One per zone, whether `ds` or `dnskey` failed.
-fn chainKey(g: *Graph, id: CellId) graph.Key {
-    return .{ .kind = .ds, .name = g.cell(id).key.name };
 }
 
 /// `ds(zone)`: the anchor at the root; below it, `rrset(zone, DS)` judged
@@ -86,7 +81,6 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         const rr: RR = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = anchor } };
         return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.scratch.allocator().dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
     }
-    if (g.refusing(chainKey(g, id))) return g.fail(id, refused);
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
@@ -153,7 +147,6 @@ pub fn runDs(g: *Graph, id: CellId) !void {
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
-    if (g.refusing(chainKey(g, id))) return g.fail(id, refused);
     if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     // A DS on record, proven or not, says the keys will be needed: fetch
