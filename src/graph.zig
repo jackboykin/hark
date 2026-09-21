@@ -397,8 +397,18 @@ pub const Graph = struct {
     }
 
     pub fn deinit(g: *Graph) void {
-        for (g.cells.items, 0..) |c, i| if (c.live) g.free(@intCast(i), c) catch {};
-        for (g.cells.items) |c| g.gpa.destroy(c);
+        // Not `free`: in slot order a cell would unpin from inputs gone first.
+        for (g.cells.items) |c| {
+            if (c.live) {
+                c.inputs.deinit(g.gpa);
+                c.waiters.deinit(g.gpa);
+                if (c.blob) |bl| g.store.unref(bl);
+                c.budget.refs -= 1;
+                if (c.budget.refs == 0) g.gpa.destroy(c.budget);
+                c.arena.deinit();
+            }
+            g.gpa.destroy(c);
+        }
         g.cells.deinit(g.gpa);
         g.free_ids.deinit(g.gpa);
         g.scratch.deinit();
