@@ -201,6 +201,7 @@ pub const AnswerScratch = struct {
 /// until an RRset ends the chain. Length and loop checks run at demand
 /// time; a chain that fails them is a resolution failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
@@ -225,7 +226,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             if (broken) return failAnswer(g, id, .{ .code = .other, .text = "cname loop" });
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
-        s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next) orelse
+        s.hops[s.n] = try g.demand(id, Key.of(&kb, .rrset, next, qtype), next) orelse
             return failAnswer(g, id, unreachable_authority);
         s.n += 1;
     }
@@ -270,12 +271,13 @@ fn refreshable(g: *Graph, s: *const AnswerScratch, expires: i64) bool {
 /// puts the name inside the parent's zone. Only strict ancestors of a
 /// question are probed; the question itself goes out as `rrset`.
 pub fn runCut(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     // The axiom, re-derived after eviction.
     if (name.labels.len == 0) return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
-    if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name) orelse
+    if (s.parent == null) s.parent = try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
         return g.fail(id, unreachable_authority);
     const parent = g.cell(s.parent.?);
     if (!parent.settled()) return;
@@ -288,7 +290,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     // No cut below a name that does not exist (RFC 8020).
     if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
     // A fresh fact at the probe name answers it without a packet.
-    if (try g.peek(try g.keyFor(.rrset, name, .a))) |known|
+    if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known|
         return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
     if (!s.started) {
         s.ask.reset(pc.zone);
@@ -323,9 +325,10 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 
 /// An authoritative denial at a probe name, published; when it lapses.
 fn publishDenial(g: *Graph, id: CellId, msg: dns.Message, zone: dns.Name, name: dns.Name) !?i64 {
+    var kb: graph.KeyBuf = undefined;
     if (!msg.header.flags.aa) return null;
     const reply = try classify(g, msg, zone, name, .a) orelse return null;
-    try g.publish(try g.keyFor(.rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
+    try g.publish(Key.of(&kb, .rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
     return replyExpiry(reply);
 }
 
@@ -359,9 +362,10 @@ fn unminimised(g: *Graph, id: CellId, inside: graph.Value) !void {
 /// When the closest name from `from` up to (not including) `zone` known
 /// not to exist stops being known.
 fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
+    var kb: graph.KeyBuf = undefined;
     var n = from;
     while (n.labels.len > zone.labels.len) : (n = .{ .labels = n.labels[1..] }) {
-        const f = try g.peek(try g.keyFor(.rrset, n, .a)) orelse continue;
+        const f = try g.peek(Key.of(&kb, .rrset, n, .a)) orelse continue;
         if (f.value.rrset.kind == .nxdomain) return f.expires_ns;
     }
     return null;
@@ -370,9 +374,10 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
 /// `ns(zone)`: only a parent referral settles it. Demanding an
 /// unsettled one re-probes the cut, whose referral publishes both.
 pub fn runNs(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.ns;
-    if (s.cut == null) s.cut = try g.demand(id, try g.keyFor(.cut, zone, .a), zone) orelse
+    if (s.cut == null) s.cut = try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse
         return g.fail(id, unreachable_authority);
     const cut = g.cell(s.cut.?);
     if (!cut.settled()) return;
@@ -387,18 +392,19 @@ pub fn runNs(g: *Graph, id: CellId) !void {
 /// `addr(host)`: glue seeds it provisionally (`absorbReferral`); else
 /// the A and AAAA RRsets one level deeper, through at most one CNAME hop.
 pub fn runAddr(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
     const s = g.cell(id).scratch.addr;
     if (s.host == null) {
         s.host = g.cell(id).name;
-        if (try g.peek(try g.keyFor(.rrset, s.host.?, .cname))) |cname| if (cname.value.rrset.kind == .alias) {
+        if (try g.peek(Key.of(&kb, .rrset, s.host.?, .cname))) |cname| if (cname.value.rrset.kind == .alias) {
             s.host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), cname.value.rrset.target, false);
             s.hopped = true;
         };
     }
     const host = s.host.?;
-    if (s.a == null) s.a = try g.demand(id, try g.keyFor(.rrset, host, .a), host);
-    if (s.aaaa == null) s.aaaa = try g.demand(id, try g.keyFor(.rrset, host, .aaaa), host);
+    if (s.a == null) s.a = try g.demand(id, Key.of(&kb, .rrset, host, .a), host);
+    if (s.aaaa == null) s.aaaa = try g.demand(id, Key.of(&kb, .rrset, host, .aaaa), host);
     var addrs: std.ArrayList(na.Address) = .empty;
     var pending = false;
     var alias: ?dns.Name = null;
@@ -463,6 +469,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
 /// `rrset(name, type)`: from the deepest known cut at or above the name,
 /// ask its servers; follow referrals; settle on the first kept reply.
 pub fn runRrset(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
@@ -472,9 +479,10 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             if (try denial.deny(g, id)) return;
             // A cut at the name itself exists only from a referral;
             // otherwise start at the parent's. A DS always lives there.
-            const own = try g.keyFor(.cut, name, .a);
+            const own = Key.of(&kb, .cut, name, .a);
             const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
-            const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
+            var parent_kb: graph.KeyBuf = undefined;
+            const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else Key.of(&parent_kb, .cut, parent_name, .a);
             const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
             s.cut = try g.demand(id, key, cut_name) orelse
                 return g.fail(id, unreachable_authority);
@@ -485,7 +493,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
         if (!s.dname_checked) {
             s.dname_checked = true;
-            if (try dnameAbove(g, name)) |owner| s.dname = try g.demand(id, try g.keyFor(.rrset, owner, .dname), owner);
+            if (try dnameAbove(g, name)) |owner| s.dname = try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner);
             if (s.dname) |did| s.dname_judge = try trust.demandSecure(g, id, did);
         }
         if (s.dname_judge) |jid| {
@@ -558,6 +566,7 @@ fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
 /// A chain starting with a CNAME at `name` is also the fact
 /// `rrset(name, CNAME)`, so any later type finds the hop.
 fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: Reply) !void {
+    var kb: graph.KeyBuf = undefined;
     if (qtype == .cname or reply.answers.len == 0) return;
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
@@ -570,28 +579,30 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .stored_ns = reply.stored_ns,
         .ttl = first.ttl,
     };
-    try g.publish(try g.keyFor(.rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
+    try g.publish(Key.of(&kb, .rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
 /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
 /// so later names under it redirect from memory.
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
+    var kb: graph.KeyBuf = undefined;
     for (reply.answers) |d| {
         if (d.rtype != .dname) continue;
         var keep: std.ArrayList(dns.ResourceRecord) = .empty;
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
         const dname: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
-        try g.publish(try g.keyFor(.rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
+        try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
 
 /// The owner of the closest fresh DNAME fact above `name` (RFC 6672 §3.2).
 fn dnameAbove(g: *Graph, name: dns.Name) !?dns.Name {
+    var kb: graph.KeyBuf = undefined;
     var i: usize = 1;
     while (i < name.labels.len) : (i += 1) {
         const owner: dns.Name = .{ .labels = name.labels[i..] };
-        const d = try g.peek(try g.keyFor(.rrset, owner, .dname)) orelse continue;
+        const d = try g.peek(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
         if (d.value.rrset.kind == .answer) return owner;
     }
     return null;
@@ -618,25 +629,26 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
 /// delegation never outlives the referring zone's: that is a ghost (Jiang
 /// et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !Graph.Fact {
+    var kb: graph.KeyBuf = undefined;
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
     };
     // Looked up, not taken from the asking cell: a qmin stop marker names
     // the zone but expires at once. Null: the delegation is gone already.
-    const parent = try g.peek(try g.keyFor(.cut, zone, .a));
+    const parent = try g.peek(Key.of(&kb, .cut, zone, .a));
     const expires = @min(if (parent) |p| p.expires_ns else g.now(), g.now() + @as(i64, ns_ttl) * std.time.ns_per_s);
     const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
     const glue = try g.scratch.allocator().alloc(graph.Glue, ref.addr_count);
     for (glue, ref.addrs[0..ref.addr_count], ref.ttls[0..ref.addr_count]) |*gl, a, ttl|
         gl.* = .{ .addr = a, .expires_ns = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s) };
     const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .glue = glue } };
-    try g.publish(try g.keyFor(.cut, ref.zone_cut, .a), by, cut, expires);
-    try g.publish(try g.keyFor(.ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
+    try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), by, cut, expires);
+    try g.publish(Key.of(&kb, .ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-        if (ds.ttl > 0) try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
+        if (ds.ttl > 0) try g.publish(Key.of(&kb, .rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
         // A signed delegation from a zone signed all the way down: whatever
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
@@ -654,7 +666,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
             ttl = @min(ttl, rr.ttl);
         }
         if (addrs.items.len == 0) continue;
-        const key = try g.keyFor(.addr, host, .a);
+        const key = Key.of(&kb, .addr, host, .a);
         if (try g.peek(key)) |existing| if (!existing.value.addr.provisional) continue;
         const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
         try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
@@ -833,7 +845,8 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
-    const key = g.keyFor(.rrset, zone, .ds) catch return false;
+    var kb: graph.KeyBuf = undefined;
+    const key = Key.of(&kb, .rrset, zone, .ds);
     const ds = (g.peek(key) catch return false) orelse return false;
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
@@ -859,13 +872,14 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, transport: Transport, qnam
 /// already known for the NS names. Only when none are known, or all
 /// have failed, are unglued names resolved, up to a per-depth limit.
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
+    var kb: graph.KeyBuf = undefined;
     var list: std.ArrayList(na.Address) = .empty;
     defer list.deinit(g.gpa);
     const zone = a.zone;
     if (zone.labels.len == 0) {
         for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
     } else {
-        if (a.ns == null) a.ns = try g.demand(id, try g.keyFor(.ns, zone, .a), zone) orelse return .none;
+        if (a.ns == null) a.ns = try g.demand(id, Key.of(&kb, .ns, zone, .a), zone) orelse return .none;
         const ns = g.cell(a.ns.?);
         if (!ns.settled()) return .pending;
         if (ns.failure() != null) return .none;
@@ -874,7 +888,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         defer unknown.deinit(g.gpa);
         var pending = false;
         for (names) |host| {
-            const key = try g.keyFor(.addr, host, .a);
+            const key = Key.of(&kb, .addr, host, .a);
             if (try g.peek(key)) |known| {
                 try list.appendSlice(g.gpa, known.value.addr.addrs);
                 continue;
@@ -913,7 +927,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             g.edge.rng.shuffle(dns.Name, unknown.items);
             var demanded = false;
             for (unknown.items[0..@min(limit, unknown.items.len)]) |host| {
-                const aid = try g.demand(id, try g.keyFor(.addr, host, .a), host) orelse continue;
+                const aid = try g.demand(id, Key.of(&kb, .addr, host, .a), host) orelse continue;
                 if (!g.cell(aid).settled()) demanded = true;
             }
             if (demanded) return .pending;

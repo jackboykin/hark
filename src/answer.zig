@@ -190,10 +190,11 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
 /// with when its retention ends. Null: a hop is gone, or with DNSSEC on
 /// was never judged.
 fn past(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question) !?[]Past {
+    var kb: graph.KeyBuf = undefined;
     var list: std.ArrayList(Past) = .empty;
     var name = q.name;
     for (0..graph.max_cname_chain + 1) |_| {
-        const e = g.store.any(try g.keyFor(.rrset, name, q.qtype)) orelse return null;
+        const e = g.store.any(graph.Key.of(&kb, .rrset, name, q.qtype)) orelse return null;
         if (g.cfg.trust_anchor != null and e.blob.verdict.until_ns == 0) return null;
         const r = (try store.Store.parse(arena, e.blob)).rrset;
         try list.append(arena, .{ .reply = r, .until = retainedUntil(g, ret, r) });
@@ -208,9 +209,10 @@ const Past = struct { reply: graph.Reply, until: i64 };
 /// `min-ttl`: a question whose facts have expired but not their floor is
 /// answered from memory, unverified, asking nobody. Null: ask the graph.
 pub fn floored(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
+    var kb: graph.KeyBuf = undefined;
     if (ret.min_ttl == 0) return null;
     // A fresh answer is the graph's to serve, and costs no parse.
-    if (g.index.get(try g.keyFor(.answer, q.name, q.qtype))) |id| if (g.fresh(id)) return null;
+    if (g.index.get(graph.Key.of(&kb, .answer, q.name, q.qtype))) |id| if (g.fresh(id)) return null;
     const chain = try past(arena, g, ret, q) orelse return null;
     var expired = false;
     for (chain) |p| {

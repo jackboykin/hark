@@ -120,6 +120,7 @@ const max_proofs = 8;
 /// facts for as long as the verdict holds, their TTL runs and the negative
 /// cap allows (RFC 8198 §5.4).
 pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
+    var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     const gop = try g.denial.zones.getOrPut(g.gpa, signer.formatLower(&buf));
     if (!gop.found_existing) {
@@ -140,7 +141,7 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        try g.publish(try g.keyFor(.rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires);
+        try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires);
         if (rr.rtype == .soa) continue;
         proofs += 1;
         const sp = try Span.init(g.gpa, rr, expires);
@@ -194,10 +195,11 @@ pub fn deny(g: *Graph, id: CellId) !bool {
 }
 
 fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
+    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const now = g.now();
-    const soa = try g.peek(try g.keyFor(.rrset, zone, .soa)) orelse return false;
+    const soa = try g.peek(graph.Key.of(&kb, .rrset, zone, .soa)) orelse return false;
     var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
@@ -221,7 +223,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     var authorities: std.ArrayList(RR) = .empty;
     try aged(g, &authorities, soa.value.rrset.answers, soa.value.rrset.stored_ns);
     for (proofs[0..n]) |p| {
-        const fact = try g.peek(try g.keyFor(.rrset, p.owner, .nsec)) orelse return false;
+        const fact = try g.peek(graph.Key.of(&kb, .rrset, p.owner, .nsec)) orelse return false;
         expires = @min(expires, fact.expires_ns);
         try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
     }

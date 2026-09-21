@@ -71,10 +71,17 @@ pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, ex
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
+pub const KeyBuf = [dns.max_dotted_len + 1]u8;
+
 pub const Key = struct {
     kind: Kind,
     rtype: dns.RType = .a,
     name: []const u8,
+
+    /// Borrows `buf`: whatever keeps a key dupes its name (`newCell`, `remember`).
+    pub fn of(buf: *KeyBuf, kind: Kind, name: dns.Name, rtype: dns.RType) Key {
+        return .{ .kind = kind, .rtype = rtype, .name = name.formatLower(buf) };
+    }
 
     pub fn hash(k: Key) u64 {
         return std.hash.Wyhash.hash(@as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype), k.name);
@@ -442,15 +449,11 @@ pub const Graph = struct {
         return g.cells.items[id];
     }
 
-    pub fn keyFor(g: *Graph, kind: Kind, name: dns.Name, rtype: dns.RType) !Key {
-        var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        return .{ .kind = kind, .rtype = rtype, .name = try g.scratch.allocator().dupe(u8, name.formatLower(&buf)) };
-    }
-
     /// Held for the client until `unhold`. Null: new work past
     /// `max_in_flight`, or anything unsettled for a caller that cannot `wait`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
-        const key = try g.keyFor(.answer, name, qtype);
+        var kb: KeyBuf = undefined;
+        const key = Key.of(&kb, .answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled() or g.fresh(id)) {
             if (!wait and !g.cell(id).settled()) {
                 g.stats.clients.dropped += 1;
@@ -478,8 +481,9 @@ pub const Graph = struct {
     /// `dnskey(zone)` fetched ahead of need for a question's own walk, on
     /// its payer; one per zone at a time, holding itself until it settles.
     pub fn fetchKeys(g: *Graph, by: CellId, zone: dns.Name) !void {
+        var kb: KeyBuf = undefined;
         if (g.spent(g.payer) or g.level(by) > 0) return;
-        const key = try g.keyFor(.keys, zone, .a);
+        const key = Key.of(&kb, .keys, zone, .a);
         if (g.index.contains(key)) return;
         const id = try g.newCell(key, zone);
         g.cell(id).scratch.keys.budget = g.payer;
@@ -1103,6 +1107,7 @@ test "a cell is a few words" {
 }
 
 test "a cell replacing an expired one takes over the index entry's key" {
+    var kb: KeyBuf = undefined;
     const testing = std.testing;
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
@@ -1123,7 +1128,7 @@ test "a cell replacing an expired one takes over the index entry's key" {
     g.unhold(first);
     try testing.expect(!g.cell(first).live);
     // The entry's key must be the survivor's.
-    const key = try g.keyFor(.answer, name, .a);
+    const key = Key.of(&kb, .answer, name, .a);
     try testing.expectEqual(second, g.index.get(key).?);
     try testing.expectEqual(g.cell(second).key.name.ptr, g.index.getKey(key).?.name.ptr);
     g.unhold(second);
@@ -1175,6 +1180,7 @@ test "an evicted root cut is re-derived, not walked" {
 }
 
 test "a shared cell is paid by a waiting question with room, not its first demander" {
+    var kb: KeyBuf = undefined;
     const testing = std.testing;
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
@@ -1190,7 +1196,7 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
     const first = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, true)).?;
     const second = (try g.demandRoot(host, .a, true)).?;
-    const shared = try g.newCell(try g.keyFor(.rrset, host, .a), host);
+    const shared = try g.newCell(Key.of(&kb, .rrset, host, .a), host);
     try g.pin(shared, first);
     try g.pin(shared, second);
     g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
