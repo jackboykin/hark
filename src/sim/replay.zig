@@ -42,8 +42,6 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         .stagger_ms = scenario.stagger_ms orelse 150,
         .max_queries = scenario.max_queries orelse 100,
         .trust_anchor = s.signer.anchor(),
-        .serve_stale_ttl = scenario.serve_stale_ttl orelse 0,
-        .min_ttl = scenario.min_ttl orelse 0,
         .prefetch = scenario.prefetch orelse false,
         .trace = opts.trace,
     }, s.edge());
@@ -172,42 +170,76 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     const d64 = answer.Dns64.on(scenario.dns64_prefix, client);
     if (try answer.special(arena, q, client, d64)) |served| return served;
     if (q.qtype == .any) return try answer.hinfo(arena, q, client);
-    if (failures.get(q, client.cd, g.now())) |ede| return try answer.servfail(arena, q, client, ede);
+    if (failures.get(q, client.cd, g.now())) |ede| switch (ede.code) {
+        // A hold with nothing left to serve asks afresh.
+        .stale_answer, .stale_nxdomain_answer => if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| return served,
+        else => return try answer.servfail(arena, q, client, ede),
+    };
+    if (try memory(arena, g, scenario, q, client, d64, .floored)) |served| return served;
     const served = try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
     try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
     return served;
+}
+
+fn retention(scenario: *const rpl.Scenario) answer.Retention {
+    return .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 };
+}
+
+fn memory(arena: Allocator, g: *graph.Graph, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, how: enum { floored, stale }) !?answer.Served {
+    const minimal = scenario.minimal_responses orelse true;
+    const asked = if (d64) |d| try d.asked(arena, q) else q;
+    const served = try switch (how) {
+        .floored => answer.floored(arena, g, retention(scenario), asked, client, minimal),
+        .stale => answer.stale(arena, g, retention(scenario), asked, client, minimal),
+    } orelse return null;
+    return if (d64) |d| try d.shape(arena, q, served, null) else served;
 }
 
 fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held) !?answer.Served {
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const minimal = scenario.minimal_responses orelse true;
+    const ret = retention(scenario);
     const asked = if (d64) |d| try d.asked(arena, q) else q;
-    const root = try resolveRoot(g, s, asked, deadline) orelse return null;
+    const root = (try g.demandRoot(asked.name, asked.qtype, true)).?;
     held[0] = root;
-    const served = try answer.build(arena, g, root, asked, client, minimal);
+    try g.drain();
+    // RFC 8767 §5: stale at the client's patience, as serve does.
+    const patience = s.now_ns + answer.stale_client_ms * std.time.ns_per_ms;
+    if (ret.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
+        if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| {
+            unholdAll(g, held);
+            return served;
+        }
+    }
+    if (!try settleBy(g, s, root, deadline)) {
+        unholdAll(g, held);
+        return null;
+    }
+    const served = try answer.build(arena, g, ret, root, asked, client, minimal);
     const d = d64 orelse return served;
     var a: ?answer.Served = null;
     if (answer.Dns64.wantsA(q, served)) {
         const aq: dns.Question = .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
-        const ar = try resolveRoot(g, s, aq, deadline) orelse return null;
+        const ar = (try g.demandRoot(aq.name, aq.qtype, true)).?;
         held[1] = ar;
-        a = try answer.build(arena, g, ar, aq, client, minimal);
+        try g.drain();
+        if (!try settleBy(g, s, ar, deadline)) {
+            unholdAll(g, held);
+            return null;
+        }
+        a = try answer.build(arena, g, ret, ar, aq, client, minimal);
     }
     return try d.shape(arena, q, served, a);
 }
 
-fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, deadline: i64) !?graph.CellId {
-    const root = (try g.demandRoot(q.name, q.qtype, true)).?;
-    try g.drain();
+/// False when nothing more arrives before `until`.
+fn settleBy(g: *graph.Graph, s: *sim.Sim, root: graph.CellId, until: i64) !bool {
     while (!g.cell(root).settled()) {
-        const ev = s.next(deadline) orelse {
-            g.unhold(root);
-            return null;
-        };
+        const ev = s.next(until) orelse return false;
         try g.complete(ev.id, ev.completion);
     }
-    return root;
+    return true;
 }
 
 fn printSections(m: dns.Message) void {
@@ -479,8 +511,8 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(118, r.parsed);
-    try testing.expectEqual(114, r.ran);
+    try testing.expectEqual(120, r.parsed);
+    try testing.expectEqual(116, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 

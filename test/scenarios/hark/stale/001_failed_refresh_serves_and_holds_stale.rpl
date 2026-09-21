@@ -148,7 +148,9 @@ ENTRY_BEGIN
     www.example.com. 30 IN A 10.20.30.40
 ENTRY_END
 
-; Recovered, still held.
+; Recovered, still held: past the 5 s failure window, inside the 30 s hold.
+STEP 11 TIME_PASSES ELAPSE 10
+
 STEP 12 QUERY
 ENTRY_BEGIN
   REPLY RD EDNS
@@ -169,7 +171,7 @@ ENTRY_END
 ; Root, com, www A, its cousin, step 5's refresh.
 STEP 14 CHECK_MAX_QUERIES 5
 
-STEP 15 TIME_PASSES ELAPSE 31
+STEP 15 TIME_PASSES ELAPSE 21
 
 STEP 16 QUERY
 ENTRY_BEGIN

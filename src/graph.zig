@@ -112,10 +112,6 @@ pub const Config = struct {
     /// The first window a failure is remembered: by the server per
     /// question, by trust per zone (RFC 9520 §3.2).
     servfail_ttl: u32 = 5,
-    /// Serve an expired fact this long past expiry while its refresh fails; 0: never.
-    serve_stale_ttl: u32 = 0,
-    /// Floor for every TTL but zero (`walk.replyTtl`).
-    min_ttl: u32 = 0,
     /// Refresh a fact hit just before it expires.
     prefetch: bool = false,
     /// Null: DNSSEC off, nothing is judged.
@@ -179,10 +175,8 @@ pub const Reply = struct {
 pub const Answer = struct {
     /// In chain order; every one but the last is an alias.
     hops: []const CellId,
-    /// `secure(hop)` per hop, held; empty with DNSSEC off or served stale.
+    /// `secure(hop)` per hop, held; empty with DNSSEC off.
     judged: []const CellId = &.{},
-    /// Per hop, a stale stand-in for a failed one; this cell's alone.
-    stale: []const ?*const Reply = &.{},
 };
 
 pub const Outcome = union(enum) {

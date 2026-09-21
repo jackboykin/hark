@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
+const store = @import("store.zig");
 const dns64 = @import("dns64.zig");
 const special_use = @import("special_use.zig");
 
@@ -63,7 +64,13 @@ pub const Dns64 = struct {
 
 /// A reply, and whether it is a fact past this instant (TTL 0 is served
 /// but never memoised).
-pub const Served = struct { msg: dns.Message, cacheable: bool, ede: ?dns.Ede = null };
+pub const Served = struct {
+    msg: dns.Message,
+    cacheable: bool,
+    ede: ?dns.Ede = null,
+    /// Served stale: hold the question stale until then (`Failures`).
+    hold_until_ns: i64 = 0,
+};
 
 /// RFC 6761 names, answered asking nobody; null: ask the graph.
 pub fn special(arena: Allocator, q: dns.Question, c: Client, d64: ?Dns64) !?Served {
@@ -101,11 +108,60 @@ pub fn servfail(arena: Allocator, q: dns.Question, c: Client, ede: dns.Ede) !Ser
     } };
 }
 
-/// The answer cell shaped for a client: a failure or bogus is SERVFAIL,
-/// bogus data only to CD; a verified hop's TTLs end with its proof,
-/// signatures only to DO, AD only when asked (RFC 6840 §5.7).
-pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
-    if (g.cell(root).failure()) |why| return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
+/// Serve's policy over what the store still holds past a fact's TTL; the
+/// graph knows nothing of it.
+pub const Retention = struct {
+    /// Answer from memory, asking nobody, until a reply is this old.
+    min_ttl: u32 = 0,
+    /// RFC 8767: serve an answer this long past its retention when it
+    /// cannot be refreshed; 0: never.
+    serve_stale_ttl: u32 = 0,
+};
+
+/// BIND's stale-refresh-time (RFC 8767 §5): after serving stale, how long
+/// the question is answered stale without asking.
+pub const stale_hold_s = 30;
+/// RFC 8767 §5: a resolution past a stub's patience answers stale instead.
+pub const stale_client_ms = 1800;
+
+const Hop = struct {
+    reply: graph.Reply,
+    /// Record TTLs are raised to this (`min-ttl`), before aging.
+    floor: u32,
+    /// Where a verified hop's proof ends; records live no longer.
+    life: u32 = std.math.maxInt(u32),
+    /// Past its retention, served under RFC 8767.
+    stale: bool = false,
+};
+
+/// When `min-ttl` lets a reply go: its TTL floored, under the negative cap
+/// and its signatures' validity. TTL 0 is never floored.
+fn retainedUntil(g: *graph.Graph, ret: Retention, r: graph.Reply) i64 {
+    const own = walk.replyExpiry(r);
+    if (r.ttl == 0 or r.ttl >= ret.min_ttl) return own;
+    var floor: i64 = ret.min_ttl;
+    if (r.kind == .nodata or r.kind == .nxdomain) floor = @min(floor, g.cfg.max_negative_ttl);
+    var until = r.stored_ns + floor * std.time.ns_per_s;
+    const wall = g.wallNow();
+    for ([_][]const dns.ResourceRecord{ r.answers, r.authorities }) |section| {
+        for (section) |rr| if (rr.rtype == .rrsig) {
+            until = @min(until, g.now() + @as(i64, rr.rdata.rrsig.secondsUntilExpiry(wall)) * std.time.ns_per_s);
+        };
+    }
+    return @max(own, until);
+}
+
+fn floorOf(g: *graph.Graph, ret: Retention, r: graph.Reply) u32 {
+    const retained = @divTrunc(retainedUntil(g, ret, r) - r.stored_ns, std.time.ns_per_s);
+    return @min(ret.min_ttl, @as(u32, @intCast(std.math.clamp(retained, 0, std.math.maxInt(u32)))));
+}
+
+/// The answer cell shaped for a client: a failure or bogus is SERVFAIL
+/// unless serve-stale has something, bogus data only to CD; a verified
+/// hop's TTLs end with its proof, signatures only to DO, AD only when asked
+/// (RFC 6840 §5.7).
+pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
+    if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfail(arena, q, c, .{ .code = why.code, .text = why.text });
     const a = g.cell(root).state.fact.answer;
     // Secure only if every hop is; a verdict that failed is bogus (RFC 4035 §4.3).
     var secure = a.judged.len > 0;
@@ -113,48 +169,111 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
         .fact => |v| secure = secure and v.secure.status == .secure,
         .failure => |why| if (c.cd) {
             secure = false;
-        } else return servfail(arena, q, c, .{ .code = why.code, .text = why.text }),
+        } else return try stale(arena, g, ret, q, c, minimal) orelse servfail(arena, q, c, .{ .code = why.code, .text = why.text }),
         .pending => unreachable,
     };
     std.debug.assert(a.hops.len > 0);
-    var chain: std.ArrayList(dns.ResourceRecord) = .empty;
-    var last: graph.Reply = undefined;
-    var age: u32 = 0;
-    var life: u32 = std.math.maxInt(u32);
-    var stale = false;
-    for (a.hops, 0..) |h, i| {
-        last = if (a.stale.len > i and a.stale[i] != null) a.stale[i].?.* else g.cell(h).state.fact.rrset;
-        age = @intCast(@divTrunc(g.now() - last.stored_ns, std.time.ns_per_s));
-        life = std.math.maxInt(u32);
+    const hops = try arena.alloc(Hop, a.hops.len);
+    for (hops, a.hops, 0..) |*hop, h, i| {
+        const r = g.cell(h).state.fact.rrset;
+        hop.* = .{ .reply = r, .floor = floorOf(g, ret, r) };
         // A failed verdict proved nothing, so it bounds nothing (CD only).
         if (i < a.judged.len and g.cell(a.judged[i]).failure() == null) {
             const proven = g.cell(a.judged[i]).state.fact.secure.proven_until_ns;
-            life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
+            hop.life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
         }
-        const hop_stale = last.ede == .stale_answer;
-        stale = stale or hop_stale;
-        // A denial's life is the reply's, not a record's.
-        if (hop_stale and last.kind != .answer and last.kind != .alias) {
-            age = 0;
-            life = walk.stale_hold_s;
-        }
-        try appendAged(arena, &chain, last.answers, age, life, @min(g.cfg.min_ttl, last.ttl), c.do_bit, hop_stale);
     }
-    const positive = last.kind == .answer or last.kind == .alias;
+    return shape(arena, g, q, c, minimal, hops, secure, g.cell(root).expires_ns > g.now());
+}
+
+/// The chain for `q` as the store last held it, whatever its age, each hop
+/// with when its retention ends. Null: a hop is gone, or with DNSSEC on
+/// was never judged.
+fn past(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question) !?[]Past {
+    var list: std.ArrayList(Past) = .empty;
+    var name = q.name;
+    for (0..graph.max_cname_chain + 1) |_| {
+        const e = g.store.any(try g.keyFor(.rrset, name, q.qtype)) orelse return null;
+        if (g.cfg.trust_anchor != null and e.blob.verdict.until_ns == 0) return null;
+        const r = (try store.Store.parse(arena, e.blob)).rrset;
+        try list.append(arena, .{ .reply = r, .until = retainedUntil(g, ret, r) });
+        if (r.kind != .alias or q.qtype == .cname) return list.items;
+        name = r.target;
+    }
+    return null;
+}
+
+const Past = struct { reply: graph.Reply, until: i64 };
+
+/// `min-ttl`: a question whose facts have expired but not their floor is
+/// answered from memory, unverified, asking nobody. Null: ask the graph.
+pub fn floored(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
+    if (ret.min_ttl == 0) return null;
+    const chain = try past(arena, g, ret, q) orelse return null;
+    var expired = false;
+    for (chain) |p| {
+        if (g.now() >= p.until) return null;
+        expired = expired or g.now() >= walk.replyExpiry(p.reply);
+    }
+    if (!expired) return null;
+    const hops = try arena.alloc(Hop, chain.len);
+    for (hops, chain) |*hop, p| hop.* = .{ .reply = p.reply, .floor = floorOf(g, ret, p.reply) };
+    return try shape(arena, g, q, c, minimal, hops, false, true);
+}
+
+/// RFC 8767: an answer past its retention but inside the stale window,
+/// unverified, with EDE 3 or 19; the question is then held stale for
+/// `stale_hold_s`, or until the window ends. Null: nothing to serve.
+pub fn stale(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
+    if (ret.serve_stale_ttl == 0) return null;
+    const chain = try past(arena, g, ret, q) orelse return null;
+    var window: i64 = std.math.maxInt(i64);
+    var any = false;
+    const hops = try arena.alloc(Hop, chain.len);
+    for (hops, chain) |*hop, p| {
+        window = @min(window, p.until + @as(i64, ret.serve_stale_ttl) * std.time.ns_per_s);
+        hop.* = .{ .reply = p.reply, .floor = floorOf(g, ret, p.reply), .stale = g.now() >= p.until };
+        any = any or hop.stale;
+    }
+    if (!any or g.now() >= window) return null;
+    var served = try shape(arena, g, q, c, minimal, hops, false, false);
+    served.hold_until_ns = g.now() + stale_hold_s * std.time.ns_per_s;
+    return served;
+}
+
+fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal: bool, hops: []const Hop, secure: bool, cacheable: bool) !Served {
+    var chain: std.ArrayList(dns.ResourceRecord) = .empty;
+    var last: Hop = undefined;
+    var age: u32 = 0;
+    var life: u32 = 0;
+    var stale_any = false;
+    for (hops) |hop| {
+        last = hop;
+        age = @intCast(@divTrunc(g.now() - hop.reply.stored_ns, std.time.ns_per_s));
+        life = hop.life;
+        stale_any = stale_any or hop.stale;
+        // A denial's life is the reply's, not a record's.
+        if (hop.stale and hop.reply.kind != .answer and hop.reply.kind != .alias) {
+            age = 0;
+            life = stale_hold_s;
+        }
+        try appendAged(arena, &chain, hop.reply.answers, age, life, hop.floor, c.do_bit, hop.stale);
+    }
+    const r = last.reply;
+    const positive = r.kind == .answer or r.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        const floor = @min(g.cfg.min_ttl, last.ttl);
-        try appendAged(arena, &authorities, last.authorities, age, life, floor, c.do_bit, last.ede == .stale_answer);
-        try appendAged(arena, &additionals, last.additionals, age, life, floor, c.do_bit, last.ede == .stale_answer);
+        try appendAged(arena, &authorities, r.authorities, age, life, last.floor, c.do_bit, last.stale);
+        try appendAged(arena, &additionals, r.additionals, age, life, last.floor, c.do_bit, last.stale);
     }
-    const ede: ?dns.Ede = if (stale) // any hop: a stale alias still redirected
-        .{ .code = if (last.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
-    else if (last.ede) |code|
+    const ede: ?dns.Ede = if (stale_any) // any hop: a stale alias still redirected
+        .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
+    else if (r.ede) |code|
         .{ .code = code }
     else
         null;
-    return .{ .cacheable = g.cell(root).expires_ns > g.now(), .ede = ede, .msg = .{
+    return .{ .cacheable = cacheable, .ede = ede, .msg = .{
         .header = .{ .id = 0, .flags = .{
             .qr = true,
             .opcode = .query,
@@ -165,7 +284,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
             .z = 0,
             .ad = secure and (c.do_bit or c.ad),
             .cd = c.cd,
-            .rcode = last.rcode,
+            .rcode = r.rcode,
         } },
         .questions = try arena.dupe(dns.Question, &.{q}),
         .answers = chain.items,
@@ -176,11 +295,11 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
 
 /// TTLs aged since the reply, floored to `floor` and capped by `life`; a
 /// record past its TTL in a stale reply gets the hold (RFC 8767 §4).
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, floor: u32, sigs: bool, stale: bool) !void {
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, floor: u32, sigs: bool, is_stale: bool) !void {
     for (rrs) |rr| {
         if (rr.rtype == .rrsig and !sigs) continue;
         var aged = rr;
-        aged.ttl = if (stale and rr.ttl <= age) walk.stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
+        aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
     }
 }
@@ -210,20 +329,25 @@ pub const Failures = struct {
     }
 
     /// The EDE to answer with while the window lasts. A validation failure
-    /// keeps its reason; anything else is RFC 8914's cached error.
+    /// keeps its reason, a stale hold says to serve stale again; anything
+    /// else is RFC 8914's cached error.
     pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?dns.Ede {
         if (f.map.count() == 0) return null;
         var buf: [dns.max_dotted_len + 4]u8 = undefined;
         const e = f.map.get(key(&buf, q, cd)) orelse return null;
         if (e.until_ns <= now_ns) return null;
-        return if (e.ede.code == .dnssec_bogus) e.ede else .{ .code = .cached_error };
+        return switch (e.ede.code) {
+            .dnssec_bogus, .stale_answer, .stale_nxdomain_answer => e.ede,
+            else => .{ .code = .cached_error },
+        };
     }
 
-    /// Every reply the graph shaped for `q`: a SERVFAIL opens or widens the
-    /// window, anything else closes it.
+    /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
+    /// stale one holds the question, anything else closes it.
     pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
         var buf: [dns.max_dotted_len + 4]u8 = undefined;
         const k = key(&buf, q, cd);
+        if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .window_s = first_s, .ede = served.ede.? });
         if (served.msg.header.flags.rcode != .server_failure) {
             if (f.map.count() > 0) if (f.map.fetchRemove(k)) |kv| gpa.free(kv.key);
             return;
@@ -240,6 +364,15 @@ pub const Failures = struct {
             return;
         }
         if (first_s == 0) return;
+        try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .window_s = first_s, .ede = ede });
+    }
+
+    /// Past `max_entries` an arbitrary other question is forgotten.
+    fn put(f: *Failures, gpa: Allocator, k: []const u8, e: Entry) !void {
+        if (f.map.getPtr(k)) |old| {
+            old.* = e;
+            return;
+        }
         if (f.map.count() >= max_entries) {
             var it = f.map.keyIterator();
             const old = it.next().?.*;
@@ -248,7 +381,7 @@ pub const Failures = struct {
         }
         const own = try gpa.dupe(u8, k);
         errdefer gpa.free(own);
-        try f.map.put(gpa, own, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .window_s = first_s, .ede = ede });
+        try f.map.put(gpa, own, e);
     }
 };
 

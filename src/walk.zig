@@ -30,10 +30,6 @@ const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
 
-/// BIND's stale-refresh-time (RFC 8767 §5).
-pub const stale_hold_s = 30;
-/// RFC 8767 §5: a refresh past a stub's patience answers stale instead.
-pub const stale_client_ms = 1800;
 /// BIND's `prefetch 2 9`, the 9: or steering zones double.
 pub const refresh_floor_s = 9;
 
@@ -183,8 +179,6 @@ pub const AddrScratch = struct {
     aaaa: ?CellId = null,
     judge_a: ?CellId = null,
     judge_aaaa: ?CellId = null,
-    stale: [2]?*const Reply = .{ null, null },
-    stale_checked: [2]bool = .{ false, false },
 };
 
 pub const NsScratch = struct {
@@ -197,11 +191,6 @@ pub const AnswerScratch = struct {
     /// `secure(hop)` per hop.
     judged: [max_cname_chain + 1]CellId = undefined,
     nj: u8 = 0,
-    stale: [max_cname_chain + 1]?*const Reply = @splat(null),
-    stale_checked: [max_cname_chain + 1]bool = @splat(false),
-    /// Where the client's patience ends; one wake.
-    stale_at: i64 = 0,
-    armed: bool = false,
 };
 
 // ── Rules ──────────────────────────────────────────────────────────────
@@ -213,38 +202,20 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
-    if (s.stale_at == 0) s.stale_at = g.now() + stale_client_ms * std.time.ns_per_ms;
     var next = g.cell(id).name;
     while (true) {
         if (s.n > 0) {
             const i = s.n - 1;
             const last = g.cell(s.hops[i]);
-            if (!last.settled()) {
-                // Past the client's patience: stale answers and holds; the refresh is orphaned.
-                const until = staleWindow(g, last.key) orelse return;
-                if (g.store.any(last.key).?.hold_until_ns <= g.now()) {
-                    if (g.now() < s.stale_at) {
-                        if (!s.armed) try g.wake(id, s.stale_at);
-                        s.armed = true;
-                        return;
-                    }
-                    holdStale(g, last.key, until);
-                }
-                s.stale[i] = try staleReply(g, last.key, g.cell(id).arena.allocator());
-                s.stale_checked[i] = true;
-            } else if (!s.stale_checked[i]) {
-                s.stale_checked[i] = true;
-                if (last.failure() != null) s.stale[i] = try staleReply(g, last.key, g.cell(id).arena.allocator());
-            }
-            if (s.stale[i] == null) if (last.failure()) |why| return failAnswer(g, id, why);
+            if (!last.settled()) return;
+            if (last.failure()) |why| return failAnswer(g, id, why);
             // Judged as it lands, so its zone's chain of trust overlaps the
-            // rest of the walk. Stale hops go unjudged: their signatures
-            // may have expired, and the answer is then unchecked.
-            if (g.cfg.trust_anchor != null and s.stale[i] == null and s.nj == i) {
+            // rest of the walk.
+            if (g.cfg.trust_anchor != null and s.nj == i) {
                 s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
                 s.nj += 1;
             }
-            const r = if (s.stale[i]) |st| st.* else last.state.fact.rrset;
+            const r = last.state.fact.rrset;
             if (r.kind != .alias or qtype == .cname) break;
             next = r.target;
             var broken = s.n > max_cname_chain;
@@ -257,20 +228,15 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         s.n += 1;
     }
     var expires: i64 = std.math.maxInt(i64);
-    var stale = false;
-    for (s.hops[0..s.n], s.stale[0..s.n]) |h, st| {
-        expires = @min(expires, g.cell(h).expires_ns);
-        stale = stale or st != null;
-    }
-    const judged = if (stale) &.{} else s.judged[0..s.nj];
+    for (s.hops[0..s.n]) |h| expires = @min(expires, g.cell(h).expires_ns);
     // A verdict that failed is bogus, and lives no longer.
-    for (judged) |j| {
+    for (s.judged[0..s.nj]) |j| {
         if (!g.cell(j).settled()) return;
         expires = @min(expires, g.cell(j).expires_ns);
     }
-    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .judged = judged, .stale = s.stale[0..s.n] }, expires);
+    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .judged = s.judged[0..s.nj] }, expires);
     // Best effort.
-    if (kind == .answer and g.cfg.prefetch and !stale and refreshable(g, s, expires))
+    if (kind == .answer and g.cfg.prefetch and refreshable(g, s, expires))
         g.refresh(g.cell(id).key, g.cell(id).name) catch {};
 }
 
@@ -278,7 +244,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
 fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
-    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .judged = try arena.dupe(CellId, a.judged), .stale = try arena.dupe(?*const Reply, a.stale) } }, expires);
+    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .judged = try arena.dupe(CellId, a.judged) } }, expires);
 }
 
 fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
@@ -440,7 +406,6 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     var expires: i64 = std.math.maxInt(i64);
     var denied: i64 = std.math.maxInt(i64);
     var failed: ?Failure = null;
-    var provisional = false;
     for ([_]dns.RType{ .a, .aaaa }) |rtype| {
         const rid = (if (rtype == .a) s.a else s.aaaa) orelse continue;
         const c = g.cell(rid);
@@ -449,21 +414,14 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
             continue;
         }
         var n: usize = 0;
-        const fi: usize = @intFromBool(rtype == .aaaa);
-        if (c.failure() != null and !s.stale_checked[fi]) {
-            s.stale_checked[fi] = true;
-            s.stale[fi] = try staleReply(g, c.key, g.cell(id).arena.allocator());
-        }
-        // Stale addresses are glue-grade: unverified.
-        const stale_hop = s.stale[fi] != null;
-        if (!stale_hop) if (c.failure()) |why| {
+        if (c.failure()) |why| {
             failed = failed orelse why;
             continue;
-        };
-        const r = if (s.stale[fi]) |st| st.* else c.state.fact.rrset;
+        }
+        const r = c.state.fact.rrset;
         if (r.kind == .answer or r.kind == .alias) {
             // A bogus answer is no address.
-            if (g.cfg.trust_anchor != null and !stale_hop) {
+            if (g.cfg.trust_anchor != null) {
                 const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
                 if (slot.* == null) slot.* = try trust.demandSecure(g, id, rid);
                 const j = g.cell(slot.*.?);
@@ -486,7 +444,6 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
                 }
             } else if (alias == null) alias = r.target;
         }
-        provisional = provisional or (stale_hop and n > 0);
         if (n > 0) expires = @min(expires, c.expires_ns) else denied = @min(denied, c.expires_ns);
     }
     if (pending) return;
@@ -499,7 +456,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         if (failed) |why| return g.fail(id, why);
         expires = denied;
     }
-    try g.settle(id, .{ .addr = .{ .addrs = addrs.items, .provisional = provisional } }, expires);
+    try g.settle(id, .{ .addr = .{ .addrs = addrs.items, .provisional = false } }, expires);
 }
 
 /// `rrset(name, type)`: from the deepest known cut at or above the name,
@@ -512,9 +469,6 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         if (s.cut == null) {
             // Indexed proofs deny the name without a packet.
             if (try denial.deny(g, id)) return;
-            // Held, or failed just now: SERVFAIL, asking nobody.
-            if (g.store.any(g.cell(id).key)) |e| if (e.hold_until_ns > g.now())
-                return g.fail(id, unreachable_authority);
             // A cut at the name itself exists only from a referral;
             // otherwise start at the parent's. A DS always lives there.
             const own = try g.keyFor(.cut, name, .a);
@@ -522,11 +476,11 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
             const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
             s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
-                return failRrset(g, id, unreachable_authority);
+                return g.fail(id, unreachable_authority);
         }
         const cut = g.cell(s.cut.?);
         if (!cut.settled()) return;
-        if (cut.failure()) |why| return failRrset(g, id, why);
+        if (cut.failure()) |why| return g.fail(id, why);
         // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
         if (!s.dname_checked) {
             s.dname_checked = true;
@@ -597,38 +551,7 @@ fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
     const c = g.cell(id);
     const spent = g.now() >= c.budget.deadline_ns or c.budget.queries >= g.cfg.max_queries;
     if (!spent and !c.orphan and c.depth == 0 and c.budget.refresh_ns == 0) try g.remember(c.key, failed_recently);
-    try failRrset(g, id, why);
-}
-
-/// A failure inside the stale window holds the fact it failed to refresh.
-/// Only the answer and addr rules substitute the stale reply, so DS and
-/// DNSKEY fail for the hold.
-fn failRrset(g: *Graph, id: CellId, why: Failure) !void {
-    const key = g.cell(id).key;
-    if (staleWindow(g, key)) |until| holdStale(g, key, until);
     try g.fail(id, why);
-}
-
-fn holdStale(g: *Graph, key: Key, until: i64) void {
-    g.store.hold(key, @min(g.now() + stale_hold_s * std.time.ns_per_s, until));
-}
-
-fn staleWindow(g: *Graph, key: Key) ?i64 {
-    if (g.cfg.serve_stale_ttl == 0) return null;
-    const e = g.store.any(key) orelse return null;
-    const expired = store.rrsetExpiry(e.blob) catch return null;
-    const until = expired + @as(i64, g.cfg.serve_stale_ttl) * std.time.ns_per_s;
-    if (g.now() < expired or g.now() >= until) return null;
-    return until;
-}
-
-fn staleReply(g: *Graph, key: Key, arena: Allocator) !?*const Reply {
-    if (staleWindow(g, key) == null) return null;
-    const e = g.store.any(key).?;
-    const held = try arena.create(Reply);
-    held.* = (try store.Store.parse(arena, e.blob)).rrset;
-    held.ede = .stale_answer;
-    return held;
 }
 
 /// A chain starting with a CNAME at `name` is also the fact
@@ -818,8 +741,7 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
 
 /// The answer's shortest TTL; for an authoritative denial, min of the
 /// SOA's TTL and MINIMUM (RFC 2308 §3) from an SOA above the name and
-/// inside the zone, nothing otherwise. `min-ttl` floors the rest under the
-/// negative cap and the signatures' validity; by-products keep their own.
+/// inside the zone, nothing otherwise.
 pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
     var ttl: u32 = 0;
     switch (reply.kind) {
@@ -842,16 +764,7 @@ pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
             if (!found) ttl = 0;
         },
     }
-    if (ttl == 0 or ttl >= g.cfg.min_ttl) return ttl;
-    var floor = g.cfg.min_ttl;
-    if (reply.kind == .nodata or reply.kind == .nxdomain) floor = @min(floor, g.cfg.max_negative_ttl);
-    const now = g.wallNow();
-    for ([_][]const dns.ResourceRecord{ reply.answers, reply.authorities }) |section| {
-        for (section) |rr| if (rr.rtype == .rrsig) {
-            floor = @min(floor, rr.rdata.rrsig.secondsUntilExpiry(now));
-        };
-    }
-    return @max(ttl, floor);
+    return ttl;
 }
 
 pub fn replyExpiry(reply: Reply) i64 {
@@ -963,7 +876,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             }
             if (g.index.get(key)) |aid| {
                 if (g.cell(aid).settled()) {
-                    // Ours, settled TTL-0 (stale-backed) or failed: a fact
+                    // Ours, settled TTL-0 or failed: a fact
                     // serves its demander, a failure gives nothing.
                     if (g.holdsInput(id, aid)) {
                         if (g.cell(aid).failure() == null) try list.appendSlice(g.gpa, g.cell(aid).state.fact.addr.addrs);

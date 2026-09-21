@@ -55,8 +55,6 @@ pub const Entry = struct {
     blob: *Blob,
     expires_ns: i64,
     stored_ns: i64 = 0,
-    /// A failed refresh holds the expired fact until then (RFC 8767 §5).
-    hold_until_ns: i64 = 0,
 };
 
 const KeyContext = struct {
@@ -125,10 +123,6 @@ pub const Store = struct {
         return s.map.get(key);
     }
 
-    pub fn hold(s: *Store, key: Key, until_ns: i64) void {
-        if (s.map.getPtr(key)) |e| e.hold_until_ns = until_ns;
-    }
-
     /// Forgets this version of a fact; a newer version is not its business.
     pub fn drop(s: *Store, key: Key, blob: *Blob) void {
         const i = s.map.getIndex(key) orelse return;
@@ -153,7 +147,6 @@ pub const Store = struct {
             errdefer s.gpa.free(gop.key_ptr.name);
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
-        // A new version drops any hold.
         gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns, .stored_ns = now_ns };
         s.held += blob.len;
         s.visited.set(gop.index);
@@ -341,16 +334,6 @@ const Writer = struct {
         for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).bytes.len;
     }
 };
-
-/// When the reply's own TTL ends, read in place, no parse.
-pub fn rrsetExpiry(b: *Blob) !i64 {
-    if (b.kind != @backingInt(Kind.rrset)) return error.EndOfData;
-    var r: Reader = .{ .buf = b.payload(), .arena = undefined };
-    _ = try r.slice(5);
-    const ttl = try r.int(u32);
-    const stored_ns = try r.int(i64);
-    return stored_ns + @as(i64, ttl) * std.time.ns_per_s;
-}
 
 const Reader = struct {
     buf: []const u8,
