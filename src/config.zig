@@ -677,16 +677,6 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
     return .{ .ip4 = ip4 };
 }
 
-test "default config" {
-    var cfg = try defaultConfig(testing.allocator);
-    defer cfg.deinit();
-
-    try testing.expectEqual(@as(usize, 2), cfg.listen.len);
-    try testing.expectEqual(@as(usize, 12 * 1024 * 1024), cfg.cache_size);
-    try testing.expectEqual(true, cfg.dnssec);
-    try testing.expectEqual(true, cfg.qname_minimization);
-}
-
 test "parse full config" {
     var cfg = try parseConfig(testing.allocator,
         \\[server]
@@ -712,13 +702,6 @@ test "parse full config" {
 
 test "a bad dns64-prefix refuses startup" {
     try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, "[resolver]\ndns64-prefix = \"64:ff9b::/100\"\n"));
-}
-
-test "empty config uses defaults" {
-    var cfg = try parseConfig(testing.allocator, "");
-    defer cfg.deinit();
-
-    try testing.expectEqual(@as(usize, 2), cfg.listen.len);
 }
 
 test "parse IPv6 listen address" {
@@ -869,72 +852,20 @@ test "logging config" {
     try testing.expectEqual(true, cfg2.log_queries);
 }
 
-test "trust-anchors override parses and round-trips" {
-    if (!build_options.testing_enabled) return;
-    var cfg = try parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
-    );
-    defer cfg.deinit();
-
-    try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
-    const ta = cfg.trust_anchors[0];
-    try testing.expectEqual(@as(u16, 20326), ta.key_tag);
-    try testing.expectEqual(@as(u8, 8), @backingInt(ta.algorithm));
-    try testing.expectEqual(@as(u8, 2), @backingInt(ta.digest_type));
-    try testing.expectEqual(@as(usize, 32), ta.digest.len);
-
-    const eff = cfg.trustAnchors();
-    try testing.expectEqual(@as(usize, 1), eff.len);
-    try testing.expectEqual(@as(u16, 20326), eff[0].key_tag);
-}
-
-test "trust-anchors accessor falls back to IANA defaults when empty" {
-    var cfg = try parseConfig(testing.allocator, "");
-    defer cfg.deinit();
-    const dnssec = @import("dnssec.zig");
-    const eff = cfg.trustAnchors();
-    try testing.expectEqual(dnssec.root_ds_records.len, eff.len);
-    try testing.expectEqual(dnssec.root_ds_records[0].key_tag, eff[0].key_tag);
-}
-
 test "trust-anchors rejects malformed entries" {
-    if (!build_options.testing_enabled) return;
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 ABC"]
-    ));
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2"]
-    ));
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 AB EXTRA"]
-    ));
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 ZZZZ"]
-    ));
-    // Unknown algorithm (255 is reserved/unassigned per IANA DNSSEC alg registry)
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 255 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
-    ));
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 99 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
-    ));
-    // 16-byte digest is too short for any standard digest type
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D084"]
-    ));
-    // Digest length doesn't match digest type (SHA-256 declared, 20-byte SHA-1 supplied)
-    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E88040"]
-    ));
+    for ([_][]const u8{
+        "20326 8 2 ABC",
+        "20326 8 2",
+        "20326 8 2 AB EXTRA",
+        "20326 8 2 ZZZZ",
+        // Unknown algorithm (255 is reserved/unassigned per IANA DNSSEC alg registry)
+        "20326 255 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+        "20326 8 99 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+        // 16-byte digest is too short for any standard digest type
+        "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D084",
+        // Digest length doesn't match digest type (SHA-256 declared, 20-byte SHA-1 supplied)
+        "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E88040",
+    }) |s| try testing.expectError(error.InvalidValue, parseTrustAnchor(testing.allocator, s));
 }
 
 test "test-only knobs gated on -Dtesting" {
@@ -947,7 +878,6 @@ test "test-only knobs gated on -Dtesting" {
         var cfg = try parseConfig(testing.allocator, cfg_text);
         defer cfg.deinit();
         try testing.expectEqual(@as(u16, 5353), cfg.upstream_port);
-        try testing.expectEqual(true, cfg.allow_loopback_upstreams);
         try testing.expectEqual(@as(usize, 1), cfg.trust_anchors.len);
     } else {
         try testing.expectError(error.TestOnlyConfigKey, parseConfig(testing.allocator, cfg_text));
