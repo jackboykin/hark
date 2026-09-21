@@ -209,6 +209,8 @@ const Past = struct { reply: graph.Reply, until: i64 };
 /// answered from memory, unverified, asking nobody. Null: ask the graph.
 pub fn floored(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
     if (ret.min_ttl == 0) return null;
+    // A fresh answer is the graph's to serve, and costs no parse.
+    if (g.index.get(try g.keyFor(.answer, q.name, q.qtype))) |id| if (g.fresh(id)) return null;
     const chain = try past(arena, g, ret, q) orelse return null;
     var expired = false;
     for (chain) |p| {
