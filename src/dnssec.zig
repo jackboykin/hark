@@ -1554,7 +1554,7 @@ pub fn validateRrset(
 /// How long an RRset this signature verified may be held: RFC 4034 §3.1.2
 /// Original TTL or RFC 4035 §5.3.3 remaining window, whichever is shorter.
 pub fn rrsigTtlCap(rrsig: dns.RrsigData, now_u32: u32) u32 {
-    return @min(rrsig.original_ttl, rrsig.secondsUntilExpiry(now_u32));
+    return @min(rrsig.original_ttl, dns.secondsUntil(rrsig.sig_expiration, now_u32));
 }
 
 /// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.

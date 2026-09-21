@@ -296,14 +296,14 @@ pub const RrsigData = struct {
     key_tag: u16,
     signer_name: Name,
     signature: []const u8,
-
-    /// Seconds until this signature expires at `now`, saturating at 0. For
-    /// the RFC 4035 §5.3.3 TTL ceiling, not the validator's freshness check,
-    /// which needs the clock-skew-tolerant comparison in dnssec.zig.
-    pub fn secondsUntilExpiry(self: RrsigData, now: u32) u32 {
-        return if (serialAfter(self.sig_expiration, now)) self.sig_expiration -% now else 0;
-    }
 };
+
+/// Seconds from `now` to an RRSIG timestamp, saturating at 0. For the RFC
+/// 4035 §5.3.3 TTL ceiling, not the validator's freshness check, which
+/// needs the clock-skew-tolerant comparison in dnssec.zig.
+pub fn secondsUntil(expiration: u32, now: u32) u32 {
+    return if (serialAfter(expiration, now)) expiration -% now else 0;
+}
 
 /// RFC 1982 serial comparison. RRSIG timestamps are mod-2^32 serials (RFC
 /// 4034 §3.1.5) and must never be compared or subtracted directly.
@@ -320,24 +320,12 @@ test "serialAfter: basic comparisons" {
     try testing.expect(!serialAfter(0xFFFFFFFF, 0x00000001));
 }
 
-test "secondsUntilExpiry: saturates at zero and wraps as a serial" {
-    var sig: RrsigData = .{
-        .type_covered = .a,
-        .algorithm = .ecdsap256sha256,
-        .labels = 2,
-        .original_ttl = 3600,
-        .sig_expiration = 1000,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = .{ .labels = &.{} },
-        .signature = "",
-    };
-    try testing.expectEqual(@as(u32, 400), sig.secondsUntilExpiry(600));
-    try testing.expectEqual(@as(u32, 0), sig.secondsUntilExpiry(1000));
-    try testing.expectEqual(@as(u32, 0), sig.secondsUntilExpiry(1001));
+test "secondsUntil: saturates at zero and wraps as a serial" {
+    try testing.expectEqual(@as(u32, 400), secondsUntil(1000, 600));
+    try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1000));
+    try testing.expectEqual(@as(u32, 0), secondsUntil(1000, 1001));
     // Expiration just past the 2^32 wrap is still in the future.
-    sig.sig_expiration = 5;
-    try testing.expectEqual(@as(u32, 10), sig.secondsUntilExpiry(0xFFFFFFFB));
+    try testing.expectEqual(@as(u32, 10), secondsUntil(5, 0xFFFFFFFB));
 }
 
 /// Returns the rtype an RRSIG record covers, or null if `rr` isn't an RRSIG.
@@ -583,7 +571,53 @@ pub const WireRecord = struct {
         if (r.rtype() != .rrsig) return null;
         return @fromBackingInt(mem.readInt(u16, r.rdata()[0..2], .big));
     }
+
+    pub fn sigExpiration(r: WireRecord) u32 {
+        std.debug.assert(r.rtype() == .rrsig);
+        return mem.readInt(u32, r.rdata()[8..12], .big);
+    }
+
+    /// `rr` written into `allocator` as the store writes it, sent with its own TTL.
+    pub fn from(allocator: Allocator, rr: ResourceRecord) !WireRecord {
+        const buf = try allocator.alloc(u8, max_name_len + 2 + 10 + std.math.maxInt(u16));
+        const bytes = try allocator.realloc(buf, (try buildResourceRecordWire(buf, rr)).len);
+        const n = wireNameLen(bytes);
+        return .{ .owner = bytes[0..n], .rest = bytes[n..], .ttl = rr.ttl };
+    }
 };
+
+/// Two uncompressed wire names, ASCII case folded. Length bytes are
+/// below 64, so folding them changes nothing.
+pub fn wireNameEql(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// An uncompressed wire name as a `Name` whose labels alias it.
+pub fn nameOfWire(wire: []const u8, labels: *[max_label_count][]const u8) Name {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (wire[i] != 0) : (i += 1 + wire[i]) {
+        labels[n] = wire[i + 1 ..][0..wire[i]];
+        n += 1;
+    }
+    return .{ .labels = labels[0..n] };
+}
+
+/// `wire` (uncompressed) is `zone` or below it, case folded.
+pub fn wireIsSubdomainOf(wire: []const u8, zone: Name) bool {
+    var starts: [max_label_count]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (wire[i] != 0) : (i += 1 + wire[i]) {
+        starts[n] = @intCast(i);
+        n += 1;
+    }
+    if (n < zone.labels.len) return false;
+    for (starts[n - zone.labels.len .. n], zone.labels) |at, label| {
+        if (!std.ascii.eqlIgnoreCase(wire[at + 1 ..][0..wire[at]], label)) return false;
+    }
+    return true;
+}
 
 pub fn wireNameLen(wire: []const u8) usize {
     var i: usize = 0;
@@ -609,18 +643,6 @@ pub const Message = struct {
     authorities: []const ResourceRecord = &.{},
     additionals: []const ResourceRecord = &.{},
     opt: ?OptRecord = null,
-
-    /// The header as it goes on the wire: counts come from the sections, not
-    /// `header`, since a parsed message holds the OPT in `opt` yet counts it
-    /// in `ar_count`.
-    pub fn wireHeader(msg: Message) Header {
-        var hdr = msg.header;
-        hdr.qd_count = @intCast(msg.questions.len);
-        hdr.an_count = @intCast(msg.answers.len);
-        hdr.ns_count = @intCast(msg.authorities.len);
-        hdr.ar_count = @intCast(msg.additionals.len + @intFromBool(msg.opt != null));
-        return hdr;
-    }
 };
 
 /// Index of the first label-separating `.` at or after `start`, skipping
@@ -1668,19 +1690,42 @@ pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
 }
 
 pub fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
+    const sections: Sections(ResourceRecord) = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
+    return serializeEnds(buf, msg.header, msg.questions, ResourceRecord, sections, msg.opt, ends);
+}
+
+/// A message's record sections, parsed (`ResourceRecord`) or as stored (`WireRecord`).
+pub fn Sections(comptime R: type) type {
+    return struct {
+        answers: []const R = &.{},
+        authorities: []const R = &.{},
+        additionals: []const R = &.{},
+
+        pub fn header(s: @This(), hdr: Header, questions: usize, opt: bool) Header {
+            var out = hdr;
+            out.qd_count = @intCast(questions);
+            out.an_count = @intCast(s.answers.len);
+            out.ns_count = @intCast(s.authorities.len);
+            out.ar_count = @intCast(s.additionals.len + @intFromBool(opt));
+            return out;
+        }
+    };
+}
+
+pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
     var ser = Serializer{ .buf = buf, .pos = 0, .names = &names };
+    const write = if (R == WireRecord) Serializer.writeWireRecord else Serializer.writeResourceRecord;
 
-    try ser.writeHeader(msg.wireHeader());
-
-    for (msg.questions) |q| try ser.writeQuestion(q);
+    try ser.writeHeader(sections.header(hdr, questions.len, opt != null));
+    for (questions) |q| try ser.writeQuestion(q);
     ends.questions = ser.pos;
-    for (msg.answers) |rr| try ser.writeResourceRecord(rr);
+    for (sections.answers) |rr| try write(&ser, rr);
     ends.answers = ser.pos;
-    for (msg.authorities) |rr| try ser.writeResourceRecord(rr);
+    for (sections.authorities) |rr| try write(&ser, rr);
     ends.authorities = ser.pos;
-    for (msg.additionals) |rr| try ser.writeResourceRecord(rr);
-    if (msg.opt) |opt| try ser.writeOpt(opt);
+    for (sections.additionals) |rr| try write(&ser, rr);
+    if (opt) |o| try ser.writeOpt(o);
 
     return buf[0..ser.pos];
 }
@@ -2150,7 +2195,7 @@ test "a record written from its stored bytes is the record written from its fiel
         const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } });
         var names: NameTable = .{};
         var ser: Serializer = .{ .buf = &got_buf, .pos = 0, .names = &names };
-        try ser.writeHeader((Message{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } }).wireHeader());
+        try ser.writeHeader((Sections(ResourceRecord){ .answers = &.{ aged, aged } }).header(mem.zeroes(Header), 1, false));
         try ser.writeQuestion(q[0]);
         for (0..2) |_| try ser.writeWireRecord(wr);
         try testing.expectEqualSlices(u8, want, got_buf[0..ser.pos]);

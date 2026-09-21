@@ -98,12 +98,11 @@ pub const ServerConfig = struct {
     allow_from: []acl.Cidr,
 
     /// Operator policy: when true (default) responses to clients carry only
-    /// load-bearing records (answer, SOA on negatives, DNSSEC proofs on DO=1
-    /// / CD=1). When false, the wire shaper passes the upstream's authority
-    /// and additional sections through unchanged except for the RFC 4035
-    /// §3.2.3 DO=0 strip (which remains mandatory). Mirrors Unbound's
-    /// `minimal-responses` knob (default-on since 1.7.x). The full keep/strip
-    /// matrix is implemented and documented in `response.zig:shapeResponse`.
+    /// load-bearing records (answer, SOA on negatives, DNSSEC proofs on
+    /// DO=1). When false, the upstream's authority and additional sections
+    /// pass through, still without DNSSEC records unless DO=1. Mirrors
+    /// Unbound's `minimal-responses` knob (default-on since 1.7.x). The full
+    /// keep matrix is `answer.zig:Keep`.
     minimal_responses: bool,
 
     /// RFC 7766 §6.2.3: TCP idle timeout. Hark closes a TCP client

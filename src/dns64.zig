@@ -52,38 +52,39 @@ pub const Prefix = struct {
 };
 
 /// §5.1.2, §5.1.4: NOERROR with no AAAA beyond `::ffff:0:0/96`.
-pub fn wantsSynthesis(msg: dns.Message) bool {
-    if (msg.header.flags.rcode != .no_error) return false;
-    for (msg.answers) |rr| if (rr.rtype == .aaaa and !na.isIp4Mapped(&rr.rdata.aaaa)) return false;
+pub fn wantsSynthesis(rcode: dns.RCode, answers: []const dns.WireRecord) bool {
+    if (rcode != .no_error) return false;
+    for (answers) |rr| if (rr.rtype() == .aaaa and !na.isIp4Mapped(rr.rdata())) return false;
     return true;
 }
 
-/// `a` with each A embedded under `p` and the A RRSIG dropped; null when there
-/// is no A to embed. §5.1.7: TTL capped by the negative's SOA, else 600 s.
-pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: dns.Message, negative: dns.Message) !?dns.Message {
-    for (a.answers) |rr| {
-        if (rr.rtype == .a) break;
+/// The A reply's answers with each A embedded under `p` and the A RRSIG
+/// dropped; null when there is no A to embed. §5.1.7: TTL capped by the
+/// negative's SOA, else 600 s. AD is the caller's to clear.
+pub fn synthesizeAaaa(alloc: mem.Allocator, p: Prefix, a: []const dns.WireRecord, negative_authorities: []const dns.WireRecord) !?[]dns.WireRecord {
+    for (a) |rr| {
+        if (rr.rtype() == .a) break;
     } else return null;
-    const cap = for (negative.authorities) |rr| {
-        if (rr.rtype == .soa) break rr.ttl;
+    const cap = for (negative_authorities) |rr| {
+        if (rr.rtype() == .soa) break rr.ttl;
     } else 600;
-    const out = try alloc.alloc(dns.ResourceRecord, a.answers.len);
+    const out = try alloc.alloc(dns.WireRecord, a.len);
     var n: usize = 0;
-    for (a.answers) |rr| {
-        if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .a) continue;
-        out[n] = if (rr.rtype != .a) rr else .{
-            .name = rr.name,
-            .rtype = .aaaa,
-            .rclass = rr.rclass,
-            .ttl = @min(rr.ttl, cap),
-            .rdata = .{ .aaaa = p.embed(rr.rdata.a) },
+    for (a) |rr| {
+        if (rr.covers() == .a) continue;
+        out[n] = if (rr.rtype() != .a) rr else blk: {
+            const rest = try alloc.alloc(u8, 10 + 16);
+            const ttl = @min(rr.ttl, cap);
+            mem.writeInt(u16, rest[0..2], @backingInt(dns.RType.aaaa), .big);
+            @memcpy(rest[2..4], rr.rest[2..4]);
+            mem.writeInt(u32, rest[4..8], ttl, .big);
+            mem.writeInt(u16, rest[8..10], 16, .big);
+            rest[10..26].* = p.embed(rr.rdata()[0..4].*);
+            break :blk .{ .owner = rr.owner, .rest = rest, .ttl = ttl };
         };
         n += 1;
     }
-    var msg = a;
-    msg.answers = out[0..n];
-    msg.header.flags.ad = false;
-    return msg;
+    return out[0..n];
 }
 
 pub fn parseIp6Arpa(name: []const u8) ?[16]u8 {
@@ -100,18 +101,21 @@ pub fn parseIp6Arpa(name: []const u8) ?[16]u8 {
     return out;
 }
 
-/// CNAMEs (RFC 2317) and RRSIGs are untrue under the new owner.
-pub fn renamePtr(alloc: mem.Allocator, msg: *dns.Message, qname: []const u8) !void {
-    const owner = try dns.cloneNameLower(alloc, try dns.parseDottedName(alloc, qname));
-    const out = try alloc.alloc(dns.ResourceRecord, msg.answers.len);
+/// The PTRs re-owned to `qname`, lowercased; CNAMEs (RFC 2317) and
+/// RRSIGs are untrue under the new owner.
+pub fn renamePtr(alloc: mem.Allocator, answers: []const dns.WireRecord, qname: dns.Name) ![]dns.WireRecord {
+    var buf: [dns.max_name_len + 2]u8 = undefined;
+    const owner = try alloc.dupe(u8, buf[0..try dns.writeNameWire(&buf, qname)]);
+    // Length bytes are below 'A': lowering the whole name lowers its labels.
+    for (owner) |*c| c.* = std.ascii.toLower(c.*);
+    const out = try alloc.alloc(dns.WireRecord, answers.len);
     var n: usize = 0;
-    for (msg.answers) |rr| {
-        if (rr.rtype != .ptr) continue;
-        out[n] = .{ .name = owner, .rtype = .ptr, .rclass = rr.rclass, .ttl = rr.ttl, .rdata = rr.rdata };
+    for (answers) |rr| {
+        if (rr.rtype() != .ptr) continue;
+        out[n] = .{ .owner = owner, .rest = rr.rest, .ttl = rr.ttl };
         n += 1;
     }
-    msg.answers = out[0..n];
-    msg.header.flags.ad = false;
+    return out[0..n];
 }
 
 /// RFC 6052 §2.4.
@@ -148,29 +152,25 @@ test "parseIp6Arpa round-trips through the nibble order" {
     try testing.expectEqualSlices(u8, &addr, &parseIp6Arpa(std.ascii.upperString(&upper, name)).?);
 }
 
-test "synthesizeAaaa embeds every A, drops its RRSIG, caps TTL by the SOA and clears AD" {
+test "synthesizeAaaa embeds every A, drops its RRSIG and caps TTL by the SOA" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
     const host = try dns.parseDottedName(al, "host.example.com.");
     const sig: dns.RrsigData = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 0, .sig_expiration = 0, .sig_inception = 0, .key_tag = 0, .signer_name = host, .signature = "" };
-    const a_rrs = [_]dns.ResourceRecord{
-        .{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
-        .{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } },
+    const a = [_]dns.WireRecord{
+        try .from(al, .{ .name = host, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 192, 0, 2, 1 } } }),
+        try .from(al, .{ .name = host, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = sig } }),
     };
-    const soa = [_]dns.ResourceRecord{.{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } }};
-    var a = dns.Message{ .header = .{ .id = 0, .flags = @bitCast(@as(u16, 0)) }, .questions = &.{}, .answers = &a_rrs };
-    a.header.flags.ad = true;
-    const negative = dns.Message{ .header = a.header, .questions = &.{}, .answers = &.{}, .authorities = &soa };
-    try testing.expect(wantsSynthesis(negative));
-    const out = (try synthesizeAaaa(al, Prefix.well_known, a, negative)).?;
-    try testing.expectEqual(@as(usize, 1), out.answers.len);
-    try testing.expectEqual(dns.RType.aaaa, out.answers[0].rtype);
-    try testing.expectEqual(@as(u32, 300), out.answers[0].ttl);
-    try testing.expectEqualSlices(u8, &Prefix.well_known.embed(.{ 192, 0, 2, 1 }), &out.answers[0].rdata.aaaa);
-    try testing.expect(!out.header.flags.ad);
-    try testing.expect(!wantsSynthesis(out));
-    try testing.expectEqual(@as(?dns.Message, null), try synthesizeAaaa(al, Prefix.well_known, negative, negative));
+    const soa = [_]dns.WireRecord{try .from(al, .{ .name = host, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .unknown = "" } })};
+    try testing.expect(wantsSynthesis(.no_error, &.{}));
+    const out = (try synthesizeAaaa(al, Prefix.well_known, &a, &soa)).?;
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqual(dns.RType.aaaa, out[0].rtype());
+    try testing.expectEqual(@as(u32, 300), out[0].ttl);
+    try testing.expectEqualSlices(u8, &Prefix.well_known.embed(.{ 192, 0, 2, 1 }), out[0].rdata());
+    try testing.expect(!wantsSynthesis(.no_error, out));
+    try testing.expectEqual(@as(?[]dns.WireRecord, null), try synthesizeAaaa(al, Prefix.well_known, &.{}, &soa));
 }
 
 test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME hop" {
@@ -180,16 +180,15 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const in_addr = try dns.parseDottedName(a, "1.2.0.192.in-addr.arpa.");
     const classless = try dns.parseDottedName(a, "1.0-25.2.0.192.in-addr.arpa.");
     const host = try dns.parseDottedName(a, "host.example.com.");
-    const answers = [_]dns.ResourceRecord{
-        .{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } },
-        .{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } },
+    const answers = [_]dns.WireRecord{
+        try .from(a, .{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } }),
+        try .from(a, .{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } }),
     };
-    var msg = dns.Message{ .header = .{ .id = 0, .flags = @bitCast(@as(u16, 0)) }, .questions = &.{}, .answers = &answers };
-    msg.header.flags.ad = true;
-    const qname = "1.0.2.0.0.0.0.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa.";
-    try renamePtr(a, &msg, qname);
-    try testing.expectEqual(@as(usize, 1), msg.answers.len);
-    try testing.expect(msg.answers[0].name.eql(try dns.parseDottedName(a, qname)));
-    try testing.expect(msg.answers[0].rdata.ptr.eql(host));
-    try testing.expect(!msg.header.flags.ad);
+    const qname = try dns.parseDottedName(a, "1.0.2.0.0.0.0.C.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.B.9.F.F.4.6.0.0.ip6.arpa.");
+    const out = try renamePtr(a, &answers, qname);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    var lower: [dns.max_name_len + 2]u8 = undefined;
+    const want = lower[0..try dns.writeNameWire(&lower, try dns.cloneNameLower(a, qname))];
+    try testing.expectEqualSlices(u8, want, out[0].owner);
+    try testing.expectEqualSlices(u8, answers[1].rest, out[0].rest);
 }

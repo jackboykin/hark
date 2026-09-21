@@ -10,6 +10,7 @@ const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
 const graph = @import("../graph.zig");
 const answer = @import("../answer.zig");
+const response = @import("../response.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -167,20 +168,43 @@ fn unholdAll(g: *graph.Graph, held: *Held) void {
     };
 }
 
+/// What the client was sent, read back off the wire serve builds.
+const Sent = struct { msg: dns.Message, cacheable: bool };
+
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk) !?answer.Served {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk) !?Sent {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
-    switch (try desk.early(arena, q, client)) {
-        .synthesized, .replayed, .floored => |served| return served,
-        .recalled => |served| {
+    const served = switch (try desk.early(arena, q, client)) {
+        .synthesized, .replayed, .floored => |served| served,
+        .recalled => |served| blk: {
+            errdefer served.release(&g.store);
             try agrees(arena, g, s, scenario, q, client, held, desk, served);
-            return served;
+            break :blk served;
         },
-        .graph => {},
-    }
-    return try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null);
+        .graph => try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null),
+    };
+    defer served.release(&g.store);
+    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, served)), .cacheable = served.cacheable };
+}
+
+/// The bytes serve would send `client` for `served`, bar the query id,
+/// OPT and the rebinding scrub.
+fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, served: answer.Served) ![]const u8 {
+    const ctx: response.ResponseContext = .{
+        .query_id = 0,
+        .opcode = .query,
+        .rd = client.rd,
+        .cd = client.cd,
+        .questions = try arena.dupe(dns.Question, &.{q}),
+        .client_edns = false,
+        .client_do = client.do_bit,
+        .client_wants_ad = client.do_bit or client.ad,
+        .max_udp_payload = dns.max_message_len,
+    };
+    const reply: response.Reply = .{ .rcode = served.rcode, .ad = served.ad, .answers = served.answers, .authorities = served.authorities, .additionals = served.additionals };
+    return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, reply, arena) orelse error.OutOfMemory;
 }
 
 /// `recall`'s backstop: what it serves from the store, the graph builds
@@ -188,9 +212,10 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
 fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, recalled: answer.Served) !void {
     const before = s.log.items.len;
     const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
+    defer built.release(&g.store);
     if (s.log.items.len != before) return error.RecallDisagrees;
-    const a = try dns.serializeMessage(try arena.alloc(u8, 65535), recalled.msg);
-    const b = try dns.serializeMessage(try arena.alloc(u8, 65535), built.msg);
+    const a = try wireOf(arena, q, client, recalled);
+    const b = try wireOf(arena, q, client, built);
     const ede_eq = if (recalled.ede) |x| if (built.ede) |y| x.code == y.code and mem.eql(u8, x.text, y.text) else false else built.ede == null;
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
@@ -221,6 +246,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     held[1] = a;
     try g.drain();
     if (!try settleBy(g, s, a, deadline)) {
+        served.release(&g.store);
         unholdAll(g, held);
         return null;
     }

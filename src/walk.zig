@@ -197,14 +197,14 @@ pub const AnswerScratch = struct {
 
 // ── Rules ──────────────────────────────────────────────────────────────
 
-/// Where an answer's chain goes after `r`, the last of the hops `seen`:
-/// it ends, goes on to the alias target, or is broken by a loop or by
-/// passing `max_cname_chain`.
-pub fn chain(r: graph.Reply, qtype: dns.RType, seen: []const dns.Name) union(enum) { done, next: dns.Name, broken } {
-    if (r.kind != .alias or qtype == .cname) return .done;
+/// Where an answer's chain goes after the last of the hops `seen`, a
+/// reply of `kind` (to `target`, an alias): it ends, goes on to the
+/// target, or is broken by a loop or by passing `max_cname_chain`.
+pub fn chain(kind: @FieldType(Reply, "kind"), target: dns.Name, qtype: dns.RType, seen: []const dns.Name) union(enum) { done, next: dns.Name, broken } {
+    if (kind != .alias or qtype == .cname) return .done;
     if (seen.len > max_cname_chain) return .broken;
-    for (seen) |n| if (n.eql(r.target)) return .broken;
-    return .{ .next = r.target };
+    for (seen) |n| if (n.eql(target)) return .broken;
+    return .{ .next = target };
 }
 
 /// `answer(name, type)`: `rrset(name, type)`, then each alias's target
@@ -230,7 +230,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             }
             var seen: [max_cname_chain + 1]dns.Name = undefined;
             for (seen[0..s.n], s.hops[0..s.n]) |*n, h| n.* = g.cell(h).name;
-            switch (chain(last.state.fact.rrset, qtype, seen[0..s.n])) {
+            switch (chain(last.state.fact.rrset.kind, last.state.fact.rrset.target, qtype, seen[0..s.n])) {
                 .done => break,
                 .next => |n| next = n,
                 .broken => return failAnswer(g, id, .{ .code = .other, .text = "cname loop" }),
@@ -795,7 +795,8 @@ pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
     return ttl;
 }
 
-pub fn replyExpiry(reply: Reply) i64 {
+/// A `graph.Reply` or a `store.Rrset`.
+pub fn replyExpiry(reply: anytype) i64 {
     return reply.stored_ns + @as(i64, reply.ttl) * std.time.ns_per_s;
 }
 

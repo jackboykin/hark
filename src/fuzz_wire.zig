@@ -158,9 +158,12 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     _ = dns.extractKeepaliveTimeout(input);
     _ = dns.hasTcBit(input);
 
-    const once = try rebinding.scrub(alloc, msg.answers, scrub_cfg);
-    if ((try rebinding.scrub(alloc, once, scrub_cfg)).len != once.len) return error.ScrubNotIdempotent;
-    _ = try rebinding.scrub(alloc, msg.additionals, scrub_cfg);
+    for ([_][]const dns.ResourceRecord{ msg.answers, msg.additionals }) |section| {
+        const records = try alloc.alloc(dns.WireRecord, section.len);
+        for (records, section) |*w, rr| w.* = dns.WireRecord.from(alloc, rr) catch return;
+        const once = try rebinding.scrub(alloc, records, scrub_cfg);
+        if ((try rebinding.scrub(alloc, once, scrub_cfg)).len != once.len) return error.ScrubNotIdempotent;
+    }
 }
 
 test "fuzz: wire message chain" {

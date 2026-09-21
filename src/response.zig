@@ -1,10 +1,7 @@
-/// Wire-shaping for client-facing responses: header construction, EDNS0 OPT,
-/// truncation cascade, error responses, and per-RFC validation. Pure (no
-/// I/O); serve.zig does the I/O.
-///
-/// Response shaping policy is captured in `shapeResponse`: a per-section
-/// keep/strip matrix over (qtype, DO bit, rcode, answer-present). The cells
-/// are documented inline at each branch of `shapeResponse` below.
+/// The client's reply on the wire: header, EDNS0 OPT, the rebinding
+/// scrub, the truncation cascade, error responses, and per-RFC query
+/// validation. Pure (no I/O); serve.zig does the I/O. Which records a
+/// client is owed is answer.zig's (`Keep`); this only writes them.
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -12,213 +9,14 @@ const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const special_use = @import("special_use.zig");
 
-// ── Response shaping ───────────────────────────────────────────────────
-//
-// What a recursive resolver owes its client:
-//   1. Use the answer (or know there isn't one).
-//   2. Negatively cache the absence (RFC 2308 — SOA in authority).
-//   3. Independently validate, if DO=1 (RFC 4035 §3.2.1).
-//
-// Everything else — delegation NS in authority, glue in additional — is
-// decoration for clients that aren't recursive resolvers. Stubs don't
-// follow referrals; forwarding them invites CVE-2025-11411-class
-// section-confusion poisoning (child auth records overriding the
-// resolver's view of parent delegation).
-//
-// `shapeResponse` is the single choke point for this policy. All
-// client-bound responses flow through it via `buildResponseWire`.
-
-/// Result of shaping: section slices owned by the supplied allocator
-/// (or borrowed from `response` when no allocation was needed).
-const ShapedSections = struct {
-    answers: []const dns.ResourceRecord,
-    authorities: []const dns.ResourceRecord,
-    additionals: []const dns.ResourceRecord,
-    scrubbed: bool,
+/// What is sent: the rcode, AD as the shaper judged it, and the records.
+pub const Reply = struct {
+    rcode: dns.RCode,
+    ad: bool = false,
+    answers: []const dns.WireRecord = &.{},
+    authorities: []const dns.WireRecord = &.{},
+    additionals: []const dns.WireRecord = &.{},
 };
-
-/// Pure shaper: applies the per-section keep/strip matrix to `response`
-/// and returns new slices. Each matrix cell is spelled out at the branch
-/// that implements it; the `shapeResponse` tests below exercise them
-/// one-to-one.
-///
-/// On OOM returns the error so the caller can surface SERVFAIL —
-/// silently returning a partially-shaped response would leak records
-/// the matrix says to strip.
-fn shapeResponse(
-    alloc: mem.Allocator,
-    response: dns.Message,
-    qtype: dns.RType,
-    do_bit: bool,
-    minimal_responses: bool,
-    rebind_cfg: *const rebinding.Config,
-) mem.Allocator.Error!ShapedSections {
-    // RFC 3225, RFC 4035 §3.1: DNSSEC records only to DO. CD turns
-    // validation off (§3.2.2); it asks for no proofs.
-    const keep_dnssec = do_bit;
-
-    // qtype=NS suppresses the minimal-responses strip — for RFC 8109 root
-    // priming, the NS records *are* the answer and their glue is load-
-    // bearing. Mirrors Unbound's positive_answer() carve-out (msgencode.c:660).
-    const apply_minimal = minimal_responses and qtype != .ns;
-    // Positives shed delegation NS + glue; negatives retain SOA + proofs.
-    const positive = response.header.flags.rcode == .no_error and response.answers.len > 0;
-
-    const answers = try shapeAnswers(alloc, response.answers, qtype, keep_dnssec);
-    const authorities = try shapeAuthority(alloc, response.authorities, keep_dnssec, apply_minimal, positive);
-    const additionals = try shapeAdditional(alloc, response.additionals, keep_dnssec, apply_minimal, positive);
-
-    // Rebinding scrub covers every shaped section: negative responses
-    // pass authority/additional through un-minimised, and RFC 9460 §4.2
-    // steers clients toward consuming Additional-section SVCB/A/AAAA.
-    // Scrubbing after shaping means minimised (near-empty) sections cost
-    // nothing to scan — the security boundary is what reaches the wire.
-    const rb = rebind_cfg.*;
-    const scrubbed_answers = try rebinding.scrub(alloc, answers, rb);
-    const scrubbed_authorities = try rebinding.scrub(alloc, authorities, rb);
-    return .{
-        .answers = scrubbed_answers,
-        .authorities = scrubbed_authorities,
-        .additionals = try rebinding.scrub(alloc, additionals, rb),
-        .scrubbed = scrubbed_answers.len != answers.len or scrubbed_authorities.len != authorities.len,
-    };
-}
-
-/// Answer section: keep qtype, CNAME, DNAME unconditionally (the
-/// client's primary payload). Keep RRSIG iff the client wants DNSSEC.
-/// Strip orphan DNSSEC records when DO=0 (already covered by the
-/// keep_dnssec gate).
-fn shapeAnswers(
-    alloc: mem.Allocator,
-    answers: []const dns.ResourceRecord,
-    qtype: dns.RType,
-    keep_dnssec: bool,
-) mem.Allocator.Error![]const dns.ResourceRecord {
-    return filterRecords(alloc, answers, struct {
-        qtype: dns.RType,
-        keep_dnssec: bool,
-        pub fn keep(self: @This(), rr: dns.ResourceRecord) bool {
-            // Explicit-qtype query for an authenticating record: keep
-            // the answer's own type even when the client didn't set DO.
-            if (rr.rtype == self.qtype) return true;
-            return switch (rr.rtype) {
-                .rrsig, .nsec, .nsec3 => self.keep_dnssec,
-                else => true,
-            };
-        }
-    }{ .qtype = qtype, .keep_dnssec = keep_dnssec });
-}
-
-/// Authority section: keep SOA (RFC 2308 negative caching) and
-/// NSEC/NSEC3 (RFC 4035 wildcard / negative-existence proofs) when DO=1.
-/// Keep RRSIGs whose covered rtype is also kept. Strip delegation NS
-/// (CVE-2025-11411 class) and DS (internal-to-recursion). The
-/// minimal-responses gate allows operators to disable the NS strip
-/// (passthrough mode); the DNSSEC-on-DO=0 strip is mandatory regardless.
-fn shapeAuthority(
-    alloc: mem.Allocator,
-    authorities: []const dns.ResourceRecord,
-    keep_dnssec: bool,
-    apply_minimal: bool,
-    positive: bool,
-) mem.Allocator.Error![]const dns.ResourceRecord {
-    return filterRecords(alloc, authorities, struct {
-        keep_dnssec: bool,
-        apply_minimal: bool,
-        positive: bool,
-
-        pub fn keep(self: @This(), rr: dns.ResourceRecord) bool {
-            return switch (rr.rtype) {
-                .soa => true, // negative-cache material; always keep
-                .nsec, .nsec3 => self.keep_dnssec, // proof material
-                .ns => !(self.apply_minimal and self.positive),
-                .ds => false, // delegation chain info; not for stubs
-                .rrsig => self.keep_dnssec and self.shouldKeepRRSIG(rr),
-                else => !self.apply_minimal,
-            };
-        }
-
-        /// Drop RRSIGs whose covered rtype is one we're stripping.
-        /// Stub: cover NS/DS/A/AAAA → drop; cover SOA/NSEC/NSEC3 → keep.
-        fn shouldKeepRRSIG(self: @This(), rr: dns.ResourceRecord) bool {
-            const covered = dns.rrsigCovers(rr) orelse return false;
-            return switch (covered) {
-                .soa => true,
-                .nsec, .nsec3 => true,
-                .ns => !(self.apply_minimal and self.positive),
-                else => !self.apply_minimal,
-            };
-        }
-    }{
-        .keep_dnssec = keep_dnssec,
-        .apply_minimal = apply_minimal,
-        .positive = positive,
-    });
-}
-
-/// Additional section: under minimal-responses, strip all non-DNSSEC
-/// content on positive answers. A/AAAA glue is orphaned the moment its
-/// owning NS is stripped from authority; with no NS in authority, glue
-/// has nowhere to point. Keep RRSIG if it covers something we kept
-/// (in practice, almost never applies to additional under minimal).
-fn shapeAdditional(
-    alloc: mem.Allocator,
-    additionals: []const dns.ResourceRecord,
-    keep_dnssec: bool,
-    apply_minimal: bool,
-    positive: bool,
-) mem.Allocator.Error![]const dns.ResourceRecord {
-    return filterRecords(alloc, additionals, struct {
-        keep_dnssec: bool,
-        apply_minimal: bool,
-        positive: bool,
-
-        pub fn keep(self: @This(), rr: dns.ResourceRecord) bool {
-            if (self.apply_minimal and self.positive) {
-                // Strip everything except validation material the
-                // client explicitly opted into.
-                return switch (rr.rtype) {
-                    .nsec, .nsec3 => self.keep_dnssec,
-                    else => false,
-                };
-            }
-            // Passthrough mode (or negative response): DO=0 still strips
-            // orphan DNSSEC records per RFC 4035 §3.2.3.
-            return switch (rr.rtype) {
-                .rrsig, .nsec, .nsec3 => self.keep_dnssec,
-                else => true,
-            };
-        }
-    }{
-        .keep_dnssec = keep_dnssec,
-        .apply_minimal = apply_minimal,
-        .positive = positive,
-    });
-}
-
-/// Two-pass filter over a record slice; `predicate` is anything with a
-/// `keep(self, rr) bool`. Returns the input slice unchanged
-/// when no records would be filtered (zero-alloc fast path).
-fn filterRecords(
-    alloc: mem.Allocator,
-    records: []const dns.ResourceRecord,
-    predicate: anytype,
-) mem.Allocator.Error![]const dns.ResourceRecord {
-    var keep_count: usize = 0;
-    for (records) |rr| {
-        if (predicate.keep(rr)) keep_count += 1;
-    }
-    if (keep_count == records.len) return records;
-
-    const out = try alloc.alloc(dns.ResourceRecord, keep_count);
-    var i: usize = 0;
-    for (records) |rr| {
-        if (!predicate.keep(rr)) continue;
-        out[i] = rr;
-        i += 1;
-    }
-    return out;
-}
 
 pub const ResponseContext = struct {
     query_id: u16,
@@ -230,13 +28,6 @@ pub const ResponseContext = struct {
     client_do: bool,
     client_wants_ad: bool,
     max_udp_payload: u16,
-    /// Operator policy: when true (default) `shapeResponse` applies the
-    /// Unbound-equivalent minimal-responses strip (no delegation NS in
-    /// authority on positive answers, no glue in additional). When
-    /// false, only the RFC-mandated DO=0 DNSSEC strip runs; the rest
-    /// of the upstream's authority/additional pass through. The DO=0
-    /// strip is mandatory regardless of this knob (RFC 4035 §3.2.3).
-    minimal_responses: bool = true,
     /// RFC 7828 edns-tcp-keepalive TIMEOUT (100-ms units). Emitted only
     /// when non-null AND the client sent EDNS — null on UDP, or when
     /// the operator disabled the option. Servers MUST only advertise
@@ -265,7 +56,7 @@ pub const ResponseContext = struct {
 pub fn buildResponseWire(
     wire_buf: []u8,
     ctx: ResponseContext,
-    response: dns.Message,
+    reply: Reply,
     alloc: mem.Allocator,
 ) ?[]const u8 {
     const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
@@ -273,26 +64,19 @@ pub fn buildResponseWire(
     // Special-use answers are hark's own. Keyed on qname, so a CNAME
     // into localhost still scrubs.
     var qname_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const rebind_cfg = if (ctx.rebinding.enabled and ctx.questions.len > 0 and
+    const rb = (if (ctx.rebinding.enabled and ctx.questions.len > 0 and
         special_use.classify(ctx.questions[0].name.formatInto(&qname_buf), qtype) != .none)
         &rebinding.Config.off
     else
-        ctx.rebinding;
+        ctx.rebinding).*;
 
-    // Apply the unified response-shaping matrix. See `shapeResponse` for the
-    // per-section keep/strip rules. OOM returns null — the I/O caller
-    // surfaces it as SERVFAIL rather than emitting a half-shaped response.
-    const shaped = shapeResponse(
-        alloc,
-        response,
-        qtype,
-        ctx.client_do,
-        ctx.minimal_responses,
-        rebind_cfg,
-    ) catch return null;
-    const answers = shaped.answers;
-    const authorities = shaped.authorities;
-    const additionals = shaped.additionals;
+    // Every section: negatives pass authority and additional through, and
+    // RFC 9460 §4.2 steers clients to Additional-section SVCB/A/AAAA. OOM
+    // is null, which the caller sends as SERVFAIL, never an unscrubbed reply.
+    const answers = rebinding.scrub(alloc, reply.answers, rb) catch return null;
+    const authorities = rebinding.scrub(alloc, reply.authorities, rb) catch return null;
+    const additionals = rebinding.scrub(alloc, reply.additionals, rb) catch return null;
+    const scrubbed = answers.len != reply.answers.len or authorities.len != reply.authorities.len;
 
     var options_buf: [3]dns.EdnsOption = undefined;
     var options: std.ArrayList(dns.EdnsOption) = .initBuffer(&options_buf);
@@ -304,7 +88,7 @@ pub fn buildResponseWire(
     }
     var ede_bufs: [2][64]u8 = undefined;
     if (ctx.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
-    if (shaped.scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
+    if (scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         // RFC 6891 §6.2.3: our own receive limit, not the send budget.
         .udp_payload_size = dns.edns_udp_payload,
@@ -314,32 +98,26 @@ pub fn buildResponseWire(
         .options = options.items,
     } else null;
 
-    const msg = dns.Message{
-        .header = .{
-            .id = ctx.query_id,
-            .flags = .{
-                .qr = true,
-                .opcode = ctx.opcode,
-                .aa = false,
-                .tc = false,
-                .rd = ctx.rd,
-                .ra = true,
-                .z = 0,
-                .ad = response.header.flags.ad and ctx.client_wants_ad and !shaped.scrubbed,
-                .cd = ctx.cd,
-                .rcode = response.header.flags.rcode,
-            },
+    const hdr: dns.Header = .{
+        .id = ctx.query_id,
+        .flags = .{
+            .qr = true,
+            .opcode = ctx.opcode,
+            .aa = false,
+            .tc = false,
+            .rd = ctx.rd,
+            .ra = true,
+            .z = 0,
+            .ad = reply.ad and ctx.client_wants_ad and !scrubbed,
+            .cd = ctx.cd,
+            .rcode = reply.rcode,
         },
-        .questions = ctx.questions,
-        .answers = answers,
-        .authorities = authorities,
-        .additionals = additionals,
-        .opt = opt,
     };
+    const sections: dns.Sections(dns.WireRecord) = .{ .answers = answers, .authorities = authorities, .additionals = additionals };
 
     // Nothing past the client's payload is sent, so none is built; the rewind drops an overrun.
     var ends: dns.SectionEnds = .{};
-    if (dns.serializeMessageEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], msg, &ends) catch null) |wire| return wire;
+    if (dns.serializeEnds(wire_buf[0..@min(wire_buf.len, ctx.max_udp_payload)], hdr, ctx.questions, dns.WireRecord, sections, opt, &ends) catch null) |wire| return wire;
 
     // Sections are laid down in order and a name pointer only reaches
     // backward (RFC 1035 §4.1.4), so a response minus its tail sections is a
@@ -351,13 +129,13 @@ pub fn buildResponseWire(
     for ([_]usize{ ends.authorities, ends.answers, ends.questions }, 1..) |end, dropped| {
         if (end == 0) continue;
         var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
-        if (msg.opt) |o| ser.writeOpt(o) catch continue;
-        var hdr = msg.wireHeader();
-        hdr.flags.tc = dropped >= 2;
-        hdr.ar_count = @intFromBool(msg.opt != null);
-        if (dropped >= 2) hdr.ns_count = 0;
-        if (dropped >= 3) hdr.an_count = 0;
-        hdr.serialize(wire_buf[0..12]);
+        if (opt) |o| ser.writeOpt(o) catch continue;
+        var cut = sections.header(hdr, ctx.questions.len, opt != null);
+        cut.flags.tc = dropped >= 2;
+        cut.ar_count = @intFromBool(opt != null);
+        if (dropped >= 2) cut.ns_count = 0;
+        if (dropped >= 3) cut.an_count = 0;
+        cut.serialize(wire_buf[0..12]);
         if (ser.pos <= ctx.max_udp_payload or dropped == 3) return wire_buf[0..@min(ser.pos, ctx.max_udp_payload)];
     }
     return null;
@@ -465,25 +243,6 @@ test "buildResponseWire sets correct header fields" {
     const name = try dns.parseDottedName(a, "example.com");
     questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .server_failure,
-            },
-        },
-        .questions = &.{},
-    };
-
     var buf: [dns.max_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x1234,
@@ -495,7 +254,7 @@ test "buildResponseWire sets correct header fields" {
         .client_do = false,
         .client_wants_ad = false,
         .max_udp_payload = dns.max_udp_payload,
-    }, response, a).?;
+    }, .{ .rcode = .server_failure }, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
@@ -512,7 +271,7 @@ test "buildResponseWire carries EDE only to an EDNS client" {
     const a = arena.allocator();
 
     const questions = [_]dns.Question{.{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in }};
-    const servfail = synthesizedMessage(&.{}, &.{}, .server_failure, false);
+    const servfail: Reply = .{ .rcode = .server_failure };
     var ctx: ResponseContext = .{
         .query_id = 1,
         .opcode = .query,
@@ -546,25 +305,6 @@ test "buildResponseWire with EDNS0" {
     const name = try dns.parseDottedName(a, "example.com");
     questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = &.{},
-    };
-
     var buf: [dns.edns_udp_payload]u8 = undefined;
     const wire = buildResponseWire(&buf, .{
         .query_id = 0x5678,
@@ -576,62 +316,28 @@ test "buildResponseWire with EDNS0" {
         .client_do = false,
         .client_wants_ad = false,
         .max_udp_payload = dns.edns_udp_payload,
-    }, response, a).?;
+    }, .{ .rcode = .no_error }, a).?;
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expect(parsed.opt != null);
     try testing.expectEqual(@as(u16, dns.edns_udp_payload), parsed.opt.?.udp_payload_size);
 }
 
-test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
+test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
-
-    // Build an answer section that includes RRSIG — would need stripping for
-    // a non-DO client, which forces filterRecords to allocate.
-    const a_rdata = dns.RData{ .a = .{ 192, 0, 2, 1 } };
-    const rrsig_rdata = dns.RData{ .rrsig = .{
-        .type_covered = .a,
-        .algorithm = .ecdsap256sha256,
-        .labels = 2,
-        .original_ttl = 60,
-        .sig_expiration = 0,
-        .sig_inception = 0,
-        .key_tag = 0,
-        .signer_name = name,
-        .signature = &.{},
-    } };
-    const answers: []const dns.ResourceRecord = &.{
-        .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = a_rdata },
-        .{ .name = name, .rtype = .rrsig, .rclass = .in, .ttl = 60, .rdata = rrsig_rdata },
+    const answers = [_]dns.WireRecord{
+        try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 168, 0, 1 } } }),
+        try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 93, 184, 216, 34 } } }),
     };
+    const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = &.{},
-        .answers = answers,
-    };
-
-    // FailingAllocator with budget 0 fails every allocation; filterRecords
-    // must surface OOM as a null response, not return the unfiltered slice.
+    // Every allocation fails: the scrub cannot keep the public A without
+    // the private one, so nothing is sent rather than both.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var buf: [dns.max_udp_payload]u8 = undefined;
     const result = buildResponseWire(&buf, .{
@@ -644,7 +350,8 @@ test "buildResponseWire returns null on OOM rather than leaking DNSSEC RRs" {
         .client_do = false,
         .client_wants_ad = false,
         .max_udp_payload = dns.max_udp_payload,
-    }, response, failing.allocator());
+        .rebinding = &scrub_on,
+    }, .{ .rcode = .no_error, .answers = &answers }, failing.allocator());
 
     try testing.expect(result == null);
 }
@@ -731,51 +438,35 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
     const name = try dns.parseDottedName(a, "example.com");
     const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
 
-    var ns_authorities: [12]dns.ResourceRecord = undefined;
+    var ns_authorities: [12]dns.WireRecord = undefined;
     for (&ns_authorities, 0..) |*rr, i| {
         const ns_label = try std.fmt.allocPrint(a, "ns{d}.long.example.com.", .{i});
         const ns_name = try dns.parseDottedName(a, ns_label);
-        rr.* = .{
+        rr.* = try .from(a, .{
             .name = name,
             .rtype = .ns,
             .rclass = .in,
             .ttl = 300,
             .rdata = .{ .ns = ns_name },
-        };
+        });
     }
-    const a_record = dns.ResourceRecord{
+    const a_record: dns.WireRecord = try .from(a, .{
         .name = name,
         .rtype = .a,
         .rclass = .in,
         .ttl = 60,
         .rdata = .{ .a = .{ 192, 0, 2, 1 } },
-    };
+    });
 
-    const response = dns.Message{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = &.{},
+    const reply: Reply = .{
+        .rcode = .no_error,
         .answers = &.{a_record},
         .authorities = &ns_authorities,
         .additionals = &.{ a_record, a_record, a_record },
     };
 
     // Compressed: header+question+OPT is 40 bytes; answer 16; authorities
-    // 223; additionals 48. `minimal_responses = false` keeps authority/
-    // additional through shaping so the cascade is what actually drops them.
+    // 223; additionals 48.
     const rows = [_]struct { max: u16, tc: bool, an: u16, ns: u16 }{
         .{ .max = 300, .tc = false, .an = 1, .ns = 12 },
         .{ .max = 100, .tc = true, .an = 1, .ns = 0 },
@@ -794,8 +485,7 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
             .client_do = false,
             .client_wants_ad = false,
             .max_udp_payload = row.max,
-            .minimal_responses = false,
-        }, response, a).?;
+        }, reply, a).?;
         try testing.expect(wire.len <= row.max);
         const parsed = try dns.parseMessage(a, wire);
         try testing.expectEqual(row.tc, parsed.header.flags.tc);
@@ -823,155 +513,34 @@ test "serializeErrorResponse answers an EDNS query with OPT (RFC 6891 §6.1.1)" 
     try testing.expect(parsed.opt.?.do_bit);
 }
 
-// ── shapeResponse tests ────────────────────────────────────────────────
-//
-// Each test exercises one (or a tightly-coupled pair) of cells in the
-// keep/strip matrix implemented by `shapeResponse` above.
-// The shaper is a pure function on `dns.Message`; we build messages
-// directly and inspect the shaped sections without going through wire
-// encode/decode (the wire layer is tested elsewhere).
-
-// Test helpers shared across shape-* tests. Names are formed from
-// static byte slices so no allocation is needed.
-const shape_test_name = dns.Name{ .labels = &.{ "example", "com" } };
-const shape_test_ns_name = dns.Name{ .labels = &.{ "ns", "example", "com" } };
-
-fn shapeARecord(ip: [4]u8) dns.ResourceRecord {
-    return .{ .name = shape_test_name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } };
-}
-
-fn shapeNsRecord() dns.ResourceRecord {
-    return .{ .name = shape_test_name, .rtype = .ns, .rclass = .in, .ttl = 300, .rdata = .{ .ns = shape_test_ns_name } };
-}
-
-fn shapeGlueRecord(ip: [4]u8) dns.ResourceRecord {
-    return .{ .name = shape_test_ns_name, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = ip } };
-}
-
-fn shapeSoaRecord() dns.ResourceRecord {
-    return .{
-        .name = shape_test_name,
-        .rtype = .soa,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .soa = .{
-            .mname = shape_test_ns_name,
-            .rname = shape_test_ns_name,
-            .serial = 1,
-            .refresh = 7200,
-            .retry = 3600,
-            .expire = 1209600,
-            .minimum = 3600,
-        } },
-    };
-}
-
-fn shapeNsecRecord() dns.ResourceRecord {
-    return .{
-        .name = shape_test_name,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .nsec = .{ .next_domain_name = shape_test_ns_name, .type_bit_maps = &.{} } },
-    };
-}
-
-fn shapeRrsigRecord(covered: dns.RType) dns.ResourceRecord {
-    return .{
-        .name = shape_test_name,
-        .rtype = .rrsig,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .rrsig = .{
-            .type_covered = covered,
-            .algorithm = .ecdsap256sha256,
-            .labels = 2,
-            .original_ttl = 60,
-            .sig_expiration = 0,
-            .sig_inception = 0,
-            .key_tag = 0,
-            .signer_name = shape_test_name,
-            .signature = &.{},
-        } },
-    };
-}
-
-fn shapePositiveMessage(
-    answers: []const dns.ResourceRecord,
-    authorities: []const dns.ResourceRecord,
-    additionals: []const dns.ResourceRecord,
-) dns.Message {
-    return .{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = authorities,
-        .additionals = additionals,
-    };
-}
-
-fn shapeNxdomainMessage(authorities: []const dns.ResourceRecord) dns.Message {
-    return .{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .name_error,
-            },
-        },
-        .questions = &.{},
-        .authorities = authorities,
-    };
-}
-
-fn countByType(records: []const dns.ResourceRecord, rtype: dns.RType) usize {
-    var c: usize = 0;
-    for (records) |rr| {
-        if (rr.rtype == rtype) c += 1;
-    }
-    return c;
-}
-
-test "shape: rebinding scrub reaches additionals on NODATA passthrough" {
-    // Negative responses skip the minimal strip (`else => true`), so the
-    // scrub is the only thing between an upstream's private-address
-    // additional and the client — and RFC 9460 §4.2 trains clients to
-    // consume Additional-section records.
+test "buildResponseWire: the rebinding scrub reaches additionals" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 192, 168, 1, 1 })};
-    const msg = shapePositiveMessage(&.{}, &.{shapeSoaRecord()}, additionals);
-
-    const off = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
-    try testing.expectEqual(@as(usize, 1), off.additionals.len);
-
+    const zone = try dns.parseDottedName(a, "example.com");
+    const glue = try dns.parseDottedName(a, "ns.example.com");
+    const reply: Reply = .{
+        .rcode = .no_error,
+        .additionals = &.{try .from(a, .{ .name = glue, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 192, 168, 1, 1 } } })},
+    };
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const on = try shapeResponse(a, msg, .a, false, true, &scrub_on);
-    try testing.expectEqual(@as(usize, 0), on.additionals.len);
+    for ([_]*const rebinding.Config{ &rebinding.Config.off, &scrub_on }, [_]u16{ 1, 0 }) |rb, kept| {
+        var buf: [dns.max_udp_payload]u8 = undefined;
+        const wire = buildResponseWire(&buf, .{
+            .query_id = 0,
+            .opcode = .query,
+            .rd = true,
+            .cd = false,
+            .questions = &.{.{ .name = zone, .qtype = .a, .qclass = .in }},
+            .client_edns = false,
+            .client_do = false,
+            .client_wants_ad = false,
+            .max_udp_payload = dns.max_udp_payload,
+            .rebinding = rb,
+        }, reply, a).?;
+        try testing.expectEqual(kept, (try dns.parseMessage(a, wire)).header.ar_count);
+    }
 }
 
 test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME into it does not" {
@@ -982,12 +551,12 @@ test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const localhost = try dns.parseDottedName(a, "localhost");
     const attacker = try dns.parseDottedName(a, "attacker.com");
-    const loopback: dns.ResourceRecord = .{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } };
-    const alias: dns.ResourceRecord = .{ .name = attacker, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = localhost } };
+    const loopback: dns.WireRecord = try .from(a, .{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } });
+    const alias: dns.WireRecord = try .from(a, .{ .name = attacker, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = localhost } });
 
-    const cases = [_]struct { qname: dns.Name, answers: []const dns.ResourceRecord, kept: u16 }{
-        .{ .qname = localhost, .answers = &.{loopback}, .kept = 1 },
-        .{ .qname = attacker, .answers = &.{ alias, loopback }, .kept = 1 },
+    const cases = [_]struct { qname: dns.Name, answers: []const dns.WireRecord }{
+        .{ .qname = localhost, .answers = &.{loopback} },
+        .{ .qname = attacker, .answers = &.{ alias, loopback } },
     };
     for (cases) |c| {
         var buf: [dns.max_udp_payload]u8 = undefined;
@@ -1002,10 +571,10 @@ test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME
             .client_wants_ad = false,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = &scrub_on,
-        }, shapePositiveMessage(c.answers, &.{}, &.{}), a).?;
+        }, .{ .rcode = .no_error, .answers = c.answers }, a).?;
         const parsed = try dns.parseMessage(a, wire);
-        try testing.expectEqual(c.kept, parsed.header.an_count);
-        try testing.expectEqual(c.answers[0].rtype, parsed.answers[0].rtype);
+        try testing.expectEqual(@as(u16, 1), parsed.header.an_count);
+        try testing.expectEqual(c.answers[0].rtype(), parsed.answers[0].rtype);
     }
 }
 
@@ -1014,207 +583,23 @@ test "buildResponseWire: a rebinding scrub clears AD" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    const name = try dns.parseDottedName(a, "example.com");
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     for ([_][4]u8{ .{ 93, 184, 216, 34 }, .{ 192, 168, 1, 1 } }, [_]bool{ true, false }) |ip, ad| {
-        var msg = shapePositiveMessage(&.{shapeARecord(ip)}, &.{}, &.{});
-        msg.header.flags.ad = true;
+        const answers = [_]dns.WireRecord{try .from(a, .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = ip } })};
         var buf: [dns.max_udp_payload]u8 = undefined;
         const wire = buildResponseWire(&buf, .{
             .query_id = 0,
             .opcode = .query,
             .rd = true,
             .cd = false,
-            .questions = &.{.{ .name = shape_test_name, .qtype = .a, .qclass = .in }},
+            .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
             .client_edns = true,
             .client_do = true,
             .client_wants_ad = true,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = &scrub_on,
-        }, msg, a).?;
+        }, .{ .rcode = .no_error, .ad = true, .answers = &answers }, a).?;
         try testing.expectEqual(ad, (try dns.parseMessage(a, wire)).header.flags.ad);
     }
-}
-
-test "shape: positive DO=0 strips NS from authority, glue from additional, RRSIG everywhere" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{ shapeARecord(.{ 192, 0, 2, 1 }), shapeRrsigRecord(.a) };
-    const authorities: []const dns.ResourceRecord = &.{ shapeNsRecord(), shapeRrsigRecord(.ns) };
-    const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
-    const msg = shapePositiveMessage(answers, authorities, additionals);
-
-    const shaped = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 1), shaped.answers.len);
-    try testing.expectEqual(dns.RType.a, shaped.answers[0].rtype);
-    try testing.expectEqual(@as(usize, 0), shaped.authorities.len);
-    try testing.expectEqual(@as(usize, 0), shaped.additionals.len);
-}
-
-test "shape: positive DO=1 keeps NSEC + RRSIG-over-NSEC in authority (wildcard proof preserved)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{
-        shapeARecord(.{ 192, 0, 2, 1 }),
-        shapeRrsigRecord(.a),
-    };
-    const authorities: []const dns.ResourceRecord = &.{
-        shapeNsRecord(),
-        shapeRrsigRecord(.ns),
-        shapeNsecRecord(),
-        shapeRrsigRecord(.nsec),
-    };
-    const msg = shapePositiveMessage(answers, authorities, &.{});
-
-    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 2), shaped.answers.len);
-    try testing.expectEqual(@as(usize, 2), shaped.authorities.len);
-    try testing.expectEqual(@as(usize, 1), countByType(shaped.authorities, .nsec));
-    try testing.expectEqual(@as(usize, 1), countByType(shaped.authorities, .rrsig));
-    try testing.expectEqual(dns.RType.nsec, shaped.authorities[1].rdata.rrsig.type_covered);
-}
-
-test "shape: qtype=NS preserves authority NS + additional glue (root priming carve-out)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{shapeNsRecord()};
-    const authorities: []const dns.ResourceRecord = &.{shapeNsRecord()};
-    const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
-    const msg = shapePositiveMessage(answers, authorities, additionals);
-
-    const shaped = try shapeResponse(a, msg, .ns, false, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 1), shaped.answers.len);
-    try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
-    try testing.expectEqual(@as(usize, 1), shaped.additionals.len);
-}
-
-test "shape: minimal_responses=false on positive answer preserves authority + additional" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{shapeARecord(.{ 192, 0, 2, 1 })};
-    const authorities: []const dns.ResourceRecord = &.{shapeNsRecord()};
-    const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
-    const msg = shapePositiveMessage(answers, authorities, additionals);
-
-    const shaped = try shapeResponse(a, msg, .a, false, false, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
-    try testing.expectEqual(@as(usize, 1), shaped.additionals.len);
-}
-
-test "shape: NXDOMAIN keeps SOA, keeps NSEC + RRSIG on DO=1" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const authorities: []const dns.ResourceRecord = &.{
-        shapeSoaRecord(),
-        shapeRrsigRecord(.soa),
-        shapeNsecRecord(),
-        shapeRrsigRecord(.nsec),
-    };
-    const msg = shapeNxdomainMessage(authorities);
-
-    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 4), shaped.authorities.len);
-    try testing.expectEqual(@as(usize, 1), countByType(shaped.authorities, .soa));
-    try testing.expectEqual(@as(usize, 1), countByType(shaped.authorities, .nsec));
-    try testing.expectEqual(@as(usize, 2), countByType(shaped.authorities, .rrsig));
-}
-
-test "shape: NXDOMAIN keeps SOA on DO=0 (RFC 2308 negative cache), strips NSEC/RRSIG" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const authorities: []const dns.ResourceRecord = &.{
-        shapeSoaRecord(),
-        shapeRrsigRecord(.soa),
-        shapeNsecRecord(),
-        shapeRrsigRecord(.nsec),
-    };
-    const msg = shapeNxdomainMessage(authorities);
-
-    const shaped = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
-    try testing.expectEqual(dns.RType.soa, shaped.authorities[0].rtype);
-}
-
-test "shape: orphan RRSIG covering stripped NS is removed (no covered-record leak)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{shapeARecord(.{ 192, 0, 2, 1 })};
-    const authorities: []const dns.ResourceRecord = &.{ shapeNsRecord(), shapeRrsigRecord(.ns) };
-    const msg = shapePositiveMessage(answers, authorities, &.{});
-
-    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 0), shaped.authorities.len);
-}
-
-test "shape: explicit qtype=NSEC keeps NSEC in answer even with DO=0" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{shapeNsecRecord()};
-    const msg = shapePositiveMessage(answers, &.{}, &.{});
-
-    const shaped = try shapeResponse(a, msg, .nsec, false, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 1), shaped.answers.len);
-    try testing.expectEqual(dns.RType.nsec, shaped.answers[0].rtype);
-}
-
-test "shape: cname-chain answer authority NSEC kept on DO=1 (the wildcard-chain case)" {
-    // The original concern from the adversarial reviewer: a CNAME chain
-    // terminating in a wildcard-expanded answer carries the wildcard's
-    // NSEC proof in authority. Stripping it breaks downstream validators.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cname_target = dns.Name{ .labels = &.{ "target", "example", "com" } };
-    const cname_rr = dns.ResourceRecord{
-        .name = shape_test_name,
-        .rtype = .cname,
-        .rclass = .in,
-        .ttl = 60,
-        .rdata = .{ .cname = cname_target },
-    };
-    const answers: []const dns.ResourceRecord = &.{ cname_rr, shapeARecord(.{ 192, 0, 2, 1 }) };
-    const authorities: []const dns.ResourceRecord = &.{ shapeNsecRecord(), shapeRrsigRecord(.nsec) };
-    const msg = shapePositiveMessage(answers, authorities, &.{});
-
-    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 2), shaped.answers.len);
-    try testing.expectEqual(@as(usize, 2), shaped.authorities.len);
-}
-
-test "shape: fast path returns input slice unmodified when nothing would be filtered" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{shapeARecord(.{ 192, 0, 2, 1 })};
-    const msg = shapePositiveMessage(answers, &.{}, &.{});
-
-    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(answers.ptr, shaped.answers.ptr);
 }

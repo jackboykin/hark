@@ -859,15 +859,15 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    /// A hop of a recalled answer: its reply, when its fact lapses, and its verdict.
-    pub const Recalled = struct { reply: Reply, expires_ns: i64, verdict: store.Verdict };
+    pub const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, expires_ns: i64 };
 
     /// The answer rule read against the store, building no cell: the
     /// question's chain as stored, into `arena`. `.fresh` is what the rule
     /// would settle on for a client, whose bound is now; `.any` is every
     /// age, for the callers that decide what age serves. Null where the
     /// rule would have work to do: a hop not stored, not judged or no
-    /// longer proven (DNSSEC on), or a broken chain.
+    /// longer proven (DNSSEC on), or a broken chain. The blobs are the
+    /// store's; the caller refs what it keeps.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: enum { fresh, any }) !?[]const Recalled {
         var hops: std.ArrayList(Recalled) = .empty;
         var seen: [max_cname_chain + 1]dns.Name = undefined;
@@ -878,10 +878,12 @@ pub const Graph = struct {
             const e = (if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key)) orelse return null;
             const v = e.blob.verdict;
             if (g.cfg.trust_anchor != null and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
-            const r = (try store.Store.parse(arena, e.blob)).rrset;
-            try hops.append(arena, .{ .reply = r, .expires_ns = e.expires_ns, .verdict = e.blob.verdict });
+            const r: store.Rrset = .of(e.blob);
+            try hops.append(arena, .{ .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
             seen[hops.items.len - 1] = next;
-            switch (walk.chain(r, qtype, seen[0..hops.items.len])) {
+            var pos: usize = 0;
+            const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .{ .labels = &.{} };
+            switch (walk.chain(r.kind, target, qtype, seen[0..hops.items.len])) {
                 .done => return hops.items,
                 .next => |n| next = n,
                 .broken => return null,

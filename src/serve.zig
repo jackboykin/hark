@@ -270,19 +270,19 @@ const Server = struct {
         const name = q.name.formatInto(&name_buf);
         if (build_options.testing_enabled) if (advanceClockSeconds(dns.stripTrailingDot(name))) |secs| {
             monotonic.advanceTestClock(secs);
-            return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null, s.e.now_ns);
+            return s.send(reply, query, .{ .rcode = .no_error, .question = q, .cacheable = false }, s.e.now_ns);
         };
         const c = &s.g.stats.clients;
         switch (try s.desk.early(arena, q, client)) {
-            .synthesized => |served| return s.send(reply, query, served.msg, served.ede, s.e.now_ns),
+            .synthesized => |served| return s.send(reply, query, served, s.e.now_ns),
             .replayed => |served| {
                 c.hit += 1;
-                return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
+                return s.send(reply, query, served, s.e.now_ns);
             },
             .recalled, .floored => |served| {
                 c.hit += 1;
                 c.recalled += 1;
-                return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
+                return s.send(reply, query, served, s.e.now_ns);
             },
             .graph => {},
         }
@@ -368,17 +368,24 @@ const Server = struct {
 
     fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
         const q = query.questions[0];
-        _ = try s.desk.derived(q, answer.Client.fromQuery(query), served);
-        s.send(reply, query, served.msg, served.ede, asked_ns);
+        _ = s.desk.derived(q, answer.Client.fromQuery(query), served) catch |err| {
+            served.release(&s.g.store);
+            return err;
+        };
+        s.send(reply, query, served, asked_ns);
     }
 
     fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
+        if (p.a) |a| if (!s.g.cell(a).settled()) return null;
         const served = try s.desk.built(arena, p.root, q, client);
         if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (try s.g.demandRoot(aq.name, aq.qtype, true)) |a| {
             p.a = a;
             try s.g.drain();
+            if (!s.g.cell(a).settled()) {
+                served.release(&s.g.store);
+                return null;
+            }
         };
-        if (p.a) |a| if (!s.g.cell(a).settled()) return null;
         return try s.desk.finish(arena, q, client, served, p.a);
     }
 
@@ -402,7 +409,9 @@ const Server = struct {
         };
     }
 
-    fn send(s: *Server, reply: Reply, query: dns.Message, msg: dns.Message, ede: ?dns.Ede, asked_ns: i64) void {
+    /// Releases `served`.
+    fn send(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) void {
+        defer served.release(&s.g.store);
         const arena = s.scratch.allocator();
         var buf: [2 + @as(usize, dns.max_message_len)]u8 = undefined;
         const payload: u16 = switch (reply) {
@@ -413,11 +422,10 @@ const Server = struct {
             .tcp => dns.max_message_len,
         };
         var ctx = response.ResponseContext.fromQuery(query, payload);
-        ctx.minimal_responses = s.cfg.minimal_responses;
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
-        ctx.ede = ede;
-        const wire = response.buildResponseWire(buf[2..], ctx, msg, arena) orelse
+        ctx.ede = served.ede;
+        const wire = response.buildResponseWire(buf[2..], ctx, .{ .rcode = served.rcode, .ad = served.ad, .answers = served.answers, .authorities = served.authorities, .additionals = served.additionals }, arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions, query.opt);
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
@@ -428,12 +436,12 @@ const Server = struct {
                 .udp => |u| u.addr,
                 .tcp => |c| c.addr,
             };
-            const rcode = msg.header.flags.rcode;
+            const rcode = served.rcode;
             var rb: [24]u8 = undefined;
             const outcome = if (rcode == .no_error) "" else std.fmt.bufPrint(&rb, " {t}", .{rcode}) catch "";
             log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
-        s.count(msg.header.flags.rcode, ede);
+        s.count(served.rcode, served.ede);
         s.write(reply, buf[0 .. 2 + wire.len]);
     }
 
