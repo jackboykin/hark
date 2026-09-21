@@ -554,11 +554,53 @@ pub const ResourceRecord = struct {
     rclass: RClass,
     ttl: u32,
     rdata: RData,
-    /// When set, serializer memcpys these bytes and patches the 4 TTL bytes
-    /// at `wire_ttl_offset` from `.ttl` — the blob's own TTL is a placeholder.
-    wire: ?[]const u8 = null,
-    wire_ttl_offset: u16 = 0,
 };
+
+/// A record as the store keeps it: the owner uncompressed, then type,
+/// class, TTL, RDLENGTH and RDATA with its names uncompressed, all as
+/// `buildResourceRecordWire` wrote them. `ttl` is the one sent; the
+/// bytes carry the one received.
+pub const WireRecord = struct {
+    owner: []const u8,
+    /// TYPE through RDATA.
+    rest: []const u8,
+    ttl: u32,
+
+    pub fn rtype(r: WireRecord) RType {
+        return @fromBackingInt(mem.readInt(u16, r.rest[0..2], .big));
+    }
+
+    /// The TTL the authority sent (after the parser's caps).
+    pub fn storedTtl(r: WireRecord) u32 {
+        return mem.readInt(u32, r.rest[4..8], .big);
+    }
+
+    pub fn rdata(r: WireRecord) []const u8 {
+        return r.rest[10..];
+    }
+
+    pub fn covers(r: WireRecord) ?RType {
+        if (r.rtype() != .rrsig) return null;
+        return @fromBackingInt(mem.readInt(u16, r.rdata()[0..2], .big));
+    }
+};
+
+pub fn wireNameLen(wire: []const u8) usize {
+    var i: usize = 0;
+    while (wire[i] != 0) i += 1 + wire[i];
+    return i + 1;
+}
+
+/// RFC 1035 rdata whose names may be compressed (RFC 3597 §4): `skip`
+/// bytes, then `names` names, then the rest as is.
+fn compressedNames(rtype: RType) ?struct { skip: u8, names: u8 } {
+    return switch (rtype) {
+        .ns, .cname, .ptr => .{ .skip = 0, .names = 1 },
+        .mx => .{ .skip = 2, .names = 1 },
+        .soa => .{ .skip = 0, .names = 2 },
+        else => null,
+    };
+}
 
 pub const Message = struct {
     header: Header,
@@ -1427,57 +1469,59 @@ pub const Serializer = struct {
     }
 
     pub fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
-        const blob = rr.wire orelse {
-            _ = try self.writeRecordFields(rr);
-            return;
-        };
-        if (self.names != null and rdataCompressible(rr.rtype)) {
-            _ = try self.writeRecordFields(rr);
-            return;
+        try self.writeRecordFields(rr);
+    }
+
+    /// Names compressed as `writeResourceRecord` would, the rest copied,
+    /// `r.ttl` written over the stored TTL.
+    pub fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
+        if (self.names != null) try self.writeWireName(r.owner) else try self.writeSlice(r.owner);
+        const at = self.pos;
+        try self.writeSlice(r.rest[0..10]);
+        mem.writeInt(u32, self.buf[at + 4 ..][0..4], r.ttl, .big);
+        const layout = (if (self.names != null) compressedNames(r.rtype()) else null) orelse return self.writeSlice(r.rdata());
+        const rdata = r.rdata();
+        try self.writeSlice(rdata[0..layout.skip]);
+        var p: usize = layout.skip;
+        for (0..layout.names) |_| {
+            const n = wireNameLen(rdata[p..]);
+            try self.writeWireName(rdata[p..][0..n]);
+            p += n;
         }
-        try self.writeName(rr.name, true);
-        const ttl_at = self.pos + 4;
-        try self.writeSlice(blob[rr.wire_ttl_offset - 4 ..]);
-        mem.writeInt(u32, self.buf[ttl_at..][0..4], rr.ttl, .big);
+        try self.writeSlice(rdata[p..]);
+        mem.writeInt(u16, self.buf[at + 8 ..][0..2], try castOrRDataErr(u16, self.pos - at - 10), .big);
     }
 
-    fn rdataCompressible(rtype: RType) bool {
-        return switch (rtype) {
-            .ns, .cname, .ptr, .mx, .soa => true,
-            else => false,
-        };
-    }
-
-    /// Ignores `rr.wire`. Returns the TTL byte offset for later patching.
-    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!u16 {
+    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name, true);
         try self.writeU16(@backingInt(rr.rtype));
         try self.writeU16(@backingInt(rr.rclass));
-        const ttl_offset: u16 = try castOrRDataErr(u16, self.pos);
         try self.writeU32(rr.ttl);
 
         const rdlength_pos = self.pos;
         try self.writeU16(0);
         const rdata_start = self.pos;
-        try self.writeRData(rr.rdata);
+        try self.writeRDataNames(rr.rdata, compressedNames(rr.rtype) != null);
         const rdata_len = self.pos - rdata_start;
         mem.writeInt(u16, self.buf[rdlength_pos..][0..2], try castOrRDataErr(u16, rdata_len), .big);
-        return ttl_offset;
     }
 
     pub fn writeRData(self: *Serializer, rdata: RData) Error!void {
+        return self.writeRDataNames(rdata, false);
+    }
+
+    fn writeRDataNames(self: *Serializer, rdata: RData, compress: bool) Error!void {
         switch (rdata) {
             .a => |addr| try self.writeSlice(&addr),
             .aaaa => |addr| try self.writeSlice(&addr),
-            .ns, .cname, .ptr => |name| try self.writeName(name, true),
-            .dname => |name| try self.writeName(name, false),
+            .ns, .cname, .ptr, .dname => |name| try self.writeName(name, compress),
             .mx => |mx| {
                 try self.writeU16(mx.preference);
-                try self.writeName(mx.exchange, true);
+                try self.writeName(mx.exchange, compress);
             },
             .soa => |soa| {
-                try self.writeName(soa.mname, true);
-                try self.writeName(soa.rname, true);
+                try self.writeName(soa.mname, compress);
+                try self.writeName(soa.rname, compress);
                 try self.writeU32(soa.serial);
                 try self.writeU32(soa.refresh);
                 try self.writeU32(soa.retry);
@@ -1498,7 +1542,7 @@ pub const Serializer = struct {
                 try self.writeU32(rrsig.sig_expiration);
                 try self.writeU32(rrsig.sig_inception);
                 try self.writeU16(rrsig.key_tag);
-                try self.writeName(rrsig.signer_name, false);
+                try self.writeName(rrsig.signer_name, compress);
                 try self.writeSlice(rrsig.signature);
             },
             .dnskey => |dnskey| {
@@ -1514,7 +1558,7 @@ pub const Serializer = struct {
                 try self.writeSlice(ds_data.digest);
             },
             .nsec => |nsec_data| {
-                try self.writeName(nsec_data.next_domain_name, false);
+                try self.writeName(nsec_data.next_domain_name, compress);
                 try self.writeSlice(nsec_data.type_bit_maps);
             },
             .nsec3 => |nsec3| {
@@ -1583,22 +1627,11 @@ pub fn patchQueryId(wire: []u8, id: u16) void {
     std.mem.writeInt(u16, wire[0..2], id, .big);
 }
 
-pub const BuiltRR = struct {
-    bytes: []const u8,
-    ttl_offset: u16,
-};
-
-/// `ttl_offset` skips the owner name; result views into `wire`.
-pub fn parseRDataWire(allocator: Allocator, wire: []const u8, rtype: RType, ttl_offset: u16) Error!RData {
-    var parser = Parser{ .msg = wire, .pos = @as(usize, ttl_offset) + 4 };
-    const rdlength: usize = try parser.readU16();
-    return parser.parseRData(rtype, rdlength, allocator);
-}
-
-pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error!BuiltRR {
+/// Uncompressed, as a stored record: `WireRecord`'s layout.
+pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
     var ser = Serializer.init(buf);
-    const ttl_offset = try ser.writeRecordFields(rr);
-    return .{ .bytes = ser.buf[0..ser.pos], .ttl_offset = ttl_offset };
+    try ser.writeRecordFields(rr);
+    return ser.buf[0..ser.pos];
 }
 
 /// Uncompressed, as a stored fact holds names and records.
@@ -2022,39 +2055,6 @@ test "roundtrip: parse -> serialize -> parse -> compare" {
     try testing.expectEqualSlices(u8, &msg1.answers[0].rdata.a, &msg2.answers[0].rdata.a);
 }
 
-test "writeResourceRecord fast-path matches field path with TTL patch" {
-    const alloc = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const name = try parseDottedName(a, "example.com");
-    const base = ResourceRecord{ .name = name, .rtype = .a, .rclass = .in, .ttl = 500, .rdata = .{ .a = .{ 1, 2, 3, 4 } } };
-
-    // Pre-build the wire blob (stored in cache with placeholder TTL 500).
-    var stage: [128]u8 = undefined;
-    const built = try buildResourceRecordWire(&stage, base);
-
-    var slow: [128]u8 = undefined;
-    var ser_slow = Serializer.init(&slow);
-    try ser_slow.writeResourceRecord(.{ .name = name, .rtype = .a, .rclass = .in, .ttl = 100, .rdata = .{ .a = .{ 1, 2, 3, 4 } } });
-
-    // Fast path: same RR but wire blob carries TTL=500, rr.ttl=100 triggers a patch.
-    var fast: [128]u8 = undefined;
-    var ser_fast = Serializer.init(&fast);
-    try ser_fast.writeResourceRecord(.{
-        .name = name,
-        .rtype = .a,
-        .rclass = .in,
-        .ttl = 100,
-        .rdata = .{ .a = .{ 1, 2, 3, 4 } },
-        .wire = built.bytes,
-        .wire_ttl_offset = built.ttl_offset,
-    });
-
-    try testing.expectEqualSlices(u8, slow[0..ser_slow.pos], fast[0..ser_fast.pos]);
-}
-
 test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names stay flat" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2093,15 +2093,6 @@ test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names st
     try testing.expect(parsed.answers[0].name.eqlExact(owner));
     try testing.expect(parsed.answers[1].rdata.rrsig.signer_name.eqlExact(rrsig.signer_name));
     try testing.expect(parsed.authorities[0].rdata.ns.eqlExact(ns1));
-
-    var stage: [128]u8 = undefined;
-    const built = try buildResourceRecordWire(&stage, msg.answers[0]);
-    var blob_rr = msg.answers[0];
-    blob_rr.wire = built.bytes;
-    blob_rr.wire_ttl_offset = built.ttl_offset;
-    var buf2: [512]u8 = undefined;
-    const wire2 = try serializeMessage(&buf2, .{ .header = msg.header, .questions = msg.questions, .answers = &.{blob_rr} });
-    try testing.expectEqualSlices(u8, wire[12 .. 12 + 21 + 16], wire2[12..]);
 }
 
 test "name compression follows a pointer inside an earlier name" {
@@ -2117,6 +2108,53 @@ test "name compression follows a pointer inside an earlier name" {
     try testing.expectEqual(@as(usize, 12 + 21 + (7 + 14) + (2 + 14)), wire.len);
     const back = try parseMessage(a, wire);
     for (back.answers) |got| try testing.expect(got.name.eqlExact(mail));
+}
+
+test "a record written from its stored bytes is the record written from its fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const owner = try parseDottedName(a, "www.example.com");
+    const other = try parseDottedName(a, "ns1.Example.com");
+    const zone = try parseDottedName(a, "example.com");
+    const datas = [_]RData{
+        .{ .a = .{ 192, 0, 2, 1 } },
+        .{ .aaaa = @splat(7) },
+        .{ .ns = other },
+        .{ .cname = other },
+        .{ .dname = other },
+        .{ .ptr = other },
+        .{ .mx = .{ .preference = 10, .exchange = other } },
+        .{ .soa = .{ .mname = other, .rname = zone, .serial = 1, .refresh = 2, .retry = 3, .expire = 4, .minimum = 5 } },
+        .{ .txt = .{ .strings = &.{ "a", "bc" } } },
+        .{ .rrsig = .{ .type_covered = .a, .algorithm = .ecdsap256sha256, .labels = 3, .original_ttl = 60, .sig_expiration = 2, .sig_inception = 1, .key_tag = 7, .signer_name = zone, .signature = "sig" } },
+        .{ .nsec = .{ .next_domain_name = other, .type_bit_maps = "\x00\x01\x40" } },
+    };
+    for (datas) |d| {
+        const rtype: RType = switch (d) {
+            .unknown => unreachable,
+            inline else => |_, tag| @field(RType, @tagName(tag)),
+        };
+        const rr: ResourceRecord = .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d };
+        var stage: [512]u8 = undefined;
+        const stored = try buildResourceRecordWire(&stage, rr);
+        const n = wireNameLen(stored);
+        const wr: WireRecord = .{ .owner = stored[0..n], .rest = stored[n..], .ttl = 42 };
+        try testing.expectEqual(rtype, wr.rtype());
+        try testing.expectEqual(@as(u32, 300), wr.storedTtl());
+        var aged = rr;
+        aged.ttl = 42;
+        const q: []const Question = &.{.{ .name = zone, .qtype = rtype, .qclass = .in }};
+        var want_buf: [512]u8 = undefined;
+        var got_buf: [512]u8 = undefined;
+        const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } });
+        var names: NameTable = .{};
+        var ser: Serializer = .{ .buf = &got_buf, .pos = 0, .names = &names };
+        try ser.writeHeader((Message{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } }).wireHeader());
+        try ser.writeQuestion(q[0]);
+        for (0..2) |_| try ser.writeWireRecord(wr);
+        try testing.expectEqualSlices(u8, want, got_buf[0..ser.pos]);
+    }
 }
 
 test "edge case: empty message (too short)" {

@@ -201,7 +201,7 @@ test "fuzz: store round trip" {
                 for (want, have) |a, b| {
                     var wa: [4096]u8 = undefined;
                     var wb: [4096]u8 = undefined;
-                    try testing.expectEqualSlices(u8, (try dns.buildResourceRecordWire(&wa, a)).bytes, (try dns.buildResourceRecordWire(&wb, b)).bytes);
+                    try testing.expectEqualSlices(u8, try dns.buildResourceRecordWire(&wa, a), try dns.buildResourceRecordWire(&wb, b));
                 }
             }
         }

@@ -258,22 +258,22 @@ pub const Store = struct {
     }
 
     pub fn parse(arena: Allocator, b: *Blob) !Value {
-        var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()), .arena = arena };
+        var r: Reader = .{ .buf = try arena.dupe(u8, b.payload()) };
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
-                const zone = try r.name();
+                const zone = try r.name(arena);
                 const glue = try arena.alloc(graph.Glue, try r.int(u16));
                 for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
                 break :blk .{ .cut = .{ .zone = zone, .glue = glue } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
-                for (names) |*n| n.* = try r.name();
+                for (names) |*n| n.* = try r.name(arena);
                 break :blk .{ .ns = .{ .names = names } };
             },
             .addr => blk: {
                 const provisional = try r.int(u8) != 0;
-                break :blk .{ .addr = .{ .addrs = try r.addrs(), .provisional = provisional } };
+                break :blk .{ .addr = .{ .addrs = try r.addrs(arena), .provisional = provisional } };
             },
             .rrset => blk: {
                 var reply: graph.Reply = .{
@@ -287,25 +287,107 @@ pub const Store = struct {
                 if (flags & 2 != 0) reply.ede = @fromBackingInt(ede);
                 reply.ttl = try r.int(u32);
                 reply.stored_ns = try r.int(i64);
-                reply.target = try r.name();
-                reply.zone = try r.name();
+                reply.target = try r.name(arena);
+                reply.zone = try r.name(arena);
                 const an = try r.int(u16);
                 const ns = try r.int(u16);
                 const ar = try r.int(u16);
-                reply.answers = try r.records(an);
-                reply.authorities = try r.records(ns);
-                reply.additionals = try r.records(ar);
+                reply.answers = try r.records(arena, an);
+                reply.authorities = try r.records(arena, ns);
+                reply.additionals = try r.records(arena, ar);
                 break :blk .{ .rrset = reply };
             },
             .ds, .dnskey => |kind| blk: {
                 var c: trust.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
                 c.proven_until_ns = try r.int(i64);
-                c.records = try r.records(try r.int(u16));
+                c.records = try r.records(arena, try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
             .answer, .secure, .exchange, .refresh, .keys => unreachable,
         };
     }
+};
+
+/// An rrset's blob read in place, no allocation: the reply's scalars,
+/// its names and records as `build` wrote them.
+pub const Rrset = struct {
+    kind: @FieldType(graph.Reply, "kind"),
+    rcode: dns.RCode,
+    aa: bool,
+    ede: ?dns.Ede.Code,
+    ttl: u32,
+    stored_ns: i64,
+    /// Uncompressed wire names.
+    target: []const u8,
+    zone: []const u8,
+    sections: [3]Records,
+
+    /// `build`'s layout, which wrote it; so it cannot fail.
+    pub fn of(b: *Blob) Rrset {
+        std.debug.assert(@as(Kind, @fromBackingInt(b.kind)) == .rrset);
+        return read(.{ .buf = b.payload() }) catch unreachable;
+    }
+
+    fn read(r0: Reader) !Rrset {
+        var r = r0;
+        var v: Rrset = .{
+            .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
+            .rcode = @fromBackingInt(@as(u4, @intCast(try r.int(u8)))),
+            .aa = undefined,
+            .ede = null,
+            .ttl = undefined,
+            .stored_ns = undefined,
+            .target = undefined,
+            .zone = undefined,
+            .sections = undefined,
+        };
+        const flags = try r.int(u8);
+        v.aa = flags & 1 != 0;
+        const ede = try r.int(u16);
+        if (flags & 2 != 0) v.ede = @fromBackingInt(ede);
+        v.ttl = try r.int(u32);
+        v.stored_ns = try r.int(i64);
+        v.target = try r.wireName();
+        v.zone = try r.wireName();
+        var counts: [3]u16 = undefined;
+        for (&counts) |*n| n.* = try r.int(u16);
+        for (&v.sections, counts) |*sec, n| {
+            const start = r.pos;
+            for (0..n) |_| {
+                _ = try r.wireName();
+                const fixed = try r.slice(10);
+                _ = try r.slice(mem.readInt(u16, fixed[8..10], .big));
+            }
+            sec.* = .{ .bytes = r.buf[start..r.pos], .len = n };
+        }
+        return v;
+    }
+};
+
+/// A section's records, as stored; each read with the TTL it came with.
+pub const Records = struct {
+    bytes: []const u8,
+    len: u16,
+
+    pub fn iterator(r: Records) Iterator {
+        return .{ .bytes = r.bytes };
+    }
+
+    pub const Iterator = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        pub fn next(it: *Iterator) ?dns.WireRecord {
+            if (it.pos == it.bytes.len) return null;
+            const owner_len = dns.wireNameLen(it.bytes[it.pos..]);
+            const owner = it.bytes[it.pos..][0..owner_len];
+            const rest_at = it.pos + owner_len;
+            const rest_len = 10 + mem.readInt(u16, it.bytes[rest_at + 8 ..][0..2], .big);
+            it.pos = rest_at + rest_len;
+            const rest = it.bytes[rest_at..][0..rest_len];
+            return .{ .owner = owner, .rest = rest, .ttl = mem.readInt(u32, rest[4..8], .big) };
+        }
+    };
 };
 
 const Writer = struct {
@@ -341,14 +423,13 @@ const Writer = struct {
     }
 
     fn records(w: *Writer, rrs: []const RR) !void {
-        for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).bytes.len;
+        for (rrs) |rr| w.pos += (try dns.buildResourceRecordWire(w.buf[w.pos..], rr)).len;
     }
 };
 
 const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
-    arena: Allocator,
 
     fn int(r: *Reader, comptime T: type) !T {
         if (r.pos + @sizeOf(T) > r.buf.len) return error.EndOfData;
@@ -362,12 +443,16 @@ const Reader = struct {
         return r.buf[r.pos..][0..n];
     }
 
-    fn name(r: *Reader) !dns.Name {
-        return dns.readNameWire(r.arena, r.buf, &r.pos);
+    fn name(r: *Reader, arena: Allocator) !dns.Name {
+        return dns.readNameWire(arena, r.buf, &r.pos);
     }
 
-    fn addrs(r: *Reader) ![]na.Address {
-        const list = try r.arena.alloc(na.Address, try r.int(u16));
+    fn wireName(r: *Reader) ![]const u8 {
+        return r.slice(dns.wireNameLen(r.buf[r.pos..]));
+    }
+
+    fn addrs(r: *Reader, arena: Allocator) ![]na.Address {
+        const list = try arena.alloc(na.Address, try r.int(u16));
         for (list) |*a| a.* = try r.addr();
         return list;
     }
@@ -379,8 +464,8 @@ const Reader = struct {
         return if (family == std.posix.AF.INET) na.initIp4(raw[0..4].*, port) else na.initIp6(raw[0..16].*, port, 0, 0);
     }
 
-    fn records(r: *Reader, n: u16) ![]RR {
-        return dns.readRecordsWire(r.arena, r.buf, &r.pos, n);
+    fn records(r: *Reader, arena: Allocator, n: u16) ![]RR {
+        return dns.readRecordsWire(arena, r.buf, &r.pos, n);
     }
 };
 
@@ -440,8 +525,31 @@ test "a fact survives the blob byte for byte" {
         for (want, got) |a, b| {
             var wa: [4096]u8 = undefined;
             var wb: [4096]u8 = undefined;
-            try testing.expectEqualSlices(u8, (try dns.buildResourceRecordWire(&wa, a)).bytes, (try dns.buildResourceRecordWire(&wb, b)).bytes);
+            try testing.expectEqualSlices(u8, try dns.buildResourceRecordWire(&wa, a), try dns.buildResourceRecordWire(&wb, b));
         }
+    }
+
+    const view: Rrset = .of(blob);
+    try testing.expectEqual(reply.kind, view.kind);
+    try testing.expectEqual(reply.rcode, view.rcode);
+    try testing.expectEqual(reply.aa, view.aa);
+    try testing.expectEqual(reply.ede, view.ede);
+    try testing.expectEqual(reply.ttl, view.ttl);
+    try testing.expectEqual(reply.stored_ns, view.stored_ns);
+    try testing.expectEqualSlices(u8, "\x03www\x07example\x03com\x00", view.target);
+    try testing.expectEqualSlices(u8, "\x07example\x03com\x00", view.zone);
+    for ([_][]const RR{ reply.answers, reply.authorities, reply.additionals }, view.sections) |want, got| {
+        try testing.expectEqual(want.len, got.len);
+        var it = got.iterator();
+        for (want) |rr| {
+            const wr = it.next().?;
+            var wa: [4096]u8 = undefined;
+            const bytes = try dns.buildResourceRecordWire(&wa, rr);
+            try testing.expectEqualSlices(u8, bytes[0..wr.owner.len], wr.owner);
+            try testing.expectEqualSlices(u8, bytes[wr.owner.len..], wr.rest);
+            try testing.expectEqual(rr.ttl, wr.ttl);
+        }
+        try testing.expectEqual(null, it.next());
     }
 
     _ = blob.ref();

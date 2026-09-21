@@ -182,7 +182,7 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     const host = try dns.parseDottedName(a, "host.example.com.");
     const answers = [_]dns.ResourceRecord{
         .{ .name = in_addr, .rtype = .cname, .rclass = .in, .ttl = 3600, .rdata = .{ .cname = classless } },
-        .{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host }, .wire = "stale" },
+        .{ .name = classless, .rtype = .ptr, .rclass = .in, .ttl = 300, .rdata = .{ .ptr = host } },
     };
     var msg = dns.Message{ .header = .{ .id = 0, .flags = @bitCast(@as(u16, 0)) }, .questions = &.{}, .answers = &answers };
     msg.header.flags.ad = true;
@@ -190,7 +190,6 @@ test "renamePtr re-owns PTRs to the ip6.arpa qname and drops the RFC 2317 CNAME 
     try renamePtr(a, &msg, qname);
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     try testing.expect(msg.answers[0].name.eql(try dns.parseDottedName(a, qname)));
-    try testing.expectEqual(@as(?[]const u8, null), msg.answers[0].wire);
     try testing.expect(msg.answers[0].rdata.ptr.eql(host));
     try testing.expect(!msg.header.flags.ad);
 }
