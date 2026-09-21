@@ -309,15 +309,12 @@ pub const Cell = struct {
     key: Key,
     name: dns.Name,
     live: bool = true,
-    settled: bool = false,
     orphan: bool = false,
     /// Bumped each time the slot is reused.
     gen: u32 = 0,
     /// The cycle check that last walked through here.
     seen: u64 = 0,
-    /// Settled: exactly one of the two.
-    value: Value = undefined,
-    failure: ?Failure = null,
+    state: State = .pending,
     expires_ns: i64 = 0,
     waiters: std.ArrayList(CellId) = .empty,
     /// Unpinned at settle; an answer's at free.
@@ -331,10 +328,20 @@ pub const Cell = struct {
     /// Everything the cell owns; freed with it.
     arena: std.heap.ArenaAllocator,
 
+    pub const State = union(enum) { pending, fact: Value, failure: Failure };
+
+    pub fn settled(c: *const Cell) bool {
+        return c.state != .pending;
+    }
+
+    pub fn failure(c: *const Cell) ?Failure {
+        return if (c.state == .failure) c.state.failure else null;
+    }
+
     fn inFlight(c: *const Cell, g: *Graph) bool {
         for (c.inputs.items) |i| {
             const in = g.cell(i);
-            if (in.key.kind == .exchange and !in.settled) return true;
+            if (in.key.kind == .exchange and !in.settled()) return true;
         }
         return false;
     }
@@ -428,8 +435,8 @@ pub const Graph = struct {
     /// `max_in_flight`, or anything unsettled for a caller that cannot `wait`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
         const key = try g.keyFor(.answer, name, qtype);
-        if (g.index.get(key)) |id| if (!g.cell(id).settled or g.fresh(id)) {
-            if (!wait and !g.cell(id).settled) {
+        if (g.index.get(key)) |id| if (!g.cell(id).settled() or g.fresh(id)) {
+            if (!wait and !g.cell(id).settled()) {
                 g.stats.clients.dropped += 1;
                 return null;
             }
@@ -567,7 +574,7 @@ pub const Graph = struct {
             // In progress keeps the slot. A settled owner yields it, key too:
             // its arena dies with it.
             const gop = try g.index.getOrPut(g.gpa, own_key);
-            if (!gop.found_existing or g.cell(gop.value_ptr.*).settled) {
+            if (!gop.found_existing or g.cell(gop.value_ptr.*).settled()) {
                 gop.key_ptr.* = own_key;
                 gop.value_ptr.* = id;
             }
@@ -628,7 +635,7 @@ pub const Graph = struct {
             c.orphan = true;
             for (c.inputs.items) |i| g.release(i);
         }
-        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled or !c.inFlight(g))) g.free(id, c) catch {};
+        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled() or !c.inFlight(g))) g.free(id, c) catch {};
     }
 
     fn adopt(g: *Graph, id: CellId) void {
@@ -664,7 +671,7 @@ pub const Graph = struct {
     /// version while fresh; a verdict is stamped on the bytes it judged.
     pub fn settle(g: *Graph, id: CellId, value: Value, expires_ns: i64) !void {
         const c = g.cell(id);
-        std.debug.assert(!c.settled);
+        std.debug.assert(!c.settled());
         g.tally.settles += 1;
         if (g.cfg.trace) switch (value) {
             .ds, .dnskey, .secure => |chain| {
@@ -673,8 +680,7 @@ pub const Graph = struct {
             },
             else => {},
         };
-        c.settled = true;
-        c.value = value;
+        c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
             .cut, .ns, .addr, .rrset, .ds, .dnskey => {
@@ -682,7 +688,7 @@ pub const Graph = struct {
                 defer clock.stop();
                 const blob = try g.store.build(value);
                 c.blob = blob;
-                c.value = try store.Store.parse(c.arena.allocator(), blob);
+                c.state.fact = try store.Store.parse(c.arena.allocator(), blob);
                 if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns, g.now()) catch |err| {
                     g.store.unref(blob);
                     if (err != error.Refused) return err;
@@ -701,15 +707,14 @@ pub const Graph = struct {
     /// this instant but what its demanders read now.
     pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
-        std.debug.assert(!c.settled);
+        std.debug.assert(!c.settled());
         g.tally.settles += 1;
         if (g.cfg.trace) {
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
             std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
         }
         if (c.key.kind == .secure) g.stats.trust.bogus += 1;
-        c.settled = true;
-        c.failure = why;
+        c.state = .{ .failure = why };
         c.expires_ns = g.now();
         try g.woken(id, false);
     }
@@ -753,7 +758,7 @@ pub const Graph = struct {
 
     pub fn fresh(g: *Graph, id: CellId) bool {
         const c = g.cell(id);
-        return c.settled and c.expires_ns > g.now();
+        return c.settled() and c.expires_ns > g.now();
     }
 
     pub fn bound(g: *Graph, budget: *const Budget) i64 {
@@ -771,7 +776,7 @@ pub const Graph = struct {
         };
         if (live) |id| {
             const c = g.cell(id);
-            if (!c.settled or c.expires_ns > g.bound(budget) or (c.budget == budget and c.expires_ns > g.now())) return id;
+            if (!c.settled() or c.expires_ns > g.bound(budget) or (c.budget == budget and c.expires_ns > g.now())) return id;
         }
         return null;
     }
@@ -779,11 +784,10 @@ pub const Graph = struct {
     fn materialise(g: *Graph, key: Key, name: dns.Name, budget: *Budget, e: store.Entry) !CellId {
         const id = try g.newCell(key, name, budget, 0);
         const c = g.cell(id);
-        c.value = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
+        c.state = .{ .fact = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
             g.free(id, c) catch {};
             return err;
-        };
-        c.settled = true;
+        } };
         c.blob = e.blob.ref();
         c.expires_ns = e.expires_ns;
         return id;
@@ -795,10 +799,10 @@ pub const Graph = struct {
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.index.get(key);
         if (g.store.get(key, g.now())) |e| {
-            if (live) |id| if (g.cell(id).blob == e.blob) return .{ .value = g.cell(id).value, .expires_ns = e.expires_ns };
+            if (live) |id| if (g.cell(id).blob == e.blob) return .{ .value = g.cell(id).state.fact, .expires_ns = e.expires_ns };
             return .{ .value = try store.Store.parse(g.scratch.allocator(), e.blob), .expires_ns = e.expires_ns };
         }
-        if (live) |id| if (g.fresh(id)) return .{ .value = g.cell(id).value, .expires_ns = g.cell(id).expires_ns };
+        if (live) |id| if (g.fresh(id)) return .{ .value = g.cell(id).state.fact, .expires_ns = g.cell(id).expires_ns };
         return null;
     }
 
@@ -838,7 +842,7 @@ pub const Graph = struct {
     /// Evidence from a referral or a denial at a probe name: settles a
     /// cell in progress for the key, except the publisher's own; else a fact.
     pub fn publish(g: *Graph, key: Key, by: CellId, value: Value, expires_ns: i64) !void {
-        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled) return g.settle(id, value, expires_ns);
+        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled()) return g.settle(id, value, expires_ns);
         try g.fact(key, value, expires_ns);
     }
 
@@ -857,7 +861,7 @@ pub const Graph = struct {
     /// readers while the rule still has the cell in hand.
     fn run(g: *Graph, id: CellId) !void {
         const c = g.cell(id);
-        if (!c.live or c.settled) return;
+        if (!c.live or c.settled()) return;
         c.holds += 1;
         defer {
             c.holds -= 1;
@@ -869,7 +873,7 @@ pub const Graph = struct {
         defer clock.stop();
         // Ended waiting and created nothing: the model's own cost.
         const created_before = g.created;
-        defer if (g.cell(id).live and !g.cell(id).settled and g.created == created_before) {
+        defer if (g.cell(id).live and !g.cell(id).settled() and g.created == created_before) {
             g.tally.reruns += 1;
             g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
         };

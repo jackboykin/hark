@@ -95,21 +95,21 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     const parent = g.cell(s.parent.?);
-    if (!parent.settled) return;
-    if (parent.failure) |why| return g.fail(id, why);
-    const parent_zone = parent.value.cut.zone;
+    if (!parent.settled()) return;
+    if (parent.failure()) |why| return g.fail(id, why);
+    const parent_zone = parent.state.fact.cut.zone;
     if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, parent_zone, .a), parent_zone, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     const parent_keys = g.cell(s.keys.?);
-    if (!parent_keys.settled) return;
-    if (parent_keys.failure) |why| return g.fail(id, why);
-    if (parent_keys.value.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.value.dnskey.status } }, parent_keys.expires_ns);
+    if (!parent_keys.settled()) return;
+    if (parent_keys.failure()) |why| return g.fail(id, why);
+    if (parent_keys.state.fact.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.state.fact.dnskey.status } }, parent_keys.expires_ns);
     if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .ds), zone, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     const rs = g.cell(s.rrset.?);
-    if (!rs.settled) return;
-    if (rs.failure) |why| return g.fail(id, why);
-    const r = rs.value.rrset;
+    if (!rs.settled()) return;
+    if (rs.failure()) |why| return g.fail(id, why);
+    const r = rs.state.fact.rrset;
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
         .nodata, .nxdomain => dnssec.authoritySigner(r.authorities),
@@ -121,9 +121,9 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (s.signer == null) s.signer = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     const keys = g.cell(s.signer.?);
-    if (!keys.settled) return;
-    if (keys.failure) |why| return g.fail(id, why);
-    if (keys.value.dnskey.status != .secure) return failChain(g, id, s.rrset.?);
+    if (!keys.settled()) return;
+    if (keys.failure()) |why| return g.fail(id, why);
+    if (keys.state.fact.dnskey.status != .secure) return failChain(g, id, s.rrset.?);
     const budget = &g.cell(id).budget.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -131,7 +131,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const expires = @min(rs.expires_ns, keys.expires_ns);
     switch (r.kind) {
         .answer => {
-            const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.value.dnskey.records, now, budget) orelse
+            const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget) orelse
                 return failChain(g, id, s.rrset.?);
             const status: Status = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
@@ -141,7 +141,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
                 return failChain(g, id, s.rrset.?);
             var cap: u32 = std.math.maxInt(u32);
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.value.dnskey.records, now, budget, &cap) != .secure)
+            if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &cap) != .secure)
                 return failChain(g, id, s.rrset.?);
             switch (dnssec.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
@@ -166,18 +166,18 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
         s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth);
     };
     const ds = g.cell(s.ds.?);
-    if (!ds.settled) return;
-    if (ds.failure) |why| return g.fail(id, why);
-    if (ds.value.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.value.ds.status } }, ds.expires_ns);
+    if (!ds.settled()) return;
+    if (ds.failure()) |why| return g.fail(id, why);
+    if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires_ns);
     if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth) orelse
         return g.fail(id, no_chain);
     const rs = g.cell(s.rrset.?);
-    if (!rs.settled) return;
-    if (rs.failure) |why| return g.fail(id, why);
-    const r = rs.value.rrset;
+    if (!rs.settled()) return;
+    if (rs.failure()) |why| return g.fail(id, why);
+    const r = rs.state.fact.rrset;
     if (r.kind != .answer) return failChain(g, id, s.rrset.?);
     var ds_data: std.ArrayList(dns.DsData) = .empty;
-    for (ds.value.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
+    for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
     const budget = &g.cell(id).budget.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -197,7 +197,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     if (g.index.get(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == t.gen;
-        if (same and (!c.settled or c.expires_ns > g.bound(budget) or (c.budget == budget and g.fresh(sid)))) {
+        if (same and (!c.settled() or c.expires_ns > g.bound(budget) or (c.budget == budget and g.fresh(sid)))) {
             try g.pin(sid, by);
             return sid;
         }
@@ -224,15 +224,15 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
 pub fn runSecure(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
-    const r = t.value.rrset;
+    const r = t.state.fact.rrset;
     const zone = r.zone;
     const depth = g.cell(id).depth;
     if (s.zone_ds == null) s.zone_ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, depth) orelse
         return g.fail(id, no_chain);
     const zd = g.cell(s.zone_ds.?);
-    if (!zd.settled) return;
-    if (zd.failure) |why| return g.fail(id, why);
-    if (zd.value.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.value.ds.status } }, zd.expires_ns);
+    if (!zd.settled()) return;
+    if (zd.failure()) |why| return g.fail(id, why);
+    if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
     var expires = @min(t.expires_ns, zd.expires_ns);
     const budget = &g.cell(id).budget.validation;
     const now = g.wallNow();
@@ -265,7 +265,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 if (!rr.name.isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return failBogus(g, id, s.target);
                 if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, try g.keyFor(.dnskey, sig.signer_name, .a), sig.signer_name, depth) orelse
                     return g.fail(id, no_chain);
-                pending = pending or !g.cell(s.keys[groups].?).settled;
+                pending = pending or !g.cell(s.keys[groups].?).settled();
             }
             if (pending) return;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
@@ -285,15 +285,15 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                     continue;
                 }
                 const kc = g.cell(s.keys[groups].?);
-                if (kc.failure) |why| return g.fail(id, why);
-                if (kc.value.dnskey.status != .secure) return failBogus(g, id, s.target);
+                if (kc.failure()) |why| return g.fail(id, why);
+                if (kc.state.fact.dnskey.status != .secure) return failBogus(g, id, s.target);
                 expires = @min(expires, kc.expires_ns);
-                const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.value.dnskey.records, now, budget) orelse
+                const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget) orelse
                     return failBogus(g, id, s.target);
                 cap = @min(cap, dnssec.rrsigTtlCap(verified, now));
                 var verdict: Status = .secure;
                 if (verified.labels < dnssec.signedLabels(rr.name)) {
-                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, budget, &cap) != .secure) return failBogus(g, id, s.target);
+                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &cap) != .secure) return failBogus(g, id, s.target);
                     verdict = dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget);
                     if (verdict == .bogus or verdict == .unchecked) return failBogus(g, id, s.target);
                 }
@@ -306,13 +306,13 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             if (s.keys[0] == null) s.keys[0] = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, depth) orelse
                 return g.fail(id, no_chain);
             const kc = g.cell(s.keys[0].?);
-            if (!kc.settled) return;
+            if (!kc.settled()) return;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
-            if (kc.failure) |why| return g.fail(id, why);
-            if (kc.value.dnskey.status != .secure) return failBogus(g, id, s.target);
+            if (kc.failure()) |why| return g.fail(id, why);
+            if (kc.state.fact.dnskey.status != .secure) return failBogus(g, id, s.target);
             expires = @min(expires, kc.expires_ns);
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.value.dnskey.records, now, budget, &cap) != .secure) return failBogus(g, id, s.target);
+            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &cap) != .secure) return failBogus(g, id, s.target);
             switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
                 .secure => {
                     expires = @min(expires, capExpiry(g, cap));
@@ -330,17 +330,17 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
 /// a positive, or to the SOA owner for a negative. Once (`probe_depth`).
 fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell, depth: u8) !union(enum) { pending, insecure: i64, none } {
     var deepest = t.name;
-    if (t.value.rrset.kind == .nodata or t.value.rrset.kind == .nxdomain) {
+    if (t.state.fact.rrset.kind == .nodata or t.state.fact.rrset.kind == .nxdomain) {
         deepest = zone;
-        for (t.value.rrset.authorities) |rr| if (rr.rtype == .soa and t.name.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
+        for (t.state.fact.rrset.authorities) |rr| if (rr.rtype == .soa and t.name.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
             deepest = rr.name;
         };
     }
     while (true) {
         if (s.probe) |pid| {
             const p = g.cell(pid);
-            if (!p.settled) return .pending;
-            if (p.failure == null and p.value.ds.status == .insecure) return .{ .insecure = p.expires_ns };
+            if (!p.settled()) return .pending;
+            if (p.failure() == null and p.state.fact.ds.status == .insecure) return .{ .insecure = p.expires_ns };
             s.probe = null;
         }
         s.probe_depth = @max(s.probe_depth, @as(u8, @intCast(zone.labels.len))) + 1;

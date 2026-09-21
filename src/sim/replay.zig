@@ -200,7 +200,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
 fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, deadline: i64) !?graph.CellId {
     const root = (try g.demandRoot(q.name, q.qtype, true)).?;
     try g.drain();
-    while (!g.cell(root).settled) {
+    while (!g.cell(root).settled()) {
         const ev = s.next(deadline) orelse {
             g.unhold(root);
             return null;
@@ -574,11 +574,11 @@ test "a silent sibling is hedged past and still records its timeout" {
         const start = s.now_ns;
         const root = (try g.demandRoot(q.name, q.qtype, true)).?;
         try g.drain();
-        while (!g.cell(root).settled) {
+        while (!g.cell(root).settled()) {
             const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
             try g.complete(ev.id, ev.completion);
         }
-        try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
         g.unhold(root);
         const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
         while (s.next(start + 5 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
@@ -606,11 +606,11 @@ test "a silent sibling is hedged past and still records its timeout" {
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
         const root = (try g.demandRoot(q.name, q.qtype, true)).?;
         try g.drain();
-        while (!g.cell(root).settled) {
+        while (!g.cell(root).settled()) {
             const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
             try g.complete(ev.id, ev.completion);
         }
-        try testing.expectEqual(.answer, g.cell(g.cell(root).value.answer.hops[0]).value.rrset.kind);
+        try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
         g.unhold(root);
         var asked_ns1 = false;
         for (s.log.items) |row| asked_ns1 = asked_ns1 or na.AddressKey.fromAddress(row.server).eql(ns1);

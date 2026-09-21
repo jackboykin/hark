@@ -105,8 +105,8 @@ pub fn servfail(arena: Allocator, q: dns.Question, c: Client, ede: dns.Ede) !Ser
 /// bogus data only to CD; a verified hop's TTLs end with its proof,
 /// signatures only to DO, AD only when asked (RFC 6840 §5.7).
 pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
-    if (g.cell(root).failure) |why| return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
-    const a = g.cell(root).value.answer;
+    if (g.cell(root).failure()) |why| return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
+    const a = g.cell(root).state.fact.answer;
     if (a.status == .bogus and !c.cd) {
         const why = a.why orelse graph.Failure{ .code = .dnssec_bogus };
         return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
@@ -118,12 +118,12 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
     var life: u32 = std.math.maxInt(u32);
     var stale = false;
     for (a.hops, 0..) |h, i| {
-        last = if (a.stale.len > i and a.stale[i] != null) a.stale[i].?.* else g.cell(h).value.rrset;
+        last = if (a.stale.len > i and a.stale[i] != null) a.stale[i].?.* else g.cell(h).state.fact.rrset;
         age = @intCast(@divTrunc(g.now() - last.stored_ns, std.time.ns_per_s));
         life = std.math.maxInt(u32);
         // A failed verdict proved nothing, so it bounds nothing (CD only).
-        if (i < a.judged.len and g.cell(a.judged[i]).failure == null) {
-            const proven = g.cell(a.judged[i]).value.secure.proven_until_ns;
+        if (i < a.judged.len and g.cell(a.judged[i]).failure() == null) {
+            const proven = g.cell(a.judged[i]).state.fact.secure.proven_until_ns;
             life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
         }
         const hop_stale = last.ede == .stale_answer;

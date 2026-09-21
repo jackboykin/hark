@@ -274,7 +274,7 @@ const Server = struct {
         const wait = s.pending.items.len < s.g.cfg.max_in_flight;
         const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
-        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled(), .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
         if (p.cached) if (try s.finish(arena, &p, query)) |served| {
             s.g.stats.clients.hit += 1;
@@ -289,7 +289,7 @@ const Server = struct {
         var i: usize = 0;
         while (i < s.pending.items.len) {
             const p = &s.pending.items[i];
-            if (!s.g.cell(p.root).settled) {
+            if (!s.g.cell(p.root).settled()) {
                 i += 1;
                 continue;
             }
@@ -331,7 +331,7 @@ const Server = struct {
         };
         var a: ?answer.Served = null;
         if (p.a) |id| {
-            if (!s.g.cell(id).settled) return null;
+            if (!s.g.cell(id).settled()) return null;
             a = try answer.build(arena, s.g, id, .{ .name = q.name, .qtype = .a, .qclass = q.qclass }, client, s.cfg.minimal_responses);
         }
         return try d64.shape(arena, q, served, a);
