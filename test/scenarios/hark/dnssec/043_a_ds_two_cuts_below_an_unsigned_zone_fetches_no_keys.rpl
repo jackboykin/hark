@@ -1,0 +1,95 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = sub.example.
+; hark: dnssec-zone = deep.sub.example.
+
+SCENARIO_BEGIN a DS two cuts below an unsigned zone fetches no keys ahead
+
+; example. is delegated without a DS, so nothing below it is proven:
+; sub.example.'s DS rests on example.'s word, and the DS sub.example.
+; serves for deep.sub.example. on that. Keys are fetched ahead of their
+; proof only along a path signed all the way down; here the chain stops
+; at example. and fetches no DNSKEY below it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN NSEC zz. NS RRSIG NSEC
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.example. IN A
+    SECTION AUTHORITY
+      sub.example. 3600 IN NS ns.sub.example.
+      sub.example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.sub.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      deep.sub.example. IN A
+    SECTION AUTHORITY
+      deep.sub.example. 3600 IN NS ns.deep.sub.example.
+      deep.sub.example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.deep.sub.example. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.deep.sub.example. IN A
+    SECTION ANSWER
+      www.deep.sub.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.deep.sub.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.deep.sub.example. IN A
+  SECTION ANSWER
+    www.deep.sub.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

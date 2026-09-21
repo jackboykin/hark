@@ -145,17 +145,32 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     }
 }
 
+/// Every cut from `zone` up is proven secure or, unproven yet, delegated
+/// with a DS, to the root or to a cut proven secure.
+pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
+    var z = zone;
+    while (true) {
+        if (try g.peek(try g.keyFor(.ds, z, .a))) |f| return f.value.ds.status == .secure;
+        if (z.labels.len == 0) return true;
+        const ds = try g.peek(try g.keyFor(.rrset, z, .ds)) orelse return false;
+        if (ds.value.rrset.kind != .answer) return false;
+        const above: dns.Name = .{ .labels = z.labels[1..] };
+        const cut = try g.peek(try g.keyFor(.cut, above, .a)) orelse return false;
+        z = cut.value.cut.zone;
+    }
+}
+
 /// `dnskey(zone)`: `rrset(zone, DNSKEY)` verified under `ds(zone)`.
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
     if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone) orelse
         return g.fail(id, no_chain);
-    // A DS on record, proven or not, says the keys will be needed: fetch
-    // them alongside the proof instead of a round trip per level after it.
-    if (s.rrset == null) if (try g.peek(try g.keyFor(.rrset, zone, .ds))) |f| if (f.value.rrset.kind == .answer) {
+    // Signed all the way down, proven or not yet, says the keys will be
+    // needed: fetch them alongside the proof instead of a round trip per
+    // level after it.
+    if (s.rrset == null and try signedDown(g, zone))
         s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone);
-    };
     const ds = g.cell(s.ds.?);
     if (!ds.settled()) return;
     if (ds.failure()) |why| return g.fail(id, why);
