@@ -194,9 +194,8 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
     if (s.log.items.len != before) return error.RecallDisagrees;
     const a = try dns.serializeMessage(try arena.alloc(u8, 65535), recalled.msg);
     const b = try dns.serializeMessage(try arena.alloc(u8, 65535), built.msg);
-    const ea: ?dns.Ede.Code = if (recalled.ede) |e| e.code else null;
-    const eb: ?dns.Ede.Code = if (built.ede) |e| e.code else null;
-    if (!mem.eql(u8, a, b) or ea != eb) return error.RecallDisagrees;
+    const ede_eq = if (recalled.ede) |x| if (built.ede) |y| x.code == y.code and mem.eql(u8, x.text, y.text) else false else built.ede == null;
+    if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
 
 fn retention(scenario: *const rpl.Scenario) answer.Retention {
