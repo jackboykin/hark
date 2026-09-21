@@ -53,20 +53,4 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
-
-    // `test` compiles synth-pellet without a consumer (sema only, no codegen):
-    // a root outside the test binary rots silently on an API change.
-    const pellet_mod = b.createModule(.{
-        .root_source_file = b.path("bench/recursion/synth_pellet.zig"),
-        .target = target,
-        .optimize = .safe,
-        .strip = true,
-        .imports = &.{.{ .name = "hark", .module = mod }},
-    });
-    const synth_pellet_exe = b.addExecutable(.{ .name = "synth-pellet", .root_module = pellet_mod });
-    test_step.dependOn(&b.addExecutable(.{ .name = "synth-pellet-check", .root_module = pellet_mod }).step);
-
-    const synth_pellet_install = b.addInstallArtifact(synth_pellet_exe, .{});
-    const synth_pellet_step = b.step("synth-pellet", "Build the recursion-bench pellet synthesizer (zig-out/bin/synth-pellet)");
-    synth_pellet_step.dependOn(&synth_pellet_install.step);
 }

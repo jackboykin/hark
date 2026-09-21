@@ -1,0 +1,23 @@
+recursor:
+  threads: 1
+  hint_file: __DIR__/root.hints
+  socket_dir: __RUN__
+  daemon: false
+  setuid: ''
+  setgid: ''
+  max_mthreads: 4096
+  qname_minimization: false
+incoming:
+  listen: [127.0.0.1:5354]
+  allow_from: [127.0.0.0/8]
+dnssec:
+  validation: 'off'
+outgoing:
+  source_address: [0.0.0.0]
+  dont_query: []
+recordcache:
+  max_entries: 4000000
+packetcache:
+  max_entries: 4000000
+logging:
+  loglevel: 3

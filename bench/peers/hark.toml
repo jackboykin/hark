@@ -1,0 +1,15 @@
+[server]
+listen = ["127.0.0.1:5354"]
+
+[resolver]
+dnssec = false
+qname-minimization = false
+
+[cache]
+size = 268435456
+
+[logging]
+queries = false
+
+[rebinding]
+allow-zones = ["bench"]

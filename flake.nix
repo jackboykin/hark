@@ -44,6 +44,14 @@
             (pkgs.python3.withPackages (p: with p; [ dnspython cryptography pytest pytest-timeout pytest-xdist ]))
           ];
         };
+        bench = pkgs.mkShell {
+          packages = with pkgs; [
+            (zigFor z)
+            nsd dnsperf iproute2 util-linux bind.dnsutils
+            unbound pdns-recursor knot-resolver_6 bind
+            (python3.withPackages (p: [ p.dnspython ]))
+          ];
+        };
       });
     };
 }

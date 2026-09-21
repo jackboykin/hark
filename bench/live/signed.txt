@@ -1,0 +1,16 @@
+achmea.nl
+actify.nl
+autodesk.com
+base.org
+calendly.com
+canva.com
+cdc.gov
+checkpoint.com
+cloud.microsoft
+cloudflare-dns.com
+cloudflare.com
+cloudflare.net
+www.isc.org
+www.ietf.org
+www.denic.de
+www.bund.de

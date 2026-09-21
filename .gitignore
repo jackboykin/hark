@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 .claude/
 result
+bench/peers/out/
+bench/live/out/
