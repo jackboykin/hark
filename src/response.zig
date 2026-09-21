@@ -17,7 +17,7 @@ const special_use = @import("special_use.zig");
 // What a recursive resolver owes its client:
 //   1. Use the answer (or know there isn't one).
 //   2. Negatively cache the absence (RFC 2308 — SOA in authority).
-//   3. Independently validate, if DO=1 / CD=1 (RFC 4035 §3.2.3).
+//   3. Independently validate, if DO=1 (RFC 4035 §3.2.1).
 //
 // Everything else — delegation NS in authority, glue in additional — is
 // decoration for clients that aren't recursive resolvers. Stubs don't
@@ -50,14 +50,12 @@ fn shapeResponse(
     response: dns.Message,
     qtype: dns.RType,
     do_bit: bool,
-    cd_bit: bool,
     minimal_responses: bool,
     rebind_cfg: *const rebinding.Config,
 ) mem.Allocator.Error!ShapedSections {
-    // CD=1 means the client is doing its own validation; it MUST receive
-    // the full proof set (RFC 4035 §3.2.2). Treat the keep set as
-    // DO=1-equivalent regardless of the DO bit.
-    const keep_dnssec = do_bit or cd_bit;
+    // RFC 3225, RFC 4035 §3.1: DNSSEC records only to DO. CD turns
+    // validation off (§3.2.2); it asks for no proofs.
+    const keep_dnssec = do_bit;
 
     // qtype=NS suppresses the minimal-responses strip — for RFC 8109 root
     // priming, the NS records *are* the answer and their glue is load-
@@ -289,7 +287,6 @@ pub fn buildResponseWire(
         response,
         qtype,
         ctx.client_do,
-        ctx.cd,
         ctx.minimal_responses,
         rebind_cfg,
     ) catch return null;
@@ -969,11 +966,11 @@ test "shape: rebinding scrub reaches additionals on NODATA passthrough" {
     const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 192, 168, 1, 1 })};
     const msg = shapePositiveMessage(&.{}, &.{shapeSoaRecord()}, additionals);
 
-    const off = try shapeResponse(a, msg, .a, false, false, true, &rebinding.Config.off);
+    const off = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
     try testing.expectEqual(@as(usize, 1), off.additionals.len);
 
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-    const on = try shapeResponse(a, msg, .a, false, false, true, &scrub_on);
+    const on = try shapeResponse(a, msg, .a, false, true, &scrub_on);
     try testing.expectEqual(@as(usize, 0), on.additionals.len);
 }
 
@@ -1048,7 +1045,7 @@ test "shape: positive DO=0 strips NS from authority, glue from additional, RRSIG
     const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
     const msg = shapePositiveMessage(answers, authorities, additionals);
 
-    const shaped = try shapeResponse(a, msg, .a, false, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 1), shaped.answers.len);
     try testing.expectEqual(dns.RType.a, shaped.answers[0].rtype);
@@ -1073,7 +1070,7 @@ test "shape: positive DO=1 keeps NSEC + RRSIG-over-NSEC in authority (wildcard p
     };
     const msg = shapePositiveMessage(answers, authorities, &.{});
 
-    const shaped = try shapeResponse(a, msg, .a, true, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 2), shaped.answers.len);
     try testing.expectEqual(@as(usize, 2), shaped.authorities.len);
@@ -1092,7 +1089,7 @@ test "shape: qtype=NS preserves authority NS + additional glue (root priming car
     const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
     const msg = shapePositiveMessage(answers, authorities, additionals);
 
-    const shaped = try shapeResponse(a, msg, .ns, false, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .ns, false, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 1), shaped.answers.len);
     try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
@@ -1109,7 +1106,7 @@ test "shape: minimal_responses=false on positive answer preserves authority + ad
     const additionals: []const dns.ResourceRecord = &.{shapeGlueRecord(.{ 1, 2, 3, 4 })};
     const msg = shapePositiveMessage(answers, authorities, additionals);
 
-    const shaped = try shapeResponse(a, msg, .a, false, false, false, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, false, false, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
     try testing.expectEqual(@as(usize, 1), shaped.additionals.len);
@@ -1128,7 +1125,7 @@ test "shape: NXDOMAIN keeps SOA, keeps NSEC + RRSIG on DO=1" {
     };
     const msg = shapeNxdomainMessage(authorities);
 
-    const shaped = try shapeResponse(a, msg, .a, true, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 4), shaped.authorities.len);
     try testing.expectEqual(@as(usize, 1), countByType(shaped.authorities, .soa));
@@ -1149,25 +1146,10 @@ test "shape: NXDOMAIN keeps SOA on DO=0 (RFC 2308 negative cache), strips NSEC/R
     };
     const msg = shapeNxdomainMessage(authorities);
 
-    const shaped = try shapeResponse(a, msg, .a, false, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, false, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 1), shaped.authorities.len);
     try testing.expectEqual(dns.RType.soa, shaped.authorities[0].rtype);
-}
-
-test "shape: CD=1 with DO=0 still preserves validation material (RFC 4035 §3.2.2)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const answers: []const dns.ResourceRecord = &.{ shapeARecord(.{ 192, 0, 2, 1 }), shapeRrsigRecord(.a) };
-    const authorities: []const dns.ResourceRecord = &.{ shapeNsecRecord(), shapeRrsigRecord(.nsec) };
-    const msg = shapePositiveMessage(answers, authorities, &.{});
-
-    const shaped = try shapeResponse(a, msg, .a, false, true, true, &rebinding.Config.off);
-
-    try testing.expectEqual(@as(usize, 2), shaped.answers.len);
-    try testing.expectEqual(@as(usize, 2), shaped.authorities.len);
 }
 
 test "shape: orphan RRSIG covering stripped NS is removed (no covered-record leak)" {
@@ -1179,7 +1161,7 @@ test "shape: orphan RRSIG covering stripped NS is removed (no covered-record lea
     const authorities: []const dns.ResourceRecord = &.{ shapeNsRecord(), shapeRrsigRecord(.ns) };
     const msg = shapePositiveMessage(answers, authorities, &.{});
 
-    const shaped = try shapeResponse(a, msg, .a, true, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 0), shaped.authorities.len);
 }
@@ -1192,7 +1174,7 @@ test "shape: explicit qtype=NSEC keeps NSEC in answer even with DO=0" {
     const answers: []const dns.ResourceRecord = &.{shapeNsecRecord()};
     const msg = shapePositiveMessage(answers, &.{}, &.{});
 
-    const shaped = try shapeResponse(a, msg, .nsec, false, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .nsec, false, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 1), shaped.answers.len);
     try testing.expectEqual(dns.RType.nsec, shaped.answers[0].rtype);
@@ -1218,7 +1200,7 @@ test "shape: cname-chain answer authority NSEC kept on DO=1 (the wildcard-chain 
     const authorities: []const dns.ResourceRecord = &.{ shapeNsecRecord(), shapeRrsigRecord(.nsec) };
     const msg = shapePositiveMessage(answers, authorities, &.{});
 
-    const shaped = try shapeResponse(a, msg, .a, true, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
 
     try testing.expectEqual(@as(usize, 2), shaped.answers.len);
     try testing.expectEqual(@as(usize, 2), shaped.authorities.len);
@@ -1232,7 +1214,7 @@ test "shape: fast path returns input slice unmodified when nothing would be filt
     const answers: []const dns.ResourceRecord = &.{shapeARecord(.{ 192, 0, 2, 1 })};
     const msg = shapePositiveMessage(answers, &.{}, &.{});
 
-    const shaped = try shapeResponse(a, msg, .a, true, false, true, &rebinding.Config.off);
+    const shaped = try shapeResponse(a, msg, .a, true, true, &rebinding.Config.off);
 
     try testing.expectEqual(answers.ptr, shaped.answers.ptr);
 }

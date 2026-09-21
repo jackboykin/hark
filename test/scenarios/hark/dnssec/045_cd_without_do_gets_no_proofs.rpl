@@ -1,0 +1,43 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a CD client without DO is sent no DNSSEC records
+
+; RFC 3225 and RFC 4035 §3.1: DNSSEC records go only to a client that set
+; DO (or asked for their type). CD turns validation off (§3.2.2); it does
+; not ask for proofs. 005's signed NODATA, asked with CD and no DO: the
+; SOA stays, its RRSIG and the NSEC do not.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a. IN AAAA
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD CD
+  SECTION QUESTION
+    a. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA CD NOERROR
+  SECTION QUESTION
+    a. IN AAAA
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+ENTRY_END
+
+SCENARIO_END

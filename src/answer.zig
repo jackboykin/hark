@@ -343,15 +343,15 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
             age = 0;
             life = stale_hold_s;
         }
-        try appendAged(arena, &chain, hop.reply.answers, age, life, hop.floor, c.do_bit, hop.stale);
+        try appendAged(arena, &chain, hop.reply.answers, age, life, hop.floor, c.do_bit, q.qtype, hop.stale);
     }
     const r = last.reply;
     const positive = r.kind == .answer or r.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
     if (!(positive and minimal and q.qtype != .ns)) {
-        try appendAged(arena, &authorities, r.authorities, age, life, last.floor, c.do_bit, last.stale);
-        try appendAged(arena, &additionals, r.additionals, age, life, last.floor, c.do_bit, last.stale);
+        try appendAged(arena, &authorities, r.authorities, age, life, last.floor, c.do_bit, q.qtype, last.stale);
+        try appendAged(arena, &additionals, r.additionals, age, life, last.floor, c.do_bit, q.qtype, last.stale);
     }
     const ede: ?dns.Ede = if (stale_any) // any hop: a stale alias still redirected
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
@@ -381,9 +381,15 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
 
 /// TTLs aged since the reply, floored to `floor` and capped by `life`; a
 /// record past its TTL in a stale reply gets the hold (RFC 8767 §4).
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, floor: u32, sigs: bool, is_stale: bool) !void {
+/// DNSSEC records only to DO, or when asked for by type (RFC 3225, RFC
+/// 4035 §3.1); CD turns validation off and asks for nothing.
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, age: u32, life: u32, floor: u32, do_bit: bool, qtype: dns.RType, is_stale: bool) !void {
     for (rrs) |rr| {
-        if (rr.rtype == .rrsig and !sigs) continue;
+        const dnssec = switch (rr.rtype) {
+            .rrsig, .nsec, .nsec3 => true,
+            else => false,
+        };
+        if (dnssec and !do_bit and rr.rtype != qtype) continue;
         var aged = rr;
         aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
