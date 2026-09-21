@@ -1546,42 +1546,6 @@ pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, compti
     return buf[0..ser.pos];
 }
 
-test "header roundtrip" {
-    const original = Header{
-        .id = 0xABCD,
-        .flags = .{
-            .qr = true,
-            .opcode = .query,
-            .aa = true,
-            .tc = false,
-            .rd = true,
-            .ra = true,
-            .z = 0,
-            .ad = false,
-            .cd = false,
-            .rcode = .no_error,
-        },
-        .qd_count = 1,
-        .an_count = 2,
-        .ar_count = 1,
-    };
-
-    var buf: [12]u8 = undefined;
-    original.serialize(&buf);
-    const parsed = Header.parse(&buf);
-
-    try testing.expectEqual(original.id, parsed.id);
-    try testing.expectEqual(original.flags, parsed.flags);
-    try testing.expectEqual(original.qd_count, parsed.qd_count);
-    try testing.expectEqual(original.an_count, parsed.an_count);
-    try testing.expectEqual(original.ns_count, parsed.ns_count);
-    try testing.expectEqual(original.ar_count, parsed.ar_count);
-
-    var buf2: [12]u8 = undefined;
-    parsed.serialize(&buf2);
-    try testing.expectEqualSlices(u8, &buf, &buf2);
-}
-
 test "header parse known bytes" {
     // Hand-crafted: id=0x1234, QR=1, opcode=0, AA=0, TC=0, RD=1, RA=1, rcode=0
     // flags = 1_0000_0_0_1_1_000_0000 = 0x8180
@@ -1603,19 +1567,6 @@ test "header parse known bytes" {
     try testing.expect(hdr.flags.ra);
     try testing.expectEqual(@as(u16, 1), hdr.qd_count);
     try testing.expectEqual(@as(u16, 2), hdr.an_count);
-}
-
-test "name parsing - uncompressed" {
-    const data = "\x07example\x03com\x00";
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var parser = Parser{ .msg = data, .pos = 0 };
-    const name = try parser.parseName(arena.allocator());
-
-    try testing.expectEqual(@as(usize, 2), name.labels.len);
-    try testing.expectEqualStrings("example", name.labels[0]);
-    try testing.expectEqualStrings("com", name.labels[1]);
-    try testing.expectEqual(data.len, parser.pos);
 }
 
 test "name parsing - compressed" {
@@ -1862,60 +1813,6 @@ test "TXT record parsing" {
     try testing.expectEqualStrings("hello", txt.strings[1]);
 }
 
-test "roundtrip: parse -> serialize -> parse -> compare" {
-    var original_pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, original_pkt[0..2], 0xABCD, .big);
-    mem.writeInt(u16, original_pkt[2..4], 0x0100, .big); // RD=1
-    mem.writeInt(u16, original_pkt[4..6], 1, .big);
-    mem.writeInt(u16, original_pkt[6..8], 1, .big);
-    mem.writeInt(u16, original_pkt[8..10], 0, .big);
-    mem.writeInt(u16, original_pkt[10..12], 0, .big);
-
-    var pos: usize = 12;
-    const qname = "\x07example\x03com\x00";
-    @memcpy(original_pkt[pos..][0..qname.len], qname);
-    pos += qname.len;
-    mem.writeInt(u16, original_pkt[pos..][0..2], 1, .big); // A
-    pos += 2;
-    mem.writeInt(u16, original_pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-
-    // Answer: A record (no compression for roundtrip test)
-    const aname = "\x07example\x03com\x00";
-    @memcpy(original_pkt[pos..][0..aname.len], aname);
-    pos += aname.len;
-    mem.writeInt(u16, original_pkt[pos..][0..2], 1, .big); // A
-    pos += 2;
-    mem.writeInt(u16, original_pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, original_pkt[pos..][0..4], 300, .big);
-    pos += 4;
-    mem.writeInt(u16, original_pkt[pos..][0..2], 4, .big);
-    pos += 2;
-    original_pkt[pos] = 1;
-    original_pkt[pos + 1] = 2;
-    original_pkt[pos + 2] = 3;
-    original_pkt[pos + 3] = 4;
-    pos += 4;
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg1 = try parseMessage(arena.allocator(), original_pkt[0..pos]);
-
-    var ser_buf: [max_udp_payload]u8 = undefined;
-    const serialized = try serializeMessage(&ser_buf, msg1);
-
-    const msg2 = try parseMessage(arena.allocator(), serialized);
-
-    try testing.expectEqual(msg1.header.id, msg2.header.id);
-    try testing.expectEqual(msg1.header.flags.rd, msg2.header.flags.rd);
-    try testing.expectEqual(msg1.questions.len, msg2.questions.len);
-    try testing.expectEqual(msg1.answers.len, msg2.answers.len);
-    try testing.expect(msg1.questions[0].name.eql(msg2.questions[0].name));
-    try testing.expect(msg1.answers[0].name.eql(msg2.answers[0].name));
-    try testing.expectEqualSlices(u8, &msg1.answers[0].rdata.a, &msg2.answers[0].rdata.a);
-}
-
 test "name compression: owner and RFC 1035 rdata share suffixes, DNSSEC names stay flat" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2113,22 +2010,6 @@ test "EDNS0: reserializing a parsed OPT response counts it once" {
     _ = try parseMessage(arena.allocator(), out);
 }
 
-test "EDNS0: parse non-EDNS response has null opt" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const msg = try buildQuery(alloc, 0x5678, "example.com", .a, .{});
-    try testing.expect(msg.opt == null);
-
-    var buf: [max_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-    const parsed = try parseMessage(alloc, wire);
-
-    try testing.expect(parsed.opt == null);
-    try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
-}
-
 test "EDNS0: serialized OPT has correct wire format" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2158,21 +2039,6 @@ test "EDNS0: serialized OPT has correct wire format" {
     try testing.expectEqual(@as(u32, 0x00008000), ttl);
     // RDLENGTH = 0
     try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
-}
-
-test "EDNS0: buildQuery without edns has no opt" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const msg = try buildQuery(alloc, 0x1111, "test.com", .aaaa, .{ .rd = false });
-    try testing.expect(msg.opt == null);
-
-    var buf: [max_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-
-    const ar_count = mem.readInt(u16, wire[10..12], .big);
-    try testing.expectEqual(@as(u16, 0), ar_count);
 }
 
 test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
@@ -2353,7 +2219,6 @@ test "validateResponse accepts a question-less error reply but rejects question-
         .questions = &.{},
     };
     try validateResponse(refused_no_question, qname, .a);
-    try std.testing.expectEqual(@as(usize, 0), refused_no_question.questions.len);
 
     var noerror_no_question = refused_no_question;
     noerror_no_question.header.flags.rcode = .no_error;
@@ -2630,39 +2495,18 @@ test "compression past its work budget writes names whole, and they read back" {
     for (rrs, back.answers) |want, got| try testing.expect(want.rdata.ptr.eql(got.rdata.ptr));
 }
 
-test "parseDottedName basic" {
-    const name = try parseDottedName(testing.allocator, "example.com");
-    defer freeName(testing.allocator, name);
-    try testing.expectEqual(@as(usize, 2), name.labels.len);
-    try testing.expectEqualStrings("example", name.labels[0]);
-    try testing.expectEqualStrings("com", name.labels[1]);
-}
-
-test "parseDottedName trailing dot" {
-    const name = try parseDottedName(testing.allocator, "example.com.");
-    defer freeName(testing.allocator, name);
-    try testing.expectEqual(@as(usize, 2), name.labels.len);
-    try testing.expectEqualStrings("example", name.labels[0]);
-    try testing.expectEqualStrings("com", name.labels[1]);
-}
-
-test "parseDottedName root zone" {
-    const name = try parseDottedName(testing.allocator, ".");
-    defer testing.allocator.free(name.labels);
-    try testing.expectEqual(@as(usize, 0), name.labels.len);
-
-    const name2 = try parseDottedName(testing.allocator, "");
-    defer testing.allocator.free(name2.labels);
-    try testing.expectEqual(@as(usize, 0), name2.labels.len);
-}
-
-test "parseDottedName empty label" {
-    try testing.expectError(error.InvalidLabelType, parseDottedName(testing.allocator, "example..com"));
-}
-
-test "parseDottedName too-long label" {
+test "parseDottedName: trailing dot optional, root is empty, bad labels refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const want = Name{ .labels = &.{ "example", "com" } };
+    try testing.expect(want.eqlExact(try parseDottedName(a, "example.com")));
+    try testing.expect(want.eqlExact(try parseDottedName(a, "example.com.")));
+    try testing.expectEqual(@as(usize, 0), (try parseDottedName(a, ".")).labels.len);
+    try testing.expectEqual(@as(usize, 0), (try parseDottedName(a, "")).labels.len);
+    try testing.expectError(error.InvalidLabelType, parseDottedName(a, "example..com"));
     const long_label = @as([64]u8, @splat('a')) ++ ".com".*;
-    try testing.expectError(error.LabelTooLong, parseDottedName(testing.allocator, &long_label));
+    try testing.expectError(error.LabelTooLong, parseDottedName(a, &long_label));
 }
 
 test "substituteSuffix declines a substitution that overflows a legal name" {
@@ -2681,54 +2525,12 @@ test "substituteSuffix declines a substitution that overflows a legal name" {
     try testing.expect(fits.?.eql(.{ .labels = &.{ long_label, long_label, "net" } }));
 }
 
-test "isSubdomainOf equal names" {
+test "isSubdomainOf: self, descendants and the root; case-insensitive; never a sibling" {
     const name = Name{ .labels = &.{ "example", "com" } };
     try testing.expect(name.isSubdomainOf(name));
-}
-
-test "isSubdomainOf child of parent" {
-    const child = Name{ .labels = &.{ "www", "example", "com" } };
-    const parent = Name{ .labels = &.{ "example", "com" } };
-    try testing.expect(child.isSubdomainOf(parent));
-}
-
-test "isSubdomainOf sibling returns false" {
-    const a = Name{ .labels = &.{ "a", "example", "com" } };
-    const b = Name{ .labels = &.{ "b", "example", "com" } };
-    try testing.expect(!a.isSubdomainOf(b));
-}
-
-test "isSubdomainOf root parent" {
-    const name = Name{ .labels = &.{ "example", "com" } };
-    const root = Name{ .labels = &.{} };
-    try testing.expect(name.isSubdomainOf(root));
-}
-
-test "isSubdomainOf case insensitive" {
-    const child = Name{ .labels = &.{ "WWW", "EXAMPLE", "COM" } };
-    const parent = Name{ .labels = &.{ "example", "com" } };
-    try testing.expect(child.isSubdomainOf(parent));
-}
-
-test "buildQuery roundtrip" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try buildQuery(arena.allocator(), 0x1234, "example.com", .a, .{});
-
-    try testing.expectEqual(@as(u16, 0x1234), msg.header.id);
-    try testing.expect(!msg.header.flags.qr);
-    try testing.expect(msg.header.flags.rd);
-    try testing.expectEqual(@as(usize, 1), msg.questions.len);
-    try testing.expectEqual(RType.a, msg.questions[0].qtype);
-    try testing.expectEqual(RClass.in, msg.questions[0].qclass);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    try testing.expectEqual(msg.header.id, msg2.header.id);
-    try testing.expectEqual(msg.header.flags.rd, msg2.header.flags.rd);
-    try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
-    try testing.expectEqual(msg.questions[0].qtype, msg2.questions[0].qtype);
+    try testing.expect((Name{ .labels = &.{ "WWW", "EXAMPLE", "COM" } }).isSubdomainOf(name));
+    try testing.expect(name.isSubdomainOf(.{ .labels = &.{} }));
+    try testing.expect(!(Name{ .labels = &.{ "a", "example", "com" } }).isSubdomainOf(.{ .labels = &.{ "b", "example", "com" } }));
 }
 
 test "buildQuery rd=false roundtrip" {

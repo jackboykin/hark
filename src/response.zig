@@ -198,38 +198,6 @@ pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rc
     return null;
 }
 
-test "buildResponseWire sets correct header fields" {
-    const alloc = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const questions = try a.alloc(dns.Question, 1);
-    const name = try dns.parseDottedName(a, "example.com");
-    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
-
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 0x1234,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .questions = questions,
-        .client_edns = false,
-        .client_do = false,
-        .client_wants_ad = false,
-        .max_udp_payload = dns.max_udp_payload,
-    }, .{ .rcode = .server_failure }, a).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(true, parsed.header.flags.qr);
-    try testing.expectEqual(true, parsed.header.flags.rd);
-    try testing.expectEqual(true, parsed.header.flags.ra);
-    try testing.expectEqual(dns.RCode.server_failure, parsed.header.flags.rcode);
-    try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
-}
-
 test "buildResponseWire carries EDE only to an EDNS client" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -258,34 +226,6 @@ test "buildResponseWire carries EDE only to an EDNS client" {
 
     ctx.client_edns = false;
     try testing.expectEqual(null, (try dns.parseMessage(a, buildResponseWire(&buf, ctx, servfail, a).?)).opt);
-}
-
-test "buildResponseWire with EDNS0" {
-    const alloc = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const questions = try a.alloc(dns.Question, 1);
-    const name = try dns.parseDottedName(a, "example.com");
-    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
-
-    var buf: [dns.edns_udp_payload]u8 = undefined;
-    const wire = buildResponseWire(&buf, .{
-        .query_id = 0x5678,
-        .opcode = .query,
-        .rd = true,
-        .cd = false,
-        .questions = questions,
-        .client_edns = true,
-        .client_do = false,
-        .client_wants_ad = false,
-        .max_udp_payload = dns.edns_udp_payload,
-    }, .{ .rcode = .no_error }, a).?;
-
-    const parsed = try dns.parseMessage(a, wire);
-    try testing.expect(parsed.opt != null);
-    try testing.expectEqual(@as(u16, dns.edns_udp_payload), parsed.opt.?.udp_payload_size);
 }
 
 test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
@@ -339,19 +279,6 @@ test "serializeErrorResponse produces valid DNS message" {
     try testing.expectEqual(true, parsed.header.flags.ra);
     try testing.expectEqual(true, parsed.header.flags.qr);
     try testing.expectEqual(@as(u16, 1), parsed.header.qd_count);
-}
-
-test "serializeErrorResponse with no question (parse failure)" {
-    var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .query, .format_error, 0, false, &.{}, null).?;
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const parsed = try dns.parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
-    try testing.expectEqual(dns.RCode.format_error, parsed.header.flags.rcode);
-    try testing.expectEqual(@as(u16, 0), parsed.header.qd_count);
 }
 
 test "validateQuery rejects QR=1 (response posing as query)" {

@@ -444,7 +444,10 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         var diag: rpl.Diag = .{};
         const scenario = rpl.parse(arena, text, &diag) catch |err| switch (err) {
             error.UnsupportedRType => continue,
-            else => return err,
+            else => {
+                std.debug.print("{s}/{s}:{d}: {s}\n", .{ root, ent.path, diag.line, diag.msg });
+                return err;
+            },
         };
         r.parsed += 1;
         var expect_fail = false;

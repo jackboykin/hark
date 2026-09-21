@@ -971,37 +971,3 @@ test "rejections" {
         try testing.expect(mem.startsWith(u8, diag.msg, c.msg));
     }
 }
-
-test "every scenario on disk parses" {
-    const io = testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var parsed: usize = 0;
-    var unsupported: usize = 0;
-    for ([_][]const u8{ "test/scenarios/hark", "test/corpus/unbound" }) |root| {
-        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return error.SkipZigTest;
-        defer dir.close(io);
-        var walker = try dir.walk(testing.allocator);
-        defer walker.deinit();
-        while (try walker.next(io)) |ent| {
-            if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
-            const text = try dir.readFileAlloc(io, ent.path, arena, .limited(1 << 20));
-            var diag: Diag = .{};
-            _ = parse(arena, text, &diag) catch |err| switch (err) {
-                error.UnsupportedRType => {
-                    unsupported += 1;
-                    continue;
-                },
-                else => {
-                    std.debug.print("{s}/{s}:{d}: {s}\n", .{ root, ent.path, diag.line, diag.msg });
-                    return err;
-                },
-            };
-            parsed += 1;
-        }
-    }
-    // NSEC3 text is not loaded yet; those scenarios are the unsupported count.
-    try testing.expect(parsed >= 80);
-    try testing.expect(unsupported <= 18);
-}

@@ -1703,22 +1703,9 @@ const test_owner = dns.Name{
     },
 };
 
-test "DS hash verification - synthetic" {
-    var expected_digest = try dsDigest(Sha256, test_owner, test_dnskey);
-
-    const ds = dns.DsData{
-        .key_tag = keyTag(test_dnskey),
-        .algorithm = .rsasha256,
-        .digest_type = .sha256,
-        .digest = &expected_digest,
-    };
-
-    try verifyDs(ds, test_dnskey, test_owner);
-}
-
 test "DS hash verification - sha1 and sha384 digest types" {
     // verifyDs's three digest arms collapse to one comptime helper; exercise
-    // the sha1 and sha384 instantiations (only sha256 was covered above).
+    // the sha1 and sha384 instantiations (the ML-DSA-44 vector pins sha256).
     const d1 = try dsDigest(Sha1, test_owner, test_dnskey);
     try verifyDs(.{
         .key_tag = keyTag(test_dnskey),
@@ -1986,31 +1973,9 @@ test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
 }
 
 test "DS hash verification - wrong digest fails" {
-    const dnskey = dns.DnskeyData{
-        .flags = 257,
-        .protocol = 3,
-        .algorithm = .rsasha256,
-        .public_key = &.{ 0x03, 0x01, 0x00, 0x01 },
-    };
-
-    const owner = dns.Name{
-        .labels = &.{
-            @as([]const u8, "example"),
-            @as([]const u8, "com"),
-        },
-    };
-
-    var bad_digest: [32]u8 = undefined;
-    @memset(&bad_digest, 0xFF);
-
-    const ds = dns.DsData{
-        .key_tag = keyTag(dnskey),
-        .algorithm = .rsasha256,
-        .digest_type = .sha256,
-        .digest = &bad_digest,
-    };
-
-    try testing.expectError(error.InvalidSignature, verifyDs(ds, dnskey, owner));
+    const bad_digest: [32]u8 = @splat(0xFF);
+    const ds = dns.DsData{ .key_tag = keyTag(test_dnskey), .algorithm = .rsasha256, .digest_type = .sha256, .digest = &bad_digest };
+    try testing.expectError(error.InvalidSignature, verifyDs(ds, test_dnskey, test_owner));
 }
 
 const TestFlatten = struct {
@@ -3034,18 +2999,13 @@ test "base32hex decode/encode roundtrip" {
     try testing.expectEqualSlices(u8, &hash, dec_buf[0..n]);
 }
 
-test "base32hex case insensitivity" {
+test "base32hex decode ignores case and refuses characters outside the alphabet" {
     var buf1: [20]u8 = undefined;
     var buf2: [20]u8 = undefined;
     const n1 = try dns.base32HexDecode(&buf1, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM");
     const n2 = try dns.base32HexDecode(&buf2, "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
-    try testing.expectEqual(n1, n2);
     try testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
-}
-
-test "base32hex invalid characters" {
-    var buf: [20]u8 = undefined;
-    try testing.expectError(error.InvalidBase32, dns.base32HexDecode(&buf, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
+    try testing.expectError(error.InvalidBase32, dns.base32HexDecode(&buf1, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
 }
 
 test "nsec3OwnerHash extraction" {
@@ -4424,25 +4384,15 @@ test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
     try testing.expect(validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget) == null);
 }
 
-fn expectVerifyRsaInvalidKey(exp: []const u8) !void {
-    var key_data: [1 + 16 + 256]u8 = undefined;
-    key_data[0] = @intCast(exp.len);
-    @memcpy(key_data[1 .. 1 + exp.len], exp);
-    @memset(key_data[1 + exp.len ..], 0xAA);
+test "verifyRsa rejects exponents 0, 1 and even" {
     const sig: [256]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("test"), key_data[0 .. 1 + exp.len + 256], Sha256));
-}
-
-test "verifyRsa rejects even exponent" {
-    try expectVerifyRsaInvalidKey(&.{ 0x01, 0x00, 0x02 }); // 65538, even
-}
-
-test "verifyRsa rejects exponent 0" {
-    try expectVerifyRsaInvalidKey(&.{0});
-}
-
-test "verifyRsa rejects exponent 1" {
-    try expectVerifyRsaInvalidKey(&.{1});
+    inline for (.{ &[_]u8{0}, &[_]u8{1}, &[_]u8{ 0x01, 0x00, 0x02 } }) |exp| {
+        var key_data: [1 + exp.len + 256]u8 = undefined;
+        key_data[0] = exp.len;
+        @memcpy(key_data[1..][0..exp.len], exp);
+        @memset(key_data[1 + exp.len ..], 0xAA);
+        try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("test"), &key_data, Sha256));
+    }
 }
 
 test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
