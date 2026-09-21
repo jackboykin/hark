@@ -231,7 +231,6 @@ const config_toml =
     \\
     \\[cache]
     \\size = 268435456
-    \\entries = 200000
     \\
     \\[logging]
     \\queries = false
