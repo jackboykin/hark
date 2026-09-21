@@ -237,7 +237,7 @@ pub const Store = struct {
                 try w.int(u16, @intCast(c.records.len));
                 try w.records(c.records);
             },
-            .answer, .secure, .exchange, .refresh => unreachable,
+            .answer, .secure, .exchange, .refresh, .keys => unreachable,
         }
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
@@ -293,7 +293,7 @@ pub const Store = struct {
                 c.records = try r.records(try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
-            .answer, .secure, .exchange, .refresh => unreachable,
+            .answer, .secure, .exchange, .refresh, .keys => unreachable,
         };
     }
 };

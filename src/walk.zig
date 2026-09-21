@@ -637,6 +637,10 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     if (g.cfg.trust_anchor != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
         if (ds.ttl > 0) try g.publish(try g.keyFor(.rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
+        // A signed delegation from a zone signed all the way down: whatever
+        // the walk finds below, its proof runs through these keys, so they
+        // are fetched as it descends.
+        if (ds.kind == .answer and try trust.signedDown(g, zone)) try g.fetchKeys(by, ref.zone_cut);
     }
     // Glue is only a fact: never displacing an authoritative set, nor
     // pre-empting a walk for one in progress.

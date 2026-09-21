@@ -585,8 +585,8 @@ fn logStats(g: *graph.Graph) void {
     log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d} | resolved {d}  hit {d}%  stale {d}", .{
         c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, served, if (served > 0) c.hit * 100 / served else 0, c.stale,
     });
-    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  retry {d} | refresh {d}  refused {d}", .{
-        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.retry, r.refresh, r.refused,
+    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
+        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.retry, r.refresh, r.keys, r.refused,
     });
     log.info("stats trust     secure {d}  insecure {d}  bogus {d}", .{ t.secure, t.insecure, t.bogus });
     log.info("stats store     {d} KiB in {d} facts  in cells {d} KiB | evicted {d}  refused {d}", .{

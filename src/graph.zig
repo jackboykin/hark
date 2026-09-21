@@ -66,7 +66,8 @@ pub const Edge = struct {
 };
 
 /// `refresh`: `answer` derived again for the store; nobody waits.
-pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange, refresh };
+/// `keys`: a signed zone's `dnskey` fetched while the walk descends.
+pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, keys };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -207,13 +208,18 @@ pub const Value = union(Kind) {
     secure: trust.Chain,
     exchange: Outcome,
     refresh: void,
+    keys: void,
 };
 
 /// A question's: its root holds it, and every run the root waits on pays
 /// from it (`payerOf`).
 pub const Budget = struct {
     queries: u32 = 0,
+    /// A question's end is its deadline too: the key fetches its walk
+    /// began stop with it.
     deadline_ns: i64,
+    /// The roots sharing it: a question and the key fetches its walk began.
+    refs: u32 = 1,
     /// When a refresh began; 0 for a client.
     refresh_ns: i64 = 0,
     unminimised: walk.Unminimised = .{},
@@ -224,7 +230,7 @@ pub const Budget = struct {
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
     clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, hit: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
-    resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, retry: u64 = 0, refresh: u64 = 0, refused: u64 = 0 } = .{},
+    resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, retry: u64 = 0, refresh: u64 = 0, keys: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
 
@@ -290,6 +296,7 @@ pub const Scratch = union(enum) {
     dnskey: *trust.DnskeyScratch,
     secure: *trust.SecureScratch,
     exchange: *ExchangeScratch,
+    keys: *trust.KeysScratch,
 
     fn init(kind: Kind, arena: Allocator) !Scratch {
         return switch (kind) {
@@ -407,7 +414,7 @@ pub const Graph = struct {
                 c.inputs.deinit(g.gpa);
                 c.waiters.deinit(g.gpa);
                 if (c.blob) |bl| g.store.unref(bl);
-                if (budgetOf(c)) |b| g.gpa.destroy(b);
+                if (budgetOf(c)) |b| g.unref(b);
                 c.arena.deinit();
             }
             g.gpa.destroy(c);
@@ -469,6 +476,22 @@ pub const Graph = struct {
     pub fn unhold(g: *Graph, id: CellId) void {
         g.cell(id).holds -= 1;
         g.release(id);
+    }
+
+    /// `dnskey(zone)` fetched ahead of need for a question's own walk, on
+    /// its payer; one per zone at a time, holding itself until it settles.
+    pub fn fetchKeys(g: *Graph, by: CellId, zone: dns.Name) !void {
+        if (g.spent(g.payer) or g.level(by) > 0) return;
+        const key = try g.keyFor(.keys, zone, .a);
+        if (g.index.contains(key)) return;
+        const id = try g.newCell(key, zone);
+        g.cell(id).scratch.keys.budget = g.payer;
+        g.payer.refs += 1;
+        g.cell(id).holds += 1;
+        errdefer g.unhold(id);
+        try g.ready.append(g.gpa, id);
+        g.stats.resolver.keys += 1;
+        if (g.cfg.trace) std.debug.print("  keys {s}\n", .{key.name});
     }
 
     /// One per key at a time; holds itself until it settles.
@@ -672,8 +695,9 @@ pub const Graph = struct {
             _ = g.index.remove(c.key);
         };
         if (budgetOf(c)) |b| {
-            g.gpa.destroy(b);
-            g.budgets -= 1;
+            // A question gone, the key fetches its walk began end too.
+            if (c.scratch == .answer) b.deadline_ns = @min(b.deadline_ns, g.now());
+            g.unref(b);
         }
         c.arena.deinit();
         c.arena = std.heap.ArenaAllocator.init(g.gpa);
@@ -712,7 +736,7 @@ pub const Graph = struct {
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
                 if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, c.expires_ns);
             },
-            .answer, .exchange, .refresh => {},
+            .answer, .exchange, .refresh, .keys => {},
         }
         try g.woken(id, value == .answer);
     }
@@ -741,8 +765,8 @@ pub const Graph = struct {
             for (c.inputs.items) |i| g.unpin(i, id);
             c.inputs.clearRetainingCapacity();
         }
-        // The run's hold still pins a refresh; one release, below.
-        if (c.key.kind == .refresh) c.holds -= 1;
+        // The run's hold still pins a self-held root; one release, below.
+        if (c.key.kind == .refresh or c.key.kind == .keys) c.holds -= 1;
         g.release(id);
     }
 
@@ -888,8 +912,16 @@ pub const Graph = struct {
     fn budgetOf(c: *const Cell) ?*Budget {
         return switch (c.scratch) {
             .answer => |a| a.budget,
+            .keys => |k| k.budget,
             else => null,
         };
+    }
+
+    fn unref(g: *Graph, b: *Budget) void {
+        b.refs -= 1;
+        if (b.refs > 0) return;
+        g.gpa.destroy(b);
+        g.budgets -= 1;
     }
 
     pub fn spent(g: *const Graph, b: *const Budget) bool {
@@ -990,6 +1022,7 @@ pub const Graph = struct {
             .ds => try trust.runDs(g, id),
             .dnskey => try trust.runDnskey(g, id),
             .secure => try trust.runSecure(g, id),
+            .keys => try trust.runKeys(g, id),
             .exchange => {},
         }
     }

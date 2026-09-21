@@ -145,6 +145,23 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     }
 }
 
+pub const KeysScratch = struct {
+    /// The payer of the walk that met the delegation, shared.
+    budget: *graph.Budget = undefined,
+    keys: ?CellId = null,
+};
+
+/// `keys(zone)`: a root with no fact of its own, holding `dnskey(zone)`
+/// until it settles, so the chain of trust overlaps the walk below
+/// (Unbound's prefetch-key).
+pub fn runKeys(g: *Graph, id: CellId) !void {
+    const s = g.cell(id).scratch.keys;
+    const zone = g.cell(id).name;
+    if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, zone, .a), zone) orelse
+        return g.settle(id, .keys, g.now());
+    if (g.cell(s.keys.?).settled()) try g.settle(id, .keys, g.now());
+}
+
 /// Every cut from `zone` up is proven secure or, unproven yet, delegated
 /// with a DS, to the root or to a cut proven secure.
 pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
