@@ -363,11 +363,16 @@ fn firstOfRrset(rrs: []const RR, i: usize) bool {
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !graph.Reply {
     var keep: std.ArrayList(RR) = .empty;
     var ttl: u32 = std.math.maxInt(u32);
+    var any = false;
     for (msg.authorities) |rr| if (rr.name.eql(child) and (rr.rtype == .ds or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds))) {
         try keep.append(g.scratch.allocator(), rr);
-        if (rr.rtype == .ds) ttl = @min(ttl, rr.ttl);
+        if (rr.rtype == .ds) {
+            ttl = @min(ttl, rr.ttl);
+            any = true;
+        }
     };
-    if (keep.items.len > 0) return .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    // Signatures over no DS are no answer.
+    if (any) return .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
     ttl = 0;
     for (msg.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
         ttl = if (ttl == 0) rr.ttl else @min(ttl, rr.ttl);
