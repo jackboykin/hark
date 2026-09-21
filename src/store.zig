@@ -218,7 +218,7 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
-                try w.int(u8, @intFromBool(c.stop) | @as(u8, @intFromBool(c.failed)) << 1);
+                try w.int(u8, @intFromBool(c.stop));
                 try w.int(u8, c.probes);
                 try w.addrs(c.addrs);
             },
@@ -249,12 +249,7 @@ pub const Store = struct {
                 try w.int(u16, @intCast(c.records.len));
                 try w.records(c.records);
             },
-            // A failed answer alone, for its SERVFAIL window.
-            .answer => |a| {
-                try w.int(u8, @backingInt(a.status));
-                try w.int(u8, @intFromBool(a.broken));
-            },
-            .secure, .exchange, .refresh => unreachable,
+            .answer, .secure, .exchange, .refresh => unreachable,
         }
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
@@ -270,7 +265,7 @@ pub const Store = struct {
             .cut => blk: {
                 const zone = try r.name();
                 const flags = try r.int(u8);
-                break :blk .{ .cut = .{ .zone = zone, .stop = flags & 1 != 0, .failed = flags & 2 != 0, .probes = try r.int(u8), .addrs = try r.addrs() } };
+                break :blk .{ .cut = .{ .zone = zone, .stop = flags & 1 != 0, .probes = try r.int(u8), .addrs = try r.addrs() } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
@@ -309,11 +304,7 @@ pub const Store = struct {
                 c.records = try r.records(try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
-            .answer => blk: {
-                const status: dnssec.SecurityStatus = @fromBackingInt(@as(u2, @intCast(try r.int(u8))));
-                break :blk .{ .answer = .{ .hops = &.{}, .status = status, .broken = try r.int(u8) != 0 } };
-            },
-            .secure, .exchange, .refresh => unreachable,
+            .answer, .secure, .exchange, .refresh => unreachable,
         };
     }
 };
@@ -353,19 +344,14 @@ const Writer = struct {
     }
 };
 
-/// Read in place, no parse.
-pub const RrsetLife = struct { servfail: bool, expires_ns: i64 };
-
-pub fn rrsetLife(b: *Blob) !RrsetLife {
+/// When the reply's own TTL ends, read in place, no parse.
+pub fn rrsetExpiry(b: *Blob) !i64 {
     if (b.kind != @backingInt(Kind.rrset)) return error.EndOfData;
     var r: Reader = .{ .buf = b.payload(), .arena = undefined };
-    const kind = try r.int(u8);
-    _ = try r.int(u8);
-    _ = try r.int(u8);
-    _ = try r.int(u16);
+    _ = try r.slice(5);
     const ttl = try r.int(u32);
     const stored_ns = try r.int(i64);
-    return .{ .servfail = kind == @backingInt(@as(@FieldType(graph.Reply, "kind"), .servfail)), .expires_ns = stored_ns + @as(i64, ttl) * std.time.ns_per_s };
+    return stored_ns + @as(i64, ttl) * std.time.ns_per_s;
 }
 
 const Reader = struct {
@@ -477,7 +463,7 @@ test "a fact survives the blob byte for byte" {
     const cut_blob = try s.build(.{ .cut = .{ .zone = zone, .stop = true, .probes = 3 } });
     defer s.unref(cut_blob);
     const cut = (try Store.parse(arena, cut_blob)).cut;
-    try testing.expect(cut.zone.eqlExact(zone) and cut.stop and !cut.failed and cut.probes == 3);
+    try testing.expect(cut.zone.eqlExact(zone) and cut.stop and cut.probes == 3);
 }
 
 test "the cap holds by eviction and admission" {

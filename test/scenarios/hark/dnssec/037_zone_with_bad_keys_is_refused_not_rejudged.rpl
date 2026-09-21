@@ -1,0 +1,126 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a zone whose keys fail validation is refused for the window, not judged per question
+
+; RFC 9520 §3.4: validation failures are cached. Bogus keys are no fact, so
+; they are not stored; the zone is refused chain work for servfail-ttl
+; instead. Without it every new name under a zone with bad keys fetches
+; and verifies the keys again: KeyTrap's lever, one question at a time.
+;
+; The DS is static (key tag 1) and matches no DNSKEY (029's shape). a and b
+; are two questions inside the window: one DNSKEY fetch between them. c,
+; after the window, fetches the keys again.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS 1 13 2 0000000000000000000000000000000000000000000000000000000000000000
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.example. IN A
+    SECTION ANSWER
+      a.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.example. IN A
+    SECTION ANSWER
+      b.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.example. IN A
+    SECTION ANSWER
+      c.example. 3600 IN A 192.0.2.3
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    b.example. IN A
+ENTRY_END
+
+; . DNSKEY, a at the root, a and example. DNSKEY at the child, then b alone.
+STEP 5 CHECK_MAX_QUERIES 5
+
+STEP 6 TIME_PASSES ELAPSE 10
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    c.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    c.example. IN A
+ENTRY_END
+
+STEP 9 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    example. DNSKEY 127.0.10.2
+    example. DNSKEY 127.0.10.2
+ENTRY_END
+
+SCENARIO_END

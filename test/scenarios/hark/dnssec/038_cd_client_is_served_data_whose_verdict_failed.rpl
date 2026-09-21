@@ -1,0 +1,74 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a CD client is served data whose verdict failed
+
+; A failed verdict is bogus and proves nothing: a CD client still gets the
+; data (RFC 4035 §3.2.2), with TTLs bounded by no proof. The failed
+; `secure` cell has no value to read; reading it crashed the server.
+; 036's forgery, never mended, asked with CD twice.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 604800 IN A 192.0.2.66
+      ; Hand-declared, so the harness does not sign over it: key_tag 1
+      ; matches no DNSKEY in example.'s generated set.
+      www.example. 604800 IN RRSIG A 13 2 604800 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+RANGE_END
+
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO CD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA CD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+STEP 3 TIME_PASSES ELAPSE 1
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO CD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA CD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+SCENARIO_END

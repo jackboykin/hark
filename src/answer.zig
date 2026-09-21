@@ -93,22 +93,36 @@ pub fn hinfo(arena: Allocator, q: dns.Question, c: Client) !Served {
     } };
 }
 
-/// The answer cell shaped for a client: bogus is SERVFAIL unless CD, a
-/// verified hop's TTLs end with its proof, signatures only to DO, AD only
-/// when asked (RFC 6840 §5.7). `cached`: settled from memory alone.
-pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool, cached: bool) !Served {
+/// SERVFAIL, and why.
+pub fn servfail(arena: Allocator, q: dns.Question, c: Client, ede: dns.Ede) !Served {
+    return .{ .cacheable = false, .ede = ede, .msg = .{
+        .header = .{ .id = 0, .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = c.rd, .ra = true, .z = 0, .ad = false, .cd = c.cd, .rcode = .server_failure } },
+        .questions = try arena.dupe(dns.Question, &.{q}),
+    } };
+}
+
+/// The answer cell shaped for a client: a failure or bogus is SERVFAIL,
+/// bogus data only to CD; a verified hop's TTLs end with its proof,
+/// signatures only to DO, AD only when asked (RFC 6840 §5.7).
+pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
+    if (g.cell(root).failure) |why| return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
     const a = g.cell(root).value.answer;
+    if (a.status == .bogus and !c.cd) {
+        const why = a.why orelse graph.Failure{ .code = .dnssec_bogus };
+        return servfail(arena, q, c, .{ .code = why.code, .text = why.text });
+    }
+    std.debug.assert(a.hops.len > 0);
     var chain: std.ArrayList(dns.ResourceRecord) = .empty;
-    var last: graph.Reply = .{ .kind = .servfail, .rcode = .server_failure, .aa = false };
+    var last: graph.Reply = undefined;
     var age: u32 = 0;
     var life: u32 = std.math.maxInt(u32);
-    const served = !a.broken and (a.status != .bogus or c.cd);
     var stale = false;
-    if (served) for (a.hops, 0..) |h, i| {
+    for (a.hops, 0..) |h, i| {
         last = if (a.stale.len > i and a.stale[i] != null) a.stale[i].?.* else g.cell(h).value.rrset;
         age = @intCast(@divTrunc(g.now() - last.stored_ns, std.time.ns_per_s));
         life = std.math.maxInt(u32);
-        if (i < a.judged.len) {
+        // A failed verdict proved nothing, so it bounds nothing (CD only).
+        if (i < a.judged.len and g.cell(a.judged[i]).failure == null) {
             const proven = g.cell(a.judged[i]).value.secure.proven_until_ns;
             life = @intCast(@min(@max(@divTrunc(proven - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
         }
@@ -120,7 +134,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
             life = walk.stale_hold_s;
         }
         try appendAged(arena, &chain, last.answers, age, life, @min(g.cfg.min_ttl, last.ttl), c.do_bit, hop_stale);
-    };
+    }
     const positive = last.kind == .answer or last.kind == .alias;
     var authorities: std.ArrayList(dns.ResourceRecord) = .empty;
     var additionals: std.ArrayList(dns.ResourceRecord) = .empty;
@@ -129,13 +143,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
         try appendAged(arena, &authorities, last.authorities, age, life, floor, c.do_bit, last.ede == .stale_answer);
         try appendAged(arena, &additionals, last.additionals, age, life, floor, c.do_bit, last.ede == .stale_answer);
     }
-    const ede: ?dns.Ede = if (a.broken)
-        .{ .code = .other, .text = "cname loop" }
-    else if (!served)
-        .{ .code = .dnssec_bogus }
-    else if (last.kind == .servfail)
-        .{ .code = if (cached) .cached_error else last.ede orelse .no_reachable_authority }
-    else if (stale) // any hop: a stale alias still redirected
+    const ede: ?dns.Ede = if (stale) // any hop: a stale alias still redirected
         .{ .code = if (last.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
     else if (last.ede) |code|
         .{ .code = code }
@@ -150,9 +158,9 @@ pub fn build(arena: Allocator, g: *graph.Graph, root: graph.CellId, q: dns.Quest
             .rd = c.rd,
             .ra = true,
             .z = 0,
-            .ad = served and a.status == .secure and (c.do_bit or c.ad),
+            .ad = a.status == .secure and (c.do_bit or c.ad),
             .cd = c.cd,
-            .rcode = if (last.kind == .servfail) last.rcode else if (last.kind == .nxdomain) .name_error else .no_error,
+            .rcode = last.rcode,
         } },
         .questions = try arena.dupe(dns.Question, &.{q}),
         .answers = chain.items,
@@ -170,4 +178,95 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.ResourceRecord), rrs: []
         aged.ttl = if (stale and rr.ttl <= age) walk.stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
     }
+}
+
+/// RFC 9520 §3.2's failure cache: a question that failed is answered here,
+/// asking nobody, for a window that doubles while it keeps failing, to the
+/// RFC's 5 minutes; an answer forgets it. Keyed (qname, qtype, CD), since a
+/// CD client is owed bogus data. Policy over no fact, so it is the server's.
+pub const Failures = struct {
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+
+    const Entry = struct { until_ns: i64, window_s: u32, ede: dns.Ede };
+    const max_window_s = 300;
+    const max_entries = 4096;
+
+    pub fn deinit(f: *Failures, gpa: Allocator) void {
+        var it = f.map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        f.map.deinit(gpa);
+    }
+
+    fn key(buf: *[dns.max_dotted_len + 4]u8, q: dns.Question, cd: bool) []const u8 {
+        const name = q.name.formatLower(buf[0 .. dns.max_dotted_len + 1]);
+        std.mem.writeInt(u16, buf[name.len..][0..2], @backingInt(q.qtype), .little);
+        buf[name.len + 2] = @intFromBool(cd);
+        return buf[0 .. name.len + 3];
+    }
+
+    /// The EDE to answer with while the window lasts. A validation failure
+    /// keeps its reason; anything else is RFC 8914's cached error.
+    pub fn get(f: *Failures, q: dns.Question, cd: bool, now_ns: i64) ?dns.Ede {
+        if (f.map.count() == 0) return null;
+        var buf: [dns.max_dotted_len + 4]u8 = undefined;
+        const e = f.map.get(key(&buf, q, cd)) orelse return null;
+        if (e.until_ns <= now_ns) return null;
+        return if (e.ede.code == .dnssec_bogus) e.ede else .{ .code = .cached_error };
+    }
+
+    /// Every reply the graph shaped for `q`: a SERVFAIL opens or widens the
+    /// window, anything else closes it.
+    pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
+        var buf: [dns.max_dotted_len + 4]u8 = undefined;
+        const k = key(&buf, q, cd);
+        if (served.msg.header.flags.rcode != .server_failure) {
+            if (f.map.count() > 0) if (f.map.fetchRemove(k)) |kv| gpa.free(kv.key);
+            return;
+        }
+        const ede = served.ede orelse dns.Ede{ .code = .other };
+        if (f.map.getPtr(k)) |e| {
+            // Every client waiting on one failure notes it: once is enough.
+            if (now_ns < e.until_ns) return;
+            // Failing again within a window of the last lapsing: back off.
+            const again = now_ns < e.until_ns + @as(i64, e.window_s) * std.time.ns_per_s;
+            e.window_s = if (again) @min(e.window_s * 2, max_window_s) else first_s;
+            e.until_ns = now_ns + @as(i64, e.window_s) * std.time.ns_per_s;
+            e.ede = ede;
+            return;
+        }
+        if (first_s == 0) return;
+        if (f.map.count() >= max_entries) {
+            var it = f.map.keyIterator();
+            const old = it.next().?.*;
+            _ = f.map.remove(old);
+            gpa.free(old);
+        }
+        const own = try gpa.dupe(u8, k);
+        errdefer gpa.free(own);
+        try f.map.put(gpa, own, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .window_s = first_s, .ede = ede });
+    }
+};
+
+test "a failure is remembered, backs off while it persists, and an answer forgets it" {
+    const testing = std.testing;
+    var f: Failures = .{};
+    defer f.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const q: dns.Question = .{ .name = try dns.parseDottedName(arena.allocator(), "Example."), .qtype = .a, .qclass = .in };
+    const s = std.time.ns_per_s;
+    const failed = try servfail(arena.allocator(), q, .{}, .{ .code = .no_reachable_authority });
+    try f.note(testing.allocator, q, false, failed, 5, 0);
+    try testing.expectEqual(dns.Ede.Code.cached_error, f.get(q, false, 4 * s).?.code);
+    try testing.expectEqual(null, f.get(q, true, 4 * s));
+    try testing.expectEqual(null, f.get(q, false, 5 * s));
+    try f.note(testing.allocator, q, false, failed, 5, 6 * s);
+    // Clients that shared the failure note it at the same instant.
+    try f.note(testing.allocator, q, false, failed, 5, 6 * s);
+    try testing.expect(f.get(q, false, 15 * s) != null);
+    try testing.expectEqual(null, f.get(q, false, 16 * s));
+    var ok = failed;
+    ok.msg.header.flags.rcode = .no_error;
+    try f.note(testing.allocator, q, false, ok, 5, 17 * s);
+    try testing.expectEqual(0, f.map.count());
 }

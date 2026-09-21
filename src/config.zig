@@ -73,7 +73,8 @@ pub const ServerConfig = struct {
     prefetch: bool,
     serve_stale_ttl: u32,
     min_ttl: u32,
-    bogus_ttl: u32,
+    /// The first window a failed question is answered from memory (RFC 9520 §3.2).
+    servfail_ttl: u32,
     dnssec: bool,
     qname_minimization: bool,
     dns64: ?dns64.Prefix,
@@ -188,7 +189,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .prefetch = false,
         .serve_stale_ttl = 0,
         .min_ttl = 0,
-        .bogus_ttl = 5,
+        .servfail_ttl = 5,
         .dnssec = true,
         .qname_minimization = true,
         .dns64 = null,
@@ -251,7 +252,7 @@ const config_schema = [_]SectionSpec{
         .{ .name = "prefetch", .kind = .boolean },
         .{ .name = "serve-stale-ttl", .kind = .integer },
         .{ .name = "min-ttl", .kind = .integer },
-        .{ .name = "bogus-ttl", .kind = .integer },
+        .{ .name = "servfail-ttl", .kind = .integer },
     } },
     .{ .name = "logging", .keys = &.{
         .{ .name = "queries", .kind = .boolean },
@@ -463,7 +464,14 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
         if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
-        if (try nonNegative(u32, cache, "bogus-ttl")) |v| cfg.bogus_ttl = v;
+        if (try nonNegative(u32, cache, "servfail-ttl")) |v| {
+            // RFC 9520 §3.2: a failure is remembered no longer than 5 minutes.
+            if (v > 300) {
+                errLog("config: servfail-ttl must not exceed 300", .{});
+                return error.InvalidValue;
+            }
+            cfg.servfail_ttl = v;
+        }
     }
 
     if (parsed.table.getTable("logging")) |logging| {
@@ -759,14 +767,14 @@ test "cache prefetch and stale config" {
         \\prefetch = true
         \\serve-stale-ttl = 3600
         \\min-ttl = 300
-        \\bogus-ttl = 7
+        \\servfail-ttl = 7
     );
     defer cfg.deinit();
 
     try testing.expectEqual(true, cfg.prefetch);
     try testing.expectEqual(@as(u32, 3600), cfg.serve_stale_ttl);
     try testing.expectEqual(@as(u32, 300), cfg.min_ttl);
-    try testing.expectEqual(@as(u32, 7), cfg.bogus_ttl);
+    try testing.expectEqual(@as(u32, 7), cfg.servfail_ttl);
 }
 
 test "tcp idle and queries knobs parse and validate" {

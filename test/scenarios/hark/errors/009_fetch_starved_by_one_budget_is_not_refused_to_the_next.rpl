@@ -1,0 +1,110 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: max-queries = 5
+
+SCENARIO_BEGIN a fetch starved by one client's budget is not refused to the next
+
+; A failed upstream fetch is remembered for servfail-ttl (RFC 9520 §3.2),
+; but only when the failure says something about the zone. Client 1's
+; CNAME leads into www.victim, whose unglued NS needs its own walk; the
+; budget (max-queries = 5) runs out down there, so the victim's own ask
+; never sees a refused exchange and ends exhausted. Remembering that
+; failure would SERVFAIL client 2, on a fresh budget, for the window.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil. IN A
+    SECTION AUTHORITY
+      evil. 3600 IN NS ns.evil.
+    SECTION ADDITIONAL
+      ns.evil. 3600 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      victim. IN A
+    SECTION AUTHORITY
+      victim. 3600 IN NS ns.other.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.other.
+    SECTION ADDITIONAL
+      ns.other. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.evil. IN A
+    SECTION ANSWER
+      www.evil. 3600 IN CNAME www.victim.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.other. IN A
+    SECTION ANSWER
+      ns.other. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.victim. IN A
+    SECTION ANSWER
+      www.victim. 3600 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.evil. IN A
+ENTRY_END
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.evil. IN A
+ENTRY_END
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+SCENARIO_END

@@ -1,8 +1,9 @@
 //! The resolver as a graph of typed DNS facts.
 //!
 //! A cell is a fact with a TTL: a zone cut, an NS set, a host's addresses,
-//! an RRset, or one exchange with a server. A rule settles a cell kind; it
-//! runs when the cell is first demanded and again whenever an input settles.
+//! an RRset, or one exchange with a server; or a failure, which is none.
+//! A rule settles a cell kind; it runs when the cell is first demanded and
+//! again whenever an input settles.
 //! Rules are pure over their inputs, scratch, now and rng; the exchange cell
 //! is the only impure leaf, settled by the edge.
 //!
@@ -108,14 +109,13 @@ pub const Config = struct {
     max_in_flight: u32 = 1024,
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
+    /// The first window a failure is remembered: by the server per
+    /// question, by trust per zone (RFC 9520 §3.2).
     servfail_ttl: u32 = 5,
     /// Serve an expired fact this long past expiry while its refresh fails; 0: never.
     serve_stale_ttl: u32 = 0,
     /// Floor for every TTL but zero (`walk.replyTtl`).
     min_ttl: u32 = 0,
-    /// Lifetime of an RRset judged bogus: its own TTL is untrusted, so one
-    /// is assigned (RFC 4035 §4.7).
-    bogus_ttl: u32 = 5,
     /// Refresh a fact hit just before it expires.
     prefetch: bool = false,
     /// Null: DNSSEC off, nothing is judged.
@@ -134,8 +134,6 @@ pub const Cut = struct {
     stop: bool = false,
     /// Minimised steps so far (`max_minimize_count`).
     probes: u8 = 0,
-    /// Every parent server failed the probe.
-    failed: bool = false,
     /// The referral's glue: asked before the addr cells, whatever its TTL.
     addrs: []const na.Address = &.{},
 };
@@ -153,7 +151,7 @@ pub const Addr = struct {
 /// The RRset at (name, type), as the reply sections that settled it, so
 /// the client sees what the authority said.
 pub const Reply = struct {
-    kind: enum { answer, alias, nodata, nxdomain, servfail },
+    kind: enum { answer, alias, nodata, nxdomain, yxdomain },
     rcode: dns.RCode,
     aa: bool,
     answers: []const dns.ResourceRecord = &.{},
@@ -175,10 +173,10 @@ pub const Reply = struct {
 pub const Answer = struct {
     /// In chain order; every one but the last is an alias.
     hops: []const CellId,
-    /// Looped or outran `max_cname_chain`: served as SERVFAIL.
-    broken: bool = false,
     /// The weakest `secure(hop)` verdict; `.unchecked` with DNSSEC off.
+    /// `.bogus` is a verdict that failed (RFC 4035 §4.3), for `why`.
     status: dnssec.SecurityStatus = .unchecked,
+    why: ?Failure = null,
     /// `secure(hop)` per hop; empty with DNSSEC off.
     judged: []const CellId = &.{},
     /// Per hop, a stale stand-in for a failed one; this cell's alone.
@@ -192,8 +190,14 @@ pub const Outcome = union(enum) {
     mismatch,
     /// Same name, different bytes: the server mangles case; retry over TCP.
     mangled,
-    /// Refused by the root's query budget or deadline.
-    budget,
+};
+
+/// Why a cell settled on no fact: nothing about the DNS, so it is never
+/// stored and expires as it settles. Its demanders read it; the next
+/// demand starts afresh, and remembering it is the server's policy.
+pub const Failure = struct {
+    code: dns.Ede.Code,
+    text: []const u8 = "",
 };
 
 pub const Value = union(Kind) {
@@ -226,6 +230,8 @@ pub const Stats = struct {
     resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, retry: u64 = 0, refresh: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
+
+const max_failed = 4096;
 
 /// BIND's `prefetch 2`.
 pub const refresh_window_ns = 2 * std.time.ns_per_s;
@@ -309,7 +315,9 @@ pub const Cell = struct {
     gen: u32 = 0,
     /// The cycle check that last walked through here.
     seen: u64 = 0,
+    /// Settled: exactly one of the two.
     value: Value = undefined,
+    failure: ?Failure = null,
     expires_ns: i64 = 0,
     waiters: std.ArrayList(CellId) = .empty,
     /// Unpinned at settle; an answer's at free.
@@ -348,6 +356,10 @@ pub const Graph = struct {
     budgets: u32 = 0,
     /// Exchanges the edge holds.
     flights: u32 = 0,
+    /// Work that failed, until when it is refused rather than tried again
+    /// (RFC 9520 §3.2): an upstream fetch by its `rrset` key, a zone's
+    /// chain of trust by its `ds` key. Policy, outside cells.
+    failed: std.HashMapUnmanaged(Key, i64, Key.Context, 80) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
     /// Live cells only.
@@ -387,6 +399,9 @@ pub const Graph = struct {
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
+        var it = g.failed.keyIterator();
+        while (it.next()) |k| g.gpa.free(k.name);
+        g.failed.deinit(g.gpa);
         g.denial.deinit(g.gpa);
         g.store.deinit();
     }
@@ -409,11 +424,9 @@ pub const Graph = struct {
         return .{ .kind = kind, .rtype = rtype, .name = try g.scratch.allocator().dupe(u8, name.formatLower(&buf)) };
     }
 
-    /// Held for the client until `unhold`. A failed answer is memoised for
-    /// its SERVFAIL window, not for a client with CD, who is owed the data.
-    /// Null: new work past `max_in_flight`, or anything unsettled for a
-    /// caller that cannot `wait`; what is in the store is always served.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, cd: bool, wait: bool) !?CellId {
+    /// Held for the client until `unhold`. Null: new work past
+    /// `max_in_flight`, or anything unsettled for a caller that cannot `wait`.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
         const key = try g.keyFor(.answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled or g.fresh(id)) {
             if (!wait and !g.cell(id).settled) {
@@ -423,18 +436,16 @@ pub const Graph = struct {
             g.cell(id).holds += 1;
             return id;
         };
-        const budget = try g.gpa.create(Budget);
-        budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
-        const memo = if (cd) null else g.store.get(key, g.now());
-        if (memo == null and (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight)) {
+        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight) {
             g.stats.clients.dropped += 1;
-            g.gpa.destroy(budget);
             return null;
         }
-        const id = if (memo) |e| try g.materialise(key, name, budget, e) else try g.newCell(key, name, budget, 0);
+        const budget = try g.gpa.create(Budget);
+        budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
+        const id = try g.newCell(key, name, budget, 0);
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
-        if (memo == null) try g.ready.append(g.gpa, id);
+        try g.ready.append(g.gpa, id);
         return id;
     }
 
@@ -678,33 +689,66 @@ pub const Graph = struct {
                 };
             },
             .secure => |v| {
-                switch (v.status) {
-                    .secure => g.stats.trust.secure += 1,
-                    .insecure => g.stats.trust.insecure += 1,
-                    .bogus, .unchecked => g.stats.trust.bogus += 1,
-                }
-                // Bogus bytes carry no trustworthy TTL: the fact they are
-                // now lives on the assigned one, and so does its verdict.
-                const t = g.cell(c.scratch.secure.target);
-                if (v.status == .bogus) {
-                    c.expires_ns = @min(expires_ns, g.now() + @as(i64, g.cfg.bogus_ttl) * std.time.ns_per_s);
-                    t.expires_ns = @min(t.expires_ns, c.expires_ns);
-                    if (t.blob) |b| g.store.shorten(t.key, b, c.expires_ns);
-                }
-                if (t.blob) |b| b.verdict.stamp(v, c.expires_ns);
+                if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
+                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, c.expires_ns);
             },
-            .answer => |a| if (a.broken or a.status == .bogus) try g.fact(c.key, value, expires_ns),
-            .exchange, .refresh => {},
+            .answer, .exchange, .refresh => {},
         }
+        try g.woken(id, value == .answer);
+    }
+
+    /// Settles on no fact (`Failure`): nothing is stored, nothing outlives
+    /// this instant but what its demanders read now.
+    pub fn fail(g: *Graph, id: CellId, why: Failure) !void {
+        const c = g.cell(id);
+        std.debug.assert(!c.settled);
+        g.tally.settles += 1;
+        if (g.cfg.trace) {
+            var nb: [dns.max_dotted_len + 1]u8 = undefined;
+            std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
+        }
+        if (c.key.kind == .secure) g.stats.trust.bogus += 1;
+        c.settled = true;
+        c.failure = why;
+        c.expires_ns = g.now();
+        try g.woken(id, false);
+    }
+
+    fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
+        const c = g.cell(id);
         try g.ready.appendSlice(g.gpa, c.waiters.items);
         // An answer serves from its hops; everything else has copied out.
-        if (value != .answer) {
+        if (!keep_inputs) {
             for (c.inputs.items) |i| g.unpin(i, id);
             c.inputs.clearRetainingCapacity();
         }
         // The run's hold still pins a refresh; one release, below.
         if (c.key.kind == .refresh) c.holds -= 1;
         g.release(id);
+    }
+
+    /// Refuse `key`'s work for `servfail_ttl`; past `max_failed` keys an
+    /// arbitrary other one is forgotten.
+    pub fn remember(g: *Graph, key: Key) !void {
+        const until = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
+        if (g.failed.getPtr(key)) |u| {
+            u.* = until;
+            return;
+        }
+        if (g.failed.count() >= max_failed) {
+            var it = g.failed.keyIterator();
+            const old = it.next().?.*;
+            _ = g.failed.remove(old);
+            g.gpa.free(old.name);
+        }
+        const own: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try g.gpa.dupe(u8, key.name) };
+        errdefer g.gpa.free(own.name);
+        try g.failed.put(g.gpa, own, until);
+    }
+
+    pub fn refusing(g: *Graph, key: Key) bool {
+        if (g.failed.count() == 0) return false;
+        return (g.failed.get(key) orelse return false) > g.now();
     }
 
     pub fn fresh(g: *Graph, id: CellId) bool {
@@ -874,19 +918,19 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
-    /// `.budget` when the asker's budget, deadline or orphaning refuses it.
-    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !CellId {
+    /// Null, like `demand`, when the asker's budget, deadline or orphaning
+    /// refuses the work.
+    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
         const budget = g.cell(by).budget;
-        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, budget, g.cell(by).depth);
-        try g.pin(id, by);
         if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
                 std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, if (g.cell(by).orphan) "orphan" else if (g.now() >= budget.deadline_ns) "past the deadline" else "query budget spent" });
             }
-            try g.settle(id, .{ .exchange = .budget }, g.now());
-            return id;
+            return null;
         }
+        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, budget, g.cell(by).depth);
+        try g.pin(id, by);
         budget.queries += 1;
         g.cell(id).holds += 1;
         const clock = Tally.clock(&g.tally.send_ns);
@@ -933,9 +977,9 @@ test "a cell replacing an expired one takes over the index entry's key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    const first = (try g.demandRoot(name, .a, false, true)).?;
+    const first = (try g.demandRoot(name, .a, true)).?;
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now);
-    const second = (try g.demandRoot(name, .a, false, true)).?;
+    const second = (try g.demandRoot(name, .a, true)).?;
     try testing.expect(first != second);
     g.unhold(first);
     try testing.expect(!g.cell(first).live);
@@ -960,12 +1004,12 @@ test "a caller that cannot wait gets only what is settled" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    try testing.expectEqual(null, try g.demandRoot(name, .a, false, false));
-    const first = (try g.demandRoot(name, .a, false, true)).?;
-    try testing.expectEqual(null, try g.demandRoot(name, .a, false, false));
+    try testing.expectEqual(null, try g.demandRoot(name, .a, false));
+    const first = (try g.demandRoot(name, .a, true)).?;
+    try testing.expectEqual(null, try g.demandRoot(name, .a, false));
     try testing.expectEqual(@as(u64, 2), g.stats.clients.dropped);
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now + std.time.ns_per_s);
-    try testing.expectEqual(first, (try g.demandRoot(name, .a, false, false)).?);
+    try testing.expectEqual(first, (try g.demandRoot(name, .a, false)).?);
     g.unhold(first);
     g.unhold(first);
 }
@@ -985,7 +1029,7 @@ test "an evicted root cut is re-derived, not walked" {
     g.store.remove(root_cut);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, false, true)).?;
+    const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, true)).?;
     try g.drain();
     try testing.expect(g.store.get(root_cut, now) != null);
     g.unhold(root);

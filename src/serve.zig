@@ -80,6 +80,7 @@ const Server = struct {
     g: *graph.Graph,
     watched: std.ArrayList(Slot) = .empty,
     pending: std.ArrayList(Pending) = .empty,
+    failures: answer.Failures = .{},
     scratch: std.heap.ArenaAllocator,
     stopping: bool = false,
 
@@ -208,6 +209,7 @@ const Server = struct {
         for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
         for (s.pending.items) |p| s.release(p);
         s.pending.deinit(s.gpa);
+        s.failures.deinit(s.gpa);
         s.watched.deinit(s.gpa);
         s.scratch.deinit();
     }
@@ -262,11 +264,15 @@ const Server = struct {
         const d64 = answer.Dns64.on(s.cfg.dns64, client);
         if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null, s.e.now_ns);
         if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null, s.e.now_ns);
+        if (s.failures.get(q, client.cd, s.e.now_ns)) |ede| {
+            s.g.stats.clients.hit += 1;
+            return s.send(reply, query, (try answer.servfail(arena, q, client, ede)).msg, ede, s.e.now_ns);
+        }
         const asked = if (d64) |d| try d.asked(arena, q) else q;
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
         // `max_in_flight` waiters only what is known is served (DNSBomb).
         const wait = s.pending.items.len < s.g.cfg.max_in_flight;
-        const root = try s.g.demandRoot(asked.name, asked.qtype, client.cd, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
+        const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
@@ -307,20 +313,26 @@ const Server = struct {
         }
     }
 
-    /// The reply once every root it needs has settled.
+    /// The reply once every root it needs has settled, noted in the failure cache.
     fn finish(s: *Server, arena: Allocator, p: *Pending, query: dns.Message) !?answer.Served {
         const q = query.questions[0];
         const client = answer.Client.fromQuery(query);
-        const d64 = answer.Dns64.on(s.cfg.dns64, client) orelse return try answer.build(arena, s.g, p.root, q, client, s.cfg.minimal_responses, p.cached);
-        const served = try answer.build(arena, s.g, p.root, try d64.asked(arena, q), client, s.cfg.minimal_responses, p.cached);
-        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, client.cd, true)) |a| {
+        const served = try s.shape(arena, p, q, client) orelse return null;
+        try s.failures.note(s.gpa, q, client.cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
+        return served;
+    }
+
+    fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
+        const d64 = answer.Dns64.on(s.cfg.dns64, client) orelse return try answer.build(arena, s.g, p.root, q, client, s.cfg.minimal_responses);
+        const served = try answer.build(arena, s.g, p.root, try d64.asked(arena, q), client, s.cfg.minimal_responses);
+        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, true)) |a| {
             p.a = a;
             try s.g.drain();
         };
         var a: ?answer.Served = null;
         if (p.a) |id| {
             if (!s.g.cell(id).settled) return null;
-            a = try answer.build(arena, s.g, id, .{ .name = q.name, .qtype = .a, .qclass = q.qclass }, client, s.cfg.minimal_responses, p.cached);
+            a = try answer.build(arena, s.g, id, .{ .name = q.name, .qtype = .a, .qclass = q.qclass }, client, s.cfg.minimal_responses);
         }
         return try d64.shape(arena, q, served, a);
     }
@@ -457,7 +469,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .store_bytes = cfg.cache_size,
         .serve_stale_ttl = cfg.serve_stale_ttl,
         .min_ttl = cfg.min_ttl,
-        .bogus_ttl = cfg.bogus_ttl,
+        .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
         .max_in_flight = cfg.max_in_flight,
         .trace = trace,

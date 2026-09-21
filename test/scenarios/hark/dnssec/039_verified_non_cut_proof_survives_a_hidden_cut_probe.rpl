@@ -1,0 +1,113 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a verified proof that a name is no cut is not discredited by a hidden-cut probe
+
+; Unsigned AA answers from signed example. probe for a hidden cut one label
+; at a time (tld-servers.ru's shape). a.example is an ordinary name: its
+; signed NODATA for DS is sound and proves no cut there. Treating it as
+; bogus refused a.example as a zone and ended the proof, so the probe for
+; c.a.example asked for a.example DS again.
+;
+; b.a.example and c.a.example are insecure cuts proven by the parent.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      a.example. 3600 IN NSEC b.a.example. A RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.a.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      b.a.example. 3600 IN NSEC z.example. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.a.example. IN A
+    SECTION ANSWER
+      x.b.a.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.a.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      c.a.example. 3600 IN NSEC z.example. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.a.example. IN A
+    SECTION ANSWER
+      y.c.a.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.b.a.example. IN A
+ENTRY_END
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    x.b.a.example. IN A
+ENTRY_END
+STEP 3 TIME_PASSES ELAPSE 10
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    y.c.a.example. IN A
+ENTRY_END
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    y.c.a.example. IN A
+ENTRY_END
+STEP 6 CHECK_MAX_QUERIES 11
+
+SCENARIO_END

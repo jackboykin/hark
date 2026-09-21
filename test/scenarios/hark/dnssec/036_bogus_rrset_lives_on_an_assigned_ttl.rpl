@@ -4,10 +4,10 @@
 
 SCENARIO_BEGIN an RRset that fails validation keeps a small assigned TTL, not its own
 
-; RFC 4035 §4.7: RRsets that fail to validate do not have trustworthy TTLs,
-; so the resolver MUST assign one, and it SHOULD be small. A forged reply
-; carrying a week-long TTL and a bad signature must not SERVFAIL the name
-; from memory for a week; hark assigns bogus-ttl (5 s by default).
+; RFC 4035 §4.7: RRsets that fail to validate do not have trustworthy TTLs.
+; A forged reply carrying a week-long TTL and a bad signature must not
+; SERVFAIL the name from memory for a week: the bytes end with the verdict,
+; and the failure cache answers for servfail-ttl (5 s by default; RFC 9520).
 ;
 ; The child serves the forgery through step 4 and the genuine, signed
 ; record from step 5 on. Every query inside the assigned lifetime is

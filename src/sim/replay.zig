@@ -61,13 +61,15 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     // CHECK_ANSWER reads the held roots' hops.
     var held: Held = .{ null, null };
     defer unholdAll(&g, &held);
+    var failures: answer.Failures = .{};
+    defer failures.deinit(gpa);
     var last: ?dns.Message = null;
     var cursor: usize = 0;
     for (scenario.steps) |st| {
         s.step = st.n;
         report.step = st.n;
         switch (st.kind) {
-            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held) orelse {
+            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &failures) orelse {
                 report.msg = "client timed out";
                 return error.ScenarioFailed;
             }).msg,
@@ -110,7 +112,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         }
     }
     report.phase = .warm;
-    try requery(arena, &g, &s, scenario, report, &held);
+    try requery(arena, &g, &s, scenario, report, &held, &failures);
     // Quiescence: nothing outlives its demand.
     unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
@@ -125,7 +127,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared.
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held) !void {
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, failures: *answer.Failures) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -138,7 +140,7 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held) orelse {
+        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, failures) orelse {
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
@@ -164,36 +166,40 @@ fn unholdAll(g: *graph.Graph, held: *Held) void {
 
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held) !?answer.Served {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, failures: *answer.Failures) !?answer.Served {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     const d64 = answer.Dns64.on(scenario.dns64_prefix, client);
     if (try answer.special(arena, q, client, d64)) |served| return served;
     if (q.qtype == .any) return try answer.hinfo(arena, q, client);
+    if (failures.get(q, client.cd, g.now())) |ede| return try answer.servfail(arena, q, client, ede);
+    const served = try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
+    try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
+    return served;
+}
+
+fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held) !?answer.Served {
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const minimal = scenario.minimal_responses orelse true;
     const asked = if (d64) |d| try d.asked(arena, q) else q;
-    const root = try resolveRoot(g, s, asked, client, deadline) orelse return null;
-    held[0] = root.id;
-    const served = try answer.build(arena, g, root.id, asked, client, minimal, root.cached);
+    const root = try resolveRoot(g, s, asked, deadline) orelse return null;
+    held[0] = root;
+    const served = try answer.build(arena, g, root, asked, client, minimal);
     const d = d64 orelse return served;
     var a: ?answer.Served = null;
     if (answer.Dns64.wantsA(q, served)) {
         const aq: dns.Question = .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
-        const ar = try resolveRoot(g, s, aq, client, deadline) orelse return null;
-        held[1] = ar.id;
-        a = try answer.build(arena, g, ar.id, aq, client, minimal, ar.cached);
+        const ar = try resolveRoot(g, s, aq, deadline) orelse return null;
+        held[1] = ar;
+        a = try answer.build(arena, g, ar, aq, client, minimal);
     }
     return try d.shape(arena, q, served, a);
 }
 
-const Root = struct { id: graph.CellId, cached: bool };
-
-fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, client: answer.Client, deadline: i64) !?Root {
-    const root = (try g.demandRoot(q.name, q.qtype, client.cd, true)).?;
+fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, deadline: i64) !?graph.CellId {
+    const root = (try g.demandRoot(q.name, q.qtype, true)).?;
     try g.drain();
-    const cached = g.cell(root).settled;
     while (!g.cell(root).settled) {
         const ev = s.next(deadline) orelse {
             g.unhold(root);
@@ -201,7 +207,7 @@ fn resolveRoot(g: *graph.Graph, s: *sim.Sim, q: dns.Question, client: answer.Cli
         };
         try g.complete(ev.id, ev.completion);
     }
-    return .{ .id = root, .cached = cached };
+    return root;
 }
 
 fn printSections(m: dns.Message) void {
@@ -474,8 +480,8 @@ test "trace one scenario" {
 test "hark walk scenarios settle to today's answers" {
     // Stale at the client timer is the edge's, not a rule's (2½).
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(109, r.parsed);
-    try testing.expectEqual(105, r.ran);
+    try testing.expectEqual(114, r.parsed);
+    try testing.expectEqual(110, r.ran);
     try testing.expectEqual(0, r.failed);
 }
 
@@ -566,7 +572,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
         defer g.deinit();
         const start = s.now_ns;
-        const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
+        const root = (try g.demandRoot(q.name, q.qtype, true)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -598,7 +604,7 @@ test "a silent sibling is hedged past and still records its timeout" {
         const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
         try g.rtt.put(testing.allocator, ns1, dead);
         if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
-        const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
+        const root = (try g.demandRoot(q.name, q.qtype, true)).?;
         try g.drain();
         while (!g.cell(root).settled) {
             const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
@@ -646,13 +652,13 @@ test "the door counts resolutions and exchanges in flight" {
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_in_flight = 1 }, s.edge());
     defer g.deinit();
-    const root = (try g.demandRoot(q.name, q.qtype, false, true)).?;
+    const root = (try g.demandRoot(q.name, q.qtype, true)).?;
     try g.drain();
     try testing.expectEqual(1, g.budgets);
     try testing.expectEqual(1, g.flights);
     // New work is turned away; the same question joins the one in progress.
-    try testing.expectEqual(null, try g.demandRoot(other, .a, false, true));
-    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, false, true)).?);
+    try testing.expectEqual(null, try g.demandRoot(other, .a, true));
+    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, true)).?);
     try testing.expectEqual(1, g.stats.clients.dropped);
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.flights);
