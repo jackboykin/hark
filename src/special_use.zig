@@ -24,7 +24,6 @@
 const std = @import("std");
 const mem = std.mem;
 const dns = @import("dns.zig");
-const synthesizedMessage = @import("response.zig").synthesizedMessage;
 
 pub const Action = enum {
     none,
@@ -89,14 +88,18 @@ fn eqlOrSubdomainOf(name: []const u8, tail: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name[name.len - tail.len ..], tail);
 }
 
-/// Synthesize a complete dns.Message for the matched action. The returned
-/// records reference allocator-owned memory; caller (the resolver) typically
-/// passes its per-query arena.
+/// hark's own reply to a special-use name.
+pub const Synthesized = struct {
+    rcode: dns.RCode = .no_error,
+    answers: []const dns.ResourceRecord = &.{},
+};
+
+/// The reply for the matched action; records live in `allocator`.
 pub fn synthesize(
     allocator: mem.Allocator,
     name: []const u8,
     action: Action,
-) !dns.Message {
+) !Synthesized {
     std.debug.assert(action != .none);
     // Lowercase the client-typed name so synthesized owners match the
     // `tryParseMessage` scrub policy.
@@ -160,7 +163,7 @@ pub fn synthesize(
         },
     }
 
-    return synthesizedMessage(answers, &.{}, rcode, false);
+    return .{ .rcode = rcode, .answers = answers };
 }
 
 /// Synthetic responses are stable forever — RFC 6761 names cannot be
@@ -226,7 +229,7 @@ test "synthesize localhost A produces 127.0.0.1" {
     defer arena.deinit();
     const msg = try synthesize(arena.allocator(), "localhost.", .localhost_a);
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
-    try testing.expectEqual(dns.RCode.no_error, msg.header.flags.rcode);
+    try testing.expectEqual(dns.RCode.no_error, msg.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
 }
 
@@ -234,6 +237,6 @@ test "synthesize nxdomain has no answers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const msg = try synthesize(arena.allocator(), "invalid.", .nxdomain);
-    try testing.expectEqual(dns.RCode.name_error, msg.header.flags.rcode);
+    try testing.expectEqual(dns.RCode.name_error, msg.rcode);
     try testing.expectEqual(@as(usize, 0), msg.answers.len);
 }

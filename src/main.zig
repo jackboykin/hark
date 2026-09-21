@@ -3,7 +3,7 @@ const build_options = @import("build_options");
 const hark = @import("hark");
 const Io = std.Io;
 
-var log_verbose: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var log_verbose = false;
 
 pub const std_options: std.Options = .{
     .logFn = logFn,
@@ -16,7 +16,7 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (level == .debug and !log_verbose.load(.acquire)) return;
+    if (level == .debug and !log_verbose) return;
 
     const scope_prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     const level_prefix = comptime level.asText() ++ scope_prefix;
@@ -130,7 +130,7 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8, io: Io) !voi
         loadDefaultConfig(allocator, io) catch std.process.exit(1);
 
     if (cli_verbose or cfg.log_queries) {
-        log_verbose.store(true, .release);
+        log_verbose = true;
     }
 
     // A socket per exchange in flight can exceed systemd's default 1024 soft cap.

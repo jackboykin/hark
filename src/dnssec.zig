@@ -213,11 +213,6 @@ pub fn dsExceedsUdp(rrs: []const dns.ResourceRecord) bool {
     return false;
 }
 
-/// DS RDATA: key tag (2), algorithm (1), digest type (1), digest.
-pub fn dsRdataExceedsUdp(rdata: []const u8) bool {
-    return rdata.len > 2 and signatureExceedsUdp(@fromBackingInt(@intCast(rdata[2])));
-}
-
 fn digestSupported(digest_type: dns.DigestType) bool {
     return switch (digest_type) {
         .sha1, .sha256, .sha384 => true,
@@ -1471,20 +1466,6 @@ fn rrsetVerifiesWithAnyKey(
         if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
     }
     return false;
-}
-
-/// A message is no better authenticated than its least authenticated RRset.
-pub fn weakest(a: SecurityStatus, b: SecurityStatus) SecurityStatus {
-    return if (verdictRank(a) <= verdictRank(b)) a else b;
-}
-
-fn verdictRank(s: SecurityStatus) u8 {
-    return switch (s) {
-        .bogus => 0,
-        .unchecked => 1,
-        .insecure => 2,
-        .secure => 3,
-    };
 }
 
 /// The RRSIG covering (`owner`, `covered_type`). Owner-scoped: one response

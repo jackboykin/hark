@@ -3,45 +3,27 @@ const std = @import("std");
 const linux = std.os.linux;
 const build_options = @import("build_options");
 
-fn gettime() ?std.posix.timespec {
-    var ts: std.posix.timespec = undefined;
-    return if (linux.errno(linux.clock_gettime(.BOOTTIME, &ts)) == .SUCCESS) ts else null;
-}
-
 // Test-clock offset (seconds). Added to every clock read so scenarios can
 // `STEP n TIME_PASSES ELAPSE k` and observe TTL expiry without sleeping.
 // Production builds compile this out — `testOffsetSec` is a comptime-known
 // 0 so the optimizer drops the load entirely.
-var test_offset_secs: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+var test_offset_secs: i64 = 0;
 
 inline fn testOffsetSec() i64 {
     if (!build_options.testing_enabled) return 0;
-    return test_offset_secs.load(.monotonic);
+    return test_offset_secs;
 }
 
 /// Advance the synthetic test clock by `secs`. No-op in production builds.
 /// Driven from the scenario-control DNS-query intercept (see `serve.zig`).
 pub fn advanceTestClock(secs: i64) void {
     if (!build_options.testing_enabled) return;
-    _ = test_offset_secs.fetchAdd(secs, .monotonic);
-}
-
-pub fn nowSec() i64 {
-    return (gettime() orelse return 0).sec + testOffsetSec();
-}
-
-pub fn nowMs() i64 {
-    const ts = gettime() orelse return 0;
-    return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms) + testOffsetSec() * std.time.ms_per_s;
-}
-
-pub fn nowUs() i64 {
-    const ts = gettime() orelse return 0;
-    return ts.sec * std.time.us_per_s + @divTrunc(ts.nsec, std.time.ns_per_us) + testOffsetSec() * std.time.us_per_s;
+    test_offset_secs += secs;
 }
 
 pub fn nowNs() i128 {
-    const ts = gettime() orelse return 0;
+    var ts: std.posix.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.BOOTTIME, &ts)) != .SUCCESS) return 0;
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec + @as(i128, testOffsetSec()) * std.time.ns_per_s;
 }
 
@@ -54,11 +36,4 @@ pub fn wallclockSec() i64 {
     var ts: std.posix.timespec = undefined;
     const base: i64 = if (linux.errno(linux.clock_gettime(.REALTIME, &ts)) == .SUCCESS) ts.sec else 0;
     return base + testOffsetSec();
-}
-
-/// Wall-clock `Io.Timestamp`, offset by the synthetic test clock so DoT
-/// cert-validity / CA-bundle expiry advance under `STEP n TIME_PASSES`. Use
-/// this, not a raw `Io.Timestamp.now`, for scenario-advanceable reads.
-pub fn wallclockTimestamp(io: std.Io) std.Io.Timestamp {
-    return std.Io.Timestamp.now(io, .real).addDuration(.fromSeconds(testOffsetSec()));
 }

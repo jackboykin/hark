@@ -28,19 +28,10 @@ pub fn initIp6(bytes: [16]u8, port: u16, flow: u32, scope: u32) Address {
     return .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope } } };
 }
 
-/// Wildcard `0.0.0.0:0` / `[::]:0` of the same family as `peer`. The kernel
-/// fills in a random ephemeral source port (RFC 5452 §9.1) when this binds.
-pub fn wildcardFor(peer: Address) Address {
-    return switch (peer) {
-        .ip4 => initIp4(.{ 0, 0, 0, 0 }, 0),
-        .ip6 => initIp6(@splat(0), 0, 0, 0),
-    };
-}
-
 /// Canonical Murmur3 fmix64. FNV-1a's multiply only propagates leftward, so
 /// without it the bottom bits stay invariant when inputs share theirs (IPv4
-/// keys with addr[0]=0). Shard selectors subset both halves. Not cryptographic.
-pub fn fmix64(h0: u64) u64 {
+/// keys with addr[0]=0), and the hash map reads both ends. Not cryptographic.
+fn fmix64(h0: u64) u64 {
     var h = h0;
     h ^= h >> 33;
     h *%= 0xff51afd7ed558ccd;
@@ -157,13 +148,6 @@ pub fn afU32(addr: Address) u32 {
     };
 }
 
-pub fn getSockName(fd: posix.fd_t) !Address {
-    var pa: PosixAddress = undefined;
-    var len: posix.socklen_t = @sizeOf(PosixAddress);
-    try sys.getsockname(fd, @ptrCast(&pa), &len);
-    return fromSockaddr(&pa);
-}
-
 /// Format an address as "ip:port" into a caller-provided buffer.
 /// Delegates to std.Io.net.IpAddress.format, which emits IPv6 in
 /// RFC 5952 canonical form ("[::1]:53" rather than "[0000:...:0001]:53").
@@ -264,33 +248,6 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     // v4 1.2.3.4 vs v6 ::102:304 share addr bytes — family must disambiguate.
     try testing.expect(!ctx.eql(a, e));
     try testing.expect(ctx.hash(a) != ctx.hash(e));
-}
-
-test "AddressKey.HashCtx: 16-shard distribution on sequential IPv4 keys" {
-    // Pre-finalizer, every IPv4 key with addr[0]=0 collapsed to a single
-    // shard because the FNV chain didn't propagate input bits to bit 32+.
-    // Pin the floor so any future tweak that re-introduces that pathology
-    // fails loudly.
-    const ctx: AddressKey.HashCtx = .{};
-    var counts: [16]u32 = @splat(0);
-    var i: u32 = 0;
-    while (i < 4096) : (i += 1) {
-        const k = AddressKey.fromAddress(initIp4(.{
-            @intCast((i >> 16) & 0xff),
-            @intCast((i >> 8) & 0xff),
-            @intCast(i & 0xff),
-            1,
-        }, 53));
-        const h32: u32 = @truncate(ctx.hash(k) >> 32);
-        counts[h32 & 15] += 1;
-    }
-    // Uniform expectation: 4096 / 16 = 256 per bucket. Allow ±60% (worst
-    // observed ~190 with the post-finalizer hash); a bucket at 0 or > 700
-    // would mean the finalizer regressed.
-    for (counts) |c| {
-        try testing.expect(c >= 100);
-        try testing.expect(c <= 700);
-    }
 }
 
 test "AddressKey.HashCtx: randomizeHashSeed shifts the hash space" {

@@ -17,14 +17,12 @@ const min_stagger_ms: u32 = 50;
 pub const Transport = enum {
     udp,
     tcp,
-    dot,
 
     /// Round trips a cold exchange costs, handshake included.
     pub fn coldRtts(t: Transport) u32 {
         return switch (t) {
             .udp => 1,
             .tcp => 2,
-            .dot => 3,
         };
     }
 };
@@ -202,7 +200,6 @@ test "a cold exchange costs the transport's round trips of the estimate" {
     const udp = s.timeout(true, .udp);
     try testing.expect(udp > min_timeout_ms);
     try testing.expectEqual(udp * 2, s.timeout(true, .tcp));
-    try testing.expectEqual(udp * 3, s.timeout(true, .dot));
     // The failover cap bounds one round trip; the cold total is above it.
     for (0..3) |_| _ = s.observeTimeout(1000);
     try testing.expect(s.timeout(true, .udp) > failover_timeout_cap_ms);

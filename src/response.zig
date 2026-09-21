@@ -184,41 +184,6 @@ pub fn serializeErrorResponse(
     return dns.serializeMessage(wire_buf, msg) catch null;
 }
 
-/// Build a `dns.Message` value for a cached or synthesized response. The
-/// header is the canonical recursive-resolver shape: aa=false (we are not
-/// authoritative for any zone), ra=true (recursion available), no question
-/// section (the wire builder copies questions from `ResponseContext`).
-/// Used by the cache-hit fast path, the RFC 6761 special-use short-circuit,
-/// and the RFC 8482 ANY/HINFO synthesizer — anywhere a response is built
-/// without going through actual recursion.
-pub fn synthesizedMessage(
-    answers: []const dns.ResourceRecord,
-    authorities: []const dns.ResourceRecord,
-    rcode: dns.RCode,
-    authenticated: bool,
-) dns.Message {
-    return .{
-        .header = .{
-            .id = 0,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = false,
-                .ra = true,
-                .z = 0,
-                .ad = authenticated,
-                .cd = false,
-                .rcode = rcode,
-            },
-        },
-        .questions = &.{},
-        .answers = answers,
-        .authorities = authorities,
-    };
-}
-
 pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
     // RFC 1035 §4.1.1: a QR=1 packet is a response, not a query. Don't
     // resolve it. Returning format_error keeps the TCP connection useful

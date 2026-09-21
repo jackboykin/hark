@@ -151,12 +151,9 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
         var again: [70000]u8 = undefined;
         const wire2 = try dns.serializeMessage(&again, try dns.parseMessage(alloc, wire));
         if (!std.mem.eql(u8, wire, wire2)) return error.RoundtripDrift;
-        _ = dns.extractKeepaliveTimeout(wire);
     } else |_| {}
     var small: [dns.max_udp_payload]u8 = undefined;
     _ = dns.serializeMessage(&small, msg) catch {};
-    _ = dns.extractKeepaliveTimeout(input);
-    _ = dns.hasTcBit(input);
 
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.additionals }) |section| {
         const records = try alloc.alloc(dns.WireRecord, section.len);

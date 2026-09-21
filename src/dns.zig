@@ -13,15 +13,6 @@ pub fn safeTagName(val: anytype, buf: *[24]u8) []const u8 {
     };
 }
 
-/// Check the TC (truncation) bit on raw wire data without full parsing.
-/// Used to detect truncated UDP responses before attempting parseMessage,
-/// which may fail with EndOfData on mid-record truncation (RFC 2181).
-pub fn hasTcBit(bytes: []const u8) bool {
-    if (bytes.len < header_len) return false;
-    const flags: Header.Flags = @bitCast(mem.readInt(u16, bytes[2..4], .big));
-    return flags.tc;
-}
-
 pub const max_label_len = 63;
 pub const max_label_count = 127; // (255 wire octets - 1 root byte) / 2 octets per single-char label = 127
 pub const max_name_len = 253;
@@ -38,17 +29,6 @@ pub const edns_udp_payload: u16 = 1232;
 /// response buffer we might parse.
 pub const max_message_len: u16 = 65535;
 
-/// Stage `wire_query` into `buf` as a 2-byte big-endian length prefix
-/// followed by the query bytes. Returns the populated slice. Used by
-/// DNS-over-TCP and DNS-over-TLS callers; both bound queries to
-/// `edns_udp_payload`.
-pub fn stageLengthPrefixed(buf: *[2 + edns_udp_payload]u8, wire_query: []const u8) ![]const u8 {
-    if (wire_query.len > edns_udp_payload) return error.QueryTooLarge;
-    std.mem.writeInt(u16, buf[0..2], @intCast(wire_query.len), .big);
-    @memcpy(buf[2..][0..wire_query.len], wire_query);
-    return buf[0 .. 2 + wire_query.len];
-}
-
 pub const OpCode = enum(u4) {
     query = 0,
     _,
@@ -63,12 +43,6 @@ pub const RCode = enum(u4) {
     refused = 5,
     yx_domain = 6,
     _,
-
-    /// Server-side error (SERVFAIL/REFUSED) — the server received the query
-    /// but couldn't or wouldn't answer. Used for lame detection (RFC 4697).
-    pub fn isServerError(self: RCode) bool {
-        return self == .server_failure or self == .refused;
-    }
 };
 
 pub const RType = enum(u16) {
@@ -328,29 +302,6 @@ test "secondsUntil: saturates at zero and wraps as a serial" {
     try testing.expectEqual(@as(u32, 10), secondsUntil(5, 0xFFFFFFFB));
 }
 
-/// Returns the rtype an RRSIG record covers, or null if `rr` isn't an RRSIG.
-/// Centralised because RFC 4035 RRSIG-vs-covered-RRset bookkeeping recurs
-/// across the cache, shaper, and validator paths.
-pub fn rrsigCovers(rr: ResourceRecord) ?RType {
-    if (rr.rtype != .rrsig) return null;
-    return rr.rdata.rrsig.type_covered;
-}
-
-/// Wildcard-expansion / negative-existence DNSSEC proof material per
-/// RFC 4035 §3.1.3. True for NSEC, NSEC3, and RRSIGs covering either.
-/// Used by the CNAME-chain aggregator and the cache's wildcard / negative
-/// proof capture — same predicate, multiple call sites.
-pub fn isNsecProofMaterial(rr: ResourceRecord) bool {
-    return switch (rr.rtype) {
-        .nsec, .nsec3 => true,
-        .rrsig => switch (rrsigCovers(rr) orelse return false) {
-            .nsec, .nsec3 => true,
-            else => false,
-        },
-        else => false,
-    };
-}
-
 pub const DnskeyData = struct {
     flags: u16,
     protocol: u8,
@@ -485,7 +436,6 @@ pub fn base32HexEncode(dest: []u8, data: []const u8) []const u8 {
 // ── EDNS0 (RFC 6891) ──────────────────────────────────────────────────
 
 pub const edns_opt_tcp_keepalive: u16 = 11; // RFC 7828
-const edns_opt_padding: u16 = 12; // RFC 7830
 
 pub const edns_opt_ede: u16 = 15; // RFC 8914
 
@@ -524,10 +474,6 @@ pub const OptRecord = struct {
     version: u8,
     do_bit: bool,
     options: []const EdnsOption,
-    /// If non-zero, serializeMessage adds an EDNS0 padding option (code 12)
-    /// so the total message is a multiple of this block size. Set by
-    /// buildQuery.
-    padding_block: u16 = 0,
 };
 
 pub const Question = struct {
@@ -556,11 +502,6 @@ pub const WireRecord = struct {
 
     pub fn rtype(r: WireRecord) RType {
         return @fromBackingInt(mem.readInt(u16, r.rest[0..2], .big));
-    }
-
-    /// The TTL the authority sent (after the parser's caps).
-    pub fn storedTtl(r: WireRecord) u32 {
-        return mem.readInt(u32, r.rest[4..8], .big);
     }
 
     pub fn rdata(r: WireRecord) []const u8 {
@@ -758,16 +699,9 @@ fn applyCase0x20(rng: std.Random, name: Name) void {
     }
 }
 
-/// RFC 8467 §4.1 client policy: pad *queries* to multiples of 128
-/// octets (468 is the same section's *response* block — don't swap them).
-pub const dot_padding_block: u16 = 128;
-
 const EdnsConfig = struct {
     udp_payload_size: u16 = edns_udp_payload,
     do_bit: bool = false,
-    /// If non-zero, add EDNS0 padding (option code 12, RFC 7830) so the
-    /// total message is a multiple of this. See `dot_padding_block` for DoT.
-    padding_block: u16 = 0,
 };
 
 const QueryOptions = struct {
@@ -808,7 +742,6 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
             .version = 0,
             .do_bit = edns.do_bit,
             .options = &.{},
-            .padding_block = edns.padding_block,
         } else null,
     };
 }
@@ -1105,92 +1038,6 @@ const Parser = struct {
         return name;
     }
 };
-
-/// Advance past one wire-format name starting at `start`. Names are either
-/// a chain of length-prefixed labels terminated by a zero byte, or a 2-byte
-/// compression pointer (top two bits set). Returns the position one past
-/// the name, or null if the wire is malformed.
-fn skipWireName(wire: []const u8, start: usize) ?usize {
-    var p = start;
-    while (p < wire.len) {
-        const b = wire[p];
-        if (b == 0) return p + 1;
-        if (b & 0xC0 == 0xC0) {
-            if (p + 1 >= wire.len) return null;
-            return p + 2;
-        }
-        if (b & 0xC0 != 0) return null; // reserved label types
-        p += 1 + b;
-    }
-    return null;
-}
-
-/// Convert an RFC 7828 TIMEOUT (100-ms units) into whole seconds. Sub-second
-/// non-zero values round up so a 100-ms hint doesn't evict the connection on
-/// the same tick. TIMEOUT=0 ("close ASAP" per RFC 7828 §3.3) passes through
-/// as 0; callers that pool a connection must clamp against weaponized 0
-/// before applying.
-pub fn keepaliveToSeconds(timeout_100ms: u16) i64 {
-    return @divFloor(@as(i64, @intCast(timeout_100ms)) + 9, 10);
-}
-
-/// RFC 7828 §3.3: read the edns-tcp-keepalive TIMEOUT (option 11) advertised
-/// in a TCP/DoT response. Returns the value in 100-ms units, or null if no
-/// OPT record carries it. Cheap wire scan — does not allocate, does not
-/// touch rdata bodies beyond OPT's option list.
-pub fn extractKeepaliveTimeout(wire: []const u8) ?u16 {
-    if (wire.len < header_len) return null;
-    const ar = mem.readInt(u16, wire[10..][0..2], .big);
-    if (ar == 0) return null;
-    const qd = mem.readInt(u16, wire[4..][0..2], .big);
-    const an = mem.readInt(u16, wire[6..][0..2], .big);
-    const ns = mem.readInt(u16, wire[8..][0..2], .big);
-
-    var pos: usize = header_len;
-    for (0..qd) |_| {
-        pos = skipWireName(wire, pos) orelse return null;
-        if (pos + 4 > wire.len) return null;
-        pos += 4;
-    }
-    const rr_no_opt = @as(usize, an) + @as(usize, ns);
-    for (0..rr_no_opt) |_| {
-        pos = skipWireName(wire, pos) orelse return null;
-        if (pos + 10 > wire.len) return null;
-        const rdlen = mem.readInt(u16, wire[pos + 8 ..][0..2], .big);
-        pos += 10 + @as(usize, rdlen);
-        if (pos > wire.len) return null;
-    }
-    for (0..ar) |_| {
-        const name_start = pos;
-        pos = skipWireName(wire, pos) orelse return null;
-        if (pos + 10 > wire.len) return null;
-        const rtype = mem.readInt(u16, wire[pos..][0..2], .big);
-        const rdlen = mem.readInt(u16, wire[pos + 8 ..][0..2], .big);
-        if (pos + 10 + @as(usize, rdlen) > wire.len) return null;
-        if (rtype == @backingInt(RType.opt)) {
-            // RFC 6891 §6.1.2: OPT owner MUST be root (single zero byte).
-            if (wire[name_start] != 0) return null;
-            const opt_rdata = wire[pos + 10 .. pos + 10 + rdlen];
-            var op: usize = 0;
-            while (op + 4 <= opt_rdata.len) {
-                const code = mem.readInt(u16, opt_rdata[op..][0..2], .big);
-                const length = mem.readInt(u16, opt_rdata[op + 2 ..][0..2], .big);
-                op += 4;
-                if (op + length > opt_rdata.len) return null;
-                if (code == edns_opt_tcp_keepalive) {
-                    // RFC 7828 §3.2: 0 octets is the client form; the
-                    // server-to-client TIMEOUT form is always 2 octets.
-                    if (length == 2) return mem.readInt(u16, opt_rdata[op..][0..2], .big);
-                    return null;
-                }
-                op += length;
-            }
-            return null;
-        }
-        pos += 10 + @as(usize, rdlen);
-    }
-    return null;
-}
 
 fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsOption {
     if (rdata.len == 0) return &.{};
@@ -1609,45 +1456,14 @@ pub const Serializer = struct {
 
         var rdlength: u16 = 0;
         for (opt.options) |o| rdlength += 4 + (try castOrRDataErr(u16, o.data.len));
-
-        // EDNS0 padding (RFC 7830, option code 12): pad total message up to
-        // the next multiple of padding_block (RFC 8467 §4.1 client policy).
-        var padding_len: u16 = 0;
-        if (opt.padding_block > 0) {
-            // self.pos already includes name(1) + type(2) + class(2) + ttl(4) = 9
-            // bytes of OPT. Only the rdlength (2) and the padding option header
-            // (4) remain unwritten, so the predicted final size is self.pos + 6
-            // + rdlength + padding_len.
-            const msg_size_before_padding = self.pos + 2 + rdlength + 4;
-            const rem = msg_size_before_padding % opt.padding_block;
-            if (rem != 0) padding_len = @intCast(opt.padding_block - rem);
-            rdlength += 4 + padding_len; // code(2) + length(2) + padding data
-        }
-
         try self.writeU16(rdlength);
         for (opt.options) |o| {
             try self.writeU16(o.code);
             try self.writeU16(@intCast(o.data.len));
             try self.writeSlice(o.data);
         }
-
-        if (opt.padding_block > 0) {
-            try self.writeU16(edns_opt_padding);
-            try self.writeU16(padding_len);
-            try self.ensureSpace(padding_len);
-            @memset(self.buf[self.pos..][0..padding_len], 0);
-            self.pos += padding_len;
-        }
     }
 };
-
-/// Overwrite the 2-byte query id in a serialized DNS message. Used by
-/// failover/staggered paths that build and serialize once, then rotate
-/// per-attempt query-id entropy (RFC 5452 §9.1).
-pub fn patchQueryId(wire: []u8, id: u16) void {
-    std.debug.assert(wire.len >= 2);
-    std.mem.writeInt(u16, wire[0..2], id, .big);
-}
 
 /// Uncompressed, as a stored record: `WireRecord`'s layout.
 pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
@@ -2186,7 +2002,6 @@ test "a record written from its stored bytes is the record written from its fiel
         const n = wireNameLen(stored);
         const wr: WireRecord = .{ .owner = stored[0..n], .rest = stored[n..], .ttl = 42 };
         try testing.expectEqual(rtype, wr.rtype());
-        try testing.expectEqual(@as(u32, 300), wr.storedTtl());
         var aged = rr;
         aged.ttl = 42;
         const q: []const Question = &.{.{ .name = zone, .qtype = rtype, .qclass = .in }};
@@ -2219,47 +2034,6 @@ test "edge case: truncated question" {
     pkt[13] = 'a'; // but only 1 byte of data
 
     try testing.expectError(error.EndOfData, parseMessage(testing.allocator, &pkt));
-}
-
-test "hasTcBit detects truncation on mid-record truncated response" {
-    // Regression: a TC=1 UDP response truncated mid-record causes parseMessage
-    // to fail with EndOfData. hasTcBit must detect TC on the raw wire data so
-    // the resolver can fall back to TCP before attempting to parse.
-
-    var pkt: [32]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x1234, .big); // id
-    mem.writeInt(u16, pkt[2..4], 0x8200, .big); // QR=1, TC=1
-    mem.writeInt(u16, pkt[4..6], 1, .big); // qdcount=1
-    mem.writeInt(u16, pkt[6..8], 1, .big); // ancount=1
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    const qname = "\x07example\x03com\x00";
-    @memcpy(pkt[12..][0..qname.len], qname);
-    const qend = 12 + qname.len;
-    mem.writeInt(u16, pkt[qend..][0..2], 1, .big); // qtype=A
-    mem.writeInt(u16, pkt[qend + 2 ..][0..2], 1, .big); // qclass=IN
-
-    // Answer record starts but is truncated — only 2 bytes of a name pointer
-    const ans_start = qend + 4;
-    pkt[ans_start] = 0xC0; // compressed name pointer...
-    pkt[ans_start + 1] = 0x0C; // ...to offset 12
-
-    const truncated = pkt[0 .. ans_start + 2];
-
-    try testing.expect(hasTcBit(truncated));
-
-    // parseMessage fails — this is the bug we're guarding against.
-    // Use an arena because parseMessage leaks partial allocations on error.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), truncated));
-
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1, TC=0
-    try testing.expect(!hasTcBit(truncated));
-
-    try testing.expect(!hasTcBit(pkt[0..4]));
-    try testing.expect(!hasTcBit(&[_]u8{}));
 }
 
 test "edge case: max-length label" {
@@ -2386,38 +2160,6 @@ test "EDNS0: serialized OPT has correct wire format" {
     try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
 }
 
-test "EDNS0: padding_block pads to the next multiple (RFC 8467 §4.1)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const msg = try buildQuery(alloc, 0xBEEF, "example.com", .a, .{
-        .rd = true,
-        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_block = dot_padding_block },
-    });
-
-    var buf: [max_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-
-    // A short query lands exactly one block; never zero, never off-block.
-    try testing.expectEqual(@as(usize, dot_padding_block), wire.len);
-
-    // A long QNAME crosses into the second block, still block-aligned.
-    const long_name = "a-fairly-long-label-for-padding.subdomain-with-more-length." ++
-        "yet-another-label-to-cross-128.example.com";
-    const msg2 = try buildQuery(alloc, 0xBEF0, long_name, .a, .{
-        .rd = true,
-        .edns = .{ .do_bit = false, .udp_payload_size = 4096, .padding_block = dot_padding_block },
-    });
-    var buf2: [max_udp_payload]u8 = undefined;
-    const wire2 = try serializeMessage(&buf2, msg2);
-    try testing.expect(wire2.len > dot_padding_block);
-    try testing.expectEqual(@as(usize, 0), wire2.len % dot_padding_block);
-
-    const parsed = try parseMessage(alloc, wire);
-    try testing.expect(parsed.opt != null);
-}
-
 test "EDNS0: buildQuery without edns has no opt" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2528,27 +2270,6 @@ pub fn makeWildcardName(buf: *[max_label_count + 1][]const u8, closest_encloser:
     }
     return Name{ .labels = buf[0 .. closest_encloser.labels.len + 1] };
 }
-
-/// Proper ancestors of a dotted name, closest first, capped at `max_depth`.
-/// Every caller walks suffixes to probe the cache, and every probe costs an
-/// arena clone on a hit — so the bound is the caller's to justify.
-pub const Ancestors = struct {
-    rest: []const u8,
-    left: u8,
-
-    pub fn init(name: []const u8, max_depth: u8) Ancestors {
-        return .{ .rest = name, .left = max_depth };
-    }
-
-    pub fn next(self: *Ancestors) ?[]const u8 {
-        if (self.left == 0) return null;
-        const dot = indexOfUnescapedDot(self.rest, 0) orelse return null;
-        if (dot + 1 >= self.rest.len) return null; // trailing dot only
-        self.left -= 1;
-        self.rest = self.rest[dot + 1 ..];
-        return self.rest;
-    }
-};
 
 /// RFC 6672 §2.2 substitution: `owner` with its trailing `suffix` labels
 /// replaced by `target`. Null when the result would overflow a legal name —
@@ -3462,143 +3183,6 @@ test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
     }
 }
 
-test "applyCase0x20 on root and all-numeric is a no-op" {
-    var prng: std.Random.DefaultPrng = .init(0x20);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const root = try parseDottedName(alloc, ".");
-    applyCase0x20(prng.random(), root);
-    try testing.expectEqual(@as(usize, 0), root.labels.len);
-
-    const numeric = try parseDottedName(alloc, "12345.com");
-    const numeric_copy = try parseDottedName(alloc, "12345.com");
-    applyCase0x20(prng.random(), numeric);
-    try testing.expect(mem.eql(u8, numeric.labels[0], numeric_copy.labels[0]));
-}
-
-test "buildQuery with case_rng" {
-    var prng: std.Random.DefaultPrng = .init(0x20);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const lower = try buildQuery(alloc, 0x1234, "example.com", .a, .{});
-    const randomized = try buildQuery(alloc, 0x1234, "example.com", .a, .{
-        .case_rng = prng.random(),
-    });
-
-    try testing.expect(lower.questions[0].name.eql(randomized.questions[0].name));
-}
-
-pub fn serializeOptOptionResponse(
-    arena: Allocator,
-    buf: []u8,
-    qname: []const u8,
-    include_answer: bool,
-    opt_code: u16,
-    opt_data: []const u8,
-) ![]const u8 {
-    const name = try parseDottedName(arena, qname);
-    const questions = try arena.alloc(Question, 1);
-    questions[0] = .{ .name = name, .qtype = .a, .qclass = .in };
-
-    var answers: []ResourceRecord = &.{};
-    if (include_answer) {
-        answers = try arena.alloc(ResourceRecord, 1);
-        answers[0] = .{
-            .name = name,
-            .rtype = .a,
-            .rclass = .in,
-            .ttl = 300,
-            .rdata = .{ .a = .{ 192, 0, 2, 1 } },
-        };
-    }
-
-    const options = try arena.alloc(EdnsOption, 1);
-    options[0] = .{ .code = opt_code, .data = opt_data };
-
-    const msg: Message = .{
-        .header = .{
-            .id = 0x1234,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = false,
-                .tc = false,
-                .rd = true,
-                .ra = true,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = questions,
-        .answers = answers,
-        .opt = .{
-            .udp_payload_size = edns_udp_payload,
-            .extended_rcode = 0,
-            .version = 0,
-            .do_bit = false,
-            .options = options,
-        },
-    };
-    return serializeMessage(buf, msg);
-}
-
-test "extractKeepaliveTimeout reads RFC 7828 option 11" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var buf: [256]u8 = undefined;
-    const ka_data = [_]u8{ 0x00, 0x64 }; // 100 * 100ms = 10s
-    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", true, edns_opt_tcp_keepalive, &ka_data);
-    try testing.expectEqual(@as(?u16, 100), extractKeepaliveTimeout(wire));
-}
-
-test "extractKeepaliveTimeout returns null when option absent" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var buf: [256]u8 = undefined;
-    const padding = [_]u8{ 0, 0, 0, 0 };
-    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", false, 12, &padding);
-    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(wire));
-}
-
-test "extractKeepaliveTimeout returns null on zero-length client form" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var buf: [256]u8 = undefined;
-    const empty = [_]u8{};
-    const wire = try serializeOptOptionResponse(arena.allocator(), &buf, "example.com", false, edns_opt_tcp_keepalive, &empty);
-    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(wire));
-}
-
-test "Ancestors yields proper suffixes, stops at the root and at the bound" {
-    const collect = struct {
-        fn f(buf: [][]const u8, name: []const u8, max_depth: u8) [][]const u8 {
-            var it = Ancestors.init(name, max_depth);
-            var n: usize = 0;
-            while (it.next()) |a| : (n += 1) buf[n] = a;
-            return buf[0..n];
-        }
-    }.f;
-    var buf: [8][]const u8 = undefined;
-
-    try testing.expectEqualDeep(@as([]const []const u8, &.{ "b.c.example", "c.example", "example" }), collect(&buf, "a.b.c.example", 8));
-    // A trailing dot is a separator with nothing after it, not a label.
-    try testing.expectEqualDeep(@as([]const []const u8, &.{"example."}), collect(&buf, "a.example.", 8));
-    try testing.expectEqual(@as(usize, 0), collect(&buf, "example", 8).len);
-    try testing.expectEqual(@as(usize, 0), collect(&buf, ".", 8).len);
-    // The bound cuts the walk short rather than wrapping or overrunning.
-    try testing.expectEqualDeep(@as([]const []const u8, &.{"b.c.example"}), collect(&buf, "a.b.c.example", 1));
-    try testing.expectEqual(@as(usize, 0), collect(&buf, "a.b.c.example", 0).len);
-    // An escaped dot is label content, not a boundary (RFC 4343 §2.1).
-    try testing.expectEqualDeep(@as([]const []const u8, &.{ "c.d", "d" }), collect(&buf, "a\\.b.c.d", 8));
-    try testing.expectEqualDeep(@as([]const []const u8, &.{"d"}), collect(&buf, "a\\\\.d", 8));
-}
-
 test "formatInto is injective over hostile labels" {
     var buf: [max_dotted_len + 1]u8 = undefined;
 
@@ -3657,21 +3241,6 @@ test "parseDottedName decodes presentation escapes" {
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\12"));
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\1x2"));
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\999"));
-}
-
-test "extractKeepaliveTimeout rejects malformed wire" {
-    // Header-only buffer claiming 1 question but zero bytes follow.
-    var buf: [12]u8 = .{ 0, 0, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0 };
-    try testing.expectEqual(@as(?u16, null), extractKeepaliveTimeout(&buf));
-}
-
-test "keepaliveToSeconds rounds up" {
-    try testing.expectEqual(@as(i64, 0), keepaliveToSeconds(0));
-    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(1)); // 100ms → ≥1s
-    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(9));
-    try testing.expectEqual(@as(i64, 1), keepaliveToSeconds(10)); // exactly 1s
-    try testing.expectEqual(@as(i64, 2), keepaliveToSeconds(11)); // 1.1s → 2s
-    try testing.expectEqual(@as(i64, 10), keepaliveToSeconds(100)); // 10s
 }
 
 fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {

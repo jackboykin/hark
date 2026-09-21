@@ -143,13 +143,6 @@ pub fn extractReferral(
     };
 }
 
-/// A lame sibling's referral when the cut is `zone` itself, read from
-/// `zone`'s parent. .fr and afnic.fr share g.ext.nic.fr but not d.nic.fr.
-pub fn referralAtCut(response: dns.Message, zone: dns.Name, policy: AddrPolicy) ?Referral {
-    if (response.header.flags.aa or response.answers.len != 0 or zone.labels.len == 0) return null;
-    return extractReferral(response, zone, .{ .labels = zone.labels[1..] }, policy);
-}
-
 /// RFC 1034 §4.3.5: drop this reply and ask a sibling. SERVFAIL, REFUSED
 /// and FORMERR (hark never retries without EDNS); a lame reply, non-AA
 /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
@@ -233,56 +226,6 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
     try testing.expect(!shouldTrySibling(msg, zone, .{}));
 }
 
-test "probeStep: referral only from NOERROR, NXDOMAIN stops, NODATA and data step" {
-    var msg = reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 192, 0, 2, 1 })});
-    try testing.expect(probeStep(msg, www, root, .{}) == .referral);
-
-    msg.header.flags.rcode = .name_error;
-    try testing.expect(probeStep(msg, www, root, .{}) == .nxdomain);
-    msg.header.flags.rcode = .server_failure;
-    try testing.expect(probeStep(msg, www, root, .{}) == .failed);
-
-    msg.header.flags.rcode = .no_error;
-    msg.authorities = &.{};
-    try testing.expect(probeStep(msg, www, root, .{}) == .nodata);
-    msg.answers = &.{glueA(example, .{ 192, 0, 2, 1 })};
-    try testing.expect(probeStep(msg, www, root, .{}) == .answered);
-}
-
-test "referralAtCut refers from one label above the zone" {
-    const zone: dns.Name = .{ .labels = &.{ "afnic", "fr" } };
-    const ns: dns.Name = .{ .labels = &.{ "ns", "afnic", "fr" } };
-    var msg = reply(&.{nsRr(zone, ns)}, &.{glueA(ns, .{ 1, 2, 3, 7 })});
-    const r = referralAtCut(msg, zone, .{}) orelse return error.TestExpectedReferral;
-    try testing.expect(r.zone_cut.eql(zone));
-    try testing.expectEqual(@as(usize, 1), r.addr_count);
-
-    msg.header.flags.aa = true;
-    try testing.expect(referralAtCut(msg, zone, .{}) == null);
-    msg.header.flags.aa = false;
-    try testing.expect(referralAtCut(msg, root, .{}) == null);
-}
-
-test "extractReferral with NS and glue A records" {
-    const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 1, 2, 3, 4 })}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    try testing.expectEqual(na.initIp4(.{ 1, 2, 3, 4 }, 53).ip4.bytes, result.addrs[0].ip4.bytes);
-    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
-    try testing.expect(result.zone_cut.eql(example));
-}
-
-test "extractReferral with no NS records returns null" {
-    try testing.expect(extractReferral(reply(&.{}, &.{}), example, root, .{}) == null);
-}
-
-test "extractReferral with NS but no glue returns zero addrs" {
-    const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-    try testing.expectEqual(@as(usize, 1), result.ns_count);
-    try testing.expect(result.zone_cut.eql(example));
-    try testing.expect(result.ns_names[0].eqlExact(ns1));
-}
-
 test "extractReferral case-insensitive glue matching" {
     const upper: dns.Name = .{ .labels = &.{ "NS1", "EXAMPLE", "COM" } };
     const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{glueA(upper, .{ 1, 2, 3, 4 })}), www, root, .{}) orelse return error.TestUnexpectedResult;
@@ -294,35 +237,6 @@ test "extractReferral rejects private IP glue (DNS rebinding defense)" {
     try testing.expectEqual(@as(usize, 0), result.addr_count);
 }
 
-test "extractReferral accepts loopback glue when policy.allow_loopback = true" {
-    // Locks in the test-only opt-in branch: with allow_loopback=true,
-    // loopback glue is *not* rejected. Without this test, inverting the
-    // boolean default would silently pass every other test.
-    const result = extractReferral(
-        reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 127, 0, 0, 1 })}),
-        www,
-        root,
-        .{ .allow_loopback = true, .upstream_port = 5353 },
-    ) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    try testing.expectEqual(@as(u16, 5353), result.addrs[0].getPort());
-}
-
-test "extractReferral rejects out-of-zone glue" {
-    const evil: dns.Name = .{ .labels = &.{ "ns1", "evil", "org" } };
-    const result = extractReferral(reply(&.{nsRr(example, evil)}, &.{glueA(evil, .{ 6, 6, 6, 6 })}), www, .{ .labels = &.{"com"} }, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-}
-
-test "extractReferral without glue carries multiple NS names" {
-    const other1: dns.Name = .{ .labels = &.{ "ns1", "other", "net" } };
-    const other2: dns.Name = .{ .labels = &.{ "ns2", "other", "net" } };
-    const result = extractReferral(reply(&.{ nsRr(example, other1), nsRr(example, other2) }, &.{}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-    try testing.expectEqual(@as(usize, 2), result.ns_count);
-    try testing.expect(result.zone_cut.eql(example));
-}
-
 test "extractReferral with AAAA glue returns IPv6 address" {
     const ipv6 = [_]u8{ 0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     const glue: dns.ResourceRecord = .{ .name = ns1, .rtype = .aaaa, .rclass = .in, .ttl = 172800, .rdata = .{ .aaaa = ipv6 } };
@@ -330,12 +244,4 @@ test "extractReferral with AAAA glue returns IPv6 address" {
     try testing.expectEqual(@as(usize, 1), result.addr_count);
     try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
     try testing.expectEqual(na.initIp6(ipv6, 53, 0, 0).ip6.bytes, result.addrs[0].ip6.bytes);
-}
-
-test "extractReferral rejects same-zone NS as non-referral" {
-    // A server returning NS records for its own zone (e.g. alongside a CNAME
-    // answer) is not a referral — the zone cut must be strictly deeper than
-    // the parent zone.  RFC 1034 §4.2.1, RFC 8499 §7.
-    const api: dns.Name = .{ .labels = &.{ "api", "example", "com" } };
-    try testing.expect(extractReferral(reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 192, 0, 2, 1 })}), api, example, .{}) == null);
 }

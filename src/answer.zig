@@ -100,16 +100,8 @@ fn wireAll(arena: Allocator, rrs: []const dns.ResourceRecord) ![]dns.WireRecord 
     return out;
 }
 
-fn synthesized(arena: Allocator, q: dns.Question, msg: dns.Message) !Served {
-    return .{
-        .rcode = msg.header.flags.rcode,
-        .ad = msg.header.flags.ad,
-        .question = q,
-        .answers = try wireAll(arena, msg.answers),
-        .authorities = try wireAll(arena, msg.authorities),
-        .additionals = try wireAll(arena, msg.additionals),
-        .cacheable = false,
-    };
+fn synthesized(arena: Allocator, q: dns.Question, s: special_use.Synthesized) !Served {
+    return .{ .rcode = s.rcode, .question = q, .answers = try wireAll(arena, s.answers), .cacheable = false };
 }
 
 /// RFC 6761 names, answered asking nobody; null: ask the graph.
@@ -122,8 +114,7 @@ pub fn special(arena: Allocator, q: dns.Question, d64: ?Dns64) !?Served {
     // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
         var a = try synthesized(arena, q, try special_use.synthesize(arena, name, special_use.classify(name, .a)));
-        a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, served.authorities) orelse return served;
-        a.ad = false;
+        a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
     };
     return served;
