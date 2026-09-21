@@ -780,12 +780,14 @@ pub const Graph = struct {
         return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.refresh_ns + refresh_window_ns);
     }
 
-    /// Stored since the refresh began counts, inclusive: the edge reads the
-    /// clock once per event, so a refresh shares an instant with what its
-    /// trigger stored.
+    /// Evidence stored since the refresh began counts, inclusive: the edge
+    /// reads the clock once per event, so a refresh shares an instant with
+    /// what its trigger fetched. A verdict is stored when judged, however
+    /// old its evidence, so it is judged again.
     fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
         const live = g.index.get(key);
-        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(g.payer) or e.stored_ns >= g.payer.refresh_ns) {
+        const verdict = key.kind == .ds or key.kind == .dnskey;
+        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) {
             if (live) |id| if (g.cell(id).blob == e.blob) return id;
             return try g.materialise(key, name, e);
         };
