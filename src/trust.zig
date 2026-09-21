@@ -50,7 +50,7 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 /// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
 /// zone draining its own budget must not drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
-    if (g.cell(id).budget.validation.exhausted()) return g.fail(id, .{ .code = .dnssec_bogus, .text = "validation budget spent" });
+    if (g.payer.validation.exhausted()) return g.fail(id, .{ .code = .dnssec_bogus, .text = "validation budget spent" });
     const t = g.cell(rid);
     t.expires_ns = @min(t.expires_ns, g.now());
     if (t.blob) |b| g.store.drop(t.key, b);
@@ -61,7 +61,7 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (!g.cell(id).budget.validation.exhausted()) try g.remember(g.cell(id).key, refused);
+    if (!g.payer.validation.exhausted()) try g.remember(g.cell(id).key, refused);
     try failBogus(g, id, rid);
 }
 
@@ -84,19 +84,19 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.scratch.allocator().dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
     }
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
-    if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
+    if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name) orelse
         return g.fail(id, no_chain);
     const parent = g.cell(s.parent.?);
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
     const parent_zone = parent.state.fact.cut.zone;
-    if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, parent_zone, .a), parent_zone, g.cell(id).depth) orelse
+    if (s.keys == null) s.keys = try g.demand(id, try g.keyFor(.dnskey, parent_zone, .a), parent_zone) orelse
         return g.fail(id, no_chain);
     const parent_keys = g.cell(s.keys.?);
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
     if (parent_keys.state.fact.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.state.fact.dnskey.status } }, parent_keys.expires_ns);
-    if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .ds), zone, g.cell(id).depth) orelse
+    if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .ds), zone) orelse
         return g.fail(id, no_chain);
     const rs = g.cell(s.rrset.?);
     if (!rs.settled()) return;
@@ -110,13 +110,13 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .yxdomain => null,
     } orelse return failChain(g, id, s.rrset.?);
     if (!dnssec.isProperAncestor(signer, zone)) return failChain(g, id, s.rrset.?);
-    if (s.signer == null) s.signer = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, g.cell(id).depth) orelse
+    if (s.signer == null) s.signer = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer) orelse
         return g.fail(id, no_chain);
     const keys = g.cell(s.signer.?);
     if (!keys.settled()) return;
     if (keys.failure()) |why| return g.fail(id, why);
     if (keys.state.fact.dnskey.status != .secure) return failChain(g, id, s.rrset.?);
-    const budget = &g.cell(id).budget.validation;
+    const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
@@ -149,18 +149,18 @@ pub fn runDs(g: *Graph, id: CellId) !void {
 pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
-    if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, g.cell(id).depth) orelse
+    if (s.ds == null) s.ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone) orelse
         return g.fail(id, no_chain);
     // A DS on record, proven or not, says the keys will be needed: fetch
     // them alongside the proof instead of a round trip per level after it.
     if (s.rrset == null) if (try g.peek(try g.keyFor(.rrset, zone, .ds))) |f| if (f.value.rrset.kind == .answer) {
-        s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth);
+        s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone);
     };
     const ds = g.cell(s.ds.?);
     if (!ds.settled()) return;
     if (ds.failure()) |why| return g.fail(id, why);
     if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires_ns);
-    if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone, g.cell(id).depth) orelse
+    if (s.rrset == null) s.rrset = try g.demand(id, try g.keyFor(.rrset, zone, .dnskey), zone) orelse
         return g.fail(id, no_chain);
     const rs = g.cell(s.rrset.?);
     if (!rs.settled()) return;
@@ -169,7 +169,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     if (r.kind != .answer) return failChain(g, id, s.rrset.?);
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
-    const budget = &g.cell(id).budget.validation;
+    const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
@@ -184,19 +184,18 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     const t = g.cell(rid);
     const key = try g.keyFor(.secure, t.name, t.key.rtype);
-    const budget = g.cell(by).budget;
     if (g.index.get(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == t.gen;
-        if (same and (!c.settled() or c.expires_ns > g.bound(budget) or (c.budget == budget and g.fresh(sid)))) {
+        if (same and (!c.settled() or g.serves(sid))) {
             try g.pin(sid, by);
             return sid;
         }
     }
-    const sid = try g.newCell(key, t.name, g.cell(by).budget, g.cell(by).depth);
+    const sid = try g.newCell(key, t.name);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = t.gen };
     try g.pin(sid, by);
-    if (t.blob) |b| if (b.verdict.until_ns > g.bound(budget)) {
+    if (t.blob) |b| if (b.verdict.until_ns > g.bound(g.payer)) {
         try g.settle(sid, .{ .secure = b.verdict.chain() }, b.verdict.until_ns);
         return sid;
     };
@@ -217,21 +216,20 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const t = g.cell(s.target);
     const r = t.state.fact.rrset;
     const zone = r.zone;
-    const depth = g.cell(id).depth;
-    if (s.zone_ds == null) s.zone_ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone, depth) orelse
+    if (s.zone_ds == null) s.zone_ds = try g.demand(id, try g.keyFor(.ds, zone, .a), zone) orelse
         return g.fail(id, no_chain);
     const zd = g.cell(s.zone_ds.?);
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
     if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
     var expires = @min(t.expires_ns, zd.expires_ns);
-    const budget = &g.cell(id).budget.validation;
+    const budget = &g.payer.validation;
     const now = g.wallNow();
     var cap: u32 = std.math.maxInt(u32);
     // An unsigned AA reply from a zone expected to sign: the answering
     // zone may be an unsigned child folded onto the parent's servers
     // (tld-servers.ru on the ru servers), which only its DS can say.
-    if (r.aa and !hasSignature(r)) switch (try probeHiddenCut(g, id, s, zone, t, depth)) {
+    if (r.aa and !hasSignature(r)) switch (try probeHiddenCut(g, id, s, zone, t)) {
         .pending => return,
         .insecure => |until| return g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
         .none => {},
@@ -254,7 +252,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 // RFC 4034 §3.1.3; a signer above the answering zone
                 // authenticates nothing here.
                 if (!rr.name.isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return failBogus(g, id, s.target);
-                if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, try g.keyFor(.dnskey, sig.signer_name, .a), sig.signer_name, depth) orelse
+                if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, try g.keyFor(.dnskey, sig.signer_name, .a), sig.signer_name) orelse
                     return g.fail(id, no_chain);
                 pending = pending or !g.cell(s.keys[groups].?).settled();
             }
@@ -295,7 +293,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         },
         .nodata, .nxdomain => {
             const signer = dnssec.authoritySigner(r.authorities) orelse return failBogus(g, id, s.target);
-            if (s.keys[0] == null) s.keys[0] = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer, depth) orelse
+            if (s.keys[0] == null) s.keys[0] = try g.demand(id, try g.keyFor(.dnskey, signer, .a), signer) orelse
                 return g.fail(id, no_chain);
             const kc = g.cell(s.keys[0].?);
             if (!kc.settled()) return;
@@ -320,7 +318,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
 
 /// `ds(candidate)` one label at a time below `zone`, down to the name for
 /// a positive, or to the SOA owner for a negative. Once (`probe_depth`).
-fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell, depth: u8) !union(enum) { pending, insecure: i64, none } {
+fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell) !union(enum) { pending, insecure: i64, none } {
     var deepest = t.name;
     if (t.state.fact.rrset.kind == .nodata or t.state.fact.rrset.kind == .nxdomain) {
         deepest = zone;
@@ -338,7 +336,7 @@ fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *
         s.probe_depth = @max(s.probe_depth, @as(u8, @intCast(zone.labels.len))) + 1;
         if (s.probe_depth > deepest.labels.len) return .none;
         const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - s.probe_depth ..] };
-        s.probe = try g.demand(id, try g.keyFor(.ds, candidate, .a), candidate, depth) orelse return .none;
+        s.probe = try g.demand(id, try g.keyFor(.ds, candidate, .a), candidate) orelse return .none;
     }
 }
 

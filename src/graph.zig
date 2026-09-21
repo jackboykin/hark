@@ -209,11 +209,11 @@ pub const Value = union(Kind) {
     refresh: void,
 };
 
-/// Referenced by every cell charged to it.
+/// A question's: its root holds it, and every run the root waits on pays
+/// from it (`payerOf`).
 pub const Budget = struct {
     queries: u32 = 0,
     deadline_ns: i64,
-    refs: u32 = 0,
     /// When a refresh began; 0 for a client.
     refresh_ns: i64 = 0,
     unminimised: walk.Unminimised = .{},
@@ -273,6 +273,9 @@ const ExchangeScratch = struct {
     server: na.Address,
     transport: Transport,
     sent_ns: i64,
+    /// The payer's deadline came before the server's timeout, so a timeout
+    /// says nothing about the server.
+    cut_short: bool,
 };
 
 /// In the cell's arena: a cell pays for its own kind's, not the largest.
@@ -319,9 +322,6 @@ pub const Cell = struct {
     /// Unpinned at settle; an answer's at free.
     inputs: std.ArrayList(CellId) = .empty,
     holds: u32 = 0,
-    budget: *Budget,
-    /// Demand-chain length through NS-address sub-resolutions.
-    depth: u8,
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
     /// Everything the cell owns; freed with it.
@@ -360,6 +360,10 @@ pub const Graph = struct {
     checks: u64 = 0,
     live: u32 = 0,
     budgets: u32 = 0,
+    /// Who pays for the running rule: derived at each run, never stored.
+    payer: *Budget = undefined,
+    /// A run nobody waits on spends nothing.
+    unpaid: Budget = undefined,
     /// Exchanges the edge holds.
     flights: u32 = 0,
     /// Work that failed, refused at `demand` rather than tried again
@@ -403,8 +407,7 @@ pub const Graph = struct {
                 c.inputs.deinit(g.gpa);
                 c.waiters.deinit(g.gpa);
                 if (c.blob) |bl| g.store.unref(bl);
-                c.budget.refs -= 1;
-                if (c.budget.refs == 0) g.gpa.destroy(c.budget);
+                if (budgetOf(c)) |b| g.gpa.destroy(b);
                 c.arena.deinit();
             }
             g.gpa.destroy(c);
@@ -456,9 +459,7 @@ pub const Graph = struct {
             g.stats.clients.dropped += 1;
             return null;
         }
-        const budget = try g.gpa.create(Budget);
-        budget.* = .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms };
-        const id = try g.newCell(key, name, budget, 0);
+        const id = try g.newRoot(key, name, .{ .deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.ready.append(g.gpa, id);
@@ -478,10 +479,8 @@ pub const Graph = struct {
             g.stats.resolver.refused += 1;
             return;
         }
-        const budget = try g.gpa.create(Budget);
         const at = g.now() + g.edge.rng.intRangeLessThan(i64, 0, refresh_jitter_ns);
-        budget.* = .{ .deadline_ns = 0, .refresh_ns = g.now() };
-        const id = try g.newCell(rkey, name, budget, 0);
+        const id = try g.newRoot(rkey, name, .{ .deadline_ns = 0, .refresh_ns = g.now() });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.wake(id, at);
@@ -501,7 +500,8 @@ pub const Graph = struct {
         if (completion == .wake) {
             if (g.cell(id).gen == completion.wake) {
                 // A refresh's budget runs from its first wake.
-                if (g.cell(id).key.kind == .refresh and g.cell(id).budget.deadline_ns == 0) g.cell(id).budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
+                const c = g.cell(id);
+                if (c.key.kind == .refresh and c.scratch.answer.budget.deadline_ns == 0) c.scratch.answer.budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
                 try g.ready.append(g.gpa, id);
             }
             return g.drain();
@@ -550,7 +550,7 @@ pub const Graph = struct {
             .reply => |r| try g.observe(sc.server, r.rtt_ns),
             .timeout => {
                 g.stats.resolver.timeout += 1;
-                if (g.now() < c.budget.deadline_ns) try g.observeTimeout(sc.server);
+                if (!sc.cut_short) try g.observeTimeout(sc.server);
             },
             else => {},
         }
@@ -562,9 +562,19 @@ pub const Graph = struct {
 
     // ── Cells ──────────────────────────────────────────────────────────
 
-    /// Owns `budget` from the call; all or nothing.
-    pub fn newCell(g: *Graph, key: Key, name: dns.Name, budget: *Budget, depth: u8) !CellId {
-        errdefer if (budget.refs == 0) g.gpa.destroy(budget);
+    /// A question's cell, holding its budget.
+    fn newRoot(g: *Graph, key: Key, name: dns.Name, budget: Budget) !CellId {
+        const b = try g.gpa.create(Budget);
+        errdefer g.gpa.destroy(b);
+        b.* = budget;
+        const id = try g.newCell(key, name);
+        g.cell(id).scratch.answer.budget = b;
+        g.budgets += 1;
+        return id;
+    }
+
+    /// All or nothing.
+    pub fn newCell(g: *Graph, key: Key, name: dns.Name) !CellId {
         const reused = g.free_ids.pop();
         errdefer if (reused) |r| g.free_ids.appendAssumeCapacity(r);
         const id: CellId = reused orelse @intCast(g.cells.items.len);
@@ -593,13 +603,9 @@ pub const Graph = struct {
             .gen = if (reused != null) c.gen +% 1 else 0,
             .key = own_key,
             .name = own_name,
-            .budget = budget,
-            .depth = depth,
             .arena = arena,
             .scratch = scratch,
         };
-        budget.refs += 1;
-        if (budget.refs == 1) g.budgets += 1;
         g.live += 1;
         g.created += 1;
         return id;
@@ -665,9 +671,8 @@ pub const Graph = struct {
         if (g.index.get(c.key)) |i| if (i == id) {
             _ = g.index.remove(c.key);
         };
-        c.budget.refs -= 1;
-        if (c.budget.refs == 0) {
-            g.gpa.destroy(c.budget);
+        if (budgetOf(c)) |b| {
+            g.gpa.destroy(b);
             g.budgets -= 1;
         }
         c.arena.deinit();
@@ -771,28 +776,50 @@ pub const Graph = struct {
         return c.settled() and c.expires_ns > g.now();
     }
 
-    pub fn bound(g: *Graph, budget: *const Budget) i64 {
+    pub fn bound(g: *const Graph, budget: *const Budget) i64 {
         return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.refresh_ns + refresh_window_ns);
     }
 
     /// Stored since the refresh began counts, inclusive: the edge reads the
     /// clock once per event, so a refresh shares an instant with what its
     /// trigger stored.
-    fn lookup(g: *Graph, key: Key, name: dns.Name, budget: *Budget) !?CellId {
+    fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
         const live = g.index.get(key);
-        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(budget) or e.stored_ns >= budget.refresh_ns) {
+        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(g.payer) or e.stored_ns >= g.payer.refresh_ns) {
             if (live) |id| if (g.cell(id).blob == e.blob) return id;
-            return try g.materialise(key, name, budget, e);
+            return try g.materialise(key, name, e);
         };
         if (live) |id| {
             const c = g.cell(id);
-            if (!c.settled() or c.expires_ns > g.bound(budget) or (c.budget == budget and c.expires_ns > g.now())) return id;
+            if (!c.settled() or g.serves(id)) return id;
         }
         return null;
     }
 
-    fn materialise(g: *Graph, key: Key, name: dns.Name, budget: *Budget, e: store.Entry) !CellId {
-        const id = try g.newCell(key, name, budget, 0);
+    /// A live fact serves the running rule while it outlives the payer's
+    /// bound, or, still fresh, is already the payer's own input.
+    pub fn serves(g: *Graph, id: CellId) bool {
+        const c = g.cell(id);
+        return c.expires_ns > g.bound(g.payer) or (g.fresh(id) and g.pays(id));
+    }
+
+    /// Does the running rule's payer already wait on `id`?
+    fn pays(g: *Graph, id: CellId) bool {
+        g.checks += 1;
+        var stack: std.ArrayList(CellId) = .empty;
+        stack.append(g.scratch.allocator(), id) catch return false;
+        while (stack.pop()) |i| {
+            const c = g.cell(i);
+            if (c.seen == g.checks) continue;
+            c.seen = g.checks;
+            if (budgetOf(c)) |b| if (b == g.payer) return true;
+            stack.appendSlice(g.scratch.allocator(), c.waiters.items) catch return false;
+        }
+        return false;
+    }
+
+    fn materialise(g: *Graph, key: Key, name: dns.Name, e: store.Entry) !CellId {
+        const id = try g.newCell(key, name);
         const c = g.cell(id);
         c.state = .{ .fact = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
             g.free(id, c) catch {};
@@ -818,17 +845,78 @@ pub const Graph = struct {
 
     /// Null on a cycle, or on new work for an orphan. New work that failed
     /// recently settles as that failure, its rule never run.
-    pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name, depth: u8) !?CellId {
-        if (try g.lookup(key, name, g.cell(by).budget)) |id| {
+    pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name) !?CellId {
+        if (try g.lookup(key, name)) |id| {
             if (!g.fresh(id) and g.reaches(by, id)) return null;
             try g.pin(id, by);
             return id;
         }
         if (g.cell(by).orphan) return null;
-        const id = try g.newCell(key, name, g.cell(by).budget, depth);
+        const id = try g.newCell(key, name);
         try g.pin(id, by);
         if (g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
         return id;
+    }
+
+    /// The first question waiting on `id`, oldest demand first, whose budget
+    /// has room; else the first one at all. None for an orphan.
+    fn payerOf(g: *Graph, id: CellId) ?*Budget {
+        g.checks += 1;
+        var first: ?*Budget = null;
+        var stack: std.ArrayList(CellId) = .empty;
+        stack.append(g.scratch.allocator(), id) catch return null;
+        while (stack.pop()) |i| {
+            const c = g.cell(i);
+            if (c.seen == g.checks or c.orphan) continue;
+            c.seen = g.checks;
+            if (budgetOf(c)) |b| {
+                if (!g.spent(b)) return b;
+                first = first orelse b;
+                continue;
+            }
+            var w = c.waiters.items.len;
+            while (w > 0) {
+                w -= 1;
+                stack.append(g.scratch.allocator(), c.waiters.items[w]) catch return first;
+            }
+        }
+        return first;
+    }
+
+    fn budgetOf(c: *const Cell) ?*Budget {
+        return switch (c.scratch) {
+            .answer => |a| a.budget,
+            else => null,
+        };
+    }
+
+    pub fn spent(g: *const Graph, b: *const Budget) bool {
+        return g.now() >= b.deadline_ns or b.queries >= g.cfg.max_queries or b.validation.exhausted();
+    }
+
+    /// NS-address sub-resolutions between `id` and its nearest question,
+    /// along the shortest demand chain; 0 for an orphan.
+    pub fn level(g: *Graph, id: CellId) u8 {
+        g.checks += 1;
+        const gpa = g.scratch.allocator();
+        var here: std.ArrayList(CellId) = .empty;
+        var next: std.ArrayList(CellId) = .empty;
+        here.append(gpa, id) catch return 0;
+        var d: u8 = 0;
+        while (true) : (d +|= 1) {
+            while (here.pop()) |i| {
+                const c = g.cell(i);
+                if (c.seen == g.checks or c.orphan) continue;
+                c.seen = g.checks;
+                if (budgetOf(c) != null) return d;
+                for (c.waiters.items) |w| {
+                    const list = if (g.cell(w).key.kind == .addr) &next else &here;
+                    list.append(gpa, w) catch return d;
+                }
+            }
+            if (next.items.len == 0) return 0;
+            std.mem.swap(std.ArrayList(CellId), &here, &next);
+        }
     }
 
     /// Does settling `from` transitively wake `target`? Then `from`
@@ -879,6 +967,8 @@ pub const Graph = struct {
             g.release(id);
         }
         _ = g.scratch.reset(.retain_capacity);
+        g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_hash = 0 } };
+        g.payer = g.payerOf(id) orelse &g.unpaid;
         g.tally.runs += 1;
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
@@ -933,10 +1023,10 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
-    /// Null, like `demand`, when the asker's budget, deadline or orphaning
-    /// refuses the work.
+    /// Null, like `demand`, when the payer's budget or deadline, or the
+    /// asker's orphaning, refuses the work.
     pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
-        const budget = g.cell(by).budget;
+        const budget = g.payer;
         if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -944,7 +1034,7 @@ pub const Graph = struct {
             }
             return null;
         }
-        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname, budget, g.cell(by).depth);
+        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname);
         try g.pin(id, by);
         budget.queries += 1;
         g.cell(id).holds += 1;
@@ -958,14 +1048,15 @@ pub const Graph = struct {
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);
-        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .sent_ns = g.now() };
+        const timeout_at = g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms;
+        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= timeout_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
             .server = server,
             .transport = transport,
             .wire = wire,
-            .deadline_ns = @min(budget.deadline_ns, g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms),
+            .deadline_ns = @min(budget.deadline_ns, timeout_at),
         });
         g.flights += 1;
         if (transport == .udp) g.stats.resolver.udp += 1 else g.stats.resolver.tcp += 1;
@@ -1048,4 +1139,37 @@ test "an evicted root cut is re-derived, not walked" {
     try g.drain();
     try testing.expect(g.store.get(root_cut, now) != null);
     g.unhold(root);
+}
+
+test "a shared cell is paid by a question with room and sits at its shortest chain" {
+    const testing = std.testing;
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    const Stub = struct {
+        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    };
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
+    // First asks through an NS address; second asks the host itself.
+    const first = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, true)).?;
+    const second = (try g.demandRoot(host, .a, true)).?;
+    const addr = try g.newCell(try g.keyFor(.addr, host, .a), host);
+    try g.pin(addr, first);
+    const rrset = try g.newCell(try g.keyFor(.rrset, host, .a), host);
+    try g.pin(rrset, addr);
+    try testing.expectEqual(1, g.level(rrset));
+    try g.pin(rrset, second);
+    try testing.expectEqual(0, g.level(rrset));
+    // The first demander spent is no reason to stop.
+    g.cell(first).scratch.answer.budget.queries = g.cfg.max_queries;
+    try testing.expectEqual(g.cell(second).scratch.answer.budget, g.payerOf(rrset).?);
+    g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
+    try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(rrset).?);
+    g.unhold(first);
+    g.unhold(second);
 }

@@ -186,6 +186,8 @@ pub const NsScratch = struct {
 };
 
 pub const AnswerScratch = struct {
+    /// The question's; set as the root is made, freed with it.
+    budget: *graph.Budget = undefined,
     hops: [max_cname_chain + 1]CellId = undefined,
     n: u8 = 0,
     /// `secure(hop)` per hop.
@@ -223,7 +225,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             if (broken) return failAnswer(g, id, .{ .code = .other, .text = "cname loop" });
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
-        s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next, 0) orelse
+        s.hops[s.n] = try g.demand(id, try g.keyFor(.rrset, next, qtype), next) orelse
             return failAnswer(g, id, unreachable_authority);
         s.n += 1;
     }
@@ -273,7 +275,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (name.labels.len == 0) return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
-    if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name, g.cell(id).depth) orelse
+    if (s.parent == null) s.parent = try g.demand(id, try g.keyFor(.cut, parent_name, .a), parent_name) orelse
         return g.fail(id, unreachable_authority);
     const parent = g.cell(s.parent.?);
     if (!parent.settled()) return;
@@ -282,7 +284,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     const inside: graph.Value = .{ .cut = .{ .zone = pc.zone } };
     if (!g.cfg.qmin or name.labels.len > delegation.max_minimize_count) return g.settle(id, inside, parent.expires_ns);
     // Not a fact: the cut is unknown, and only this instant's demanders read it.
-    if (g.cell(id).budget.unminimised.covers(name)) return g.settle(id, inside, g.now());
+    if (g.payer.unminimised.covers(name)) return g.settle(id, inside, g.now());
     // No cut below a name that does not exist (RFC 8020).
     if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
     // A fresh fact at the probe name answers it without a packet.
@@ -347,7 +349,7 @@ pub const Unminimised = struct {
 };
 
 fn unminimised(g: *Graph, id: CellId, inside: graph.Value) !void {
-    const u = &g.cell(id).budget.unminimised;
+    const u = &g.payer.unminimised;
     const name = g.cell(id).name;
     u.len = @intCast(try dns.writeNameWire(&u.below, name));
     u.labels = @intCast(name.labels.len);
@@ -370,7 +372,7 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
 pub fn runNs(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.ns;
-    if (s.cut == null) s.cut = try g.demand(id, try g.keyFor(.cut, zone, .a), zone, g.cell(id).depth) orelse
+    if (s.cut == null) s.cut = try g.demand(id, try g.keyFor(.cut, zone, .a), zone) orelse
         return g.fail(id, unreachable_authority);
     const cut = g.cell(s.cut.?);
     if (!cut.settled()) return;
@@ -385,8 +387,7 @@ pub fn runNs(g: *Graph, id: CellId) !void {
 /// `addr(host)`: glue seeds it provisionally (`absorbReferral`); else
 /// the A and AAAA RRsets one level deeper, through at most one CNAME hop.
 pub fn runAddr(g: *Graph, id: CellId) !void {
-    const depth = g.cell(id).depth + 1;
-    if (depth > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
+    if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
     const s = g.cell(id).scratch.addr;
     if (s.host == null) {
         s.host = g.cell(id).name;
@@ -396,8 +397,8 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         };
     }
     const host = s.host.?;
-    if (s.a == null) s.a = try g.demand(id, try g.keyFor(.rrset, host, .a), host, depth);
-    if (s.aaaa == null) s.aaaa = try g.demand(id, try g.keyFor(.rrset, host, .aaaa), host, depth);
+    if (s.a == null) s.a = try g.demand(id, try g.keyFor(.rrset, host, .a), host);
+    if (s.aaaa == null) s.aaaa = try g.demand(id, try g.keyFor(.rrset, host, .aaaa), host);
     var addrs: std.ArrayList(na.Address) = .empty;
     var pending = false;
     var alias: ?dns.Name = null;
@@ -475,7 +476,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
             const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else try g.keyFor(.cut, parent_name, .a);
             const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
-            s.cut = try g.demand(id, key, cut_name, g.cell(id).depth) orelse
+            s.cut = try g.demand(id, key, cut_name) orelse
                 return g.fail(id, unreachable_authority);
         }
         const cut = g.cell(s.cut.?);
@@ -484,7 +485,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
         if (!s.dname_checked) {
             s.dname_checked = true;
-            if (try dnameAbove(g, name)) |owner| s.dname = try g.demand(id, try g.keyFor(.rrset, owner, .dname), owner, g.cell(id).depth);
+            if (try dnameAbove(g, name)) |owner| s.dname = try g.demand(id, try g.keyFor(.rrset, owner, .dname), owner);
             if (s.dname) |did| s.dname_judge = try trust.demandSecure(g, id, did);
         }
         if (s.dname_judge) |jid| {
@@ -549,8 +550,8 @@ const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "fa
 
 fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
     const c = g.cell(id);
-    const spent = g.now() >= c.budget.deadline_ns or c.budget.queries >= g.cfg.max_queries;
-    if (!spent and !c.orphan and c.depth == 0 and c.budget.refresh_ns == 0) try g.remember(c.key, failed_recently);
+    const spent = g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
+    if (!spent and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
     try g.fail(id, why);
 }
 
@@ -860,7 +861,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     if (zone.labels.len == 0) {
         for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
     } else {
-        if (a.ns == null) a.ns = try g.demand(id, try g.keyFor(.ns, zone, .a), zone, g.cell(id).depth) orelse return .none;
+        if (a.ns == null) a.ns = try g.demand(id, try g.keyFor(.ns, zone, .a), zone) orelse return .none;
         const ns = g.cell(a.ns.?);
         if (!ns.settled()) return .pending;
         if (ns.failure() != null) return .none;
@@ -885,7 +886,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                 } else {
                     // In progress for someone: wait, unless it is
                     // transitively waiting on us.
-                    if (try g.demand(id, key, host, g.cell(id).depth) != null) pending = true;
+                    if (try g.demand(id, key, host) != null) pending = true;
                     continue;
                 }
             }
@@ -900,7 +901,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         if (list.items.len == 0 and pending) return .pending;
         if (list.items.len == 0 and !a.fetched_unglued and unknown.items.len > 0) {
             a.fetched_unglued = true;
-            const limit: usize = switch (g.cell(id).depth) {
+            const limit: usize = switch (g.level(id)) {
                 0 => 3,
                 1 => 2,
                 else => 1,
@@ -908,7 +909,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             g.edge.rng.shuffle(dns.Name, unknown.items);
             var demanded = false;
             for (unknown.items[0..@min(limit, unknown.items.len)]) |host| {
-                const aid = try g.demand(id, try g.keyFor(.addr, host, .a), host, g.cell(id).depth) orelse continue;
+                const aid = try g.demand(id, try g.keyFor(.addr, host, .a), host) orelse continue;
                 if (!g.cell(aid).settled()) demanded = true;
             }
             if (demanded) return .pending;
