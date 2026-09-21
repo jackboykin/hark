@@ -330,8 +330,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         .pending => return,
         .exhausted => try g.fail(id, unreachable_authority),
         .reply => |msg| {
-            const walk: delegation.Walk = .{ .name = "", .target = name, .zone = pc.zone };
-            switch (delegation.probeStep(msg, &walk, g.cfg.addr_policy)) {
+            switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
                 .referral => |ref| {
                     const cut = try absorbReferral(g, id, ref, msg, pc.zone);
                     try g.settle(id, cut.value, cut.expires_ns);

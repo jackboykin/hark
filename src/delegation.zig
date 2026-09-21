@@ -11,56 +11,6 @@ pub const max_servers_per_level = 26;
 /// (RFC 9156's MAX_MINIMIZE_COUNT).
 pub const max_minimize_count = 10;
 
-/// Iteration state for one name's descent through the delegation tree.
-/// Same-zone CNAME hops keep the zone and servers and only restart
-/// QNAME minimization; cross-zone hops start a fresh Walk.
-pub const Walk = struct {
-    name: []const u8,
-    target: dns.Name,
-    zone: dns.Name = .{ .labels = &.{} },
-    addrs: [max_servers_per_level]na.Address = undefined,
-    addr_count: usize = 0,
-    /// NS names still without an address, looked up once `addrs` runs dry.
-    pending: []const dns.Name = &.{},
-    delegations: usize = 0,
-    /// `zone` signs with an algorithm whose DO answers overflow 1232,
-    /// decided where the cut is: from the referral's DS, else the cache.
-    tcp: bool = false,
-    /// RFC 9156 probe depth: labels of `target` sent in the next query.
-    /// Equal to `target.labels.len` means the full name goes out.
-    probe_labels: usize = 0,
-
-    pub fn init(allocator: mem.Allocator, name: []const u8) !Walk {
-        return .{ .name = name, .target = try dns.parseDottedName(allocator, name) };
-    }
-
-    pub fn servers(w: *const Walk) []const na.Address {
-        return w.addrs[0..w.addr_count];
-    }
-
-    pub fn setServers(w: *Walk, list: []const na.Address) void {
-        w.addr_count = list.len;
-        @memcpy(w.addrs[0..list.len], list);
-    }
-
-    pub fn stopProbing(w: *Walk) void {
-        w.probe_labels = w.target.labels.len;
-    }
-
-    pub fn restartProbing(w: *Walk, qmin: bool) void {
-        w.probe_labels = if (qmin) w.zone.labels.len + 1 else w.target.labels.len;
-    }
-
-    pub fn probeName(w: *const Walk) dns.Name {
-        return .{ .labels = w.target.labels[w.target.labels.len - w.probe_labels ..] };
-    }
-
-    /// `probes` counts the resolution's minimised steps so far.
-    pub fn isFinal(w: *const Walk, qmin: bool, probes: usize) bool {
-        return w.probe_labels >= w.target.labels.len or !qmin or probes >= max_minimize_count;
-    }
-};
-
 /// What a minimised probe's reply does to the walk.
 pub const ProbeStep = union(enum) {
     referral: Referral,
@@ -71,14 +21,14 @@ pub const ProbeStep = union(enum) {
     failed,
 };
 
-pub fn probeStep(response: dns.Message, walk: *const Walk, policy: AddrPolicy) ProbeStep {
+pub fn probeStep(response: dns.Message, target: dns.Name, zone: dns.Name, policy: AddrPolicy) ProbeStep {
     switch (response.header.flags.rcode) {
         // Error replies can carry authority NS that delegate nothing.
         .no_error => {},
         .name_error => return .nxdomain,
         else => return .failed,
     }
-    if (extractReferral(response, walk.target, walk.zone, policy)) |referral| return .{ .referral = referral };
+    if (extractReferral(response, target, zone, policy)) |referral| return .{ .referral = referral };
     return if (response.answers.len > 0) .answered else .nodata;
 }
 
@@ -200,19 +150,6 @@ pub fn referralAtCut(response: dns.Message, zone: dns.Name, policy: AddrPolicy) 
     return extractReferral(response, zone, .{ .labels = zone.labels[1..] }, policy);
 }
 
-/// Unsigned authoritative data below the tracked cut: an unseen child cut
-/// may sit anywhere between `zone` and `target`.
-pub fn hidesCut(response: dns.Message, walk: *const Walk) bool {
-    return walk.target.labels.len > walk.zone.labels.len and
-        response.header.flags.aa and !hasSignedRecords(response);
-}
-
-fn hasSignedRecords(response: dns.Message) bool {
-    for (response.answers) |rr| if (rr.rtype == .rrsig) return true;
-    for (response.authorities) |rr| if (rr.rtype == .rrsig) return true;
-    return false;
-}
-
 /// RFC 1034 §4.3.5: drop this reply and ask a sibling. SERVFAIL, REFUSED
 /// and FORMERR (hark never retries without EDNS); a lame reply, non-AA
 /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
@@ -297,36 +234,19 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
 }
 
 test "probeStep: referral only from NOERROR, NXDOMAIN stops, NODATA and data step" {
-    var walk: Walk = .{ .name = "www.example.com", .target = www };
-    walk.restartProbing(true);
-
     var msg = reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 192, 0, 2, 1 })});
-    try testing.expect(probeStep(msg, &walk, .{}) == .referral);
+    try testing.expect(probeStep(msg, www, root, .{}) == .referral);
 
     msg.header.flags.rcode = .name_error;
-    try testing.expect(probeStep(msg, &walk, .{}) == .nxdomain);
+    try testing.expect(probeStep(msg, www, root, .{}) == .nxdomain);
     msg.header.flags.rcode = .server_failure;
-    try testing.expect(probeStep(msg, &walk, .{}) == .failed);
+    try testing.expect(probeStep(msg, www, root, .{}) == .failed);
 
     msg.header.flags.rcode = .no_error;
     msg.authorities = &.{};
-    try testing.expect(probeStep(msg, &walk, .{}) == .nodata);
+    try testing.expect(probeStep(msg, www, root, .{}) == .nodata);
     msg.answers = &.{glueA(example, .{ 192, 0, 2, 1 })};
-    try testing.expect(probeStep(msg, &walk, .{}) == .answered);
-}
-
-test "Walk: minimised probes step to the full name, capped by the probe count" {
-    var walk: Walk = .{ .name = "www.example.com", .target = www };
-    walk.restartProbing(true);
-    try testing.expect(walk.probeName().eql(.{ .labels = &.{"com"} }));
-    try testing.expect(!walk.isFinal(true, 0));
-    try testing.expect(walk.isFinal(false, 0));
-    try testing.expect(walk.isFinal(true, max_minimize_count));
-
-    walk.zone = example;
-    walk.restartProbing(true);
-    try testing.expect(walk.probeName().eql(www));
-    try testing.expect(walk.isFinal(true, 0));
+    try testing.expect(probeStep(msg, www, root, .{}) == .answered);
 }
 
 test "referralAtCut refers from one label above the zone" {
