@@ -59,15 +59,20 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
     // CHECK_ANSWER reads the held roots' hops.
     var held: Held = .{ null, null };
     defer unholdAll(&g, &held);
-    var failures: answer.Failures = .{};
-    defer failures.deinit(gpa);
+    var desk: answer.Desk = .{
+        .g = &g,
+        .retention = .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 },
+        .dns64 = scenario.dns64_prefix,
+        .minimal = scenario.minimal_responses orelse true,
+    };
+    defer desk.deinit();
     var last: ?dns.Message = null;
     var cursor: usize = 0;
     for (scenario.steps) |st| {
         s.step = st.n;
         report.step = st.n;
         switch (st.kind) {
-            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &failures) orelse {
+            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk) orelse {
                 report.msg = "client timed out";
                 return error.ScenarioFailed;
             }).msg,
@@ -110,7 +115,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
         }
     }
     report.phase = .warm;
-    try requery(arena, &g, &s, scenario, report, &held, &failures);
+    try requery(arena, &g, &s, scenario, report, &held, &desk);
     // Quiescence: nothing outlives its demand.
     unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
@@ -125,7 +130,7 @@ pub fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options,
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared.
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, failures: *answer.Failures) !void {
+fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, desk: *answer.Desk) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -138,7 +143,7 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, failures) orelse {
+        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk) orelse {
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
@@ -164,33 +169,25 @@ fn unholdAll(g: *graph.Graph, held: *Held) void {
 
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
-fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, failures: *answer.Failures) !?answer.Served {
+fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk) !?answer.Served {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
-    const d64 = answer.Dns64.on(scenario.dns64_prefix, client);
-    if (try answer.special(arena, q, client, d64)) |served| return served;
-    if (q.qtype == .any) return try answer.hinfo(arena, q, client);
-    if (failures.get(q, client.cd, g.now())) |ede| switch (ede.code) {
-        // A hold with nothing left to serve asks afresh.
-        .stale_answer, .stale_nxdomain_answer => if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| return served,
-        else => return try answer.servfail(arena, q, client, ede),
-    };
-    if (try memory(arena, g, scenario, q, client, d64, .fresh)) |served| {
-        try agrees(arena, g, s, scenario, q, client, d64, held, served);
-        try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
-        return served;
+    switch (try desk.early(arena, q, client)) {
+        .synthesized, .replayed, .floored => |served| return served,
+        .recalled => |served| {
+            try agrees(arena, g, s, scenario, q, client, held, desk, served);
+            return served;
+        },
+        .graph => {},
     }
-    const served = try memory(arena, g, scenario, q, client, d64, .floored) orelse
-        try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return null;
-    try failures.note(g.gpa, q, client.cd, served, g.cfg.servfail_ttl, g.now());
-    return served;
+    return try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null);
 }
 
 /// `recall`'s backstop: what it serves from the store, the graph builds
 /// too, asking nobody, to the byte.
-fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held, recalled: answer.Served) !void {
+fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk, recalled: answer.Served) !void {
     const before = s.log.items.len;
-    const built = try shapeClient(arena, g, s, scenario, q, client, d64, held) orelse return error.RecallDisagrees;
+    const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
     if (s.log.items.len != before) return error.RecallDisagrees;
     const a = try dns.serializeMessage(try arena.alloc(u8, 65535), recalled.msg);
     const b = try dns.serializeMessage(try arena.alloc(u8, 65535), built.msg);
@@ -198,36 +195,18 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
 
-fn retention(scenario: *const rpl.Scenario) answer.Retention {
-    return .{ .min_ttl = scenario.min_ttl orelse 0, .serve_stale_ttl = scenario.serve_stale_ttl orelse 0 };
-}
-
-fn memory(arena: Allocator, g: *graph.Graph, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, how: enum { fresh, floored, stale }) !?answer.Served {
-    const minimal = scenario.minimal_responses orelse true;
-    const asked = if (d64) |d| try d.asked(arena, q) else q;
-    const served = try switch (how) {
-        .fresh => answer.fresh(arena, g, retention(scenario), asked, client, minimal),
-        .floored => answer.floored(arena, g, retention(scenario), asked, client, minimal),
-        .stale => answer.stale(arena, g, retention(scenario), asked, client, minimal),
-    } orelse return null;
-    const d = d64 orelse return served;
-    if (how == .fresh and answer.Dns64.wantsA(q, served)) return null;
-    return try d.shape(arena, q, served, null);
-}
-
-fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, d64: ?answer.Dns64, held: *Held) !?answer.Served {
+/// The graph driven synchronously: serve parks the client instead.
+fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, q: dns.Question, client: answer.Client, held: *Held, desk: *answer.Desk) !?answer.Served {
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
-    const minimal = scenario.minimal_responses orelse true;
-    const ret = retention(scenario);
-    const asked = if (d64) |d| try d.asked(arena, q) else q;
+    const asked = try desk.asked(arena, q, client);
     const root = (try g.demandRoot(asked.name, asked.qtype, true)).?;
     held[0] = root;
     try g.drain();
     // RFC 8767 §5: stale at the client's patience, as serve does.
     const patience = s.now_ns + answer.stale_client_ms * std.time.ns_per_ms;
-    if (ret.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
-        if (try memory(arena, g, scenario, q, client, d64, .stale)) |served| {
+    if (desk.retention.serve_stale_ttl > 0 and !try settleBy(g, s, root, @min(patience, deadline))) {
+        if (try desk.memory(arena, q, client, .stale)) |served| {
             unholdAll(g, held);
             return served;
         }
@@ -236,21 +215,16 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
         unholdAll(g, held);
         return null;
     }
-    const served = try answer.build(arena, g, ret, root, asked, client, minimal);
-    const d = d64 orelse return served;
-    var a: ?answer.Served = null;
-    if (answer.Dns64.wantsA(q, served)) {
-        const aq: dns.Question = .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
-        const ar = (try g.demandRoot(aq.name, aq.qtype, true)).?;
-        held[1] = ar;
-        try g.drain();
-        if (!try settleBy(g, s, ar, deadline)) {
-            unholdAll(g, held);
-            return null;
-        }
-        a = try answer.build(arena, g, ret, ar, aq, client, minimal);
+    const served = try desk.built(arena, root, q, client);
+    const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
+    const a = (try g.demandRoot(aq.name, aq.qtype, true)).?;
+    held[1] = a;
+    try g.drain();
+    if (!try settleBy(g, s, a, deadline)) {
+        unholdAll(g, held);
+        return null;
     }
-    return try d.shape(arena, q, served, a);
+    return try desk.finish(arena, q, client, served, a);
 }
 
 /// False when nothing more arrives before `until`.

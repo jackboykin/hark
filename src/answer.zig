@@ -118,6 +118,87 @@ pub const Retention = struct {
     serve_stale_ttl: u32 = 0,
 };
 
+/// The client path, in the one order serve and the replay both take:
+/// RFC 6761, RFC 8482, the failure cache, memory, then the graph, which
+/// each drives its own way; past the client's patience, stale.
+pub const Desk = struct {
+    g: *graph.Graph,
+    retention: Retention,
+    dns64: ?dns64.Prefix,
+    minimal: bool,
+    failures: Failures = .{},
+
+    pub fn deinit(d: *Desk) void {
+        d.failures.deinit(d.g.gpa);
+    }
+
+    /// `recalled` and `floored` come noted; a replay never is, or a hold
+    /// would extend itself.
+    pub const Early = union(enum) {
+        synthesized: Served,
+        replayed: Served,
+        recalled: Served,
+        floored: Served,
+        graph,
+    };
+
+    pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
+        if (try special(arena, q, c, Dns64.on(d.dns64, c))) |s| return .{ .synthesized = s };
+        if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q, c) };
+        if (d.failures.get(q, c.cd, d.g.now())) |ede| switch (ede.code) {
+            // A hold with nothing left to serve asks afresh.
+            .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
+            else => return .{ .replayed = try servfail(arena, q, c, ede) },
+        };
+        if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
+        if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };
+        return .graph;
+    }
+
+    pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: enum { fresh, floored, stale }) !?Served {
+        const aq = try d.asked(arena, q, c);
+        const served = try switch (how) {
+            .fresh => fresh(arena, d.g, d.retention, aq, c, d.minimal),
+            .floored => floored(arena, d.g, d.retention, aq, c, d.minimal),
+            .stale => stale(arena, d.g, d.retention, aq, c, d.minimal),
+        } orelse return null;
+        const x = Dns64.on(d.dns64, c) orelse return served;
+        // Synthesis needs the A: the graph's to fetch.
+        if (how == .fresh and Dns64.wantsA(q, served)) return null;
+        return try x.shape(arena, q, served, null);
+    }
+
+    pub fn asked(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !dns.Question {
+        return if (Dns64.on(d.dns64, c)) |x| try x.asked(arena, q) else q;
+    }
+
+    pub fn built(d: *Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
+        return build(arena, d.g, d.retention, root, try d.asked(arena, q, c), c, d.minimal);
+    }
+
+    /// Under DNS64, the A to ask for behind `served`, an empty AAAA (§5.1.2).
+    pub fn wantsA(d: *Desk, q: dns.Question, c: Client, served: Served) ?dns.Question {
+        return if (Dns64.on(d.dns64, c) != null and Dns64.wantsA(q, served)) aOf(q) else null;
+    }
+
+    fn aOf(q: dns.Question) dns.Question {
+        return .{ .name = q.name, .qtype = .a, .qclass = q.qclass };
+    }
+
+    pub fn finish(d: *Desk, arena: Allocator, q: dns.Question, c: Client, served: Served, a: ?graph.CellId) !Served {
+        const x = Dns64.on(d.dns64, c) orelse return served;
+        const from = if (a) |id| try build(arena, d.g, d.retention, id, aOf(q), c, d.minimal) else null;
+        return try x.shape(arena, q, served, from);
+    }
+
+    /// Every reply the resolver derived, noted: a failure opens or widens
+    /// its window, stale holds it, an answer forgets it.
+    pub fn derived(d: *Desk, q: dns.Question, c: Client, served: Served) !Served {
+        try d.failures.note(d.g.gpa, q, c.cd, served, d.g.cfg.servfail_ttl, d.g.now());
+        return served;
+    }
+};
+
 /// BIND's stale-refresh-time (RFC 8767 §5): after serving stale, how long
 /// the question is answered stale without asking.
 pub const stale_hold_s = 30;

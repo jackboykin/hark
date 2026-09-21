@@ -87,8 +87,7 @@ const Server = struct {
     g: *graph.Graph,
     watched: std.ArrayList(Slot) = .empty,
     pending: std.ArrayList(Pending) = .empty,
-    failures: answer.Failures = .{},
-    retention: answer.Retention,
+    desk: answer.Desk,
     scratch: std.heap.ArenaAllocator,
     stopping: bool = false,
 
@@ -221,7 +220,7 @@ const Server = struct {
         for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
         for (s.pending.items) |p| s.release(p);
         s.pending.deinit(s.gpa);
-        s.failures.deinit(s.gpa);
+        s.desk.deinit();
         s.watched.deinit(s.gpa);
         s.scratch.deinit();
     }
@@ -273,25 +272,16 @@ const Server = struct {
             monotonic.advanceTestClock(secs);
             return s.send(reply, query, response.synthesizedMessage(&.{}, &.{}, .no_error, false), null, s.e.now_ns);
         };
-        const d64 = answer.Dns64.on(s.cfg.dns64, client);
-        if (try answer.special(arena, q, client, d64)) |served| return s.send(reply, query, served.msg, null, s.e.now_ns);
-        if (q.qtype == .any) return s.send(reply, query, (try answer.hinfo(arena, q, client)).msg, null, s.e.now_ns);
-        if (s.failures.get(q, client.cd, s.e.now_ns)) |ede| switch (ede.code) {
-            // A hold with nothing left to serve asks afresh.
-            .stale_answer, .stale_nxdomain_answer => if (try s.memory(arena, q, client, .stale)) |served| {
-                s.g.stats.clients.hit += 1;
+        const c = &s.g.stats.clients;
+        switch (try s.desk.early(arena, q, client)) {
+            .synthesized => |served| return s.send(reply, query, served.msg, served.ede, s.e.now_ns),
+            .replayed, .recalled, .floored => |served| {
+                c.hit += 1;
                 return s.send(reply, query, served.msg, served.ede, s.e.now_ns);
             },
-            else => {
-                s.g.stats.clients.hit += 1;
-                return s.send(reply, query, (try answer.servfail(arena, q, client, ede)).msg, ede, s.e.now_ns);
-            },
-        };
-        if (try s.memory(arena, q, client, .fresh) orelse try s.memory(arena, q, client, .floored)) |served| {
-            s.g.stats.clients.hit += 1;
-            return s.answered(reply, query, served, s.e.now_ns);
+            .graph => {},
         }
-        const asked = if (d64) |d| try d.asked(arena, q) else q;
+        const asked = try s.desk.asked(arena, q, client);
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
         // `max_in_flight` waiters only what is known is served (DNSBomb).
         const wait = s.pending.items.len < s.g.cfg.max_in_flight;
@@ -300,7 +290,7 @@ const Server = struct {
         var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled(), .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
         errdefer s.release(p);
         if (p.cached) if (try s.shape(arena, &p, q, client)) |served| {
-            s.g.stats.clients.hit += 1;
+            c.hit += 1;
             try s.answered(reply, query, served, p.asked_ns);
             return s.release(p);
         };
@@ -342,14 +332,14 @@ const Server = struct {
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
     /// the resolution goes on without it.
     fn impatient(s: *Server, p: *Pending) !bool {
-        if (p.stale_tried or s.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
+        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
         p.stale_tried = true;
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = try dns.parseMessage(arena, p.wire);
         const q = query.questions[0];
         const client = answer.Client.fromQuery(query);
-        const served = try s.memory(arena, q, client, .stale) orelse return false;
+        const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
         s.g.stats.clients.miss += 1;
         try s.answered(p.reply, query, served, p.asked_ns);
         return true;
@@ -362,50 +352,27 @@ const Server = struct {
     /// When the loop must look at the pending clients next.
     fn nextPatience(s: *Server) i64 {
         var at: i64 = std.math.maxInt(i64);
-        if (s.retention.serve_stale_ttl == 0) return at;
+        if (s.desk.retention.serve_stale_ttl == 0) return at;
         for (s.pending.items) |p| if (!p.stale_tried) {
             at = @min(at, patience(p));
         };
         return at;
     }
 
-    /// An answer from what the store still holds, asking nobody.
-    fn memory(s: *Server, arena: Allocator, q: dns.Question, client: answer.Client, how: enum { fresh, floored, stale }) !?answer.Served {
-        const d64 = answer.Dns64.on(s.cfg.dns64, client);
-        const asked = if (d64) |d| try d.asked(arena, q) else q;
-        const served = try switch (how) {
-            .fresh => answer.fresh(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
-            .floored => answer.floored(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
-            .stale => answer.stale(arena, s.g, s.retention, asked, client, s.cfg.minimal_responses),
-        } orelse return null;
-        const d = d64 orelse return served;
-        // Synthesis needs the A: the graph's to fetch.
-        if (how == .fresh and answer.Dns64.wantsA(q, served)) return null;
-        return try d.shape(arena, q, served, null);
-    }
-
-    /// A reply the resolver derived, noted in the failure cache: a failure
-    /// opens or widens its window, stale holds it, an answer forgets it.
-    /// What the cache replays is its own note, sent as is: noted, a
-    /// replayed hold would extend itself.
     fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
-        try s.failures.note(s.gpa, query.questions[0], answer.Client.fromQuery(query).cd, served, s.g.cfg.servfail_ttl, s.e.now_ns);
+        const q = query.questions[0];
+        _ = try s.desk.derived(q, answer.Client.fromQuery(query), served);
         s.send(reply, query, served.msg, served.ede, asked_ns);
     }
 
     fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
-        const d64 = answer.Dns64.on(s.cfg.dns64, client) orelse return try answer.build(arena, s.g, s.retention, p.root, q, client, s.cfg.minimal_responses);
-        const served = try answer.build(arena, s.g, s.retention, p.root, try d64.asked(arena, q), client, s.cfg.minimal_responses);
-        if (p.a == null and answer.Dns64.wantsA(q, served)) if (try s.g.demandRoot(q.name, .a, true)) |a| {
+        const served = try s.desk.built(arena, p.root, q, client);
+        if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (try s.g.demandRoot(aq.name, aq.qtype, true)) |a| {
             p.a = a;
             try s.g.drain();
         };
-        var a: ?answer.Served = null;
-        if (p.a) |id| {
-            if (!s.g.cell(id).settled()) return null;
-            a = try answer.build(arena, s.g, s.retention, id, .{ .name = q.name, .qtype = .a, .qclass = q.qclass }, client, s.cfg.minimal_responses);
-        }
-        return try d64.shape(arena, q, served, a);
+        if (p.a) |a| if (!s.g.cell(a).settled()) return null;
+        return try s.desk.finish(arena, q, client, served, p.a);
     }
 
     fn release(s: *Server, p: Pending) void {
@@ -545,7 +512,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     }, e.edge());
     defer g.deinit();
     g.attach();
-    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .scratch = std.heap.ArenaAllocator.init(gpa) };
+    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
