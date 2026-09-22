@@ -719,9 +719,9 @@ fn verdict(g: *Graph, kept: Kept, zone: dns.Name, name: dns.Name, qtype: dns.RTy
 /// The rcode is one of the three that answer. YXDOMAIN is derived, not
 /// taken: the chain must reach an in-zone DNAME whose substitution
 /// overflows (RFC 6672 §2.2), and an rcode DNSSEC does not sign must
-/// agree (RFC 6604 §4). Where the chain leaves the zone, an NXDOMAIN or
-/// YXDOMAIN speaks for a name outside it and the reply is an alias.
-/// Null: bizarre.
+/// agree (RFC 6604 §4). Where the chain leaves the zone, the final query
+/// cycle speaks for a name outside it (RFC 6604 §3): its rcode and its
+/// out-of-zone records are dropped and the reply is an alias. Null: bizarre.
 fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
@@ -780,8 +780,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .rcode = if (left) .no_error else msg.header.flags.rcode,
         .aa = msg.header.flags.aa,
         .answers = keep.items,
-        .authorities = msg.authorities,
-        .additionals = msg.additionals,
+        .authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities,
+        .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,
         .target = cur,
         .zone = zone,
         .stored_ns = g.now(),
@@ -795,6 +795,12 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     if (msg.header.flags.rcode == .name_error and !left) reply.kind = .nxdomain;
     reply.ttl = replyTtl(g, reply, zone, name);
     return .{ .reply = reply };
+}
+
+fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {
+    var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(g.scratch.allocator(), rrs.len);
+    for (rrs) |rr| if (rr.name.isSubdomainOf(zone)) keep.appendAssumeCapacity(rr);
+    return keep.items;
 }
 
 fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
