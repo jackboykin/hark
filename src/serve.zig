@@ -369,7 +369,7 @@ const Server = struct {
             _ = s.timers.pop();
             const p = &s.pending.items[t.slot];
             if (!p.live or p.gen != t.gen or p.at_ns != t.at_ns) continue;
-            if (try s.impatient(p)) {
+            if (try s.impatient(p) or s.gone(p.*)) {
                 s.unpark(t.slot);
                 s.vacate(t.slot);
             } else try s.schedule(t.slot);
@@ -423,9 +423,21 @@ const Server = struct {
 
     fn schedule(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
-        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0) return;
-        p.at_ns = patience(p.*);
+        p.at_ns = if (!p.stale_tried and s.desk.retention.serve_stale_ttl != 0)
+            patience(p.*)
+        else if (p.reply == .udp and s.e.now_ns < timeout(p.*))
+            timeout(p.*)
+        else
+            return;
         try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
+    }
+
+    /// Past its timeout a UDP client lets go, unless it alone holds the
+    /// resolution: the outcome is still wanted for the next ask.
+    fn gone(s: *Server, p: Pending) bool {
+        if (p.reply != .udp or s.e.now_ns < timeout(p) or s.g.cell(p.a orelse p.root).holds == 1) return false;
+        s.g.stats.clients.late += 1;
+        return true;
     }
 
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
@@ -446,6 +458,10 @@ const Server = struct {
 
     fn patience(p: Pending) i64 {
         return p.asked_ns + answer.stale_client_ms * std.time.ns_per_ms;
+    }
+
+    fn timeout(p: Pending) i64 {
+        return p.asked_ns + answer.client_timeout_ms * std.time.ns_per_ms;
     }
 
     /// When the loop must look at a parked client next.

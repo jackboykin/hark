@@ -34,6 +34,7 @@ class HarkConfig:
     # staggered race, forcing the deterministic sequential server loop.
     stagger_ms: int | None = None
     max_queries: int | None = None
+    max_in_flight: int | None = None
     # Each entry is a `"<key-tag> <alg> <dtype> <hex>"` string fed to
     # hark's test-only `[resolver] trust-anchors = [...]` knob. Requires
     # `dnssec = true`; to_toml enforces that pairing.
@@ -68,6 +69,8 @@ class HarkConfig:
             f'listen = ["{self.listen_ip}:{self.listen_port}"]',
             f"minimal-responses = {str(self.minimal_responses).lower()}",
         ]
+        if self.max_in_flight is not None:
+            lines.append(f"max-in-flight = {self.max_in_flight}")
         if self.tcp_idle_timeout_ms is not None:
             lines.append(f"tcp-idle-timeout-ms = {self.tcp_idle_timeout_ms}")
         if self.allow_from:

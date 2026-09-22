@@ -21,6 +21,7 @@ Hark-only extensions:
   - ; hark: serve-stale-ttl = <seconds>     header directive (optional)
   - ; hark: min-ttl = <seconds>             header directive (optional)
   - ; hark: prefetch = yes                  header directive (optional)
+  - ; hark: max-in-flight = <n>             header directive (optional)
   - ; hark: client-timeout = <seconds>      header directive: how long each QUERY waits (default 5)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
@@ -207,6 +208,7 @@ class Scenario:
     # specific NS-failure order. None = harness/hark default.
     stagger_ms: int | None = None
     max_queries: int | None = None
+    max_in_flight: int | None = None
     dns64_prefix: str | None = None
     serve_stale_ttl: int | None = None
     prefetch: bool | None = None
@@ -283,6 +285,8 @@ class _Parser:
             self.scenario.stagger_ms = int(val.strip())
         elif key == "max-queries":
             self.scenario.max_queries = int(val.strip())
+        elif key == "max-in-flight":
+            self.scenario.max_in_flight = int(val.strip())
         elif key == "dns64-prefix":
             self.scenario.dns64_prefix = val.strip()
         elif key == "serve-stale-ttl":
