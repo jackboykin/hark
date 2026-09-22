@@ -1,11 +1,12 @@
 # shellcheck shell=bash
 # Sourced by the rigs: NSD authority and hark on loopback inside unshare -Urn,
 # pinned for the 7950X, plus the samplers that see what process time hides.
-# env: CPU_RES (2), CPU_LOAD (4-7), CPU_NSD (8-11), CPU_AUX (13), PERF=1 for
-# per-window perf counters on CPU_RES (perfd.sh, started outside the namespace).
+# env: CPU_RES (2), CPU_LOAD (4-7), CPU_NSD (8-11), CPU_AUX (13, probes),
+# CPU_SAMPLE (14, the udp sampler), PERF=1 for per-window perf counters on
+# CPU_RES (perfd.sh, started outside the namespace).
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 P=$B/peers
-CPU_RES=${CPU_RES:-2} CPU_LOAD=${CPU_LOAD:-4-7} CPU_NSD=${CPU_NSD:-8-11} CPU_AUX=${CPU_AUX:-13}
+CPU_RES=${CPU_RES:-2} CPU_LOAD=${CPU_LOAD:-4-7} CPU_NSD=${CPU_NSD:-8-11} CPU_AUX=${CPU_AUX:-13} CPU_SAMPLE=${CPU_SAMPLE:-14}
 PORT=5354
 
 # Re-runs the calling script in a fresh user and network namespace.
@@ -63,7 +64,7 @@ core_busy() { # snap0 snap1 -> busy usr sys si (percent of the core)
 # for hark's listener and G for a generator socket aimed at it.
 # shellcheck disable=SC2016 # awk and the inner bash expand these, not us
 udp_start() {
-  (exec taskset -c "$CPU_AUX" bash -c 'while :; do awk -v p="$1" "$2" /proc/net/udp; sleep 0.05; done' _ \
+  (exec taskset -c "$CPU_SAMPLE" bash -c 'while :; do awk -v p="$1" "$2" /proc/net/udp; sleep 0.05; done' _ \
     "$(printf ':%04X' "$PORT")" '{ split($5, q, ":"); k = $2 ~ p "$" ? "L" : $3 ~ p "$" ? "G" : "" }
       k { print k, $10, strtonum("0x" q[2]), $13 }') >"$R/udp" &
   UDP=$!
