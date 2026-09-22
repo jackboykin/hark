@@ -60,6 +60,24 @@ SCENARIO = (
         RANGE_BEGIN 0 100
           ADDRESS 127.0.10.2
           ENTRY_BEGIN
+            MATCH opcode qname
+            ADJUST copy_id copy_query
+            REPLY QR AA NOERROR
+            SECTION QUESTION
+              popular.live. IN A
+            SECTION ANSWER
+              popular.live. 1 IN A 192.0.2.7
+          ENTRY_END
+          ENTRY_BEGIN
+            MATCH opcode qname
+            ADJUST copy_id copy_query
+            REPLY QR AA NOERROR
+            SECTION QUESTION
+              hit.live. IN A
+            SECTION ANSWER
+              hit.live. 3600 IN A 192.0.2.8
+          ENTRY_END
+          ENTRY_BEGIN
             MATCH opcode subdomain
             ADJUST copy_id copy_query
             REPLY QR AA NOERROR
@@ -118,11 +136,15 @@ def stats(proc) -> dict[str, int]:
     return {k: int(v) for k, v in re.findall(r"([a-z]+) (\d+)", line)}
 
 
-@pytest.fixture
-def hark(tmp_path):
+def serve(tmp_path, cache_size: int | None = None):
     path = tmp_path / "admission.rpl"
     path.write_text(SCENARIO)
-    with conftest.scenario_env(rpl.parse(path), cache_size=TINY_CACHE) as (_, proc):
+    return conftest.scenario_env(rpl.parse(path), cache_size=cache_size)
+
+
+@pytest.fixture
+def hark(tmp_path):
+    with serve(tmp_path, TINY_CACHE) as (_, proc):
         yield proc
 
 
@@ -139,3 +161,38 @@ def test_late_waiters_make_room_for_new_questions(hark):
     advance(2)
     assert send_raw_query("c.live.", "A", conftest.HARK_LISTEN, timeout=2).rcode() == dns.rcode.NOERROR
     assert stats(hark)["reaped"] > 0
+
+
+def test_a_crowded_queue_sheds_novel_names_only(tmp_path):
+    with serve(tmp_path) as (_, proc):
+        for name in ("hit.live.", "popular.live."):
+            assert send_raw_query(name, "A", conftest.HARK_LISTEN).rcode() == dns.rcode.NOERROR
+        advance(2)  # popular.live's TTL (1 s) lapses; its answer stays on record.
+        # Queued while hark is stopped, the burst fills its 2 MB receive
+        # buffer (a loopback datagram takes ~1 KB of it) and the kernel drops
+        # the overflow: hark's first wake finds the queue crowded.
+        burst = ["novel.live.", "popular.live."] + ["hit.live."] * 3000
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+            proc.proc.send_signal(signal.SIGSTOP)
+            try:
+                for name in burst:
+                    s.sendto(dns.message.make_query(name, "A").to_wire(), conftest.HARK_LISTEN)
+            finally:
+                proc.proc.send_signal(signal.SIGCONT)
+            s.settimeout(1)
+            answered: dict[str, int] = {}
+            try:
+                while True:
+                    reply = dns.message.from_wire(s.recv(4096))
+                    assert reply.rcode() == dns.rcode.NOERROR
+                    name = reply.question[0].name.to_text().lower()
+                    answered[name] = answered.get(name, 0) + 1
+            except socket.timeout:
+                pass
+        assert answered.get("hit.live.", 0) > 1000
+        assert answered.get("popular.live.") == 1
+        assert "novel.live." not in answered
+        assert stats(proc)["shed"] == 1
+        # Drained, a novel name gets in.
+        assert send_raw_query("novel.live.", "A", conftest.HARK_LISTEN).rcode() == dns.rcode.NOERROR

@@ -284,7 +284,7 @@ pub const Budget = struct {
 
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
-    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, reaped: u64 = 0, echoed: u64 = 0, echo_ms: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
+    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, reaped: u64 = 0, shed: u64 = 0, echoed: u64 = 0, echo_ms: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
     resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, unsent: u64 = 0, retry: u64 = 0, refresh: u64 = 0, keys: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
@@ -505,21 +505,24 @@ pub const Graph = struct {
         return g.cells.items[id];
     }
 
-    /// Held for the client until `unhold`. Null: new work past
-    /// `max_in_flight`, `max_flights` or `max_work_bytes`, or anything unsettled for a caller
-    /// that cannot `wait`.
-    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
+    /// What a client may start: `known`, only what is settled; `join`,
+    /// work in progress too; `new`, a resolution of its own.
+    pub const Admit = enum { known, join, new };
+
+    /// Held for the client until `unhold`. Null: past what `admit` allows,
+    /// or new work past `max_in_flight`, `max_flights` or `max_work_bytes`.
+    pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !?CellId {
         var kb: KeyBuf = undefined;
         const key = Key.of(&kb, .answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled() or g.fresh(id)) {
-            if (!wait and !g.cell(id).settled()) {
+            if (admit == .known and !g.cell(id).settled()) {
                 g.stats.clients.dropped += 1;
                 return null;
             }
             g.cell(id).holds += 1;
             return id;
         };
-        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) {
+        if (admit != .new or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) {
             g.stats.clients.dropped += 1;
             return null;
         }
@@ -1209,9 +1212,9 @@ test "a cell replacing an expired one takes over the index entry's key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    const first = (try g.demandRoot(name, .a, true)).?;
+    const first = (try g.demandRoot(name, .a, .new)).?;
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now);
-    const second = (try g.demandRoot(name, .a, true)).?;
+    const second = (try g.demandRoot(name, .a, .new)).?;
     try testing.expect(first != second);
     g.unhold(first);
     try testing.expect(!g.cell(first).live);
@@ -1236,12 +1239,16 @@ test "a caller that cannot wait gets only what is settled" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    try testing.expectEqual(null, try g.demandRoot(name, .a, false));
-    const first = (try g.demandRoot(name, .a, true)).?;
-    try testing.expectEqual(null, try g.demandRoot(name, .a, false));
-    try testing.expectEqual(@as(u64, 2), g.stats.clients.dropped);
+    try testing.expectEqual(null, try g.demandRoot(name, .a, .known));
+    const first = (try g.demandRoot(name, .a, .new)).?;
+    try testing.expectEqual(null, try g.demandRoot(name, .a, .known));
+    // Work in progress is joined; none is started.
+    try testing.expectEqual(first, (try g.demandRoot(name, .a, .join)).?);
+    try testing.expectEqual(null, try g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .join));
+    try testing.expectEqual(@as(u64, 3), g.stats.clients.dropped);
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now + std.time.ns_per_s);
-    try testing.expectEqual(first, (try g.demandRoot(name, .a, false)).?);
+    try testing.expectEqual(first, (try g.demandRoot(name, .a, .known)).?);
+    g.unhold(first);
     g.unhold(first);
     g.unhold(first);
 }
@@ -1261,7 +1268,7 @@ test "an evicted root cut is re-derived, not walked" {
     g.store.drop(root_cut, g.store.any(root_cut).?.blob);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, true)).?;
+    const root = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, .new)).?;
     try g.drain();
     try testing.expect(g.store.get(root_cut, now) != null);
     g.unhold(root);
@@ -1282,8 +1289,8 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const host = try dns.parseDottedName(arena.allocator(), "ns.example.");
-    const first = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, true)).?;
-    const second = (try g.demandRoot(host, .a, true)).?;
+    const first = (try g.demandRoot(try dns.parseDottedName(arena.allocator(), "a.example."), .a, .new)).?;
+    const second = (try g.demandRoot(host, .a, .new)).?;
     const shared = try g.newCell(Key.of(&kb, .rrset, host, .a), host);
     try g.pin(shared, first);
     try g.pin(shared, second);

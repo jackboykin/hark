@@ -27,6 +27,12 @@ const udp_recv_max = 4096;
 /// wake they fell 13%, at 8 they held.
 const udp_per_wake = 64;
 const udp_misses_per_wake = 8;
+/// Eighths of a listener's receive buffer past which it is crowded: once
+/// full, the kernel drops blindly, hits and misses alike. Below it sits a
+/// client keeping 1000 queries outstanding, ~55% of the 2 MB buffer at
+/// ~1.1 KB a datagram; above it, 512 KB of room, ~2 ms of arrivals at four
+/// times the miss ceiling.
+const crowded_eighths = 6;
 
 const Conn = struct {
     fd: posix.fd_t,
@@ -174,6 +180,7 @@ const Server = struct {
     /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t) !void {
         var buf: [udp_recv_max]u8 = undefined;
+        const crowded = crowdedQueue(fd);
         const parks = s.parks;
         for (0..udp_per_wake) |_| {
             if (s.parks - parks == udp_misses_per_wake) return;
@@ -182,7 +189,7 @@ const Server = struct {
             const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, &pa.any, &len);
             if (linux.errno(rc) != .SUCCESS) return;
             const from = na.fromSockaddr(&pa);
-            if (acl.allow(s.cfg.allow_from, from)) try s.ask(buf[0..rc], .{ .udp = .{ .fd = fd, .addr = from } });
+            if (acl.allow(s.cfg.allow_from, from)) try s.ask(buf[0..rc], .{ .udp = .{ .fd = fd, .addr = from } }, crowded);
         }
     }
 
@@ -239,7 +246,8 @@ const Server = struct {
             c.served += 1;
             c.owed += 1;
             c.last_ns = s.e.now_ns;
-            try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c });
+            // Its window paces a TCP client: no queue overflows for it.
+            try s.ask(c.buf[start + 2 ..][0..flen], .{ .tcp = c }, false);
             // Turned away, or a failed write: the connection is gone.
             if (s.watched.items[tok & slot_mask].w != .conn) return;
             start += 2 + flen;
@@ -290,7 +298,7 @@ const Server = struct {
         }
     }
 
-    fn ask(s: *Server, wire: []const u8, reply: Reply) !void {
+    fn ask(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
         if (reply == .udp) s.g.stats.clients.udp += 1 else s.g.stats.clients.tcp += 1;
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
@@ -327,8 +335,11 @@ const Server = struct {
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
         // `max_in_flight` parked clients only what is known is served.
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
-        const wait = s.parked < s.g.cfg.max_in_flight;
-        const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
+        const admit: graph.Graph.Admit = if (s.parked >= s.g.cfg.max_in_flight) .known else if (crowded and !s.known(asked)) .join else .new;
+        const root = try s.g.demandRoot(asked.name, asked.qtype, admit) orelse {
+            if (admit == .join) c.shed += 1;
+            return if (reply == .tcp) s.drop(reply.tcp);
+        };
         try s.g.drain();
         var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
         {
@@ -343,6 +354,13 @@ const Server = struct {
             p.wire = try s.g.work.allocator().dupe(u8, wire);
         }
         try s.hold(p);
+    }
+
+    /// Answered once, at any age: worth new work while the core is behind,
+    /// unlike a name never seen (a random-subdomain flood).
+    fn known(s: *Server, q: dns.Question) bool {
+        var kb: graph.KeyBuf = undefined;
+        return s.g.store.any(graph.Key.of(&kb, .rrset, q.name, q.qtype)) != null;
     }
 
     /// Parks `p` on the cell it waits for; released if it cannot be.
@@ -550,7 +568,7 @@ const Server = struct {
     fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
         if (p.a) |a| if (!s.g.cell(a).settled()) return null;
         const served = try s.desk.built(arena, p.root, q, client);
-        if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (try s.g.demandRoot(aq.name, aq.qtype, true)) |a| {
+        if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (try s.g.demandRoot(aq.name, aq.qtype, .new)) |a| {
             p.a = a;
             try s.g.drain();
             if (!s.g.cell(a).settled()) {
@@ -759,8 +777,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  shed {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.shed, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.keys, r.refused,
@@ -788,6 +806,16 @@ fn rssMiB() ?u64 {
     _ = it.next();
     const pages = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
     return pages * std.heap.pageSize() / (1024 * 1024);
+}
+
+/// Past `crowded_eighths` of its receive buffer (SO_MEMINFO, Linux 4.12):
+/// one getsockopt a wake, not a control message a datagram.
+fn crowdedQueue(fd: posix.fd_t) bool {
+    // SK_MEMINFO_RMEM_ALLOC, SK_MEMINFO_RCVBUF, and the rest.
+    var info: [9]u32 = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(info));
+    if (linux.errno(linux.getsockopt(fd, posix.SOL.SOCKET, linux.SO.MEMINFO, @ptrCast(&info), &len)) != .SUCCESS) return false;
+    return info[0] > info[1] / 8 * crowded_eighths;
 }
 
 fn listenOn(addr: na.Address, sock_type: u32) !posix.fd_t {
