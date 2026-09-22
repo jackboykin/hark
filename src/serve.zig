@@ -71,13 +71,31 @@ const Pending = struct {
     root: graph.CellId,
     /// Under DNS64, the A behind an empty AAAA.
     a: ?graph.CellId = null,
-    /// Settled from memory alone.
-    cached: bool,
     wire: []u8,
     reply: Reply,
     asked_ns: i64,
     /// Past the client's patience, stale was looked for once.
     stale_tried: bool = false,
+    /// The slot is reused; a timer names the tenant it was set for.
+    gen: u32 = 0,
+    live: bool = true,
+    /// When the loop looks at it next; a timer for any other time is spent.
+    at_ns: i64 = std.math.maxInt(i64),
+    /// The other clients parked on the same cell.
+    prev: u32 = none,
+    next: u32 = none,
+
+    const none = std.math.maxInt(u32);
+};
+
+const Timer = struct {
+    at_ns: i64,
+    slot: u32,
+    gen: u32,
+
+    fn order(_: void, a: Timer, b: Timer) std.math.Order {
+        return std.math.order(a.at_ns, b.at_ns);
+    }
 };
 
 const Server = struct {
@@ -86,7 +104,13 @@ const Server = struct {
     e: *Edge,
     g: *graph.Graph,
     watched: std.ArrayList(Slot) = .empty,
+    /// Clients parked on unsettled cells, in stable slots.
     pending: std.ArrayList(Pending) = .empty,
+    vacant: std.ArrayList(u32) = .empty,
+    parked: u32 = 0,
+    /// By cell id, the first slot parked on it.
+    heads: std.ArrayList(u32) = .empty,
+    timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
     scratch: std.heap.ArenaAllocator,
     stopping: bool = false,
@@ -141,9 +165,9 @@ const Server = struct {
     /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t) !void {
         var buf: [udp_recv_max]u8 = undefined;
-        const parked = s.pending.items.len;
+        const parked = s.parked;
         for (0..udp_per_wake) |_| {
-            if (s.pending.items.len - parked == udp_misses_per_wake) return;
+            if (s.parked - parked == udp_misses_per_wake) return;
             var pa: na.PosixAddress = undefined;
             var len: posix.socklen_t = @sizeOf(na.PosixAddress);
             const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, &pa.any, &len);
@@ -218,15 +242,18 @@ const Server = struct {
     /// Clients still waiting get nothing; the graph frees their roots.
     fn deinit(s: *Server) void {
         for (s.watched.items) |x| if (x.w == .conn) s.drop(x.w.conn);
-        for (s.pending.items) |p| s.release(p);
+        for (s.pending.items) |p| if (p.live) s.release(p);
         s.pending.deinit(s.gpa);
+        s.vacant.deinit(s.gpa);
+        s.heads.deinit(s.gpa);
+        s.timers.deinit(s.gpa);
         s.desk.deinit();
         s.watched.deinit(s.gpa);
         s.scratch.deinit();
     }
 
     fn drop(s: *Server, c: *Conn) void {
-        for (s.pending.items) |*p| if (p.reply == .tcp and p.reply.tcp == c) {
+        if (c.owed > 0) for (s.pending.items) |*p| if (p.live and p.reply == .tcp and p.reply.tcp == c) {
             p.reply = .{ .udp = .{ .fd = -1, .addr = c_addr_none } };
         };
         sys.close(c.fd);
@@ -289,51 +316,116 @@ const Server = struct {
         const asked = try s.desk.asked(arena, q, client);
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
         // `max_in_flight` waiters only what is known is served (DNSBomb).
-        const wait = s.pending.items.len < s.g.cfg.max_in_flight;
+        const wait = s.parked < s.g.cfg.max_in_flight;
         const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
-        var p: Pending = .{ .root = root, .cached = s.g.cell(root).settled(), .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
+        {
+            errdefer s.release(p);
+            // Recall declined what the graph holds: inside the refresh window, a
+            // verdict it could not stamp, a put the store refused, DNS64's A.
+            if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
+                c.hit += 1;
+                try s.answered(reply, query, served, p.asked_ns);
+                return s.release(p);
+            };
+            p.wire = try s.gpa.dupe(u8, wire);
+        }
+        try s.hold(p);
+    }
+
+    /// Parks `p` on the cell it waits for; released if it cannot be.
+    fn hold(s: *Server, p: Pending) !void {
         errdefer s.release(p);
-        // Recall declined what the graph holds: inside the refresh window, a
-        // verdict it could not stamp, a put the store refused, DNS64's A.
-        if (p.cached) if (try s.shape(arena, &p, q, client)) |served| {
-            c.hit += 1;
-            try s.answered(reply, query, served, p.asked_ns);
-            return s.release(p);
+        try s.reach(p.a orelse p.root);
+        try s.timers.ensureUnusedCapacity(s.gpa, 1);
+        try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
+        const i: u32 = s.vacant.pop() orelse blk: {
+            try s.pending.append(s.gpa, .{ .root = 0, .wire = &.{}, .reply = undefined, .asked_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
+            break :blk @intCast(s.pending.items.len - 1);
         };
-        p.wire = try s.gpa.dupe(u8, wire);
-        try s.pending.append(s.gpa, p);
+        const gen = s.pending.items[i].gen +% 1;
+        s.pending.items[i] = p;
+        s.pending.items[i].gen = gen;
+        s.parked += 1;
+        s.link(i);
+        // Its capacity is reserved above.
+        s.schedule(i) catch unreachable;
     }
 
     fn settle(s: *Server) !void {
-        var i: usize = 0;
-        while (i < s.pending.items.len) {
-            const p = &s.pending.items[i];
-            if (!s.g.cell(p.root).settled()) {
-                if (try s.impatient(p)) {
-                    s.release(p.*);
-                    _ = s.pending.swapRemove(i);
-                } else i += 1;
-                continue;
+        while (s.g.answered.pop()) |id| {
+            if (id >= s.heads.items.len or !s.g.cell(id).settled()) continue;
+            var i = s.heads.items[id];
+            s.heads.items[id] = Pending.none;
+            while (i != Pending.none) {
+                const next = s.pending.items[i].next;
+                try s.ready(i);
+                i = next;
             }
-            if (p.reply == .udp and p.reply.udp.fd == -1) {
-                s.g.stats.clients.abandoned += 1;
-                s.release(p.*);
-                _ = s.pending.swapRemove(i);
-                continue;
-            }
-            _ = s.scratch.reset(.retain_capacity);
-            const arena = s.scratch.allocator();
-            const query = try dns.parseMessage(arena, p.wire);
-            const served = try s.shape(arena, p, query.questions[0], answer.Client.fromQuery(query)) orelse {
-                i += 1;
-                continue;
-            };
-            s.g.stats.clients.miss += 1;
-            try s.answered(p.reply, query, served, p.asked_ns);
-            s.release(p.*);
-            _ = s.pending.swapRemove(i);
         }
+        while (s.timers.peek()) |t| {
+            if (t.at_ns > s.e.now_ns) break;
+            _ = s.timers.pop();
+            const p = &s.pending.items[t.slot];
+            if (!p.live or p.gen != t.gen or p.at_ns != t.at_ns) continue;
+            if (try s.impatient(p)) {
+                s.unpark(t.slot);
+                s.vacate(t.slot);
+            } else try s.schedule(t.slot);
+        }
+    }
+
+    fn ready(s: *Server, i: u32) !void {
+        const p = &s.pending.items[i];
+        if (p.reply == .udp and p.reply.udp.fd == -1) {
+            s.g.stats.clients.abandoned += 1;
+            return s.vacate(i);
+        }
+        _ = s.scratch.reset(.retain_capacity);
+        const arena = s.scratch.allocator();
+        const query = try dns.parseMessage(arena, p.wire);
+        const served = try s.shape(arena, p, query.questions[0], answer.Client.fromQuery(query)) orelse {
+            try s.reach(p.a.?);
+            return s.link(i);
+        };
+        s.g.stats.clients.miss += 1;
+        try s.answered(p.reply, query, served, p.asked_ns);
+        s.vacate(i);
+    }
+
+    fn reach(s: *Server, id: graph.CellId) !void {
+        if (id >= s.heads.items.len) try s.heads.appendNTimes(s.gpa, Pending.none, id + 1 - s.heads.items.len);
+    }
+
+    fn link(s: *Server, i: u32) void {
+        const p = &s.pending.items[i];
+        const on = p.a orelse p.root;
+        p.prev = Pending.none;
+        p.next = s.heads.items[on];
+        if (p.next != Pending.none) s.pending.items[p.next].prev = i;
+        s.heads.items[on] = i;
+    }
+
+    fn unpark(s: *Server, i: u32) void {
+        const p = s.pending.items[i];
+        if (p.next != Pending.none) s.pending.items[p.next].prev = p.prev;
+        if (p.prev != Pending.none) s.pending.items[p.prev].next = p.next else s.heads.items[p.a orelse p.root] = p.next;
+    }
+
+    fn vacate(s: *Server, i: u32) void {
+        const p = &s.pending.items[i];
+        s.release(p.*);
+        p.live = false;
+        s.parked -= 1;
+        s.vacant.appendAssumeCapacity(i);
+    }
+
+    fn schedule(s: *Server, i: u32) !void {
+        const p = &s.pending.items[i];
+        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0) return;
+        p.at_ns = patience(p.*);
+        try s.timers.push(s.gpa, .{ .at_ns = p.at_ns, .slot = i, .gen = p.gen });
     }
 
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
@@ -356,14 +448,10 @@ const Server = struct {
         return p.asked_ns + answer.stale_client_ms * std.time.ns_per_ms;
     }
 
-    /// When the loop must look at the pending clients next.
-    fn nextPatience(s: *Server) i64 {
-        var at: i64 = std.math.maxInt(i64);
-        if (s.desk.retention.serve_stale_ttl == 0) return at;
-        for (s.pending.items) |p| if (!p.stale_tried) {
-            at = @min(at, patience(p));
-        };
-        return at;
+    /// When the loop must look at a parked client next.
+    fn nextTimer(s: *Server) i64 {
+        const t = s.timers.peek() orelse return std.math.maxInt(i64);
+        return t.at_ns;
     }
 
     fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
@@ -559,7 +647,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             stats_at = e.now_ns + stats_every;
             logStats(&g);
         }
-        const ev = try e.next(@min(e.now_ns + std.time.ns_per_s, s.nextPatience())) orelse {
+        const ev = try e.next(@min(e.now_ns + std.time.ns_per_s, s.nextTimer())) orelse {
             try s.settle();
             continue;
         };

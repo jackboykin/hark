@@ -437,6 +437,8 @@ pub const Graph = struct {
     /// Live cells only.
     index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
     ready: std.ArrayList(CellId) = .empty,
+    /// Questions settled since the server last looked: its cue, not a fact.
+    answered: std.ArrayList(CellId) = .empty,
     /// Per-server estimate, capped; the one state outliving a demand.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
@@ -479,6 +481,7 @@ pub const Graph = struct {
         g.scratch.deinit();
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
+        g.answered.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
         var it = g.failed.keyIterator();
         while (it.next()) |k| g.gpa.free(k.name);
@@ -810,6 +813,7 @@ pub const Graph = struct {
     fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
         const c = g.cell(id);
         try g.ready.appendSlice(g.gpa, c.waiters.items);
+        if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
         // An answer serves from its hops; everything else has copied out.
         if (!keep_inputs) {
             for (c.inputs.items) |i| g.unpin(i, id);
