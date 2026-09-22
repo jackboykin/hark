@@ -144,7 +144,8 @@ pub fn extractReferral(
 }
 
 /// RFC 1034 §5.3.3: drop this reply and ask a sibling. Any rcode but an
-/// answer's (hark never retries without EDNS on FORMERR); a lame reply, non-AA
+/// answer's, extended ones too (RFC 6891 §6.1.3; hark never retries
+/// without EDNS on FORMERR or BADVERS); a lame reply, non-AA
 /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
 /// recursor's cache, RA set and AA clear, which an RD-clear query gets
 /// only from a server that recursed on its own. A recursor's referral
@@ -152,6 +153,7 @@ pub fn extractReferral(
 pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: AddrPolicy) bool {
     const flags = response.header.flags;
     const rec_lame = flags.ra and !flags.aa;
+    if (response.opt) |o| if (o.extended_rcode != 0) return true;
     switch (flags.rcode) {
         .no_error => {},
         .name_error, .yx_domain => return rec_lame,
@@ -223,6 +225,9 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
     try testing.expect(shouldTrySibling(msg, zone, .{}));
     msg.header.flags.ra = false;
     try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    // BADVERS: header rcode 0, extended 1.
+    msg.opt = .{ .udp_payload_size = 1232, .extended_rcode = 1, .version = 0, .do_bit = false, .options = &.{} };
+    try testing.expect(shouldTrySibling(msg, zone, .{}));
 }
 
 test "extractReferral case-insensitive glue matching" {
