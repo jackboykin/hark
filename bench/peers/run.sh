@@ -44,7 +44,12 @@ round() { # resolver round
   start "$1" || return
   warm
   perf "$1" hit "$2" -d "$R/hit.txt" -c 4 -T 4 -q 400 -l 10
-  perf "$1" lat "$2" -d "$R/hit.txt" -c 1 -T 1 -Q 20000 -l 5 -v
+  # A histogram, not -v: dnsperf flushes a -v line per reply, and one
+  # write stalling on ext4 held its receiver ~19 ms.
+  perf "$1" lat "$2" -d "$R/hit.txt" -c 1 -T 1 -Q 20000 -l 5 -O latency-histogram
+  # 70% of the resolver's own ceiling: one rate for all would saturate the slower.
+  perf "$1" load "$2" -d "$R/hit.txt" -c 4 -T 4 -q 400 -l 5 -O latency-histogram \
+    -Q "$(awk '/Queries per second/ { printf "%d", $4 * 0.7 }' "$OUT/$1.hit.$2.txt")"
   stop; start "$1" || return
   perf "$1" miss "$2" -d "$R/miss.txt" -c 4 -T 4 -q 1000 -l 10
   stop; start "$1" || return
