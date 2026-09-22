@@ -1,0 +1,90 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a YXDOMAIN its records contradict is no answer
+
+; hark derives YXDOMAIN from an in-zone DNAME whose substitution overflows
+; (RFC 6672 §2.2), and the rcode must agree (RFC 6604 §4). Each reply
+; below disagrees: bizarre contents (RFC 1034 §5.3.3), so the sole server
+; is dropped and the question SERVFAILs.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ; YXDOMAIN carrying an A for the question
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA YXDOMAIN
+    SECTION QUESTION
+      a.example. IN A
+    SECTION ANSWER
+      a.example. 3600 IN A 192.0.2.66
+  ENTRY_END
+  ; YXDOMAIN over a DNAME whose substitution fits
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA YXDOMAIN
+    SECTION QUESTION
+      fit.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+  ENTRY_END
+  ; NOERROR over a DNAME whose substitution overflows
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+    SECTION ANSWER
+      long.example. 3600 IN DNAME bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    fit.doc.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    fit.doc.example. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+ENTRY_END
+
+SCENARIO_END

@@ -67,7 +67,7 @@ pub const Ask = struct {
 
     const Result = union(enum) {
         pending,
-        reply: dns.Message,
+        reply: Kept,
         /// No reply from anyone: no rcode to surface.
         exhausted,
     };
@@ -146,9 +146,13 @@ pub const Ask = struct {
         msg.answers = &.{};
         msg.authorities = &.{};
         msg.additionals = &.{};
-        return .{ .reply = msg };
+        return .{ .reply = .{ .msg = msg } };
     }
 };
+
+const Kept = struct { msg: dns.Message, verdict: ?Verdict = null };
+
+const Verdict = union(enum) { reply: Reply, loop };
 
 pub const RrsetScratch = struct {
     cut: ?CellId = null,
@@ -310,7 +314,8 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
         .pending => return,
         .exhausted => try g.fail(id, unreachable_authority),
-        .reply => |msg| {
+        .reply => |kept| {
+            const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
                 .referral => |ref| {
                     const cut = try absorbReferral(g, id, ref, msg, pc.zone);
@@ -321,11 +326,11 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                 // below it. A positive answer is not: the parent may serve
                 // occluded data for a name it delegated (bailiwick/006).
                 .nodata => {
-                    _ = try publishDenial(g, id, msg, pc.zone, name);
+                    _ = try publishDenial(g, id, kept, pc.zone, name);
                     try g.settle(id, inside, parent.expires_ns);
                 },
                 .nxdomain => {
-                    const until = try publishDenial(g, id, msg, pc.zone, name) orelse return unminimised(g, id, inside);
+                    const until = try publishDenial(g, id, kept, pc.zone, name) orelse return unminimised(g, id, inside);
                     try g.settle(id, inside, @min(parent.expires_ns, until));
                 },
                 .failed => try unminimised(g, id, inside),
@@ -335,10 +340,13 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 }
 
 /// An authoritative denial at a probe name, published; when it lapses.
-fn publishDenial(g: *Graph, id: CellId, msg: dns.Message, zone: dns.Name, name: dns.Name) !?i64 {
+fn publishDenial(g: *Graph, id: CellId, kept: Kept, zone: dns.Name, name: dns.Name) !?i64 {
     var kb: graph.KeyBuf = undefined;
-    if (!msg.header.flags.aa) return null;
-    const reply = try classify(g, msg, zone, name, .a) orelse return null;
+    if (!kept.msg.header.flags.aa) return null;
+    const reply = switch (try verdict(g, kept, zone, name, .a)) {
+        .reply => |r| r,
+        .loop => return null,
+    };
     try g.publish(Key.of(&kb, .rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
     return replyExpiry(reply);
 }
@@ -524,7 +532,8 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         switch (try ask(g, id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
             .pending => return,
             .exhausted => return failAsk(g, id, unreachable_authority),
-            .reply => |msg| {
+            .reply => |kept| {
+                const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
                 if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
                     const s2 = g.cell(id).scratch.rrset;
@@ -547,8 +556,10 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     .no_error, .name_error, .yx_domain => {},
                     else => return failAsk(g, id, unreachable_authority),
                 }
-                const reply = try classify(g, msg, zone, name, qtype) orelse
-                    return failAsk(g, id, .{ .code = .other, .text = "cname loop" });
+                const reply = switch (try verdict(g, kept, zone, name, qtype)) {
+                    .reply => |r| r,
+                    .loop => return failAsk(g, id, .{ .code = .other, .text = "cname loop" }),
+                };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
                 return settleRrset(g, id, reply);
@@ -685,22 +696,42 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     return .{ .value = cut, .expires_ns = expires };
 }
 
+/// Null when the rcode contradicts the records: bizarre contents (RFC 1034
+/// §5.3.3). Only rcode 6 or a DNAME can, so only those are classified here.
+fn judge(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Kept {
+    const dname = for (msg.answers) |rr| {
+        if (rr.rtype == .dname) break true;
+    } else false;
+    if (msg.header.flags.rcode != .yx_domain and !dname) return .{ .msg = msg };
+    return .{ .msg = msg, .verdict = try classify(g, msg, zone, name, qtype) orelse return null };
+}
+
+/// `ask`'s verdict where it reached one; a reply it did not classify has
+/// neither rcode 6 nor a DNAME, which `classify` cannot find bizarre.
+fn verdict(g: *Graph, kept: Kept, zone: dns.Name, name: dns.Name, qtype: dns.RType) !Verdict {
+    return kept.verdict orelse (try classify(g, kept.msg, zone, name, qtype)).?;
+}
+
 /// What a kept, non-referral reply says about (name, type). The answer
 /// section is reduced to the chain from `name`: CNAMEs (and the DNAMEs
 /// that synthesise them), then the asked type at the end. Anything else
 /// is unsolicited (RFC 2181 §5.4.1) and dropped, NXDOMAIN included.
-/// Null: the chain loops, a resolution failure. The rcode is one of the
-/// three that answer.
-fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Reply {
+/// The rcode is one of the three that answer. YXDOMAIN is derived, not
+/// taken: the chain must reach an in-zone DNAME whose substitution
+/// overflows (RFC 6672 §2.2), and an rcode DNSSEC does not sign must
+/// agree (RFC 6604 §4). Where the chain leaves the zone first, the rcode
+/// speaks for a name outside it and the reply is an alias. Null: bizarre.
+fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
     var hops: usize = 0;
     var answered = false;
+    var overflow = false;
     var seen: [17]dns.Name = undefined;
     // NXDOMAIN denies the end of the chain; records there are noise.
     const collect = msg.header.flags.rcode != .name_error;
     while (hops < 16) : (hops += 1) {
-        for (seen[0..hops]) |n| if (n.eql(cur)) return null;
+        for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         for (msg.answers) |rr| {
             if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and (rr.rtype == qtype or qtype == .any)) {
@@ -728,7 +759,10 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             try keep.append(g.scratch.allocator(), d);
             try keepSigs(g, &keep, msg.answers, d.name, .dname);
             if (cname == null) {
-                const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse break;
+                const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
+                    overflow = true;
+                    break;
+                };
                 cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
             }
         }
@@ -737,9 +771,12 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         try keepSigs(g, &keep, msg.answers, cur, .cname);
         cur = c.rdata.cname;
     }
+    const yx = msg.header.flags.rcode == .yx_domain;
+    const left = yx and !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
+    if (overflow != yx and !left) return null;
     var reply: Reply = .{
-        .kind = if (answered) .answer else if (hops > 0) .alias else .nodata,
-        .rcode = msg.header.flags.rcode,
+        .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
+        .rcode = if (left) .no_error else msg.header.flags.rcode,
         .aa = msg.header.flags.aa,
         .answers = keep.items,
         .authorities = msg.authorities,
@@ -754,13 +791,9 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         reply.kind = .alias;
         reply.target = keep.items[0].rdata.cname;
     }
-    switch (msg.header.flags.rcode) {
-        .name_error => reply.kind = .nxdomain,
-        .yx_domain => reply.kind = .yxdomain,
-        else => {},
-    }
+    if (msg.header.flags.rcode == .name_error) reply.kind = .nxdomain;
     reply.ttl = replyTtl(g, reply, zone, name);
-    return reply;
+    return .{ .reply = reply };
 }
 
 fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
@@ -778,8 +811,6 @@ pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
             for (reply.answers) |rr| if (rr.rtype != .rrsig) {
                 ttl = @min(ttl, rr.ttl);
             };
-            // A bare YXDOMAIN carries no record to live by.
-            if (ttl == std.math.maxInt(u32)) ttl = 0;
         },
         .nodata, .nxdomain => if (reply.aa) {
             ttl = g.cfg.max_negative_ttl;
@@ -833,10 +864,14 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                         if (at.transport == .udp) {
                             _ = try sendTo(g, id, a, at.server, .tcp, .random, qname, qtype);
                         }
-                    } else if (!delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) {
-                        a.nattempts = 0;
-                        return .{ .reply = r.msg };
-                    } else if (a.held == null) a.held = at.exchange;
+                    } else {
+                        const kept = if (delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) null else try judge(g, r.msg, a.zone, qname, qtype);
+                        if (kept) |k| {
+                            a.nattempts = 0;
+                            return .{ .reply = k };
+                        }
+                        if (a.held == null) a.held = at.exchange;
+                    }
                 },
             }
         }

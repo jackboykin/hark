@@ -1,0 +1,60 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a signed DNAME overflow is a secure YXDOMAIN
+
+; A signed DNAME whose substitution overflows is YXDOMAIN with AD, and
+; lives by its DNAME: ten seconds on, it comes from memory at 3590.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA YXDOMAIN
+    SECTION QUESTION
+      aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+    SECTION ANSWER
+      long.example. 3600 IN DNAME bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question flags
+  REPLY QR RD RA AD YXDOMAIN
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 10
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question flags answer ttl
+  REPLY QR RD RA AD YXDOMAIN
+  SECTION QUESTION
+    aaaaaaaaaaaaaaaaaaaa.long.example. IN A
+  SECTION ANSWER
+    long.example. 3590 IN DNAME bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.
+ENTRY_END
+
+; From memory: after the question and the root DNSKEY, nothing new.
+STEP 6 CHECK_MAX_QUERIES 2
+
+SCENARIO_END
