@@ -146,13 +146,15 @@ pub const Ask = struct {
         msg.answers = &.{};
         msg.authorities = &.{};
         msg.additionals = &.{};
-        return .{ .reply = .{ .msg = msg } };
+        return .{ .reply = .{ .msg = msg, .verdict = .none } };
     }
 };
 
-const Kept = struct { msg: dns.Message, verdict: ?Verdict = null };
+/// A reply `ask` settled on, judged against the question it asked.
+const Kept = struct { msg: dns.Message, verdict: Verdict };
 
-const Verdict = union(enum) { reply: Reply, loop };
+/// `none`: an rcode that answers nothing.
+const Verdict = union(enum) { reply: Reply, loop, none };
 
 pub const RrsetScratch = struct {
     cut: ?CellId = null,
@@ -326,11 +328,11 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                 // below it. A positive answer is not: the parent may serve
                 // occluded data for a name it delegated (bailiwick/006).
                 .nodata => {
-                    _ = try publishDenial(g, id, kept, pc.zone, name);
+                    _ = try publishDenial(g, id, kept, name);
                     try g.settle(id, inside, parent.expires_ns);
                 },
                 .nxdomain => {
-                    const until = try publishDenial(g, id, kept, pc.zone, name) orelse return unminimised(g, id, inside);
+                    const until = try publishDenial(g, id, kept, name) orelse return unminimised(g, id, inside);
                     try g.settle(id, inside, @min(parent.expires_ns, until));
                 },
                 .failed => try unminimised(g, id, inside),
@@ -340,12 +342,12 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 }
 
 /// An authoritative denial at a probe name, published; when it lapses.
-fn publishDenial(g: *Graph, id: CellId, kept: Kept, zone: dns.Name, name: dns.Name) !?i64 {
+fn publishDenial(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
     var kb: graph.KeyBuf = undefined;
     if (!kept.msg.header.flags.aa) return null;
-    const reply = switch (try verdict(g, kept, zone, name, .a)) {
+    const reply = switch (kept.verdict) {
         .reply => |r| r,
-        .loop => return null,
+        .loop, .none => return null,
     };
     try g.publish(Key.of(&kb, .rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
     return replyExpiry(reply);
@@ -551,14 +553,11 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     s2.ask.add(g, ref.addrs[0..ref.addr_count]);
                     continue;
                 }
-                // Any other rcode is no useful response (RFC 9520 §2).
-                switch (msg.header.flags.rcode) {
-                    .no_error, .name_error, .yx_domain => {},
-                    else => return failAsk(g, id, unreachable_authority),
-                }
-                const reply = switch (try verdict(g, kept, zone, name, qtype)) {
+                const reply = switch (kept.verdict) {
                     .reply => |r| r,
                     .loop => return failAsk(g, id, .{ .code = .other, .text = "cname loop" }),
+                    // No useful response (RFC 9520 §2).
+                    .none => return failAsk(g, id, unreachable_authority),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
@@ -697,19 +696,13 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
 }
 
 /// Null when the rcode contradicts the records: bizarre contents (RFC 1034
-/// §5.3.3). Only rcode 6 or a DNAME can, so only those are classified here.
+/// §5.3.3). A referral is judged too, as the nodata it reads as; its
+/// asker follows the cut and never reads the verdict.
 fn judge(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Kept {
-    const dname = for (msg.answers) |rr| {
-        if (rr.rtype == .dname) break true;
-    } else false;
-    if (msg.header.flags.rcode != .yx_domain and !dname) return .{ .msg = msg };
-    return .{ .msg = msg, .verdict = try classify(g, msg, zone, name, qtype) orelse return null };
-}
-
-/// `ask`'s verdict where it reached one; a reply it did not classify has
-/// neither rcode 6 nor a DNAME, which `classify` cannot find bizarre.
-fn verdict(g: *Graph, kept: Kept, zone: dns.Name, name: dns.Name, qtype: dns.RType) !Verdict {
-    return kept.verdict orelse (try classify(g, kept.msg, zone, name, qtype)).?;
+    return .{ .msg = msg, .verdict = switch (msg.header.flags.rcode) {
+        .no_error, .name_error, .yx_domain => try classify(g, msg, zone, name, qtype) orelse return null,
+        else => .none,
+    } };
 }
 
 /// What a kept, non-referral reply says about (name, type). The answer
@@ -861,8 +854,10 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             const at = a.end(i);
             switch (ex.state.fact.exchange) {
                 .timeout => {},
-                // A server that normalizes case answers.
-                .mismatch => if (at.case == .random) {
+                // Over TCP a forger cannot follow, and a server that
+                // normalizes case answers; a garbled datagram gets the
+                // same second chance.
+                .mismatch, .malformed => if (at.case == .random) {
                     _ = try sendTo(g, id, a, at.server, .tcp, .plain, qname, qtype);
                 },
                 .reply => |r| {
