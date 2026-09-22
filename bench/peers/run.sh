@@ -5,6 +5,8 @@
 set -uo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
 [[ ${IN_NS:-} ]] || exec env IN_NS=1 unshare -Urn "$0" "$@"
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$D/../lib.sh"
 
 MODE=${1:-smoke}; shift
 [[ $MODE == bench ]] && { ROUNDS=${1:-1}; shift; }
@@ -39,36 +41,35 @@ start() {
   echo "$1 did not come up"; tail "$R/${1%%=*}.log"; return 1
 }
 stop() { kill $PID; wait $PID 2>/dev/null; while ask smoke.bench A >/dev/null 2>&1; do sleep 0.1; done; }
-warm() { for i in $(seq 8); do ask host$i.bench A >/dev/null; done; }
-cpu() { awk '{print $14+$15}' /proc/$PID/stat; }
+warm() { for i in $(seq 8); do ask "host$i.bench" A >/dev/null; done; }
 perf() { # label workload round dnsperf-args...
-  local f=$OUT/$1.$2.$3.txt c0 t0; shift 3
-  c0=$(cpu) t0=$(date +%s%N)
+  local f=$OUT/$1.$2.$3.txt s0; shift 3
+  s0=$(core_snap)
   taskset -c "${CPU_LOAD:-4-7}" dnsperf -s 127.0.0.1 -p 5354 -t 3 "$@" >"$f" 2>&1
-  echo "cpu_pct $(( ($(cpu) - c0) * 1000000000 / ($(date +%s%N) - t0) ))" >>"$f"
+  echo "core_busy $(core_busy "$s0" "$(core_snap)")" >>"$f"
 }
 round() { # resolver round
   local l=${1%%=*}
-  start $1 || return
+  start "$1" || return
   warm
-  perf $l hit $2 -d "$R/hit.txt" -c 4 -T 4 -q 400 -l 10
-  perf $l lat $2 -d "$R/hit.txt" -c 1 -T 1 -Q 20000 -l 5 -v
-  stop; start $1 || return
-  perf $l miss $2 -d "$R/miss.txt" -c 4 -T 4 -q 2000 -l 10
-  stop; start $1 || return
+  perf "$l" hit "$2" -d "$R/hit.txt" -c 4 -T 4 -q 400 -l 10
+  perf "$l" lat "$2" -d "$R/hit.txt" -c 1 -T 1 -Q 20000 -l 5 -v
+  stop; start "$1" || return
+  perf "$l" miss "$2" -d "$R/miss.txt" -c 4 -T 4 -q 1000 -l 10
+  stop; start "$1" || return
   warm
-  perf $l mix $2 -d "$R/mix.txt" -c 4 -T 4 -q 2000 -l 10
+  perf "$l" mix "$2" -d "$R/mix.txt" -c 4 -T 4 -q 1000 -l 10
   stop
 }
 
 sleep 0.5
 if [[ $MODE == smoke ]]; then
-  for n in "${RES[@]}"; do start $n && echo "${n%%=*}: $(ask smoke.bench A) $(ask zz9.bench A)" && stop; done
+  for n in "${RES[@]}"; do start "$n" && echo "${n%%=*}: $(ask smoke.bench A) $(ask zz9.bench A)" && stop; done
   exit
 fi
 for r in $(seq "$ROUNDS"); do
-  order=$(shuf -e "${RES[@]}")
-  echo "round $r:" $order
-  for n in $order; do round $n $r; done
+  mapfile -t order < <(shuf -e "${RES[@]}")
+  echo "round $r: ${order[*]}"
+  for n in "${order[@]}"; do round "$n" "$r"; done
 done
 python3 "$D/sum.py" "$OUT"
