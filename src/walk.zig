@@ -719,8 +719,9 @@ fn verdict(g: *Graph, kept: Kept, zone: dns.Name, name: dns.Name, qtype: dns.RTy
 /// The rcode is one of the three that answer. YXDOMAIN is derived, not
 /// taken: the chain must reach an in-zone DNAME whose substitution
 /// overflows (RFC 6672 §2.2), and an rcode DNSSEC does not sign must
-/// agree (RFC 6604 §4). Where the chain leaves the zone first, the rcode
-/// speaks for a name outside it and the reply is an alias. Null: bizarre.
+/// agree (RFC 6604 §4). Where the chain leaves the zone, an NXDOMAIN or
+/// YXDOMAIN speaks for a name outside it and the reply is an alias.
+/// Null: bizarre.
 fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
@@ -772,8 +773,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         cur = c.rdata.cname;
     }
     const yx = msg.header.flags.rcode == .yx_domain;
-    const left = yx and !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
-    if (overflow != yx and !left) return null;
+    const left = !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
+    if (overflow != yx and !(yx and left)) return null;
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .rcode = if (left) .no_error else msg.header.flags.rcode,
@@ -791,7 +792,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         reply.kind = .alias;
         reply.target = keep.items[0].rdata.cname;
     }
-    if (msg.header.flags.rcode == .name_error) reply.kind = .nxdomain;
+    if (msg.header.flags.rcode == .name_error and !left) reply.kind = .nxdomain;
     reply.ttl = replyTtl(g, reply, zone, name);
     return .{ .reply = reply };
 }
