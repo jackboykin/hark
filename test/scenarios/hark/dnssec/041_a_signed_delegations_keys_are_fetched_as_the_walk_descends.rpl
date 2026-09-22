@@ -2,6 +2,7 @@
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
 ; hark: dnssec-zone = sub.example.
+; sim-only: queries sent in one instant reach the responder in either order
 
 SCENARIO_BEGIN a signed delegation's keys are fetched as the walk descends
 

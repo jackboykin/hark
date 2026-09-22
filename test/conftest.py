@@ -53,7 +53,12 @@ class RplFile(pytest.File):
     """Pytest File collector for in-tree `.rpl` scenarios."""
 
     def collect(self):
-        yield RplItem.from_parent(self, name=self.path.stem)
+        item = RplItem.from_parent(self, name=self.path.stem)
+        # The sim delivers every due event in order; a live run cannot
+        # always, so a scenario may say it is judged by the sim alone.
+        if m := re.search(r"^; sim-only: (.+)$", self.path.read_text(), re.M):
+            item.add_marker(pytest.mark.skip(reason=m.group(1)))
+        yield item
 
 
 class RplItem(pytest.Item):

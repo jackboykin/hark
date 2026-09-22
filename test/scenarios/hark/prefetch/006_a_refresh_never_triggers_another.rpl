@@ -2,6 +2,7 @@
 ; hark: prefetch = yes
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
+; sim-only: a clock jump fires a jittered refresh after the DS it would reuse has lapsed
 
 SCENARIO_BEGIN a refresh never triggers another
 
