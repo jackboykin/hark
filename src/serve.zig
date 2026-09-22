@@ -74,8 +74,12 @@ const Pending = struct {
     wire: []u8,
     reply: Reply,
     asked_ns: i64,
+    /// When the first client parked on the same cell asked.
+    origin_ns: i64,
     /// Past the client's patience, stale was looked for once.
     stale_tried: bool = false,
+    /// Settled, and held to leave at `at_ns`.
+    echoed: bool = false,
     /// The slot is reused; a timer names the tenant it was set for.
     gen: u32 = 0,
     live: bool = true,
@@ -315,18 +319,18 @@ const Server = struct {
         }
         const asked = try s.desk.asked(arena, q, client);
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
-        // `max_in_flight` waiters only what is known is served (DNSBomb).
+        // `max_in_flight` parked clients only what is known is served.
         const wait = s.parked < s.g.cfg.max_in_flight;
         const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
-        var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns };
+        var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
         {
             errdefer s.release(p);
             // Recall declined what the graph holds: inside the refresh window, a
             // verdict it could not stamp, a put the store refused, DNS64's A.
             if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
                 c.hit += 1;
-                try s.answered(reply, query, served, p.asked_ns);
+                try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
             p.wire = try s.gpa.dupe(u8, wire);
@@ -341,7 +345,7 @@ const Server = struct {
         try s.timers.ensureUnusedCapacity(s.gpa, 1);
         try s.vacant.ensureTotalCapacity(s.gpa, s.pending.items.len + 1);
         const i: u32 = s.vacant.pop() orelse blk: {
-            try s.pending.append(s.gpa, .{ .root = 0, .wire = &.{}, .reply = undefined, .asked_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
+            try s.pending.append(s.gpa, .{ .root = 0, .wire = &.{}, .reply = undefined, .asked_ns = 0, .origin_ns = 0, .live = false, .gen = std.math.maxInt(u32) });
             break :blk @intCast(s.pending.items.len - 1);
         };
         const gen = s.pending.items[i].gen +% 1;
@@ -369,6 +373,10 @@ const Server = struct {
             _ = s.timers.pop();
             const p = &s.pending.items[t.slot];
             if (!p.live or p.gen != t.gen or p.at_ns != t.at_ns) continue;
+            if (p.echoed) {
+                try s.ready(t.slot);
+                continue;
+            }
             if (try s.impatient(p) or s.gone(p.*)) {
                 s.unpark(t.slot);
                 s.vacate(t.slot);
@@ -389,8 +397,23 @@ const Server = struct {
             try s.reach(p.a.?);
             return s.link(i);
         };
+        // DNSBomb: a UDP client that joined a resolution is answered as long
+        // after its ask as the first was, so replies leave spaced as their
+        // questions came, never in one burst. TCP cannot be spoofed.
+        const echo = if (p.reply == .udp and !p.echoed) p.asked_ns - p.origin_ns else 0;
+        const leaves_ns = s.e.now_ns + echo;
+        if (echo > 0 and leaves_ns < timeout(p.*)) {
+            served.release(&s.g.store);
+            // Shaped again when it leaves, so its TTLs age to then.
+            try s.timers.push(s.gpa, .{ .at_ns = leaves_ns, .slot = i, .gen = p.gen });
+            p.at_ns = leaves_ns;
+            p.echoed = true;
+            s.g.stats.clients.echoed += 1;
+            s.g.stats.clients.echo_ms += @intCast(@divTrunc(echo, std.time.ns_per_ms));
+            return;
+        }
         s.g.stats.clients.miss += 1;
-        try s.answered(p.reply, query, served, p.asked_ns);
+        try s.answered(p.reply, query, served, p.asked_ns, leaves_ns);
         s.vacate(i);
     }
 
@@ -403,7 +426,10 @@ const Server = struct {
         const on = p.a orelse p.root;
         p.prev = Pending.none;
         p.next = s.heads.items[on];
-        if (p.next != Pending.none) s.pending.items[p.next].prev = i;
+        if (p.next != Pending.none) {
+            s.pending.items[p.next].prev = i;
+            p.origin_ns = @min(p.origin_ns, s.pending.items[p.next].origin_ns);
+        }
         s.heads.items[on] = i;
     }
 
@@ -452,7 +478,7 @@ const Server = struct {
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
         s.g.stats.clients.miss += 1;
-        try s.answered(p.reply, query, served, p.asked_ns);
+        try s.answered(p.reply, query, served, p.asked_ns, s.e.now_ns);
         return true;
     }
 
@@ -470,7 +496,7 @@ const Server = struct {
         return t.at_ns;
     }
 
-    fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64) !void {
+    fn answered(s: *Server, reply: Reply, query: dns.Message, served: answer.Served, asked_ns: i64, leaves_ns: i64) !void {
         const q = query.questions[0];
         _ = s.desk.derived(q, answer.Client.fromQuery(query), served) catch |err| {
             served.release(&s.g.store);
@@ -478,7 +504,7 @@ const Server = struct {
         };
         // Its waiter kept the resolution going; past a UDP client's
         // timeout the outcome is noted and the reply goes nowhere.
-        if (reply == .udp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
+        if (reply == .udp and leaves_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
             s.g.stats.clients.late += 1;
             return served.release(&s.g.store);
         }
@@ -696,8 +722,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d} | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.keys, r.refused,
