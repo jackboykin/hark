@@ -33,7 +33,7 @@ const max_hedge = 3;
 /// BIND's `prefetch 2 9`, the 9: or steering zones double.
 const refresh_floor_s = 9;
 
-pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport };
+pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport, case: graph.Case };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
 /// last or when it ended; what a reply leaves in flight records on its own.
@@ -823,15 +823,15 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             const at = a.end(i);
             switch (ex.state.fact.exchange) {
                 .timeout => {},
-                .mismatch => {},
-                .mangled => if (at.transport == .udp) {
-                    _ = try sendTo(g, id, a, at.server, .tcp, qname, qtype);
+                // A server that normalizes case answers.
+                .mismatch => if (at.case == .random) {
+                    _ = try sendTo(g, id, a, at.server, .tcp, .plain, qname, qtype);
                 },
                 .reply => |r| {
                     if (r.msg.header.flags.tc) {
                         // TC over TCP: a broken server, as good as a timeout.
                         if (at.transport == .udp) {
-                            _ = try sendTo(g, id, a, at.server, .tcp, qname, qtype);
+                            _ = try sendTo(g, id, a, at.server, .tcp, .random, qname, qtype);
                         }
                     } else if (!delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) {
                         a.nattempts = 0;
@@ -845,7 +845,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (a.next < a.nservers and (a.nattempts == 0 or early)) {
             const server = a.next;
             a.next += 1;
-            const state = try sendTo(g, id, a, server, if (a.tcp_first) .tcp else .udp, qname, qtype) orelse continue;
+            const state = try sendTo(g, id, a, server, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
             if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.wake(id, a.hedge_at);
             continue;
@@ -865,17 +865,17 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 
 /// One attempt on the estimate's timeout; only the last of all is uncapped.
 /// Null: refused, so launch nothing more; what is in flight may still answer.
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, transport: Transport, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
     a.tried |= Ask.bit(server);
     const key = a.servers[server];
     const state = g.rtt.get(key) orelse ns_rtt.RttState.unknown;
     const timeout_ms = state.timeout(a.nattempts == 0 and a.next >= a.nservers, transport);
-    const ex = try g.exchange(id, key.toAddress(), transport, qname, qtype, timeout_ms) orelse {
+    const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms) orelse {
         a.next = a.nservers;
         a.fetched_unglued = true;
         return null;
     };
-    a.attempts[a.nattempts] = .{ .exchange = ex, .server = server, .transport = transport };
+    a.attempts[a.nattempts] = .{ .exchange = ex, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
     return state;
 }

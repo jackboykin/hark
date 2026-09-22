@@ -133,7 +133,16 @@ pub const Sim = struct {
         flags.qr = true;
         flags.rd = query.header.flags.rd;
         var question = q;
-        if (entry.force_lower_qname) question.name = try dns.cloneNameLower(s.arena, q.name);
+        switch (entry.qname_case) {
+            .copy => {},
+            .lower => question.name = try dns.cloneNameLower(s.arena, q.name),
+            .upper => {
+                question.name = try dns.cloneNameFlat(s.arena, q.name, false);
+                for (question.name.labels) |l| for (@constCast(l)) |*c| {
+                    c.* = std.ascii.toUpper(c.*);
+                };
+            },
+        }
         const questions = try s.arena.dupe(dns.Question, &.{question});
         const msg: dns.Message = .{
             .header = .{ .id = query.header.id, .flags = flags },

@@ -1,25 +1,25 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: qname-minimisation = no
 
-SCENARIO_BEGIN 0x20-case mismatch on echoed question retries over TCP
+SCENARIO_BEGIN a mangled 0x20 echo over TCP earns one plain-case TCP retry
 
-; A mangled 0x20 echo is resent to the same auth over TCP. The UDP
-; entry lowercases the echo and answers a decoy; TCP answers for real.
-; 36 eligible letters: P(no retry) = 2^-36.
+; UDP keeps the case but truncates, so the TCP retry still carries 0x20.
+; That TCP echo comes back uppercased: a mismatch, which earns one more
+; TCP query in plain case, where an echo in any case passes.
+; 36 eligible letters: P(no mismatch) = 2^-36.
 
 RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
   ENTRY_BEGIN
     MATCH opcode qname qtype UDP
-    ADJUST copy_id copy_query force_lower_qname
-    REPLY QR AA NOERROR
+    ADJUST copy_id copy_query
+    REPLY QR AA TC NOERROR
     SECTION QUESTION
       abcdefghijklmnopqrstuvwxyz.example.com. IN A
-    SECTION ANSWER
-      abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.99
   ENTRY_END
   ENTRY_BEGIN
     MATCH opcode qname qtype TCP
-    ADJUST copy_id copy_query
+    ADJUST copy_id copy_query force_upper_qname
     REPLY QR AA NOERROR
     SECTION QUESTION
       abcdefghijklmnopqrstuvwxyz.example.com. IN A
@@ -44,5 +44,8 @@ ENTRY_BEGIN
   SECTION ANSWER
     abcdefghijklmnopqrstuvwxyz.example.com. 3600 IN A 192.0.2.1
 ENTRY_END
+
+; UDP, TCP with 0x20, TCP plain: nothing more.
+STEP 3 CHECK_MAX_QUERIES 3
 
 SCENARIO_END

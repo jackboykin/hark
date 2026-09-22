@@ -187,11 +187,12 @@ pub const Answer = struct {
 pub const Outcome = union(enum) {
     reply: struct { msg: dns.Message, rtt_ns: i64 },
     timeout,
-    /// Wrong id, question or case: a spoof.
+    /// Unparsable, or a wrong id, question or 0x20 case.
     mismatch,
-    /// Same name, different bytes: the server mangles case; retry over TCP.
-    mangled,
 };
+
+/// Plain goes only over TCP, where a forger cannot follow.
+pub const Case = enum { random, plain };
 
 /// Why a cell settled on no fact: nothing about the DNS, so it is never
 /// stored and expires as it settles. Its demanders read it; the next
@@ -282,6 +283,7 @@ const ExchangeScratch = struct {
     qtype: dns.RType,
     server: na.Address,
     transport: Transport,
+    case: Case,
     sent_ns: i64,
     /// The payer's deadline came before the server's timeout, so a timeout
     /// says nothing about the server.
@@ -543,13 +545,8 @@ pub const Graph = struct {
                 g.tally.parses += 1;
                 const bytes = try arena.dupe(u8, borrowed);
                 const msg = dns.parseMessage(arena, bytes) catch break :blk .mismatch;
-                if (msg.header.id != sc.id or !msg.header.flags.qr) break :blk .mismatch;
-                dns.validateResponse(msg, sc.sent_name, sc.qtype) catch break :blk .mismatch;
-                switch (dns.checkEcho(msg, sc.sent_name, sc.qtype)) {
-                    .mismatch => break :blk .mismatch,
-                    .mangled => break :blk .mangled,
-                    .ok => {},
-                }
+                if (msg.header.id != sc.id) break :blk .mismatch;
+                dns.validateResponse(msg, sc.sent_name, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // 0x20 case checked; every name is a lowercase fact from here.
                 inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
                     for (@constCast(section)) |*rr| {
@@ -1094,7 +1091,8 @@ pub const Graph = struct {
 
     /// Null, like `demand`, when the payer's budget or deadline, or the
     /// asker's orphaning, refuses the work.
-    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
+    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
+        std.debug.assert(case == .random or transport == .tcp);
         const budget = g.payer;
         if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
             if (g.cfg.trace) {
@@ -1113,12 +1111,12 @@ pub const Graph = struct {
         var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();
-        const msg = try dns.buildQuery(arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = rng });
+        const msg = try dns.buildQuery(arena, qid, qname.formatInto(&name_buf), qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = if (case == .random) rng else null });
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);
         const timeout_at = g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms;
-        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= timeout_at };
+        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= timeout_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
