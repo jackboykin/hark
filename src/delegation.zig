@@ -143,8 +143,8 @@ pub fn extractReferral(
     };
 }
 
-/// RFC 1034 §4.3.5: drop this reply and ask a sibling. SERVFAIL, REFUSED
-/// and FORMERR (hark never retries without EDNS); a lame reply, non-AA
+/// RFC 1034 §5.3.3: drop this reply and ask a sibling. Any rcode but an
+/// answer's (hark never retries without EDNS on FORMERR); a lame reply, non-AA
 /// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
 /// recursor's cache, RA set and AA clear, which an RD-clear query gets
 /// only from a server that recursed on its own. A recursor's referral
@@ -153,10 +153,10 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: Ad
     const flags = response.header.flags;
     const rec_lame = flags.ra and !flags.aa;
     switch (flags.rcode) {
-        .server_failure, .refused, .format_error => return true,
-        .name_error => return rec_lame,
         .no_error => {},
-        else => return false,
+        .name_error => return rec_lame,
+        .yx_domain => return false,
+        else => return true,
     }
     if (flags.aa) return false;
     if (response.answers.len != 0) return rec_lame;

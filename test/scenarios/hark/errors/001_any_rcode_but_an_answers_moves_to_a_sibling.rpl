@@ -1,0 +1,174 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: stagger-ms = 0
+
+SCENARIO_BEGIN any rcode but an answer's moves to a sibling
+
+; Each of ns1-ns5 fails the question its own way; ns6 fails down. and
+; answers up. Every server is asked whatever the pick order, the failure
+; is remembered (RFC 9520), and up. surfaces ns6's answer.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns1.example.com.
+      example.com. 86400 IN NS ns2.example.com.
+      example.com. 86400 IN NS ns3.example.com.
+      example.com. 86400 IN NS ns4.example.com.
+      example.com. 86400 IN NS ns5.example.com.
+      example.com. 86400 IN NS ns6.example.com.
+    SECTION ADDITIONAL
+      ns1.example.com. 86400 IN A 127.0.10.3
+      ns2.example.com. 86400 IN A 127.0.10.4
+      ns3.example.com. 86400 IN A 127.0.10.5
+      ns4.example.com. 86400 IN A 127.0.10.6
+      ns5.example.com. 86400 IN A 127.0.10.7
+      ns6.example.com. 86400 IN A 127.0.10.8
+  ENTRY_END
+RANGE_END
+
+; ns1: SERVFAIL
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ns2: REFUSED
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ns3: FORMERR
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR FORMERR
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ns4: NOTIMP
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.6
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR NOTIMP
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+; ns5: a recursor's NXDOMAIN
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.7
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR RA NXDOMAIN
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.8
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      up.example.com. IN A
+    SECTION ANSWER
+      up.example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    down.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    down.example.com. IN A
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    down.example.com. A 127.0.10.3
+    down.example.com. A 127.0.10.4
+    down.example.com. A 127.0.10.5
+    down.example.com. A 127.0.10.6
+    down.example.com. A 127.0.10.7
+    down.example.com. A 127.0.10.8
+ENTRY_END
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    down.example.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=13
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    down.example.com. IN A
+ENTRY_END
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    up.example.com. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    up.example.com. IN A
+  SECTION ANSWER
+    up.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

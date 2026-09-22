@@ -134,10 +134,8 @@ scenario does not reach could give up where a re-resolving resolver recovers —
 is the stale-glue gap below, not something this scenario discriminates on.
 
 The broader "one failing NS must not condemn the resolution" story (RFC 1034
-§4.3.5) is **fixed** for SERVFAIL / REFUSED / FORMERR via
-`RCode.shouldTrySiblingNs`; see
-`../hark/errors/multi_NS_fallthrough.divergence.md` for the full narrative,
-the committed `004`–`006` scenarios, and the one remaining stale-glue gap.
+§5.3.3) is **fixed**: any rcode but an answer's moves to a sibling
+(`../hark/errors/001_any_rcode_but_an_answers_moves_to_a_sibling.rpl`).
 
 **Verdict:** sibling-fallthrough closed; stale-glue re-resolution is the live
 remainder.
