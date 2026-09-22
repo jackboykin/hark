@@ -453,6 +453,8 @@ pub const Ede = struct {
         stale_nxdomain_answer = 19,
         no_reachable_authority = 22,
         synthesized = 29,
+        /// draft-muks-dns-ede-rate-limited.
+        over_quota = 32,
     };
 
     pub fn option(self: Ede, buf: *[64]u8) EdnsOption {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import signal
 import socket
+import struct
 import textwrap
 import time
 
@@ -196,3 +197,27 @@ def test_a_crowded_queue_sheds_novel_names_only(tmp_path):
         assert stats(proc)["shed"] == 1
         # Drained, a novel name gets in.
         assert send_raw_query("novel.live.", "A", conftest.HARK_LISTEN).rcode() == dns.rcode.NOERROR
+
+
+def tcp_ask(conn: socket.socket, names: list[str]) -> list[dns.message.Message]:
+    """Pipelined on one connection: every frame in one write."""
+    conn.sendall(b"".join(struct.pack("!H", len(w)) + w for w in (dns.message.make_query(n, "A", use_edns=0).to_wire() for n in names)))
+    replies = []
+    for _ in names:
+        (n,) = struct.unpack("!H", conn.recv(2, socket.MSG_WAITALL))
+        replies.append(dns.message.from_wire(conn.recv(n, socket.MSG_WAITALL)))
+    return replies
+
+
+def test_tcp_turned_away_is_servfail_over_quota(hark):
+    fire([f"q{i}.silent." for i in range(64)])
+    with socket.create_connection(conftest.HARK_LISTEN, timeout=2) as conn:
+        for reply in tcp_ask(conn, ["x.live.", "y.live."]):
+            assert reply.rcode() == dns.rcode.SERVFAIL
+            assert [e.code for e in reply.extended_errors()] == [32]
+        # Hark's limit, not the name's failure: nothing is remembered, so
+        # UDP is turned away too rather than answered a cached error.
+        with pytest.raises(dns.exception.Timeout):
+            send_raw_query("x.live.", "A", conftest.HARK_LISTEN, timeout=0.3)
+        # The connection stays open.
+        assert tcp_ask(conn, ["localhost."])[0].rcode() == dns.rcode.NOERROR

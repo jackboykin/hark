@@ -332,13 +332,16 @@ const Server = struct {
             .graph => {},
         }
         const asked = try s.desk.asked(arena, q, client);
-        // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
+        // BCP 140 again: turned away is silence on UDP, SERVFAIL on TCP. Past
         // `max_in_flight` parked clients only what is known is served.
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
         const admit: graph.Graph.Admit = if (s.parked >= s.g.cfg.max_in_flight) .known else if (crowded and !s.known(asked)) .join else .new;
         const root = try s.g.demandRoot(asked.name, asked.qtype, admit) orelse {
             if (admit == .join) c.shed += 1;
-            return if (reply == .tcp) s.drop(reply.tcp);
+            // Hark's limits, not the name's failure: never noted. A close
+            // would take the connection's other queries with it (RFC 7766 §6.2.1).
+            if (reply == .tcp) s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
+            return;
         };
         try s.g.drain();
         var p: Pending = .{ .root = root, .wire = &.{}, .reply = reply, .asked_ns = s.e.now_ns, .origin_ns = s.e.now_ns };
