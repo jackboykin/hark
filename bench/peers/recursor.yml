@@ -1,3 +1,4 @@
+# The listener's receive buffer is fixed at 250000 in the source; no setting.
 recursor:
   threads: 1
   hint_file: __DIR__/root.hints
