@@ -749,7 +749,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             cname = rr;
             break;
         };
-        // RFC 6672 §3.3: the deepest DNAME above `cur` synthesises the
+        // RFC 6672 §3.2: the deepest DNAME above `cur` synthesises the
         // CNAME and travels with it.
         var dname: ?dns.ResourceRecord = null;
         for (msg.answers) |rr| {
