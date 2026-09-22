@@ -530,6 +530,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
         .max_in_flight = cfg.max_in_flight,
+        .max_flights = flightShare(),
         .trace = trace,
     }, e.edge());
     defer g.deinit();
@@ -575,6 +576,13 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
 }
 
 const stats_every = 5 * std.time.ns_per_min;
+
+/// Half the fd limit `main` raised: an exchange holds a socket, and
+/// clients, listeners and the loop need the rest.
+fn flightShare() u32 {
+    const lim = posix.getrlimit(.NOFILE) catch return std.math.maxInt(u32);
+    return @intCast(@min(lim.cur / 2, std.math.maxInt(u32)));
+}
 
 /// Cumulative since start, one line per plane. Every five minutes, on
 /// USR1/HUP, and at exit.

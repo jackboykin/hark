@@ -115,6 +115,7 @@ pub const Config = struct {
     max_resolve_depth: u8 = 3,
     /// Resolutions, or exchanges, in flight at once; a client past either is turned away.
     max_in_flight: u32 = 1024,
+    max_flights: u32 = std.math.maxInt(u32),
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     /// The first window a failure is remembered: by the server per
@@ -461,7 +462,8 @@ pub const Graph = struct {
     }
 
     /// Held for the client until `unhold`. Null: new work past
-    /// `max_in_flight`, or anything unsettled for a caller that cannot `wait`.
+    /// `max_in_flight` or `max_flights`, or anything unsettled for a caller
+    /// that cannot `wait`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
         var kb: KeyBuf = undefined;
         const key = Key.of(&kb, .answer, name, qtype);
@@ -473,7 +475,7 @@ pub const Graph = struct {
             g.cell(id).holds += 1;
             return id;
         };
-        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight) {
+        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights) {
             g.stats.clients.dropped += 1;
             return null;
         }
@@ -510,7 +512,7 @@ pub const Graph = struct {
     pub fn refresh(g: *Graph, key: Key, name: dns.Name) !void {
         const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
         if (g.index.contains(rkey)) return;
-        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2) {
+        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_flights / 2) {
             g.stats.resolver.refused += 1;
             return;
         }
