@@ -87,6 +87,8 @@ pub const Served = struct {
     ede: ?dns.Ede = null,
     /// Served stale: hold the question stale until then (`Failures`).
     hold_until_ns: i64 = 0,
+    /// A failure of this host's, not the DNS's: never noted (`Failures`).
+    local: bool = false,
     held: []const *store.Blob = &.{},
 
     pub fn release(s: Served, st: *store.Store) void {
@@ -129,6 +131,13 @@ pub fn hinfo(arena: Allocator, q: dns.Question) !Served {
 /// SERVFAIL, and why.
 pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
     return .{ .rcode = .server_failure, .question = q, .cacheable = false, .ede = ede };
+}
+
+/// A cell's failure, as SERVFAIL.
+fn servfailOf(q: dns.Question, why: graph.Failure) Served {
+    var s = servfail(q, .{ .code = why.code, .text = why.text });
+    s.local = why.local;
+    return s;
 }
 
 /// Serve's policy over what the store still holds past a fact's TTL; the
@@ -278,7 +287,7 @@ fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob) Hop {
 /// hop's TTLs end with its proof, signatures only to DO, AD only when asked
 /// (RFC 6840 §5.7).
 pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
-    if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfail(q, .{ .code = why.code, .text = why.text });
+    if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
     // Secure only if every hop is; a verdict that failed is bogus (RFC 4035 §4.3).
     var secure = a.judged.len > 0;
@@ -286,7 +295,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
         .fact => |v| secure = secure and v.secure.status == .secure,
         .failure => |why| if (c.cd) {
             secure = false;
-        } else return try stale(arena, g, ret, q, c, minimal) orelse servfail(q, .{ .code = why.code, .text = why.text }),
+        } else return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why),
         .pending => unreachable,
     };
     std.debug.assert(a.hops.len > 0);
@@ -522,8 +531,10 @@ pub const Failures = struct {
     }
 
     /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
-    /// stale one holds the question, anything else closes it.
+    /// stale one holds the question, anything else closes it. A local
+    /// failure says nothing about the question.
     pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
+        if (served.local) return;
         const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
         if (forgets and f.map.count() == 0) return;
         var buf: [dns.max_dotted_len + 4]u8 = undefined;

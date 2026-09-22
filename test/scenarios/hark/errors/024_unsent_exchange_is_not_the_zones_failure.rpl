@@ -1,0 +1,163 @@
+; hark: root-hints = 127.0.10.1
+; sim-only: a socket refused at the host is the sim's to stage; live, harness/test_fd_exhaustion.py covers the edge
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN an exchange that never left the host is not the zone's failure
+
+; Out of sockets, an exchange never leaves: its silence is hark's own and
+; says nothing about the zone or its servers. Client 1's two sends to the
+; root (the ask and its retry) are refused at the host, so www.victim
+; SERVFAILs; remembering that as the fetch's failure (RFC 9520 §3.2) would
+; SERVFAIL client 2's www.evil, whose CNAME leads there, for the window,
+; and as the question's, client 3's www.victim with a cached error.
+; Client 4's first send to a victim server is refused and the sibling
+; answers.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      evil. IN A
+    SECTION AUTHORITY
+      evil. 3600 IN NS ns.evil.
+    SECTION ADDITIONAL
+      ns.evil. 3600 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      victim. IN A
+    SECTION AUTHORITY
+      victim. 3600 IN NS ns1.victim.
+      victim. 3600 IN NS ns2.victim.
+    SECTION ADDITIONAL
+      ns1.victim. 3600 IN A 127.0.10.3
+      ns2.victim. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.evil. IN A
+    SECTION ANSWER
+      www.evil. 3600 IN CNAME www.victim.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.victim. IN A
+    SECTION ANSWER
+      www.victim. 3600 IN A 192.0.2.9
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.victim. IN A
+    SECTION ANSWER
+      mail.victim. 3600 IN A 192.0.2.25
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.victim. IN A
+    SECTION ANSWER
+      www.victim. 3600 IN A 192.0.2.9
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.victim. IN A
+    SECTION ANSWER
+      mail.victim. 3600 IN A 192.0.2.25
+  ENTRY_END
+RANGE_END
+
+STEP 1 UNSENT
+STEP 2 UNSENT
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.evil. IN A
+ENTRY_END
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH all
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.evil. IN A
+  SECTION ANSWER
+    www.evil. 3600 IN CNAME www.victim.
+    www.victim. 3600 IN A 192.0.2.9
+ENTRY_END
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH all
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.victim. IN A
+  SECTION ANSWER
+    www.victim. 3600 IN A 192.0.2.9
+ENTRY_END
+STEP 9 UNSENT
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.victim. IN A
+ENTRY_END
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH all
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.victim. IN A
+  SECTION ANSWER
+    mail.victim. 3600 IN A 192.0.2.25
+ENTRY_END
+SCENARIO_END

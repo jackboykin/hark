@@ -60,6 +60,8 @@ pub const Ask = struct {
     held: ?CellId = null,
     /// The zone's DS names ML-DSA-44, whose DO answers truncate: TCP from the start.
     tcp_first: bool = false,
+    /// An attempt, or a server set's sub-resolution, never left the host.
+    local: bool = false,
 
     comptime {
         std.debug.assert(max_servers < 32);
@@ -139,6 +141,11 @@ pub const Ask = struct {
     /// Every server failed: bare SERVFAIL. An authority's REFUSED or
     /// FORMERR passed through reads as hark's own policy at the stub, and
     /// the randomised server order must not change what the stub sees.
+    /// The zone's servers failed, unless some were never asked.
+    fn exhausted(a: *const Ask) Failure {
+        return .{ .code = .no_reachable_authority, .local = a.local };
+    }
+
     fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
         var msg = a.heldMsg(g) orelse return .exhausted;
@@ -315,7 +322,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     }
     switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, unreachable_authority),
+        .exhausted => try g.fail(id, g.cell(id).scratch.cut.ask.exhausted()),
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
@@ -533,7 +540,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     while (true) {
         switch (try ask(g, id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
             .pending => return,
-            .exhausted => return failAsk(g, id, unreachable_authority),
+            .exhausted => return failAsk(g, id, g.cell(id).scratch.rrset.ask.exhausted()),
             .reply => |kept| {
                 const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
@@ -557,7 +564,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     .reply => |r| r,
                     .loop => return failAsk(g, id, .{ .code = .other, .text = "cname loop" }),
                     // No useful response (RFC 9520 §2).
-                    .none => return failAsk(g, id, unreachable_authority),
+                    .none => return failAsk(g, id, g.cell(id).scratch.rrset.ask.exhausted()),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
@@ -574,13 +581,13 @@ fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
 /// The fetch itself failed: the next asker in the window is refused
 /// (RFC 9520 §3.2), unless the failure may be the asker's own: a spent
 /// budget or deadline (here or in a sub-resolution), an orphan, an address
-/// sub-resolution's depth, or a refresh.
+/// sub-resolution's depth, a refresh, or something that never left the host.
 const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "failed recently" };
 
 fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
     const c = g.cell(id);
     const spent = g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
-    if (!spent and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
+    if (!spent and !c.orphan and !why.local and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
     try g.fail(id, why);
 }
 
@@ -854,6 +861,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             const at = a.end(i);
             switch (ex.state.fact.exchange) {
                 .timeout => {},
+                .unsent => a.local = true,
                 // Over TCP a forger cannot follow, and a server that
                 // normalizes case answers; a garbled datagram gets the
                 // same second chance.
@@ -931,7 +939,10 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         if (a.ns == null) a.ns = try g.demand(id, Key.of(&kb, .ns, zone, .a), zone) orelse return .none;
         const ns = g.cell(a.ns.?);
         if (!ns.settled()) return .pending;
-        if (ns.failure() != null) return .none;
+        if (ns.failure()) |why| {
+            a.local = a.local or why.local;
+            return .none;
+        }
         const names = ns.state.fact.ns.names;
         var unknown: std.ArrayList(dns.Name) = .empty;
         defer unknown.deinit(g.gpa);
@@ -947,7 +958,9 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                     // Ours, settled TTL-0 or failed: a fact
                     // serves its demander, a failure gives nothing.
                     if (g.holdsInput(id, aid)) {
-                        if (g.cell(aid).failure() == null) try list.appendSlice(g.gpa, g.cell(aid).state.fact.addr.addrs);
+                        if (g.cell(aid).failure()) |why| {
+                            a.local = a.local or why.local;
+                        } else try list.appendSlice(g.gpa, g.cell(aid).state.fact.addr.addrs);
                         continue;
                     }
                 } else {

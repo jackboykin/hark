@@ -118,6 +118,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options, rep
                 return error.ScenarioFailed;
             },
             .timeout => cursor += 1,
+            .unsent => s.pending_unsent += 1,
             // What was due arrives on the way.
             .time_passes => {
                 const until = s.now_ns + @as(i64, st.seconds) * std.time.ns_per_s;
@@ -537,7 +538,7 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(122, r.parsed);
+    try testing.expectEqual(123, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 
@@ -722,4 +723,49 @@ test "the door counts resolutions and exchanges in flight" {
     g.unhold(root);
     try testing.expectEqual(0, g.live);
     try testing.expectEqual(0, g.budgets);
+}
+
+test "an exchange that never left the host writes no estimate" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: rpl.Diag = .{};
+    const scenario = try rpl.parse(arena,
+        \\; hark: root-hints = 127.0.10.1
+        \\SCENARIO_BEGIN unsent
+        \\RANGE_BEGIN 0 100
+        \\  ADDRESS 127.0.10.1
+        \\  ENTRY_BEGIN
+        \\    MATCH opcode
+        \\    ADJUST copy_id copy_query
+        \\    REPLY QR AA NOERROR
+        \\    SECTION QUESTION
+        \\      www.example.com. IN A
+        \\    SECTION ANSWER
+        \\      www.example.com. 60 IN A 10.20.30.40
+        \\  ENTRY_END
+        \\RANGE_END
+        \\STEP 1 QUERY
+        \\ENTRY_BEGIN
+        \\  REPLY RD
+        \\  SECTION QUESTION
+        \\    www.example.com. IN A
+        \\ENTRY_END
+        \\SCENARIO_END
+    , &diag);
+    const q = scenario.steps[0].entry.?.questions[0];
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
+    defer s.deinit();
+    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
+    defer g.deinit();
+    s.pending_unsent = 1;
+    const root = (try g.demandRoot(q.name, q.qtype, true)).?;
+    try g.drain();
+    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    try testing.expect(g.cell(root).failure() == null);
+    try testing.expectEqual(1, g.stats.resolver.unsent);
+    // Only replies wrote it: a timeout would have started it at 400 ms.
+    const server = na.AddressKey.fromAddress(scenario.root_hints[0]);
+    try testing.expect(g.rtt.get(server).?.srtt_us < 50 * std.time.us_per_ms);
+    g.unhold(root);
 }

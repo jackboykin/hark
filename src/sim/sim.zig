@@ -54,6 +54,8 @@ pub const Sim = struct {
     step: u32 = 0,
     /// `STEP n TIMEOUT`: drop this many of the next upstream queries.
     pending_drops: u32 = 0,
+    /// `STEP n UNSENT`: refuse this many of the next upstream queries at the host.
+    pending_unsent: u32 = 0,
     events: std.PriorityQueue(Event, void, Event.before) = .empty,
     seq: u32 = 0,
     log: std.ArrayList(LogRow) = .empty,
@@ -97,6 +99,10 @@ pub const Sim = struct {
     /// One upstream query. Its reply or absence is scheduled now; nothing
     /// depends on later steps.
     pub fn send(s: *Sim, ex: Exchange) !void {
+        if (s.pending_unsent > 0) {
+            s.pending_unsent -= 1;
+            return s.schedule(ex.id, s.now_ns, .unsent);
+        }
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
         if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         const q = query.questions[0];

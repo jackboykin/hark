@@ -102,6 +102,8 @@ pub const Step = struct {
         check_max_queries,
         /// Drop the next upstream query as if the authority timed out.
         timeout,
+        /// Refuse the next upstream query at the host, as if out of sockets.
+        unsent,
         time_passes,
     };
 };
@@ -361,7 +363,7 @@ const Parser = struct {
                 }
                 return p.fail("TIME_PASSES needs `ELAPSE <n>` or `EVAL \"<n>\"`");
             },
-            .timeout => return .{ .n = n, .kind = kind },
+            .timeout, .unsent => return .{ .n = n, .kind = kind },
             .check_max_queries => {
                 const bound = try p.int(u32, toks.next() orelse return p.fail("CHECK_MAX_QUERIES takes one integer"));
                 if (toks.next() != null) return p.fail("CHECK_MAX_QUERIES takes one integer");
