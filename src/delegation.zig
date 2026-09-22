@@ -154,8 +154,7 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: Ad
     const rec_lame = flags.ra and !flags.aa;
     switch (flags.rcode) {
         .no_error => {},
-        .name_error => return rec_lame,
-        .yx_domain => return false,
+        .name_error, .yx_domain => return rec_lame,
         else => return true,
     }
     if (flags.aa) return false;

@@ -4,9 +4,9 @@
 
 SCENARIO_BEGIN any rcode but an answer's moves to a sibling
 
-; Each of ns1-ns5 fails the question its own way; ns6 fails down. and
+; Each of ns1-ns6 fails the question its own way; ns7 fails down. and
 ; answers up. Every server is asked whatever the pick order, the failure
-; is remembered (RFC 9520), and up. surfaces ns6's answer.
+; is remembered (RFC 9520), and up. surfaces ns7's answer.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -23,6 +23,7 @@ RANGE_BEGIN 0 100
       example.com. 86400 IN NS ns4.example.com.
       example.com. 86400 IN NS ns5.example.com.
       example.com. 86400 IN NS ns6.example.com.
+      example.com. 86400 IN NS ns7.example.com.
     SECTION ADDITIONAL
       ns1.example.com. 86400 IN A 127.0.10.3
       ns2.example.com. 86400 IN A 127.0.10.4
@@ -30,6 +31,7 @@ RANGE_BEGIN 0 100
       ns4.example.com. 86400 IN A 127.0.10.6
       ns5.example.com. 86400 IN A 127.0.10.7
       ns6.example.com. 86400 IN A 127.0.10.8
+      ns7.example.com. 86400 IN A 127.0.10.9
   ENTRY_END
 RANGE_END
 
@@ -93,8 +95,20 @@ RANGE_BEGIN 0 100
   ENTRY_END
 RANGE_END
 
+; ns6: a recursor's YXDOMAIN
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.8
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR RA YXDOMAIN
+    SECTION QUESTION
+      down.example.com. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.9
   ENTRY_BEGIN
     MATCH opcode qname qtype
     ADJUST copy_id copy_query
@@ -137,6 +151,7 @@ ENTRY_BEGIN
     down.example.com. A 127.0.10.6
     down.example.com. A 127.0.10.7
     down.example.com. A 127.0.10.8
+    down.example.com. A 127.0.10.9
 ENTRY_END
 
 STEP 4 QUERY
