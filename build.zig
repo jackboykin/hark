@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (b.option(bool, "bench-layout", "LLVM and lld, a section per function, for bench/layouts.sh") orelse false) {
+        exe.use_llvm = true;
+        exe.use_lld = true;
+        exe.link_function_sections = true;
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
