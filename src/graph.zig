@@ -187,8 +187,10 @@ pub const Answer = struct {
 pub const Outcome = union(enum) {
     reply: struct { msg: dns.Message, rtt_ns: i64 },
     timeout,
-    /// Unparsable, or a wrong id, question or 0x20 case.
+    /// Parses, but a wrong id, question or 0x20 case: not the reply sent for.
     mismatch,
+    /// Does not parse.
+    malformed,
 };
 
 /// Plain goes only over TCP, where a forger cannot follow.
@@ -544,7 +546,7 @@ pub const Graph = struct {
                 defer clock.stop();
                 g.tally.parses += 1;
                 const bytes = try arena.dupe(u8, borrowed);
-                const msg = dns.parseMessage(arena, bytes) catch break :blk .mismatch;
+                const msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
                 if (msg.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent_name, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // 0x20 case checked; every name is a lowercase fact from here.
