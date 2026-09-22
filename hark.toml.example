@@ -6,7 +6,8 @@ allow-from = []               # client CIDR allowlist; empty = allow all.
                               # Required when binding non-loopback (BCP 140).
 max-in-flight = 1024          # cap on waiting clients, resolutions and upstream queries;
                               # past it only cached answers are served
-max-udp-payload = 1232        # advertised EDNS0 buffer size
+max-udp-payload = 1232        # max EDNS0 buffer size honored from clients;
+                              # raise only where the path MTU fits it
 minimal-responses = true      # strip non-load-bearing authority/additional RRs
 tcp-idle-timeout-ms = 5000    # close idle TCP clients (RFC 7766 §6.2.3)
 tcp-queries-per-conn = 128    # queries per TCP connection before close
