@@ -113,8 +113,6 @@ pub const Config = struct {
     /// The hedge stagger before a server has answered; 0: no hedge.
     stagger_ms: u32 = 150,
     max_resolve_depth: u8 = 3,
-    /// Resolutions, or exchanges, in flight at once; a client past either is turned away.
-    max_in_flight: u32 = 1024,
     max_flights: u32 = std.math.maxInt(u32),
     max_work_bytes: usize = std.math.maxInt(usize),
     max_delegations: u8 = 16,
@@ -505,24 +503,25 @@ pub const Graph = struct {
         return g.cells.items[id];
     }
 
-    /// What a client may start: `known`, only what is settled; `join`,
-    /// work in progress too; `new`, a resolution of its own.
-    pub const Admit = enum { known, join, new };
+    /// What a client may start: `join`, only what is settled or in
+    /// progress; `new`, a resolution of its own.
+    pub const Admit = enum { join, new };
 
-    /// Held for the client until `unhold`. Null: past what `admit` allows,
-    /// or new work past `max_in_flight`, `max_flights` or `max_work_bytes`.
+    /// Held for the client until `unhold`. Null: a new resolution `admit`
+    /// does not allow, or anything unsettled past `max_work_bytes` (a
+    /// joiner is work too), or new work past `max_flights`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, admit: Admit) !?CellId {
         var kb: KeyBuf = undefined;
         const key = Key.of(&kb, .answer, name, qtype);
         if (g.index.get(key)) |id| if (!g.cell(id).settled() or g.fresh(id)) {
-            if (admit == .known and !g.cell(id).settled()) {
+            if (!g.cell(id).settled() and g.work.bytes >= g.cfg.max_work_bytes) {
                 g.stats.clients.dropped += 1;
                 return null;
             }
             g.cell(id).holds += 1;
             return id;
         };
-        if (admit != .new or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) {
+        if (admit != .new or g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) {
             g.stats.clients.dropped += 1;
             return null;
         }
@@ -559,7 +558,7 @@ pub const Graph = struct {
     pub fn refresh(g: *Graph, key: Key, name: dns.Name) !void {
         const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
         if (g.index.contains(rkey)) return;
-        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
+        if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.refused += 1;
             return;
         }
@@ -1225,7 +1224,7 @@ test "a cell replacing an expired one takes over the index entry's key" {
     g.unhold(second);
 }
 
-test "a caller that cannot wait gets only what is settled" {
+test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
     const testing = std.testing;
     var now: i64 = std.time.ns_per_s;
     var wall: i64 = 0;
@@ -1234,21 +1233,19 @@ test "a caller that cannot wait gets only what is settled" {
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{}, .max_work_bytes = 1 }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
-    try testing.expectEqual(null, try g.demandRoot(name, .a, .known));
+    try testing.expectEqual(null, try g.demandRoot(name, .a, .join));
     const first = (try g.demandRoot(name, .a, .new)).?;
-    try testing.expectEqual(null, try g.demandRoot(name, .a, .known));
-    // Work in progress is joined; none is started.
-    try testing.expectEqual(first, (try g.demandRoot(name, .a, .join)).?);
-    try testing.expectEqual(null, try g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .join));
+    // Its own bytes are past the ceiling: nothing unsettled is joined or started.
+    try testing.expectEqual(null, try g.demandRoot(name, .a, .join));
+    try testing.expectEqual(null, try g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .new));
     try testing.expectEqual(@as(u64, 3), g.stats.clients.dropped);
     try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now + std.time.ns_per_s);
-    try testing.expectEqual(first, (try g.demandRoot(name, .a, .known)).?);
-    g.unhold(first);
+    try testing.expectEqual(first, (try g.demandRoot(name, .a, .join)).?);
     g.unhold(first);
     g.unhold(first);
 }

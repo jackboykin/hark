@@ -152,8 +152,6 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         cfg.stagger_ms = scenario.stagger_ms
     if scenario.max_queries is not None:
         cfg.max_queries = scenario.max_queries
-    if scenario.max_in_flight is not None:
-        cfg.max_in_flight = scenario.max_in_flight
     if scenario.dns64_prefix is not None:
         cfg.dns64_prefix = scenario.dns64_prefix
     if scenario.serve_stale_ttl is not None:

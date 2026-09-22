@@ -119,7 +119,6 @@ const Server = struct {
     /// Clients parked on unsettled cells, in stable slots.
     pending: std.ArrayList(Pending) = .empty,
     vacant: std.ArrayList(u32) = .empty,
-    parked: u32 = 0,
     /// Ever parked: a wake counts its misses by it, since `reap` may unpark mid-wake.
     parks: u64 = 0,
     /// By cell id, the first slot parked on it.
@@ -332,10 +331,9 @@ const Server = struct {
             .graph => {},
         }
         const asked = try s.desk.asked(arena, q, client);
-        // BCP 140 again: turned away is silence on UDP, SERVFAIL on TCP. Past
-        // `max_in_flight` parked clients only what is known is served.
+        // BCP 140 again: turned away is silence on UDP, SERVFAIL on TCP.
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
-        const admit: graph.Graph.Admit = if (s.parked >= s.g.cfg.max_in_flight) .known else if (crowded and !s.known(asked)) .join else .new;
+        const admit: graph.Graph.Admit = if (crowded and !s.known(asked)) .join else .new;
         const root = try s.g.demandRoot(asked.name, asked.qtype, admit) orelse {
             if (admit == .join) c.shed += 1;
             // Hark's limits, not the name's failure: never noted. A close
@@ -379,7 +377,6 @@ const Server = struct {
         const gen = s.pending.items[i].gen +% 1;
         s.pending.items[i] = p;
         s.pending.items[i].gen = gen;
-        s.parked += 1;
         s.parks += 1;
         s.link(i);
         // Its capacity is reserved above.
@@ -472,7 +469,6 @@ const Server = struct {
         const p = &s.pending.items[i];
         s.release(p.*);
         p.live = false;
-        s.parked -= 1;
         s.vacant.appendAssumeCapacity(i);
     }
 
@@ -716,7 +712,6 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .store_bytes = cfg.cache_size,
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
-        .max_in_flight = cfg.max_in_flight,
         .max_flights = flightShare(),
         .max_work_bytes = cfg.cache_size,
         .trace = trace,

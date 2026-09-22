@@ -675,7 +675,7 @@ test "a silent sibling is hedged past and still records its timeout" {
     };
 }
 
-test "the door counts resolutions and exchanges in flight" {
+test "the door counts exchanges in flight" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -705,26 +705,24 @@ test "the door counts resolutions and exchanges in flight" {
     , &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     const other = try dns.parseDottedName(arena, "other.example.com.");
-    for ([_][2]u32{ .{ 1, std.math.maxInt(u32) }, .{ 1024, 1 } }) |door| {
-        var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
-        defer s.deinit();
-        var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_in_flight = door[0], .max_flights = door[1] }, s.edge());
-        defer g.deinit();
-        const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
-        try g.drain();
-        try testing.expectEqual(1, g.budgets);
-        try testing.expectEqual(1, g.flights);
-        // New work is turned away; the same question joins the one in progress.
-        try testing.expectEqual(null, try g.demandRoot(other, .a, .new));
-        try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, .new)).?);
-        try testing.expectEqual(1, g.stats.clients.dropped);
-        while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
-        try testing.expectEqual(0, g.flights);
-        g.unhold(root);
-        g.unhold(root);
-        try testing.expectEqual(0, g.live);
-        try testing.expectEqual(0, g.budgets);
-    }
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
+    defer s.deinit();
+    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
+    defer g.deinit();
+    const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
+    try g.drain();
+    try testing.expectEqual(1, g.budgets);
+    try testing.expectEqual(1, g.flights);
+    // New work is turned away; the same question joins the one in progress.
+    try testing.expectEqual(null, try g.demandRoot(other, .a, .new));
+    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, .new)).?);
+    try testing.expectEqual(1, g.stats.clients.dropped);
+    while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
+    try testing.expectEqual(0, g.flights);
+    g.unhold(root);
+    g.unhold(root);
+    try testing.expectEqual(0, g.live);
+    try testing.expectEqual(0, g.budgets);
 }
 
 test "an exchange that never left the host writes no estimate" {
