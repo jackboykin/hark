@@ -131,8 +131,8 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options, rep
     // Quiescence: nothing outlives its demand.
     unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
-    if (g.live != 0 or g.budgets != 0 or g.flights != 0) {
-        report.msg = "cells, budgets or flights outlived the scenario";
+    if (g.live != 0 or g.budgets != 0 or g.flights != 0 or g.work.bytes != 0) {
+        report.msg = "cells, budgets, flights or work bytes outlived the scenario";
         return error.ScenarioFailed;
     }
 }

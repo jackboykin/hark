@@ -58,6 +58,8 @@ const Tcp = struct {
 const client_tag: u64 = 1 << 32;
 
 gpa: Allocator,
+/// TCP buffers are work in progress: the graph's `Work` counts them.
+work: Allocator,
 epfd: posix.fd_t,
 now_ns: i64 = 0,
 wall_sec: i64 = 0,
@@ -70,7 +72,7 @@ head: usize = 0,
 pub fn init(gpa: Allocator) !Edge {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
     if (linux.errno(rc) != .SUCCESS) return error.EpollCreateFailed;
-    var e: Edge = .{ .gpa = gpa, .epfd = @intCast(rc) };
+    var e: Edge = .{ .gpa = gpa, .work = gpa, .epfd = @intCast(rc) };
     e.tick();
     return e;
 }
@@ -139,10 +141,10 @@ fn open(e: *Edge, ex: Exchange) !Flight {
         try e.ctl(linux.EPOLL.CTL_ADD, fd, linux.EPOLL.IN, ex.id);
         return .{ .fd = fd, .seq = 0 };
     }
-    const t = try e.gpa.create(Tcp);
-    errdefer e.gpa.destroy(t);
-    t.* = .{ .query = try e.gpa.alloc(u8, 2 + ex.wire.len) };
-    errdefer e.gpa.free(t.query);
+    const t = try e.work.create(Tcp);
+    errdefer e.work.destroy(t);
+    t.* = .{ .query = try e.work.alloc(u8, 2 + ex.wire.len) };
+    errdefer e.work.free(t.query);
     mem.writeInt(u16, t.query[0..2], @intCast(ex.wire.len), .big);
     @memcpy(t.query[2..], ex.wire);
     na.connectTo(fd, &ex.server) catch |err| switch (err) {
@@ -156,8 +158,8 @@ fn open(e: *Edge, ex: Exchange) !Flight {
 fn close(e: *Edge, f: Flight) void {
     sys.close(f.fd);
     if (f.tcp) |t| {
-        e.gpa.free(t.query);
-        e.gpa.destroy(t);
+        e.work.free(t.query);
+        e.work.destroy(t);
     }
 }
 

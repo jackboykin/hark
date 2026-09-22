@@ -226,6 +226,44 @@ pub const Value = union(Kind) {
     keys: void,
 };
 
+/// Bytes held by work in progress, counted where they are allocated: cell
+/// arenas by the chunk, budgets, the edge's TCP buffers.
+pub const Work = struct {
+    child: Allocator,
+    bytes: usize = 0,
+
+    pub fn allocator(w: *Work) Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *Work = @ptrCast(@alignCast(ctx));
+        const p = w.child.rawAlloc(len, a, ra) orelse return null;
+        w.bytes += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: mem.Alignment, len: usize, ra: usize) bool {
+        const w: *Work = @ptrCast(@alignCast(ctx));
+        if (!w.child.rawResize(m, a, len, ra)) return false;
+        w.bytes = w.bytes - m.len + len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const w: *Work = @ptrCast(@alignCast(ctx));
+        const p = w.child.rawRemap(m, a, len, ra) orelse return null;
+        w.bytes = w.bytes - m.len + len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: mem.Alignment, ra: usize) void {
+        const w: *Work = @ptrCast(@alignCast(ctx));
+        w.child.rawFree(m, a, ra);
+        w.bytes -= m.len;
+    }
+};
+
 /// A question's: its root holds it, and every run the root waits on pays
 /// from it (`payerOf`).
 pub const Budget = struct {
@@ -373,6 +411,7 @@ pub const Cell = struct {
 
 pub const Graph = struct {
     gpa: Allocator,
+    work: Work,
     cfg: Config,
     edge: Edge,
     /// One run's transients, reset at every run.
@@ -406,7 +445,7 @@ pub const Graph = struct {
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .gpa = gpa, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
         // The root cut is an axiom; `runCut` re-derives it if evicted.
         try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
@@ -598,8 +637,8 @@ pub const Graph = struct {
 
     /// A question's cell, holding its budget.
     fn newRoot(g: *Graph, key: Key, name: dns.Name, budget: Budget) !CellId {
-        const b = try g.gpa.create(Budget);
-        errdefer g.gpa.destroy(b);
+        const b = try g.work.allocator().create(Budget);
+        errdefer g.work.allocator().destroy(b);
         b.* = budget;
         const id = try g.newCell(key, name);
         g.cell(id).scratch.answer.budget = b;
@@ -614,7 +653,7 @@ pub const Graph = struct {
         const id: CellId = reused orelse @intCast(g.cells.items.len);
         const c = if (reused != null) g.cells.items[id] else try g.gpa.create(Cell);
         errdefer if (reused == null) g.gpa.destroy(c);
-        var arena = std.heap.ArenaAllocator.init(g.gpa);
+        var arena = std.heap.ArenaAllocator.init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
         const own_key: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) };
@@ -711,7 +750,7 @@ pub const Graph = struct {
             g.unref(b);
         }
         c.arena.deinit();
-        c.arena = std.heap.ArenaAllocator.init(g.gpa);
+        c.arena = std.heap.ArenaAllocator.init(g.work.allocator());
         c.scratch = .none;
         try g.free_ids.append(g.gpa, id);
     }
@@ -963,7 +1002,7 @@ pub const Graph = struct {
     fn unref(g: *Graph, b: *Budget) void {
         b.refs -= 1;
         if (b.refs > 0) return;
-        g.gpa.destroy(b);
+        g.work.allocator().destroy(b);
         g.budgets -= 1;
     }
 

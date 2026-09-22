@@ -535,6 +535,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     }, e.edge());
     defer g.deinit();
     g.attach();
+    e.work = g.work.allocator();
     var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
@@ -601,7 +602,7 @@ fn logStats(g: *graph.Graph) void {
     log.info("stats store     {d} KiB in {d} facts  in cells {d} KiB | evicted {d}  refused {d}", .{
         g.store.held / 1024, g.store.map.count(), (g.store.bytes - g.store.held) / 1024, g.store.evictions, g.store.refusals,
     });
-    log.info("stats process   rss {d} MiB  live cells {d}  in flight {d}", .{ rssMiB() orelse 0, g.live, g.flights });
+    log.info("stats process   rss {d} MiB  live cells {d}  in flight {d}  work {d} KiB", .{ rssMiB() orelse 0, g.live, g.flights, g.work.bytes / 1024 });
 }
 
 fn pct(n: u64, of: u64) u64 {
