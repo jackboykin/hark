@@ -372,6 +372,12 @@ const Server = struct {
             served.release(&s.g.store);
             return err;
         };
+        // Its waiter kept the resolution going; past a UDP client's
+        // timeout the outcome is noted and the reply goes nowhere.
+        if (reply == .udp and s.e.now_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
+            s.g.stats.clients.late += 1;
+            return served.release(&s.g.store);
+        }
         s.send(reply, query, served, asked_ns);
     }
 
@@ -577,8 +583,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d} | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d} | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.retry, r.refresh, r.keys, r.refused,

@@ -230,6 +230,9 @@ pub const Desk = struct {
 const stale_hold_s = 30;
 /// RFC 8767 §5: a resolution past a stub's patience answers stale instead.
 pub const stale_client_ms = 1800;
+/// RFC 8767 §5: "a common timeout value of 2 seconds". Past it a UDP
+/// client has given up, or never asked (DNSBomb).
+pub const client_timeout_ms = 2000;
 
 const Hop = struct {
     blob: *store.Blob,

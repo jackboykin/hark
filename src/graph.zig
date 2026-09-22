@@ -236,7 +236,7 @@ pub const Budget = struct {
 
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
-    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
+    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
     resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, retry: u64 = 0, refresh: u64 = 0, keys: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
