@@ -1,0 +1,47 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a reply counts only with the one question sent
+
+; RFC 5452 §9.1 at every rcode: a question-less YXDOMAIN is a mismatch,
+; its forged A included, and earns the plain TCP retry, which answers.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH qname qtype UDP
+    ADJUST copy_id drop_question
+    REPLY QR AA YXDOMAIN
+    SECTION QUESTION
+      yx.example.com. IN A
+    SECTION ANSWER
+      yx.example.com. 3600 IN A 192.0.2.66
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH qname qtype TCP
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      yx.example.com. IN A
+    SECTION ANSWER
+      yx.example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    yx.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    yx.example.com. IN A
+  SECTION ANSWER
+    yx.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

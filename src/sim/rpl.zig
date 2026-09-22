@@ -62,9 +62,9 @@ pub const Entry = struct {
     ede: ?u16 = null,
     /// ADJUST drop: a blackholed authority.
     drop: bool = false,
-    /// ADJUST force_lower_qname / force_upper_qname: the responder recases
-    /// the echoed question.
-    qname_case: enum { copy, lower, upper } = .copy,
+    /// ADJUST force_lower_qname / force_upper_qname / drop_question: how
+    /// the responder echoes the question.
+    echo: enum { copy, lower, upper, none } = .copy,
     /// ADJUST unsigned: the signer leaves the entry alone (an unsigned zone
     /// served from a signed zone's address).
     unsigned: bool = false,
@@ -406,9 +406,11 @@ const Parser = struct {
                     if (eqlLower(t, "drop")) {
                         e.drop = true;
                     } else if (eqlLower(t, "force_lower_qname")) {
-                        e.qname_case = .lower;
+                        e.echo = .lower;
                     } else if (eqlLower(t, "force_upper_qname")) {
-                        e.qname_case = .upper;
+                        e.echo = .upper;
+                    } else if (eqlLower(t, "drop_question")) {
+                        e.echo = .none;
                     } else if (eqlLower(t, "unsigned")) {
                         e.unsigned = true;
                     } else if (!eqlLower(t, "copy_id") and !eqlLower(t, "copy_query")) {

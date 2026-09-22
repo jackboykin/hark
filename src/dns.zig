@@ -2157,59 +2157,42 @@ pub fn substituteSuffix(allocator: Allocator, owner: Name, suffix: Name, target:
     return .{ .labels = labels };
 }
 
-/// RFC 5452 §9.1, relaxed: an error rcode may omit or misstate the question.
-/// `cased`: sent 0x20-randomized, so an echo keeps the case at any rcode.
-pub fn validateResponse(response: Message, sent: Name, qtype: RType, cased: bool) error{FormatError}!void {
-    if (!response.header.flags.qr) return error.FormatError;
-    const rcode = response.header.flags.rcode;
-    const answers = rcode == .no_error or rcode == .name_error;
-    if (response.questions.len != 1) {
-        if (answers) return error.FormatError;
-        return;
-    }
+/// RFC 5452 §9.1: the one question sent, at any rcode; byte for byte when
+/// `cased`. RFC 9619 lets a message carry none, but then nothing matches.
+pub fn validateResponse(response: Message, sent: Name, qtype: RType, cased: bool) error{Mismatch}!void {
+    const f = response.header.flags;
+    if (!f.qr or f.opcode != .query or response.questions.len != 1) return error.Mismatch;
     const q = response.questions[0];
-    if (cased and q.name.eql(sent) and !q.name.eqlExact(sent)) return error.FormatError;
-    if (answers and !(q.qtype == qtype and q.qclass == .in and q.name.eql(sent))) return error.FormatError;
+    const same = if (cased) q.name.eqlExact(sent) else q.name.eql(sent);
+    if (!same or q.qtype != qtype or q.qclass != .in) return error.Mismatch;
 }
 
-test "validateResponse: an altered 0x20 echo fails at any rcode, a plain one never" {
+test "validateResponse: only the one question sent, at any rcode" {
     const sent = Name{ .labels = &.{ "eXaMpLe", "cOm" } };
     const lower = Name{ .labels = &.{ "example", "com" } };
     const other = Name{ .labels = &.{ "other", "net" } };
     const reply = struct {
-        // comptime name so the questions array lands in static memory —
+        // comptime so the questions array lands in static memory —
         // a runtime param would leave it dangling on this frame's stack.
-        fn make(comptime name: Name, rcode: RCode) Message {
+        fn make(comptime names: []const Name, rcode: RCode) Message {
             const f = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = rcode };
-            return .{ .header = .{ .id = 0, .flags = f }, .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }} };
+            comptime var qs: [names.len]Question = undefined;
+            inline for (names, 0..) |n, i| qs[i] = .{ .name = n, .qtype = .a, .qclass = .in };
+            const final = qs;
+            return .{ .header = .{ .id = 0, .flags = f }, .questions = &final };
         }
     }.make;
-    const bad = error.FormatError;
+    const bad = error.Mismatch;
 
-    try validateResponse(reply(sent, .no_error), sent, .a, true);
-    try std.testing.expectError(bad, validateResponse(reply(lower, .no_error), sent, .a, true));
-    try std.testing.expectError(bad, validateResponse(reply(lower, .refused), sent, .a, true));
-    try validateResponse(reply(lower, .no_error), sent, .a, false);
-    try std.testing.expectError(bad, validateResponse(reply(other, .no_error), sent, .a, false));
-    try validateResponse(reply(other, .refused), sent, .a, true);
-}
-
-test "validateResponse accepts a question-less error reply but rejects question-less NOERROR" {
-    // RFC 9619: error rcodes may omit the question; NOERROR may not. An error
-    // reply with QDCOUNT=0 thus passes here with empty questions — every
-    // question-echo check must gate on questions.len==1 before indexing questions[0].
-    const qname = Name{ .labels = &.{ "example", "com" } };
-    const base_flags = Header.Flags{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = true, .z = 0, .ad = false, .cd = false, .rcode = .refused };
-
-    const refused_no_question = Message{
-        .header = .{ .id = 0, .flags = base_flags },
-        .questions = &.{},
-    };
-    try validateResponse(refused_no_question, qname, .a, true);
-
-    var noerror_no_question = refused_no_question;
-    noerror_no_question.header.flags.rcode = .no_error;
-    try std.testing.expectError(error.FormatError, validateResponse(noerror_no_question, qname, .a, true));
+    try validateResponse(reply(&.{sent}, .no_error), sent, .a, true);
+    try validateResponse(reply(&.{lower}, .no_error), sent, .a, false);
+    try std.testing.expectError(bad, validateResponse(reply(&.{lower}, .refused), sent, .a, true));
+    try std.testing.expectError(bad, validateResponse(reply(&.{other}, .refused), sent, .a, false));
+    try std.testing.expectError(bad, validateResponse(reply(&.{}, .format_error), sent, .a, false));
+    try std.testing.expectError(bad, validateResponse(reply(&.{ sent, sent }, .refused), sent, .a, true));
+    var notify = reply(&.{sent}, .no_error);
+    notify.header.flags.opcode = @fromBackingInt(4);
+    try std.testing.expectError(bad, validateResponse(notify, sent, .a, true));
 }
 
 fn freeName(allocator: Allocator, name: Name) void {

@@ -133,8 +133,8 @@ pub const Sim = struct {
         flags.qr = true;
         flags.rd = query.header.flags.rd;
         var question = q;
-        switch (entry.qname_case) {
-            .copy => {},
+        switch (entry.echo) {
+            .copy, .none => {},
             .lower => question.name = try dns.cloneNameLower(s.arena, q.name),
             .upper => {
                 question.name = try dns.cloneNameFlat(s.arena, q.name, false);
@@ -143,7 +143,7 @@ pub const Sim = struct {
                 };
             },
         }
-        const questions = try s.arena.dupe(dns.Question, &.{question});
+        const questions: []const dns.Question = if (entry.echo == .none) &.{} else try s.arena.dupe(dns.Question, &.{question});
         const msg: dns.Message = .{
             .header = .{ .id = query.header.id, .flags = flags },
             .questions = questions,

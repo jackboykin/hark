@@ -71,10 +71,10 @@ MATCH_VALID_FLAGS = frozenset({
 
 # ADJUST directive: dnspython's make_response already copies the ID, so
 # copy_id is a no-op; copy_query echoes the query's QUESTION section.
-# `force_lower_qname` / `force_upper_qname` opt the response out of the
-# verbatim-echo default and recase the question name, to test hark's 0x20
-# echo verification.
-ADJUST_VALID_FLAGS = frozenset({"copy_id", "copy_query", "force_lower_qname", "force_upper_qname", "drop", "unsigned"})
+ADJUST_VALID_FLAGS = frozenset({
+    "copy_id", "copy_query", "force_lower_qname", "force_upper_qname",
+    "drop_question", "drop", "unsigned",
+})
 
 # Section names → dnspython section indices via parse helper. QUERY_LOG is a
 # hark-only section used inside CHECK_QUERY_LOG entries; lines are
@@ -439,9 +439,6 @@ class _Parser:
                 self._validate_flags(flags, MATCH_VALID_FLAGS, "MATCH")
                 entry.match.update(flags)
             elif head == "ADJUST":
-                # `copy_id` / `copy_query` are implicit in `make_response`
-                # + the verbatim-echo default; only the recasing flags are
-                # acted on by the responder.
                 flags = [t.lower() for t in tokens[1:]]
                 self._validate_flags(flags, ADJUST_VALID_FLAGS, "ADJUST")
                 entry.adjust.update(flags)
