@@ -24,7 +24,9 @@ root-hints = []               # override IANA roots ("ip" or "ip:port");
                               # empty = compiled-in defaults
 
 [cache]
-size = 12582912               # answer cache, bytes
+size = 12582912               # answer cache, bytes; resolutions in flight may hold
+                              # as much again (counted bytes; about 3-4x that in RSS),
+                              # past which only what is known is served
 prefetch = false              # refresh popular entries before they expire
 serve-stale-ttl = 0           # serve expired answers for N seconds
 min-ttl = 0                   # floor for very short TTLs

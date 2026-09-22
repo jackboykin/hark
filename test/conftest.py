@@ -124,7 +124,7 @@ def run_scenario(path: Path, lift: bool = False) -> None:
 
 
 @contextlib.contextmanager
-def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | None = None):
+def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | None = None, cache_size: int | None = None):
     """Responder + hark wired for `scenario`; yields `(resp, proc)`.
 
     Shared by the .rpl step-runner and python tests that drive their own
@@ -142,6 +142,7 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
         listen_port=HARK_LISTEN[1],
         upstream_port=RESP_PORT,
         root_hints=hinted,
+        cache_size=cache_size,
     )
     if scenario.qname_minimization is not None:
         cfg.qname_minimization = scenario.qname_minimization

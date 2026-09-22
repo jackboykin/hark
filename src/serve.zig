@@ -102,6 +102,8 @@ const Timer = struct {
     }
 };
 
+const Tenant = struct { slot: u32, gen: u32 };
+
 const Server = struct {
     gpa: Allocator,
     cfg: *const config.ServerConfig,
@@ -112,8 +114,11 @@ const Server = struct {
     pending: std.ArrayList(Pending) = .empty,
     vacant: std.ArrayList(u32) = .empty,
     parked: u32 = 0,
+    /// Ever parked: a wake counts its misses by it, since `reap` may unpark mid-wake.
+    parks: u64 = 0,
     /// By cell id, the first slot parked on it.
     heads: std.ArrayList(u32) = .empty,
+    late: std.Deque(Tenant) = .empty,
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
     scratch: std.heap.ArenaAllocator,
@@ -169,9 +174,9 @@ const Server = struct {
     /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t) !void {
         var buf: [udp_recv_max]u8 = undefined;
-        const parked = s.parked;
+        const parks = s.parks;
         for (0..udp_per_wake) |_| {
-            if (s.parked - parked == udp_misses_per_wake) return;
+            if (s.parks - parks == udp_misses_per_wake) return;
             var pa: na.PosixAddress = undefined;
             var len: posix.socklen_t = @sizeOf(na.PosixAddress);
             const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, &pa.any, &len);
@@ -250,6 +255,7 @@ const Server = struct {
         s.pending.deinit(s.gpa);
         s.vacant.deinit(s.gpa);
         s.heads.deinit(s.gpa);
+        s.late.deinit(s.gpa);
         s.timers.deinit(s.gpa);
         s.desk.deinit();
         s.watched.deinit(s.gpa);
@@ -320,6 +326,7 @@ const Server = struct {
         const asked = try s.desk.asked(arena, q, client);
         // BCP 140 again: turned away is silence on UDP, a close on TCP. Past
         // `max_in_flight` parked clients only what is known is served.
+        if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
         const wait = s.parked < s.g.cfg.max_in_flight;
         const root = try s.g.demandRoot(asked.name, asked.qtype, wait) orelse return if (reply == .tcp) s.drop(reply.tcp);
         try s.g.drain();
@@ -333,7 +340,7 @@ const Server = struct {
                 try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
-            p.wire = try s.gpa.dupe(u8, wire);
+            p.wire = try s.g.work.allocator().dupe(u8, wire);
         }
         try s.hold(p);
     }
@@ -352,6 +359,7 @@ const Server = struct {
         s.pending.items[i] = p;
         s.pending.items[i].gen = gen;
         s.parked += 1;
+        s.parks += 1;
         s.link(i);
         // Its capacity is reserved above.
         s.schedule(i) catch unreachable;
@@ -377,7 +385,7 @@ const Server = struct {
                 try s.ready(t.slot);
                 continue;
             }
-            if (try s.impatient(p) or s.gone(p.*)) {
+            if (try s.impatient(p) or try s.gone(t.slot)) {
                 s.unpark(t.slot);
                 s.vacate(t.slot);
             } else try s.schedule(t.slot);
@@ -459,11 +467,39 @@ const Server = struct {
     }
 
     /// Past its timeout a UDP client lets go, unless it alone holds the
-    /// resolution: the outcome is still wanted for the next ask.
-    fn gone(s: *Server, p: Pending) bool {
-        if (p.reply != .udp or s.e.now_ns < timeout(p) or s.g.cell(p.a orelse p.root).holds == 1) return false;
+    /// resolution: the outcome is still wanted for the next ask, while
+    /// there is room for it (`reap`).
+    fn gone(s: *Server, i: u32) !bool {
+        const p = s.pending.items[i];
+        if (p.reply != .udp or s.e.now_ns < timeout(p)) return false;
+        if (s.g.cell(p.a orelse p.root).holds == 1) {
+            // Each is done within its resolution's deadline: the front goes stale first.
+            while (s.late.front()) |l| if (s.parkedAs(l) == null) {
+                _ = s.late.popFront();
+            } else break;
+            try s.late.pushBack(s.gpa, .{ .slot = i, .gen = p.gen });
+            return false;
+        }
         s.g.stats.clients.late += 1;
         return true;
+    }
+
+    /// Over the work ceiling, the late clients `gone` kept let go, oldest
+    /// first, until it is met: their resolutions end as orphans. Nothing
+    /// failed, so nothing is noted.
+    fn reap(s: *Server) void {
+        while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
+            const l = s.late.popFront() orelse return;
+            const i = s.parkedAs(l) orelse continue;
+            s.g.stats.clients.reaped += 1;
+            s.unpark(i);
+            s.vacate(i);
+        }
+    }
+
+    fn parkedAs(s: *Server, l: Tenant) ?u32 {
+        const p = s.pending.items[l.slot];
+        return if (p.live and p.gen == l.gen and !p.echoed) l.slot else null;
     }
 
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
@@ -528,7 +564,7 @@ const Server = struct {
     fn release(s: *Server, p: Pending) void {
         s.g.unhold(p.root);
         if (p.a) |a| s.g.unhold(a);
-        s.gpa.free(p.wire);
+        s.g.work.allocator().free(p.wire);
     }
 
     fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {
@@ -661,6 +697,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .prefetch = cfg.prefetch,
         .max_in_flight = cfg.max_in_flight,
         .max_flights = flightShare(),
+        .max_work_bytes = cfg.cache_size,
         .trace = trace,
     }, e.edge());
     defer g.deinit();
@@ -722,8 +759,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.keys, r.refused,

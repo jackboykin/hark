@@ -27,6 +27,7 @@ class HarkConfig:
     qname_minimization: bool = True
     dnssec: bool = False
     cache_min_ttl: int = 0
+    cache_size: int | None = None
     serve_stale_ttl: int = 0
     prefetch: bool = False
     minimal_responses: bool = True
@@ -97,6 +98,8 @@ class HarkConfig:
             anchors = ", ".join(f'"{a}"' for a in self.trust_anchors)
             lines.append(f"trust-anchors = [{anchors}]")
         cache = [f"min-ttl = {self.cache_min_ttl}"] if self.cache_min_ttl else []
+        if self.cache_size is not None:
+            cache.append(f"size = {self.cache_size}")
         if self.serve_stale_ttl:
             cache.append(f"serve-stale-ttl = {self.serve_stale_ttl}")
         if self.prefetch:

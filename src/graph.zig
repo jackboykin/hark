@@ -116,6 +116,7 @@ pub const Config = struct {
     /// Resolutions, or exchanges, in flight at once; a client past either is turned away.
     max_in_flight: u32 = 1024,
     max_flights: u32 = std.math.maxInt(u32),
+    max_work_bytes: usize = std.math.maxInt(usize),
     max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     /// The first window a failure is remembered: by the server per
@@ -227,7 +228,8 @@ pub const Value = union(Kind) {
 };
 
 /// Bytes held by work in progress, counted where they are allocated: cell
-/// arenas by the chunk, budgets, the edge's TCP buffers.
+/// arenas by the chunk, budgets, the edge's TCP buffers, the query bytes
+/// of clients waiting.
 pub const Work = struct {
     child: Allocator,
     bytes: usize = 0,
@@ -282,7 +284,7 @@ pub const Budget = struct {
 
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
-    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, echoed: u64 = 0, echo_ms: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
+    clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, reaped: u64 = 0, echoed: u64 = 0, echo_ms: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
     resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, unsent: u64 = 0, retry: u64 = 0, refresh: u64 = 0, keys: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
@@ -504,7 +506,7 @@ pub const Graph = struct {
     }
 
     /// Held for the client until `unhold`. Null: new work past
-    /// `max_in_flight` or `max_flights`, or anything unsettled for a caller
+    /// `max_in_flight`, `max_flights` or `max_work_bytes`, or anything unsettled for a caller
     /// that cannot `wait`.
     pub fn demandRoot(g: *Graph, name: dns.Name, qtype: dns.RType, wait: bool) !?CellId {
         var kb: KeyBuf = undefined;
@@ -517,7 +519,7 @@ pub const Graph = struct {
             g.cell(id).holds += 1;
             return id;
         };
-        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights) {
+        if (!wait or g.budgets >= g.cfg.max_in_flight or g.flights >= g.cfg.max_in_flight or g.flights >= g.cfg.max_flights or g.work.bytes >= g.cfg.max_work_bytes) {
             g.stats.clients.dropped += 1;
             return null;
         }
@@ -554,7 +556,7 @@ pub const Graph = struct {
     pub fn refresh(g: *Graph, key: Key, name: dns.Name) !void {
         const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
         if (g.index.contains(rkey)) return;
-        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_flights / 2) {
+        if (g.budgets >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_in_flight / 2 or g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.refused += 1;
             return;
         }
