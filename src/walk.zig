@@ -3,7 +3,6 @@
 //! the chain of trust is trust.zig's.
 const std = @import("std");
 const mem = std.mem;
-const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const delegation = @import("delegation.zig");
