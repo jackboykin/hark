@@ -733,22 +733,47 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_len
     em[0] = 0x00;
 }
 
-/// Verify an ECDSA signature (P-256 or P-384) given raw x||y key and r||s signature.
-fn verifyEcdsa(comptime Curve: type, signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
-    const key_len = Curve.PublicKey.uncompressed_sec1_encoded_length - 1;
-    if (key_data.len != key_len) return error.InvalidKey;
-    if (signature.len != key_len) return error.InvalidSignature;
+/// Verify an ECDSA signature (RFC 6605: raw x||y key, r||s signature) per
+/// FIPS 186-5 §6.4.2. std's Verifier computes u1·G and u2·Q separately and
+/// normalises the sum to affine; one double-base multiplication shares the
+/// doublings, and comparing r·Z against the projective X skips the inversion.
+fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
+    const Curve = Ecdsa.Curve;
+    const Scalar = Curve.scalar.Scalar;
+    const len = Curve.scalar.encoded_length;
+    if (key_data.len != 2 * len) return error.InvalidKey;
+    if (signature.len != 2 * len) return error.InvalidSignature;
 
-    // Prepend 0x04 for SEC1 uncompressed format
-    var sec1_key: [1 + key_len]u8 = undefined;
-    sec1_key[0] = 0x04;
-    @memcpy(sec1_key[1..], key_data);
+    var sec1: [1 + 2 * len]u8 = undefined;
+    sec1[0] = 0x04;
+    @memcpy(sec1[1..], key_data);
+    const q = Curve.fromSec1(&sec1) catch return error.InvalidKey;
 
-    const pub_key = Curve.PublicKey.fromSec1(&sec1_key) catch return error.InvalidKey;
-    const sig = Curve.Signature.fromBytes(signature[0..key_len].*);
-    var verifier = sig.verifier(pub_key) catch return error.InvalidSignature;
-    data.feed(&verifier);
-    verifier.verify() catch return error.InvalidSignature;
+    const r_bytes = signature[0..len].*;
+    const r = Scalar.fromBytes(r_bytes, .big) catch return error.InvalidSignature;
+    const s = Scalar.fromBytes(signature[len..][0..len].*, .big) catch return error.InvalidSignature;
+    if (r.isZero() or s.isZero()) return error.InvalidSignature;
+
+    var wide: [64]u8 = @splat(0);
+    var hash = Ecdsa.Hash.init(.{});
+    data.feed(&hash);
+    hash.final(wide[64 - Ecdsa.Hash.digest_length ..]);
+    const e = Scalar.fromBytes64(wide, .big);
+
+    const w = s.invert();
+    const point = Curve.mulDoubleBasePublic(Curve.basePoint, e.mul(w).toBytes(.little), q, r.mul(w).toBytes(.little), .little) catch
+        return error.InvalidSignature;
+
+    // x = X/Z lies in [0, p) and must equal r mod n: x is r, or r + n when that is below p.
+    const r_fe = Curve.Fe.fromBytes(r_bytes, .big) catch unreachable; // r < n < p
+    if (point.x.equivalent(r_fe.mul(point.z))) return;
+    const Int = @Int(.unsigned, 8 * len);
+    const n = Curve.scalar.field_order;
+    if (mem.readInt(Int, &r_bytes, .big) < Curve.Fe.field_order - n) {
+        const n_fe = comptime Curve.Fe.fromInt(n) catch unreachable;
+        if (point.x.equivalent(r_fe.add(n_fe).mul(point.z))) return;
+    }
+    return error.InvalidSignature;
 }
 
 fn verifyEd25519(signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
@@ -2103,19 +2128,15 @@ test "buildSignedData reconstructs wildcard owner name" {
     try testing.expectEqualSlices(u8, expected_wc_owner, signed[rr_start..][0..expected_wc_owner.len]);
 }
 
-test "ECDSA P-256 signature verification" {
-    const key_pair = EcdsaP256.KeyPair.generate(testing.io);
-    const pub_bytes = key_pair.public_key.toUncompressedSec1();
-    // DNSSEC key is raw 64-byte x||y (without 0x04 prefix)
-    const dnssec_key = pub_bytes[1..65];
-
+test "ECDSA P-384 signature verification" {
+    // The sim signs only P-256; this is P-384's one gate.
+    const key_pair = EcdsaP384.KeyPair.generate(testing.io);
+    const dnssec_key = key_pair.public_key.toUncompressedSec1()[1..];
     const msg = "test DNSSEC signed data";
-    const sig = try key_pair.sign(msg, null);
-    const sig_bytes = sig.toBytes();
+    const sig = (try key_pair.sign(msg, null)).toBytes();
 
-    try verifyEcdsa(EcdsaP256, &sig_bytes, &SignedData.raw(msg), dnssec_key);
-
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, &sig_bytes, &SignedData.raw("wrong data"), dnssec_key));
+    try verifyEcdsa(EcdsaP384, &sig, &SignedData.raw(msg), dnssec_key);
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &SignedData.raw("wrong data"), dnssec_key));
 }
 
 test "Ed25519 signature verification" {
@@ -2241,6 +2262,19 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
     signature[100] ^= 1;
     rrsig.signer_name = test_com;
     try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget));
+}
+
+test "ECDSA P-256 accepts x(R) at or above the group order" {
+    // Wycheproof ecdsa_secp256r1_sha256 "minimal R length": x(R) = r + n,
+    // a branch honest signers reach about once in 2^129.
+    var key: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&key, "0ad99500288d466940031d72a9f5445a4d43784640855bf0a69874d2de5fe103c5011e6ef2c42dcd50d5d3d29f99ae6eba2c80c9244f4c5422f0979ff0c3ba5e");
+    var sig: [64]u8 = @splat(0);
+    _ = try std.fmt.hexToBytes(sig[16..32], "4319055358e8617b0c46353d039cdaab");
+    _ = try std.fmt.hexToBytes(sig[32..], "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254e");
+
+    try verifyEcdsa(EcdsaP256, &sig, &SignedData.raw("123400"), &key);
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, &sig, &SignedData.raw("123401"), &key));
 }
 
 test "invalid key sizes are rejected" {
