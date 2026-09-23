@@ -1021,6 +1021,12 @@ pub const Graph = struct {
         g.budgets -= 1;
     }
 
+    /// Orphaned, or the payer's deadline or query budget spent: the
+    /// asker's reasons, never the servers'.
+    pub fn stopped(g: *const Graph, by: CellId) bool {
+        return g.cells.items[by].orphan or g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
+    }
+
     pub fn spent(g: *const Graph, b: *const Budget) bool {
         return g.now() >= b.deadline_ns or b.queries >= g.cfg.max_queries or b.validation.exhausted();
     }
@@ -1161,7 +1167,7 @@ pub const Graph = struct {
     pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
         std.debug.assert(case == .random or transport == .tcp);
         const budget = g.payer;
-        if (g.cell(by).orphan or g.now() >= budget.deadline_ns or budget.queries >= g.cfg.max_queries) {
+        if (g.stopped(by)) {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
                 std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, if (g.cell(by).orphan) "orphan" else if (g.now() >= budget.deadline_ns) "past the deadline" else "query budget spent" });
