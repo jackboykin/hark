@@ -7,7 +7,8 @@ const std = @import("std");
 const testing = std.testing;
 const Smith = testing.Smith;
 const dns = @import("dns.zig");
-const dnssec = @import("dnssec.zig");
+const proof = @import("proof.zig");
+const rrsig = @import("rrsig.zig");
 
 const apex = "example";
 const alphabet = [_][]const u8{ "a", "b", "*", "A" };
@@ -150,7 +151,7 @@ const Zone = struct {
     /// around it. A circular chain leaves no name out.
     fn relevant(z: *const Zone, name: dns.Name) usize {
         var h: [20]u8 = undefined;
-        if (z.nsec3) h = dnssec.nsec3Hash(name, z.salt[0..z.salt_len], z.iterations) catch unreachable;
+        if (z.nsec3) h = proof.nsec3Hash(name, z.salt[0..z.salt_len], z.iterations) catch unreachable;
         for (z.recs[0..z.n_recs], 0..) |rr, i| {
             if (z.nsec3) {
                 const owner = &z.hashes[i];
@@ -158,7 +159,7 @@ const Zone = struct {
                 if (std.mem.eql(u8, owner, &h) or between(std.mem.order(u8, owner, &h), std.mem.order(u8, &h, next), std.mem.order(u8, owner, next))) return i;
             } else {
                 const next = rr.rdata.nsec.next_domain_name;
-                if (rr.name.eql(name) or between(dnssec.canonicalNameOrder(rr.name, name), dnssec.canonicalNameOrder(name, next), dnssec.canonicalNameOrder(rr.name, next))) return i;
+                if (rr.name.eql(name) or between(proof.canonicalNameOrder(rr.name, name), proof.canonicalNameOrder(name, next), proof.canonicalNameOrder(rr.name, next))) return i;
             }
         }
         unreachable;
@@ -255,7 +256,7 @@ fn draw(z: *Zone, s: *Smith) void {
     z.n_recs = 0;
     for (0..z.n) |i| {
         const e = &z.entries[i];
-        if (z.nsec3) ehash[i] = dnssec.nsec3Hash(e.name(), z.salt[0..z.salt_len], z.iterations) catch unreachable;
+        if (z.nsec3) ehash[i] = proof.nsec3Hash(e.name(), z.salt[0..z.salt_len], z.iterations) catch unreachable;
         if (z.omitted(e) or (!z.nsec3 and @as(u8, @bitCast(e.types)) == 0)) continue;
         order[z.n_recs] = i;
         z.n_recs += 1;
@@ -264,7 +265,7 @@ fn draw(z: *Zone, s: *Smith) void {
     std.mem.sort(usize, order[0..z.n_recs], Ctx{ .z = z, .ehash = &ehash }, struct {
         fn lt(c: Ctx, a: usize, b: usize) bool {
             if (c.z.nsec3) return std.mem.order(u8, &c.ehash[a], &c.ehash[b]) == .lt;
-            return dnssec.canonicalNameOrder(c.z.entries[a].name(), c.z.entries[b].name()) == .lt;
+            return proof.canonicalNameOrder(c.z.entries[a].name(), c.z.entries[b].name()) == .lt;
         }
     }.lt);
     for (order[0..z.n_recs], 0..) |i, r| z.hashes[r] = ehash[i];
@@ -358,7 +359,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     const exact = s.boolWeighted(2, 1);
     var mask: [max_chain]bool = undefined;
     var sec: Section = .{};
-    var budget: dnssec.ValidationBudget = .{};
+    var budget: rrsig.ValidationBudget = .{};
 
     var ql: [max_depth + 1][]const u8 = undefined;
     const qname = genName(s, &ql);
@@ -371,7 +372,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     const nc = z.nextCloser(qname);
     var wl: [dns.max_label_count + 1][]const u8 = undefined;
     const wc = dns.makeWildcardName(&wl, ce).?;
-    const v1 = dnssec.validateNegativeProof(auth, qname, qtype, is_nxdomain, zone, &budget);
+    const v1 = proof.validateNegativeProof(auth, qname, qtype, is_nxdomain, zone, &budget);
     errdefer dump(&z, auth, qname, qtype, .{ t, is_nxdomain, exact, v1 });
     switch (v1) {
         .secure => if (t == .positive or t == .referral or (is_nxdomain and t != .nxdomain)) return error.UnsoundDenial,
@@ -389,7 +390,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     // Wildcard expansion: no closer match below the RRSIG's encloser.
     budget = .{};
     const labels: u8 = if (exact) @intCast(ce.labels.len) else s.valueRangeAtMost(u8, 0, @intCast(qname.labels.len));
-    const v2 = dnssec.proveNoCloserMatch(auth, qname, labels, zone, &budget);
+    const v2 = proof.proveNoCloserMatch(auth, qname, labels, zone, &budget);
     errdefer std.debug.print("wildcard labels={d} {t}\n", .{ labels, v2 });
     switch (v2) {
         .secure, .insecure => |v| {
@@ -413,7 +414,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     const ref = sec.pick(&z, s, &mask, exact);
     const e = z.find(child);
     const insecure_delegation = if (e) |x| x.types.delegation() and !x.types.ds else false;
-    const v3 = dnssec.classifyDelegation(ref, child, zone, &budget);
+    const v3 = proof.classifyDelegation(ref, child, zone, &budget);
     errdefer dump(&z, ref, child, .ds, .{ insecure_delegation, v3 });
     switch (v3) {
         .insecure => {

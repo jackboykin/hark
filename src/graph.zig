@@ -15,7 +15,7 @@ const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const delegation = @import("delegation.zig");
-const dnssec = @import("dnssec.zig");
+const rrsig = @import("rrsig.zig");
 const monotonic = @import("monotonic.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
@@ -277,7 +277,7 @@ pub const Budget = struct {
     refresh_ns: i64 = 0,
     unminimised: walk.Unminimised = .{},
     /// KeyTrap: every verify the resolution does, whichever cell does it.
-    validation: dnssec.ValidationBudget = .{},
+    validation: rrsig.ValidationBudget = .{},
 };
 
 /// Cumulative since start; `serve.zig` prints them.
@@ -445,7 +445,7 @@ pub const Graph = struct {
     /// Verified NSEC facts in span order (denial.zig).
     denial: denial.Index = .{},
     /// Signatures already verified, by content: a speedup, never a verdict.
-    verify_memo: dnssec.VerifyMemo = .{},
+    verify_memo: rrsig.VerifyMemo = .{},
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {

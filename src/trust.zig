@@ -4,6 +4,8 @@
 const std = @import("std");
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
+const proof = @import("proof.zig");
+const rrsig = @import("rrsig.zig");
 const graph = @import("graph.zig");
 const denial = @import("denial.zig");
 
@@ -19,7 +21,7 @@ pub const Proof = enum(u8) { secure, insecure };
 pub const Chain = struct {
     status: Proof,
     records: []const RR = &.{},
-    /// `secure` only: where the signatures' validity ends (`rrsigTtlCap`).
+    /// `secure` only: where the signatures' validity ends (`rrsig.ttlCap`).
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
@@ -105,12 +107,12 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const r = rs.state.fact.rrset;
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
-        .nodata, .nxdomain => dnssec.authoritySigner(r.authorities),
+        .nodata, .nxdomain => proof.authoritySigner(r.authorities),
         // A name that is no cut may alias (a hidden-cut probe).
         .alias => return g.fail(id, no_cut),
         .yxdomain => null,
     } orelse return failChain(g, id, s.rrset.?);
-    if (!dnssec.isProperAncestor(signer, zone)) return failChain(g, id, s.rrset.?);
+    if (!proof.isProperAncestor(signer, zone)) return failChain(g, id, s.rrset.?);
     if (s.signer == null) s.signer = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
         return g.fail(id, no_chain);
     const keys = g.cell(s.signer.?);
@@ -127,7 +129,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return failChain(g, id, s.rrset.?);
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
-            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
+            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, rrsig.ttlCap(sig, now))));
         },
         .nodata, .nxdomain => {
             // RFC 4034 §3.1.3.
@@ -136,7 +138,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             var cap: u32 = std.math.maxInt(u32);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
                 return failChain(g, id, s.rrset.?);
-            switch (dnssec.classifyDelegation(r.authorities, zone, signer, budget)) {
+            switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
                 // A proven non-cut, or no proof: the bytes are sound.
                 else => try g.fail(id, no_cut),
@@ -212,7 +214,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget, &g.verify_memo) catch
         return failChain(g, id, s.rrset.?);
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
-    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, dnssec.rrsigTtlCap(sig, now))));
+    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, rrsig.ttlCap(sig, now))));
 }
 
 /// The judgement of one rrset version; a fresh cell per version, since
@@ -318,10 +320,10 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 expires = @min(expires, kc.expires_ns);
                 const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                     return failBogus(g, id, s.target);
-                cap = @min(cap, dnssec.rrsigTtlCap(verified, now));
-                if (verified.labels < dnssec.signedLabels(rr.name)) {
+                cap = @min(cap, rrsig.ttlCap(verified, now));
+                if (verified.labels < rrsig.signedLabels(rr.name)) {
                     if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return failBogus(g, id, s.target);
-                    switch (dnssec.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget)) {
+                    switch (proof.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget)) {
                         .secure => {},
                         .insecure => status = .insecure,
                         .bogus, .unchecked => return failBogus(g, id, s.target),
@@ -331,7 +333,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             try g.settle(id, .{ .secure = .{ .status = status, .proven_until_ns = if (status == .secure) capExpiry(g, cap) else std.math.maxInt(i64) } }, @min(expires, capExpiry(g, cap)));
         },
         .nodata, .nxdomain => {
-            const signer = dnssec.authoritySigner(r.authorities) orelse return failBogus(g, id, s.target);
+            const signer = proof.authoritySigner(r.authorities) orelse return failBogus(g, id, s.target);
             if (s.keys[0] == null) s.keys[0] = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
                 return g.fail(id, no_chain);
             const kc = g.cell(s.keys[0].?);
@@ -342,7 +344,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             if (kc.state.fact.dnskey.status != .secure) return failBogus(g, id, s.target);
             expires = @min(expires, kc.expires_ns);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return failBogus(g, id, s.target);
-            switch (dnssec.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
+            switch (proof.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
                 .secure => {
                     expires = @min(expires, capExpiry(g, cap));
                     try denial.absorb(g, id, signer, r, expires);

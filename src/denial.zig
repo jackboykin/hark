@@ -7,7 +7,7 @@
 //! from the store fails closed.
 const std = @import("std");
 const dns = @import("dns.zig");
-const dnssec = @import("dnssec.zig");
+const proof = @import("proof.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
 
@@ -55,7 +55,7 @@ const Zone = struct {
         var hi: usize = z.spans.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (dnssec.canonicalNameOrder(z.spans.items[mid].owner, name) == .lt) lo = mid + 1 else hi = mid;
+            if (proof.canonicalNameOrder(z.spans.items[mid].owner, name) == .lt) lo = mid + 1 else hi = mid;
         }
         return lo;
     }
@@ -75,7 +75,7 @@ const Zone = struct {
         const pos = z.position(name);
         for ([_]usize{ if (pos > 0) pos - 1 else n - 1, n - 1 }) |i| {
             const sp = &z.spans.items[i];
-            if (sp.expires_ns > g.now() and dnssec.nsecCovers(sp.owner, sp.nsec, name)) return sp;
+            if (sp.expires_ns > g.now() and proof.nsecCovers(sp.owner, sp.nsec, name)) return sp;
         }
         return null;
     }
@@ -205,8 +205,8 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     var nxdomain = false;
     if (z.span(g, name)) |cover| {
         proofs[0] = cover;
-        if (dnssec.nsecProvesNameNonexistence(cover.owner, cover.nsec, name)) {
-            const ce = dnssec.closestEncloser(name, cover.owner, cover.nsec.next_domain_name) orelse return false;
+        if (proof.nsecProvesNameNonexistence(cover.owner, cover.nsec, name)) {
+            const ce = proof.closestEncloser(name, cover.owner, cover.nsec.next_domain_name) orelse return false;
             var wc_buf: [dns.max_label_count + 1][]const u8 = undefined;
             const wildcard = dns.makeWildcardName(&wc_buf, ce) orelse return false;
             if (z.exact(g, wildcard)) |wc| {
@@ -228,7 +228,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
     }
     const budget = &g.payer.validation;
-    if (dnssec.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, budget) != .secure) return false;
+    if (proof.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, budget) != .secure) return false;
 
     var reply: graph.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,

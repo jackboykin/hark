@@ -3090,3 +3090,12 @@ test "parseMessage handles OOM at every allocation without leaking" {
     var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(backing.allocator(), parseMessageOomProbe, .{wire});
 }
+
+test "base32hex decode ignores case and refuses characters outside the alphabet" {
+    var buf1: [20]u8 = undefined;
+    var buf2: [20]u8 = undefined;
+    const n1 = try base32HexDecode(&buf1, "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM");
+    const n2 = try base32HexDecode(&buf2, "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
+    try testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
+    try testing.expectError(error.InvalidBase32, base32HexDecode(&buf1, "INVALID!CHARS@@@@@@@@@@@@@@@@@@@!"));
+}

@@ -8,6 +8,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("../dns.zig");
 const dnssec = @import("../dnssec.zig");
+const rrsig = @import("../rrsig.zig");
 const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 
@@ -31,7 +32,7 @@ pub const Key = struct {
         // RFC 6605 §4: the uncompressed point without its 0x04 prefix.
         const sec1 = pair.public_key.toUncompressedSec1();
         const dnskey: dns.DnskeyData = .{ .flags = 256, .protocol = 3, .algorithm = .ecdsap256sha256, .public_key = try arena.dupe(u8, sec1[1..]) };
-        const tag = dnssec.keyTag(dnskey);
+        const tag = rrsig.keyTag(dnskey);
         return .{
             .zone = zone,
             .pair = pair,
@@ -121,7 +122,7 @@ pub const Signer = struct {
             var covered = false;
             for (originals) |o| covered = covered or (o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype);
             if (covered) continue;
-            var set: [dnssec.SignedData.max_entries]RR = undefined;
+            var set: [rrsig.SignedData.max_entries]RR = undefined;
             var n: usize = 0;
             for (originals) |rr| if (rr.rtype == head.rtype and rr.name.eql(head.name)) {
                 set[n] = rr;
@@ -168,7 +169,7 @@ pub const Signer = struct {
         var sig: dns.RrsigData = .{
             .type_covered = head.rtype,
             .algorithm = .ecdsap256sha256,
-            .labels = @intCast(dnssec.signedLabels(wildcard orelse head.name)),
+            .labels = @intCast(rrsig.signedLabels(wildcard orelse head.name)),
             .original_ttl = head.ttl,
             .sig_expiration = @intCast(self.now + 365 * 86400),
             .sig_inception = @intCast(self.now - 86400),
@@ -177,7 +178,7 @@ pub const Signer = struct {
             .signature = &.{},
         };
         var buf: [8192]u8 = undefined;
-        const data = try dnssec.buildSignedData(&buf, sig, set);
+        const data = try rrsig.buildSignedData(&buf, sig, set);
         var s = try key.pair.signer(null);
         data.feed(&s);
         sig.signature = try self.arena.dupe(u8, &(try s.finalize()).toBytes());
@@ -216,8 +217,8 @@ test "what the signer mints, the validator accepts" {
     const sig = try signer.sign(&signer.keys[1], &.{a}, null);
     const dnskey: RR = .{ .name = zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = signer.keys[1].dnskey } };
     const keysig = try signer.sign(&signer.keys[1], &.{dnskey}, null);
-    var budget: dnssec.ValidationBudget = .{};
-    var memo: dnssec.VerifyMemo = .{};
+    var budget: rrsig.ValidationBudget = .{};
+    var memo: rrsig.VerifyMemo = .{};
     try std.testing.expect(dnssec.validateRrset(&.{ a, sig }, owner, .a, &.{dnskey}, 1_800_000_000, &budget, &memo) != null);
     _ = try dnssec.validateDnskeyRrset(&.{ dnskey, keysig }, &.{signer.keys[1].ds}, zone, 1_800_000_000, &budget, &memo);
     // Same seed, same key: the query log stays reproducible.
