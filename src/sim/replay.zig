@@ -201,18 +201,19 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
         .graph => try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null),
     };
     defer served.release(&g.store);
-    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, rb, served)), .cacheable = served.cacheable };
+    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, entry.do_bit or entry.edns, rb, served)), .cacheable = served.cacheable };
 }
 
-/// The bytes serve would send `client` for `served`, bar the query id and OPT.
-fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, rb: *const rebinding.Config, served: answer.Served) ![]const u8 {
+/// The bytes serve would send `client` for `served`, bar the query id.
+fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, rb: *const rebinding.Config, served: answer.Served) ![]const u8 {
     const ctx: response.ResponseContext = .{
         .query_id = 0,
         .opcode = .query,
         .rd = client.rd,
         .cd = client.cd,
         .questions = try arena.dupe(dns.Question, &.{q}),
-        .client_edns = false,
+        .client_edns = edns,
+        .ede = served.ede,
         .client_do = client.do_bit,
         .client_wants_ad = client.do_bit or client.ad,
         .max_udp_payload = dns.max_message_len,
@@ -229,8 +230,8 @@ fn agrees(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.S
     const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return error.RecallDisagrees;
     defer built.release(&g.store);
     if (s.log.items.len != before) return error.RecallDisagrees;
-    const a = try wireOf(arena, q, client, rb, recalled);
-    const b = try wireOf(arena, q, client, rb, built);
+    const a = try wireOf(arena, q, client, false, rb, recalled);
+    const b = try wireOf(arena, q, client, false, rb, built);
     const ede_eq = if (recalled.ede) |x| if (built.ede) |y| x.code == y.code and mem.eql(u8, x.text, y.text) else false else built.ede == null;
     if (!mem.eql(u8, a, b) or !ede_eq) return error.RecallDisagrees;
 }
@@ -321,6 +322,12 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, compare_ttl: bool) ?[]const
     if (m.answer and !sectionEql(actual.answers, e.answers, m.ttl)) return "ANSWER mismatch";
     if (m.authority and !sectionEql(actual.authorities, e.authorities, m.ttl)) return "AUTHORITY mismatch";
     if (m.additional and !sectionEql(actual.additionals, e.additionals, m.ttl)) return "ADDITIONAL mismatch";
+    if (e.ede) |want| {
+        const opt = actual.opt orelse return "EDE mismatch";
+        for (opt.options) |o| {
+            if (o.code == dns.edns_opt_ede and o.data.len >= 2 and mem.readInt(u16, o.data[0..2], .big) == want) break;
+        } else return "EDE mismatch";
+    }
     return null;
 }
 
