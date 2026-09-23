@@ -1,5 +1,5 @@
-//! The delegation walk: how a cut, an NS set, a host's addresses, an
-//! RRset and a client's answer settle. Rules over the model in graph.zig;
+//! The delegation walk: how a cut, a host's addresses, an RRset
+//! and a client's answer settle. Rules over the model in graph.zig;
 //! the chain of trust is trust.zig's.
 const std = @import("std");
 const mem = std.mem;
@@ -38,8 +38,8 @@ pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport,
 /// last or when it ended; what a reply leaves in flight records on its own.
 pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
-    /// `ns(zone)`, held: a TTL-0 set answers this ask once, not a re-probe per pass.
-    ns: ?CellId = null,
+    /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
+    cut: ?CellId = null,
     have_servers: bool = false,
     /// Every address gathered so far; a later gather appends what is new.
     servers: [max_servers]na.AddressKey = undefined,
@@ -191,10 +191,6 @@ pub const AddrScratch = struct {
     aaaa: ?CellId = null,
     judge_a: ?CellId = null,
     judge_aaaa: ?CellId = null,
-};
-
-pub const NsScratch = struct {
-    cut: ?CellId = null,
 };
 
 pub const AnswerScratch = struct {
@@ -409,24 +405,6 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
         if (f.value.rrset.kind == .nxdomain) return f.expires_ns;
     }
     return null;
-}
-
-/// `ns(zone)`: only a parent referral settles it. Demanding an
-/// unsettled one re-probes the cut, whose referral publishes both.
-pub fn runNs(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
-    const zone = g.cell(id).name;
-    const s = g.cell(id).scratch.ns;
-    if (s.cut == null) s.cut = try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse
-        return g.fail(id, unreachable_authority);
-    const cut = g.cell(s.cut.?);
-    if (!cut.settled()) return;
-    // A cut at `zone` means the referral published us already; a
-    // shallower one means no delegation here while it holds.
-    if (g.cell(id).settled()) return;
-    if (cut.failure()) |why| return g.fail(id, why);
-    if (cut.state.fact.cut.zone.eql(zone)) return g.fail(id, unreachable_authority);
-    try g.settle(id, .{ .ns = .{ .names = &.{} } }, cut.expires_ns);
 }
 
 /// `addr(host)`: glue seeds it provisionally (`absorbReferral`); else
@@ -659,7 +637,7 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     return .{ .kind = .yxdomain, .rcode = .yx_domain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
-/// Publish the child's cut, NS set and glue, and return the cut. The
+/// Publish the child's cut with its NS names and glue, and return it. The
 /// delegation never outlives the referring zone's: that is a ghost (Jiang
 /// et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !Graph.Fact {
@@ -676,9 +654,8 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     const glue = try g.scratch.allocator().alloc(graph.Glue, ref.addr_count);
     for (glue, ref.addrs[0..ref.addr_count], ref.ttls[0..ref.addr_count]) |*gl, a, ttl|
         gl.* = .{ .addr = a, .expires_ns = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s) };
-    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .glue = glue } };
+    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .names = names, .glue = glue } };
     try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), by, cut, expires);
-    try g.publish(Key.of(&kb, .ns, ref.zone_cut, .a), by, .{ .ns = .{ .names = names } }, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
@@ -942,14 +919,15 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     if (zone.labels.len == 0) {
         for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
     } else {
-        if (a.ns == null) a.ns = try g.demand(id, Key.of(&kb, .ns, zone, .a), zone) orelse return .none;
-        const ns = g.cell(a.ns.?);
-        if (!ns.settled()) return .pending;
-        if (ns.failure()) |why| {
+        if (a.cut == null) a.cut = try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none;
+        const cut = g.cell(a.cut.?);
+        if (!cut.settled()) return .pending;
+        if (cut.failure()) |why| {
             a.local = a.local or why.local;
             return .none;
         }
-        const names = ns.state.fact.ns.names;
+        // A shallower cut: no delegation here while it holds.
+        const names = if (cut.state.fact.cut.zone.eql(zone)) cut.state.fact.cut.names else &.{};
         var unknown: std.ArrayList(dns.Name) = .empty;
         defer unknown.deinit(g.gpa);
         var pending = false;

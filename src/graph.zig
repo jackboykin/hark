@@ -1,7 +1,8 @@
 //! The resolver as a graph of typed DNS facts.
 //!
-//! A cell is a fact with a TTL: a zone cut, an NS set, a host's addresses,
-//! an RRset, or one exchange with a server; or a failure, which is none.
+//! A cell is a fact with a TTL: a zone cut with its NS names, a host's
+//! addresses, an RRset, or one exchange with a server; or a failure, which
+//! is none.
 //! A rule settles a cell kind; it runs when the cell is first demanded and
 //! again whenever an input settles.
 //! Rules are pure over their inputs, scratch, now and rng; the exchange cell
@@ -70,7 +71,7 @@ pub const Edge = struct {
 
 /// `refresh`: `answer` derived again for the store; nobody waits.
 /// `keys`: a signed zone's `dnskey` fetched while the walk descends.
-pub const Kind = enum(u8) { cut, ns, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, keys };
+pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, keys };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -133,6 +134,8 @@ pub const Config = struct {
 /// The zone cut above a name, as learned from the parent's servers.
 pub const Cut = struct {
     zone: dns.Name,
+    /// `zone`'s, from a referral. None at the root: hints carry addresses.
+    names: []const dns.Name = &.{},
     /// The referral's glue, asked before the addr cells.
     glue: []const Glue = &.{},
 };
@@ -147,10 +150,6 @@ pub const Glue = struct {
         return gl.expires_ns >= now_ns;
     }
 };
-
-/// NS names from the parent referral. The root has none: hints carry
-/// addresses, not names.
-pub const Ns = struct { names: []const dns.Name };
 
 pub const Addr = struct {
     addrs: []const na.Address,
@@ -215,7 +214,6 @@ pub const Failure = struct {
 
 pub const Value = union(Kind) {
     cut: Cut,
-    ns: Ns,
     addr: Addr,
     rrset: Reply,
     answer: Answer,
@@ -343,7 +341,6 @@ const ExchangeScratch = struct {
 pub const Scratch = union(enum) {
     none,
     cut: *walk.CutScratch,
-    ns: *walk.NsScratch,
     addr: *walk.AddrScratch,
     rrset: *walk.RrsetScratch,
     answer: *walk.AnswerScratch,
@@ -783,7 +780,7 @@ pub const Graph = struct {
         c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
-            .cut, .ns, .addr, .rrset, .ds, .dnskey => {
+            .cut, .addr, .rrset, .ds, .dnskey => {
                 const clock = Tally.clock(&g.tally.store_ns);
                 defer clock.stop();
                 const blob = try g.store.build(value);
@@ -1130,7 +1127,6 @@ pub const Graph = struct {
         switch (g.cell(id).key.kind) {
             .cut => try walk.runCut(g, id),
             .rrset => try walk.runRrset(g, id),
-            .ns => try walk.runNs(g, id),
             .addr => try walk.runAddr(g, id),
             .answer, .refresh => try walk.runAnswer(g, id),
             .ds => try trust.runDs(g, id),

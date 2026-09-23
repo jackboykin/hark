@@ -214,15 +214,13 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
+                try w.int(u16, @intCast(c.names.len));
+                for (c.names) |name| try w.name(name);
                 try w.int(u16, @intCast(c.glue.len));
                 for (c.glue) |gl| {
                     try w.addr(gl.addr);
                     try w.int(i64, gl.expires_ns);
                 }
-            },
-            .ns => |n| {
-                try w.int(u16, @intCast(n.names.len));
-                for (n.names) |name| try w.name(name);
             },
             .addr => |a| {
                 try w.int(u8, @intFromBool(a.provisional));
@@ -262,14 +260,11 @@ pub const Store = struct {
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name(arena);
-                const glue = try arena.alloc(graph.Glue, try r.int(u16));
-                for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
-                break :blk .{ .cut = .{ .zone = zone, .glue = glue } };
-            },
-            .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
                 for (names) |*n| n.* = try r.name(arena);
-                break :blk .{ .ns = .{ .names = names } };
+                const glue = try arena.alloc(graph.Glue, try r.int(u16));
+                for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
+                break :blk .{ .cut = .{ .zone = zone, .names = names, .glue = glue } };
             },
             .addr => blk: {
                 const provisional = try r.int(u8) != 0;
