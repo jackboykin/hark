@@ -1,0 +1,87 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; sim-only: signature math is counted inside the engine; a live run cannot see it
+
+SCENARIO_BEGIN a second name under one wildcard reuses every signature it verified
+
+; Two names expand `*.` and are denied a closer match by one `a. NSEC zz.`,
+; so the second reply carries byte-identical signed data: the `*.` A as
+; signed (RFC 4035 §5.3.2 rebuilds the owner) and the same NSEC. Its
+; validation runs no signature math.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      foo. IN A
+    SECTION ANSWER
+      foo. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      a. 3600 IN NSEC zz. A RRSIG NSEC
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      bar. IN A
+    SECTION ANSWER
+      bar. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      a. 3600 IN NSEC zz. A RRSIG NSEC
+  ENTRY_END
+
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    foo. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    foo. IN A
+  SECTION ANSWER
+    foo. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    bar. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    bar. IN A
+  SECTION ANSWER
+    bar. 3600 IN A 192.0.2.1
+ENTRY_END
+
+; Asked upstream, not synthesised: else nothing here reaches the memo.
+STEP 5 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  SECTION QUERY_LOG
+    bar. A 127.0.10.1
+ENTRY_END
+
+; The root's keys, the `*.` A and the NSEC, each once.
+STEP 6 CHECK_MAX_VERIFIES 3
+
+SCENARIO_END

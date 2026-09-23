@@ -91,8 +91,8 @@ pub const Step = struct {
     entry: ?Entry = null,
     /// TIME_PASSES: seconds to advance.
     seconds: u32 = 0,
-    /// CHECK_MAX_QUERIES: bound on upstream queries so far.
-    max_queries: u32 = 0,
+    /// CHECK_MAX_QUERIES, CHECK_MAX_VERIFIES: the bound so far.
+    bound: u32 = 0,
 
     pub const Kind = enum {
         query,
@@ -100,6 +100,8 @@ pub const Step = struct {
         check_query_log,
         check_out_query,
         check_max_queries,
+        /// Signatures whose math ran, memo hits excluded.
+        check_max_verifies,
         /// Drop the next upstream query as if the authority timed out.
         timeout,
         /// Refuse the next upstream query at the host, as if out of sockets.
@@ -364,10 +366,10 @@ const Parser = struct {
                 return p.fail("TIME_PASSES needs `ELAPSE <n>` or `EVAL \"<n>\"`");
             },
             .timeout, .unsent => return .{ .n = n, .kind = kind },
-            .check_max_queries => {
-                const bound = try p.int(u32, toks.next() orelse return p.fail("CHECK_MAX_QUERIES takes one integer"));
-                if (toks.next() != null) return p.fail("CHECK_MAX_QUERIES takes one integer");
-                return .{ .n = n, .kind = kind, .max_queries = bound };
+            .check_max_queries, .check_max_verifies => {
+                const bound = try p.int(u32, toks.next() orelse return p.fail("CHECK_MAX_* takes one integer"));
+                if (toks.next() != null) return p.fail("CHECK_MAX_* takes one integer");
+                return .{ .n = n, .kind = kind, .bound = bound };
             },
             else => {
                 const line = try p.next();
@@ -894,7 +896,7 @@ test "minimal hark scenario" {
     try testing.expectEqual(3, s.steps[1].entry.?.ede.?);
     try testing.expectEqual(dns.RCode.name_error, s.steps[1].entry.?.flags.rcode);
     try testing.expectEqual(10, s.steps[2].seconds);
-    try testing.expectEqual(7, s.steps[3].max_queries);
+    try testing.expectEqual(7, s.steps[3].bound);
 }
 
 test "unbound prelude is lifted" {

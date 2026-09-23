@@ -113,8 +113,12 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options, rep
                 }
                 cursor += 1;
             },
-            .check_max_queries => if (s.log.items.len > st.max_queries) {
+            .check_max_queries => if (s.log.items.len > st.bound) {
                 report.msg = "CHECK_MAX_QUERIES exceeded";
+                return error.ScenarioFailed;
+            },
+            .check_max_verifies => if (g.verify_memo.misses > st.bound) {
+                report.msg = "CHECK_MAX_VERIFIES exceeded";
                 return error.ScenarioFailed;
             },
             .timeout => cursor += 1,
@@ -538,7 +542,7 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(123, r.parsed);
+    try testing.expectEqual(124, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 
