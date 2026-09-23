@@ -135,9 +135,6 @@ pub const Cut = struct {
     zone: dns.Name,
     /// The referral's glue, asked before the addr cells.
     glue: []const Glue = &.{},
-    /// Only the deepest cut known above the name; whether another lies
-    /// between went unlearned. Never stored.
-    unknown: bool = false,
 };
 
 /// A glue address lives on its own TTL, never past its delegation's.
@@ -212,6 +209,8 @@ pub const Failure = struct {
     /// Something never left the host: the failure is ours, not the zone's,
     /// and is never remembered.
     local: bool = false,
+    /// No probe could place the cut: ask in full from the deepest one known.
+    unplaced: bool = false,
 };
 
 pub const Value = union(Kind) {
@@ -781,7 +780,6 @@ pub const Graph = struct {
             },
             else => {},
         };
-        std.debug.assert(!(value == .cut and value.cut.unknown and expires_ns > g.now()));
         c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
@@ -875,16 +873,29 @@ pub const Graph = struct {
     /// old its evidence, so it is judged again.
     fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
         const live = g.index.get(key);
-        const verdict = key.kind == .ds or key.kind == .dnskey;
-        if (g.store.get(key, g.now())) |e| if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) {
+        if (g.stored(key)) |e| {
             if (live) |id| if (g.cell(id).blob == e.blob) return id;
             return try g.materialise(key, name, e);
-        };
+        }
         if (live) |id| {
             const c = g.cell(id);
             if (!c.settled() or g.serves(id)) return id;
         }
         return null;
+    }
+
+    /// The stored fact `demand` would hand the running rule.
+    fn stored(g: *Graph, key: Key) ?store.Entry {
+        const e = g.store.get(key, g.now()) orelse return null;
+        const verdict = key.kind == .ds or key.kind == .dnskey;
+        return if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) e else null;
+    }
+
+    /// Would `demand` settle `key` for the running rule without running it?
+    pub fn holds(g: *Graph, key: Key) bool {
+        if (g.stored(key) != null) return true;
+        const id = g.index.get(key) orelse return false;
+        return g.cell(id).state == .fact and g.serves(id);
     }
 
     /// A live fact serves the running rule while it outlives the payer's

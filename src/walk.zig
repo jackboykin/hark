@@ -290,15 +290,17 @@ fn refreshable(g: *Graph, s: *const AnswerScratch, expires: i64) bool {
 }
 
 /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's
-/// servers when minimising; a referral is a deeper cut, an answer or a
-/// denial puts the name inside the parent's zone, and anything else leaves
-/// the cut unknown. Only strict ancestors of a question are probed; the
+/// servers; a referral is a deeper cut, an answer or a denial puts the
+/// name inside the parent's zone, silence fails, and any other reply
+/// places no cut. Only strict ancestors of a question are probed; the
 /// question itself goes out as `rrset`.
 pub fn runCut(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     // The axiom, re-derived after eviction.
     if (name.labels.len == 0) return g.settle(id, .{ .cut = .{ .zone = name } }, std.math.maxInt(i64));
+    // Past minimising's reach only a referral places a cut.
+    if (!probeable(g, name)) return g.fail(id, unplaced);
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
     if (s.parent == null) s.parent = try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
@@ -308,7 +310,6 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
     const inside: graph.Value = .{ .cut = .{ .zone = pc.zone } };
-    if (!g.cfg.qmin or name.labels.len > delegation.max_minimize_count or pc.unknown) return unknownCut(g, id, pc.zone);
     // No cut below a name that does not exist (RFC 8020).
     if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
     // A fresh fact at the probe name answers it without a packet.
@@ -337,10 +338,10 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     try g.settle(id, inside, parent.expires_ns);
                 },
                 .nxdomain => {
-                    const until = try publishDenial(g, id, kept, name) orelse return unknownCut(g, id, pc.zone);
+                    const until = try publishDenial(g, id, kept, name) orelse return g.fail(id, unplaced);
                     try g.settle(id, inside, @min(parent.expires_ns, until));
                 },
-                .failed => try unknownCut(g, id, pc.zone),
+                .failed => try g.fail(id, unplaced),
             }
         },
     }
@@ -358,8 +359,44 @@ fn publishDenial(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
     return replyExpiry(reply);
 }
 
-fn unknownCut(g: *Graph, id: CellId, zone: dns.Name) !void {
-    try g.settle(id, .{ .cut = .{ .zone = zone, .unknown = true } }, g.now());
+const unplaced: Failure = .{ .code = .no_reachable_authority, .text = "no probe placed the cut", .unplaced = true };
+
+fn probeable(g: *const Graph, name: dns.Name) bool {
+    return g.cfg.qmin and name.labels.len <= delegation.max_minimize_count;
+}
+
+/// The cut a question for `qname` starts from, walking up from `from`:
+/// the deepest one known, unless a strict ancestor of `qname` a probe may
+/// place comes first.
+fn startAt(g: *Graph, qname: dns.Name, from: dns.Name, probe: bool) dns.Name {
+    var kb: graph.KeyBuf = undefined;
+    var n = from;
+    while (n.labels.len > 0) : (n = .{ .labels = n.labels[1..] }) {
+        if (g.holds(Key.of(&kb, .cut, n, .a))) return n;
+        if (probe and n.labels.len < qname.labels.len and probeable(g, n)) return n;
+    }
+    return n;
+}
+
+pub const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
+
+/// Waits on `startAt`'s cut, or on the deepest one known if no probe
+/// could place it.
+pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *?CellId) !Start {
+    var kb: graph.KeyBuf = undefined;
+    if (slot.* == null) {
+        const n = startAt(g, qname, from, true);
+        slot.* = try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none;
+    }
+    while (true) {
+        const c = g.cell(slot.*.?);
+        if (!c.settled()) return .pending;
+        const why = c.failure() orelse return .{ .cut = slot.*.? };
+        if (!why.unplaced) return .{ .failed = why };
+        const n = startAt(g, qname, from, false);
+        if (n.eql(c.name)) return .{ .failed = unreachable_authority };
+        slot.* = try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none;
+    }
 }
 
 /// When the closest name from `from` up to (not including) `zone` known
@@ -388,7 +425,7 @@ pub fn runNs(g: *Graph, id: CellId) !void {
     // shallower one means no delegation here while it holds.
     if (g.cell(id).settled()) return;
     if (cut.failure()) |why| return g.fail(id, why);
-    if (cut.state.fact.cut.zone.eql(zone) or cut.state.fact.cut.unknown) return g.fail(id, unreachable_authority);
+    if (cut.state.fact.cut.zone.eql(zone)) return g.fail(id, unreachable_authority);
     try g.settle(id, .{ .ns = .{ .names = &.{} } }, cut.expires_ns);
 }
 
@@ -477,22 +514,16 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
-        if (s.cut == null) {
-            // Indexed proofs deny the name without a packet.
-            if (try denial.deny(g, id)) return;
-            // A cut at the name itself exists only from a referral;
-            // otherwise start at the parent's. A DS always lives there.
-            const own = Key.of(&kb, .cut, name, .a);
-            const parent_name: dns.Name = .{ .labels = name.labels[@min(1, name.labels.len)..] };
-            var parent_kb: graph.KeyBuf = undefined;
-            const key = if (qtype != .ds and (try g.peek(own) != null or name.labels.len == 0)) own else Key.of(&parent_kb, .cut, parent_name, .a);
-            const cut_name = if (key.name.ptr == own.name.ptr) name else parent_name;
-            s.cut = try g.demand(id, key, cut_name) orelse
-                return g.fail(id, unreachable_authority);
-        }
-        const cut = g.cell(s.cut.?);
-        if (!cut.settled()) return;
-        if (cut.failure()) |why| return g.fail(id, why);
+        // Indexed proofs deny the name without a packet.
+        if (s.cut == null and try denial.deny(g, id)) return;
+        // A DS always lives in the parent's zone.
+        const from: dns.Name = if (qtype == .ds) .{ .labels = name.labels[@min(1, name.labels.len)..] } else name;
+        const cut = switch (try start(g, id, name, from, &s.cut)) {
+            .pending => return,
+            .none => return g.fail(id, unreachable_authority),
+            .failed => |why| return g.fail(id, why),
+            .cut => |cid| g.cell(cid),
+        };
         // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
         if (!s.dname_checked) {
             s.dname_checked = true;
@@ -637,8 +668,8 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
     };
-    // Looked up, not taken from the asking cell: an unknown cut names the
-    // zone but expires at once. Null: the delegation is gone already.
+    // Looked up: the asker may have followed referrals below its own cut.
+    // Null: the delegation is gone already.
     const parent = try g.peek(Key.of(&kb, .cut, zone, .a));
     const expires = @min(if (parent) |p| p.expires_ns else g.now(), g.now() + @as(i64, ns_ttl) * std.time.ns_per_s);
     const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());

@@ -8,6 +8,7 @@ const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 const graph = @import("graph.zig");
 const denial = @import("denial.zig");
+const walk = @import("walk.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
@@ -94,12 +95,12 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.scratch.allocator().dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
     }
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
-    if (s.parent == null) s.parent = try g.demand(id, graph.Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
-        return g.fail(id, no_chain);
-    const parent = g.cell(s.parent.?);
-    if (!parent.settled()) return;
-    if (parent.failure()) |why| return g.fail(id, why);
-    const parent_zone = parent.state.fact.cut.zone;
+    const parent_zone = switch (try walk.start(g, id, zone, parent_name, &s.parent)) {
+        .pending => return,
+        .none => return g.fail(id, no_chain),
+        .failed => |why| return g.fail(id, why),
+        .cut => |cid| g.cell(cid).state.fact.cut.zone,
+    };
     if (s.keys == null) s.keys = try g.demand(id, graph.Key.of(&kb, .dnskey, parent_zone, .a), parent_zone) orelse
         return g.fail(id, no_chain);
     const parent_keys = g.cell(s.keys.?);

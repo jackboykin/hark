@@ -1,9 +1,9 @@
 ; hark: root-hints = 127.0.10.1
 
-SCENARIO_BEGIN an NXDOMAIN nobody vouches for leaves the cut unknown
+SCENARIO_BEGIN an NXDOMAIN nobody vouches for places no cut
 
 ; The example server denies the probe at b.example without AA. That is no
-; fact: the cut stays unknown, so c.b.example is not probed and the
+; fact and places no cut, so c.b.example is not probed and the
 ; question goes out in full. Three queries: the root, the probe, the
 ; question.
 
