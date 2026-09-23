@@ -118,7 +118,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const keys = g.cell(s.signer.?);
     if (!keys.settled()) return;
     if (keys.failure()) |why| return g.fail(id, why);
-    if (keys.state.fact.dnskey.status != .secure) return failChain(g, id, s.rrset.?);
+    if (keys.state.fact.dnskey.status == .insecure) return g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(rs.expires_ns, keys.expires_ns));
     const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -293,6 +293,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 // RFC 4034 §3.1.3; a signer above the answering zone
                 // authenticates nothing here.
                 if (!rr.name.isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return failBogus(g, id, s.target);
+                if (rr.rtype == .ds and !proof.isProperAncestor(sig.signer_name, rr.name)) return failBogus(g, id, s.target);
                 if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
                     return g.fail(id, no_chain);
                 pending = pending or !g.cell(s.keys[groups].?).settled();
@@ -316,8 +317,11 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 }
                 const kc = g.cell(s.keys[groups].?);
                 if (kc.failure()) |why| return g.fail(id, why);
-                if (kc.state.fact.dnskey.status != .secure) return failBogus(g, id, s.target);
                 expires = @min(expires, kc.expires_ns);
+                if (kc.state.fact.dnskey.status == .insecure) {
+                    status = .insecure;
+                    continue;
+                }
                 const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                     return failBogus(g, id, s.target);
                 cap = @min(cap, rrsig.ttlCap(verified, now));
@@ -334,6 +338,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         },
         .nodata, .nxdomain => {
             const signer = proof.authoritySigner(r.authorities) orelse return failBogus(g, id, s.target);
+            if (t.key.rtype == .ds and t.name.labels.len > 0 and !proof.isProperAncestor(signer, t.name)) return failBogus(g, id, s.target);
             if (s.keys[0] == null) s.keys[0] = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
                 return g.fail(id, no_chain);
             const kc = g.cell(s.keys[0].?);
@@ -341,8 +346,11 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
             if (kc.failure()) |why| return g.fail(id, why);
-            if (kc.state.fact.dnskey.status != .secure) return failBogus(g, id, s.target);
             expires = @min(expires, kc.expires_ns);
+            if (kc.state.fact.dnskey.status == .insecure) {
+                if (!signer.isSubdomainOf(zone) or !t.name.isSubdomainOf(signer)) return failBogus(g, id, s.target);
+                return g.settle(id, .{ .secure = .{ .status = .insecure } }, expires);
+            }
             if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return failBogus(g, id, s.target);
             switch (proof.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
                 .secure => {

@@ -1,0 +1,35 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN the root's own DS denial is a secure NODATA
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      . IN DS
+    SECTION AUTHORITY
+      . 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400
+      . 86400 IN NSEC aaa. NS SOA RRSIG NSEC DNSKEY
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    . IN DS
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    . IN DS
+ENTRY_END
+
+SCENARIO_END
