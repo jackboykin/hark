@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const hark = @import("hark");
 const Io = std.Io;
@@ -49,7 +50,7 @@ fn logFn(
 const log = std.log;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    const allocator = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
