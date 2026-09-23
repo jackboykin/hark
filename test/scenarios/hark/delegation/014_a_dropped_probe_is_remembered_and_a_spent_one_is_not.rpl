@@ -1,0 +1,117 @@
+; hark: root-hints = 127.0.10.1
+; hark: max-queries = 2
+
+SCENARIO_BEGIN a probe the server dropped is remembered, one the budget ended is not
+
+; RFC 9520 §3.2. The example server drops the probe at b.example and
+; answers the names below in full. The first question spends its budget on
+; the root and the probe: its silence is the budget's, so nothing is
+; remembered. The second probes again, is dropped, and asks in full. The
+; third, within servfail-ttl, asks in full without probing.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      h2.b.example. IN A
+    SECTION ANSWER
+      h2.b.example. 300 IN A 192.0.2.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      h3.b.example. IN A
+    SECTION ANSWER
+      h3.b.example. 300 IN A 192.0.2.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query drop
+    REPLY QR NOERROR
+    SECTION QUESTION
+      b.example. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    h1.b.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    h1.b.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    h2.b.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    h2.b.example. IN A
+  SECTION ANSWER
+    h2.b.example. 300 IN A 192.0.2.2
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    h3.b.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    h3.b.example. IN A
+  SECTION ANSWER
+    h3.b.example. 300 IN A 192.0.2.3
+ENTRY_END
+
+STEP 7 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    b.example. A
+    b.example. A
+    h2.b.example. A
+    h3.b.example. A
+ENTRY_END
+
+STEP 8 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

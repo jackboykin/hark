@@ -179,6 +179,8 @@ pub const RrsetScratch = struct {
 
 pub const CutScratch = struct {
     parent: ?CellId = null,
+    /// A probe here failed lately (`Graph.unprobe`).
+    unprobed: bool = false,
     started: bool = false,
     ask: Ask = .{},
 };
@@ -317,6 +319,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     // A fresh fact at the probe name answers it without a packet.
     if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known|
         return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
+    if (s.unprobed) return unknownCut(g, id, pc.zone);
     if (!s.started) {
         s.ask.reset(pc.zone);
         s.ask.probe = true;
@@ -330,6 +333,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         .exhausted => {
             const a = &g.cell(id).scratch.cut.ask;
             if (a.nservers == 0 or a.local or g.stopped(id)) return g.fail(id, a.exhausted());
+            try g.unprobe(g.cell(id).key);
             try unknownCut(g, id, pc.zone);
         },
         .reply => |kept| {
@@ -351,7 +355,10 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     const until = try publishDenial(g, id, kept, name) orelse return unknownCut(g, id, pc.zone);
                     try g.settle(id, inside, @min(parent.expires_ns, until));
                 },
-                .failed => try unknownCut(g, id, pc.zone),
+                .failed => {
+                    try g.unprobe(g.cell(id).key);
+                    try unknownCut(g, id, pc.zone);
+                },
             }
         },
     }
