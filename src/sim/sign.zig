@@ -165,7 +165,7 @@ pub const Signer = struct {
     /// an expansion of that owner.
     pub fn sign(self: *Signer, key: *const Key, set: []const RR, wildcard: ?dns.Name) !RR {
         const head = set[0];
-        var rrsig: dns.RrsigData = .{
+        var sig: dns.RrsigData = .{
             .type_covered = head.rtype,
             .algorithm = .ecdsap256sha256,
             .labels = @intCast(dnssec.signedLabels(wildcard orelse head.name)),
@@ -177,12 +177,11 @@ pub const Signer = struct {
             .signature = &.{},
         };
         var buf: [8192]u8 = undefined;
-        const data = try dnssec.buildSignedData(&buf, rrsig, set);
+        const data = try dnssec.buildSignedData(&buf, sig, set);
         var s = try key.pair.signer(null);
         data.feed(&s);
-        const sig = try s.finalize();
-        rrsig.signature = try self.arena.dupe(u8, &sig.toBytes());
-        return .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = rrsig } };
+        sig.signature = try self.arena.dupe(u8, &(try s.finalize()).toBytes());
+        return .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } };
     }
 
     /// An unmatched DNSKEY question: the zone's key, self-signed, from an

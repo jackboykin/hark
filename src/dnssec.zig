@@ -261,12 +261,12 @@ pub fn validateDnskeyRrset(
     const pq = hasMlDsaDs(ds_records);
     for (dnskey_records) |rrsig_rr| {
         if (rrsig_rr.rtype != .rrsig) continue;
-        const rrsig = rrsig_rr.rdata.rrsig;
-        if (rrsig.type_covered != .dnskey) continue;
-        if (pq and rrsig.algorithm != .mldsa44) continue;
+        const sig = rrsig_rr.rdata.rrsig;
+        if (sig.type_covered != .dnskey) continue;
+        if (pq and sig.algorithm != .mldsa44) continue;
         for (filtered, 0..) |rr, i| {
-            if (!anchored[i] or key_tags[i] != rrsig.key_tag) continue;
-            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return rrsig;
+            if (!anchored[i] or key_tags[i] != sig.key_tag) continue;
+            if (try tryVerifyRrsig(sig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return sig;
         }
     }
     return error.InvalidSignature;
@@ -1597,7 +1597,7 @@ const Keyset = struct {
 };
 
 fn rrsetVerifiesWithAnyKey(
-    rrsig: dns.RrsigData,
+    sig: dns.RrsigData,
     keyset: *const Keyset,
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
@@ -1605,8 +1605,8 @@ fn rrsetVerifiesWithAnyKey(
     memo: *VerifyMemo,
 ) error{ValidationBudgetExhausted}!bool {
     for (keyset.keys[0..keyset.len], keyset.tags[0..keyset.len]) |dk, tag| {
-        if (tag != rrsig.key_tag) continue;
-        if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget, memo)) return true;
+        if (tag != sig.key_tag) continue;
+        if (try tryVerifyRrsig(sig, dk, rrset, now_u32, budget, memo)) return true;
     }
     return false;
 }
@@ -1621,8 +1621,8 @@ pub fn findRrsigAt(
 ) ?dns.RrsigData {
     for (records) |rr| {
         if (rr.rtype != .rrsig) continue;
-        const rrsig = rr.rdata.rrsig;
-        if (rrsig.type_covered == covered_type and rr.name.eql(owner)) return rrsig;
+        const sig = rr.rdata.rrsig;
+        if (sig.type_covered == covered_type and rr.name.eql(owner)) return sig;
     }
     return null;
 }
@@ -1661,12 +1661,12 @@ pub fn validateRrset(
 
     for (records) |sig_rr| {
         if (sig_rr.rtype != .rrsig) continue;
-        const rrsig = sig_rr.rdata.rrsig;
-        if (rrsig.type_covered != covered_type) continue;
+        const sig = sig_rr.rdata.rrsig;
+        if (sig.type_covered != covered_type) continue;
         if (!sig_rr.name.eql(owner)) continue;
-        if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
+        if (!isSupportedAlgorithm(sig.algorithm)) continue;
 
-        if (rrsetVerifiesWithAnyKey(rrsig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return rrsig;
+        if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return sig;
     }
     // Nothing verified on a zone already proven secure — bogus, even when
     // every candidate RRSIG used an unsupported algorithm: real supported
@@ -1678,8 +1678,8 @@ pub fn validateRrset(
 
 /// How long an RRset this signature verified may be held: RFC 4034 §3.1.2
 /// Original TTL or RFC 4035 §5.3.3 remaining window, whichever is shorter.
-pub fn rrsigTtlCap(rrsig: dns.RrsigData, now_u32: u32) u32 {
-    return @min(rrsig.original_ttl, dns.secondsUntil(rrsig.sig_expiration, now_u32));
+pub fn rrsigTtlCap(sig: dns.RrsigData, now_u32: u32) u32 {
+    return @min(sig.original_ttl, dns.secondsUntil(sig.sig_expiration, now_u32));
 }
 
 /// RFC 4034 §3.1.3: RRSIG labels exclude a leading `*`.
@@ -1736,16 +1736,16 @@ pub fn verifyAuthorityProofSigs(
         var sig_verified = false;
         for (authorities) |sig_rr| {
             if (sig_rr.rtype != .rrsig) continue;
-            const rrsig = sig_rr.rdata.rrsig;
-            if (rrsig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
-            if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
+            const sig = sig_rr.rdata.rrsig;
+            if (sig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
+            if (!isSupportedAlgorithm(sig.algorithm)) continue;
             // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
             // the `*.CE` NSEC under its own owner), and the proofs read the owner
             // as served: a real `*.zone NSEC` signature would verify under any.
-            if (rrsig.labels != signedLabels(rr.name)) return .bogus;
+            if (sig.labels != signedLabels(rr.name)) return .bogus;
 
-            if (rrsetVerifiesWithAnyKey(rrsig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return .bogus) {
-                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
+            if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return .bogus) {
+                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(sig, now_u32));
                 sig_verified = true;
                 break;
             }
@@ -2360,7 +2360,7 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .ttl = 3600,
         .rdata = .{ .mx = .{ .preference = 10, .exchange = .{ .labels = &[_][]const u8{ "mail", "example", "com" } } } },
     }};
-    var rrsig = dns.RrsigData{
+    var sig = dns.RrsigData{
         .type_covered = .mx,
         .algorithm = .mldsa44,
         .labels = 2,
@@ -2372,13 +2372,13 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .signature = &signature,
     };
     var budget: ValidationBudget = .{};
-    try verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo);
+    try verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo);
 
     signature[100] ^= 1;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo));
     signature[100] ^= 1;
-    rrsig.signer_name = test_com;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo));
+    sig.signer_name = test_com;
+    try testing.expectError(error.InvalidSignature, verifyRrsig(sig, dnskey, &mx, 1439000000, &budget, &test_memo));
 }
 
 test "VerifyMemo: a remembered signature binds its key and still expires" {
@@ -4035,7 +4035,7 @@ test "validateRrset propagates budget exhaustion as bogus" {
         .public_key = &.{},
     };
     const tag = keyTag(dnskey);
-    const rrsig = dns.RrsigData{
+    const sig = dns.RrsigData{
         .type_covered = .a,
         .algorithm = .ecdsap256sha256,
         .labels = 2,
@@ -4048,7 +4048,7 @@ test "validateRrset propagates budget exhaustion as bogus" {
     };
     const answers = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = rrsig } },
+        .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } },
     };
     const dnskeys = [_]dns.ResourceRecord{
         .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
@@ -4363,7 +4363,7 @@ fn testSignMlDsa(
     kp: *const MlDsa44.KeyPair,
     sig_buf: *[MlDsa44.Signature.encoded_length]u8,
 ) !dns.RrsigData {
-    var rrsig = dns.RrsigData{
+    var sig = dns.RrsigData{
         .type_covered = covered,
         .algorithm = .mldsa44,
         .labels = @intCast(signedLabels(rrset[0].name)),
@@ -4375,12 +4375,12 @@ fn testSignMlDsa(
         .signature = &.{},
     };
     var canonical_buf: [65536]u8 = undefined;
-    const data = try buildSignedData(&canonical_buf, rrsig, rrset);
-    var sig = try kp.signer(null);
-    data.feed(&sig);
-    sig_buf.* = sig.finalize().toBytes();
-    rrsig.signature = sig_buf;
-    return rrsig;
+    const data = try buildSignedData(&canonical_buf, sig, rrset);
+    var s = try kp.signer(null);
+    data.feed(&s);
+    sig_buf.* = s.finalize().toBytes();
+    sig.signature = sig_buf;
+    return sig;
 }
 
 test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the only one that counts" {
@@ -4394,8 +4394,8 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
         fn rr(dk: dns.DnskeyData) dns.ResourceRecord {
             return .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dk } };
         }
-        fn sig(rrsig: dns.RrsigData) dns.ResourceRecord {
-            return .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = rrsig } };
+        fn sig(s: dns.RrsigData) dns.ResourceRecord {
+            return .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = s } };
         }
     };
     // ed_pub is undefined until testSignRrset fills it, so the Ed25519 signature
