@@ -434,9 +434,6 @@ pub const Graph = struct {
     /// (RFC 9520 §3.2): an upstream fetch, a zone's DS or keys. Policy,
     /// outside cells.
     failed: std.HashMapUnmanaged(Key, Refusal, Key.Context, 80) = .empty,
-    /// Cut probes that drew silence or an error, keyed by the cut, until
-    /// when (RFC 9520 §3.2): the names below go out in full meanwhile.
-    unprobed: std.HashMapUnmanaged(Key, i64, Key.Context, 80) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
     /// Live cells only.
@@ -494,9 +491,6 @@ pub const Graph = struct {
         var it = g.failed.keyIterator();
         while (it.next()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
-        var ut = g.unprobed.keyIterator();
-        while (ut.next()) |k| g.gpa.free(k.name);
-        g.unprobed.deinit(g.gpa);
         g.denial.deinit(g.gpa);
         g.verify_memo.deinit(g.gpa);
         g.store.deinit();
@@ -841,35 +835,23 @@ pub const Graph = struct {
         g.release(id);
     }
 
-    /// Refuse new work for `key` with `why` for `servfail_ttl`.
+    /// Refuse new work for `key` with `why` for `servfail_ttl`; past
+    /// `max_failed` keys an arbitrary other one is forgotten.
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
-        try g.keep(Refusal, &g.failed, key, .{ .until_ns = g.failedUntil(), .why = why });
-    }
-
-    /// Ask below `cut` in full, unprobed, for `servfail_ttl`.
-    pub fn unprobe(g: *Graph, cut: Key) !void {
-        try g.keep(i64, &g.unprobed, cut, g.failedUntil());
-    }
-
-    fn failedUntil(g: *const Graph) i64 {
-        return g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s;
-    }
-
-    /// Past `max_failed` keys an arbitrary other one is forgotten.
-    fn keep(g: *Graph, comptime V: type, map: *std.HashMapUnmanaged(Key, V, Key.Context, 80), key: Key, value: V) !void {
-        if (map.getPtr(key)) |u| {
-            u.* = value;
+        const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why };
+        if (g.failed.getPtr(key)) |u| {
+            u.* = r;
             return;
         }
-        if (map.count() >= max_failed) {
-            var it = map.keyIterator();
+        if (g.failed.count() >= max_failed) {
+            var it = g.failed.keyIterator();
             const old = it.next().?.*;
-            _ = map.remove(old);
+            _ = g.failed.remove(old);
             g.gpa.free(old.name);
         }
         const own: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try g.gpa.dupe(u8, key.name) };
         errdefer g.gpa.free(own.name);
-        try map.put(g.gpa, own, value);
+        try g.failed.put(g.gpa, own, r);
     }
 
     fn refused(g: *Graph, key: Key) ?Failure {
@@ -995,14 +977,7 @@ pub const Graph = struct {
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name);
         try g.pin(id, by);
-        if (g.refused(key)) |why| {
-            try g.fail(id, why);
-            return id;
-        }
-        if (key.kind == .cut and g.unprobed.count() > 0) if (g.unprobed.get(key)) |until| {
-            g.cell(id).scratch.cut.unprobed = until > g.now();
-        };
-        try g.ready.append(g.gpa, id);
+        if (g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
         return id;
     }
 
