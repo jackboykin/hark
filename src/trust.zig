@@ -183,9 +183,10 @@ pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
         if (z.labels.len == 0) return true;
         const ds = try g.peek(graph.Key.of(&kb, .rrset, z, .ds)) orelse return false;
         if (ds.value.rrset.kind != .answer) return false;
-        const above: dns.Name = .{ .labels = z.labels[1..] };
-        const cut = try g.peek(graph.Key.of(&kb, .cut, above, .a)) orelse return false;
-        z = cut.value.cut.zone;
+        // The DS came from the zone above, whichever cut lies between.
+        const above = ds.value.rrset.zone;
+        if (!proof.isProperAncestor(above, z)) return false;
+        z = above;
     }
 }
 

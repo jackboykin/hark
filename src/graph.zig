@@ -135,6 +135,9 @@ pub const Cut = struct {
     zone: dns.Name,
     /// The referral's glue, asked before the addr cells.
     glue: []const Glue = &.{},
+    /// Only the deepest cut known above the name; whether another lies
+    /// between went unlearned. Never stored.
+    unknown: bool = false,
 };
 
 /// A glue address lives on its own TTL, never past its delegation's.
@@ -275,7 +278,6 @@ pub const Budget = struct {
     refs: u32 = 1,
     /// When a refresh began; 0 for a client.
     refresh_ns: i64 = 0,
-    unminimised: walk.Unminimised = .{},
     /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: rrsig.ValidationBudget = .{},
 };
@@ -779,6 +781,7 @@ pub const Graph = struct {
             },
             else => {},
         };
+        std.debug.assert(!(value == .cut and value.cut.unknown and expires_ns > g.now()));
         c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {

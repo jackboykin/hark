@@ -1,0 +1,75 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN an NXDOMAIN nobody vouches for leaves the cut unknown
+
+; The example server denies the probe at b.example without AA. That is no
+; fact: the cut stays unknown, so c.b.example is not probed and the
+; question goes out in full. Three queries: the root, the probe, the
+; question.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NXDOMAIN
+    SECTION QUESTION
+      b.example. IN A
+    SECTION AUTHORITY
+      example. 300 IN SOA ns.example. host.example. 1 3600 600 86400 300
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.b.example. IN A
+    SECTION AUTHORITY
+      example. 300 IN SOA ns.example. host.example. 1 3600 600 86400 300
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.c.b.example. IN A
+    SECTION ANSWER
+      a.c.b.example. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.c.b.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.c.b.example. IN A
+  SECTION ANSWER
+    a.c.b.example. 300 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 CHECK_MAX_QUERIES 3
+
+SCENARIO_END

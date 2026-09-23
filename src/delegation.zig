@@ -14,7 +14,7 @@ pub const max_minimize_count = 10;
 /// What a minimised probe's reply does to the walk.
 pub const ProbeStep = union(enum) {
     referral: Referral,
-    /// Stop minimising (RFC 9156 relaxed mode).
+    /// Stop minimising; RFC 8020 when vouched for.
     nxdomain,
     nodata,
     answered,

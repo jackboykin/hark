@@ -2,7 +2,7 @@
 
 SCENARIO_BEGIN a minimised probe's error sends the names below it in full
 
-; RFC 9156 §2.3 relaxed mode. The com server refuses the probe at err.com
+; RFC 9156 §3 (6e). The com server refuses the probe at err.com
 ; but answers the full question. The error is no fact about any cut: the
 ; resolution asks every name below err.com in full, so b.err.com is not
 ; probed. Three queries: com at the root, the err.com probe, the question.

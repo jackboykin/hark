@@ -214,6 +214,7 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
+                try w.int(u8, @intFromBool(c.unknown));
                 try w.int(u16, @intCast(c.glue.len));
                 for (c.glue) |gl| {
                     try w.addr(gl.addr);
@@ -262,9 +263,10 @@ pub const Store = struct {
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name(arena);
+                const unknown = try r.int(u8) != 0;
                 const glue = try arena.alloc(graph.Glue, try r.int(u16));
                 for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
-                break :blk .{ .cut = .{ .zone = zone, .glue = glue } };
+                break :blk .{ .cut = .{ .zone = zone, .glue = glue, .unknown = unknown } };
             },
             .ns => blk: {
                 const names = try arena.alloc(dns.Name, try r.int(u16));
