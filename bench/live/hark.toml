@@ -1,2 +1,8 @@
 [server]
-listen = ["127.0.0.1:5361"]
+listen = ["127.0.0.1:__PORT__"]
+
+[cache]
+size = 1073741824
+
+[rebinding]
+enabled = false
