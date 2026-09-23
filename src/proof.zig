@@ -71,15 +71,13 @@ pub fn classifyDelegation(
     }
     // RFC 5155 §8.6: closest encloser, then an Opt-Out span over the next
     // closer. No wildcard step: delegations are never synthesized.
-    const ce_offset = switch (nsec3ClosestEncloser(authorities, child_zone, child_hash, salt, iterations, zone, budget)) {
-        .offset => |o| o,
+    const ce = switch (nsec3ClosestEncloser(authorities, child_zone, child_hash, salt, iterations, zone, budget)) {
+        .found => |f| f,
         .verdict => |v| return if (v == .bogus) .bogus else .unproven,
     };
     // Offset 0 is the owner match returned on above.
-    std.debug.assert(ce_offset != 0);
-    const next_closer = dns.Name{ .labels = child_zone.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
-    return if (nsec3Cover(authorities, zone, &nc_hash) == true) .unsigned else .unproven;
+    std.debug.assert(ce.offset != 0);
+    return if (nsec3Cover(authorities, zone, &ce.next_closer_hash) == true) .unsigned else .unproven;
 }
 
 /// Compare two DNS names in canonical ordering (RFC 4034 §6.1).
@@ -529,7 +527,10 @@ fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nse
     return .{ .params = .{ .salt = salt, .iterations = iterations } };
 }
 
-const ClosestEncloser = union(enum) { offset: usize, verdict: SecurityStatus };
+const ClosestEncloser = union(enum) {
+    found: struct { offset: usize, next_closer_hash: [Sha1.digest_length]u8 },
+    verdict: SecurityStatus,
+};
 
 /// RFC 5155 §8.3: hash qname and each ancestor until one owns an NSEC3.
 /// RFC 6840 §4.1: a delegation or DNAME owner anchors nothing below it, else
@@ -543,6 +544,7 @@ fn nsec3ClosestEncloser(
     zone: dns.Name,
     budget: *rrsig.ValidationBudget,
 ) ClosestEncloser {
+    var below_hash: [Sha1.digest_length]u8 = undefined;
     for (0..qname.labels.len) |label_offset| {
         // Nothing above the signer is in its chain; don't pay to hash it.
         if (qname.labels.len - label_offset < zone.labels.len) break;
@@ -556,8 +558,9 @@ fn nsec3ClosestEncloser(
             const owner_hash = supportedNsec3OwnerHash(rr, zone) orelse continue;
             if (!mem.eql(u8, &owner_hash, &ancestor_hash)) continue;
             if (provesNothingBelowOwner(rr.rdata.nsec3.type_bit_maps)) return .{ .verdict = .unchecked };
-            return .{ .offset = label_offset };
+            return .{ .found = .{ .offset = label_offset, .next_closer_hash = below_hash } };
         }
+        below_hash = ancestor_hash;
     }
     return .{ .verdict = .unchecked };
 }
@@ -650,16 +653,16 @@ fn validateNsec3NegativeProof(
 
     // Closest-encloser proof (RFC 5155 §8.4 / §8.6). Shared by NXDOMAIN rcode
     // and NODATA fallthrough; the wildcard step below distinguishes them.
-    const ce_offset = switch (nsec3ClosestEncloser(authorities, qname, qname_hash, salt, iterations, zone, budget)) {
-        .offset => |o| o,
+    const found = switch (nsec3ClosestEncloser(authorities, qname, qname_hash, salt, iterations, zone, budget)) {
+        .found => |f| f,
         .verdict => |v| return v,
     };
+    const ce_offset = found.offset;
 
     // CE == qname contradicts NXDOMAIN (and wildcard-expansion semantics).
     if (ce_offset == 0) return .bogus;
 
-    const next_closer = dns.Name{ .labels = qname.labels[ce_offset - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
+    const nc_hash = found.next_closer_hash;
 
     var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
     const ce = dns.Name{ .labels = qname.labels[ce_offset..] };
@@ -2065,6 +2068,23 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     try testing.expectEqual(@as(u32, 2), b.nsec3_blocks_spent);
     const second = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.bogus, second);
+}
+
+test "an NSEC3 NXDOMAIN proof hashes its next closer once" {
+    const qname = dns.Name{ .labels = &.{ "www", "example", "com" } };
+    const next_closer = dns.Name{ .labels = &.{ "example", "com" } };
+    const wildcard = dns.Name{ .labels = &.{ "*", "com" } };
+    const salt: []const u8 = &.{};
+    var bufs: [3]Nsec3OwnerBufs = .{ .{}, .{}, .{} };
+    const ce_next: [20]u8 = @splat(0);
+    const authorities = [_]dns.ResourceRecord{
+        makeNsec3Rr(makeNsec3OwnerName(try nsec3Hash(test_com, salt, 0), test_com.labels, &bufs[0]), salt, &ce_next, &com_apex_bitmap),
+        makeCoveringNsec3(try nsec3Hash(next_closer, salt, 0), test_com.labels, salt, &bufs[1]),
+        makeCoveringNsec3(try nsec3Hash(wildcard, salt, 0), test_com.labels, salt, &bufs[2]),
+    };
+    var b: rrsig.ValidationBudget = .{};
+    try testing.expectEqual(SecurityStatus.secure, validateNegativeProof(&authorities, qname, .a, true, test_com, &b));
+    try testing.expectEqual(@as(u32, 4), b.nsec3_blocks_spent);
 }
 
 test "nsec3Hash KAT: wire-captured jsc.nasa.gov owner hash" {
