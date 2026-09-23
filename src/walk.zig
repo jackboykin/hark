@@ -61,6 +61,9 @@ pub const Ask = struct {
     tcp_first: bool = false,
     /// An attempt, or a server set's sub-resolution, never left the host.
     local: bool = false,
+    /// A cut probe: an unknown cut asks the same servers again in full,
+    /// so one silent pass that left the host ends it.
+    probe: bool = false,
 
     comptime {
         std.debug.assert(max_servers < 32);
@@ -316,11 +319,19 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
     if (!s.started) {
         s.ask.reset(pc.zone);
+        s.ask.probe = true;
         s.started = true;
     }
     switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, g.cell(id).scratch.cut.ask.exhausted()),
+        // RFC 9156 §3 (6e): silence teaches no more than an error, unless
+        // nobody could be asked, an attempt never left the host, or hark
+        // stopped itself.
+        .exhausted => {
+            const a = &g.cell(id).scratch.cut.ask;
+            if (a.nservers == 0 or a.local or g.stopped(id)) return g.fail(id, a.exhausted());
+            try unknownCut(g, id, pc.zone);
+        },
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
@@ -560,9 +571,7 @@ fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
 const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "failed recently" };
 
 fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
-    const c = g.cell(id);
-    const spent = g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
-    if (!spent and !c.orphan and !why.local and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
+    if (!g.stopped(id) and !why.local and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(g.cell(id).key, failed_recently);
     try g.fail(id, why);
 }
 
@@ -820,7 +829,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (!a.have_servers) switch (try gatherServers(g, id, a)) {
             .pending => return .pending,
             .none => {
-                if (a.retried or a.held != null) return a.giveUp(g);
+                if (a.retried or a.held != null or (a.probe and !a.local)) return a.giveUp(g);
                 a.retry(g);
                 continue;
             },

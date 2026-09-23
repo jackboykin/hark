@@ -1,0 +1,157 @@
+; sim-only: an exchange refused at the host is the sim's to stage
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a probe the host could not send is no evidence against the parent
+
+; Both probe sends at uk.prserv.net are refused at the host; the retry
+; pass is dropped. That silence is partly hark's own, so nothing is asked
+; in full and the question SERVFAILs, remembered nowhere. Asked again, the
+; servers' silence is theirs and the question goes out in full.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      net. IN A
+    SECTION AUTHORITY
+      net. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      prserv.net. IN A
+    SECTION AUTHORITY
+      prserv.net. 86400 IN NS ns1.prserv.net.
+      prserv.net. 86400 IN NS ns2.prserv.net.
+    SECTION ADDITIONAL
+      ns1.prserv.net. 86400 IN A 127.0.10.3
+      ns2.prserv.net. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ns.uk.prserv.net. IN A
+    SECTION AUTHORITY
+      uk.prserv.net. 3600 IN NS ns.uk.prserv.net.
+    SECTION ADDITIONAL
+      ns.uk.prserv.net. 3600 IN A 127.0.10.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      prserv.net. IN A
+    SECTION ANSWER
+      prserv.net. 3600 IN A 192.0.2.7
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query drop
+    REPLY QR NOERROR
+    SECTION QUESTION
+      uk.prserv.net. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ns.uk.prserv.net. IN A
+    SECTION AUTHORITY
+      uk.prserv.net. 3600 IN NS ns.uk.prserv.net.
+    SECTION ADDITIONAL
+      ns.uk.prserv.net. 3600 IN A 127.0.10.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      prserv.net. IN A
+    SECTION ANSWER
+      prserv.net. 3600 IN A 192.0.2.7
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query drop
+    REPLY QR NOERROR
+    SECTION QUESTION
+      uk.prserv.net. IN A
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.5
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.uk.prserv.net. IN A
+    SECTION ANSWER
+      ns.uk.prserv.net. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    prserv.net. IN A
+ENTRY_END
+STEP 2 UNSENT
+STEP 3 UNSENT
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.uk.prserv.net. IN A
+ENTRY_END
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    ns.uk.prserv.net. IN A
+ENTRY_END
+STEP 6 CHECK_MAX_QUERIES 5
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.uk.prserv.net. IN A
+ENTRY_END
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ns.uk.prserv.net. IN A
+  SECTION ANSWER
+    ns.uk.prserv.net. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END
