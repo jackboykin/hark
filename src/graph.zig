@@ -444,11 +444,14 @@ pub const Graph = struct {
     tally: Tally = .{},
     /// Verified NSEC facts in span order (denial.zig).
     denial: denial.Index = .{},
+    /// Signatures already verified, by content: a speedup, never a verdict.
+    verify_memo: dnssec.VerifyMemo = .{},
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
+        if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
         try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
@@ -487,6 +490,7 @@ pub const Graph = struct {
         while (it.next()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
         g.denial.deinit(g.gpa);
+        g.verify_memo.deinit(g.gpa);
         g.store.deinit();
     }
 

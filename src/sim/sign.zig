@@ -218,8 +218,9 @@ test "what the signer mints, the validator accepts" {
     const dnskey: RR = .{ .name = zone, .rtype = .dnskey, .rclass = .in, .ttl = 3600, .rdata = .{ .dnskey = signer.keys[1].dnskey } };
     const keysig = try signer.sign(&signer.keys[1], &.{dnskey}, null);
     var budget: dnssec.ValidationBudget = .{};
-    try std.testing.expect(dnssec.validateRrset(&.{ a, sig }, owner, .a, &.{dnskey}, 1_800_000_000, &budget) != null);
-    _ = try dnssec.validateDnskeyRrset(&.{ dnskey, keysig }, &.{signer.keys[1].ds}, zone, 1_800_000_000, &budget);
+    var memo: dnssec.VerifyMemo = .{};
+    try std.testing.expect(dnssec.validateRrset(&.{ a, sig }, owner, .a, &.{dnskey}, 1_800_000_000, &budget, &memo) != null);
+    _ = try dnssec.validateDnskeyRrset(&.{ dnskey, keysig }, &.{signer.keys[1].ds}, zone, 1_800_000_000, &budget, &memo);
     // Same seed, same key: the query log stays reproducible.
     const again = try Signer.init(arena, &scenario, 7, 1_800_000_000);
     try std.testing.expectEqualSlices(u8, signer.keys[1].ds.digest, again.keys[1].ds.digest);

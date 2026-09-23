@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
@@ -7,6 +8,7 @@ const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
+const Blake3 = std.crypto.hash.Blake3;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -56,6 +58,82 @@ pub const ValidationBudget = struct {
     fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.nsec3_hash_spent >= self.max_nsec3_hash) return error.ValidationBudgetExhausted;
         self.nsec3_hash_spent += 1;
+    }
+};
+
+/// Signatures that verified, remembered by what the math saw: algorithm,
+/// key, signature and the digest of the signed data (RFC 4034 §3.1.8.1).
+/// The RRSIG header is in that data, so an entry for an expired signature
+/// is unreachable once `verifyRrsig` refuses the window; nothing expires or
+/// invalidates. A hit decides nothing the math wouldn't: every check before
+/// the crypto still runs, and the budget is charged first.
+pub const VerifyMemo = struct {
+    /// Empty remembers nothing.
+    sets: []Set = &.{},
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    /// 256 bits: an attacker plants tags with their own zone's valid
+    /// signatures, so a forgery is a birthday search over the tag width.
+    const Tag = [32]u8;
+    /// One cache line; way 0 is the more recent.
+    const Set = extern struct { ways: [2]Tag align(64) };
+    const bytes = 256 * 1024;
+
+    pub fn init(gpa: mem.Allocator) !VerifyMemo {
+        const sets = try gpa.alloc(Set, bytes / @sizeOf(Set));
+        // Tags are public: reused memory holding one would be a forgery.
+        @memset(sets, .{ .ways = @splat(@splat(0)) });
+        return .{ .sets = sets };
+    }
+
+    pub fn deinit(m: *VerifyMemo, gpa: mem.Allocator) void {
+        gpa.free(m.sets);
+    }
+
+    /// Lengths framed: an RSA key and signature are both variable, and
+    /// bytes moved across their boundary must not name the same entry.
+    fn tag(algorithm: dns.DnssecAlgorithm, key: []const u8, signature: []const u8, digest: []const u8) Tag {
+        var frame: [5]u8 = undefined;
+        frame[0] = @backingInt(algorithm);
+        mem.writeInt(u16, frame[1..3], @intCast(key.len), .big);
+        mem.writeInt(u16, frame[3..5], @intCast(signature.len), .big);
+        var h = Blake3.init(.{});
+        h.update(&frame);
+        h.update(key);
+        h.update(signature);
+        h.update(digest);
+        var t: Tag = undefined;
+        h.final(&t);
+        return t;
+    }
+
+    fn set(m: *VerifyMemo, t: *const Tag) *Set {
+        return &m.sets[mem.readInt(u32, t[0..4], .little) & (m.sets.len - 1)];
+    }
+
+    /// A miss is counted even when empty: the math runs either way.
+    fn recall(m: *VerifyMemo, t: *const Tag) bool {
+        if (m.sets.len != 0) {
+            const s = m.set(t);
+            if (mem.eql(u8, &s.ways[0], t)) {
+                m.hits += 1;
+                return true;
+            }
+            if (mem.eql(u8, &s.ways[1], t)) {
+                s.ways = .{ t.*, s.ways[0] };
+                m.hits += 1;
+                return true;
+            }
+        }
+        m.misses += 1;
+        return false;
+    }
+
+    fn remember(m: *VerifyMemo, t: *const Tag) void {
+        if (m.sets.len == 0) return;
+        const s = m.set(t);
+        s.ways = .{ t.*, s.ways[0] };
     }
 };
 
@@ -134,6 +212,7 @@ pub fn validateDnskeyRrset(
     zone_name: dns.Name,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
 ) VerifyError!dns.RrsigData {
     // Filter to only DNSKEY records for signature verification.
     // Response answers may include RRSIG records alongside DNSKEYs;
@@ -187,7 +266,7 @@ pub fn validateDnskeyRrset(
         if (pq and rrsig.algorithm != .mldsa44) continue;
         for (filtered, 0..) |rr, i| {
             if (!anchored[i] or key_tags[i] != rrsig.key_tag) continue;
-            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget)) return rrsig;
+            if (try tryVerifyRrsig(rrsig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return rrsig;
         }
     }
     return error.InvalidSignature;
@@ -556,8 +635,9 @@ fn tryVerifyRrsig(
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
 ) error{ValidationBudgetExhausted}!bool {
-    verifyRrsig(rrsig, dnskey, rrset, now_u32, budget) catch |e| switch (e) {
+    verifyRrsig(rrsig, dnskey, rrset, now_u32, budget, memo) catch |e| switch (e) {
         error.ValidationBudgetExhausted => return error.ValidationBudgetExhausted,
         else => return false,
     };
@@ -570,6 +650,7 @@ fn verifyRrsig(
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
 ) VerifyError!void {
     // KeyTrap (CVE-2023-50387) mitigation: charge before any work so attempts
     // count even when the cheap pre-checks below would reject.
@@ -622,19 +703,58 @@ fn verifyRrsig(
     };
 
     switch (rrsig.algorithm) {
-        .rsasha1, .rsasha1_nsec3 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha1),
-        .rsasha256 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha256),
-        .rsasha512 => try verifyRsa(rrsig.signature, &data, dnskey.public_key, Sha512),
-        .ecdsap256sha256 => try verifyEcdsa(EcdsaP256, rrsig.signature, &data, dnskey.public_key),
-        .ecdsap384sha384 => try verifyEcdsa(EcdsaP384, rrsig.signature, &data, dnskey.public_key),
-        .ed25519 => try verifyEd25519(rrsig.signature, &data, dnskey.public_key),
-        .mldsa44 => try verifyMlDsa(rrsig.signature, &data, dnskey.public_key),
+        inline .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => |alg| {
+            var digest: [Digest(alg).digest_length]u8 = undefined;
+            var hash = Digest(alg).init(.{});
+            data.feed(&hash);
+            hash.final(&digest);
+            const t = VerifyMemo.tag(alg, dnskey.public_key, rrsig.signature, &digest);
+            if (memo.recall(&t)) {
+                // The gate runs Debug: every hit in every scenario is re-proven.
+                if (builtin.mode == .debug) verifyMath(alg, rrsig.signature, &data, &digest, dnskey.public_key) catch unreachable;
+                return;
+            }
+            try verifyMath(alg, rrsig.signature, &data, &digest, dnskey.public_key);
+            memo.remember(&t);
+        },
         else => return error.UnsupportedAlgorithm,
     }
 }
 
+/// What an algorithm signs: RSA and ECDSA sign this digest of the data, so
+/// the memo assumes nothing the algorithm doesn't. Ed25519 and ML-DSA hash
+/// the data themselves; SHA-256 only names their entries.
+fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
+    return switch (algorithm) {
+        .rsasha1, .rsasha1_nsec3 => Sha1,
+        .rsasha256, .ecdsap256sha256, .ed25519, .mldsa44 => Sha256,
+        .ecdsap384sha384 => Sha384,
+        .rsasha512 => Sha512,
+        else => @compileError("no verifier for " ++ @tagName(algorithm)),
+    };
+}
+
+/// A function of its arguments alone, or remembered hits would bypass the
+/// change: policy (distrusting an algorithm, a key-size floor) runs before.
+fn verifyMath(
+    comptime algorithm: dns.DnssecAlgorithm,
+    signature: []const u8,
+    data: *const SignedData,
+    digest: *const [Digest(algorithm).digest_length]u8,
+    key: []const u8,
+) VerifyError!void {
+    return switch (algorithm) {
+        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512 => verifyRsa(Digest(algorithm), signature, digest, key),
+        .ecdsap256sha256 => verifyEcdsa(EcdsaP256, signature, digest, key),
+        .ecdsap384sha384 => verifyEcdsa(EcdsaP384, signature, digest, key),
+        .ed25519 => verifyEd25519(signature, data, key),
+        .mldsa44 => verifyMlDsa(signature, data, key),
+        else => comptime unreachable,
+    };
+}
+
 /// Parse an RFC 3110 RSA public key and verify a PKCS#1 v1.5 signature.
-fn verifyRsa(signature: []const u8, data: *const SignedData, key_data: []const u8, comptime Hash: type) VerifyError!void {
+fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.digest_length]u8, key_data: []const u8) VerifyError!void {
     // RFC 3110: first byte is exponent length (if < 256), then exponent, then modulus
     // If first byte is 0, next 2 bytes are exponent length
     if (key_data.len < 3) return error.InvalidKey;
@@ -684,12 +804,8 @@ fn verifyRsa(signature: []const u8, data: *const SignedData, key_data: []const u
 
     var em_dec: [512]u8 = undefined;
     decoded_fe.toBytes(em_dec[0..modulus.len], .big) catch return error.InvalidSignature;
-    var hasher = Hash.init(.{});
-    data.feed(&hasher);
-    var digest: [Hash.digest_length]u8 = undefined;
-    hasher.final(&digest);
     var em_expected: [512]u8 = undefined;
-    pkcs1v15Encode(em_expected[0..modulus.len], Hash, &digest);
+    pkcs1v15Encode(em_expected[0..modulus.len], Hash, digest);
 
     // Xor-fold compare: no data-dependent branch, so still constant-time —
     // though EM in signature *verification* is public data anyway.
@@ -737,7 +853,7 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_len
 /// FIPS 186-5 §6.4.2. std's Verifier computes u1·G and u2·Q separately and
 /// normalises the sum to affine; one double-base multiplication shares the
 /// doublings, and comparing r·Z against the projective X skips the inversion.
-fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
+fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, digest: *const [Ecdsa.Hash.digest_length]u8, key_data: []const u8) VerifyError!void {
     const Curve = Ecdsa.Curve;
     const Scalar = Curve.scalar.Scalar;
     const len = Curve.scalar.encoded_length;
@@ -755,9 +871,7 @@ fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, data: *const SignedD
     if (r.isZero() or s.isZero()) return error.InvalidSignature;
 
     var wide: [64]u8 = @splat(0);
-    var hash = Ecdsa.Hash.init(.{});
-    data.feed(&hash);
-    hash.final(wide[64 - Ecdsa.Hash.digest_length ..]);
+    wide[64 - digest.len ..].* = digest.*;
     const e = Scalar.fromBytes64(wide, .big);
 
     const w = s.invert();
@@ -1488,10 +1602,11 @@ fn rrsetVerifiesWithAnyKey(
     rrset: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
 ) error{ValidationBudgetExhausted}!bool {
     for (keyset.keys[0..keyset.len], keyset.tags[0..keyset.len]) |dk, tag| {
         if (tag != rrsig.key_tag) continue;
-        if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget)) return true;
+        if (try tryVerifyRrsig(rrsig, dk, rrset, now_u32, budget, memo)) return true;
     }
     return false;
 }
@@ -1527,6 +1642,7 @@ pub fn validateRrset(
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
 ) ?dns.RrsigData {
     // Refuse rather than truncate: the caller sets AD on the *unpruned*
     // response, so verifying a signature over records[0..64] while
@@ -1550,7 +1666,7 @@ pub fn validateRrset(
         if (!sig_rr.name.eql(owner)) continue;
         if (!isSupportedAlgorithm(rrsig.algorithm)) continue;
 
-        if (rrsetVerifiesWithAnyKey(rrsig, &keyset, filtered[0..count], now_u32, budget) catch return null) return rrsig;
+        if (rrsetVerifiesWithAnyKey(rrsig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return rrsig;
     }
     // Nothing verified on a zone already proven secure — bogus, even when
     // every candidate RRSIG used an unsupported algorithm: real supported
@@ -1587,6 +1703,7 @@ pub fn verifyAuthorityProofSigs(
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *ValidationBudget,
+    memo: *VerifyMemo,
     ttl_cap: ?*u32,
 ) SecurityStatus {
     for (authorities) |rr| {
@@ -1627,7 +1744,7 @@ pub fn verifyAuthorityProofSigs(
             // as served: a real `*.zone NSEC` signature would verify under any.
             if (rrsig.labels != signedLabels(rr.name)) return .bogus;
 
-            if (rrsetVerifiesWithAnyKey(rrsig, &keyset, rrset[0..rrset_count], now_u32, budget) catch return .bogus) {
+            if (rrsetVerifiesWithAnyKey(rrsig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return .bogus) {
                 if (ttl_cap) |cap| cap.* = @min(cap.*, rrsigTtlCap(rrsig, now_u32));
                 sig_verified = true;
                 break;
@@ -1804,7 +1921,7 @@ test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, &budget),
+        validateDnskeyRrset(&dnskey_records, &.{ds}, test_owner, 1700000000, &budget, &test_memo),
     );
 }
 
@@ -1838,14 +1955,14 @@ test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidKey,
-        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
+        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget, &test_memo),
     );
 
     // 64 exactly is still accepted (and rejected on signature grounds, not
     // size) — the boundary is off-by-one sensitive.
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(records[0..64], &.{ds}, test_owner, 1700000000, &budget),
+        validateDnskeyRrset(records[0..64], &.{ds}, test_owner, 1700000000, &budget, &test_memo),
     );
 }
 
@@ -1867,14 +1984,14 @@ test "verifyAuthorityProofSigs: oversized owner+type is refused, not truncated" 
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, null),
+        verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, &test_memo, null),
     );
     // 16 is within the buffer and fails on the ordinary no-signature path,
     // so the boundary is the size check and not a signature accident.
     var budget2: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, null),
+        verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, &test_memo, null),
     );
 }
 
@@ -1921,7 +2038,7 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
     @memcpy(ok[0..64], recs[0..64]);
     ok[64] = sig_rr;
     var budget: ValidationBudget = .{};
-    _ = try validateDnskeyRrset(&ok, &.{ds}, test_owner, 1_700_000_000, &budget);
+    _ = try validateDnskeyRrset(&ok, &.{ds}, test_owner, 1_700_000_000, &budget, &test_memo);
 
     // The 65th key must not ride in on that signature.
     var laundered: [66]dns.ResourceRecord = undefined;
@@ -1930,7 +2047,7 @@ test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" 
     var budget2: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidKey,
-        validateDnskeyRrset(&laundered, &.{ds}, test_owner, 1_700_000_000, &budget2),
+        validateDnskeyRrset(&laundered, &.{ds}, test_owner, 1_700_000_000, &budget2, &test_memo),
     );
 }
 
@@ -1973,7 +2090,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
     var budget: ValidationBudget = .{ .max_sig_verify = cap };
     try testing.expectError(
         error.ValidationBudgetExhausted,
-        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget),
+        validateDnskeyRrset(&records, &.{ds}, test_owner, 1700000000, &budget, &test_memo),
     );
     try testing.expectEqual(cap, budget.sig_verify_spent);
 }
@@ -1997,7 +2114,7 @@ test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
     };
     const records = [_]dns.ResourceRecord{ds_record}; // No RRSIG present.
     var b: ValidationBudget = .{};
-    try testing.expect(validateRrset(&records, owner, .ds, &.{}, 1700000000, &b) == null);
+    try testing.expect(validateRrset(&records, owner, .ds, &.{}, 1700000000, &b, &test_memo) == null);
 }
 
 test "DS hash verification - wrong digest fails" {
@@ -2135,8 +2252,8 @@ test "ECDSA P-384 signature verification" {
     const msg = "test DNSSEC signed data";
     const sig = (try key_pair.sign(msg, null)).toBytes();
 
-    try verifyEcdsa(EcdsaP384, &sig, &SignedData.raw(msg), dnssec_key);
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &SignedData.raw("wrong data"), dnssec_key));
+    try verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, msg), dnssec_key);
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, "wrong data"), dnssec_key));
 }
 
 test "Ed25519 signature verification" {
@@ -2255,13 +2372,38 @@ test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag
         .signature = &signature,
     };
     var budget: ValidationBudget = .{};
-    try verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget);
+    try verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo);
 
     signature[100] ^= 1;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo));
     signature[100] ^= 1;
     rrsig.signer_name = test_com;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(rrsig, dnskey, &mx, 1439000000, &budget, &test_memo));
+}
+
+test "VerifyMemo: a remembered signature binds its key and still expires" {
+    const recs = [_]dns.ResourceRecord{
+        .{ .name = test_owner, .rtype = .a, .rclass = .in, .ttl = 3600, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_bytes, &pub_bytes);
+    var other_sig: [64]u8 = undefined;
+    var other_pub: [32]u8 = undefined;
+    const other = try testSignRrset(&recs, .a, test_owner, .ed25519, &other_sig, &other_pub);
+
+    var memo: VerifyMemo = try .init(testing.allocator);
+    defer memo.deinit(testing.allocator);
+    var budget: ValidationBudget = .{};
+    const now: u32 = 1_700_000_000;
+
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, now, &budget, &memo);
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, now, &budget, &memo);
+    try testing.expectEqual(1, memo.hits);
+    // Same signature and data under another key of the same algorithm.
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, other.dnskey, &recs, now, &budget, &memo));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(signed.rrsig, signed.dnskey, &recs, signed.rrsig.sig_expiration + 1, &budget, &memo));
+    try testing.expectEqual(1, memo.hits);
 }
 
 test "ECDSA P-256 accepts x(R) at or above the group order" {
@@ -2273,8 +2415,8 @@ test "ECDSA P-256 accepts x(R) at or above the group order" {
     _ = try std.fmt.hexToBytes(sig[16..32], "4319055358e8617b0c46353d039cdaab");
     _ = try std.fmt.hexToBytes(sig[32..], "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254e");
 
-    try verifyEcdsa(EcdsaP256, &sig, &SignedData.raw("123400"), &key);
-    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, &sig, &SignedData.raw("123401"), &key));
+    try verifyEcdsa(EcdsaP256, &sig, &testDigest(Sha256, "123400"), &key);
+    try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP256, &sig, &testDigest(Sha256, "123401"), &key));
 }
 
 test "invalid key sizes are rejected" {
@@ -2283,9 +2425,9 @@ test "invalid key sizes are rejected" {
     const sig96: [96]u8 = @splat(0);
 
     // ECDSA P-256: key must be 64 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, &sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP256, &sig64, &testDigest(EcdsaP256.Hash, msg), &.{ 0x01, 0x02 }));
     // ECDSA P-384: key must be 96 bytes
-    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, &sig96, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
+    try testing.expectError(error.InvalidKey, verifyEcdsa(EcdsaP384, &sig96, &testDigest(EcdsaP384.Hash, msg), &.{ 0x01, 0x02 }));
     // Ed25519: key must be 32 bytes
     try testing.expectError(error.InvalidKey, verifyEd25519(&sig64, &SignedData.raw(msg), &.{ 0x01, 0x02 }));
     // ML-DSA-44: key 1312 bytes, signature 2420 bytes
@@ -2300,8 +2442,8 @@ test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK
     var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     key_data[6] = 0x80;
     const signature: [128]u8 = @splat(0xaa);
-    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, &SignedData.raw("x"), &key_data, Sha1));
-    try testing.expectError(error.InvalidSignature, verifyRsa(&signature, &SignedData.raw("x"), &key_data, Sha256));
+    try testing.expectError(error.InvalidSignature, verifyRsa(Sha1, &signature, &testDigest(Sha1, "x"), &key_data));
+    try testing.expectError(error.InvalidSignature, verifyRsa(Sha256, &signature, &testDigest(Sha256, "x"), &key_data));
 }
 
 test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
@@ -2309,12 +2451,12 @@ test "verifyRsa rejects leading-zero-padded e=1 exponent (forgery defense)" {
     var k1 = [_]u8{ 4, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     k1[5] = 0x80;
     const sig: [128]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("x"), &k1, Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(Sha256, &sig, &testDigest(Sha256, "x"), &k1));
 
     // 2-byte exp_len encoding with 8-byte padded exponent.
     var k2 = [_]u8{ 0, 0, 8 } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x01} ++ @as([128]u8, @splat(0x55));
     k2[11] = 0x80;
-    try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("x"), &k2, Sha256));
+    try testing.expectError(error.InvalidKey, verifyRsa(Sha256, &sig, &testDigest(Sha256, "x"), &k2));
 }
 
 test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
@@ -3760,10 +3902,10 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
         } } };
     }
     var at_cap: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(rrs[0 .. 2 * max_proof_records], &.{key}, 1700000000, &at_cap, null));
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(rrs[0 .. 2 * max_proof_records], &.{key}, 1700000000, &at_cap, &test_memo, null));
     try testing.expect(at_cap.sig_verify_spent > 0);
     var past: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&rrs, &.{key}, 1700000000, &past, null));
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&rrs, &.{key}, 1700000000, &past, &test_memo, null));
     try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
@@ -3813,12 +3955,12 @@ const test_window_empty_rrset: []const dns.ResourceRecord = &.{};
 test "verifyRrsig rejects expired signature" {
     var budget: ValidationBudget = .{};
     // Expiration tolerance is 0 — any time strictly past expiration rejects.
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + 1, &budget));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1700000000 + 1, &budget, &test_memo));
 }
 
 test "verifyRrsig rejects not-yet-valid signature" {
     var budget: ValidationBudget = .{};
-    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, &budget));
+    try testing.expectError(error.SignatureExpired, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, 1699000000 - inception_skew_tolerance - 1, &budget, &test_memo));
 }
 
 test "verifyRrsig tolerates clock skew within window" {
@@ -3828,7 +3970,7 @@ test "verifyRrsig tolerates clock skew within window" {
         1699000000 - inception_skew_tolerance, // just before inception, within tolerance
     }) |now| {
         // Time check passes; empty key fails verifyEcdsa's length check first.
-        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, &budget));
+        try testing.expectError(error.InvalidKey, verifyRrsig(test_window_rrsig, test_window_dnskey, test_window_empty_rrset, now, &budget, &test_memo));
     }
 }
 
@@ -3853,7 +3995,7 @@ test "verifyRrsig rejects signer that is not an ancestor of owner (RFC 4034 §3.
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, &budget),
+        verifyRrsig(rrsig, test_window_dnskey, &rrset, 1699500000, &budget, &test_memo),
     );
 }
 
@@ -3868,6 +4010,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
             test_window_empty_rrset,
             1699500000,
             &budget,
+            &test_memo,
         ));
     }
     try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent);
@@ -3877,6 +4020,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
         test_window_empty_rrset,
         1699500000,
         &budget,
+        &test_memo,
     ));
 }
 
@@ -3910,7 +4054,7 @@ test "validateRrset propagates budget exhaustion as bogus" {
         .{ .name = test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
     };
     var budget: ValidationBudget = .{ .max_sig_verify = 0 };
-    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget) == null);
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, &test_memo) == null);
 }
 
 // ── verifyAuthorityProofSigs: validation-bypass guards ────────────────
@@ -3960,7 +4104,7 @@ test "verifyAuthorityProofSigs: NSEC without RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
     );
 }
 
@@ -3983,7 +4127,7 @@ test "verifyAuthorityProofSigs: signed NSEC + unsigned NSEC returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
     );
 }
 
@@ -4002,7 +4146,7 @@ test "verifyAuthorityProofSigs: only-unsupported-algo RRSIG returns bogus" {
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
     );
 }
 
@@ -4022,7 +4166,7 @@ test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bo
     var budget: ValidationBudget = .{};
     try testing.expectEqual(
         SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, null),
+        verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, &test_memo, null),
     );
 }
 
@@ -4042,8 +4186,8 @@ test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict"
 
     var b1: ValidationBudget = .{};
     var b2: ValidationBudget = .{};
-    try testing.expect(validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1) == null);
-    try testing.expect(validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2) == null);
+    try testing.expect(validateRrset(&with_foreign, test_owner, .a, &dnskeys, 1699500000, &b1, &test_memo) == null);
+    try testing.expect(validateRrset(without_foreign, test_owner, .a, &dnskeys, 1699500000, &b2, &test_memo) == null);
 }
 
 test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
@@ -4056,7 +4200,7 @@ test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(test_owner, test_ecdsa_dnskey)};
     var budget: ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget) == null);
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyRrsig rejects labels below the signer's label count" {
@@ -4070,9 +4214,9 @@ test "verifyRrsig rejects labels below the signer's label count" {
     var pub_buf: [32]u8 = undefined;
     var signed = try testSignRrset(&recs, .a, test_owner, .ed25519, &sig_buf, &pub_buf);
     var budget: ValidationBudget = .{};
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
     signed.rrsig.labels = 1;
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
 }
 
 test "verifyRrsig verifies signed data past its stack buffer" {
@@ -4085,9 +4229,9 @@ test "verifyRrsig verifies signed data past its stack buffer" {
     var pub_buf: [32]u8 = undefined;
     const signed = try testSignRrset(&recs, .txt, test_owner, .ed25519, &sig_buf, &pub_buf);
     var budget: ValidationBudget = .{};
-    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget);
+    try verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo);
     recs[0].rdata.txt.strings = strings[1..];
-    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget));
+    try testing.expectError(error.InvalidSignature, verifyRrsig(signed.rrsig, signed.dnskey, &recs, 1_700_000_000, &budget, &test_memo));
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
@@ -4106,12 +4250,12 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const sig_rr = dns.ResourceRecord{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
     const replayed = [_]dns.ResourceRecord{ nsecRr(v, a), sig_rr };
     var budget: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, null));
+    try testing.expectEqual(SecurityStatus.bogus, verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, &test_memo, null));
 
     const own_sig = dns.ResourceRecord{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: ValidationBudget = .{};
-    try testing.expectEqual(SecurityStatus.secure, verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, null));
+    try testing.expectEqual(SecurityStatus.secure, verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo, null));
 }
 
 test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
@@ -4149,7 +4293,7 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
         const signed = try testSignRrset(&below, rtype, parent, .ed25519, &sig_buf, &pub_buf);
         try testing.expectError(
             error.InvalidSignature,
-            verifyRrsig(signed.rrsig, signed.dnskey, &below, 1_700_000_000, &budget),
+            verifyRrsig(signed.rrsig, signed.dnskey, &below, 1_700_000_000, &budget, &test_memo),
         );
 
         // Owner == signer is the apex shape and must still verify, or the rule
@@ -4160,8 +4304,17 @@ test "verifyRrsig rejects NS and SOA signed by a strictly-higher zone" {
             .{ .name = parent, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = rdata },
         };
         const apex = try testSignRrset(&at_apex, rtype, parent, .ed25519, &apex_sig_buf, &apex_pub_buf);
-        try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget);
+        try verifyRrsig(apex.rrsig, apex.dnskey, &at_apex, 1_700_000_000, &budget, &test_memo);
     }
+}
+
+/// Remembers nothing; unit tests exercise the math alone.
+var test_memo: VerifyMemo = .{};
+
+fn testDigest(comptime Hash: type, msg: []const u8) [Hash.digest_length]u8 {
+    var d: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &d, .{});
+    return d;
 }
 
 /// Sign `rrset` with a fresh Ed25519 key; returns the RRSIG and the DNSKEY
@@ -4259,23 +4412,23 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     // Downgrade: ML-DSA-44 signature stripped, classical one intact. Bogus.
     const stripped = keys ++ [_]dns.ResourceRecord{key.sig(ed.rrsig)};
     var b1: ValidationBudget = .{};
-    try testing.expectError(error.InvalidSignature, validateDnskeyRrset(&stripped, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b1));
+    try testing.expectError(error.InvalidSignature, validateDnskeyRrset(&stripped, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b1, &test_memo));
 
     // Both present, either order: the ML-DSA-44 one is what verifies.
     const dual = keys ++ [_]dns.ResourceRecord{ key.sig(ed.rrsig), key.sig(pq) };
     var b2: ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b2)).algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual, &.{ ed_ds, pq_ds }, test_owner, 1_700_000_000, &b2, &test_memo)).algorithm);
     const dual_rev = keys ++ [_]dns.ResourceRecord{ key.sig(pq), key.sig(ed.rrsig) };
-    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual_rev, &.{ pq_ds, ed_ds }, test_owner, 1_700_000_000, &b2)).algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.mldsa44, (try validateDnskeyRrset(&dual_rev, &.{ pq_ds, ed_ds }, test_owner, 1_700_000_000, &b2, &test_memo)).algorithm);
 
     // An ML-DSA-44 DS that anchors nothing demands nothing: unknown digest,
     // or SHA-1 beside a usable SHA-256 DS (RFC 4509 §3).
     const odd_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = @fromBackingInt(9), .digest = &pq_digest };
     var b4: ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, odd_ds }, test_owner, 1_700_000_000, &b4)).algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, odd_ds }, test_owner, 1_700_000_000, &b4, &test_memo)).algorithm);
     var pq_sha1 = try dsDigest(Sha1, test_owner, pq_key);
     const sha1_ds = dns.DsData{ .key_tag = keyTag(pq_key), .algorithm = .mldsa44, .digest_type = .sha1, .digest = &pq_sha1 };
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, sha1_ds }, test_owner, 1_700_000_000, &b4)).algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ ed_ds, sha1_ds }, test_owner, 1_700_000_000, &b4, &test_memo)).algorithm);
 
     // Only the ML-DSA-44 key survives into the keyset used below the apex;
     // without an ML-DSA-44 DS the keyset stays whole.
@@ -4289,7 +4442,7 @@ test "validateDnskeyRrset: a DS advertising ML-DSA-44 makes its signature the on
     // No ML-DSA-44 DS: the key's presence in the DNSKEY RRset alone demands
     // nothing (RFC 6840 §5.11 MUST NOT; RFC 6781 §4.1.4 liberal rollover).
     var b3: ValidationBudget = .{};
-    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ed_ds}, test_owner, 1_700_000_000, &b3)).algorithm);
+    try testing.expectEqual(dns.DnssecAlgorithm.ed25519, (try validateDnskeyRrset(&stripped, &.{ed_ds}, test_owner, 1_700_000_000, &b3, &test_memo)).algorithm);
 }
 
 test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
@@ -4313,7 +4466,7 @@ test "validateDnskeyRrset: RRSIG algorithm must match the DS-anchored key's" {
     var budget: ValidationBudget = .{};
     try testing.expectError(
         error.InvalidSignature,
-        validateDnskeyRrset(&recs, &.{ds}, test_owner, 1_700_000_000, &budget),
+        validateDnskeyRrset(&recs, &.{ds}, test_owner, 1_700_000_000, &budget, &test_memo),
     );
 }
 
@@ -4346,7 +4499,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .{ .name = test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
     };
     var budget: ValidationBudget = .{};
-    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget).?;
+    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &test_memo).?;
     // The verifying signature's own bounds: original_ttl 300 against a
     // remaining window of 100_000_000 s. Never the junk record's 1.
     try testing.expectEqual(@as(u32, 300), rrsigTtlCap(sig, now));
@@ -4369,7 +4522,7 @@ test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the sh
     // 60 s before the signature dies.
     const now: u32 = 1_800_000_000 - 60;
     var budget: ValidationBudget = .{};
-    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget).?;
+    const sig = validateRrset(&answers, test_owner, .a, &dnskeys, now, &budget, &test_memo).?;
     try testing.expectEqual(@as(u32, 60), rrsigTtlCap(sig, now));
 }
 
@@ -4401,14 +4554,14 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     @memcpy(answers[0..70], &recs);
     answers[70] = sig_rr;
     var budget: ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1_700_000_000, &budget) == null);
+    try testing.expect(validateRrset(&answers, test_owner, .a, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 
     // Control: the signed 64 on their own still validate.
     var exact: [65]dns.ResourceRecord = undefined;
     @memcpy(exact[0..64], recs[0..64]);
     exact[64] = sig_rr;
     var budget2: ValidationBudget = .{};
-    try testing.expect(validateRrset(&exact, test_owner, .a, &dnskeys, 1_700_000_000, &budget2) != null);
+    try testing.expect(validateRrset(&exact, test_owner, .a, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
 }
 
 test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
@@ -4421,7 +4574,7 @@ test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
         rrsigRr(test_owner, .a, .dsasha1, 0, test_owner),
     };
     var budget: ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget) == null);
+    try testing.expect(validateRrset(&answers, test_owner, .a, &.{}, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyRsa rejects exponents 0, 1 and even" {
@@ -4431,7 +4584,7 @@ test "verifyRsa rejects exponents 0, 1 and even" {
         key_data[0] = exp.len;
         @memcpy(key_data[1..][0..exp.len], exp);
         @memset(key_data[1 + exp.len ..], 0xAA);
-        try testing.expectError(error.InvalidKey, verifyRsa(&sig, &SignedData.raw("test"), &key_data, Sha256));
+        try testing.expectError(error.InvalidKey, verifyRsa(Sha256, &sig, &testDigest(Sha256, "test"), &key_data));
     }
 }
 
@@ -4467,7 +4620,7 @@ test "verifyRsa bounds the public exponent (RFC 3110 allows absurd ones)" {
         @memset(buf[1..][0..elen], 0xFF);
         @memset(buf[1 + elen ..][0..256], 0xFF);
         const key_data = buf[0 .. 1 + elen + 256];
-        const res = verifyRsa(&sig, &SignedData.raw("hello"), key_data, Sha256);
+        const res = verifyRsa(Sha256, &sig, &testDigest(Sha256, "hello"), key_data);
         if (want_rejected) {
             // Rejected on the key, before any modular arithmetic runs.
             try testing.expectError(error.InvalidKey, res);
