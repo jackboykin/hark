@@ -38,17 +38,15 @@ pub const VerifyError = error{
 /// zones SERVFAIL during rollover windows.
 const max_sig_verify_per_resolution: u32 = 96;
 
-/// NSEC3 hash cap per query (CVE-2023-50868). Whole-query exhaustion fails
-/// CLOSED to `.bogus`; the per-record `max_nsec3_iterations` cap fails OPEN.
-const max_nsec3_hashes_per_resolution: u32 = 96;
+const max_nsec3_blocks_per_resolution: u32 = 8192;
 
 /// Per-resolution DNSSEC CPU budget, shared by every cell a client question
 /// demands (`graph.Budget`). Exactly `max` draws succeed; the rest refuse.
 pub const ValidationBudget = struct {
     sig_verify_spent: u32 = 0,
     max_sig_verify: u32 = max_sig_verify_per_resolution,
-    nsec3_hash_spent: u32 = 0,
-    max_nsec3_hash: u32 = max_nsec3_hashes_per_resolution,
+    nsec3_blocks_spent: u32 = 0,
+    max_nsec3_blocks: u32 = max_nsec3_blocks_per_resolution,
 
     fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
         if (self.sig_verify_spent >= self.max_sig_verify) return error.ValidationBudgetExhausted;
@@ -56,12 +54,19 @@ pub const ValidationBudget = struct {
     }
 
     pub fn exhausted(self: *const ValidationBudget) bool {
-        return self.sig_verify_spent >= self.max_sig_verify or self.nsec3_hash_spent >= self.max_nsec3_hash;
+        return self.sig_verify_spent >= self.max_sig_verify or self.nsec3Exhausted();
     }
 
-    pub fn consumeNsec3Hash(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.nsec3_hash_spent >= self.max_nsec3_hash) return error.ValidationBudgetExhausted;
-        self.nsec3_hash_spent += 1;
+    pub fn nsec3Exhausted(self: *const ValidationBudget) bool {
+        return self.nsec3_blocks_spent >= self.max_nsec3_blocks;
+    }
+
+    pub fn consumeNsec3(self: *ValidationBudget, blocks: u32) error{ValidationBudgetExhausted}!void {
+        if (blocks > self.max_nsec3_blocks - @min(self.nsec3_blocks_spent, self.max_nsec3_blocks)) {
+            self.nsec3_blocks_spent = self.max_nsec3_blocks;
+            return error.ValidationBudgetExhausted;
+        }
+        self.nsec3_blocks_spent += blocks;
     }
 };
 

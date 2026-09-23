@@ -52,11 +52,18 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 /// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
 /// zone draining its own budget must not drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
-    if (g.payer.validation.exhausted()) return g.fail(id, .{ .code = .dnssec_bogus, .text = "validation budget spent" });
+    if (budgetSpent(g)) |why| return g.fail(id, why);
     const t = g.cell(rid);
     t.expires_ns = @min(t.expires_ns, g.now());
     if (t.blob) |b| g.store.drop(t.key, b);
     try g.fail(id, .{ .code = .dnssec_bogus });
+}
+
+fn budgetSpent(g: *Graph) ?Failure {
+    const b = &g.payer.validation;
+    if (b.nsec3Exhausted()) return .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent" };
+    if (b.exhausted()) return .{ .code = .dnssec_bogus, .text = "validation budget spent" };
+    return null;
 }
 
 /// A zone's DS or keys proven bogus: demanding them again is refused for
@@ -139,9 +146,9 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
                 return failChain(g, id, s.rrset.?);
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
-                .insecure => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
+                .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
                 // A proven non-cut, or no proof: the bytes are sound.
-                else => try g.fail(id, no_cut),
+                .unproven, .bogus => try g.fail(id, budgetSpent(g) orelse no_cut),
             }
         },
         .alias, .yxdomain => unreachable,

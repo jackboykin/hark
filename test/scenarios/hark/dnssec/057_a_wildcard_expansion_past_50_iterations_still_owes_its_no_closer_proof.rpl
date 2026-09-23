@@ -1,0 +1,97 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a wildcard expansion past 50 iterations still owes its no-closer-match proof
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN NS
+    SECTION ANSWER
+      example. 3600 IN NS ns.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.example. IN A
+    SECTION ANSWER
+      a.example. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      3G0296CSQ440AM918JRUB42G7576P103.example. 3600 IN NSEC3 1 0 100 AABB 3G0296CSQ440AM918JRUB42G7576P105 A RRSIG
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      3G0296CSQ440AM918JRUB42G7576P103.example. 3600 IN NSEC3 1 0 100 AABB 3G0296CSQ440AM918JRUB42G7576P105 A RRSIG
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.example. IN A
+  SECTION ANSWER
+    a.example. IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+SCENARIO_END

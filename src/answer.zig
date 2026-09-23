@@ -525,7 +525,7 @@ pub const Failures = struct {
         const e = f.map.get(key(&buf, q, cd)) orelse return null;
         if (e.until_ns <= now_ns) return null;
         return switch (e.ede.code) {
-            .dnssec_bogus, .stale_answer, .stale_nxdomain_answer => e.ede,
+            .dnssec_bogus, .unsupported_nsec3_iterations, .stale_answer, .stale_nxdomain_answer => e.ede,
             else => .{ .code = .cached_error },
         };
     }

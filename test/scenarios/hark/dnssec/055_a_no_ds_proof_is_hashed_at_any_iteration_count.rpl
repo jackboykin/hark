@@ -1,0 +1,147 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a no-DS proof is hashed at any iteration count: 100 resolves insecure, past the budget SERVFAILs with EDE 27
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN NS
+    SECTION ANSWER
+      example. 3600 IN NS ns.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      SG47CABJS5K60K6J71146IB8M4LVPD3B.example. 3600 IN NSEC3 1 0 100 AABB SG47CABJS5K60K6J71146IB8M4LVPD3C NS
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION AUTHORITY
+      child.example. 3600 IN NS ns.child.example.
+      SG47CABJS5K60K6J71146IB8M4LVPD3B.example. 3600 IN NSEC3 1 0 100 AABB SG47CABJS5K60K6J71146IB8M4LVPD3C NS
+    SECTION ADDITIONAL
+      ns.child.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      kid.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      0FFT3235SMBUBMFDBT4LHL17OUBJL6GG.example. 3600 IN NSEC3 1 0 65535 AABB 0FFT3235SMBUBMFDBT4LHL17OUBJL6GH NS
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      www.kid.example. IN A
+    SECTION AUTHORITY
+      kid.example. 3600 IN NS ns.kid.example.
+      0FFT3235SMBUBMFDBT4LHL17OUBJL6GG.example. 3600 IN NSEC3 1 0 65535 AABB 0FFT3235SMBUBMFDBT4LHL17OUBJL6GH NS
+    SECTION ADDITIONAL
+      ns.kid.example. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 3600 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.kid.example. IN A
+    SECTION ANSWER
+      www.kid.example. 3600 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.child.example. IN A
+  SECTION ANSWER
+    www.child.example. IN A 192.0.2.7
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.kid.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=27
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.kid.example. IN A
+ENTRY_END
+
+SCENARIO_END

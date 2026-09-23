@@ -1095,7 +1095,7 @@ pub const Graph = struct {
             g.release(id);
         }
         _ = g.scratch.reset(.retain_capacity);
-        g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_hash = 0 } };
+        g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
         g.payer = g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;
         g.tally.runs += 1;

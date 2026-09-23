@@ -247,7 +247,7 @@ fn draw(z: *Zone, s: *Smith) void {
     z.optout = z.nsec3 and s.boolWeighted(1, 1);
     z.salt_len = s.valueRangeAtMost(u8, 0, z.salt.len);
     s.bytes(z.salt[0..z.salt_len]);
-    z.iterations = s.valueRangeAtMost(u16, 0, 2);
+    z.iterations = ([_]u16{ 0, 1, 2, 51, 150 })[s.valueRangeAtMost(u8, 0, 4)];
     const all_optout = z.optout and s.boolWeighted(1, 1);
 
     // Hashes are entry-indexed here and record-indexed once sorted.
@@ -417,7 +417,7 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
     const v3 = proof.classifyDelegation(ref, child, zone, &budget);
     errdefer dump(&z, ref, child, .ds, .{ insecure_delegation, v3 });
     switch (v3) {
-        .insecure => {
+        .unsigned => {
             if (child.labels.len == 1 or z.cutAbove(child)) return error.UnsoundDelegation;
             // An omitted ENT hashes into an Opt-Out span: to a validator it
             // doesn't exist, and the clause below grants those §12.2's
@@ -425,9 +425,8 @@ fn fuzzOne(_: void, s: *Smith) anyerror!void {
             if (e != null and !insecure_delegation and !z.omitted(e.?)) return error.UnsoundDelegation;
             if (!z.inChain(child) and !z.optoutCovered(z.nextCloser(child))) return error.UnsoundDelegation;
         },
-        .secure => if (exact and insecure_delegation) return error.HonestDelegationRefused,
+        .unproven => if (exact and insecure_delegation) return error.HonestDelegationRefused,
         .bogus => {},
-        .unchecked => return error.DelegationVerdict,
     }
 }
 
