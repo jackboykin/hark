@@ -8,7 +8,6 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 
-const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -444,7 +443,7 @@ pub fn verifyRrsig(
     };
 
     switch (rrsig.algorithm) {
-        inline .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => |alg| {
+        inline .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => |alg| {
             var digest: [Digest(alg).digest_length]u8 = undefined;
             var hash = Digest(alg).init(.{});
             data.feed(&hash);
@@ -467,7 +466,6 @@ pub fn verifyRrsig(
 /// the data themselves; SHA-256 only names their entries.
 fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
     return switch (algorithm) {
-        .rsasha1, .rsasha1_nsec3 => Sha1,
         .rsasha256, .ecdsap256sha256, .ed25519, .mldsa44 => Sha256,
         .ecdsap384sha384 => Sha384,
         .rsasha512 => Sha512,
@@ -475,12 +473,10 @@ fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
     };
 }
 
-/// RFC 8624 §3.1: MUST validate RSASHA1/RSASHA1-NSEC3 even though they
-/// are NOT RECOMMENDED for signing — signing-not-recommended is not
-/// validation-unsupported. The same set as `verifyRrsig`'s prongs.
+/// The same set as `verifyRrsig`'s prongs.
 pub fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
     return switch (algo) {
-        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => true,
+        .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => true,
         else => false,
     };
 }
@@ -495,7 +491,7 @@ fn verifyMath(
     key: []const u8,
 ) VerifyError!void {
     return switch (algorithm) {
-        .rsasha1, .rsasha1_nsec3, .rsasha256, .rsasha512 => verifyRsa(Digest(algorithm), signature, digest, key),
+        .rsasha256, .rsasha512 => verifyRsa(Digest(algorithm), signature, digest, key),
         .ecdsap256sha256 => verifyEcdsa(EcdsaP256, signature, digest, key),
         .ecdsap384sha384 => verifyEcdsa(EcdsaP384, signature, digest, key),
         .ed25519 => verifyEd25519(signature, data, key),
@@ -568,10 +564,6 @@ fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.di
 /// EMSA-PKCS1-v1_5 (RFC 8017 §9.2); the stdlib's is private.
 fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_length]u8) void {
     const hash_der: []const u8 = &switch (Hash) {
-        Sha1 => .{
-            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
-            0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
-        },
         Sha256 => .{
             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
@@ -677,21 +669,15 @@ pub fn signedLabels(name: dns.Name) usize {
     return name.labels.len - @intFromBool(star);
 }
 
-test "isSupportedAlgorithm covers RFC 8624 MUST-validate set" {
-    // RFC 8624 §3.1: validators MUST validate algorithms 5 (RSASHA1),
-    // 7 (RSASHA1-NSEC3-SHA1), 8 (RSASHA256), 10 (RSASHA512), 13 and 14
-    // (ECDSA), 15 (Ed25519). Marking any of these unsupported silently
-    // downgrades signed zones to insecure and lets forged answers through.
-    try testing.expect(isSupportedAlgorithm(.rsasha1));
-    try testing.expect(isSupportedAlgorithm(.rsasha1_nsec3));
+test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
     try testing.expect(isSupportedAlgorithm(.rsasha256));
     try testing.expect(isSupportedAlgorithm(.rsasha512));
     try testing.expect(isSupportedAlgorithm(.ecdsap256sha256));
     try testing.expect(isSupportedAlgorithm(.ecdsap384sha384));
     try testing.expect(isSupportedAlgorithm(.ed25519));
     try testing.expect(isSupportedAlgorithm(.mldsa44));
-    // Algorithms RFC 8624 declares MUST NOT use for either signing or
-    // validation should still register as unsupported.
+    try testing.expect(!isSupportedAlgorithm(.rsasha1));
+    try testing.expect(!isSupportedAlgorithm(.rsasha1_nsec3));
     try testing.expect(!isSupportedAlgorithm(.rsamd5));
     try testing.expect(!isSupportedAlgorithm(.dsasha1));
 }
@@ -975,7 +961,6 @@ test "verifyRsa accepts RFC 3110 keys with exponent > 4 bytes (xelerance.com KSK
     var key_data = [_]u8{ 5, 0x01, 0x00, 0x00, 0x00, 0x01 } ++ @as([128]u8, @splat(0x55));
     key_data[6] = 0x80;
     const signature: [128]u8 = @splat(0xaa);
-    try testing.expectError(error.InvalidSignature, verifyRsa(Sha1, &signature, &testDigest(Sha1, "x"), &key_data));
     try testing.expectError(error.InvalidSignature, verifyRsa(Sha256, &signature, &testDigest(Sha256, "x"), &key_data));
 }
 
@@ -1003,20 +988,6 @@ test "pkcs1v15Encode produces RFC 8017 §9.2 byte layout (per hash)" {
         hash_abc: []const u8,
     };
     inline for ([_]Case{
-        .{
-            .Hash = Sha1,
-            .digest_len = 20,
-            .der = &.{
-                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
-                0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
-            },
-            // SHA-1("abc") — RFC 3174 Appendix A.
-            .hash_abc = &.{
-                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a,
-                0xba, 0x3e, 0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c,
-                0x9c, 0xd0, 0xd8, 0x9d,
-            },
-        },
         .{
             .Hash = Sha256,
             .digest_len = 32,
