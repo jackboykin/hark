@@ -436,12 +436,22 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
 
+/// One scenario under one seed, run twice.
+const Job = struct {
+    path: []const u8,
+    scenario: rpl.Scenario,
+    seed: u64,
+    expect_fail: bool,
+    failed: bool = false,
+    tally: graph.Tally = .{},
+    cells: usize = 0,
+};
+
 /// Replay every scenario under `root` across `seeds`, checking
-/// that one seed replays to one upstream query log.
+/// that one seed replays to one upstream query log. The runs share
+/// nothing, so debug spreads them over every core.
 fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
     const io = testing.io;
-    // Debug catches leaks; the tally wants the production allocator.
-    const gpa = if (@import("builtin").mode == .debug) testing.allocator else std.heap.smp_allocator;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -450,6 +460,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     var walker = try dir.walk(testing.allocator);
     defer walker.deinit();
     var r: Replayed = .{ .parsed = 0, .failed = 0 };
+    var jobs: std.ArrayList(Job) = .empty;
     while (try walker.next(io)) |ent| {
         if (ent.kind != .file or !mem.endsWith(u8, ent.basename, ".rpl")) continue;
         const text = try dir.readFileAlloc(io, ent.path, arena, .limited(1 << 20));
@@ -464,36 +475,25 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         r.parsed += 1;
         var expect_fail = false;
         for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
+        const path = try arena.dupe(u8, ent.path);
         var seed: u64 = 1;
-        while (seed <= seeds) : (seed += 1) {
-            var first: Report = .{};
-            defer gpa.free(first.log);
-            const result = runScenario(gpa, &scenario, .{ .seed = seed }, &first);
-            inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(r.tally, f) += @field(first.tally, f);
-            r.cells += first.cells;
-            r.scenarios += 1;
-            if (expect_fail) {
-                if (result) |_| {
-                    r.failed += 1;
-                    std.debug.print("{s}: passed but is marked xfail\n", .{ent.path});
-                } else |_| {}
-                continue;
-            }
-            result catch |err| {
-                r.failed += 1;
-                std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ ent.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
-                break;
-            };
-            var second: Report = .{};
-            defer gpa.free(second.log);
-            runScenario(gpa, &scenario, .{ .seed = seed }, &second) catch {};
-            if (!mem.eql(u8, first.log, second.log)) {
-                r.failed += 1;
-                std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ ent.path, seed });
-                break;
-            }
-        }
+        while (seed <= seeds) : (seed += 1) try jobs.append(arena, .{ .path = path, .scenario = scenario, .seed = seed, .expect_fail = expect_fail });
     }
+    var next: std.atomic.Value(usize) = .init(0);
+    var leaked: std.atomic.Value(bool) = .init(false);
+    // Release runs time the model: one thread, so the numbers compare.
+    const cpus = if (@import("builtin").mode == .debug) std.Thread.getCpuCount() catch 1 else 1;
+    const threads = try arena.alloc(std.Thread, @min(jobs.items.len, cpus) -| 1);
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, replayJobs, .{ jobs.items, &next, &leaked });
+    replayJobs(jobs.items, &next, &leaked);
+    for (threads) |t| t.join();
+    for (jobs.items) |j| {
+        inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(r.tally, f) += @field(j.tally, f);
+        r.cells += j.cells;
+        r.scenarios += 1;
+        r.failed += @intFromBool(j.failed);
+    }
+    if (leaked.load(.monotonic)) r.failed += 1;
     // Debug numbers mean nothing.
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
@@ -513,6 +513,47 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         @as(f64, @floatFromInt(r.cells)) / @as(f64, @floatFromInt(@max(r.scenarios, 1))),
     });
     return r;
+}
+
+/// Take jobs until none are left. Debug catches leaks per thread; the
+/// tally wants the production allocator.
+fn replayJobs(jobs: []Job, next: *std.atomic.Value(usize), leaked: *std.atomic.Value(bool)) void {
+    const debug = @import("builtin").mode == .debug;
+    var da: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
+    defer if (debug and da.deinit() == .leak) leaked.store(true, .monotonic);
+    const gpa = if (debug) da.allocator() else std.heap.smp_allocator;
+    while (true) {
+        const i = next.fetchAdd(1, .monotonic);
+        if (i >= jobs.len) return;
+        replayJob(gpa, &jobs[i]);
+    }
+}
+
+fn replayJob(gpa: Allocator, j: *Job) void {
+    var first: Report = .{};
+    defer gpa.free(first.log);
+    const result = runScenario(gpa, &j.scenario, .{ .seed = j.seed }, &first);
+    j.tally = first.tally;
+    j.cells = first.cells;
+    if (j.expect_fail) {
+        if (result) |_| {
+            j.failed = true;
+            std.debug.print("{s}: passed but is marked xfail\n", .{j.path});
+        } else |_| {}
+        return;
+    }
+    result catch |err| {
+        j.failed = true;
+        std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, j.seed, first.phase, first.step, first.msg, @errorName(err), first.log });
+        return;
+    };
+    var second: Report = .{};
+    defer gpa.free(second.log);
+    runScenario(gpa, &j.scenario, .{ .seed = j.seed }, &second) catch {};
+    if (!mem.eql(u8, first.log, second.log)) {
+        j.failed = true;
+        std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ j.path, j.seed });
+    }
 }
 
 // `HARK_SCENARIO=path/to/x.rpl zig build test` replays one scenario with
