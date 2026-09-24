@@ -75,6 +75,10 @@ pub fn extractReferral(
     parent_zone: dns.Name,
     policy: AddrPolicy,
 ) ?Referral {
+    // Servers that set AA on referrals still refer: only answers or an SOA
+    // make the NS the zone's own.
+    if (response.header.flags.aa and response.answers.len > 0) return null;
+    for (response.authorities) |rr| if (rr.rtype == .soa and target.isSubdomainOf(rr.name)) return null;
     var zone_cut: ?dns.Name = null;
     var zone_cut_depth: usize = 0;
     for (response.authorities) |rr| {

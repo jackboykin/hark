@@ -32,7 +32,7 @@ pub const VerifyError = error{
     ValidationBudgetExhausted,
 };
 
-/// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per query. Sized for a
+/// KeyTrap (CVE-2023-50387) cap on RRSIG verifies per resolution. Sized for a
 /// cold-cache 5-level chain × dual-algo × KSK rollover. Raise if legitimate
 /// zones SERVFAIL during rollover windows.
 const max_sig_verify_per_resolution: u32 = 96;

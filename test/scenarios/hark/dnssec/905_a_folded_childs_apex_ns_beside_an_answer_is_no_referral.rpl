@@ -1,0 +1,76 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+
+SCENARIO_BEGIN a folded child's apex NS beside an answer is no referral
+
+; example. and its signed child child.example. share a server, which never
+; refers to the child: it answers from child.example. itself, AA, and puts
+; the child's apex NS in authority beside the wildcard expansion and its
+; no-closer-match NSEC (the .ph servers answer this way). That NS is answer
+; data, not a delegation. Taken as a referral, it minted the cut and read
+; the child's NSEC as the parent's word on the child's DS: a DS denial
+; signed below its owner, bogus, refused for servfail-ttl across the child.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.child.example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 3600 IN A 192.0.2.7
+    SECTION AUTHORITY
+      child.example. 3600 IN NS ns.example.
+      *.child.example. 3600 IN NSEC child.example. A RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION ANSWER
+      child.example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.child.example. IN A
+  SECTION ANSWER
+    www.child.example. 3600 IN A 192.0.2.7
+ENTRY_END
+
+SCENARIO_END

@@ -437,7 +437,7 @@ pub const Graph = struct {
     ready: std.ArrayList(CellId) = .empty,
     /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,
-    /// Per-server estimate, capped; the one state outliving a demand.
+    /// Per-server estimate, capped.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
     /// Verified NSEC facts in span order (denial.zig).
