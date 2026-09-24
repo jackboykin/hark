@@ -347,6 +347,13 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
             pos += nsec_data.type_bit_maps.len;
             return pos;
         },
+        .named => |d| {
+            if (d.head.len > buf.len) return error.BufferTooSmall;
+            @memcpy(buf[0..d.head.len], d.head);
+            var pos = d.head.len;
+            for (d.names) |name| pos += try writeCanonicalNameWire(buf[pos..], name);
+            return pos;
+        },
         else => {
             var ser = dns.Serializer.init(buf);
             ser.writeRData(rdata) catch return error.BufferTooSmall;
@@ -851,6 +858,37 @@ test "buildSignedData reconstructs wildcard owner name" {
     // NOT \x03foo\x07example\x03com\x00 (17 bytes)
     const expected_wc_owner = "\x01*\x07example\x03com\x00";
     try testing.expectEqualSlices(u8, expected_wc_owner, signed[rr_start..][0..expected_wc_owner.len]);
+}
+
+test "verifyRrsig takes an SRV target that arrived compressed and mixed case" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = "\x00\x00\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00" ++
+        "\x04_sip\x04_tcp\x07Example\x00\x00\x21\x00\x01" ++
+        "\xc0\x0c\x00\x21\x00\x01\x00\x00\x01\x2c\x00\x0c" ++
+        "\x00\x0a\x00\x14\x13\xc4\x03SIP\xc0\x16";
+    const msg = try dns.parseMessage(a, wire);
+    const b64 = std.base64.standard.Decoder;
+    var key: [32]u8 = undefined;
+    try b64.decode(&key, "pN1ZplRgxmic0CryiKUUNeppeKGaijf6hL5+N3QVvM4=");
+    var sig: [64]u8 = undefined;
+    try b64.decode(&sig, "90H7Oz/xTne6mQrj0HA4f59/p3hGTc4GS1j+p5QY19Mkda7NqlosTLVN0ewALvovWJXG9FpbnzIhjBvdGNCQCQ==");
+    const rrsig: dns.RrsigData = .{
+        .type_covered = .srv,
+        .algorithm = .ed25519,
+        .labels = 3,
+        .original_ttl = 300,
+        .sig_expiration = 2114380800, // 20370101000000
+        .sig_inception = 1767225600, // 20260101000000
+        .key_tag = 60260,
+        .signer_name = try dns.parseDottedName(a, "example"),
+        .signature = &sig,
+    };
+    const dnskey: dns.DnskeyData = .{ .flags = 257, .protocol = 3, .algorithm = .ed25519, .public_key = &key };
+    var budget: ValidationBudget = .{};
+    var memo: VerifyMemo = .{};
+    try verifyRrsig(rrsig, dnskey, msg.answers, 1_800_000_000, &budget, &memo);
 }
 
 test "ECDSA P-384 signature verification" {

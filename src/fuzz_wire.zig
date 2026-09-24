@@ -123,6 +123,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
         switch (rr.rdata) {
             .ns, .cname, .dname, .ptr => |n| try checkName(alloc, n),
             .rrsig => |x| try checkName(alloc, x.signer_name),
+            .named => |x| for (x.names) |n| try checkName(alloc, n),
             .mx => |x| try checkName(alloc, x.exchange),
             .soa => |x| {
                 try checkName(alloc, x.mname);

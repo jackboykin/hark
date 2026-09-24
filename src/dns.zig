@@ -53,7 +53,14 @@ pub const RType = enum(u16) {
     ptr = 12,
     mx = 15,
     txt = 16,
+    rp = 17,
+    afsdb = 18,
+    rt = 21,
+    px = 26,
     aaaa = 28,
+    srv = 33,
+    naptr = 35,
+    kx = 36,
     /// RFC 6672. RFC 6840 §4.1 also requires recognizing the bit in an
     /// NSEC/NSEC3 bitmap: names beneath a DNAME owner are synthesized,
     /// not absent.
@@ -341,6 +348,11 @@ pub const Nsec3Data = struct {
     type_bit_maps: []const u8,
 };
 
+pub const NamedData = struct {
+    head: []const u8,
+    names: []const Name,
+};
+
 pub const RData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
@@ -356,6 +368,7 @@ pub const RData = union(enum) {
     ds: DsData,
     nsec: NsecData,
     nsec3: Nsec3Data,
+    named: NamedData,
     unknown: []const u8,
 };
 
@@ -576,6 +589,17 @@ fn compressedNames(rtype: RType) ?struct { skip: u8, names: u8 } {
         .ns, .cname, .ptr => .{ .skip = 0, .names = 1 },
         .mx => .{ .skip = 2, .names = 1 },
         .soa => .{ .skip = 0, .names = 2 },
+        else => null,
+    };
+}
+
+fn embeddedNames(rtype: RType) ?struct { skip: u8, strings: u8 = 0, names: u8 } {
+    return switch (rtype) {
+        .rp => .{ .skip = 0, .names = 2 },
+        .afsdb, .rt, .kx => .{ .skip = 2, .names = 1 },
+        .px => .{ .skip = 2, .names = 2 },
+        .srv => .{ .skip = 6, .names = 1 },
+        .naptr => .{ .skip = 4, .strings = 3, .names = 1 },
         else => null,
     };
 }
@@ -1026,11 +1050,33 @@ const Parser = struct {
                     .type_bit_maps = try self.readSlice(bitmap_len),
                 } };
             },
-            .opt, .any, .svcb, .https, .nsec3param, _ => {
-                const data = try self.readSlice(rdlength);
-                return .{ .unknown = data };
+            else => {
+                if (embeddedNames(rtype) != null) return .{ .named = try self.parseNamed(rtype, rdlength, allocator) };
+                return .{ .unknown = try self.readSlice(rdlength) };
             },
         }
+    }
+
+    fn parseNamed(self: *Parser, rtype: RType, rdlength: usize, allocator: Allocator) Error!NamedData {
+        const layout = embeddedNames(rtype).?;
+        const start = self.pos;
+        const rdata_end = start + rdlength;
+        var at = start + layout.skip;
+        for (0..layout.strings) |_| {
+            if (at >= rdata_end) return error.InvalidRDataLength;
+            at += 1 + @as(usize, self.msg[at]);
+        }
+        if (at > rdata_end) return error.InvalidRDataLength;
+        self.pos = at;
+        var names: [2]Name = undefined;
+        var n: usize = 0;
+        errdefer for (names[0..n]) |name| freeWireParsedName(allocator, name);
+        for (0..layout.names) |_| {
+            names[n] = try self.parseName(allocator);
+            n += 1;
+        }
+        if (self.pos != rdata_end) return error.FormatError;
+        return .{ .head = self.msg[start..at], .names = try allocator.dupe(Name, names[0..n]) };
     }
 
     fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
@@ -1148,9 +1194,9 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
 ///
 /// Lifetime contract: parsed `Name.labels[i]` byte slices and rdata byte
 /// slices (RRSIG signature, DNSKEY public_key, DS digest, NSEC bitmap,
-/// NSEC3 salt/hash/bitmap, NSEC3PARAM salt, unknown, EDNS option data)
-/// alias `bytes` — the wire buffer. Caller must keep `bytes` alive for
-/// the lifetime of the returned Message.
+/// NSEC3 salt/hash/bitmap, NSEC3PARAM salt, named head, unknown,
+/// EDNS option data) alias `bytes` — the wire buffer. Caller must keep
+/// `bytes` alive for the lifetime of the returned Message.
 ///
 /// `allocator` must be an arena on success: the returned Message's
 /// aliased slices point into `bytes`, so nothing in it can be freed one
@@ -1442,6 +1488,10 @@ pub const Serializer = struct {
                 try self.writeU8(try castOrRDataErr(u8, nsec3.next_hashed_owner.len));
                 try self.writeSlice(nsec3.next_hashed_owner);
                 try self.writeSlice(nsec3.type_bit_maps);
+            },
+            .named => |d| {
+                try self.writeSlice(d.head);
+                for (d.names) |name| try self.writeName(name, false);
             },
             .unknown => |data| try self.writeSlice(data),
         }
@@ -1893,7 +1943,7 @@ test "a record written from its stored bytes is the record written from its fiel
     };
     for (datas) |d| {
         const rtype: RType = switch (d) {
-            .unknown => unreachable,
+            .named, .unknown => unreachable,
             inline else => |_, tag| @field(RType, @tagName(tag)),
         };
         const rr: ResourceRecord = .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d };
@@ -2188,8 +2238,8 @@ test "validateResponse: only the one question sent, at any rcode" {
 /// Free only the heap-allocated outer slice of a `Name` parsed from a wire
 /// buffer. Inner labels alias the wire (`parseName` collects them into a
 /// stack buffer and `dupe`s only the outer slice), so they are never
-/// freed. Used on parseMessage error
-/// paths to drain per-record interiors without touching wire-aliased data.
+/// freed. Used on parseMessage error paths to drain per-record interiors
+/// without touching wire-aliased data.
 fn freeWireParsedName(allocator: Allocator, name: Name) void {
     allocator.free(name.labels);
 }
@@ -2211,6 +2261,10 @@ fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
         .txt => |t| allocator.free(t.strings),
         .rrsig => |r| freeWireParsedName(allocator, r.signer_name),
         .nsec => |n| freeWireParsedName(allocator, n.next_domain_name),
+        .named => |d| {
+            for (d.names) |name| freeWireParsedName(allocator, name);
+            allocator.free(d.names);
+        },
     }
 }
 
@@ -2228,6 +2282,11 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
             s.rname = try cloneNameLower(allocator, s.rname);
         },
         .rrsig => |*r| r.signer_name = try cloneNameLower(allocator, r.signer_name),
+        .named => |*d| {
+            const names = try allocator.alloc(Name, d.names.len);
+            for (d.names, names) |name, *to| to.* = try cloneNameLower(allocator, name);
+            d.names = names;
+        },
         // RFC 6840 §5.1: names in NSEC RDATA are *not* case-folded when
         // canonicalizing (RRSIG RDATA names are) — hark once did the inverse
         // of both, so any case-preserving signer failed verification zone-wide.
@@ -2850,9 +2909,9 @@ fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {
 }
 
 test "parseMessage handles OOM at every allocation without leaking" {
-    // Question + two A answers + one NS authority + OPT — exercises per-record
-    // parseName, parseRData branches, parseEdnsOptions, and the four section
-    // ArrayList spines.
+    // Question + two A answers + an RP + one NS authority + OPT — exercises
+    // per-record parseName, parseRData branches, parseEdnsOptions, and the
+    // four section ArrayList spines.
     const example_com = Name{ .labels = &.{ "example", "com" } };
     const ns_target = Name{ .labels = &.{ "ns", "example", "com" } };
     const msg: Message = .{
@@ -2877,6 +2936,7 @@ test "parseMessage handles OOM at every allocation without leaking" {
         .answers = &.{
             .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
             .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } },
+            .{ .name = example_com, .rtype = .rp, .rclass = .in, .ttl = 60, .rdata = .{ .named = .{ .head = "", .names = &.{ ns_target, example_com } } } },
         },
         .authorities = &.{
             .{ .name = example_com, .rtype = .ns, .rclass = .in, .ttl = 3600, .rdata = .{ .ns = ns_target } },
@@ -2897,7 +2957,7 @@ test "parseMessage handles OOM at every allocation without leaking" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const parsed = try parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u16, 2), parsed.header.an_count);
+    try testing.expectEqual(@as(u16, 3), parsed.header.an_count);
     try testing.expectEqual(@as(u16, 1), parsed.header.ns_count);
     try testing.expect(parsed.opt != null);
 
