@@ -1153,8 +1153,8 @@ fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: us
 /// the lifetime of the returned Message.
 ///
 /// `allocator` must be an arena on success: the returned Message's
-/// aliased slices point into `bytes`, so `freeMessage` is only sound
-/// when `allocator.free` is a no-op. On error, per-item cleanup is
+/// aliased slices point into `bytes`, so nothing in it can be freed one
+/// piece at a time. On error, per-item cleanup is
 /// skipped for the same reason — only ArrayList backing buffers are
 /// deinit'd, which is safe under any allocator.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
@@ -2078,21 +2078,8 @@ pub fn lowerNameIntoBuf(buf: []u8, name: []const u8) []const u8 {
     return buf[0..name.len];
 }
 
-fn cloneName(allocator: Allocator, name: Name) !Name {
-    const labels = try allocator.alloc([]const u8, name.labels.len);
-    errdefer allocator.free(labels);
-    var initialized: usize = 0;
-    errdefer for (labels[0..initialized]) |l| allocator.free(l);
-    for (name.labels, 0..) |label, i| {
-        labels[i] = try allocator.dupe(u8, label);
-        initialized += 1;
-    }
-    return .{ .labels = labels };
-}
-
 /// Single-allocation clone: labels slice and every label byte share one
-/// contiguous buffer, so the result is arena-only — `freeName` on it would
-/// free mid-buffer pointers.
+/// contiguous buffer.
 pub fn cloneNameFlat(allocator: Allocator, name: Name, comptime lower: bool) !Name {
     const buf = try allocator.alignedAlloc(u8, name_flat_align, nameFlatSize(name));
     return writeNameFlat(buf, name, lower);
@@ -2198,157 +2185,10 @@ test "validateResponse: only the one question sent, at any rcode" {
     try std.testing.expectError(bad, validateResponse(notify, sent, .a, true));
 }
 
-fn freeName(allocator: Allocator, name: Name) void {
-    for (name.labels) |l| allocator.free(l);
-    allocator.free(name.labels);
-}
-
-/// Free a slice that may be empty (parsed data can alias the wire buffer with
-/// zero-length slices that were never heap-allocated).
-fn freeIfOwned(allocator: Allocator, slice: []const u8) void {
-    if (slice.len > 0) allocator.free(slice);
-}
-
-/// Duplicate a slice, returning an unallocated empty slice for empty inputs.
-/// Mirrors `freeIfOwned` so clone/free symmetry is preserved.
-fn dupeOrEmpty(allocator: Allocator, slice: []const u8) ![]const u8 {
-    if (slice.len == 0) return &.{};
-    return allocator.dupe(u8, slice);
-}
-
-fn freeRData(allocator: Allocator, rdata: RData) void {
-    switch (rdata) {
-        .a, .aaaa => {},
-        .ns, .cname, .dname, .ptr => |name| freeName(allocator, name),
-        .mx => |mx| freeName(allocator, mx.exchange),
-        .soa => |soa| {
-            freeName(allocator, soa.mname);
-            freeName(allocator, soa.rname);
-        },
-        .txt => |txt| {
-            for (txt.strings) |s| allocator.free(s);
-            allocator.free(txt.strings);
-        },
-        .rrsig => |rrsig| {
-            freeName(allocator, rrsig.signer_name);
-            freeIfOwned(allocator, rrsig.signature);
-        },
-        .dnskey => |dnskey| freeIfOwned(allocator, dnskey.public_key),
-        .ds => |ds_data| freeIfOwned(allocator, ds_data.digest),
-        .nsec => |nsec_data| {
-            freeName(allocator, nsec_data.next_domain_name);
-            freeIfOwned(allocator, nsec_data.type_bit_maps);
-        },
-        .nsec3 => |nsec3| {
-            freeIfOwned(allocator, nsec3.salt);
-            freeIfOwned(allocator, nsec3.next_hashed_owner);
-            freeIfOwned(allocator, nsec3.type_bit_maps);
-        },
-        .unknown => |data| allocator.free(data),
-    }
-}
-
-fn cloneRData(allocator: Allocator, rdata: RData) !RData {
-    return switch (rdata) {
-        .a => |v| .{ .a = v },
-        .aaaa => |v| .{ .aaaa = v },
-        .ns => |name| .{ .ns = try cloneName(allocator, name) },
-        .cname => |name| .{ .cname = try cloneName(allocator, name) },
-        .dname => |name| .{ .dname = try cloneName(allocator, name) },
-        .ptr => |name| .{ .ptr = try cloneName(allocator, name) },
-        .mx => |mx| .{ .mx = .{
-            .preference = mx.preference,
-            .exchange = try cloneName(allocator, mx.exchange),
-        } },
-        .soa => |soa| blk: {
-            const mname = try cloneName(allocator, soa.mname);
-            errdefer freeName(allocator, mname);
-            const rname = try cloneName(allocator, soa.rname);
-            break :blk .{ .soa = .{
-                .mname = mname,
-                .rname = rname,
-                .serial = soa.serial,
-                .refresh = soa.refresh,
-                .retry = soa.retry,
-                .expire = soa.expire,
-                .minimum = soa.minimum,
-            } };
-        },
-        .txt => |txt| blk: {
-            const strings = try allocator.alloc([]const u8, txt.strings.len);
-            errdefer allocator.free(strings);
-            var init_count: usize = 0;
-            errdefer for (strings[0..init_count]) |s| allocator.free(s);
-            for (txt.strings, 0..) |s, i| {
-                strings[i] = try allocator.dupe(u8, s);
-                init_count += 1;
-            }
-            break :blk .{ .txt = .{ .strings = strings } };
-        },
-        .rrsig => |rrsig| blk: {
-            const signer = try cloneName(allocator, rrsig.signer_name);
-            errdefer freeName(allocator, signer);
-            const sig = try allocator.dupe(u8, rrsig.signature);
-            break :blk .{ .rrsig = .{
-                .type_covered = rrsig.type_covered,
-                .algorithm = rrsig.algorithm,
-                .labels = rrsig.labels,
-                .original_ttl = rrsig.original_ttl,
-                .sig_expiration = rrsig.sig_expiration,
-                .sig_inception = rrsig.sig_inception,
-                .key_tag = rrsig.key_tag,
-                .signer_name = signer,
-                .signature = sig,
-            } };
-        },
-        .dnskey => |dnskey| .{ .dnskey = .{
-            .flags = dnskey.flags,
-            .protocol = dnskey.protocol,
-            .algorithm = dnskey.algorithm,
-            .public_key = try allocator.dupe(u8, dnskey.public_key),
-        } },
-        .ds => |ds_data| .{ .ds = .{
-            .key_tag = ds_data.key_tag,
-            .algorithm = ds_data.algorithm,
-            .digest_type = ds_data.digest_type,
-            .digest = try allocator.dupe(u8, ds_data.digest),
-        } },
-        .nsec => |nsec_data| blk: {
-            const next_name = try cloneName(allocator, nsec_data.next_domain_name);
-            errdefer freeName(allocator, next_name);
-            break :blk .{ .nsec = .{
-                .next_domain_name = next_name,
-                .type_bit_maps = try dupeOrEmpty(allocator, nsec_data.type_bit_maps),
-            } };
-        },
-        .nsec3 => |nsec3| blk: {
-            const salt = try dupeOrEmpty(allocator, nsec3.salt);
-            errdefer freeIfOwned(allocator, salt);
-            const next_hash = try dupeOrEmpty(allocator, nsec3.next_hashed_owner);
-            errdefer freeIfOwned(allocator, next_hash);
-            break :blk .{ .nsec3 = .{
-                .hash_algorithm = nsec3.hash_algorithm,
-                .flags = nsec3.flags,
-                .iterations = nsec3.iterations,
-                .salt = salt,
-                .next_hashed_owner = next_hash,
-                .type_bit_maps = try dupeOrEmpty(allocator, nsec3.type_bit_maps),
-            } };
-        },
-        .unknown => |data| .{ .unknown = try allocator.dupe(u8, data) },
-    };
-}
-
-fn freeOpt(allocator: Allocator, opt: OptRecord) void {
-    for (opt.options) |o| allocator.free(o.data);
-    if (opt.options.len > 0) allocator.free(opt.options);
-}
-
 /// Free only the heap-allocated outer slice of a `Name` parsed from a wire
 /// buffer. Inner labels alias the wire (`parseName` collects them into a
-/// stack buffer and `dupe`s only the outer slice); calling `freeName` on a
-/// wire-parsed name would invoke `allocator.free` on those wire-pointing
-/// slices, which is only sound under an arena. Used on parseMessage error
+/// stack buffer and `dupe`s only the outer slice), so they are never
+/// freed. Used on parseMessage error
 /// paths to drain per-record interiors without touching wire-aliased data.
 fn freeWireParsedName(allocator: Allocator, name: Name) void {
     allocator.free(name.labels);
@@ -2394,8 +2234,7 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         // Still cloned, just not folded: the scrub re-anchors label bytes off
         // the upstream wire buffer the message does not own. 0x20 never touches
         // a signer-chosen next_domain, and range comparisons use
-        // case-insensitive cmpLabelsCI regardless. `cloneNameFlat`, not
-        // `cloneName`: per-label would be N+1 allocs per NSEC on the parse path.
+        // case-insensitive cmpLabelsCI regardless.
         .nsec => |*n| n.next_domain_name = try cloneNameFlat(allocator, n.next_domain_name, false),
     }
 }
@@ -2403,29 +2242,6 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
 fn freeWireParsedRR(allocator: Allocator, rr: ResourceRecord) void {
     freeWireParsedName(allocator, rr.name);
     freeWireParsedRData(allocator, rr.rdata);
-}
-
-fn freeResourceRecords(allocator: Allocator, rrs: []const ResourceRecord) void {
-    for (rrs) |rr| {
-        freeName(allocator, rr.name);
-        freeRData(allocator, rr.rdata);
-    }
-    allocator.free(rrs);
-}
-
-/// Free a Message and all owned contents. For Messages returned from
-/// `parseMessage`, `allocator` must be the arena the Message was parsed
-/// into — Name labels and all rdata byte slices (TXT strings included)
-/// alias the wire buffer, so `allocator.free` on them is only sound when
-/// it is a no-op. For manually-built or `cloneRData`'d Messages (e.g.
-/// cache-owned records), any allocator that owns the contents works.
-fn freeMessage(allocator: Allocator, msg: Message) void {
-    for (msg.questions) |q| freeName(allocator, q.name);
-    allocator.free(msg.questions);
-    freeResourceRecords(allocator, msg.answers);
-    freeResourceRecords(allocator, msg.authorities);
-    freeResourceRecords(allocator, msg.additionals);
-    if (msg.opt) |opt| freeOpt(allocator, opt);
 }
 
 test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a week" {
@@ -3020,10 +2836,8 @@ test "parseDottedName decodes presentation escapes" {
 
 fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {
     const msg = try parseMessage(allocator, wire);
-    // Wire-safe teardown: parseMessage's lifetime contract says inner labels
-    // and rdata byte slices alias `wire`, so a normal `freeMessage` would
-    // call `allocator.free` on wire-pointing slices. Drain only the heap
-    // material the parser actually allocates from `allocator`.
+    // Inner labels and rdata byte slices alias `wire`: free only what the
+    // parser allocates from `allocator`.
     for (msg.questions) |q| freeWireParsedName(allocator, q.name);
     allocator.free(msg.questions);
     for (msg.answers) |rr| freeWireParsedRR(allocator, rr);
