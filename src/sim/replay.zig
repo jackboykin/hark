@@ -13,6 +13,7 @@ const answer = @import("../answer.zig");
 const response = @import("../response.zig");
 const rebinding = @import("../rebinding.zig");
 const config = @import("../config.zig");
+const ns_rtt = @import("../ns_rtt.zig");
 
 pub const Report = struct {
     /// The failing step and why.
@@ -611,120 +612,167 @@ test "lifted unbound walk scenarios settle to today's answers" {
     try testing.expectEqual(0, r.failed);
 }
 
-test "a silent sibling is hedged past and still records its timeout" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // ns1 (127.0.10.3) listens nowhere, ns2 answers: cold, ns1 gets 400 ms
-    // and the hedge asks ns2 at 150.
+/// ns1 (127.0.10.3) listens nowhere, ns2 (127.0.10.4) answers.
+const siblings_rpl =
+    \\; hark: root-hints = 127.0.10.1
+    \\SCENARIO_BEGIN hedge
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.1
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR NOERROR
+    \\    SECTION QUESTION
+    \\      com. IN A
+    \\    SECTION AUTHORITY
+    \\      com. 86400 IN NS a.gtld.fake.
+    \\    SECTION ADDITIONAL
+    \\      a.gtld.fake. 86400 IN A 127.0.10.2
+    \\  ENTRY_END
+    \\RANGE_END
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.2
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR NOERROR
+    \\    SECTION QUESTION
+    \\      example.com. IN A
+    \\    SECTION AUTHORITY
+    \\      example.com. 86400 IN NS ns1.example.com.
+    \\      example.com. 86400 IN NS ns2.example.com.
+    \\    SECTION ADDITIONAL
+    \\      ns1.example.com. 86400 IN A 127.0.10.3
+    \\      ns2.example.com. 86400 IN A 127.0.10.4
+    \\  ENTRY_END
+    \\RANGE_END
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.4
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname qtype
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      www.example.com. IN A
+    \\    SECTION ANSWER
+    \\      www.example.com. 60 IN A 10.20.30.40
+    \\  ENTRY_END
+    \\RANGE_END
+    \\STEP 1 QUERY
+    \\ENTRY_BEGIN
+    \\  REPLY RD
+    \\  SECTION QUESTION
+    \\    www.example.com. IN A
+    \\ENTRY_END
+    \\SCENARIO_END
+;
+
+const Siblings = struct {
+    ns1: ?ns_rtt.RttState = null,
+    ns2: ?ns_rtt.RttState = null,
+};
+
+/// Times in ms from the start: the answer, then when each sibling was
+/// first asked; the estimates are read after the drain.
+const Walked = struct {
+    took_ms: i64,
+    ns1_ms: ?i64,
+    ns2_ms: ?i64,
+    ns1: ?ns_rtt.RttState,
+    ns2: ?ns_rtt.RttState,
+};
+
+/// Checks the walk answers, then that the graph drains as exchanges settle.
+fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings) !Walked {
     var diag: rpl.Diag = .{};
-    const scenario = try rpl.parse(arena,
-        \\; hark: root-hints = 127.0.10.1
-        \\SCENARIO_BEGIN hedge
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.1
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode qname
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR NOERROR
-        \\    SECTION QUESTION
-        \\      com. IN A
-        \\    SECTION AUTHORITY
-        \\      com. 86400 IN NS a.gtld.fake.
-        \\    SECTION ADDITIONAL
-        \\      a.gtld.fake. 86400 IN A 127.0.10.2
-        \\  ENTRY_END
-        \\RANGE_END
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.2
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode qname
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR NOERROR
-        \\    SECTION QUESTION
-        \\      example.com. IN A
-        \\    SECTION AUTHORITY
-        \\      example.com. 86400 IN NS ns1.example.com.
-        \\      example.com. 86400 IN NS ns2.example.com.
-        \\    SECTION ADDITIONAL
-        \\      ns1.example.com. 86400 IN A 127.0.10.3
-        \\      ns2.example.com. 86400 IN A 127.0.10.4
-        \\  ENTRY_END
-        \\RANGE_END
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.4
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode qname qtype
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR AA NOERROR
-        \\    SECTION QUESTION
-        \\      www.example.com. IN A
-        \\    SECTION ANSWER
-        \\      www.example.com. 60 IN A 10.20.30.40
-        \\  ENTRY_END
-        \\RANGE_END
-        \\STEP 1 QUERY
-        \\ENTRY_BEGIN
-        \\  REPLY RD
-        \\  SECTION QUESTION
-        \\    www.example.com. IN A
-        \\ENTRY_END
-        \\SCENARIO_END
-    , &diag);
+    const scenario = try rpl.parse(arena, siblings_rpl, &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     const ns1 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 3 }, 53));
     const ns2 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 4 }, 53));
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
+    defer s.deinit();
+    var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger_ms }, s.edge());
+    defer g.deinit();
+    if (planted.ns1) |e| try g.rtt.put(testing.allocator, ns1, e);
+    if (planted.ns2) |e| try g.rtt.put(testing.allocator, ns2, e);
+    const start = s.now_ns;
+    const horizon = start + 10 * std.time.ns_per_s;
+    var ns1_ms: ?i64 = null;
+    var ns2_ms: ?i64 = null;
+    const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
+    try g.drain();
+    while (!g.cell(root).settled()) {
+        const ev = s.next(horizon) orelse return error.TestUnexpectedResult;
+        try g.complete(ev.id, ev.completion);
+        const at_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
+        for (s.log.items) |row| {
+            const key = na.AddressKey.fromAddress(row.server);
+            if (key.eql(ns1) and ns1_ms == null) ns1_ms = at_ms;
+            if (key.eql(ns2) and ns2_ms == null) ns2_ms = at_ms;
+        }
+    }
+    try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
+    g.unhold(root);
+    const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
+    while (s.next(horizon)) |ev| try g.complete(ev.id, ev.completion);
+    try testing.expectEqual(0, g.live);
+    return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns1 = g.rtt.get(ns1), .ns2 = g.rtt.get(ns2) };
+}
+
+/// srtt 1.5 s: a 3 s estimate, past the 2 s cap.
+const dead: ns_rtt.RttState = .{ .srtt_us = 1500 * std.time.us_per_ms, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
+
+test "a silent sibling is hedged past and still records its timeout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Cold, ns1 gets 400 ms and the hedge asks ns2 at 150.
     var ns1_first_seen = false;
     for (1..9) |seed| for ([_]u32{ 150, 0 }) |stagger| {
-        var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
-        defer s.deinit();
-        var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger }, s.edge());
-        defer g.deinit();
-        const start = s.now_ns;
-        const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
-        try g.drain();
-        while (!g.cell(root).settled()) {
-            const ev = s.next(start + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
-            try g.complete(ev.id, ev.completion);
-        }
-        try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
-        g.unhold(root);
-        const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
-        while (s.next(start + 5 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
-        try testing.expectEqual(0, g.live);
-        try testing.expect(s.log.items[2].qname.eql(q.name));
-        const ns1_first = na.AddressKey.fromAddress(s.log.items[2].server).eql(ns1);
+        const w = try walkSiblings(arena_state.allocator(), seed, stagger, .{});
+        const ns1_first = w.ns1_ms != null and (w.ns2_ms == null or w.ns1_ms.? < w.ns2_ms.?);
         ns1_first_seen = ns1_first_seen or ns1_first;
-        try testing.expect(g.rtt.get(ns2) != null);
-        if (ns1_first) try testing.expectEqual(1, g.rtt.get(ns1).?.consecutive_timeouts) else try testing.expect(g.rtt.get(ns1) == null);
+        try testing.expect(w.ns2 != null);
+        if (ns1_first) try testing.expectEqual(1, w.ns1.?.consecutive_timeouts) else try testing.expect(w.ns1 == null);
         if (stagger > 0) {
             // Walk (≤ 2 × 50 ms), the stagger, then ns2 (≤ 50 ms).
-            try testing.expect(took_ms < 400);
-            if (ns1_first) try testing.expect(took_ms >= 150);
-        } else if (ns1_first) try testing.expect(took_ms >= 400);
+            try testing.expect(w.took_ms < 400);
+            if (ns1_first) try testing.expect(w.took_ms >= 150);
+        } else if (ns1_first) try testing.expect(w.took_ms >= 400);
     };
     try testing.expect(ns1_first_seen);
+}
 
+test "a dead server is asked only when nothing live is left" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
     for (1..9) |seed| for ([_]bool{ false, true }) |all_dead| {
-        var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
-        defer s.deinit();
-        var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
-        defer g.deinit();
-        const dead: @import("../ns_rtt.zig").RttState = .{ .srtt_us = 1, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
-        try g.rtt.put(testing.allocator, ns1, dead);
-        if (all_dead) try g.rtt.put(testing.allocator, ns2, dead);
-        const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
-        try g.drain();
-        while (!g.cell(root).settled()) {
-            const ev = s.next(s.now_ns + 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
-            try g.complete(ev.id, ev.completion);
-        }
-        try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
-        g.unhold(root);
-        var asked_ns1 = false;
-        for (s.log.items) |row| asked_ns1 = asked_ns1 or na.AddressKey.fromAddress(row.server).eql(ns1);
-        if (!all_dead) try testing.expect(!asked_ns1);
+        const w = try walkSiblings(arena_state.allocator(), seed, 0, .{ .ns1 = dead, .ns2 = if (all_dead) dead else null });
+        if (!all_dead) try testing.expect(w.ns1_ms == null);
     };
+}
+
+test "the last live server waits its whole estimate, unhedged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // srtt 1.5 s: a 3 s estimate.
+    for (1..9) |seed| {
+        const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = .{ .srtt_us = 1500 * std.time.us_per_ms }, .ns2 = dead });
+        try testing.expect(w.ns2_ms.? - w.ns1_ms.? >= 3000);
+    }
+}
+
+test "servers all dead are hedged through like any list" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // One stagger, not the 2 s cap.
+    var ns1_first_seen = false;
+    for (1..9) |seed| {
+        const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = dead, .ns2 = dead });
+        if (w.ns1_ms == null or w.ns2_ms.? < w.ns1_ms.?) continue;
+        ns1_first_seen = true;
+        try testing.expect(w.ns2_ms.? - w.ns1_ms.? < 500);
+    }
+    try testing.expect(ns1_first_seen);
 }
 
 test "the door counts exchanges in flight" {

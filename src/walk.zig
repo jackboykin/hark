@@ -44,8 +44,7 @@ pub const Ask = struct {
     /// Every address gathered so far; a later gather appends what is new.
     servers: [max_servers]na.AddressKey = undefined,
     nservers: u8 = 0,
-    next: u8 = 0,
-    /// Bit i: `servers[i]` has been sent to.
+    /// Bit i: `servers[i]` sent to or given up on.
     tried: u32 = 0,
     fetched_unglued: bool = false,
     /// Every server silent once: one more attempt each, at the backed-off timeout.
@@ -94,42 +93,73 @@ pub const Ask = struct {
         a.* = .{ .zone = zone };
     }
 
-    /// Appends, shuffled. Dead servers are skipped unless nothing else is left.
+    fn untried(a: *const Ask) u32 {
+        return (bit(a.nservers) - 1) & ~a.tried;
+    }
+
+    const Pick = struct {
+        server: u8,
+        dead: bool,
+        /// Last untried of its kind, live or dead: waits uncapped.
+        last: bool,
+    };
+
+    /// Uniform within the best band. Chosen per send, so a timeout earlier
+    /// in this ask already counts.
+    fn pick(a: *const Ask, g: *Graph) ?Pick {
+        var best: i64 = ns_rtt.dead_band;
+        var ties: u32 = 0;
+        var live: u8 = 0;
+        var m = a.untried();
+        while (m != 0) : (m &= m - 1) {
+            const i = @ctz(m);
+            const b = g.band(a.servers[i]);
+            live += @intFromBool(b != ns_rtt.dead_band);
+            if (b < best) {
+                best = b;
+                ties = bit(i);
+            } else if (b == best) ties |= bit(i);
+        }
+        if (ties == 0) return null;
+        const dead = best == ns_rtt.dead_band;
+        // Every dead server ties in the dead band.
+        const last = if (dead) @popCount(ties) == 1 else live == 1;
+        var k = g.edge.rng.uintLessThan(u8, @popCount(ties));
+        while (k > 0) : (k -= 1) ties &= ties - 1;
+        return .{ .server = @ctz(ties), .dead = dead, .last = last };
+    }
+
+    /// The dead are hedged to only once nothing live is in flight.
+    fn liveInFlight(a: *const Ask, g: *Graph) bool {
+        for (a.attempts[0..a.nattempts]) |at| if (!g.isDead(a.servers[at.server])) return true;
+        return false;
+    }
+
+    fn noneLive(a: *const Ask, g: *Graph) bool {
+        var m = a.untried();
+        while (m != 0) : (m &= m - 1) if (!g.isDead(a.servers[@ctz(m)])) return false;
+        return true;
+    }
+
     fn add(a: *Ask, g: *Graph, addrs: []const na.Address) void {
-        var live: usize = 0;
-        for (addrs) |s| live += @intFromBool(!g.isDead(s));
-        const from = a.nservers;
-        if (from == 0) a.tcp_first = g.cfg.trust_anchor != null and zoneTruncates(g, a.zone);
+        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchor != null and zoneTruncates(g, a.zone);
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
-            if (live > 0 and g.isDead(s)) continue;
             a.servers[a.nservers] = na.AddressKey.fromAddress(s);
             a.nservers += 1;
         }
-        g.edge.rng.shuffle(na.AddressKey, a.servers[from..a.nservers]);
-        // Fastest band first, random within it; a server never timed sorts as fast.
-        std.sort.insertion(na.AddressKey, a.servers[from..a.nservers], g, rttBand);
-        a.have_servers = a.next < a.nservers;
+        a.have_servers = a.untried() != 0;
     }
 
-    fn rttBand(g: *Graph, x: na.AddressKey, y: na.AddressKey) bool {
-        const band_us = 50 * std.time.us_per_ms;
-        const bx = @divTrunc((g.rtt.get(x) orelse ns_rtt.RttState.unknown).srtt_us, band_us);
-        const by = @divTrunc((g.rtt.get(y) orelse ns_rtt.RttState.unknown).srtt_us, band_us);
-        return bx < by;
-    }
-
-    /// Once more from the top in a fresh order, skipping the dead unless all are.
+    /// Once more, skipping the dead unless all are.
     fn retry(a: *Ask, g: *Graph) void {
         a.retried = true;
         g.stats.resolver.retry += 1;
-        g.edge.rng.shuffle(na.AddressKey, a.servers[0..a.nservers]);
         a.tried = 0;
-        for (a.servers[0..a.nservers], 0..) |s, i| if (g.isDead(s.toAddress())) {
+        for (a.servers[0..a.nservers], 0..) |s, i| if (g.isDead(s)) {
             a.tried |= bit(i);
         };
         if (a.tried == bit(a.nservers) - 1) a.tried = 0;
-        a.next = 0;
         a.have_servers = a.nservers > 0;
     }
 
@@ -849,13 +879,13 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                 // normalizes case answers; a garbled datagram gets the
                 // same second chance.
                 .mismatch, .malformed => if (at.case == .random) {
-                    _ = try sendTo(g, id, a, at.server, .tcp, .plain, qname, qtype);
+                    _ = try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .plain, qname, qtype);
                 },
                 .reply => |r| {
                     if (r.msg.header.flags.tc) {
                         // TC over TCP: a broken server, as good as a timeout.
                         if (at.transport == .udp) {
-                            _ = try sendTo(g, id, a, at.server, .tcp, .random, qname, qtype);
+                            _ = try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .random, qname, qtype);
                         }
                     } else {
                         const kept = if (delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) null else try judge(g, r.msg, a.zone, qname, qtype);
@@ -868,16 +898,13 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                 },
             }
         }
-        while (a.next < a.nservers and a.tried & Ask.bit(a.next) != 0) a.next += 1;
         const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
-        if (a.next < a.nservers and (a.nattempts == 0 or early)) {
-            const server = a.next;
-            a.next += 1;
-            const state = try sendTo(g, id, a, server, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
+        if (a.nattempts == 0 or early) if (a.pick(g)) |p| if (a.nattempts == 0 or !p.dead or !a.liveInFlight(g)) {
+            const state = try sendTo(g, id, a, p.server, p.last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
-            if (g.cfg.stagger_ms > 0 and a.next < a.nservers) try g.wake(id, a.hedge_at);
+            if (g.cfg.stagger_ms > 0 and !p.last) try g.wake(id, a.hedge_at);
             continue;
-        }
+        };
         if (a.nattempts > 0) return .pending;
         // Every known server tried: gather again for what settled since.
         a.have_servers = false;
@@ -891,15 +918,16 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
-/// One attempt on the estimate's timeout; only the last of all is uncapped.
+/// One attempt on the estimate's timeout; only `last`, alone in flight,
+/// waits uncapped.
 /// Null: refused, so launch nothing more; what is in flight may still answer.
-fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
+fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
     a.tried |= Ask.bit(server);
     const key = a.servers[server];
     const state = g.rtt.get(key) orelse ns_rtt.RttState.unknown;
-    const timeout_ms = state.timeout(a.nattempts == 0 and a.next >= a.nservers, transport);
+    const timeout_ms = state.timeout(a.nattempts == 0 and last, transport);
     const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms) orelse {
-        a.next = a.nservers;
+        a.tried = Ask.bit(a.nservers) - 1;
         a.fetched_unglued = true;
         return null;
     };
@@ -985,7 +1013,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     if (g.cfg.trace) {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         var zb: [dns.max_dotted_len + 1]u8 = undefined;
-        std.debug.print("  {s} at {s}: {d} servers tried, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), @popCount(a.tried), if (a.held != null) "best failure held" else "no reply at all" });
+        std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != null) "best failure held" else "no reply at all" });
     }
     return .none;
 }

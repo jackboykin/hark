@@ -1162,9 +1162,12 @@ pub const Graph = struct {
         return @divTrunc(g.now(), std.time.ns_per_ms);
     }
 
-    pub fn isDead(g: *Graph, server: na.Address) bool {
-        const state = g.rtt.get(na.AddressKey.fromAddress(server)) orelse return false;
-        return state.isDead(g.nowMs());
+    pub fn band(g: *Graph, server: na.AddressKey) i64 {
+        return (g.rtt.get(server) orelse ns_rtt.RttState.unknown).band(g.nowMs());
+    }
+
+    pub fn isDead(g: *Graph, server: na.AddressKey) bool {
+        return g.band(server) == ns_rtt.dead_band;
     }
 
     // ── Exchanges ──────────────────────────────────────────────────────

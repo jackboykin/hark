@@ -57,6 +57,12 @@ const hedge_decay_ms: i64 = 30_000;
 
 const max_hedge_stagger_ms: u32 = 300;
 
+/// Estimates closer than this are noise.
+const band_us: i64 = 50 * std.time.us_per_ms;
+
+/// Below every live band.
+pub const dead_band = std.math.maxInt(i64);
+
 /// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
 const failover_timeout_cap_ms: u32 = 2000;
 
@@ -108,6 +114,11 @@ pub const RttState = struct {
 
     pub fn isDead(s: RttState, now_ms: i64) bool {
         return s.consecutive_timeouts >= dead_threshold and s.dead_until_ms > now_ms;
+    }
+
+    /// A server never timed ranks with the fastest.
+    pub fn band(s: RttState, now_ms: i64) i64 {
+        return if (s.isDead(now_ms)) dead_band else @divTrunc(s.srtt_us, band_us);
     }
 
     /// What a cold exchange over `transport` needs. A non-last server is
