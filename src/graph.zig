@@ -29,6 +29,22 @@ pub const max_cname_chain = 16;
 
 pub const CellId = u32;
 
+/// A `?CellId` in half the bytes.
+pub const OptionalCellId = enum(CellId) {
+    none = std.math.maxInt(CellId),
+    _,
+
+    pub fn wrap(id: ?CellId) OptionalCellId {
+        const i = id orelse return .none;
+        std.debug.assert(i != @backingInt(OptionalCellId.none));
+        return @fromBackingInt(i);
+    }
+
+    pub fn unwrap(o: OptionalCellId) ?CellId {
+        return if (o == .none) null else @backingInt(o);
+    }
+};
+
 pub const Transport = ns_rtt.Transport;
 
 pub const Exchange = struct {

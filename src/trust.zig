@@ -12,6 +12,7 @@ const walk = @import("walk.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
+const OptionalCellId = graph.OptionalCellId;
 const Failure = graph.Failure;
 const RR = dns.ResourceRecord;
 
@@ -27,22 +28,22 @@ pub const Chain = struct {
 };
 
 pub const DsScratch = struct {
-    parent: ?CellId = null,
-    keys: ?CellId = null,
-    rrset: ?CellId = null,
-    signer: ?CellId = null,
+    parent: OptionalCellId = .none,
+    keys: OptionalCellId = .none,
+    rrset: OptionalCellId = .none,
+    signer: OptionalCellId = .none,
     fault: ?Fault = null,
     probe: Probe = .{},
 };
-pub const DnskeyScratch = struct { ds: ?CellId = null, rrset: ?CellId = null };
+pub const DnskeyScratch = struct { ds: OptionalCellId = .none, rrset: OptionalCellId = .none };
 pub const SecureScratch = struct {
     /// The rrset version under judgement; ids recycle, so its generation too.
     target: CellId = 0,
     target_gen: u32 = 0,
     /// `ds(zone)`: is the answering zone expected to sign at all.
-    zone_ds: ?CellId = null,
+    zone_ds: OptionalCellId = .none,
     /// `dnskey(signer)` per RRset group, in section order.
-    keys: [max_groups]?CellId = @splat(null),
+    keys: [max_groups]OptionalCellId = @splat(.none),
     fault: ?Fault = null,
     probe: Probe = .{},
 };
@@ -113,15 +114,15 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .failed => |why| return g.fail(id, why),
         .cut => |cid| g.cell(cid).state.fact.cut.zone,
     };
-    if (s.keys == null) s.keys = try g.demand(id, graph.Key.of(&kb, .dnskey, parent_zone, .a), parent_zone) orelse
-        return g.fail(id, no_chain);
-    const parent_keys = g.cell(s.keys.?);
+    if (s.keys == .none) s.keys = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, parent_zone, .a), parent_zone) orelse
+        return g.fail(id, no_chain));
+    const parent_keys = g.cell(s.keys.unwrap().?);
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
     if (parent_keys.state.fact.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.state.fact.dnskey.status } }, parent_keys.expires_ns);
-    if (s.rrset == null) s.rrset = try g.demand(id, graph.Key.of(&kb, .rrset, zone, .ds), zone) orelse
-        return g.fail(id, no_chain);
-    const rs = g.cell(s.rrset.?);
+    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .ds), zone) orelse
+        return g.fail(id, no_chain));
+    const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
     if (s.fault == null) {
         s.fault = if (rs.failure()) |why| .{ .failed = why } else try judgeDs(g, id, s, zone, rs) orelse return;
@@ -132,7 +133,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .cut_short => try g.fail(id, no_chain),
         .insecure => |until| try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
         .none => switch (s.fault.?) {
-            .bogus => try failChain(g, id, s.rrset.?),
+            .bogus => try failChain(g, id, s.rrset.unwrap().?),
             .failed => |why| try g.fail(id, why),
         },
     }
@@ -149,9 +150,9 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
         .yxdomain => null,
     } orelse return .bogus;
     if (!proof.isProperAncestor(signer, zone)) return .bogus;
-    if (s.signer == null) s.signer = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-        return .{ .failed = no_chain };
-    const keys = g.cell(s.signer.?);
+    if (s.signer == .none) s.signer = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
+        return .{ .failed = no_chain });
+    const keys = g.cell(s.signer.unwrap().?);
     if (!keys.settled()) return null;
     if (keys.failure()) |why| return .{ .failed = why };
     const budget = &g.payer.validation;
@@ -187,7 +188,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
 pub const KeysScratch = struct {
     /// The payer of the walk that met the delegation, shared.
     budget: *graph.Budget = undefined,
-    keys: ?CellId = null,
+    keys: OptionalCellId = .none,
 };
 
 /// `keys(zone)`: a root with no fact of its own, holding `dnskey(zone)`
@@ -197,9 +198,9 @@ pub fn runKeys(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const s = g.cell(id).scratch.keys;
     const zone = g.cell(id).name;
-    if (s.keys == null) s.keys = try g.demand(id, graph.Key.of(&kb, .dnskey, zone, .a), zone) orelse
-        return g.settle(id, .keys, g.now());
-    if (g.cell(s.keys.?).settled()) try g.settle(id, .keys, g.now());
+    if (s.keys == .none) s.keys = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, zone, .a), zone) orelse
+        return g.settle(id, .keys, g.now()));
+    if (g.cell(s.keys.unwrap().?).settled()) try g.settle(id, .keys, g.now());
 }
 
 /// Every cut from `zone` up is proven secure or, unproven yet, delegated
@@ -224,24 +225,24 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
-    if (s.ds == null) s.ds = try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
-        return g.fail(id, no_chain);
+    if (s.ds == .none) s.ds = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
+        return g.fail(id, no_chain));
     // Signed all the way down, proven or not yet, says the keys will be
     // needed: fetch them alongside the proof instead of a round trip per
     // level after it.
-    if (s.rrset == null and try signedDown(g, zone))
-        s.rrset = try g.demand(id, graph.Key.of(&kb, .rrset, zone, .dnskey), zone);
-    const ds = g.cell(s.ds.?);
+    if (s.rrset == .none and try signedDown(g, zone))
+        s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .dnskey), zone));
+    const ds = g.cell(s.ds.unwrap().?);
     if (!ds.settled()) return;
     if (ds.failure()) |why| return g.fail(id, why);
     if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires_ns);
-    if (s.rrset == null) s.rrset = try g.demand(id, graph.Key.of(&kb, .rrset, zone, .dnskey), zone) orelse
-        return g.fail(id, no_chain);
-    const rs = g.cell(s.rrset.?);
+    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .dnskey), zone) orelse
+        return g.fail(id, no_chain));
+    const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
     if (rs.failure()) |why| return g.fail(id, why);
     const r = rs.state.fact.rrset;
-    if (r.kind != .answer) return failChain(g, id, s.rrset.?);
+    if (r.kind != .answer) return failChain(g, id, s.rrset.unwrap().?);
     var ds_data: std.ArrayList(dns.DsData) = .empty;
     for (ds.state.fact.ds.records) |rr| if (rr.rtype == .ds) try ds_data.append(g.scratch.allocator(), rr.rdata.ds);
     const budget = &g.payer.validation;
@@ -249,7 +250,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     defer clock.stop();
     const now = g.wallNow();
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget, &g.verify_memo) catch
-        return failChain(g, id, s.rrset.?);
+        return failChain(g, id, s.rrset.unwrap().?);
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, rrsig.ttlCap(sig, now))));
 }
@@ -294,9 +295,9 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
     const zone = t.state.fact.rrset.zone;
-    if (s.zone_ds == null) s.zone_ds = try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
-        return g.fail(id, no_chain);
-    const zd = g.cell(s.zone_ds.?);
+    if (s.zone_ds == .none) s.zone_ds = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
+        return g.fail(id, no_chain));
+    const zd = g.cell(s.zone_ds.unwrap().?);
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
     if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
@@ -342,9 +343,9 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 // RFC 4034 §3.1.3; a signer above the answering zone
                 // authenticates nothing here.
                 if (!proof.deepestApex(rr.name, rr.rtype).isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return .bogus;
-                if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
-                    return .{ .failed = no_chain };
-                pending = pending or !g.cell(s.keys[groups].?).settled();
+                if (s.keys[groups] == .none) s.keys[groups] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
+                    return .{ .failed = no_chain });
+                pending = pending or !g.cell(s.keys[groups].unwrap().?).settled();
             }
             if (pending) return null;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
@@ -363,7 +364,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     if (!target.eql(rr.rdata.cname)) return .bogus;
                     continue;
                 }
-                const kc = g.cell(s.keys[groups].?);
+                const kc = g.cell(s.keys[groups].unwrap().?);
                 if (kc.failure()) |why| return .{ .failed = why };
                 expires = @min(expires, kc.expires_ns);
                 if (kc.state.fact.dnskey.status == .insecure) {
@@ -387,9 +388,9 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         .nodata, .nxdomain => {
             const signer = proof.authoritySigner(r.authorities) orelse return .bogus;
             if (!proof.deepestApex(t.name, t.key.rtype).isSubdomainOf(signer)) return .bogus;
-            if (s.keys[0] == null) s.keys[0] = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-                return .{ .failed = no_chain };
-            const kc = g.cell(s.keys[0].?);
+            if (s.keys[0] == .none) s.keys[0] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
+                return .{ .failed = no_chain });
+            const kc = g.cell(s.keys[0].unwrap().?);
             if (!kc.settled()) return null;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
@@ -418,22 +419,22 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
 /// `ds(candidate)` one label at a time below `above`, down to `deepest`,
 /// for a proven insecure cut; each candidate is asked once.
 const Probe = struct {
-    cell: ?CellId = null,
+    cell: OptionalCellId = .none,
     depth: u8 = 0,
 
     fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, cut_short } {
         var kb: graph.KeyBuf = undefined;
         while (true) {
-            if (p.cell) |pid| {
+            if (p.cell.unwrap()) |pid| {
                 const c = g.cell(pid);
                 if (!c.settled()) return .pending;
                 if (c.failure() == null and c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
-                p.cell = null;
+                p.cell = .none;
             }
             p.depth = @max(p.depth, @as(u8, @intCast(above.labels.len))) + 1;
             if (p.depth > deepest.labels.len) return .none;
             const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - p.depth ..] };
-            p.cell = try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .cut_short;
+            p.cell = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .cut_short);
         }
     }
 };

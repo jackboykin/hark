@@ -16,6 +16,7 @@ const store = @import("store.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
+const OptionalCellId = graph.OptionalCellId;
 const Key = graph.Key;
 const Transport = graph.Transport;
 const Reply = graph.Reply;
@@ -40,7 +41,7 @@ pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport,
 pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
     /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
-    cut: ?CellId = null,
+    cut: OptionalCellId = .none,
     have_servers: bool = false,
     /// Every address gathered so far; a later gather appends what is new.
     servers: [max_servers]na.AddressKey = undefined,
@@ -56,7 +57,7 @@ pub const Ask = struct {
     /// When the next attempt may start early.
     hedge_at: i64 = 0,
     /// The first failing reply: an rcode from someone, as opposed to silence.
-    held: ?CellId = null,
+    held: OptionalCellId = .none,
     /// The zone's DS names ML-DSA-44, whose DO answers truncate: TCP from the start.
     tcp_first: bool = false,
     /// An attempt, or a server set's sub-resolution, never left the host.
@@ -165,7 +166,7 @@ pub const Ask = struct {
     }
 
     fn heldMsg(a: *const Ask, g: *Graph) ?dns.Message {
-        return g.cell(a.held orelse return null).state.fact.exchange.reply.msg;
+        return g.cell(a.held.unwrap() orelse return null).state.fact.exchange.reply.msg;
     }
 
     /// Every server failed: bare SERVFAIL. An authority's REFUSED or
@@ -194,11 +195,11 @@ const Kept = struct { msg: dns.Message, verdict: Verdict };
 const Verdict = union(enum) { reply: Reply, loop, none };
 
 pub const RrsetScratch = struct {
-    cut: ?CellId = null,
+    cut: OptionalCellId = .none,
     /// A fresh DNAME above the name; only a secure one redirects from
     /// memory (Unbound's rule; dnssec/023).
-    dname: ?CellId = null,
-    dname_judge: ?CellId = null,
+    dname: OptionalCellId = .none,
+    dname_judge: OptionalCellId = .none,
     dname_checked: bool = false,
     started: bool = false,
     ask: Ask = .{},
@@ -206,7 +207,7 @@ pub const RrsetScratch = struct {
 };
 
 pub const CutScratch = struct {
-    parent: ?CellId = null,
+    parent: OptionalCellId = .none,
     started: bool = false,
     ask: Ask = .{},
 };
@@ -218,10 +219,10 @@ pub const AddrScratch = struct {
     /// The NS name, or the target of its one allowed CNAME hop.
     host: ?dns.Name = null,
     hopped: bool = false,
-    a: ?CellId = null,
-    aaaa: ?CellId = null,
-    judge_a: ?CellId = null,
-    judge_aaaa: ?CellId = null,
+    a: OptionalCellId = .none,
+    aaaa: OptionalCellId = .none,
+    judge_a: OptionalCellId = .none,
+    judge_aaaa: OptionalCellId = .none,
 };
 
 pub const AnswerScratch = struct {
@@ -330,9 +331,9 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (!probeable(g, name)) return g.fail(id, unplaced);
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
-    if (s.parent == null) s.parent = try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
-        return g.fail(id, unreachable_authority);
-    const parent = g.cell(s.parent.?);
+    if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
+        return g.fail(id, unreachable_authority));
+    const parent = g.cell(s.parent.unwrap().?);
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
@@ -409,20 +410,20 @@ pub const Start = union(enum) { pending, none, cut: CellId, failed: Failure };
 
 /// Waits on `startAt`'s cut, or on the deepest one known if no probe
 /// could place it.
-pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *?CellId) !Start {
+pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *OptionalCellId) !Start {
     var kb: graph.KeyBuf = undefined;
-    if (slot.* == null) {
+    if (slot.* == .none) {
         const n = startAt(g, qname, from, true);
-        slot.* = try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none;
+        slot.* = .wrap(try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none);
     }
     while (true) {
-        const c = g.cell(slot.*.?);
+        const c = g.cell(slot.*.unwrap().?);
         if (!c.settled()) return .pending;
-        const why = c.failure() orelse return .{ .cut = slot.*.? };
+        const why = c.failure() orelse return .{ .cut = slot.*.unwrap().? };
         if (!why.unplaced) return .{ .failed = why };
         const n = startAt(g, qname, from, false);
         if (n.eql(c.name)) return .{ .failed = unreachable_authority };
-        slot.* = try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none;
+        slot.* = .wrap(try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none);
     }
 }
 
@@ -452,8 +453,8 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         };
     }
     const host = s.host.?;
-    if (s.a == null) s.a = try g.demand(id, Key.of(&kb, .rrset, host, .a), host);
-    if (s.aaaa == null) s.aaaa = try g.demand(id, Key.of(&kb, .rrset, host, .aaaa), host);
+    if (s.a == .none) s.a = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .a), host));
+    if (s.aaaa == .none) s.aaaa = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .aaaa), host));
     var addrs: std.ArrayList(na.Address) = .empty;
     var pending = false;
     var alias: ?dns.Name = null;
@@ -463,7 +464,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     var denied: i64 = std.math.maxInt(i64);
     var failed: ?Failure = null;
     for ([_]dns.RType{ .a, .aaaa }) |rtype| {
-        const rid = (if (rtype == .a) s.a else s.aaaa) orelse continue;
+        const rid = (if (rtype == .a) s.a else s.aaaa).unwrap() orelse continue;
         const c = g.cell(rid);
         if (!c.settled()) {
             pending = true;
@@ -479,8 +480,8 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
             // A bogus answer is no address.
             if (g.cfg.trust_anchor != null) {
                 const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
-                if (slot.* == null) slot.* = try trust.demandSecure(g, id, rid);
-                const j = g.cell(slot.*.?);
+                if (slot.* == .none) slot.* = .wrap(try trust.demandSecure(g, id, rid));
+                const j = g.cell(slot.*.unwrap().?);
                 if (!j.settled()) {
                     pending = true;
                     continue;
@@ -524,7 +525,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
         // Indexed proofs deny the name without a packet.
-        if (s.cut == null and try denial.deny(g, id)) return;
+        if (s.cut == .none and try denial.deny(g, id)) return;
         const from = proof.deepestApex(name, qtype);
         const cut = switch (try start(g, id, name, from, &s.cut)) {
             .pending => return,
@@ -535,13 +536,13 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
         if (!s.dname_checked) {
             s.dname_checked = true;
-            if (try dnameAbove(g, name)) |owner| s.dname = try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner);
-            if (s.dname) |did| s.dname_judge = try trust.demandSecure(g, id, did);
+            if (try dnameAbove(g, name)) |owner| s.dname = .wrap(try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner));
+            if (s.dname.unwrap()) |did| s.dname_judge = .wrap(try trust.demandSecure(g, id, did));
         }
-        if (s.dname_judge) |jid| {
+        if (s.dname_judge.unwrap()) |jid| {
             if (!g.cell(jid).settled()) return;
             if (g.cell(jid).failure() == null and g.cell(jid).state.fact.secure.status == .secure) {
-                const reply = try dnameRedirect(g, name, s.dname.?);
+                const reply = try dnameRedirect(g, name, s.dname.unwrap().?);
                 return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
             }
         }
@@ -858,7 +859,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (!a.have_servers) switch (try gatherServers(g, id, a)) {
             .pending => return .pending,
             .none => {
-                if (a.retried or a.held != null) return a.giveUp(g);
+                if (a.retried or a.held != .none) return a.giveUp(g);
                 a.retry(g);
                 continue;
             },
@@ -893,7 +894,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                             a.nattempts = 0;
                             return .{ .reply = k };
                         }
-                        if (a.held == null) a.held = at.exchange;
+                        if (a.held == .none) a.held = .wrap(at.exchange);
                     }
                 },
             }
@@ -947,8 +948,8 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     if (zone.labels.len == 0) {
         for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
     } else {
-        if (a.cut == null) a.cut = try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none;
-        const cut = g.cell(a.cut.?);
+        if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
+        const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
         if (cut.failure()) |why| {
             a.local = a.local or why.local;
@@ -1013,7 +1014,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     if (g.cfg.trace) {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         var zb: [dns.max_dotted_len + 1]u8 = undefined;
-        std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != null) "best failure held" else "no reply at all" });
+        std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     }
     return .none;
 }
