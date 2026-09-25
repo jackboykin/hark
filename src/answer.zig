@@ -164,11 +164,12 @@ pub const Desk = struct {
         d.failures.deinit(d.g.gpa);
     }
 
-    /// `recalled` and `floored` come noted; a replay never is, or a hold
-    /// would extend itself.
+    /// `recalled` and `floored` come noted; `replayed` and `held` never are,
+    /// or a hold would extend itself.
     pub const Early = union(enum) {
         synthesized: Served,
         replayed: Served,
+        held: Served,
         recalled: Served,
         floored: Served,
         graph,
@@ -180,7 +181,7 @@ pub const Desk = struct {
         if (d.failures.get(q, c.cd, d.g.now())) |ede| switch (ede.code) {
             // A hold with nothing left to serve asks afresh.
             .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
-            else => return .{ .replayed = servfail(q, ede) },
+            else => return .{ .held = servfail(q, ede) },
         };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };

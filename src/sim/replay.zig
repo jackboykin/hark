@@ -193,7 +193,7 @@ fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *cons
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
     const served = switch (try desk.early(arena, q, client)) {
-        .synthesized, .replayed, .floored => |served| served,
+        .synthesized, .replayed, .held, .floored => |served| served,
         .recalled => |served| blk: {
             errdefer served.release(&g.store);
             try agrees(arena, g, s, scenario, q, client, held, desk, rb, served);

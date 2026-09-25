@@ -318,7 +318,7 @@ const Server = struct {
         };
         const c = &s.g.stats.clients;
         switch (try s.desk.early(arena, q, client)) {
-            .synthesized => |served| return s.send(reply, query, served, s.e.now_ns),
+            .synthesized, .held => |served| return s.send(reply, query, served, s.e.now_ns),
             .replayed => |served| {
                 c.hit += 1;
                 return s.send(reply, query, served, s.e.now_ns);
