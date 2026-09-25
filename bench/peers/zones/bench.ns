@@ -1,0 +1,42 @@
+; bench. is shaped like com.: 13 names in bailiwick, an A and an AAAA each.
+; Both zones include this, the root as glue and bench. at its apex, and
+; lib.sh binds the bench nsd to these addresses (V6=0 leaves out the AAAA).
+bench.      172800 IN NS   ns1.bench.
+bench.      172800 IN NS   ns2.bench.
+bench.      172800 IN NS   ns3.bench.
+bench.      172800 IN NS   ns4.bench.
+bench.      172800 IN NS   ns5.bench.
+bench.      172800 IN NS   ns6.bench.
+bench.      172800 IN NS   ns7.bench.
+bench.      172800 IN NS   ns8.bench.
+bench.      172800 IN NS   ns9.bench.
+bench.      172800 IN NS   ns10.bench.
+bench.      172800 IN NS   ns11.bench.
+bench.      172800 IN NS   ns12.bench.
+bench.      172800 IN NS   ns13.bench.
+ns1.bench.  172800 IN A    192.5.6.30
+ns1.bench.  172800 IN AAAA 2001:503:a83e::2:30
+ns2.bench.  172800 IN A    192.33.14.30
+ns2.bench.  172800 IN AAAA 2001:503:231d::2:30
+ns3.bench.  172800 IN A    192.26.92.30
+ns3.bench.  172800 IN AAAA 2001:503:83eb::30
+ns4.bench.  172800 IN A    192.31.80.30
+ns4.bench.  172800 IN AAAA 2001:500:856e::30
+ns5.bench.  172800 IN A    192.12.94.30
+ns5.bench.  172800 IN AAAA 2001:502:1ca1::30
+ns6.bench.  172800 IN A    192.35.51.30
+ns6.bench.  172800 IN AAAA 2001:503:d414::30
+ns7.bench.  172800 IN A    192.42.93.30
+ns7.bench.  172800 IN AAAA 2001:503:eea3::30
+ns8.bench.  172800 IN A    192.54.112.30
+ns8.bench.  172800 IN AAAA 2001:502:8cc::30
+ns9.bench.  172800 IN A    192.43.172.30
+ns9.bench.  172800 IN AAAA 2001:503:39c1::30
+ns10.bench. 172800 IN A    192.48.79.30
+ns10.bench. 172800 IN AAAA 2001:502:7094::30
+ns11.bench. 172800 IN A    192.52.178.30
+ns11.bench. 172800 IN AAAA 2001:503:d2d::30
+ns12.bench. 172800 IN A    192.41.162.30
+ns12.bench. 172800 IN AAAA 2001:500:d937::30
+ns13.bench. 172800 IN A    192.55.83.30
+ns13.bench. 172800 IN AAAA 2001:501:b1f9::30

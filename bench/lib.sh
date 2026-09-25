@@ -1,12 +1,14 @@
 # shellcheck shell=bash
 # Sourced by the rigs: NSD authority and hark on loopback inside unshare -Urn,
 # pinned for the 7950X, plus the samplers that see what process time hides.
-# env: CPU_RES (2), CPU_LOAD (4-7), CPU_NSD (8-11), CPU_AUX (13, probes),
-# CPU_SAMPLE (14, the udp sampler), PERF=1 for per-window perf counters on
-# CPU_RES (perfd.sh, started outside the namespace).
+# env: CPU_RES (2), CPU_LOAD (4-7), CPU_NSD (8-11, bench.'s nsd), CPU_ROOT (12,
+# the root's), CPU_AUX (13, probes), CPU_SAMPLE (14, the udp sampler), V6=0
+# to leave bench.'s AAAA servers unreachable as on an IPv4-only host, PERF=1
+# for per-window perf counters on CPU_RES (perfd.sh, started outside the
+# namespace).
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 P=$B/peers
-CPU_RES=${CPU_RES:-2} CPU_LOAD=${CPU_LOAD:-4-7} CPU_NSD=${CPU_NSD:-8-11} CPU_AUX=${CPU_AUX:-13} CPU_SAMPLE=${CPU_SAMPLE:-14}
+CPU_RES=${CPU_RES:-2} CPU_LOAD=${CPU_LOAD:-4-7} CPU_NSD=${CPU_NSD:-8-11} CPU_ROOT=${CPU_ROOT:-12} CPU_AUX=${CPU_AUX:-13} CPU_SAMPLE=${CPU_SAMPLE:-14}
 PORT=5354
 
 # Re-runs the calling script in a fresh user and network namespace.
@@ -21,15 +23,28 @@ ns() {
   kill "$pd"; wait "$pd"; rm -rf "$PERF_DIR"; exit "$rc"
 }
 
-# NSD serves . and bench. on 198.41.0.4; query files land in $R.
+nsd_up() { # name cpus zone addr...
+  local n=$1 c=$2 z=$3; shift 3
+  { sed "s|__RUN__|$R|g; s|__DIR__|$P|g; s|__NAME__|$n|g" "$P/nsd.conf"
+    printf '    ip-address: %s\n' "$@"
+    printf 'zone:\n    name: "%s"\n    zonefile: "%s.zone"\n' "$z" "$n"; } >"$R/nsd-$n.conf"
+  taskset -c "$c" nsd -c "$R/nsd-$n.conf" -d 2>"$R/nsd-$n.err" &
+}
+
+# The root's nsd on 198.41.0.4 delegates bench. to a second nsd on the
+# addresses in zones/bench.ns, so a miss starts at a cached 26-server cut, as
+# under com. Query files land in $R.
 rig_up() {
   R=$(mktemp -d)
   trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$R"' EXIT
-  sed "s|__RUN__|$R|g; s|__DIR__|$P|g" "$P/nsd.conf" >"$R/nsd.conf"
   for w in hit miss; do python3 "$P/gen_queries.py" $w >"$R/$w.txt"; done
   ip link set lo up
   ip addr add 198.41.0.4/32 dev lo
-  taskset -c "$CPU_NSD" nsd -c "$R/nsd.conf" -d 2>"$R/nsd.err" &
+  local a addrs
+  mapfile -t addrs < <(awk -v v6="${V6:-1}" '$4 == "A" || ($4 == "AAAA" && v6) { print $5 }' "$P/zones/bench.ns")
+  for a in "${addrs[@]}"; do ip addr add "$a" dev lo; done
+  nsd_up root "$CPU_ROOT" . 198.41.0.4
+  nsd_up bench "$CPU_NSD" bench. "${addrs[@]}"
   sleep 0.5
 }
 

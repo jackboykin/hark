@@ -2,6 +2,8 @@
 listen = ["127.0.0.1:5354"]
 
 [resolver]
+# One address, as the peers read from root.hints.
+root-hints = ["198.41.0.4"]
 dnssec = false
 qname-minimization = false
 
