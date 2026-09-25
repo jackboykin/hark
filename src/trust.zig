@@ -391,14 +391,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
 /// `ds(candidate)` one label at a time below `zone`. Once (`probe_depth`).
 fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell) !union(enum) { pending, insecure: i64, none } {
     var kb: graph.KeyBuf = undefined;
-    const apex = proof.deepestApex(t.name, t.key.rtype);
-    var deepest = apex;
-    if (t.state.fact.rrset.kind == .nodata or t.state.fact.rrset.kind == .nxdomain) {
-        deepest = zone;
-        for (t.state.fact.rrset.authorities) |rr| if (rr.rtype == .soa and apex.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
-            deepest = rr.name;
-        };
-    }
+    const deepest = proof.deepestApex(t.name, t.key.rtype);
     while (true) {
         if (s.probe) |pid| {
             const p = g.cell(pid);

@@ -53,6 +53,16 @@ RANGE_BEGIN 0 100
     SECTION AUTHORITY
       child.example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
   ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www2.child.example. IN AAAA
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -68,6 +78,21 @@ ENTRY_BEGIN
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     www.child.example. IN AAAA
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www2.child.example. IN AAAA
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www2.child.example. IN AAAA
 ENTRY_END
 
 SCENARIO_END
