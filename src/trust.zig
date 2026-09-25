@@ -26,7 +26,14 @@ pub const Chain = struct {
     proven_until_ns: i64 = std.math.maxInt(i64),
 };
 
-pub const DsScratch = struct { parent: ?CellId = null, keys: ?CellId = null, rrset: ?CellId = null, signer: ?CellId = null };
+pub const DsScratch = struct {
+    parent: ?CellId = null,
+    keys: ?CellId = null,
+    rrset: ?CellId = null,
+    signer: ?CellId = null,
+    fault: ?Fault = null,
+    probe: Probe = .{},
+};
 pub const DnskeyScratch = struct { ds: ?CellId = null, rrset: ?CellId = null };
 pub const SecureScratch = struct {
     /// The rrset version under judgement; ids recycle, so its generation too.
@@ -37,8 +44,7 @@ pub const SecureScratch = struct {
     /// `dnskey(signer)` per RRset group, in section order.
     keys: [max_groups]?CellId = @splat(null),
     fault: ?Fault = null,
-    probe: ?CellId = null,
-    probe_depth: u8 = 0,
+    probe: Probe = .{},
 };
 const max_groups = 8;
 
@@ -83,10 +89,12 @@ fn capExpiry(g: *Graph, cap: u32) i64 {
 
 /// `ds(zone)`: the anchor at the root; below it, `rrset(zone, DS)` judged
 /// under the keys of whatever signed it, a proper ancestor of the zone:
-/// the walked parent may hide a signed cut on its own servers, or fold
-/// one (901). A signed set with a usable algorithm is secure, a proven
-/// absence or unusable set insecure, anything else bogus. An insecure
-/// parent is inherited, and so is a failed one.
+/// the walked parent may hide a cut on its own servers, or fold one (901).
+/// A signed set with a usable algorithm is secure, a proven absence or
+/// unusable set insecure. Bytes that prove nothing, or a failed input, are
+/// insecure only below a proven insecure cut between the walked parent
+/// and the zone; otherwise the bytes are bogus or the failure stands. An
+/// insecure parent is inherited, and so is a failed one.
 pub fn runDs(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const zone = g.cell(id).name;
@@ -113,22 +121,37 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         return g.fail(id, no_chain);
     const rs = g.cell(s.rrset.?);
     if (!rs.settled()) return;
-    if (rs.failure()) |why| return g.fail(id, why);
+    if (s.fault == null) {
+        s.fault = if (rs.failure()) |why| .{ .failed = why } else try judgeDs(g, id, s, zone, rs) orelse return;
+        if (budgetSpent(g)) |why| return g.fail(id, why);
+    }
+    switch (try s.probe.run(g, id, parent_zone, parent_name)) {
+        .pending => {},
+        .cut_short => try g.fail(id, no_chain),
+        .insecure => |until| try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
+        .none => switch (s.fault.?) {
+            .bogus => try failChain(g, id, s.rrset.?),
+            .failed => |why| try g.fail(id, why),
+        },
+    }
+}
+
+fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const graph.Cell) !?Fault {
+    var kb: graph.KeyBuf = undefined;
     const r = rs.state.fact.rrset;
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
         .nodata, .nxdomain => proof.authoritySigner(r.authorities),
         // A name that is no cut may alias (a hidden-cut probe).
-        .alias => return g.fail(id, no_cut),
+        .alias => return .{ .failed = no_cut },
         .yxdomain => null,
-    } orelse return failChain(g, id, s.rrset.?);
-    if (!proof.isProperAncestor(signer, zone)) return failChain(g, id, s.rrset.?);
+    } orelse return .bogus;
+    if (!proof.isProperAncestor(signer, zone)) return .bogus;
     if (s.signer == null) s.signer = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-        return g.fail(id, no_chain);
+        return .{ .failed = no_chain };
     const keys = g.cell(s.signer.?);
-    if (!keys.settled()) return;
-    if (keys.failure()) |why| return g.fail(id, why);
-    if (keys.state.fact.dnskey.status == .insecure) return g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(rs.expires_ns, keys.expires_ns));
+    if (!keys.settled()) return null;
+    if (keys.failure()) |why| return .{ .failed = why };
     const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -137,17 +160,17 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     switch (r.kind) {
         .answer => {
             const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
-                return failChain(g, id, s.rrset.?);
+                return .bogus;
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, rrsig.ttlCap(sig, now))));
         },
         .nodata, .nxdomain => {
             // RFC 4034 §3.1.3.
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
-                return failChain(g, id, s.rrset.?);
+                return .bogus;
             var cap: u32 = std.math.maxInt(u32);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
-                return failChain(g, id, s.rrset.?);
+                return .bogus;
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
                 // A proven non-cut, or no proof: the bytes are sound.
@@ -156,6 +179,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         },
         .alias, .yxdomain => unreachable,
     }
+    return null;
 }
 
 pub const KeysScratch = struct {
@@ -279,8 +303,9 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         s.fault = try judge(g, id, s, t, expires) orelse return;
         if (budgetSpent(g)) |why| return g.fail(id, why);
     }
-    switch (try probeHiddenCut(g, id, s, zone, t)) {
+    switch (try s.probe.run(g, id, zone, proof.deepestApex(t.name, t.key.rtype))) {
         .pending => {},
+        .cut_short => try g.fail(id, no_chain),
         .insecure => |until| try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
         .none => switch (s.fault.?) {
             .bogus => try failBogus(g, id, s.target),
@@ -388,23 +413,28 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
     return null;
 }
 
-/// `ds(candidate)` one label at a time below `zone`. Once (`probe_depth`).
-fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell) !union(enum) { pending, insecure: i64, none } {
-    var kb: graph.KeyBuf = undefined;
-    const deepest = proof.deepestApex(t.name, t.key.rtype);
-    while (true) {
-        if (s.probe) |pid| {
-            const p = g.cell(pid);
-            if (!p.settled()) return .pending;
-            if (p.failure() == null and p.state.fact.ds.status == .insecure) return .{ .insecure = p.expires_ns };
-            s.probe = null;
+/// `ds(candidate)` one label at a time below `above`, down to `deepest`,
+/// for a proven insecure cut; each candidate is asked once.
+const Probe = struct {
+    cell: ?CellId = null,
+    depth: u8 = 0,
+
+    fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, cut_short } {
+        var kb: graph.KeyBuf = undefined;
+        while (true) {
+            if (p.cell) |pid| {
+                const c = g.cell(pid);
+                if (!c.settled()) return .pending;
+                if (c.failure() == null and c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
+                p.cell = null;
+            }
+            p.depth = @max(p.depth, @as(u8, @intCast(above.labels.len))) + 1;
+            if (p.depth > deepest.labels.len) return .none;
+            const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - p.depth ..] };
+            p.cell = try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .cut_short;
         }
-        s.probe_depth = @max(s.probe_depth, @as(u8, @intCast(zone.labels.len))) + 1;
-        if (s.probe_depth > deepest.labels.len) return .none;
-        const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - s.probe_depth ..] };
-        s.probe = try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .none;
     }
-}
+};
 
 /// A CNAME directly under the DNAME group before it.
 fn synthesisedUnder(rr: RR, prev_dname: ?RR) bool {

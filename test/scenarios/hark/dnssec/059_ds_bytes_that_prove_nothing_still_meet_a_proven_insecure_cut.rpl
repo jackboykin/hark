@@ -1,0 +1,523 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN DS bytes that prove nothing still meet a proven insecure cut
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN NS
+    SECTION ANSWER
+      example. 3600 IN NS ns.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sec.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sec.example. IN A
+    SECTION AUTHORITY
+      sec.example. 3600 IN NS ns.sec.example.
+    SECTION ADDITIONAL
+      ns.sec.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      edu.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      edu.example. 3600 IN NSEC z.example. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      uni.edu.example. IN DS
+    SECTION AUTHORITY
+      edu.example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      uni.edu.example. IN A
+    SECTION AUTHORITY
+      uni.edu.example. 3600 IN NS ns.uni.edu.example.
+    SECTION ADDITIONAL
+      ns.uni.edu.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      dsa.edu.example. IN DS
+    SECTION ANSWER
+      dsa.edu.example. 3600 IN DS 12345 13 2 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      dsa.edu.example. IN A
+    SECTION AUTHORITY
+      dsa.edu.example. 3600 IN NS ns.dsa.edu.example.
+    SECTION ADDITIONAL
+      ns.dsa.edu.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      unsig.example. IN DS
+    SECTION ANSWER
+      unsig.example. 3600 IN DS 12345 13 2 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      unsig.example. IN A
+    SECTION AUTHORITY
+      unsig.example. 3600 IN NS ns.unsig.example.
+    SECTION ADDITIONAL
+      ns.unsig.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      forged.example. IN DS
+    SECTION ANSWER
+      forged.example. 3600 IN DS 12345 13 2 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+      forged.example. 3600 IN RRSIG DS 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      forged.example. IN A
+    SECTION AUTHORITY
+      forged.example. 3600 IN NS ns.forged.example.
+    SECTION ADDITIONAL
+      ns.forged.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      denied.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      example. 3600 IN RRSIG SOA 13 1 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      denied.example. IN A
+    SECTION AUTHORITY
+      denied.example. 3600 IN NS ns.denied.example.
+    SECTION ADDITIONAL
+      ns.denied.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      stray.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      other. 3600 IN NSEC z.other. NS RRSIG NSEC
+      other. 3600 IN RRSIG NSEC 13 1 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      stray.example. IN A
+    SECTION AUTHORITY
+      stray.example. 3600 IN NS ns.stray.example.
+    SECTION ADDITIONAL
+      ns.stray.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      own.example. IN DS
+    SECTION ANSWER
+      own.example. 3600 IN DS 12345 13 2 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+      own.example. 3600 IN RRSIG DS 13 2 3600 20990101000000 20200101000000 1 own.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      own.example. IN A
+    SECTION AUTHORITY
+      own.example. 3600 IN NS ns.own.example.
+    SECTION ADDITIONAL
+      ns.own.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      s.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      s.example. 3600 IN NSEC t.example. A RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.s.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      c.s.example. 3600 IN NSEC d.s.example. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      x.c.s.example. IN DS
+    SECTION AUTHORITY
+      c.s.example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      c.s.example. 3600 IN RRSIG SOA 13 3 3600 20990101000000 20200101000000 1 s.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      x.c.s.example. IN A
+    SECTION AUTHORITY
+      x.c.s.example. 3600 IN NS ns.x.c.s.example.
+    SECTION ADDITIONAL
+      ns.x.c.s.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR SERVFAIL
+    SECTION QUESTION
+      y.edu.example. IN DS
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      y.edu.example. IN A
+    SECTION AUTHORITY
+      y.edu.example. 3600 IN NS ns.y.edu.example.
+    SECTION ADDITIONAL
+      ns.y.edu.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.uni.edu.example. IN A
+    SECTION ANSWER
+      www.uni.edu.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sec.example. IN A
+    SECTION ANSWER
+      www.sec.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.dsa.edu.example. IN A
+    SECTION ANSWER
+      www.dsa.edu.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.unsig.example. IN A
+    SECTION ANSWER
+      www.unsig.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.forged.example. IN A
+    SECTION ANSWER
+      www.forged.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.denied.example. IN A
+    SECTION ANSWER
+      www.denied.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.own.example. IN A
+    SECTION ANSWER
+      www.own.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.x.c.s.example. IN A
+    SECTION ANSWER
+      www.x.c.s.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.y.edu.example. IN A
+    SECTION ANSWER
+      www.y.edu.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.stray.example. IN A
+    SECTION ANSWER
+      www.stray.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.uni.edu.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.uni.edu.example. IN A
+  SECTION ANSWER
+    www.uni.edu.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.dsa.edu.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.dsa.edu.example. IN A
+  SECTION ANSWER
+    www.dsa.edu.example. 3600 IN A 192.0.2.2
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.sec.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.sec.example. IN A
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.unsig.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.unsig.example. IN A
+ENTRY_END
+
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.forged.example. IN A
+ENTRY_END
+
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.forged.example. IN A
+ENTRY_END
+
+STEP 11 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.denied.example. IN A
+ENTRY_END
+
+STEP 12 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.denied.example. IN A
+ENTRY_END
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.own.example. IN A
+ENTRY_END
+
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.own.example. IN A
+ENTRY_END
+
+STEP 15 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.x.c.s.example. IN A
+ENTRY_END
+
+STEP 16 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.x.c.s.example. IN A
+  SECTION ANSWER
+    www.x.c.s.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 17 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.y.edu.example. IN A
+ENTRY_END
+
+STEP 18 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.y.edu.example. IN A
+  SECTION ANSWER
+    www.y.edu.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 19 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.stray.example. IN A
+ENTRY_END
+
+STEP 20 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.stray.example. IN A
+ENTRY_END
+
+SCENARIO_END
