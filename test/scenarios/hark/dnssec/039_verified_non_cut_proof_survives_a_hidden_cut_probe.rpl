@@ -5,11 +5,10 @@
 
 SCENARIO_BEGIN a verified proof that a name is no cut is not discredited by a hidden-cut probe
 
-; Unsigned AA answers from signed example. probe for a hidden cut one label
-; at a time (tld-servers.ru's shape). a.example is an ordinary name: its
-; signed NODATA for DS is sound and proves no cut there. Treating it as
-; bogus refused a.example as a zone and ended the proof, so the probe for
-; c.a.example asked for a.example DS again.
+; a.example is an ordinary name: its signed NODATA for DS is sound and
+; proves no cut there. Treating it as bogus refused a.example as a zone
+; and ended the proof, so the probe for c.a.example asked for a.example
+; DS again.
 ;
 ; b.a.example and c.a.example are insecure cuts proven by the parent.
 

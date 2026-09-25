@@ -36,11 +36,13 @@ pub const SecureScratch = struct {
     zone_ds: ?CellId = null,
     /// `dnskey(signer)` per RRset group, in section order.
     keys: [max_groups]?CellId = @splat(null),
-    /// Hidden-cut probe: `ds(candidate)` one label at a time.
+    fault: ?Fault = null,
     probe: ?CellId = null,
     probe_depth: u8 = 0,
 };
 const max_groups = 8;
+
+const Fault = union(enum) { bogus, failed: Failure };
 
 /// A verdict is about one version of its inputs and lives exactly as long
 /// as they do. Bogus is no verdict that lives (RFC 4035 §4.3): it fails.
@@ -257,33 +259,44 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
 /// is unsigned; otherwise every RRset group verifies under its signer's
 /// keys (owner within signer within zone), a wildcard expansion also
 /// proves no closer match, and a negative proves itself under whatever
-/// zone signed the authority section. An unsigned authoritative reply
-/// from a signed zone may sit below a hidden insecure cut, probed one
-/// label at a time.
+/// zone signed the authority section. Bytes that prove nothing may sit
+/// below a hidden insecure cut, an unsigned child folded onto its signed
+/// parent's servers, which only its DS can say (RFC 4035 §4.3, §5.2);
+/// else bogus.
 pub fn runSecure(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const s = g.cell(id).scratch.secure;
     const t = g.cell(s.target);
-    const r = t.state.fact.rrset;
-    const zone = r.zone;
+    const zone = t.state.fact.rrset.zone;
     if (s.zone_ds == null) s.zone_ds = try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
         return g.fail(id, no_chain);
     const zd = g.cell(s.zone_ds.?);
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
     if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
-    var expires = @min(t.expires_ns, zd.expires_ns);
+    const expires = @min(t.expires_ns, zd.expires_ns);
+    if (s.fault == null) {
+        s.fault = try judge(g, id, s, t, expires) orelse return;
+        if (budgetSpent(g)) |why| return g.fail(id, why);
+    }
+    switch (try probeHiddenCut(g, id, s, zone, t)) {
+        .pending => {},
+        .insecure => |until| try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
+        .none => switch (s.fault.?) {
+            .bogus => try failBogus(g, id, s.target),
+            .failed => |why| try g.fail(id, why),
+        },
+    }
+}
+
+fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: i64) !?Fault {
+    var kb: graph.KeyBuf = undefined;
+    const r = t.state.fact.rrset;
+    const zone = r.zone;
+    var expires = until;
     const budget = &g.payer.validation;
     const now = g.wallNow();
     var cap: u32 = std.math.maxInt(u32);
-    // An unsigned AA reply from a zone expected to sign: the answering
-    // zone may be an unsigned child folded onto the parent's servers
-    // (tld-servers.ru on the ru servers), which only its DS can say.
-    if (r.aa and !hasSignature(r)) switch (try probeHiddenCut(g, id, s, zone, t)) {
-        .pending => return,
-        .insecure => |until| return g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
-        .none => {},
-    };
     switch (r.kind) {
         .answer, .alias, .yxdomain => {
             // Pass one demands every signer's keys, pass two verifies. A
@@ -294,24 +307,23 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
             var prev_dname: ?RR = null;
             for (r.answers, 0..) |rr, i| {
                 if (rr.rtype == .rrsig or !firstOfRrset(r.answers, i)) continue;
-                if (groups >= max_groups) return g.fail(id, .{ .code = .dnssec_bogus, .text = "too many rrsets" });
+                if (groups >= max_groups) return .{ .failed = .{ .code = .dnssec_bogus, .text = "too many rrsets" } };
                 defer groups += 1;
                 defer prev_dname = if (rr.rtype == .dname) rr else null;
                 if (synthesisedUnder(rr, prev_dname)) continue;
-                const sig = dnssec.findRrsigAt(r.answers, rr.name, rr.rtype) orelse return failBogus(g, id, s.target);
+                const sig = dnssec.findRrsigAt(r.answers, rr.name, rr.rtype) orelse return .bogus;
                 // RFC 4034 §3.1.3; a signer above the answering zone
                 // authenticates nothing here.
-                if (!rr.name.isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return failBogus(g, id, s.target);
-                if (rr.rtype == .ds and !proof.isProperAncestor(sig.signer_name, rr.name)) return failBogus(g, id, s.target);
+                if (!proof.deepestApex(rr.name, rr.rtype).isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return .bogus;
                 if (s.keys[groups] == null) s.keys[groups] = try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
-                    return g.fail(id, no_chain);
+                    return .{ .failed = no_chain };
                 pending = pending or !g.cell(s.keys[groups].?).settled();
             }
-            if (pending) return;
+            if (pending) return null;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
             // Signatures alone: a claim about an empty set.
-            if (groups == 0) return failBogus(g, id, s.target);
+            if (groups == 0) return .bogus;
             var status: Proof = .secure;
             groups = 0;
             prev_dname = null;
@@ -320,47 +332,48 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 defer groups += 1;
                 defer prev_dname = if (rr.rtype == .dname) rr else null;
                 if (synthesisedUnder(rr, prev_dname)) {
-                    const target = try dns.substituteSuffix(g.scratch.allocator(), rr.name, prev_dname.?.name, prev_dname.?.rdata.dname) orelse return failBogus(g, id, s.target);
-                    if (!target.eql(rr.rdata.cname)) return failBogus(g, id, s.target);
+                    const target = try dns.substituteSuffix(g.scratch.allocator(), rr.name, prev_dname.?.name, prev_dname.?.rdata.dname) orelse return .bogus;
+                    if (!target.eql(rr.rdata.cname)) return .bogus;
                     continue;
                 }
                 const kc = g.cell(s.keys[groups].?);
-                if (kc.failure()) |why| return g.fail(id, why);
+                if (kc.failure()) |why| return .{ .failed = why };
                 expires = @min(expires, kc.expires_ns);
                 if (kc.state.fact.dnskey.status == .insecure) {
                     status = .insecure;
                     continue;
                 }
                 const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
-                    return failBogus(g, id, s.target);
+                    return .bogus;
                 cap = @min(cap, rrsig.ttlCap(verified, now));
                 if (verified.labels < rrsig.signedLabels(rr.name)) {
-                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return failBogus(g, id, s.target);
+                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return .bogus;
                     switch (proof.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget)) {
                         .secure => {},
                         .insecure => status = .insecure,
-                        .bogus, .unchecked => return failBogus(g, id, s.target),
+                        .bogus, .unchecked => return .bogus,
                     }
                 }
             }
             try g.settle(id, .{ .secure = .{ .status = status, .proven_until_ns = if (status == .secure) capExpiry(g, cap) else std.math.maxInt(i64) } }, @min(expires, capExpiry(g, cap)));
         },
         .nodata, .nxdomain => {
-            const signer = proof.authoritySigner(r.authorities) orelse return failBogus(g, id, s.target);
-            if (t.key.rtype == .ds and t.name.labels.len > 0 and !proof.isProperAncestor(signer, t.name)) return failBogus(g, id, s.target);
+            const signer = proof.authoritySigner(r.authorities) orelse return .bogus;
+            if (!proof.deepestApex(t.name, t.key.rtype).isSubdomainOf(signer)) return .bogus;
             if (s.keys[0] == null) s.keys[0] = try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-                return g.fail(id, no_chain);
+                return .{ .failed = no_chain };
             const kc = g.cell(s.keys[0].?);
-            if (!kc.settled()) return;
+            if (!kc.settled()) return null;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
-            if (kc.failure()) |why| return g.fail(id, why);
+            if (kc.failure()) |why| return .{ .failed = why };
             expires = @min(expires, kc.expires_ns);
             if (kc.state.fact.dnskey.status == .insecure) {
-                if (!signer.isSubdomainOf(zone) or !t.name.isSubdomainOf(signer)) return failBogus(g, id, s.target);
-                return g.settle(id, .{ .secure = .{ .status = .insecure } }, expires);
+                if (!signer.isSubdomainOf(zone)) return .bogus;
+                try g.settle(id, .{ .secure = .{ .status = .insecure } }, expires);
+                return null;
             }
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return failBogus(g, id, s.target);
+            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return .bogus;
             switch (proof.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
                 .secure => {
                     expires = @min(expires, capExpiry(g, cap));
@@ -368,20 +381,21 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                     try g.settle(id, .{ .secure = .{ .status = .secure, .proven_until_ns = capExpiry(g, cap) } }, expires);
                 },
                 .insecure => try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
-                .bogus, .unchecked => try failBogus(g, id, s.target),
+                .bogus, .unchecked => return .bogus,
             }
         },
     }
+    return null;
 }
 
-/// `ds(candidate)` one label at a time below `zone`, down to the name for
-/// a positive, or to the SOA owner for a negative. Once (`probe_depth`).
+/// `ds(candidate)` one label at a time below `zone`. Once (`probe_depth`).
 fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *const graph.Cell) !union(enum) { pending, insecure: i64, none } {
     var kb: graph.KeyBuf = undefined;
-    var deepest = t.name;
+    const apex = proof.deepestApex(t.name, t.key.rtype);
+    var deepest = apex;
     if (t.state.fact.rrset.kind == .nodata or t.state.fact.rrset.kind == .nxdomain) {
         deepest = zone;
-        for (t.state.fact.rrset.authorities) |rr| if (rr.rtype == .soa and t.name.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
+        for (t.state.fact.rrset.authorities) |rr| if (rr.rtype == .soa and apex.isSubdomainOf(rr.name) and rr.name.isSubdomainOf(zone)) {
             deepest = rr.name;
         };
     }
@@ -403,12 +417,6 @@ fn probeHiddenCut(g: *Graph, id: CellId, s: *SecureScratch, zone: dns.Name, t: *
 fn synthesisedUnder(rr: RR, prev_dname: ?RR) bool {
     const d = prev_dname orelse return false;
     return rr.rtype == .cname and rr.name.labels.len > d.name.labels.len and rr.name.isSubdomainOf(d.name);
-}
-
-fn hasSignature(r: graph.Reply) bool {
-    for (r.answers) |rr| if (rr.rtype == .rrsig) return true;
-    for (r.authorities) |rr| if (rr.rtype == .rrsig) return true;
-    return false;
 }
 
 fn firstOfRrset(rrs: []const RR, i: usize) bool {

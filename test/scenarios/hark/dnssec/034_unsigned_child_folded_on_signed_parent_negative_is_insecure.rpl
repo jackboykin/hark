@@ -7,10 +7,8 @@ SCENARIO_BEGIN an unsigned child served from its signed parent's address answers
 
 ; Live shape: tld-servers.ru, an unsigned zone hosted on the ru servers.
 ; The walk reaches example.'s server expecting example. to sign, and gets
-; an unsigned AA NODATA whose SOA names child.example.: a delegation the
-; walk never saw. Positives already probe ds() down the name for such a
-; hidden cut; negatives went straight to bogus. The SOA owner bounds the
-; probe, and the parent's signed NSEC says no DS: insecure, NOERROR, no AD.
+; an unsigned AA NODATA from child.example.: a delegation the walk never
+; saw. The parent's signed NSEC says no DS: insecure, NOERROR, no AD.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1

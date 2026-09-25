@@ -10,6 +10,7 @@ const dnssec = @import("dnssec.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const graph = @import("graph.zig");
 const trust = @import("trust.zig");
+const proof = @import("proof.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
 
@@ -524,8 +525,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     if (!s.started) {
         // Indexed proofs deny the name without a packet.
         if (s.cut == null and try denial.deny(g, id)) return;
-        // A DS always lives in the parent's zone.
-        const from: dns.Name = if (qtype == .ds) .{ .labels = name.labels[@min(1, name.labels.len)..] } else name;
+        const from = proof.deepestApex(name, qtype);
         const cut = switch (try start(g, id, name, from, &s.cut)) {
             .pending => return,
             .none => return g.fail(id, unreachable_authority),

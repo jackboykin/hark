@@ -32,6 +32,10 @@ pub fn isProperAncestor(zone: dns.Name, name: dns.Name) bool {
     return zone.labels.len < name.labels.len and name.isSubdomainOf(zone);
 }
 
+pub fn deepestApex(name: dns.Name, rtype: dns.RType) dns.Name {
+    return if (rtype == .ds and name.labels.len > 0) .{ .labels = name.labels[1..] } else name;
+}
+
 pub const Delegation = enum {
     unsigned,
     unproven,
