@@ -36,6 +36,11 @@ pub const DsScratch = struct {
     probe: Probe = .{},
 };
 pub const DnskeyScratch = struct { ds: OptionalCellId = .none, rrset: OptionalCellId = .none };
+pub const KeysScratch = struct {
+    /// The payer of the walk that met the delegation, shared.
+    budget: *graph.Budget = undefined,
+    keys: OptionalCellId = .none,
+};
 pub const SecureScratch = struct {
     /// The rrset version under judgement; ids recycle, so its generation too.
     target: CellId = 0,
@@ -201,12 +206,6 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     }
     return null;
 }
-
-pub const KeysScratch = struct {
-    /// The payer of the walk that met the delegation, shared.
-    budget: *graph.Budget = undefined,
-    keys: OptionalCellId = .none,
-};
 
 /// `keys(zone)`: a root with no fact of its own, holding `dnskey(zone)`
 /// until it settles, so the chain of trust overlaps the walk below
