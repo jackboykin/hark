@@ -49,7 +49,25 @@ pub const SecureScratch = struct {
 };
 const max_groups = 8;
 
-const Fault = union(enum) { bogus, failed: Failure };
+/// A failed input stays pinned, its failure readable, until this cell
+/// settles.
+const Fault = union(enum) {
+    bogus,
+    input: CellId,
+    no_chain,
+    no_cut,
+    too_many_rrsets,
+
+    fn failure(f: Fault, g: *Graph) ?Failure {
+        return switch (f) {
+            .bogus => null,
+            .input => |i| g.cell(i).failure().?,
+            .no_chain => no_chain,
+            .no_cut => no_cut,
+            .too_many_rrsets => too_many_rrsets,
+        };
+    }
+};
 
 /// A verdict is about one version of its inputs and lives exactly as long
 /// as they do. Bogus is no verdict that lives (RFC 4035 §4.3): it fails.
@@ -57,6 +75,7 @@ const no_chain: Failure = .{ .code = .dnssec_bogus, .text = "no chain" };
 const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validation" };
 /// Verified, and still no proof of the insecure cut asked about.
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
+const too_many_rrsets: Failure = .{ .code = .dnssec_bogus, .text = "too many rrsets" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
 /// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
@@ -125,36 +144,34 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
     if (s.fault == null) {
-        s.fault = if (rs.failure()) |why| .{ .failed = why } else try judgeDs(g, id, s, zone, rs) orelse return;
+        s.fault = try judgeDs(g, id, s, zone, rs) orelse return;
         if (budgetSpent(g)) |why| return g.fail(id, why);
     }
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
         .cut_short => try g.fail(id, no_chain),
         .insecure => |until| try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
-        .none => switch (s.fault.?) {
-            .bogus => try failChain(g, id, s.rrset.unwrap().?),
-            .failed => |why| try g.fail(id, why),
-        },
+        .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
 }
 
 fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const graph.Cell) !?Fault {
     var kb: graph.KeyBuf = undefined;
+    if (rs.failure() != null) return .{ .input = s.rrset.unwrap().? };
     const r = rs.state.fact.rrset;
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
         .nodata, .nxdomain => proof.authoritySigner(r.authorities),
         // A name that is no cut may alias (a hidden-cut probe).
-        .alias => return .{ .failed = no_cut },
+        .alias => return .no_cut,
         .yxdomain => null,
     } orelse return .bogus;
     if (!proof.isProperAncestor(signer, zone)) return .bogus;
     if (s.signer == .none) s.signer = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-        return .{ .failed = no_chain });
+        return .no_chain);
     const keys = g.cell(s.signer.unwrap().?);
     if (!keys.settled()) return null;
-    if (keys.failure()) |why| return .{ .failed = why };
+    if (keys.failure() != null) return .{ .input = s.signer.unwrap().? };
     const budget = &g.payer.validation;
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
@@ -310,10 +327,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         .pending => {},
         .cut_short => try g.fail(id, no_chain),
         .insecure => |until| try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
-        .none => switch (s.fault.?) {
-            .bogus => try failBogus(g, id, s.target),
-            .failed => |why| try g.fail(id, why),
-        },
+        .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failBogus(g, id, s.target),
     }
 }
 
@@ -335,7 +349,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
             var prev_dname: ?RR = null;
             for (r.answers, 0..) |rr, i| {
                 if (rr.rtype == .rrsig or !firstOfRrset(r.answers, i)) continue;
-                if (groups >= max_groups) return .{ .failed = .{ .code = .dnssec_bogus, .text = "too many rrsets" } };
+                if (groups >= max_groups) return .too_many_rrsets;
                 defer groups += 1;
                 defer prev_dname = if (rr.rtype == .dname) rr else null;
                 if (synthesisedUnder(rr, prev_dname)) continue;
@@ -344,7 +358,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 // authenticates nothing here.
                 if (!proof.deepestApex(rr.name, rr.rtype).isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return .bogus;
                 if (s.keys[groups] == .none) s.keys[groups] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
-                    return .{ .failed = no_chain });
+                    return .no_chain);
                 pending = pending or !g.cell(s.keys[groups].unwrap().?).settled();
             }
             if (pending) return null;
@@ -365,7 +379,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     continue;
                 }
                 const kc = g.cell(s.keys[groups].unwrap().?);
-                if (kc.failure()) |why| return .{ .failed = why };
+                if (kc.failure() != null) return .{ .input = s.keys[groups].unwrap().? };
                 expires = @min(expires, kc.expires_ns);
                 if (kc.state.fact.dnskey.status == .insecure) {
                     status = .insecure;
@@ -389,12 +403,12 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
             const signer = proof.authoritySigner(r.authorities) orelse return .bogus;
             if (!proof.deepestApex(t.name, t.key.rtype).isSubdomainOf(signer)) return .bogus;
             if (s.keys[0] == .none) s.keys[0] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-                return .{ .failed = no_chain });
+                return .no_chain);
             const kc = g.cell(s.keys[0].unwrap().?);
             if (!kc.settled()) return null;
             const clock = graph.Tally.clock(&g.tally.verify_ns);
             defer clock.stop();
-            if (kc.failure()) |why| return .{ .failed = why };
+            if (kc.failure() != null) return .{ .input = s.keys[0].unwrap().? };
             expires = @min(expires, kc.expires_ns);
             if (kc.state.fact.dnskey.status == .insecure) {
                 if (!signer.isSubdomainOf(zone)) return .bogus;
