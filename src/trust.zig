@@ -62,9 +62,11 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 /// zone draining its own budget must not drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (budgetSpent(g)) |why| return g.fail(id, why);
-    const t = g.cell(rid);
-    t.expires_ns = @min(t.expires_ns, g.now());
-    if (t.blob) |b| g.store.drop(t.key, b);
+    if (!g.spent(g.payer)) {
+        const t = g.cell(rid);
+        t.expires_ns = @min(t.expires_ns, g.now());
+        if (t.blob) |b| g.store.drop(t.key, b);
+    }
     try g.fail(id, .{ .code = .dnssec_bogus });
 }
 
@@ -79,7 +81,7 @@ fn budgetSpent(g: *Graph) ?Failure {
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (!g.payer.validation.exhausted()) try g.remember(g.cell(id).key, refused);
+    if (!g.spent(g.payer)) try g.remember(g.cell(id).key, refused);
     try failBogus(g, id, rid);
 }
 
