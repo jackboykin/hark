@@ -74,8 +74,6 @@ const Fault = union(enum) {
     }
 };
 
-/// A verdict is about one version of its inputs and lives exactly as long
-/// as they do. Bogus is no verdict that lives (RFC 4035 §4.3): it fails.
 const no_chain: Failure = .{ .code = .dnssec_bogus, .text = "no chain" };
 const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validation" };
 /// Verified, and still no proof of the insecure cut asked about.
