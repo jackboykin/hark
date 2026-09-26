@@ -1,0 +1,69 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a chain's first hop answers its own CNAME question, signed and proven
+
+; The chain starts at a wildcard expansion; its hop, kept as the fact
+; rrset(foo, CNAME), carries the signature and the proof of no closer
+; match, and answers from memory.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      foo. IN A
+    SECTION ANSWER
+      foo. 3600 IN CNAME bar.
+    SECTION AUTHORITY
+      c. 3600 IN NSEC zz. A RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      bar. IN A
+    SECTION ANSWER
+      bar. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    foo. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    foo. IN A
+  SECTION ANSWER
+    foo. 3600 IN CNAME bar.
+    bar. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    foo. IN CNAME
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    foo. IN CNAME
+  SECTION ANSWER
+    foo. 3600 IN CNAME bar.
+ENTRY_END
+
+SCENARIO_END

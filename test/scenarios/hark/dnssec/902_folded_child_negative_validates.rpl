@@ -60,6 +60,19 @@ RANGE_BEGIN 0 100
       example. 3600 IN NSEC c.example. SOA NS DNSKEY RRSIG NSEC
       c.example. 3600 IN NSEC x.example. A RRSIG NSEC
   ENTRY_END
+  ; An RRset is another matter: the parent's signature over a name below
+  ; the tracked cut claims across it (RFC 4035 §5.3.1), and the CNAME
+  ; kept as its own fact is still the child's zone's.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    SIGN_AS example.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      x.child.example. IN A
+    SECTION ANSWER
+      x.child.example. 3600 IN CNAME www.example.
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -75,6 +88,36 @@ ENTRY_BEGIN
   REPLY QR RD RA AD NXDOMAIN
   SECTION QUESTION
     www.child.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.child.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    x.child.example. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.child.example. IN CNAME
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    x.child.example. IN CNAME
 ENTRY_END
 
 SCENARIO_END

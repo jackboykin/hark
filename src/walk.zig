@@ -645,12 +645,26 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     if (qtype == .cname or reply.answers.len == 0) return;
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
+    var keep: std.ArrayList(dns.ResourceRecord) = .empty;
+    try keep.append(g.scratch.allocator(), first);
+    try keepSigs(g, &keep, reply.answers, name, .cname);
+    // A wildcard's expansion travels with its proof of no closer match.
+    var proofs: std.ArrayList(dns.ResourceRecord) = .empty;
+    const expanded = for (keep.items[1..]) |sig| {
+        if (sig.rdata.rrsig.labels < rrsig.signedLabels(name)) break true;
+    } else false;
+    if (expanded) for (reply.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
+        .nsec, .nsec3 => try proofs.append(g.scratch.allocator(), rr),
+        else => {},
+    };
     const hop: Reply = .{
         .kind = .alias,
         .rcode = .no_error,
         .aa = reply.aa,
-        .answers = reply.answers[0..1],
+        .answers = keep.items,
+        .authorities = proofs.items,
         .target = first.rdata.cname,
+        .zone = reply.zone,
         .stored_ns = reply.stored_ns,
         .ttl = first.ttl,
     };
