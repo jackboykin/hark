@@ -602,11 +602,7 @@ fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, digest: *const [Ecds
     const len = Curve.scalar.encoded_length;
     if (key_data.len != 2 * len) return error.InvalidKey;
     if (signature.len != 2 * len) return error.InvalidSignature;
-
-    var sec1: [1 + 2 * len]u8 = undefined;
-    sec1[0] = 0x04;
-    @memcpy(sec1[1..], key_data);
-    const q = Curve.fromSec1(&sec1) catch return error.InvalidKey;
+    const q = Curve.fromSerializedAffineCoordinates(key_data[0..len].*, key_data[len..][0..len].*, .big) catch return error.InvalidKey;
 
     const r_bytes = signature[0..len].*;
     const r = Scalar.fromBytes(r_bytes, .big) catch return error.InvalidSignature;
