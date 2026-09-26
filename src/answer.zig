@@ -406,12 +406,20 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     const trim = minimal and q.qtype != .ns;
     var authorities: std.ArrayList(dns.WireRecord) = .empty;
     var additionals: std.ArrayList(dns.WireRecord) = .empty;
+    // AD vouches for authority (RFC 4035 §3.2.3): under a secure verdict,
+    // only the proofs it judged. Every hop's go out, minimal or not: the
+    // client needs each to validate the chain (RFC 6672 §5.3.3).
+    const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
+    for (hops[0 .. hops.len - 1]) |hop| {
+        const hop_age: u32 = @intCast(@divTrunc(g.now() - hop.rrset.stored_ns, std.time.ns_per_s));
+        try appendAged(arena, &authorities, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = true, .positive = true, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
+    }
+    try appendAged(arena, &authorities, r.sections[1], keep, age, life, last.floor, last.stale);
     if (!(trim and (r.kind == .answer or r.kind == .alias))) {
-        const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0 };
-        try appendAged(arena, &authorities, r.sections[1], keep, age, life, last.floor, last.stale);
+        // Nothing judges additional, so AD vouches for none of it.
         var add = keep;
         add.section = .additional;
-        try appendAged(arena, &additionals, r.sections[2], add, age, life, last.floor, last.stale);
+        if (!secure) try appendAged(arena, &additionals, r.sections[2], add, age, life, last.floor, last.stale);
     }
     const ede: ?dns.Ede = if (stale_any) // any hop: a stale alias still redirected
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
@@ -448,6 +456,8 @@ const Keep = struct {
     trim: bool = false,
     /// NOERROR with an answer.
     positive: bool = false,
+    denial: bool = true,
+    proofs_only: bool = false,
 
     fn keeps(k: Keep, rr: dns.WireRecord) bool {
         const t = rr.rtype();
@@ -456,14 +466,19 @@ const Keep = struct {
                 .rrsig, .nsec, .nsec3 => k.do_bit,
                 else => true,
             },
-            .authority => switch (t) {
-                .soa => true,
+            .authority => (!k.proofs_only or switch (if (t == .rrsig) rr.covers().? else t) {
+                .soa, .nsec, .nsec3 => true,
+                else => false,
+            }) and switch (t) {
+                // A denial's SOA is its lifetime; nothing else owes one.
+                .soa => k.denial,
                 .nsec, .nsec3 => k.do_bit,
                 .ns => !(k.trim and k.positive),
                 .ds => false,
                 // A signature goes with what it covers.
                 .rrsig => k.do_bit and switch (rr.covers().?) {
-                    .soa, .nsec, .nsec3 => true,
+                    .soa => k.denial,
+                    .nsec, .nsec3 => true,
                     .ns => !(k.trim and k.positive),
                     else => !k.trim,
                 },
@@ -487,10 +502,20 @@ fn appendAged(arena: Allocator, out: *std.ArrayList(dns.WireRecord), records: st
     var it = records.iterator();
     while (it.next()) |rr| {
         if (!keep.keeps(rr)) continue;
+        // Two hops of one zone may carry one proof.
+        const dup = keep.section == .authority and for (out.items) |o| {
+            if (sameRecord(o, rr)) break true;
+        } else false;
+        if (dup) continue;
         var aged = rr;
         aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
     }
+}
+
+/// Owner, type, class and data alike; TTLs aside.
+fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
+    return std.ascii.eqlIgnoreCase(a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
 }
 
 /// RFC 9520 §3.2's failure cache: a question that failed is answered here,
