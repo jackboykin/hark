@@ -40,6 +40,18 @@ RANGE_BEGIN 0 100
       b.pub.example. 3600 IN CNAME b.lib.example.
       b.lib.example. 3600 IN A 192.0.2.9
   ENTRY_END
+
+  ; Asked for the CNAME itself: still unsigned, still the DNAME's.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.ref.example. IN CNAME
+    SECTION ANSWER
+      ref.example. 3600 IN DNAME lib.example.
+      www.ref.example. 3600 IN CNAME www.lib.example.
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -76,6 +88,24 @@ ENTRY_BEGIN
   REPLY QR RD RA AD NOERROR
   SECTION QUESTION
     a.pub.example. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.ref.example. IN CNAME
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.ref.example. IN CNAME
+  SECTION ANSWER
+    ref.example. 3600 IN DNAME lib.example.
+    www.ref.example. 3600 IN CNAME www.lib.example.
 ENTRY_END
 
 SCENARIO_END

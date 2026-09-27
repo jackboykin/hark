@@ -776,6 +776,22 @@ fn judge(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns
     } };
 }
 
+fn deepestDname(answers: []const dns.ResourceRecord, cur: dns.Name, zone: dns.Name) ?dns.ResourceRecord {
+    var dname: ?dns.ResourceRecord = null;
+    for (answers) |rr| {
+        if (rr.rtype != .dname or !cur.isSubdomainOf(rr.name) or cur.eql(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
+        if (dname == null or rr.name.labels.len > dname.?.name.labels.len) dname = rr;
+    }
+    return dname;
+}
+
+/// A chain may pass one DNAME twice; its set is kept once.
+fn keepDname(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), answers: []const dns.ResourceRecord, d: dns.ResourceRecord) !void {
+    for (keep.items) |k| if (k.rtype == .dname and k.name.eql(d.name)) return;
+    try keep.append(g.scratch.allocator(), d);
+    try keepSigs(g, keep, answers, d.name, .dname);
+}
+
 /// What a kept, non-referral reply says about (name, type). The answer
 /// section is reduced to the chain from `name`: CNAMEs (and the DNAMEs
 /// that synthesise them), then the asked type at the end. Anything else
@@ -785,7 +801,9 @@ fn judge(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns
 /// overflows (RFC 6672 §2.2), and an rcode DNSSEC does not sign must
 /// agree (RFC 6604 §4). Where the chain leaves the zone, the final query
 /// cycle speaks for a name outside it (RFC 6604 §3): its rcode and its
-/// out-of-zone records are dropped and the reply is an alias. Null: bizarre.
+/// out-of-zone records are dropped and the reply is an alias. A CNAME
+/// question reads only the CNAME at its name, synthesised or not: the rest
+/// and its rcode go unread. Null: bizarre.
 fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
@@ -794,6 +812,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var overflow = false;
     var clipped = false;
     var seen: [max_links + 1]dns.Name = undefined;
+    // A CNAME question's answer: the target of the CNAME it matched.
+    var asked_alias: ?dns.Name = null;
     // NXDOMAIN denies the end of the chain; records there are noise.
     const collect = msg.header.flags.rcode != .name_error;
     while (true) : (hops += 1) {
@@ -803,10 +823,15 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and (rr.rtype == qtype or qtype == .any)) {
                 try keep.append(g.scratch.allocator(), rr);
                 answered = true;
+                if (rr.rtype == .cname) asked_alias = rr.rdata.cname;
             }
         }
+        const dname = deepestDname(msg.answers, cur, zone);
         if (answered) {
             try keepSigs(g, &keep, msg.answers, cur, qtype);
+            // A CNAME asked for under a DNAME is its synthesis, unsigned:
+            // the DNAME is what proves it.
+            if (qtype == .cname) if (dname) |d| try keepDname(g, &keep, msg.answers, d);
             break;
         }
         var cname: ?dns.ResourceRecord = null;
@@ -814,13 +839,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             cname = rr;
             break;
         };
-        // RFC 6672 §3.2: the deepest DNAME above `cur` synthesises the
-        // CNAME and travels with it.
-        var dname: ?dns.ResourceRecord = null;
-        for (msg.answers) |rr| {
-            if (rr.rtype != .dname or !cur.isSubdomainOf(rr.name) or cur.eql(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
-            if (dname == null or rr.name.labels.len > dname.?.name.labels.len) dname = rr;
-        }
         // Past the question's limit the rest is left unread: an alias to
         // where it stopped, so the answer finds the chain too long.
         if ((cname != null or dname != null) and hops == max_links) {
@@ -828,14 +846,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             break;
         }
         if (dname) |d| {
-            // A chain may pass one DNAME twice; its set is kept once.
-            const kept = for (keep.items) |k| {
-                if (k.rtype == .dname and k.name.eql(d.name)) break true;
-            } else false;
-            if (!kept) {
-                try keep.append(g.scratch.allocator(), d);
-                try keepSigs(g, &keep, msg.answers, d.name, .dname);
-            }
+            try keepDname(g, &keep, msg.answers, d);
             if (cname == null) {
                 const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
                     overflow = true;
@@ -847,12 +858,18 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         const c = cname orelse break;
         try keep.append(g.scratch.allocator(), c);
         try keepSigs(g, &keep, msg.answers, cur, .cname);
+        if (qtype == .cname) {
+            answered = true;
+            asked_alias = c.rdata.cname;
+            break;
+        }
         cur = c.rdata.cname;
     }
     const yx = msg.header.flags.rcode == .yx_domain;
     const left = !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
     // The rcode is the unread end's.
-    if (overflow != yx and !(yx and (left or clipped))) return null;
+    const unread = left or clipped or asked_alias != null;
+    if (overflow != yx and !(yx and unread)) return null;
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .aa = msg.header.flags.aa,
@@ -864,11 +881,11 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     };
     // A CNAME question is answered by the alias itself, the fact
     // `publishAlias` records for every other type.
-    if (qtype == .cname and answered) {
+    if (qtype == .cname) if (asked_alias) |t| {
         reply.kind = .alias;
-        reply.target = keep.items[0].rdata.cname;
-    }
-    if (msg.header.flags.rcode == .name_error and !left and !clipped) reply.kind = .nxdomain;
+        reply.target = t;
+    };
+    if (msg.header.flags.rcode == .name_error and !unread) reply.kind = .nxdomain;
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, try bindSigs(g, authorities), reply);
     reply.ttl = replyTtl(g, reply);

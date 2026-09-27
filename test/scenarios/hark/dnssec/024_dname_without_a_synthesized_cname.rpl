@@ -35,6 +35,53 @@ RANGE_BEGIN 0 100
     SECTION ANSWER
       a.b.archive.example. 3600 IN A 192.0.2.12
   ENTRY_END
+
+  ; Asked for a CNAME, with a CNAME past the DNAME's target: the answer is
+  ; the synthesis at the name, not the reply's first record nor anything
+  ; past it.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.alt.example. IN CNAME
+    SECTION ANSWER
+      alt.example. 3600 IN DNAME lib.example.
+      www.lib.example. 3600 IN CNAME x.example.
+  ENTRY_END
+
+  ; Through two DNAMEs to a name that does not exist: the CNAME question's
+  ; answer is the first synthesis, from memory too, and the NXDOMAIN is
+  ; the unread end's.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      www.nx.example. IN CNAME
+    SECTION ANSWER
+      nx.example. 3600 IN DNAME mid2.example.
+      www.nx.example. 3600 IN CNAME www.mid2.example.
+      mid2.example. 3600 IN DNAME gone.example.
+      www.mid2.example. 3600 IN CNAME www.gone.example.
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      gone.example. 3600 IN NSEC h.example. A RRSIG NSEC
+  ENTRY_END
+
+  ; Through two DNAMEs, the second's substitution too long: the YXDOMAIN
+  ; is the unread end's too.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA YXDOMAIN
+    SECTION QUESTION
+      x.yx.example. IN CNAME
+    SECTION ANSWER
+      yx.example. 3600 IN DNAME lib2.example.
+      x.yx.example. 3600 IN CNAME x.lib2.example.
+      lib2.example. 3600 IN DNAME aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -54,6 +101,60 @@ ENTRY_BEGIN
     doc.example. 3600 IN DNAME archive.example.
     a.b.doc.example. 3600 IN CNAME a.b.archive.example.
     a.b.archive.example. 3600 IN A 192.0.2.12
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.alt.example. IN CNAME
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.alt.example. IN CNAME
+  SECTION ANSWER
+    alt.example. 3600 IN DNAME lib.example.
+    www.alt.example. 3600 IN CNAME www.lib.example.
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.nx.example. IN CNAME
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.nx.example. IN CNAME
+  SECTION ANSWER
+    nx.example. 3600 IN DNAME mid2.example.
+    www.nx.example. 3600 IN CNAME www.mid2.example.
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.yx.example. IN CNAME
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    x.yx.example. IN CNAME
+  SECTION ANSWER
+    yx.example. 3600 IN DNAME lib2.example.
+    x.yx.example. 3600 IN CNAME x.lib2.example.
 ENTRY_END
 
 SCENARIO_END
