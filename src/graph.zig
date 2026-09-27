@@ -1222,6 +1222,11 @@ pub const Graph = struct {
     /// asker's orphaning, refuses the work.
     pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
         std.debug.assert(case == .random or transport == .tcp);
+        // The run's payer may spend itself mid-run while another waiter
+        // still has room: the shared work goes on at that one's cost.
+        if (g.stopped(by) and !g.cell(by).orphan) if (g.payerOf(by)) |b| {
+            g.payer = b;
+        };
         const budget = g.payer;
         if (g.stopped(by)) {
             if (g.cfg.trace) {
@@ -1365,6 +1370,14 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     // Nobody with room: the first still pays, and is refused.
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
+    g.payer = g.cell(first).scratch.answer.budget;
+    try testing.expectEqual(null, try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000));
+    // A run's payer spent mid-run: the work goes on at a waiter's with room.
+    g.cell(second).scratch.answer.budget.queries = 0;
+    g.payer = g.cell(first).scratch.answer.budget;
+    try testing.expect(try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000) != null);
+    try testing.expectEqual(1, g.cell(second).scratch.answer.budget.queries);
+    g.payer = &g.unpaid;
     g.unhold(first);
     g.unhold(second);
 }
