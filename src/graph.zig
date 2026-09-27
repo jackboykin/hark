@@ -24,8 +24,10 @@ const denial = @import("denial.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
 
-/// Hops an answer may follow. Clears 8-hop CDN chains; matches PowerDNS and Hickory.
-pub const max_cname_chain = 16;
+/// CNAME and DNAME links one question may follow, a DNAME and its
+/// synthesised CNAME counting once. Chains in the wild run to 12;
+/// resolvers stop at 10 to 19.
+pub const max_links = 14;
 
 pub const CellId = u32;
 
@@ -958,7 +960,7 @@ pub const Graph = struct {
     /// store's; the caller refs what it keeps.
     pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: enum { fresh, any }) !?[]const Recalled {
         var hops: std.ArrayList(Recalled) = .empty;
-        var seen: [max_cname_chain + 1]dns.Name = undefined;
+        var links: walk.Links = .{};
         var next = name;
         while (true) {
             var kb: KeyBuf = undefined;
@@ -968,12 +970,16 @@ pub const Graph = struct {
             if (g.cfg.trust_anchor != null and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
             const r: store.Rrset = .of(e.blob);
             try hops.append(arena, .{ .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
-            seen[hops.items.len - 1] = next;
             var pos: usize = 0;
             const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .{ .labels = &.{} };
-            switch (walk.chain(r.kind, target, qtype, seen[0..hops.items.len])) {
+            var it = r.sections[0].iterator();
+            while (it.next()) |rr| if (rr.rtype() == .cname) {
+                var at: usize = 0;
+                if (links.pass(try dns.readNameWire(arena, rr.owner, &at)) != null) return null;
+            };
+            switch (links.end(r.kind, target, qtype)) {
                 .done => return hops.items,
-                .next => |n| next = n,
+                .next => |nx| next = nx,
                 .broken => return null,
             }
         }

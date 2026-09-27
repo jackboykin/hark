@@ -11,6 +11,8 @@ SCENARIO_BEGIN long CNAME chain with same-zone segment resolves end-to-end
 ; Regression for budget conflation between network calls and same-zone
 ; CNAME continuations: a single counter that charged both would exhaust
 ; before the chain completed.
+;
+; The limit counts links, not replies.
 
 ; ── Fake root ─────────────────────────────────────────────────────
 RANGE_BEGIN 0 100
@@ -148,6 +150,90 @@ RANGE_BEGIN 0 100
     SECTION ANSWER
       hop6.beta.fake. 3600 IN CNAME bridge.gamma.fake.
   ENTRY_END
+  ; Fifteen links in one answer.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      l0.beta.fake. IN A
+    SECTION ANSWER
+      l0.beta.fake. 3600 IN CNAME l1.beta.fake.
+      l1.beta.fake. 3600 IN CNAME l2.beta.fake.
+      l2.beta.fake. 3600 IN CNAME l3.beta.fake.
+      l3.beta.fake. 3600 IN CNAME l4.beta.fake.
+      l4.beta.fake. 3600 IN CNAME l5.beta.fake.
+      l5.beta.fake. 3600 IN CNAME l6.beta.fake.
+      l6.beta.fake. 3600 IN CNAME l7.beta.fake.
+      l7.beta.fake. 3600 IN CNAME l8.beta.fake.
+      l8.beta.fake. 3600 IN CNAME l9.beta.fake.
+      l9.beta.fake. 3600 IN CNAME l10.beta.fake.
+      l10.beta.fake. 3600 IN CNAME l11.beta.fake.
+      l11.beta.fake. 3600 IN CNAME l12.beta.fake.
+      l12.beta.fake. 3600 IN CNAME l13.beta.fake.
+      l13.beta.fake. 3600 IN CNAME l14.beta.fake.
+      l14.beta.fake. 3600 IN CNAME l15.beta.fake.
+      l15.beta.fake. 3600 IN A 192.0.2.15
+  ENTRY_END
+  ; Fourteen, the limit.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      l1.beta.fake. IN A
+    SECTION ANSWER
+      l1.beta.fake. 3600 IN CNAME l2.beta.fake.
+      l2.beta.fake. 3600 IN CNAME l3.beta.fake.
+      l3.beta.fake. 3600 IN CNAME l4.beta.fake.
+      l4.beta.fake. 3600 IN CNAME l5.beta.fake.
+      l5.beta.fake. 3600 IN CNAME l6.beta.fake.
+      l6.beta.fake. 3600 IN CNAME l7.beta.fake.
+      l7.beta.fake. 3600 IN CNAME l8.beta.fake.
+      l8.beta.fake. 3600 IN CNAME l9.beta.fake.
+      l9.beta.fake. 3600 IN CNAME l10.beta.fake.
+      l10.beta.fake. 3600 IN CNAME l11.beta.fake.
+      l11.beta.fake. 3600 IN CNAME l12.beta.fake.
+      l12.beta.fake. 3600 IN CNAME l13.beta.fake.
+      l13.beta.fake. 3600 IN CNAME l14.beta.fake.
+      l14.beta.fake. 3600 IN CNAME l15.beta.fake.
+      l15.beta.fake. 3600 IN A 192.0.2.15
+  ENTRY_END
+  ; Fourteen, a DNAME and its synthesised CNAME counting once.
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.dn.beta.fake. IN A
+    SECTION ANSWER
+      dn.beta.fake. 3600 IN DNAME alt.beta.fake.
+      a.dn.beta.fake. 3600 IN CNAME a.alt.beta.fake.
+      a.alt.beta.fake. 3600 IN CNAME l3.beta.fake.
+      l3.beta.fake. 3600 IN CNAME l4.beta.fake.
+      l4.beta.fake. 3600 IN CNAME l5.beta.fake.
+      l5.beta.fake. 3600 IN CNAME l6.beta.fake.
+      l6.beta.fake. 3600 IN CNAME l7.beta.fake.
+      l7.beta.fake. 3600 IN CNAME l8.beta.fake.
+      l8.beta.fake. 3600 IN CNAME l9.beta.fake.
+      l9.beta.fake. 3600 IN CNAME l10.beta.fake.
+      l10.beta.fake. 3600 IN CNAME l11.beta.fake.
+      l11.beta.fake. 3600 IN CNAME l12.beta.fake.
+      l12.beta.fake. 3600 IN CNAME l13.beta.fake.
+      l13.beta.fake. 3600 IN CNAME l14.beta.fake.
+      l14.beta.fake. 3600 IN CNAME l15.beta.fake.
+      l15.beta.fake. 3600 IN A 192.0.2.15
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      l14.beta.fake. IN A
+    SECTION ANSWER
+      l14.beta.fake. 3600 IN CNAME l15.beta.fake.
+      l15.beta.fake. 3600 IN A 192.0.2.15
+  ENTRY_END
 RANGE_END
 
 ; ── gamma.fake authority ──────────────────────────────────────────
@@ -203,6 +289,69 @@ ENTRY_BEGIN
     hop6.beta.fake. 3600 IN CNAME bridge.gamma.fake.
     bridge.gamma.fake. 3600 IN CNAME final.delta.fake.
     final.delta.fake. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    l0.beta.fake. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    l0.beta.fake. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    l1.beta.fake. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    l1.beta.fake. IN A
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.dn.beta.fake. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.dn.beta.fake. IN A
+ENTRY_END
+
+; Recalled from memory, fifteen links are still fifteen.
+STEP 9 TIME_PASSES ELAPSE 400
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    l0.beta.fake. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    l0.beta.fake. IN A
 ENTRY_END
 
 SCENARIO_END

@@ -25,7 +25,7 @@ const Failure = graph.Failure;
 /// Nobody answered usefully, or the walk to them was refused.
 const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
 
-const max_cname_chain = graph.max_cname_chain;
+const max_links = graph.max_links;
 
 const max_servers = delegation.max_servers_per_level;
 
@@ -228,24 +228,48 @@ pub const AddrScratch = struct {
 pub const AnswerScratch = struct {
     /// The question's; set as the root is made, freed with it.
     budget: *graph.Budget = undefined,
-    hops: [max_cname_chain + 1]CellId = undefined,
+    /// Every hop but the last is an alias, a link at least.
+    hops: [max_links + 1]CellId = undefined,
     n: u8 = 0,
     /// `secure(hop)` per hop.
-    judged: [max_cname_chain + 1]CellId = undefined,
+    judged: [max_links + 1]CellId = undefined,
     nj: u8 = 0,
 };
 
 // ── Rules ──────────────────────────────────────────────────────────────
 
-/// Where an answer's chain goes after the last of the hops `seen`, a
-/// reply of `kind` (to `target`, an alias): it ends, goes on to the
-/// target, or is broken by a loop or by passing `max_cname_chain`.
-pub fn chain(kind: @FieldType(Reply, "kind"), target: dns.Name, qtype: dns.RType, seen: []const dns.Name) union(enum) { done, next: dns.Name, broken } {
-    if (kind != .alias or qtype == .cname) return .done;
-    if (seen.len > max_cname_chain) return .broken;
-    for (seen) |n| if (n.eql(target)) return .broken;
-    return .{ .next = target };
-}
+/// Each CNAME owner a chain has passed, over every hop.
+pub const Links = struct {
+    n: u8 = 0,
+    owners: [max_links]dns.Name = undefined,
+
+    pub const loop: Failure = .{ .code = .other, .text = "cname loop" };
+    pub const too_long: Failure = .{ .code = .other, .text = "alias chain too long" };
+
+    pub const Step = union(enum) { done, next: dns.Name, broken: Failure };
+
+    /// A CNAME a hop passes, at `owner`.
+    pub fn pass(l: *Links, owner: dns.Name) ?Failure {
+        if (l.left(owner)) return loop;
+        if (l.n == max_links) return too_long;
+        l.owners[l.n] = owner;
+        l.n += 1;
+        return null;
+    }
+
+    /// Where the chain goes once a hop's CNAMEs are passed. A CNAME
+    /// question stops at its name.
+    pub fn end(l: *const Links, kind: @FieldType(Reply, "kind"), target: dns.Name, qtype: dns.RType) Step {
+        if (kind != .alias or qtype == .cname) return .done;
+        if (l.left(target)) return .{ .broken = loop };
+        return .{ .next = target };
+    }
+
+    fn left(l: *const Links, name: dns.Name) bool {
+        for (l.owners[0..l.n]) |o| if (o.eql(name)) return true;
+        return false;
+    }
+};
 
 /// `answer(name, type)`: `rrset(name, type)`, then each alias's target
 /// until an RRset ends the chain. Length and loop checks run at demand
@@ -268,12 +292,19 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
                 s.nj += 1;
             }
-            var seen: [max_cname_chain + 1]dns.Name = undefined;
-            for (seen[0..s.n], s.hops[0..s.n]) |*n, h| n.* = g.cell(h).name;
-            switch (chain(last.state.fact.rrset.kind, last.state.fact.rrset.target, qtype, seen[0..s.n])) {
+            var links: Links = .{};
+            var step: Links.Step = .done;
+            for (s.hops[0..s.n]) |h| {
+                const r = g.cell(h).state.fact.rrset;
+                step = for (r.answers) |rr| {
+                    if (rr.rtype == .cname) if (links.pass(rr.name)) |why| break .{ .broken = why };
+                } else links.end(r.kind, r.target, qtype);
+                if (step != .next) break;
+            }
+            switch (step) {
                 .done => break,
                 .next => |n| next = n,
-                .broken => return failAnswer(g, id, .{ .code = .other, .text = "cname loop" }),
+                .broken => |why| return failAnswer(g, id, why),
             }
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
@@ -577,7 +608,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 }
                 const reply = switch (kept.verdict) {
                     .reply => |r| r,
-                    .loop => return failAsk(g, id, .{ .code = .other, .text = "cname loop" }),
+                    .loop => return failAsk(g, id, Links.loop),
                     // No useful response (RFC 9520 §2).
                     .none => return failAsk(g, id, g.cell(id).scratch.rrset.ask.exhausted()),
                 };
@@ -742,10 +773,11 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var hops: usize = 0;
     var answered = false;
     var overflow = false;
-    var seen: [17]dns.Name = undefined;
+    var clipped = false;
+    var seen: [max_links + 1]dns.Name = undefined;
     // NXDOMAIN denies the end of the chain; records there are noise.
     const collect = msg.header.flags.rcode != .name_error;
-    while (hops < 16) : (hops += 1) {
+    while (true) : (hops += 1) {
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         for (msg.answers) |rr| {
@@ -770,6 +802,12 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             if (rr.rtype != .dname or !cur.isSubdomainOf(rr.name) or cur.eql(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
             if (dname == null or rr.name.labels.len > dname.?.name.labels.len) dname = rr;
         }
+        // Past the question's limit the rest is left unread: an alias to
+        // where it stopped, so the answer finds the chain too long.
+        if ((cname != null or dname != null) and hops == max_links) {
+            clipped = true;
+            break;
+        }
         if (dname) |d| {
             try keep.append(g.scratch.allocator(), d);
             try keepSigs(g, &keep, msg.answers, d.name, .dname);
@@ -788,7 +826,8 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     }
     const yx = msg.header.flags.rcode == .yx_domain;
     const left = !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
-    if (overflow != yx and !(yx and left)) return null;
+    // The rcode is the unread end's.
+    if (overflow != yx and !(yx and (left or clipped))) return null;
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .rcode = if (left) .no_error else msg.header.flags.rcode,
@@ -806,7 +845,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         reply.kind = .alias;
         reply.target = keep.items[0].rdata.cname;
     }
-    if (msg.header.flags.rcode == .name_error and !left) reply.kind = .nxdomain;
+    if (msg.header.flags.rcode == .name_error and !left and !clipped) reply.kind = .nxdomain;
     reply.ttl = replyTtl(g, reply, zone, name);
     return .{ .reply = reply };
 }
@@ -1023,4 +1062,20 @@ test "an ask has a static bound" {
     // A waiting walk's scratch is a comptime constant, not a stack; the
     // server list is most of it.
     try std.testing.expect(@sizeOf(Ask) <= 640);
+}
+
+test "a chain that comes back to a name is a loop, one that runs on is too long" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: [max_links + 1]dns.Name = undefined;
+    for (&names, 0..) |*n, i| n.* = try dns.parseDottedName(a, try std.fmt.allocPrint(a, "n{d}.test", .{i}));
+    var long: Links = .{};
+    for (names[0..max_links]) |n| try std.testing.expect(long.pass(n) == null);
+    try std.testing.expect(long.end(.alias, names[max_links], .a) == .next);
+    try std.testing.expectEqualStrings(Links.too_long.text, long.pass(names[max_links]).?.text);
+    var back: Links = .{};
+    for (names[0..3]) |n| try std.testing.expect(back.pass(n) == null);
+    try std.testing.expect(back.end(.alias, names[1], .a) == .broken);
+    try std.testing.expectEqualStrings(Links.loop.text, back.pass(names[1]).?.text);
 }
