@@ -831,7 +831,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         seen[hops] = cur;
         passed = keep.items.len;
         for (msg.answers) |rr| {
-            if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and (rr.rtype == qtype or qtype == .any)) {
+            if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and rr.rtype == qtype) {
                 // A chain back to a link it passed ends at that link's
                 // signatures, kept bound with it and once (RFC 2181 §5).
                 answered = true;
