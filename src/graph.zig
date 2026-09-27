@@ -493,7 +493,7 @@ pub const Graph = struct {
         errdefer g.deinit();
         if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
-        try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
+        _ = try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -529,7 +529,7 @@ pub const Graph = struct {
         var it = g.failed.keyIterator();
         while (it.next()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
-        g.denial.deinit(g.gpa);
+        g.denial.deinit(g.gpa, &g.store);
         g.verify_memo.deinit(g.gpa);
         g.store.deinit();
     }
@@ -1132,19 +1132,33 @@ pub const Graph = struct {
     }
 
     /// Evidence from a referral or a denial at a probe name: settles a
-    /// cell in progress for the key, except the publisher's own; else a fact.
-    pub fn publish(g: *Graph, key: Key, by: CellId, value: Value, expires_ns: i64) !void {
-        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled()) return g.settle(id, value, expires_ns);
-        try g.fact(key, value, expires_ns);
+    /// cell in progress for the key, except the publisher's own; else a
+    /// fact. The bytes the store kept, borrowed; null when it kept none.
+    pub fn publish(g: *Graph, key: Key, by: CellId, value: Value, expires_ns: i64) !?*store.Blob {
+        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled()) {
+            try g.settle(id, value, expires_ns);
+            return g.kept(key, g.cell(id).blob);
+        };
+        return g.fact(key, value, expires_ns);
     }
 
-    pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !void {
-        if (expires_ns <= g.now()) return;
+    pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !?*store.Blob {
+        if (expires_ns <= g.now()) return null;
         const blob = try g.store.build(value);
         g.store.put(key, blob, expires_ns, g.now()) catch |err| {
             g.store.unref(blob);
             if (err != error.Refused) return err;
+            return null;
         };
+        return g.kept(key, blob);
+    }
+
+    /// `blob`, if it is what the store holds for `key`: a put may refuse
+    /// it, or evict it as it lands.
+    fn kept(g: *Graph, key: Key, blob: ?*store.Blob) ?*store.Blob {
+        const b = blob orelse return null;
+        const e = g.store.any(key) orelse return null;
+        return if (e.blob == b) b else null;
     }
 
     // ── Rules ──────────────────────────────────────────────────────────

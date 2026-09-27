@@ -1,28 +1,36 @@
 //! RFC 8198 aggressive use, NSEC only. Every NSEC a secure negative
 //! carried is the fact `rrset(owner, NSEC)`, its SOA the fact
 //! `rrset(zone, SOA)`; this index orders the spans by owner within their
-//! signing zone, so a later question inside a known span is denied from
-//! memory with the proofs fetched by key. The index only finds
-//! candidates: the verdict is `validateNegativeProof`'s, and a proof gone
-//! from the store fails closed.
+//! signing zone, each holding the very bytes that were judged, so a later
+//! question inside a known span is denied from memory and no later reply
+//! can change what the span says. The index only finds candidates: the
+//! verdict is `validateNegativeProof`'s.
 const std = @import("std");
 const dns = @import("dns.zig");
 const proof = @import("proof.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
 
+const store = @import("store.zig");
+
 const Graph = graph.Graph;
 const CellId = graph.CellId;
 const RR = dns.ResourceRecord;
 
-/// One NSEC's geometry; the record lives in the store.
+/// One NSEC's geometry, and the judged bytes it was cut from.
 const Span = struct {
     owner: dns.Name,
     nsec: dns.NsecData,
     expires_ns: i64,
     buf: []align(8) u8,
+    judged: *store.Blob,
 
-    fn init(gpa: std.mem.Allocator, rr: RR, expires_ns: i64) !Span {
+    fn deinit(sp: Span, gpa: std.mem.Allocator, st: *store.Store) void {
+        gpa.free(sp.buf);
+        st.unref(sp.judged);
+    }
+
+    fn init(gpa: std.mem.Allocator, rr: RR, expires_ns: i64, judged: *store.Blob) !Span {
         const n = rr.rdata.nsec;
         const owner_len = std.mem.alignForward(usize, dns.nameFlatSize(rr.name), 8);
         const next_len = std.mem.alignForward(usize, dns.nameFlatSize(n.next_domain_name), 8);
@@ -31,22 +39,29 @@ const Span = struct {
         const next = dns.writeNameFlat(@alignCast(buf[owner_len..][0..next_len]), n.next_domain_name, false);
         const bits = buf[owner_len + next_len ..];
         @memcpy(bits, n.type_bit_maps);
-        return .{ .owner = owner, .nsec = .{ .next_domain_name = next, .type_bit_maps = bits }, .expires_ns = expires_ns, .buf = buf };
+        return .{ .owner = owner, .nsec = .{ .next_domain_name = next, .type_bit_maps = bits }, .expires_ns = expires_ns, .buf = buf, .judged = judged };
     }
 };
 
 const Zone = struct {
     /// In canonical owner order.
     spans: std.ArrayList(Span) = .empty,
+    soa: ?struct { judged: *store.Blob, expires_ns: i64 } = null,
 
     /// Drop what has expired, so the neighbour of a name is a live proof.
     fn prune(z: *Zone, g: *Graph) void {
+        if (z.soa) |soa| if (soa.expires_ns <= g.now()) z.release(g);
         var w: usize = 0;
         for (z.spans.items) |sp| if (sp.expires_ns > g.now()) {
             z.spans.items[w] = sp;
             w += 1;
-        } else g.gpa.free(sp.buf);
+        } else sp.deinit(g.gpa, &g.store);
         z.spans.shrinkRetainingCapacity(w);
+    }
+
+    fn release(z: *Zone, g: *Graph) void {
+        if (z.soa) |soa| g.store.unref(soa.judged);
+        z.soa = null;
     }
 
     /// Where `name` sorts among the owners.
@@ -84,10 +99,11 @@ const Zone = struct {
 pub const Index = struct {
     zones: std.StringHashMapUnmanaged(Zone) = .empty,
 
-    pub fn deinit(ix: *Index, gpa: std.mem.Allocator) void {
+    pub fn deinit(ix: *Index, gpa: std.mem.Allocator, st: *store.Store) void {
         var it = ix.zones.iterator();
         while (it.next()) |e| {
-            for (e.value_ptr.spans.items) |sp| gpa.free(sp.buf);
+            for (e.value_ptr.spans.items) |sp| sp.deinit(gpa, st);
+            if (e.value_ptr.soa) |soa| st.unref(soa.judged);
             e.value_ptr.spans.deinit(gpa);
             gpa.free(e.key_ptr.*);
         }
@@ -95,17 +111,22 @@ pub const Index = struct {
     }
 };
 
-/// So the index cannot outgrow its facts.
+/// So the index cannot outgrow its facts, nor hold a replaced version.
 pub fn evicted(g: *Graph, key: graph.Key) void {
-    if (key.kind != .rrset or key.rtype != .nsec) return;
+    if (key.kind != .rrset or (key.rtype != .nsec and key.rtype != .soa)) return;
     const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
+    if (key.rtype == .soa) {
+        var buf: [dns.max_dotted_len + 1]u8 = undefined;
+        if (g.denial.zones.getPtr(owner.formatLower(&buf))) |z| z.release(g);
+        return;
+    }
     for (0..owner.labels.len + 1) |i| {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         const zone: dns.Name = .{ .labels = owner.labels[i..] };
         const z = g.denial.zones.getPtr(zone.formatLower(&buf)) orelse continue;
         const pos = z.position(owner);
         if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(owner)) {
-            g.gpa.free(z.spans.items[pos].buf);
+            z.spans.items[pos].deinit(g.gpa, &g.store);
             _ = z.spans.orderedRemove(pos);
             return;
         }
@@ -141,16 +162,23 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires);
-        if (rr.rtype == .soa) continue;
+        const judged = (try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires) orelse continue).ref();
+        if (rr.rtype == .soa) {
+            z.release(g);
+            z.soa = .{ .judged = judged, .expires_ns = expires };
+            continue;
+        }
         proofs += 1;
-        const sp = try Span.init(g.gpa, rr, expires);
+        const sp = Span.init(g.gpa, rr, expires, judged) catch |e| {
+            g.store.unref(judged);
+            return e;
+        };
         const pos = z.position(rr.name);
         if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(rr.name)) {
-            g.gpa.free(z.spans.items[pos].buf);
+            z.spans.items[pos].deinit(g.gpa, &g.store);
             z.spans.items[pos] = sp;
         } else z.spans.insert(g.gpa, pos, sp) catch |e| {
-            g.gpa.free(sp.buf);
+            sp.deinit(g.gpa, &g.store);
             return e;
         };
     }
@@ -194,11 +222,11 @@ pub fn deny(g: *Graph, id: CellId) !bool {
 }
 
 fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
-    var kb: graph.KeyBuf = undefined;
     const name = g.cell(id).name;
     const qtype = g.cell(id).key.rtype;
     const now = g.now();
-    const soa = try g.peek(graph.Key.of(&kb, .rrset, zone, .soa)) orelse return false;
+    const held = z.soa orelse return false;
+    if (held.expires_ns <= now) return false;
     var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
@@ -218,13 +246,14 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         }
     } else proofs[0] = z.exact(g, name) orelse return false;
 
-    var expires = soa.expires_ns;
+    var expires = held.expires_ns;
     var authorities: std.ArrayList(RR) = .empty;
-    try aged(g, &authorities, soa.value.rrset.answers, soa.value.rrset.stored_ns);
+    const soa = (try store.Store.parse(g.scratch.allocator(), held.judged)).rrset;
+    try aged(g, &authorities, soa.answers, soa.stored_ns);
     for (proofs[0..n]) |p| {
-        const fact = try g.peek(graph.Key.of(&kb, .rrset, p.owner, .nsec)) orelse return false;
-        expires = @min(expires, fact.expires_ns);
-        try aged(g, &authorities, fact.value.rrset.answers, fact.value.rrset.stored_ns);
+        expires = @min(expires, p.expires_ns);
+        const fact = (try store.Store.parse(g.scratch.allocator(), p.judged)).rrset;
+        try aged(g, &authorities, fact.answers, fact.stored_ns);
     }
     const budget = &g.payer.validation;
     if (proof.validateNegativeProof(authorities.items, name, qtype, nxdomain, zone, budget) != .secure) return false;

@@ -94,6 +94,8 @@ pub const Store = struct {
     door_set: u32 = 0,
     evictions: u64 = 0,
     refusals: u64 = 0,
+    /// Fires as a key's version leaves the map: evicted, dropped or
+    /// replaced.
     on_evict: ?OnEvict = null,
     stage: []u8,
 
@@ -144,6 +146,7 @@ pub const Store = struct {
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
+            if (s.on_evict) |h| h.f(h.ctx, key);
             s.held -= gop.value_ptr.blob.len;
             s.unref(gop.value_ptr.blob);
         } else {
@@ -580,4 +583,24 @@ test "the cap holds by eviction and admission" {
     try s.put(key, again, 10, 0);
     try testing.expect(s.get(key, 0) != null);
     try testing.expectEqual(s.held, s.bytes);
+}
+
+test "a replaced version leaves as one evicted" {
+    const testing = std.testing;
+    var s = try Store.init(testing.allocator, 1 << 16);
+    defer s.deinit();
+    var gone: u32 = 0;
+    const count = struct {
+        fn f(ctx: *anyopaque, _: Key) void {
+            const n: *u32 = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    s.on_evict = .{ .ctx = &gone, .f = count.f };
+    const zone: dns.Name = .{ .labels = &.{"x"} };
+    const key: Key = .{ .kind = .cut, .name = "x" };
+    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+    try testing.expectEqual(0, gone);
+    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+    try testing.expectEqual(1, gone);
 }

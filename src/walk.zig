@@ -412,7 +412,7 @@ fn publishDenial(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
         .reply => |r| r,
         .loop, .none => return null,
     };
-    try g.publish(Key.of(&kb, .rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
+    _ = try g.publish(Key.of(&kb, .rrset, name, .a), id, .{ .rrset = reply }, replyExpiry(reply));
     return replyExpiry(reply);
 }
 
@@ -672,7 +672,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .stored_ns = reply.stored_ns,
     };
     hop.ttl = replyTtl(g, hop);
-    try g.publish(Key.of(&kb, .rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
+    _ = try g.publish(Key.of(&kb, .rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
 /// Every DNAME a reply used is the fact `rrset(owner, DNAME)`, signed,
@@ -685,7 +685,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
         const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
-        try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
+        _ = try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
 
@@ -736,11 +736,11 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     for (glue, ref.addrs[0..ref.addr_count], ref.ttls[0..ref.addr_count]) |*gl, a, ttl|
         gl.* = .{ .addr = a, .expires_ns = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s) };
     const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .names = names, .glue = glue } };
-    try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), by, cut, expires);
+    _ = try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), by, cut, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
-        if (ds.ttl > 0) try g.publish(Key.of(&kb, .rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
+        if (ds.ttl > 0) _ = try g.publish(Key.of(&kb, .rrset, ref.zone_cut, .ds), by, .{ .rrset = ds }, replyExpiry(ds));
         // A signed delegation from a zone signed all the way down: whatever
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
@@ -761,7 +761,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         const key = Key.of(&kb, .addr, host, .a);
         if (try g.peek(key)) |existing| if (!existing.value.addr.provisional) continue;
         const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
-        try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
+        _ = try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
     }
     return .{ .value = cut, .expires_ns = expires };
 }
