@@ -67,20 +67,11 @@ pub const Entry = struct {
     stored_ns: i64 = 0,
 };
 
-const KeyContext = struct {
-    pub fn hash(_: KeyContext, k: Key) u32 {
-        return @truncate(Key.hash(k));
-    }
-    pub fn eql(_: KeyContext, a: Key, b: Key, _: usize) bool {
-        return Key.eql(a, b);
-    }
-};
-
 pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key) void };
 
 pub const Store = struct {
     gpa: Allocator,
-    map: std.ArrayHashMapUnmanaged(Key, Entry, KeyContext, true) = .empty,
+    map: std.ArrayHashMapUnmanaged(Key, Entry, Key.Context, true) = .empty,
     /// Every live blob's bytes, whoever holds it.
     bytes: usize = 0,
     /// What the map holds; the cap is on this.

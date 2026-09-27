@@ -113,11 +113,13 @@ pub const Key = struct {
         return a.kind == b.kind and a.rtype == b.rtype and mem.eql(u8, a.name, b.name);
     }
 
-    const Context = struct {
-        pub fn hash(_: Context, k: Key) u64 {
-            return k.hash();
+    /// For array hash maps: they delete without tombstones, so a map
+    /// under steady churn keeps its probes short.
+    pub const Context = struct {
+        pub fn hash(_: Context, k: Key) u32 {
+            return @truncate(k.hash());
         }
-        pub fn eql(_: Context, a: Key, b: Key) bool {
+        pub fn eql(_: Context, a: Key, b: Key, _: usize) bool {
             return a.eql(b);
         }
     };
@@ -470,11 +472,11 @@ pub const Graph = struct {
     /// Work that failed, refused at `demand` rather than tried again
     /// (RFC 9520 §3.2): an upstream fetch, a zone's DS or keys. Policy,
     /// outside cells.
-    failed: std.HashMapUnmanaged(Key, Refusal, Key.Context, 80) = .empty,
+    failed: std.ArrayHashMapUnmanaged(Key, Refusal, Key.Context, true) = .empty,
     stats: Stats = .{},
     created: u64 = 0,
     /// Live cells only.
-    index: std.HashMapUnmanaged(Key, CellId, Key.Context, 80) = .empty,
+    index: std.ArrayHashMapUnmanaged(Key, CellId, Key.Context, true) = .empty,
     ready: std.ArrayList(CellId) = .empty,
     /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,
@@ -525,8 +527,7 @@ pub const Graph = struct {
         g.ready.deinit(g.gpa);
         g.answered.deinit(g.gpa);
         g.rtt.deinit(g.gpa);
-        var it = g.failed.keyIterator();
-        while (it.next()) |k| g.gpa.free(k.name);
+        for (g.failed.keys()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
         g.denial.deinit(g.gpa, &g.store);
         g.verify_memo.deinit(g.gpa);
@@ -791,9 +792,7 @@ pub const Graph = struct {
         c.inputs.deinit(g.gpa);
         c.waiters.deinit(g.gpa);
         if (c.blob) |b| g.store.unref(b);
-        if (g.index.get(c.key)) |i| if (i == id) {
-            _ = g.index.remove(c.key);
-        };
+        if (g.index.getIndex(c.key)) |i| if (g.index.values()[i] == id) g.index.swapRemoveAt(i);
         if (budgetOf(c)) |b| {
             // A question gone, the key fetches its walk began end too.
             if (c.scratch == .answer) b.deadline_ns = @min(b.deadline_ns, g.now());
@@ -872,7 +871,7 @@ pub const Graph = struct {
     }
 
     /// Refuse new work for `key` with `why` for `servfail_ttl`; past
-    /// `max_failed` keys an arbitrary other one is forgotten.
+    /// `max_failed` keys a random other one is forgotten.
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {
         const r: Refusal = .{ .until_ns = g.now() + @as(i64, g.cfg.servfail_ttl) * std.time.ns_per_s, .why = why };
         if (g.failed.getPtr(key)) |u| {
@@ -880,9 +879,9 @@ pub const Graph = struct {
             return;
         }
         if (g.failed.count() >= max_failed) {
-            var it = g.failed.keyIterator();
-            const old = it.next().?.*;
-            _ = g.failed.remove(old);
+            const at = g.edge.rng.uintLessThan(usize, g.failed.count());
+            const old = g.failed.keys()[at];
+            g.failed.swapRemoveAt(at);
             g.gpa.free(old.name);
         }
         const own: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try g.gpa.dupe(u8, key.name) };
