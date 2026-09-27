@@ -924,8 +924,12 @@ pub const Graph = struct {
 
     fn served(g: *Graph, key: Key, live: ?CellId) ?Served {
         if (g.stored(key)) |e| return .{ .stored = e };
+        return .{ .live = g.liveServed(live) orelse return null };
+    }
+
+    fn liveServed(g: *Graph, live: ?CellId) ?CellId {
         const id = live orelse return null;
-        return if (g.cell(id).settled() and g.serves(id)) .{ .live = id } else null;
+        return if (g.cell(id).settled() and g.serves(id)) id else null;
     }
 
     fn liveVersion(g: *Graph, live: ?CellId, e: store.Entry) ?CellId {
@@ -943,10 +947,10 @@ pub const Graph = struct {
     /// Would `demand` hand the running rule a fact for `key` without
     /// running it?
     pub fn holds(g: *Graph, key: Key) bool {
-        return switch (g.served(key, g.index.get(key)) orelse return false) {
-            .stored => true,
-            .live => |id| g.cell(id).state == .fact,
-        };
+        // `served`'s order, without reading the index when the store has it.
+        if (g.stored(key) != null) return true;
+        const id = g.liveServed(g.index.get(key)) orelse return false;
+        return g.cell(id).state == .fact;
     }
 
     /// The fact `demand` would hand the running rule for `key` without
