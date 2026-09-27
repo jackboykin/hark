@@ -21,6 +21,7 @@ import dataclasses
 import socket
 import threading
 
+import dns.exception
 import dns.flags
 import dns.message
 import dns.name
@@ -160,7 +161,7 @@ class Responder:
                 continue  # simulate auth timeout
             response = self._build_response(address, query, transport="udp")
             if response is not None:
-                sock.sendto(response.to_wire(), src)
+                sock.sendto(_udp_wire(query, response), src)
 
     def _accept_tcp(self, address: str, listen_sock: socket.socket) -> None:
         while not self._stop.is_set():
@@ -209,7 +210,8 @@ class Responder:
                     except socket.timeout:
                         continue
                 return
-            wire = response.to_wire()
+            # Not the query's UDP payload, which dnspython would apply.
+            wire = response.to_wire(max_size=65535)
             conn.sendall(len(wire).to_bytes(2, "big") + wire)
         finally:
             conn.close()
@@ -371,7 +373,9 @@ class Responder:
                     served.append(signer)
             if _has_covering_rrsig(rrsets, rrset):
                 continue  # scenario declared its own — don't double-sign
-            if wildcard is not None:
+            if wildcard is not None and rrset.name.is_subdomain(wildcard.parent()) and rrset.name != wildcard.parent() and (
+                forced is not None or signer is self._deepest_signer(wildcard, strictly_above=False)
+            ):
                 # dnspython derives the labels count from the `*` owner.
                 sig = signer.sign(dns.rrset.from_rdata_list(wildcard, rrset.ttl, list(rrset)))
                 rrsets.append(dns.rrset.from_rdata_list(rrset.name, rrset.ttl, list(sig)))
@@ -499,14 +503,28 @@ def _delegation_cuts(entry: rpl.Entry) -> list[dns.name.Name]:
 def _has_covering_rrsig(rrsets: list[dns.rrset.RRset], target: dns.rrset.RRset) -> bool:
     """True if `rrsets` already contains an RRSIG over `target`. Lets a
     scenario hand-roll its own signatures (e.g., to assert a *bogus*
-    response) without the harness clobbering them."""
+    response) without the harness clobbering them. One of an algorithm
+    reserved from assignment (123-251, RFC 6014 §4) is stuffing
+    beside the set, not its signature, as in the sim."""
     for rr in rrsets:
         if rr.rdtype != dns.rdatatype.RRSIG or rr.name != target.name:
             continue
         for sig in rr:
-            if sig.type_covered == target.rdtype:
+            if sig.type_covered == target.rdtype and not 123 <= int(sig.algorithm) <= 251:
                 return True
     return False
+
+
+def _udp_wire(query: dns.message.Message, response: dns.message.Message) -> bytes:
+    # A UDP reply past the advertised payload arrives truncated, header and
+    # question alone with TC set, as the sim delivers it.
+    payload = query.payload if query.edns >= 0 else 512
+    try:
+        return response.to_wire(max_size=payload)
+    except dns.exception.TooBig:
+        response.answer, response.authority, response.additional = [], [], []
+        response.flags |= dns.flags.TC
+        return response.to_wire(max_size=payload)
 
 
 def _recv_exactly(conn: socket.socket, n: int) -> bytes | None:

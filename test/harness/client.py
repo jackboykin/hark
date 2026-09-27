@@ -142,8 +142,17 @@ def _normalize_rrset(r: dns.rrset.RRset, compare_ttl: bool) -> tuple:
     # lowercases them at sign/verify time (RFC 4035 §5.3.2), matching
     # Unbound. Scenarios that need case-preserved TXT can switch to
     # `MATCH ttl` (deferred).
-    rdatas = tuple(sorted(rd.to_text().lower() for rd in r))
+    #
+    # An RRSIG minted at run time compares by its header, as the sim's
+    # replay does.
+    rdatas = tuple(sorted(_rdata_text(rd) for rd in r))
     return (r.name.to_text(), r.rdclass, r.rdtype, ttl, rdatas)
+
+
+def _rdata_text(rd) -> str:
+    if rd.rdtype == dns.rdatatype.RRSIG:
+        return f"{dns.rdatatype.to_text(rd.type_covered)} {rd.algorithm} {rd.labels} {rd.signer.to_text()}".lower()
+    return rd.to_text().lower()
 
 
 # ── Query-log assertions ─────────────────────────────────────────────────

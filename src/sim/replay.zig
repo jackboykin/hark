@@ -389,7 +389,7 @@ fn rdataEql(a: dns.RData, b: dns.RData) bool {
         .dnskey => |v| v.flags == b.dnskey.flags and v.algorithm == b.dnskey.algorithm and mem.eql(u8, v.public_key, b.dnskey.public_key),
         // A scenario cannot spell a signature minted at run time; the
         // Python harness matches the header too.
-        .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.signer_name.eql(b.rrsig.signer_name),
+        .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.labels == b.rrsig.labels and v.signer_name.eql(b.rrsig.signer_name),
         .unknown => |v| std.ascii.eqlIgnoreCase(v, b.unknown),
         else => false,
     };

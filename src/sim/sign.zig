@@ -104,7 +104,8 @@ pub const Signer = struct {
             const key = self.keyNamed(zone) orelse return error.PlaceholderDsWithoutKey;
             rr.rdata = .{ .ds = key.ds };
         };
-        const originals = out.items[0..out.items.len];
+        // Signing appends to `out`, which may move it.
+        const originals = try self.arena.dupe(RR, out.items);
         for (originals, 0..) |head, i| {
             if (head.rtype == .rrsig) continue;
             var first = true;
@@ -119,8 +120,10 @@ pub const Signer = struct {
             if (synthesised) continue;
             const key = forced orelse self.keyFor(head.name, head.rtype, cuts) orelse continue;
             if (forced == null) try self.register(address, key);
+            // A signature of a reserved algorithm (123-251, RFC 6014 §4)
+            // is stuffing, not the set's: the set is still signed.
             var covered = false;
-            for (originals) |o| covered = covered or (o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype);
+            for (originals) |o| covered = covered or (o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
             if (covered) continue;
             var set: [rrsig.SignedData.max_entries]RR = undefined;
             var n: usize = 0;
@@ -128,7 +131,7 @@ pub const Signer = struct {
                 set[n] = rr;
                 n += 1;
             };
-            try out.append(self.arena, try self.sign(key, set[0..n], wildcard));
+            try out.append(self.arena, try self.sign(key, set[0..n], if (self.expands(wildcard, head.name, key, forced)) wildcard else null));
         }
         return out.items;
     }
@@ -141,6 +144,18 @@ pub const Signer = struct {
         for (cuts) |c| if (c.eql(owner) and rtype == .nsec) return self.deepest(owner, true);
         for (cuts) |c| if (owner.isSubdomainOf(c)) return null;
         return self.deepest(owner, false);
+    }
+
+    /// WILDCARD relabels only what the wildcard's zone could have
+    /// synthesised from it: a set it signs below the wildcard's parent.
+    fn expands(self: *const Signer, wildcard: ?dns.Name, owner: dns.Name, key: *const Key, forced: ?*const Key) bool {
+        const w = wildcard orelse return false;
+        const parent: dns.Name = .{ .labels = w.labels[1..] };
+        return owner.isSubdomainOf(parent) and !owner.eql(parent) and (forced != null or key == self.deepest(w, false));
+    }
+
+    fn reservedAlgorithm(algorithm: u8) bool {
+        return algorithm >= 123 and algorithm <= 251;
     }
 
     fn deepest(self: *const Signer, owner: dns.Name, strictly_above: bool) ?*const Key {
