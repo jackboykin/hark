@@ -648,8 +648,9 @@ fn firstOfRrset(rrs: []const RR, i: usize) bool {
 }
 
 /// What a referral from `zone` says about `rrset(child, DS)`: the signed
-/// DS set, or a denial carrying the authority section as proof. Only
-/// proof material gives it a TTL.
+/// DS set, or a denial carrying the referral's NSEC or NSEC3 proof and
+/// nothing else of it: the child's NS in a denial's authority reads as a
+/// referral to a stub.
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !graph.Reply {
     var keep: std.ArrayList(RR) = .empty;
     var ttl: u32 = std.math.maxInt(u32);
@@ -663,9 +664,15 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     };
     // Signatures over no DS are no answer.
     if (any) return .{ .kind = .answer, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
-    ttl = 0;
-    for (msg.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
-        ttl = if (ttl == 0) rr.ttl else @min(ttl, rr.ttl);
+    var proofs: std.ArrayList(RR) = .empty;
+    for (msg.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
+        .nsec, .nsec3 => {
+            try proofs.append(g.scratch.allocator(), rr);
+            if (rr.rtype != .rrsig) ttl = @min(ttl, rr.ttl);
+        },
+        else => {},
     };
-    return .{ .kind = .nodata, .aa = true, .authorities = msg.authorities, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    // No proof is no fact to keep.
+    if (proofs.items.len == 0) ttl = 0;
+    return .{ .kind = .nodata, .aa = true, .authorities = proofs.items, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
 }

@@ -3,6 +3,10 @@
 
 SCENARIO_BEGIN the root's own DS denial is a secure NODATA
 
+; A child's DS denial read off its parent's referral is a NODATA too: it
+; carries the proof but not the child's NS, which a stub would read as a
+; referral. Under the unsigned mid. it is served without AD.
+
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
   ENTRY_BEGIN
@@ -14,6 +18,34 @@ RANGE_BEGIN 0 100
     SECTION AUTHORITY
       . 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400
       . 86400 IN NSEC aaa. NS SOA RRSIG NSEC DNSKEY
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      mid. IN A
+    SECTION AUTHORITY
+      mid. 86400 IN NS ns.mid.
+      mid. 86400 IN NSEC mie. NS RRSIG NSEC
+    SECTION ADDITIONAL
+      ns.mid. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      ex.mid. IN A
+    SECTION AUTHORITY
+      ex.mid. 86400 IN NS ns.ex.mid.
+      ex.mid. 86400 IN NSEC exa.mid. NS RRSIG NSEC
+    SECTION ADDITIONAL
+      ns.ex.mid. 86400 IN A 127.0.10.3
   ENTRY_END
 RANGE_END
 
@@ -30,6 +62,24 @@ ENTRY_BEGIN
   REPLY QR RD RA AD NOERROR
   SECTION QUESTION
     . IN DS
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    ex.mid. IN DS
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ex.mid. IN DS
+  SECTION ANSWER
+  SECTION AUTHORITY
+    ex.mid. 86400 IN NSEC exa.mid. NS RRSIG NSEC
 ENTRY_END
 
 SCENARIO_END
