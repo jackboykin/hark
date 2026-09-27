@@ -464,6 +464,7 @@ pub const Ede = struct {
         cached_error = 13,
         blocked = 15,
         stale_nxdomain_answer = 19,
+        not_supported = 21,
         no_reachable_authority = 22,
         unsupported_nsec3_iterations = 27,
         synthesized = 29,

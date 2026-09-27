@@ -152,7 +152,7 @@ pub const Retention = struct {
 };
 
 /// The client path, in the one order serve and the replay both take:
-/// RFC 6761, RFC 8482, the failure cache, memory, then the graph, which
+/// RFC 6761, RFC 8482, RRSIG, the failure cache, memory, then the graph, which
 /// each drives its own way; past the client's patience, stale.
 pub const Desk = struct {
     g: *graph.Graph,
@@ -179,6 +179,12 @@ pub const Desk = struct {
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
         if (try special(arena, q, Dns64.on(d.dns64, c))) |s| return .{ .synthesized = s };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
+        // RRSIGs are never signed (RFC 4035 §2.2): an answer of them can't
+        // be validated, and SERVFAIL would read as bogus. Validating, the
+        // question is a kind not supported (RFC 1035 §4.1.1); under CD, and
+        // unvalidated, the RRSIGs are data.
+        if (q.qtype == .rrsig and d.g.cfg.trust_anchor != null and !c.cd)
+            return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (d.failures.get(q, c.cd, d.g.now())) |ede| switch (ede.code) {
             // A hold with nothing left to serve asks afresh.
             .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
@@ -291,8 +297,9 @@ fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob) Hop {
 pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
     if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
-    // Secure only if every hop is; a verdict that failed is bogus (RFC 4035 §4.3).
-    var secure = a.judged.len > 0;
+    // Secure only if every hop is judged secure; a failed verdict is bogus
+    // (RFC 4035 §4.3).
+    var secure = a.judged.len == a.hops.len;
     for (a.judged) |j| switch (g.cell(j).state) {
         .fact => |v| secure = secure and v.secure.status == .secure,
         .failure => |why| if (c.cd) {

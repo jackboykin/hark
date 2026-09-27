@@ -285,8 +285,10 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             if (!last.settled()) return;
             if (last.failure()) |why| return failAnswer(g, id, why);
             // Judged as it lands, so its zone's chain of trust overlaps the
-            // rest of the walk.
-            if (g.cfg.trust_anchor != null and s.nj == i) {
+            // rest of the walk. The RRSIGs ending an RRSIG question are
+            // never signed (RFC 4035 §2.2): nothing can judge them.
+            const signatures = qtype == .rrsig and last.state.fact.rrset.kind == .answer;
+            if (g.cfg.trust_anchor != null and s.nj == i and !signatures) {
                 s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
                 s.nj += 1;
             }
@@ -665,7 +667,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     var hop: Reply = .{
         .kind = .alias,
         .aa = reply.aa,
-        .answers = keep.items,
+        .answers = try bindSigs(g, keep.items),
         .authorities = proofs.items,
         .target = first.rdata.cname,
         .zone = reply.zone,
@@ -684,7 +686,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         var keep: std.ArrayList(dns.ResourceRecord) = .empty;
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
-        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = try bindSigs(g, keep.items), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         _ = try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -820,21 +822,28 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var seen: [max_links + 1]dns.Name = undefined;
     // A CNAME question's answer: the target of the CNAME it matched.
     var asked_alias: ?dns.Name = null;
+    // What the links before `cur` kept: `keep[0..passed]`.
+    var passed: usize = 0;
     // NXDOMAIN denies the end of the chain; records there are noise.
     const collect = msg.header.flags.rcode != .name_error;
     while (true) : (hops += 1) {
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
+        passed = keep.items.len;
         for (msg.answers) |rr| {
             if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and (rr.rtype == qtype or qtype == .any)) {
-                try keep.append(g.scratch.allocator(), rr);
+                // A chain back to a link it passed ends at that link's
+                // signatures, kept bound with it and once (RFC 2181 §5).
                 answered = true;
+                if (qtype == .rrsig and hasSig(keep.items[0..passed], rr)) continue;
+                try keep.append(g.scratch.allocator(), rr);
                 if (rr.rtype == .cname) asked_alias = rr.rdata.cname;
             }
         }
         const dname = deepestDname(msg.answers, cur, zone);
         if (answered) {
-            try keepSigs(g, &keep, msg.answers, cur, qtype);
+            // Asked for RRSIG, collecting already took every signature.
+            if (qtype != .rrsig) try keepSigs(g, &keep, msg.answers, cur, qtype);
             // A CNAME asked for under a DNAME is its synthesis, unsigned:
             // the DNAME is what proves it.
             if (qtype == .cname) if (dname) |d| try keepDname(g, &keep, msg.answers, d);
@@ -879,7 +888,12 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .aa = msg.header.flags.aa,
-        .answers = try bindSigs(g, keep.items),
+        // Asked for RRSIG, the signatures at the end are the data, bound
+        // to no set; the links' stay bound.
+        .answers = if (qtype == .rrsig and answered)
+            try std.mem.concat(g.scratch.allocator(), dns.ResourceRecord, &.{ try bindSigs(g, keep.items[0..passed]), keep.items[passed..] })
+        else
+            try bindSigs(g, keep.items),
         .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,
         .target = cur,
         .zone = zone,
@@ -898,11 +912,21 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     return .{ .reply = reply };
 }
 
-/// Every signature bound to a set it covers and to one signer; the rest
-/// are dropped, so nothing unjudged travels beside what is judged (RFC
-/// 4035 §3.2.3). Sorted, so a stuffed reply costs n log n, not n². A set
-/// keeps eight, as Unbound tries (MAX_VALIDATE_RRSIGS), the usable first,
-/// so a rollover's or a multi-signer's is not crowded out.
+fn hasSig(rrs: []const dns.ResourceRecord, sig: dns.ResourceRecord) bool {
+    const s = sig.rdata.rrsig;
+    for (rrs) |rr| {
+        if (rr.rtype != .rrsig or !rr.name.eql(sig.name)) continue;
+        const r = rr.rdata.rrsig;
+        if (r.type_covered == s.type_covered and std.mem.eql(u8, r.signature, s.signature)) return true;
+    }
+    return false;
+}
+
+/// Every signature bound to a set it covers and to one signer, the rest
+/// dropped, so nothing unjudged travels beside what is judged (RFC 4035
+/// §3.2.3). Sorted, so a stuffed reply costs n log n, not n². Eight per
+/// set, usable first, as Unbound's MAX_VALIDATE_RRSIGS: a rollover is not
+/// crowded out.
 const max_sigs_per_set = 8;
 
 fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRecord {

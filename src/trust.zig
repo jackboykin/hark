@@ -401,7 +401,6 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
     while (it.next()) |c| {
         if (c.slot < s.next) continue;
         const fault: ?Fault = f: switch (c.is) {
-            .empty => .bogus,
             .synthesised => |x| {
                 const target = try dns.substituteSuffix(g.scratch.allocator(), c.owner, x.dname.name, x.dname.rdata.dname) orelse break :f .bogus;
                 break :f if (target.eql(x.cname.rdata.cname)) null else .bogus;
@@ -482,8 +481,8 @@ fn keysOf(g: *Graph, key: OptionalCellId, signer: dns.Name) bool {
 }
 
 /// The most claims a reply `classify` keeps can make: a CNAME and a DNAME
-/// set per link, the data at the end, a denial or an empty answer, one
-/// SOA and a proof's worth of NSEC or NSEC3. More is refused unread.
+/// set per link, the data at the end, a denial, one SOA and a proof's
+/// worth of NSEC or NSEC3. More is refused unread.
 const max_claims = 2 * graph.max_links + 2 + 1 + proof.max_proof_records;
 
 fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
@@ -517,8 +516,6 @@ const Claims = struct {
             /// Proven by the derivation from the DNAME (RFC 6672 §5.3.1).
             synthesised: struct { cname: RR, dname: RR },
             denial,
-            /// Signatures over no RRset.
-            empty,
         },
     };
 
@@ -552,7 +549,7 @@ const Claims = struct {
         it.ended = true;
         return switch (it.r.kind) {
             .nodata, .nxdomain => it.claim(it.r.target, it.qtype, .denial),
-            else => if (!anyRrset(answers)) it.claim(it.r.target, it.qtype, .empty) else null,
+            else => null,
         };
     }
 
@@ -577,7 +574,7 @@ fn signerOf(r: *const graph.Reply, c: Claims.Claim, within: dns.Name) ?dns.Name 
         .rrset => (dnssec.findRrsigAt(r.answers, c.owner, c.rtype) orelse return null).signer_name,
         .proof => (dnssec.findRrsigAt(r.authorities, c.owner, c.rtype) orelse return null).signer_name,
         .denial => proof.denialZone(r.authorities, r.target) orelse return null,
-        .synthesised, .empty => return null,
+        .synthesised => return null,
     };
     if (!proof.deepestApex(c.owner, c.rtype).isSubdomainOf(signer)) return null;
     if (c.is == .rrset and !signer.isSubdomainOf(within)) return null;
@@ -630,11 +627,6 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, verified: 
         }
     }
     return keep.items;
-}
-
-fn anyRrset(rrs: []const RR) bool {
-    for (rrs) |rr| if (rr.rtype != .rrsig) return true;
-    return false;
 }
 
 fn synthesisedUnder(rr: RR, dname: RR) bool {
