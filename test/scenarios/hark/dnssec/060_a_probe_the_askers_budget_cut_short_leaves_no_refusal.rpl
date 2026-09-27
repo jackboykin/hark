@@ -80,9 +80,10 @@ ENTRY_BEGIN
     www.uni.edu.example. IN A
 ENTRY_END
 
+; The budget stopped it, and the stop says so: no proof went bogus.
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=0
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.uni.edu.example. IN A
@@ -104,5 +105,21 @@ ENTRY_BEGIN
 ENTRY_END
 
 STEP 5 CHECK_MAX_QUERIES 8
+
+; Asked again, it is tried again: a limit is no failure of the question's.
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.uni.edu.example. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.uni.edu.example. IN A
+ENTRY_END
 
 SCENARIO_END

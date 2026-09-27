@@ -1,7 +1,12 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: dnssec-zone = .
+; hark: max-queries = 3
 
 SCENARIO_BEGIN bogus RRSIG must SERVFAIL with no AD bit
+
+; The budget is exactly what the verdict needs: the answer, the root's
+; keys, and the DS that shows no insecure cut. Spent to the last query,
+; it stopped nothing: the verdict is bogus.
 
 ; Security-critical negative: a validating resolver that stamps AD=1 on an
 ; orphan/forged RRSIG is broken in a way that nullifies DNSSEC. This
@@ -40,6 +45,18 @@ RANGE_BEGIN 0 100
       ; bytes. dnspython parses this; harness sees a covering RRSIG and
       ; doesn't overwrite it.
       example. 3600 IN RRSIG A 13 1 3600 20990101000000 20200101000000 1 . AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+
+  ; example. is no cut: no insecure one excuses the forgery.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      example. 3600 IN NSEC zz. A RRSIG NSEC
   ENTRY_END
 RANGE_END
 

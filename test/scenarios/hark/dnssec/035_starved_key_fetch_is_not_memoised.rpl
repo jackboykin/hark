@@ -86,4 +86,20 @@ ENTRY_BEGIN
     b.example. 3600 IN A 192.0.2.2
 ENTRY_END
 
+; The first client, asked again, is tried again: its budget was its own.
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
 SCENARIO_END

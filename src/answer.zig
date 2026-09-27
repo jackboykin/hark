@@ -87,8 +87,9 @@ pub const Served = struct {
     ede: ?dns.Ede = null,
     /// Served stale: hold the question stale until then (`Failures`).
     hold_until_ns: i64 = 0,
-    /// A failure of this host's, not the DNS's: never noted (`Failures`).
-    local: bool = false,
+    /// A failure of this host's or of the asker's limits, not the DNS's:
+    /// never noted (`Failures`).
+    theirs: bool = false,
     held: []const *store.Blob = &.{},
 
     pub fn release(s: Served, st: *store.Store) void {
@@ -136,7 +137,7 @@ pub fn servfail(q: dns.Question, ede: dns.Ede) Served {
 /// A cell's failure, as SERVFAIL.
 fn servfailOf(q: dns.Question, why: graph.Failure) Served {
     var s = servfail(q, .{ .code = why.code, .text = why.text });
-    s.local = why.local;
+    s.theirs = why.cause != .zone;
     return s;
 }
 
@@ -557,10 +558,10 @@ pub const Failures = struct {
     }
 
     /// Every reply shaped for `q`: a SERVFAIL opens or widens the window, a
-    /// stale one holds the question, anything else closes it. A local
-    /// failure says nothing about the question.
+    /// stale one holds the question, anything else closes it. A failure
+    /// of this host's or the asker's limits says nothing about the question.
     pub fn note(f: *Failures, gpa: Allocator, q: dns.Question, cd: bool, served: Served, first_s: u32, now_ns: i64) !void {
-        if (served.local) return;
+        if (served.theirs) return;
         const forgets = served.hold_until_ns == 0 and served.rcode != .server_failure;
         if (forgets and f.map.count() == 0) return;
         var buf: [dns.max_dotted_len + 4]u8 = undefined;

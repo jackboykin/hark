@@ -63,6 +63,8 @@ pub const Ask = struct {
     tcp_first: bool = false,
     /// An attempt, or a server set's sub-resolution, never left the host.
     local: bool = false,
+    /// The asker's limit kept a server from being asked.
+    cut_short: bool = false,
 
     comptime {
         std.debug.assert(max_servers < 32);
@@ -173,11 +175,6 @@ pub const Ask = struct {
     /// Every server failed: bare SERVFAIL. An authority's REFUSED or
     /// FORMERR passed through reads as hark's own policy at the stub, and
     /// the randomised server order must not change what the stub sees.
-    /// The zone's servers failed, unless some were never asked.
-    fn exhausted(a: *const Ask) Failure {
-        return .{ .code = .no_reachable_authority, .local = a.local };
-    }
-
     fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
         var msg = a.heldMsg(g) orelse return .exhausted;
@@ -381,7 +378,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     }
     switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, g.cell(id).scratch.cut.ask.exhausted()),
+        .exhausted => try g.fail(id, ended(g, &g.cell(id).scratch.cut.ask)),
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
@@ -588,14 +585,14 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     while (true) {
         switch (try ask(g, id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
             .pending => return,
-            .exhausted => return failAsk(g, id, g.cell(id).scratch.rrset.ask.exhausted()),
+            .exhausted => return failAsk(g, id, ended(g, &g.cell(id).scratch.rrset.ask)),
             .reply => |kept| {
                 const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
                 if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
                     const s2 = g.cell(id).scratch.rrset;
                     if (s2.delegations >= g.cfg.max_delegations)
-                        return failAsk(g, id, unreachable_authority);
+                        return failAsk(g, id, .{ .code = .other, .text = "too many delegations" });
                     s2.delegations += 1;
                     _ = try absorbReferral(g, id, ref, msg, zone);
                     // The parent's referral to the zone itself is its
@@ -612,7 +609,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     .reply => |r| r,
                     .loop => return failAsk(g, id, Links.loop),
                     // No useful response (RFC 9520 §2).
-                    .none => return failAsk(g, id, g.cell(id).scratch.rrset.ask.exhausted()),
+                    .none => return failAsk(g, id, ended(g, &g.cell(id).scratch.rrset.ask)),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
@@ -620,6 +617,14 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             },
         }
     }
+}
+
+/// Once every server was asked, running out is the servers' failure,
+/// whatever the asker had left (RFC 9520 §3.2); else it is the asker's limit.
+fn ended(g: *const Graph, a: *const Ask) Failure {
+    const asked_all = a.nservers > 0 and !a.cut_short and (a.retried or a.untried() == 0);
+    const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
+    return if (asked_all) zones else g.limit(g.payer) orelse zones;
 }
 
 fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
@@ -634,8 +639,7 @@ const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "fa
 
 fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
     const c = g.cell(id);
-    const spent = g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
-    if (!spent and !c.orphan and !why.local and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
+    if (why.cause == .zone and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
     try g.fail(id, why);
 }
 
@@ -1031,7 +1035,9 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             }
             const at = a.end(i);
             switch (ex.state.fact.exchange) {
-                .timeout => {},
+                // A wait the deadline cut before the server was due asked
+                // nothing of it.
+                .timeout => a.cut_short = a.cut_short or (!a.retried and ex.scratch.exchange.cut_short),
                 .unsent => a.local = true,
                 // Over TCP a forger cannot follow, and a server that
                 // normalizes case answers; a garbled datagram gets the
@@ -1084,7 +1090,9 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
     const key = a.servers[server];
     const state = g.rtt.get(key) orelse ns_rtt.RttState.unknown;
     const timeout_ms = state.timeout(a.nattempts == 0 and last, transport);
-    const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms) orelse {
+    // Silent past the capped wait is silent, however long the last is given.
+    const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms, state.timeout(false, transport)) orelse {
+        a.cut_short = a.cut_short or !a.retried;
         a.tried = Ask.bit(a.nservers) - 1;
         a.fetched_unglued = true;
         return null;
@@ -1109,7 +1117,8 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
         if (cut.failure()) |why| {
-            a.local = a.local or why.local;
+            a.local = a.local or why.cause == .host;
+            a.cut_short = a.cut_short or why.cause == .asker;
             return .none;
         }
         // A shallower cut: no delegation here while it holds.
@@ -1129,7 +1138,8 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                     // serves its demander, a failure gives nothing.
                     if (g.holdsInput(id, aid)) {
                         if (g.cell(aid).failure()) |why| {
-                            a.local = a.local or why.local;
+                            a.local = a.local or why.cause == .host;
+                            a.cut_short = a.cut_short or why.cause == .asker;
                         } else try list.appendSlice(g.gpa, g.cell(aid).state.fact.addr.addrs);
                         continue;
                     }

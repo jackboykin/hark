@@ -1,0 +1,125 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: client-timeout = 20
+; sim-only: live, a UDP client is answered within 2 s or not at all, long before the silent server's waits are done
+
+SCENARIO_BEGIN a zone's one silent server is remembered failed, however long the last is waited for
+
+; example.'s one server never answers. Alone, it is waited for uncapped,
+; and its backed-off wait soon passes the asker's 7 s deadline. Silence
+; past the wait any server is owed is still silence: the deadline cuts
+; nothing short, the zone's failure is remembered (RFC 9520 §3.2), and a
+; later client is refused from memory without a send.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns1.example.
+    SECTION ADDITIONAL
+      ns1.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 6
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 6
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 9 TIME_PASSES ELAPSE 6
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 12 TIME_PASSES ELAPSE 1
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=13
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 15 CHECK_MAX_QUERIES 9
+
+SCENARIO_END

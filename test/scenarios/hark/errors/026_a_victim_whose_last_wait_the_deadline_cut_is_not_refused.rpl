@@ -1,0 +1,256 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: client-timeout = 20
+; hark: stagger-ms = 0
+; sim-only: live, a UDP client is answered within 2 s or not at all, long before the 7 s deadline it rests on
+
+SCENARIO_BEGIN a victim whose last wait the asker's deadline cut short is not refused to the next
+
+; An attacker's delegation chain and 17 silent servers spend nearly all
+; of the asker's 7 s before handing it, by CNAME, to www.victim.. The
+; victim's one server is asked, but the deadline cuts its wait short:
+; that silence says nothing of the zone. Every server was asked, yet the
+; stop is the asker's and never remembered (RFC 9520 §3.2 holds only a
+; zone's own failures): the next client gets the answer.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      zp. IN A
+    SECTION AUTHORITY
+      zp. 3600 IN NS nsz.zp.
+    SECTION ADDITIONAL
+      nsz.zp. 3600 IN A 127.0.40.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      victim. IN A
+    SECTION AUTHORITY
+      victim. 3600 IN NS ns.victim.
+    SECTION ADDITIONAL
+      ns.victim. 3600 IN A 127.0.60.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      h1. IN A
+    SECTION AUTHORITY
+      h1. 3600 IN NS ns0.h1.
+    SECTION ADDITIONAL
+      ns0.h1. 3600 IN A 127.0.50.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.50.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      h2.h1. IN A
+    SECTION AUTHORITY
+      h2.h1. 3600 IN NS ns0.h2.h1.
+    SECTION ADDITIONAL
+      ns0.h2.h1. 3600 IN A 127.0.50.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.50.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      h3.h2.h1. IN A
+    SECTION AUTHORITY
+      h3.h2.h1. 3600 IN NS ns0.h3.h2.h1.
+    SECTION ADDITIONAL
+      ns0.h3.h2.h1. 3600 IN A 127.0.50.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.50.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      h4.h3.h2.h1. IN A
+    SECTION AUTHORITY
+      h4.h3.h2.h1. 3600 IN NS ns0.h4.h3.h2.h1.
+    SECTION ADDITIONAL
+      ns0.h4.h3.h2.h1. 3600 IN A 127.0.50.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.50.4
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      h5.h4.h3.h2.h1. IN A
+    SECTION AUTHORITY
+      h5.h4.h3.h2.h1. 3600 IN NS ns0.h5.h4.h3.h2.h1.
+    SECTION ADDITIONAL
+      ns0.h5.h4.h3.h2.h1. 3600 IN A 127.0.50.5
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.50.5
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.h5.h4.h3.h2.h1. IN A
+    SECTION AUTHORITY
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns0.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns1.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns2.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns3.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns4.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns5.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns6.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns7.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns8.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns9.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns10.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns11.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns12.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns13.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns14.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns15.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns16.example.h5.h4.h3.h2.h1.
+      example.h5.h4.h3.h2.h1. 3600 IN NS ns17.example.h5.h4.h3.h2.h1.
+    SECTION ADDITIONAL
+      ns0.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.1
+      ns1.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.2
+      ns2.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.3
+      ns3.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.4
+      ns4.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.5
+      ns5.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.6
+      ns6.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.7
+      ns7.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.8
+      ns8.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.9
+      ns9.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.10
+      ns10.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.11
+      ns11.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.12
+      ns12.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.13
+      ns13.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.14
+      ns14.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.15
+      ns15.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.16
+      ns16.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.30.17
+      ns17.example.h5.h4.h3.h2.h1. 3600 IN A 127.0.40.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.40.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.zp. IN A
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.h5.h4.h3.h2.h1. IN A
+    SECTION ANSWER
+      www.example.h5.h4.h3.h2.h1. 300 IN CNAME www.victim.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.60.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.victim. IN A
+    SECTION ANSWER
+      www.victim. 300 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.zp. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.zp. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.h5.h4.h3.h2.h1. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.h5.h4.h3.h2.h1. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.victim. IN A
+ENTRY_END
+
+; And the attacker's name, asked again with the chain known, resolves.
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.h5.h4.h3.h2.h1. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.h5.h4.h3.h2.h1. IN A
+ENTRY_END
+
+SCENARIO_END

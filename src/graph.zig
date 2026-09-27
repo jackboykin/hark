@@ -247,9 +247,9 @@ pub const Case = enum { random, plain };
 pub const Failure = struct {
     code: dns.Ede.Code,
     text: []const u8 = "",
-    /// Something never left the host: the failure is ours, not the zone's,
-    /// and is never remembered.
-    local: bool = false,
+    /// Only the zone's failures are remembered: never what failed to
+    /// leave the host, nor what an asker's own limit ended.
+    cause: enum { zone, host, asker } = .zone,
     /// No probe could place the cut: ask in full from the deepest one known.
     unplaced: bool = false,
 };
@@ -374,8 +374,8 @@ const ExchangeScratch = struct {
     transport: Transport,
     case: Case,
     sent_ns: i64,
-    /// The payer's deadline came before the server's timeout, so a timeout
-    /// says nothing about the server.
+    /// The payer's deadline came before the wait the server is owed, so a
+    /// timeout says nothing about it, nor about its zone.
     cut_short: bool,
 };
 
@@ -1075,14 +1075,16 @@ pub const Graph = struct {
         g.budgets -= 1;
     }
 
-    /// Orphaned, or the payer's deadline or query budget spent: the
-    /// asker's reasons, never the servers'.
-    pub fn stopped(g: *const Graph, by: CellId) bool {
-        return g.cells.items[by].orphan or g.now() >= g.payer.deadline_ns or g.payer.queries >= g.cfg.max_queries;
+    /// The deadline or query budget that stops `b` asking: the asker's
+    /// reasons, never the servers'.
+    pub fn limit(g: *const Graph, b: *const Budget) ?Failure {
+        if (g.now() >= b.deadline_ns) return .{ .code = .other, .text = "resolution deadline passed", .cause = .asker };
+        if (b.queries >= g.cfg.max_queries) return .{ .code = .other, .text = "query budget spent", .cause = .asker };
+        return null;
     }
 
     pub fn spent(g: *const Graph, b: *const Budget) bool {
-        return g.now() >= b.deadline_ns or b.queries >= g.cfg.max_queries or b.validation.exhausted();
+        return g.limit(b) != null or b.validation.exhausted();
     }
 
     /// NS-address sub-resolutions (an addr's own rrsets) between `id` and
@@ -1219,19 +1221,19 @@ pub const Graph = struct {
     // ── Exchanges ──────────────────────────────────────────────────────
 
     /// Null, like `demand`, when the payer's budget or deadline, or the
-    /// asker's orphaning, refuses the work.
-    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32) !?CellId {
+    /// asker's orphaning, refuses the work. `owed_ms` is the wait a server
+    /// is owed to count as silent.
+    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32, owed_ms: u32) !?CellId {
         std.debug.assert(case == .random or transport == .tcp);
         // The run's payer may spend itself mid-run while another waiter
         // still has room: the shared work goes on at that one's cost.
-        if (g.stopped(by) and !g.cell(by).orphan) if (g.payerOf(by)) |b| {
-            g.payer = b;
-        };
+        if (g.limit(g.payer) != null) g.payer = g.payerOf(by) orelse g.payer;
         const budget = g.payer;
-        if (g.stopped(by)) {
+        const stop: ?[]const u8 = if (g.cell(by).orphan) "orphan" else if (g.limit(budget)) |why| why.text else null;
+        if (stop) |why| {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
-                std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, if (g.cell(by).orphan) "orphan" else if (g.now() >= budget.deadline_ns) "past the deadline" else "query budget spent" });
+                std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, why });
             }
             return null;
         }
@@ -1249,8 +1251,9 @@ pub const Graph = struct {
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);
+        const owed_at = g.now() + @as(i64, @min(owed_ms, timeout_ms)) * std.time.ns_per_ms;
         const timeout_at = g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms;
-        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= timeout_at };
+        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
@@ -1371,11 +1374,10 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expectEqual(null, try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000));
-    // A run's payer spent mid-run: the work goes on at a waiter's with room.
+    try testing.expectEqual(null, try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000, 1000));
     g.cell(second).scratch.answer.budget.queries = 0;
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expect(try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000) != null);
+    try testing.expect(try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000, 1000) != null);
     try testing.expectEqual(1, g.cell(second).scratch.answer.budget.queries);
     g.payer = &g.unpaid;
     g.unhold(first);

@@ -88,8 +88,9 @@ const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validati
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
-/// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
-/// zone draining its own budget must not drop a victim's bytes.
+/// to set (RFC 4035 §4.7). With the validation budget spent nothing was
+/// proven: the stop is the limit's, named, and a zone draining its own
+/// budget must not drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (budgetSpent(g)) |why| return g.fail(id, why);
     if (!g.spent(g.payer)) {
@@ -100,10 +101,12 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, .{ .code = .dnssec_bogus });
 }
 
+/// The validation budget spent is the asker's limit, never bogus. A query
+/// budget or deadline is named only where an input failed on it.
 fn budgetSpent(g: *Graph) ?Failure {
     const b = &g.payer.validation;
-    if (b.nsec3Exhausted()) return .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent" };
-    if (b.exhausted()) return .{ .code = .dnssec_bogus, .text = "validation budget spent" };
+    if (b.nsec3Exhausted()) return .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker };
+    if (b.exhausted()) return .{ .code = .other, .text = "validation budget spent", .cause = .asker };
     return null;
 }
 
@@ -160,6 +163,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
         .cut_short => try g.fail(id, no_chain),
+        .stopped => |why| try g.fail(id, why),
         .insecure => |until| try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
         .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
@@ -331,6 +335,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         switch (try s.probe.run(g, id, zone, deepest)) {
             .pending => return,
             .cut_short => return g.fail(id, no_chain),
+            .stopped => |why| return g.fail(id, why),
             .insecure => |until| {
                 s.expires = @min(s.expires, until);
                 s.status = .insecure;
@@ -559,13 +564,17 @@ const Probe = struct {
     cell: OptionalCellId = .none,
     depth: u8 = 0,
 
-    fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, cut_short } {
+    /// `stopped`: a candidate failed on an asker's own limit, so no
+    /// candidate below it was ruled out.
+    fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, cut_short, stopped: Failure } {
         var kb: graph.KeyBuf = undefined;
         while (true) {
             if (p.cell.unwrap()) |pid| {
                 const c = g.cell(pid);
                 if (!c.settled()) return .pending;
-                if (c.failure() == null and c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
+                if (c.failure()) |why| {
+                    if (why.cause == .asker) return .{ .stopped = why };
+                } else if (c.state.fact.ds.status == .insecure) return .{ .insecure = c.expires_ns };
                 p.cell = .none;
             }
             p.depth = @max(p.depth, @as(u8, @intCast(above.labels.len))) + 1;
