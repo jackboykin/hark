@@ -867,7 +867,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     if (msg.header.flags.rcode == .name_error and !left and !clipped) reply.kind = .nxdomain;
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, try bindSigs(g, authorities), reply);
-    reply.ttl = replyTtl(g, reply, zone, name);
+    reply.ttl = replyTtl(g, reply);
     return .{ .reply = reply };
 }
 
@@ -969,10 +969,11 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
     for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
 }
 
-/// The answer's shortest TTL; for an authoritative denial, min of the
-/// SOA's TTL and MINIMUM (RFC 2308 §3) from an SOA above the name and
-/// inside the zone, nothing otherwise.
-pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
+/// The answer's shortest TTL. For an authoritative denial, min of the SOA's
+/// TTL and MINIMUM (RFC 2308 §3) from an SOA above the name denied, nothing
+/// otherwise. An SOA above the zone asked (a folded child's parent) counts
+/// only signed, for the validator to judge.
+pub fn replyTtl(g: *Graph, reply: Reply) u32 {
     var ttl: u32 = 0;
     switch (reply.kind) {
         .answer, .alias, .yxdomain => {
@@ -985,7 +986,11 @@ pub fn replyTtl(g: *Graph, reply: Reply, zone: dns.Name, name: dns.Name) u32 {
             ttl = g.cfg.max_negative_ttl;
             var found = false;
             for (reply.authorities) |rr| {
-                if (rr.rtype != .soa or !name.isSubdomainOf(rr.name) or !rr.name.isSubdomainOf(zone)) continue;
+                if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
+                if (!rr.name.isSubdomainOf(reply.zone)) {
+                    const sig = dnssec.findRrsigAt(reply.authorities, rr.name, .soa) orelse continue;
+                    if (!sig.signer_name.eql(rr.name)) continue;
+                }
                 ttl = @min(ttl, @min(rr.ttl, rr.rdata.soa.minimum));
                 found = true;
             }

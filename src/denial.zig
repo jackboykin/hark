@@ -238,7 +238,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .ede = .synthesized,
         .stored_ns = now,
     };
-    reply.ttl = @min(walk.replyTtl(g, reply, zone, name), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
+    reply.ttl = @min(walk.replyTtl(g, reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
     try g.settle(id, .{ .rrset = reply }, walk.replyExpiry(reply));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires);
     return true;

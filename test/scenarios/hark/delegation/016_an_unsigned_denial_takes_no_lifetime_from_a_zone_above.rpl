@@ -1,0 +1,87 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN an unsigned denial takes no lifetime from a zone above the one asked
+
+; com.'s servers deny x.com. under the root's unsigned SOA: their word
+; about another zone. The denial is served but never remembered, so asked
+; again it goes back to com. Signed, that SOA is the validator's to judge
+; (dnssec/902).
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      x.com. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 300
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 3 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 4 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+STEP 7 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    x.com. IN A
+ENTRY_END
+
+SCENARIO_END
