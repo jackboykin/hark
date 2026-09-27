@@ -190,7 +190,7 @@ test "fuzz: store round trip" {
             if (shared_store == null) shared_store = try store.Store.init(std.heap.smp_allocator, 64 * 1024);
             const st = &shared_store.?;
             const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name{ .labels = &.{} };
-            const reply: graph.Reply = .{ .kind = .answer, .rcode = msg.header.flags.rcode, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
+            const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             var buf: [dns.max_dotted_len + 1]u8 = undefined;
             const key: graph.Key = .{ .kind = .rrset, .rtype = if (msg.questions.len > 0) msg.questions[0].qtype else .a, .name = owner.formatLower(&buf) };
             const blob = st.build(.{ .rrset = reply }) catch return;

@@ -178,8 +178,7 @@ pub const Addr = struct {
 /// The RRset at (name, type), as the reply sections that settled it, so
 /// the client sees what the authority said.
 pub const Reply = struct {
-    kind: enum { answer, alias, nodata, nxdomain, yxdomain },
-    rcode: dns.RCode,
+    kind: Of,
     aa: bool,
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
@@ -194,6 +193,25 @@ pub const Reply = struct {
     stored_ns: i64 = 0,
     /// Seconds the reply stays a fact (`replyTtl`).
     ttl: u32 = 0,
+
+    /// What the reply says of (name, type).
+    pub const Of = enum {
+        answer,
+        alias,
+        nodata,
+        nxdomain,
+        yxdomain,
+
+        /// Only rcodes that answer are kept; a chain's is its final query
+        /// cycle's (RFC 6604 §3).
+        pub fn rcode(k: Of) dns.RCode {
+            return switch (k) {
+                .answer, .alias, .nodata => .no_error,
+                .nxdomain => .name_error,
+                .yxdomain => .yx_domain,
+            };
+        }
+    };
 };
 
 /// A client question: the alias chain from `rrset(name, type)` to the

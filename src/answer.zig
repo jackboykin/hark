@@ -407,7 +407,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     var authorities: std.ArrayList(dns.WireRecord) = .empty;
     var additionals: std.ArrayList(dns.WireRecord) = .empty;
     if (!(trim and (r.kind == .answer or r.kind == .alias))) {
-        const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.rcode == .no_error and answers.items.len > 0 };
+        const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0 };
         try appendAged(arena, &authorities, r.sections[1], keep, age, life, last.floor, last.stale);
         var add = keep;
         add.section = .additional;
@@ -420,7 +420,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     else
         null;
     return .{
-        .rcode = r.rcode,
+        .rcode = r.kind.rcode(),
         .ad = secure and (c.do_bit or c.ad),
         .question = q,
         .answers = answers.items,

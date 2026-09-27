@@ -140,7 +140,7 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         const rrs = try withSigs(g, r.authorities, rr);
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
-        const fact: graph.Reply = .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
+        const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires);
         if (rr.rtype == .soa) continue;
         proofs += 1;
@@ -231,7 +231,6 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
 
     var reply: graph.Reply = .{
         .kind = if (nxdomain) .nxdomain else .nodata,
-        .rcode = if (nxdomain) .name_error else .no_error,
         .aa = true,
         .authorities = authorities.items,
         .target = name,

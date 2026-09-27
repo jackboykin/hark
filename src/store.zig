@@ -227,9 +227,8 @@ pub const Store = struct {
                 try w.addrs(a.addrs);
             },
             .rrset => |r| {
-                // `rrsetLife` reads these in place.
+                // `Rrset.of` reads these in place.
                 try w.int(u8, @backingInt(r.kind));
-                try w.int(u8, @backingInt(r.rcode));
                 try w.int(u8, @intFromBool(r.aa) | @as(u8, @intFromBool(r.ede != null)) << 1);
                 try w.int(u16, if (r.ede) |e| @backingInt(e) else 0);
                 try w.int(u32, r.ttl);
@@ -273,7 +272,6 @@ pub const Store = struct {
             .rrset => blk: {
                 var reply: graph.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
-                    .rcode = @fromBackingInt(@as(u4, @intCast(try r.int(u8)))),
                     .aa = undefined,
                 };
                 const flags = try r.int(u8);
@@ -306,8 +304,7 @@ pub const Store = struct {
 /// An rrset's blob read in place, no allocation: the reply's scalars,
 /// its names and records as `build` wrote them.
 pub const Rrset = struct {
-    kind: @FieldType(graph.Reply, "kind"),
-    rcode: dns.RCode,
+    kind: graph.Reply.Of,
     aa: bool,
     ede: ?dns.Ede.Code,
     ttl: u32,
@@ -327,7 +324,6 @@ pub const Rrset = struct {
         var r = r0;
         var v: Rrset = .{
             .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
-            .rcode = @fromBackingInt(@as(u4, @intCast(try r.int(u8)))),
             .aa = undefined,
             .ede = null,
             .ttl = undefined,
@@ -497,7 +493,7 @@ test "a fact survives the blob byte for byte" {
         .expire = 4,
         .minimum = 5,
     } } }};
-    const reply: graph.Reply = .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
+    const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
     const key: Key = .{ .kind = .rrset, .rtype = .a, .name = "www.example.com" };
 
     const blob = try s.build(.{ .rrset = reply });
@@ -508,7 +504,6 @@ test "a fact survives the blob byte for byte" {
 
     const back = (try Store.parse(arena, blob)).rrset;
     try testing.expectEqual(reply.kind, back.kind);
-    try testing.expectEqual(reply.rcode, back.rcode);
     try testing.expectEqual(reply.aa, back.aa);
     try testing.expectEqual(reply.ede, back.ede);
     try testing.expectEqual(reply.ttl, back.ttl);
@@ -526,7 +521,6 @@ test "a fact survives the blob byte for byte" {
 
     const view: Rrset = .of(blob);
     try testing.expectEqual(reply.kind, view.kind);
-    try testing.expectEqual(reply.rcode, view.rcode);
     try testing.expectEqual(reply.aa, view.aa);
     try testing.expectEqual(reply.ede, view.ede);
     try testing.expectEqual(reply.ttl, view.ttl);

@@ -260,7 +260,7 @@ pub const Links = struct {
 
     /// Where the chain goes once a hop's CNAMEs are passed. A CNAME
     /// question stops at its name.
-    pub fn end(l: *const Links, kind: @FieldType(Reply, "kind"), target: dns.Name, qtype: dns.RType) Step {
+    pub fn end(l: *const Links, kind: Reply.Of, target: dns.Name, qtype: dns.RType) Step {
         if (kind != .alias or qtype == .cname) return .done;
         if (l.left(target)) return .{ .broken = loop };
         return .{ .next = target };
@@ -659,7 +659,6 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     };
     const hop: Reply = .{
         .kind = .alias,
-        .rcode = .no_error,
         .aa = reply.aa,
         .answers = keep.items,
         .authorities = proofs.items,
@@ -680,7 +679,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         var keep: std.ArrayList(dns.ResourceRecord) = .empty;
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
-        const dname: Reply = .{ .kind = .answer, .rcode = .no_error, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -708,10 +707,10 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     try keep.appendSlice(g.scratch.allocator(), d.answers);
     if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.rdata.dname)) |target| {
         try keep.append(g.scratch.allocator(), .{ .name = name, .rtype = .cname, .rclass = .in, .ttl = dname.ttl, .rdata = .{ .cname = target } });
-        return .{ .kind = .alias, .rcode = .no_error, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+        return .{ .kind = .alias, .aa = d.aa, .answers = keep.items, .target = target, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
     }
     // RFC 6672 §3.3: the substituted name is too long; YXDOMAIN.
-    return .{ .kind = .yxdomain, .rcode = .yx_domain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
+    return .{ .kind = .yxdomain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
 /// Publish the child's cut with its NS names and glue, and return it. The
@@ -851,7 +850,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     if (overflow != yx and !(yx and (left or clipped))) return null;
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
-        .rcode = if (left) .no_error else msg.header.flags.rcode,
         .aa = msg.header.flags.aa,
         .answers = try bindSigs(g, keep.items),
         .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,

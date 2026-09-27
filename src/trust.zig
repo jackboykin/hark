@@ -640,10 +640,10 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
         }
     };
     // Signatures over no DS are no answer.
-    if (any) return .{ .kind = .answer, .rcode = .no_error, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    if (any) return .{ .kind = .answer, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
     ttl = 0;
     for (msg.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
         ttl = if (ttl == 0) rr.ttl else @min(ttl, rr.ttl);
     };
-    return .{ .kind = .nodata, .rcode = .no_error, .aa = true, .authorities = msg.authorities, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    return .{ .kind = .nodata, .aa = true, .authorities = msg.authorities, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
 }
