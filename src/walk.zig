@@ -1029,19 +1029,16 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
     for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
 }
 
-/// The answer's shortest TTL, a wildcard expansion's capped by its proof's
-/// (RFC 9077 §4.1). For an authoritative denial, min of the SOA's TTL and
-/// MINIMUM (RFC 2308 §3) from an SOA above the name denied, nothing
-/// otherwise. An SOA above the zone asked (a folded child's parent) counts
-/// only signed, for the validator to judge.
+/// The answer's shortest TTL, signatures included (RFC 4034 §3), capped by
+/// a wildcard expansion's proof (RFC 9077 §4.1). A denial's comes from an
+/// SOA above the name denied (RFC 2308 §3); one above the zone asked (a
+/// folded child's parent) counts only signed, for the validator to judge.
 pub fn replyTtl(g: *Graph, reply: Reply) u32 {
     var ttl: u32 = 0;
     switch (reply.kind) {
         .answer, .alias, .yxdomain => {
             ttl = std.math.maxInt(u32);
-            for (reply.answers) |rr| if (rr.rtype != .rrsig) {
-                ttl = @min(ttl, rr.ttl);
-            };
+            for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
             for (reply.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
                 ttl = @min(ttl, rr.ttl);
             };

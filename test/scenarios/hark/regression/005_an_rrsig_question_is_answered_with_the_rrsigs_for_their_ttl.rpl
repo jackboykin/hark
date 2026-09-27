@@ -1,10 +1,11 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: qname-minimisation = no
 
-SCENARIO_BEGIN an rrsig question is answered with the rrsigs
+SCENARIO_BEGIN an rrsig question is answered with the rrsigs, for their ttl
 
 ; Asked for RRSIG, the signatures are the data: none covers a set in the
-; answer, and none may be dropped for it.
+; answer, and none is dropped for it. Their TTL alone bounds the answer
+; (RFC 4034 §3): past it, the question goes upstream again.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -50,5 +51,26 @@ ENTRY_BEGIN
   SECTION ANSWER
     www.example. 300 IN RRSIG A 13 2 300 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 301
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN RRSIG
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN RRSIG
+  SECTION ANSWER
+    www.example. 300 IN RRSIG A 13 2 300 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+ENTRY_END
+
+STEP 6 CHECK_MAX_QUERIES 4
 
 SCENARIO_END
