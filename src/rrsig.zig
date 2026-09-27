@@ -427,10 +427,7 @@ pub fn verifyRrsig(
         }
     }
 
-    // RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
-    const skew_ahead = now_u32 +% inception_skew_tolerance;
-    if (dns.serialAfter(rrsig.sig_inception, skew_ahead)) return error.SignatureExpired;
-    if (dns.serialAfter(now_u32, rrsig.sig_expiration)) return error.SignatureExpired;
+    if (!inWindow(rrsig, now_u32)) return error.SignatureExpired;
 
     // A cold burst's largest signed data was 4.3 KiB (RSA DNSKEY rollover);
     // spilling only TCP-sized sets keeps 64 KiB off every validating stack.
@@ -471,6 +468,12 @@ fn Digest(comptime algorithm: dns.DnssecAlgorithm) type {
         .rsasha512 => Sha512,
         else => @compileError("no verifier for " ++ @tagName(algorithm)),
     };
+}
+
+/// RFC 4035 §5.3.1 validity period, with asymmetric clock-skew tolerance.
+pub fn inWindow(rrsig: dns.RrsigData, now_u32: u32) bool {
+    const skew_ahead = now_u32 +% inception_skew_tolerance;
+    return !dns.serialAfter(rrsig.sig_inception, skew_ahead) and !dns.serialAfter(now_u32, rrsig.sig_expiration);
 }
 
 /// The same set as `verifyRrsig`'s prongs.

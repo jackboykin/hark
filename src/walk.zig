@@ -7,6 +7,7 @@ const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const delegation = @import("delegation.zig");
 const dnssec = @import("dnssec.zig");
+const rrsig = @import("rrsig.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const graph = @import("graph.zig");
 const trust = @import("trust.zig");
@@ -832,8 +833,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .rcode = if (left) .no_error else msg.header.flags.rcode,
         .aa = msg.header.flags.aa,
-        .answers = keep.items,
-        .authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities,
+        .answers = try bindSigs(g, keep.items),
         .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,
         .target = cur,
         .zone = zone,
@@ -846,8 +846,98 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         reply.target = keep.items[0].rdata.cname;
     }
     if (msg.header.flags.rcode == .name_error and !left and !clipped) reply.kind = .nxdomain;
+    const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
+    reply.authorities = try proofsNeeded(g, try bindSigs(g, authorities), reply);
     reply.ttl = replyTtl(g, reply, zone, name);
     return .{ .reply = reply };
+}
+
+/// Every signature bound to a set it covers and to one signer; the rest
+/// are dropped, so nothing unjudged travels beside what is judged (RFC
+/// 4035 §3.2.3). Sorted, so a stuffed reply costs n log n, not n². A set
+/// keeps eight, as Unbound tries (MAX_VALIDATE_RRSIGS), the usable first,
+/// so a rollover's or a multi-signer's is not crowded out.
+const max_sigs_per_set = 8;
+
+fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
+    for (rrs) |rr| {
+        if (rr.rtype == .rrsig) break;
+    } else return rrs;
+    // Records by owner and the type they are or cover.
+    const By = struct {
+        rrs: []const dns.ResourceRecord,
+        now: u32,
+
+        fn order(c: @This(), x: u32, y: u32) std.math.Order {
+            const p = c.rrs[x];
+            const q = c.rrs[y];
+            const o = proof.canonicalNameOrder(p.name, q.name);
+            if (o != .eq) return o;
+            return std.math.order(typ(p), typ(q));
+        }
+
+        fn lessThan(c: @This(), x: u32, y: u32) bool {
+            const o = c.order(x, y);
+            return if (o != .eq) o == .lt else c.rank(x) < c.rank(y);
+        }
+
+        fn rank(c: @This(), x: u32) u2 {
+            const rr = c.rrs[x];
+            if (rr.rtype != .rrsig) return 0;
+            const sig = rr.rdata.rrsig;
+            return if (rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, c.now)) 1 else 2;
+        }
+
+        fn typ(rr: dns.ResourceRecord) u16 {
+            return @backingInt(if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype);
+        }
+    };
+    const a = g.scratch.allocator();
+    const by: By = .{ .rrs = rrs, .now = g.wallNow() };
+    const at = try a.alloc(u32, rrs.len);
+    for (at, 0..) |*x, i| x.* = @intCast(i);
+    // Stable: a set, then its usable signatures, then the rest, each in
+    // the reply's order.
+    std.mem.sort(u32, at, by, By.lessThan);
+    const keep = try a.alloc(bool, rrs.len);
+    @memset(keep, true);
+    var i: usize = 0;
+    while (i < at.len) {
+        var j = i + 1;
+        while (j < at.len and by.order(at[i], at[j]) == .eq) j += 1;
+        const covers = rrs[at[i]].rtype != .rrsig;
+        // Every one kept names the first's signer, so `findRrsigAt`'s
+        // first agrees.
+        var first: ?dns.Name = null;
+        var kept: usize = 0;
+        for (at[i..j]) |k| if (rrs[k].rtype == .rrsig) {
+            const signer = rrs[k].rdata.rrsig.signer_name;
+            first = first orelse signer;
+            keep[k] = covers and kept < max_sigs_per_set and signer.eql(first.?);
+            kept += @intFromBool(keep[k]);
+        };
+        i = j;
+    }
+    var out: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
+    for (rrs, keep) |rr, k| if (k) out.appendAssumeCapacity(rr);
+    return out.items;
+}
+
+/// A positive's authority keeps NSEC, NSEC3 and SOA only as a wildcard
+/// expansion's proof of no closer match (RFC 4035 §3.1.3.3); anywhere
+/// else they prove nothing the answer needs.
+fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]const dns.ResourceRecord {
+    if (reply.kind == .nodata or reply.kind == .nxdomain) return rrs;
+    const expanded = for (reply.answers) |rr| {
+        if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(rr.name)) break true;
+    } else false;
+    if (expanded) return rrs;
+    var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(g.scratch.allocator(), rrs.len);
+    for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
+        .nsec, .nsec3, .soa => {},
+        else => keep.appendAssumeCapacity(rr),
+    };
+    return keep.items;
 }
 
 fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {

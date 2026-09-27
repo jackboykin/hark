@@ -163,12 +163,11 @@ fn minimal(rr: RR) bool {
     return next.labels.len == rr.name.labels.len + 1 and next.labels[0].len == 1 and next.labels[0][0] == 0 and next.isSubdomainOf(rr.name);
 }
 
-/// `rr` followed by the signatures over it; four is a dual-algorithm
-/// rollover's ceiling (RFC 6781 §4.1.4).
+/// `rr` followed by the signatures over it, already bounded by the walk.
 fn withSigs(g: *Graph, rrs: []const RR, rr: RR) ![]const RR {
     var keep: std.ArrayList(RR) = .empty;
     try keep.append(g.scratch.allocator(), rr);
-    for (rrs) |s| if (keep.items.len <= 4 and s.rtype == .rrsig and s.name.eql(rr.name) and s.rdata.rrsig.type_covered == rr.rtype) try keep.append(g.scratch.allocator(), s);
+    for (rrs) |s| if (s.rtype == .rrsig and s.name.eql(rr.name) and s.rdata.rrsig.type_covered == rr.rtype) try keep.append(g.scratch.allocator(), s);
     return keep.items;
 }
 
