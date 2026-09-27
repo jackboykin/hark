@@ -11,6 +11,9 @@ SCENARIO_BEGIN one verified CNAME hop must not authenticate the rest of the chai
 ; insertion for anyone who can add one record.
 ;
 ; Expected: SERVFAIL, AD=0.
+;
+; Signed, a chain packed into one answer verifies however long it is:
+; eight CNAMEs and the A here.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -47,6 +50,24 @@ RANGE_BEGIN 0 100
       a.example. 3600 IN RRSIG CNAME 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       b.example. 3600 IN A 192.0.2.9
   ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      l0.example. IN A
+    SECTION ANSWER
+      l0.example. 3600 IN CNAME l1.example.
+      l1.example. 3600 IN CNAME l2.example.
+      l2.example. 3600 IN CNAME l3.example.
+      l3.example. 3600 IN CNAME l4.example.
+      l4.example. 3600 IN CNAME l5.example.
+      l5.example. 3600 IN CNAME l6.example.
+      l6.example. 3600 IN CNAME l7.example.
+      l7.example. 3600 IN CNAME l8.example.
+      l8.example. 3600 IN A 192.0.2.8
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -62,6 +83,21 @@ ENTRY_BEGIN
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    l0.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    l0.example. IN A
 ENTRY_END
 
 SCENARIO_END

@@ -810,8 +810,14 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
             break;
         }
         if (dname) |d| {
-            try keep.append(g.scratch.allocator(), d);
-            try keepSigs(g, &keep, msg.answers, d.name, .dname);
+            // A chain may pass one DNAME twice; its set is kept once.
+            const kept = for (keep.items) |k| {
+                if (k.rtype == .dname and k.name.eql(d.name)) break true;
+            } else false;
+            if (!kept) {
+                try keep.append(g.scratch.allocator(), d);
+                try keepSigs(g, &keep, msg.answers, d.name, .dname);
+            }
             if (cname == null) {
                 const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
                     overflow = true;

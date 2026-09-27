@@ -47,12 +47,22 @@ pub const SecureScratch = struct {
     target_gen: u32 = 0,
     /// `ds(zone)`: is the answering zone expected to sign at all.
     zone_ds: OptionalCellId = .none,
-    /// `dnskey(signer)` per RRset group, in section order.
-    keys: [max_groups]OptionalCellId = @splat(.none),
+    /// `dnskey(signer)` of the claim at `next`, held one at a time: the
+    /// rest are fetched alongside by `keys` roots.
+    key: OptionalCellId = .none,
+    /// The reply was checked for a flood and its signers' keys fetched.
+    fetched: bool = false,
+    /// Insecure once a claim before `next` sits below a proven insecure cut.
+    status: Proof = .secure,
+    /// The claim judged next, or the one faulted awaiting its probe.
+    next: u8 = 0,
+    /// The lifetime the claims before `next` allow.
+    expires: i64 = std.math.maxInt(i64),
+    /// Where the signatures of the claims before `next` stop proving.
+    proven: i64 = std.math.maxInt(i64),
     fault: ?Fault = null,
     probe: Probe = .{},
 };
-const max_groups = 8;
 
 /// A failed input stays pinned, its failure readable, until this cell
 /// settles.
@@ -61,7 +71,6 @@ const Fault = union(enum) {
     input: CellId,
     no_chain,
     no_cut,
-    too_many_rrsets,
 
     fn failure(f: Fault, g: *Graph) ?Failure {
         return switch (f) {
@@ -69,7 +78,6 @@ const Fault = union(enum) {
             .input => |i| g.cell(i).failure().?,
             .no_chain => no_chain,
             .no_cut => no_cut,
-            .too_many_rrsets => too_many_rrsets,
         };
     }
 };
@@ -78,7 +86,6 @@ const no_chain: Failure = .{ .code = .dnssec_bogus, .text = "no chain" };
 const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validation" };
 /// Verified, and still no proof of the insecure cut asked about.
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
-const too_many_rrsets: Failure = .{ .code = .dnssec_bogus, .text = "too many rrsets" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
 /// to set (RFC 4035 §4.7). With the budget spent nothing was proven, and a
@@ -297,13 +304,9 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
 }
 
 /// `secure(rrset)`: nothing to prove where `ds` says the answering zone
-/// is unsigned; otherwise every RRset group verifies under its signer's
-/// keys (owner within signer within zone), a wildcard expansion also
-/// proves no closer match, and a negative proves itself under whatever
-/// zone signed the authority section. Bytes that prove nothing may sit
-/// below a hidden insecure cut, an unsigned child folded onto its signed
-/// parent's servers, which only its DS can say (RFC 4035 §4.3, §5.2);
-/// else bogus.
+/// is unsigned; otherwise each claim the reply makes is judged on its own.
+/// A claim that proves nothing may sit below a hidden insecure cut, which
+/// only its DS can say (RFC 4035 §4.3, §5.2); else the reply is bogus.
 pub fn runSecure(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const s = g.cell(id).scratch.secure;
@@ -315,116 +318,239 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
     if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
-    const expires = @min(t.expires_ns, zd.expires_ns);
-    if (s.fault == null) {
-        s.fault = try judge(g, id, s, t, expires) orelse return;
-        if (budgetSpent(g)) |why| return g.fail(id, why);
-    }
-    switch (try s.probe.run(g, id, zone, proof.deepestApex(t.name, t.key.rtype))) {
-        .pending => {},
-        .cut_short => try g.fail(id, no_chain),
-        .insecure => |until| try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, until)),
-        .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failBogus(g, id, s.target),
+    while (true) {
+        if (s.fault == null) {
+            s.fault = try judge(g, id, s, t, @min(t.expires_ns, zd.expires_ns)) orelse return;
+            if (budgetSpent(g)) |why| return g.fail(id, why);
+        }
+        const c = Claims.at(&t.state.fact.rrset, t.key.rtype, s.next);
+        // A proof is excused only where the data it speaks for is: the
+        // name denied, while that is the zone's; else its own owner.
+        const r = &t.state.fact.rrset;
+        const deepest = if (c.is == .proof and r.target.isSubdomainOf(zone)) proof.deepestApex(r.target, t.key.rtype) else proof.deepestApex(c.owner, c.rtype);
+        switch (try s.probe.run(g, id, zone, deepest)) {
+            .pending => return,
+            .cut_short => return g.fail(id, no_chain),
+            .insecure => |until| {
+                s.expires = @min(s.expires, until);
+                s.status = .insecure;
+                s.next += 1;
+                s.fault = null;
+                s.probe = .{};
+            },
+            .none => return if (s.fault.?.failure(g)) |why| g.fail(id, why) else failBogus(g, id, s.target),
+        }
     }
 }
 
+/// Judge the claims from `s.next` on, settling once the last proves
+/// itself; a claim that proves nothing is the fault returned.
 fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: i64) !?Fault {
     var kb: graph.KeyBuf = undefined;
-    const r = t.state.fact.rrset;
-    const zone = r.zone;
-    var expires = until;
+    const r = &t.state.fact.rrset;
+    const qtype = t.key.rtype;
+    // Every signer's keys not yet known or under way are fetched at once;
+    // each claim then waits on its own.
+    if (!s.fetched) {
+        if (flooded(r, qtype)) {
+            try failBogus(g, id, s.target);
+            return null;
+        }
+        s.fetched = true;
+        var it: Claims = .{ .r = r, .qtype = qtype };
+        while (it.next()) |c| {
+            const signer = signerOf(r, c) orelse continue;
+            const key = graph.Key.of(&kb, .dnskey, signer, .a);
+            if (!g.holds(key) and !g.index.contains(key)) try g.fetchKeys(id, signer);
+        }
+    }
     const budget = &g.payer.validation;
+    const clock = graph.Tally.clock(&g.tally.verify_ns);
+    defer clock.stop();
     const now = g.wallNow();
-    var cap: u32 = std.math.maxInt(u32);
-    switch (r.kind) {
-        .answer, .alias, .yxdomain => {
-            // Pass one demands every signer's keys, pass two verifies. A
-            // CNAME synthesised under the DNAME before it is proven by the
-            // derivation (RFC 6672 §5.3.1).
-            var groups: usize = 0;
-            var pending = false;
-            var prev_dname: ?RR = null;
-            for (r.answers, 0..) |rr, i| {
-                if (rr.rtype == .rrsig or !firstOfRrset(r.answers, i)) continue;
-                if (groups >= max_groups) return .too_many_rrsets;
-                defer groups += 1;
-                defer prev_dname = if (rr.rtype == .dname) rr else null;
-                if (synthesisedUnder(rr, prev_dname)) continue;
-                const sig = dnssec.findRrsigAt(r.answers, rr.name, rr.rtype) orelse return .bogus;
-                // RFC 4034 §3.1.3; a signer above the answering zone
-                // authenticates nothing here.
-                if (!proof.deepestApex(rr.name, rr.rtype).isSubdomainOf(sig.signer_name) or !sig.signer_name.isSubdomainOf(zone)) return .bogus;
-                if (s.keys[groups] == .none) s.keys[groups] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, sig.signer_name, .a), sig.signer_name) orelse
-                    return .no_chain);
-                pending = pending or !g.cell(s.keys[groups].unwrap().?).settled();
-            }
-            if (pending) return null;
-            const clock = graph.Tally.clock(&g.tally.verify_ns);
-            defer clock.stop();
-            // Signatures alone: a claim about an empty set.
-            if (groups == 0) return .bogus;
-            var status: Proof = .secure;
-            groups = 0;
-            prev_dname = null;
-            for (r.answers, 0..) |rr, i| {
-                if (rr.rtype == .rrsig or !firstOfRrset(r.answers, i)) continue;
-                defer groups += 1;
-                defer prev_dname = if (rr.rtype == .dname) rr else null;
-                if (synthesisedUnder(rr, prev_dname)) {
-                    const target = try dns.substituteSuffix(g.scratch.allocator(), rr.name, prev_dname.?.name, prev_dname.?.rdata.dname) orelse return .bogus;
-                    if (!target.eql(rr.rdata.cname)) return .bogus;
-                    continue;
+    var it: Claims = .{ .r = r, .qtype = qtype };
+    while (it.next()) |c| {
+        if (c.slot < s.next) continue;
+        const fault: ?Fault = f: switch (c.is) {
+            .empty => .bogus,
+            .synthesised => |x| {
+                const target = try dns.substituteSuffix(g.scratch.allocator(), c.owner, x.dname.name, x.dname.rdata.dname) orelse break :f .bogus;
+                break :f if (target.eql(x.cname.rdata.cname)) null else .bogus;
+            },
+            .rrset, .proof, .denial => {
+                const signer = signerOf(r, c) orelse break :f .bogus;
+                if (!keysOf(g, s.key, signer)) s.key = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer));
+                const kid = s.key.unwrap() orelse break :f .no_chain;
+                const kc = g.cell(kid);
+                if (!kc.settled()) {
+                    s.next = c.slot;
+                    return null;
                 }
-                const kc = g.cell(s.keys[groups].unwrap().?);
-                if (kc.failure() != null) return .{ .input = s.keys[groups].unwrap().? };
-                expires = @min(expires, kc.expires_ns);
-                if (kc.state.fact.dnskey.status == .insecure) {
-                    status = .insecure;
-                    continue;
+                if (kc.failure() != null) break :f .{ .input = kid };
+                s.expires = @min(s.expires, kc.expires_ns);
+                const keys = kc.state.fact.dnskey;
+                if (keys.status == .insecure) {
+                    // Insecure keys above a secure zone contradict its DS.
+                    if (!signer.isSubdomainOf(r.zone)) break :f .bogus;
+                    s.status = .insecure;
+                    break :f null;
                 }
-                const verified = dnssec.validateRrset(r.answers, rr.name, rr.rtype, kc.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
-                    return .bogus;
-                cap = @min(cap, rrsig.ttlCap(verified, now));
-                if (verified.labels < rrsig.signedLabels(rr.name)) {
-                    if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return .bogus;
-                    switch (proof.proveNoCloserMatch(r.authorities, rr.name, verified.labels, verified.signer_name, budget)) {
+                if (c.is == .denial) {
+                    // Its proofs verified as claims of their own; this is
+                    // the derivation from those its zone signed.
+                    const own = try signedBy(g, r.authorities, signer);
+                    switch (proof.validateNegativeProof(own, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
+                        .secure => {
+                            var only = r.*;
+                            only.authorities = own;
+                            try denial.absorb(g, id, signer, only, @min(until, kc.expires_ns, s.proven));
+                        },
+                        .insecure => s.status = .insecure,
+                        .bogus, .unchecked => break :f .bogus,
+                    }
+                    break :f null;
+                }
+                const records = if (c.is == .proof) r.authorities else r.answers;
+                const verified = dnssec.validateRrset(records, c.owner, c.rtype, keys.records, now, budget, &g.verify_memo) orelse
+                    break :f .bogus;
+                const cap = capExpiry(g, rrsig.ttlCap(verified, now));
+                s.expires = @min(s.expires, cap);
+                s.proven = @min(s.proven, cap);
+                if (c.is == .proof) {
+                    // Proof material is served under its own owner, never
+                    // expanded (RFC 4035 §3.1.3.3).
+                    if (verified.labels != rrsig.signedLabels(c.owner)) break :f .bogus;
+                    break :f null;
+                }
+                if (verified.labels < rrsig.signedLabels(c.owner)) {
+                    const own = try signedBy(g, r.authorities, verified.signer_name);
+                    switch (proof.proveNoCloserMatch(own, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {},
-                        .insecure => status = .insecure,
-                        .bogus, .unchecked => return .bogus,
+                        .insecure => s.status = .insecure,
+                        .bogus, .unchecked => break :f .bogus,
                     }
                 }
-            }
-            try g.settle(id, .{ .secure = .{ .status = status, .proven_until_ns = if (status == .secure) capExpiry(g, cap) else std.math.maxInt(i64) } }, @min(expires, capExpiry(g, cap)));
-        },
-        .nodata, .nxdomain => {
-            const signer = proof.authoritySigner(r.authorities) orelse return .bogus;
-            if (!proof.deepestApex(t.name, t.key.rtype).isSubdomainOf(signer)) return .bogus;
-            if (s.keys[0] == .none) s.keys[0] = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-                return .no_chain);
-            const kc = g.cell(s.keys[0].unwrap().?);
-            if (!kc.settled()) return null;
-            const clock = graph.Tally.clock(&g.tally.verify_ns);
-            defer clock.stop();
-            if (kc.failure() != null) return .{ .input = s.keys[0].unwrap().? };
-            expires = @min(expires, kc.expires_ns);
-            if (kc.state.fact.dnskey.status == .insecure) {
-                if (!signer.isSubdomainOf(zone)) return .bogus;
-                try g.settle(id, .{ .secure = .{ .status = .insecure } }, expires);
-                return null;
-            }
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, kc.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure) return .bogus;
-            switch (proof.validateNegativeProof(r.authorities, t.name, t.key.rtype, r.kind == .nxdomain, signer, budget)) {
-                .secure => {
-                    expires = @min(expires, capExpiry(g, cap));
-                    try denial.absorb(g, id, signer, r, expires);
-                    try g.settle(id, .{ .secure = .{ .status = .secure, .proven_until_ns = capExpiry(g, cap) } }, expires);
-                },
-                .insecure => try g.settle(id, .{ .secure = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
-                .bogus, .unchecked => return .bogus,
-            }
-        },
+                break :f null;
+            },
+        };
+        if (fault) |why| {
+            s.next = c.slot;
+            return why;
+        }
     }
+    const chain: Chain = if (s.status == .secure) .{ .status = .secure, .proven_until_ns = s.proven } else .{ .status = .insecure };
+    try g.settle(id, .{ .secure = chain }, @min(until, s.expires));
     return null;
+}
+
+fn keysOf(g: *Graph, key: OptionalCellId, signer: dns.Name) bool {
+    const kid = key.unwrap() orelse return false;
+    return g.cell(kid).name.eql(signer);
+}
+
+/// The most claims a reply `classify` keeps can make: a CNAME and a DNAME
+/// set per link, the data at the end, a denial or an empty answer, one
+/// SOA and a proof's worth of NSEC or NSEC3. More is refused unread.
+const max_claims = 2 * graph.max_links + 2 + 1 + proof.max_proof_records;
+
+fn flooded(r: *const graph.Reply, qtype: dns.RType) bool {
+    if (proof.proofFlood(r.authorities)) return true;
+    var it: Claims = .{ .r = r, .qtype = qtype };
+    var n: usize = 0;
+    while (it.next()) |_| {
+        n += 1;
+        if (n > max_claims) return true;
+    }
+    return false;
+}
+
+/// What a reply claims, one set at a time: the authority's NSEC, NSEC3 and
+/// SOA sets, the answer's RRsets in order, then a negative's denial.
+const Claims = struct {
+    r: *const graph.Reply,
+    qtype: dns.RType,
+    p: usize = 0,
+    i: usize = 0,
+    slot: u8 = 0,
+    ended: bool = false,
+
+    const Claim = struct {
+        slot: u8,
+        owner: dns.Name,
+        rtype: dns.RType,
+        is: union(enum) {
+            rrset,
+            proof,
+            /// Proven by the derivation from the DNAME (RFC 6672 §5.3.1).
+            synthesised: struct { cname: RR, dname: RR },
+            denial,
+            /// Signatures over no RRset.
+            empty,
+        },
+    };
+
+    fn next(it: *Claims) ?Claim {
+        const auth = it.r.authorities;
+        while (it.p < auth.len) {
+            const i = it.p;
+            it.p += 1;
+            const rr = auth[i];
+            switch (rr.rtype) {
+                .nsec, .nsec3, .soa => if (firstOfRrset(auth, i)) return it.claim(rr.name, rr.rtype, .proof),
+                else => {},
+            }
+        }
+        const answers = it.r.answers;
+        while (it.i < answers.len) {
+            const i = it.i;
+            it.i += 1;
+            const rr = answers[i];
+            if (rr.rtype == .rrsig or !firstOfRrset(answers, i)) continue;
+            // A CNAME under a DNAME of the reply is its synthesis (RFC 6672
+            // §2.4); of several, the deepest, as classify takes.
+            var dname: ?RR = null;
+            if (rr.rtype == .cname) for (answers) |d| {
+                if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.labels.len > dname.?.name.labels.len)) dname = d;
+            };
+            if (dname) |d| return it.claim(rr.name, rr.rtype, .{ .synthesised = .{ .cname = rr, .dname = d } });
+            return it.claim(rr.name, rr.rtype, .rrset);
+        }
+        if (it.ended) return null;
+        it.ended = true;
+        return switch (it.r.kind) {
+            .nodata, .nxdomain => it.claim(it.r.target, it.qtype, .denial),
+            else => if (!anyRrset(answers)) it.claim(it.r.target, it.qtype, .empty) else null,
+        };
+    }
+
+    fn claim(it: *Claims, owner: dns.Name, rtype: dns.RType, is: @FieldType(Claim, "is")) Claim {
+        std.debug.assert(it.slot <= max_claims);
+        defer it.slot += 1;
+        return .{ .slot = it.slot, .owner = owner, .rtype = rtype, .is = is };
+    }
+
+    fn at(r: *const graph.Reply, qtype: dns.RType, slot: u8) Claim {
+        var it: Claims = .{ .r = r, .qtype = qtype };
+        while (it.next()) |c| if (c.slot == slot) return c;
+        unreachable;
+    }
+};
+
+/// The zone a claim's signature names, if it may speak for the owner
+/// (RFC 4034 §3.1.3). A signer above the answering zone authenticates no
+/// RRset of it; a denial may come from above (a folded child's), so its
+/// proofs may too. A denial is its SOA's zone's (RFC 2308 §3), or, with
+/// no SOA (a referral's word on a DS), its first proof's signer.
+fn signerOf(r: *const graph.Reply, c: Claims.Claim) ?dns.Name {
+    const signer = switch (c.is) {
+        .rrset => (dnssec.findRrsigAt(r.answers, c.owner, c.rtype) orelse return null).signer_name,
+        .proof => (dnssec.findRrsigAt(r.authorities, c.owner, c.rtype) orelse return null).signer_name,
+        .denial => denialZone(r) orelse return null,
+        .synthesised, .empty => return null,
+    };
+    if (!proof.deepestApex(c.owner, c.rtype).isSubdomainOf(signer)) return null;
+    if (c.is == .rrset and !signer.isSubdomainOf(r.zone)) return null;
+    return signer;
 }
 
 /// `ds(candidate)` one label at a time below `above`, down to `deepest`,
@@ -450,14 +576,52 @@ const Probe = struct {
     }
 };
 
-/// A CNAME directly under the DNAME group before it.
-fn synthesisedUnder(rr: RR, prev_dname: ?RR) bool {
-    const d = prev_dname orelse return false;
-    return rr.rtype == .cname and rr.name.labels.len > d.name.labels.len and rr.name.isSubdomainOf(d.name);
+fn denialZone(r: *const graph.Reply) ?dns.Name {
+    var zone: ?dns.Name = null;
+    for (r.authorities) |rr| if (rr.rtype == .soa and r.target.isSubdomainOf(rr.name)) {
+        if (zone == null or rr.name.labels.len > zone.?.labels.len) zone = rr.name;
+    };
+    if (zone) |z| return z;
+    for (r.authorities) |rr| if (rr.rtype == .rrsig) switch (rr.rdata.rrsig.type_covered) {
+        .nsec, .nsec3 => return rr.rdata.rrsig.signer_name,
+        else => {},
+    };
+    return null;
 }
 
+/// The NSEC, NSEC3 and SOA sets `signer` signed, with their signatures:
+/// what a derivation in its zone may read.
+fn signedBy(g: *Graph, rrs: []const RR, signer: dns.Name) ![]const RR {
+    var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), rrs.len);
+    for (rrs) |rr| {
+        const t = if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
+        if (t != .nsec and t != .nsec3 and t != .soa) continue;
+        const sig = dnssec.findRrsigAt(rrs, rr.name, t) orelse continue;
+        if (sig.signer_name.eql(signer)) keep.appendAssumeCapacity(rr);
+    }
+    return keep.items;
+}
+
+fn anyRrset(rrs: []const RR) bool {
+    for (rrs) |rr| if (rr.rtype != .rrsig) return true;
+    return false;
+}
+
+fn synthesisedUnder(rr: RR, dname: RR) bool {
+    return rr.rtype == .cname and rr.name.labels.len > dname.name.labels.len and rr.name.isSubdomainOf(dname.name);
+}
+
+/// Classify keeps an answer set's records together, so its neighbour
+/// answers for all but its first: one huge answer set costs n, not n².
+/// The authority is not so kept, but holds a proof's few sets.
 fn firstOfRrset(rrs: []const RR, i: usize) bool {
-    for (rrs[0..i]) |p| if (p.rtype == rrs[i].rtype and p.name.eql(rrs[i].name)) return false;
+    const same = struct {
+        fn f(p: RR, q: RR) bool {
+            return p.rtype == q.rtype and p.name.eql(q.name);
+        }
+    }.f;
+    if (i > 0 and same(rrs[i - 1], rrs[i])) return false;
+    for (rrs[0..i]) |p| if (same(p, rrs[i])) return false;
     return true;
 }
 
@@ -481,5 +645,5 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     for (msg.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
         ttl = if (ttl == 0) rr.ttl else @min(ttl, rr.ttl);
     };
-    return .{ .kind = .nodata, .rcode = .no_error, .aa = true, .authorities = msg.authorities, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    return .{ .kind = .nodata, .rcode = .no_error, .aa = true, .authorities = msg.authorities, .target = child, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
 }

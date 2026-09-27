@@ -1,0 +1,83 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = sub.
+
+SCENARIO_BEGIN a verdict lives no longer than a proof judged before a key wait
+
+; The root's servers, serving sub. too, answer a.sub. with its alias,
+; signed by sub., and foo., which the root expands from *. and proves
+; with an NSEC of TTL 300. The root's proof is judged first, then the
+; verdict waits for sub.'s keys. The lifetime that proof allowed survives
+; the wait: the expansion lives 300 s, not its own 3600 (RFC 9077 §4.1).
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.sub. IN A
+    SECTION ANSWER
+      a.sub. 3600 IN CNAME foo.
+      foo. 3600 IN A 192.0.2.2
+    SECTION AUTHORITY
+      c. 300 IN NSEC zz. A RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sub. IN DS
+    SECTION ANSWER
+      sub. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub. IN A
+    SECTION AUTHORITY
+      sub. 3600 IN NS ns.sub.
+      sub. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.sub. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.sub. IN A
+    SECTION ANSWER
+      a.sub. 3600 IN CNAME foo.
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.sub. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.sub. IN A
+  SECTION ANSWER
+    a.sub. 300 IN CNAME foo.
+    foo. 300 IN A 192.0.2.2
+ENTRY_END
+
+SCENARIO_END

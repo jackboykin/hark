@@ -1,0 +1,92 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a negative at the end of a chain denies its target, and every CNAME on the way verifies
+
+; example: SOA, a CNAME, b NS, f CNAME, www A. The span b..f denies c, d
+; and e; the span example..a denies *.example.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ; A forged CNAME rides a genuine denial that covers both its owner and
+  ; its target.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      d.example. IN A
+    SECTION ANSWER
+      d.example. 3600 IN CNAME e.example.
+      d.example. 3600 IN RRSIG CNAME 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      example. 3600 IN NSEC a.example. SOA NS RRSIG NSEC DNSKEY
+      b.example. 3600 IN NSEC f.example. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      a.example. IN A
+    SECTION ANSWER
+      a.example. 3600 IN CNAME c.example.
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      example. 3600 IN NSEC a.example. SOA NS RRSIG NSEC DNSKEY
+      b.example. 3600 IN NSEC f.example. NS RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    d.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    d.example. IN A
+  SECTION ANSWER
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    a.example. IN A
+  SECTION ANSWER
+    a.example. 3600 IN CNAME c.example.
+ENTRY_END
+
+SCENARIO_END

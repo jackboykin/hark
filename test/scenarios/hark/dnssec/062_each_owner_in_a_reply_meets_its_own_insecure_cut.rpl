@@ -1,0 +1,120 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN each owner in a reply meets its own insecure cut
+
+; b.example is unsigned and folded onto example's servers.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; The proof of the cut lives 60 s, and is not given again.
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.example. IN DS
+    SECTION AUTHORITY
+      example. 60 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 60
+      b.example. 60 IN NSEC z.example. NS RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ; The unsigned child's CNAME is insecure; the A beside it is a signed
+  ; name's, forged.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      x.b.example. IN A
+    SECTION ANSWER
+      x.b.example. 3600 IN CNAME www.example.
+      www.example. 3600 IN A 192.0.2.66
+  ENTRY_END
+  ; A signed CNAME into the unsigned child, whose A proves nothing: its
+  ; verdict lives no longer than the proof of the cut.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      x.example. IN A
+    SECTION ANSWER
+      x.example. 3600 IN CNAME y.b.example.
+      y.b.example. 3600 IN A 192.0.2.2
+      y.b.example. 3600 IN RRSIG A 13 3 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.b.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    x.b.example. IN A
+  SECTION ANSWER
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    x.example. IN A
+  SECTION ANSWER
+    x.example. 3600 IN CNAME y.b.example.
+    y.b.example. 3600 IN A 192.0.2.2
+ENTRY_END
+
+STEP 5 TIME_PASSES ELAPSE 120
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.example. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    x.example. IN A
+ENTRY_END
+
+SCENARIO_END

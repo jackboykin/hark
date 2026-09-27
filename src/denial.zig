@@ -234,6 +234,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .rcode = if (nxdomain) .name_error else .no_error,
         .aa = true,
         .authorities = authorities.items,
+        .target = name,
         .zone = zone,
         .ede = .synthesized,
         .stored_ns = now,

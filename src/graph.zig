@@ -184,7 +184,8 @@ pub const Reply = struct {
     answers: []const dns.ResourceRecord = &.{},
     authorities: []const dns.ResourceRecord = &.{},
     additionals: []const dns.ResourceRecord = &.{},
-    /// `.alias` only: where the chain in `answers` ends.
+    /// Where the chain in `answers` ends: an alias's next name, or the
+    /// name a negative denies.
     target: dns.Name = .{ .labels = &.{} },
     /// The zone whose servers answered; what `secure` judges it against.
     zone: dns.Name = .{ .labels = &.{} },

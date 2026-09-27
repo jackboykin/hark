@@ -24,6 +24,22 @@ RANGE_BEGIN 0 100
       www.doc.example. 3600 IN CNAME www.ARCHIVE.example.
       www.ARCHIVE.example. 3600 IN A 192.0.2.9
   ENTRY_END
+
+  ; A chain passing the same DNAME twice: its set travels once, and each
+  ; CNAME under it is its synthesis wherever in the chain it falls.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.pub.example. IN A
+    SECTION ANSWER
+      pub.example. 3600 IN DNAME lib.example.
+      a.pub.example. 3600 IN CNAME a.lib.example.
+      a.lib.example. 3600 IN CNAME b.pub.example.
+      b.pub.example. 3600 IN CNAME b.lib.example.
+      b.lib.example. 3600 IN A 192.0.2.9
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -45,6 +61,21 @@ ENTRY_BEGIN
     doc.example. 3600 IN DNAME archive.example.
     www.doc.example. 3600 IN CNAME www.archive.example.
     www.archive.example. 3600 IN A 192.0.2.9
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.pub.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.pub.example. IN A
 ENTRY_END
 
 SCENARIO_END
