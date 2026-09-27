@@ -63,6 +63,9 @@ pub const SecureScratch = struct {
     expires: i64 = std.math.maxInt(i64),
     /// Where the signatures of the claims before `next` stop proving.
     proven: i64 = std.math.maxInt(i64),
+    /// Bit per claim slot: a proof set whose signature verified. Only
+    /// these feed a derivation (`verifiedProofs`).
+    verified: std.bit_set.Integer(max_claims + 1) = .empty,
     fault: ?Fault = null,
     probe: Probe = .{},
 };
@@ -427,9 +430,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     .absent => break :f .bogus,
                 }
                 if (c.is == .denial) {
-                    // Its proofs verified as claims of their own; this is
-                    // the derivation from those its zone signed.
-                    const own = try signedBy(g, r.authorities, signer);
+                    const own = try verifiedProofs(g, r, qtype, s.verified, signer);
                     switch (proof.validateNegativeProof(own, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
                         .secure => {
                             var only = r.*;
@@ -451,10 +452,11 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     // Proof material is served under its own owner, never
                     // expanded (RFC 4035 §3.1.3.3).
                     if (verified.labels != rrsig.signedLabels(c.owner)) break :f .bogus;
+                    s.verified.set(c.slot);
                     break :f null;
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
-                    const own = try signedBy(g, r.authorities, verified.signer_name);
+                    const own = try verifiedProofs(g, r, qtype, s.verified, verified.signer_name);
                     switch (proof.proveNoCloserMatch(own, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {},
                         .insecure => s.status = .insecure,
@@ -609,15 +611,23 @@ const Probe = struct {
     }
 };
 
-/// The NSEC, NSEC3 and SOA sets `signer` signed, with their signatures:
-/// what a derivation in its zone may read.
-fn signedBy(g: *Graph, rrs: []const RR, signer: dns.Name) ![]const RR {
+/// The proof sets `signer` signed that verified as claims, with their
+/// signatures: what a derivation in its zone may read. A set excused below
+/// an insecure cut or passed under insecure keys proved nothing, so it is
+/// left out. Proof claims come first, so all are judged.
+fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, verified: @FieldType(SecureScratch, "verified"), signer: dns.Name) ![]const RR {
+    const rrs = r.authorities;
     var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), rrs.len);
-    for (rrs) |rr| {
-        const t = if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
-        if (t != .nsec and t != .nsec3 and t != .soa) continue;
-        const sig = dnssec.findRrsigAt(rrs, rr.name, t) orelse continue;
-        if (sig.signer_name.eql(signer)) keep.appendAssumeCapacity(rr);
+    var it: Claims = .{ .r = r, .qtype = qtype };
+    while (it.next()) |c| {
+        if (c.is != .proof) break;
+        if (!verified.isSet(c.slot)) continue;
+        const sig = dnssec.findRrsigAt(rrs, c.owner, c.rtype) orelse continue;
+        if (!sig.signer_name.eql(signer)) continue;
+        for (rrs) |rr| {
+            const t = if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
+            if (t == c.rtype and rr.name.eql(c.owner)) keep.appendAssumeCapacity(rr);
+        }
     }
     return keep.items;
 }
