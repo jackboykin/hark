@@ -466,7 +466,8 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
     var n = from;
     while (n.labels.len > zone.labels.len) : (n = .{ .labels = n.labels[1..] }) {
         const f = try g.peek(Key.of(&kb, .rrset, n, .a)) orelse continue;
-        if (f.value.rrset.kind == .nxdomain) return f.expires_ns;
+        const gone = f.value.rrset.nonexistent() orelse continue;
+        if (gone.eql(n)) return f.expires_ns;
     }
     return null;
 }
