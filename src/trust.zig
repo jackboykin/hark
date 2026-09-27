@@ -16,10 +16,13 @@ const OptionalCellId = graph.OptionalCellId;
 const Failure = graph.Failure;
 const RR = dns.ResourceRecord;
 
-/// Proven signed, or proven unsigned. Bogus is no fact: it fails.
-pub const Proof = enum(u8) { secure, insecure };
+/// Proven signed or unsigned; for `ds` and `dnskey`, also proven no zone
+/// at all, by the parent's signed denial of a delegation. Bogus is no
+/// fact: it fails.
+pub const Proof = enum(u8) { secure, insecure, absent };
 
-/// A verdict and what it rests on: the verified DS set or keys.
+/// A verdict and what it rests on: the verified DS set or keys, or for a
+/// DS proven absent, the signed denial that proves it.
 pub const Chain = struct {
     status: Proof,
     records: []const RR = &.{},
@@ -151,7 +154,12 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const parent_keys = g.cell(s.keys.unwrap().?);
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
-    if (parent_keys.state.fact.dnskey.status != .secure) return g.settle(id, .{ .ds = .{ .status = parent_keys.state.fact.dnskey.status } }, parent_keys.expires_ns);
+    switch (parent_keys.state.fact.dnskey.status) {
+        .secure => {},
+        .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires_ns),
+        // The walk's parent proven no zone: nothing speaks for the child.
+        .absent => return g.fail(id, no_chain),
+    }
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .ds), zone) orelse
         return g.fail(id, no_chain));
     const rs = g.cell(s.rrset.unwrap().?);
@@ -205,10 +213,15 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             var cap: u32 = std.math.maxInt(u32);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
                 return .bogus;
+            const until = @min(expires, capExpiry(g, cap));
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
-                .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, @min(expires, capExpiry(g, cap))),
-                // A proven non-cut, or no proof: the bytes are sound.
-                .unproven, .bogus => try g.fail(id, budgetSpent(g) orelse no_cut),
+                .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
+                // A signed denial of the DS showing no delegation: no zone.
+                .unproven => switch (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget)) {
+                    .secure => try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until),
+                    else => try g.fail(id, budgetSpent(g) orelse no_cut),
+                },
+                .bogus => try g.fail(id, budgetSpent(g) orelse no_cut),
             }
         },
         .alias, .yxdomain => unreachable,
@@ -321,7 +334,12 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const zd = g.cell(s.zone_ds.unwrap().?);
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
-    if (zd.state.fact.ds.status != .secure) return g.settle(id, .{ .secure = .{ .status = zd.state.fact.ds.status } }, zd.expires_ns);
+    switch (zd.state.fact.ds.status) {
+        // Proven no zone, a folded child: its claims are judged as any
+        // (RFC 6840 §4.1).
+        .secure, .absent => {},
+        .insecure => return g.settle(id, .{ .secure = .{ .status = .insecure } }, zd.expires_ns),
+    }
     while (true) {
         if (s.fault == null) {
             s.fault = try judge(g, id, s, t, @min(t.expires_ns, zd.expires_ns)) orelse return;
@@ -354,8 +372,10 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
     var kb: graph.KeyBuf = undefined;
     const r = &t.state.fact.rrset;
     const qtype = t.key.rtype;
-    // Every signer's keys not yet known or under way are fetched at once;
-    // each claim then waits on its own.
+    // A zone proven no cut belongs to the zone that proved it (a folded
+    // child's parent).
+    const zd = g.cell(s.zone_ds.unwrap().?).state.fact.ds;
+    const within = if (zd.status == .absent) proof.authoritySigner(zd.records).? else r.zone;
     if (!s.fetched) {
         if (flooded(r, qtype)) {
             try failBogus(g, id, s.target);
@@ -364,7 +384,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         s.fetched = true;
         var it: Claims = .{ .r = r, .qtype = qtype };
         while (it.next()) |c| {
-            const signer = signerOf(r, c) orelse continue;
+            const signer = signerOf(r, c, within) orelse continue;
             const key = graph.Key.of(&kb, .dnskey, signer, .a);
             if (!g.holds(key) and !g.index.contains(key)) try g.fetchKeys(id, signer);
         }
@@ -383,7 +403,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 break :f if (target.eql(x.cname.rdata.cname)) null else .bogus;
             },
             .rrset, .proof, .denial => {
-                const signer = signerOf(r, c) orelse break :f .bogus;
+                const signer = signerOf(r, c, within) orelse break :f .bogus;
                 if (!keysOf(g, s.key, signer)) s.key = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer));
                 const kid = s.key.unwrap() orelse break :f .no_chain;
                 const kc = g.cell(kid);
@@ -394,11 +414,16 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                 if (kc.failure() != null) break :f .{ .input = kid };
                 s.expires = @min(s.expires, kc.expires_ns);
                 const keys = kc.state.fact.dnskey;
-                if (keys.status == .insecure) {
-                    // Insecure keys above a secure zone contradict its DS.
-                    if (!signer.isSubdomainOf(r.zone)) break :f .bogus;
-                    s.status = .insecure;
-                    break :f null;
+                switch (keys.status) {
+                    .secure => {},
+                    .insecure => {
+                        // Insecure keys above a secure zone contradict its DS.
+                        if (!signer.isSubdomainOf(r.zone)) break :f .bogus;
+                        s.status = .insecure;
+                        break :f null;
+                    },
+                    // The signer is proven no zone: its signature is forged.
+                    .absent => break :f .bogus,
                 }
                 if (c.is == .denial) {
                     // Its proofs verified as claims of their own; this is
@@ -542,10 +567,9 @@ const Claims = struct {
 };
 
 /// The zone a claim's signature names, if it may speak for the owner
-/// (RFC 4034 §3.1.3). A signer above the answering zone authenticates no
-/// RRset of it; a denial may come from above (a folded child's), so its
-/// proofs may too. A denial is the zone `proof.denialZone` names.
-fn signerOf(r: *const graph.Reply, c: Claims.Claim) ?dns.Name {
+/// (RFC 4034 §3.1.3): an RRset's only from within `within`; a denial's,
+/// which may come from above, is `proof.denialZone`'s.
+fn signerOf(r: *const graph.Reply, c: Claims.Claim, within: dns.Name) ?dns.Name {
     const signer = switch (c.is) {
         .rrset => (dnssec.findRrsigAt(r.answers, c.owner, c.rtype) orelse return null).signer_name,
         .proof => (dnssec.findRrsigAt(r.authorities, c.owner, c.rtype) orelse return null).signer_name,
@@ -553,7 +577,7 @@ fn signerOf(r: *const graph.Reply, c: Claims.Claim) ?dns.Name {
         .synthesised, .empty => return null,
     };
     if (!proof.deepestApex(c.owner, c.rtype).isSubdomainOf(signer)) return null;
-    if (c.is == .rrset and !signer.isSubdomainOf(r.zone)) return null;
+    if (c.is == .rrset and !signer.isSubdomainOf(within)) return null;
     return signer;
 }
 
