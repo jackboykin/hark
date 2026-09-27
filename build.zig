@@ -1,7 +1,7 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -54,8 +54,42 @@ pub fn build(b: *std.Build) void {
     // main.zig has no test blocks and imports only the hark module, so a
     // second exe-rooted test binary would recompile the same graph mod_tests
     // already covers for zero added coverage. Test the module only.
-    const mod_tests = b.addTest(.{ .root_module = mod, .use_llvm = true });
+    const scenario = b.option([]const u8, "scenario", "Replay one scenario, tracing every completion");
+    const asked = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &.{};
+    const filters = if (scenario != null) try std.mem.concat(b.graph.arena, []const u8, &.{ asked, &.{"trace one scenario"} }) else asked;
+    const mod_tests = b.addTest(.{ .root_module = mod, .use_llvm = true, .filters = filters });
+
+    const run_tests = b.addRunArtifact(mod_tests);
+    // A HARK_SCENARIO in the shell never reaches the tests; -Dscenario does.
+    run_tests.clearEnvironment();
+    if (scenario) |path| {
+        run_tests.setEnvironmentVariable("HARK_SCENARIO", path);
+        run_tests.has_side_effects = true;
+    }
+    // The replays read their scenarios at run time: an edited one reruns
+    // them, and an added or removed one reconfigures.
+    for ([_][]const u8{ "test/scenarios/hark", "test/corpus/unbound" }) |root| try declareInputs(b, run_tests, root);
 
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+    test_step.dependOn(&run_tests.step);
+}
+
+fn declareInputs(b: *std.Build, run: *std.Build.Step.Run, root: []const u8) !void {
+    const io = b.graph.io;
+    // A source tree without the tests (the flake's) declares nothing.
+    var dir = b.root.openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(root));
+    var it = try dir.walk(b.graph.arena);
+    while (try it.next(io)) |entry| {
+        const path = b.pathJoin(&.{ root, entry.path });
+        switch (entry.kind) {
+            .directory => b.dependOnDirectoryContents(b.path(path)),
+            .file => run.addFileInput(b.path(path)),
+            else => {},
+        }
+    }
 }

@@ -557,8 +557,8 @@ fn replayJob(gpa: Allocator, j: *Job) void {
     }
 }
 
-// `HARK_SCENARIO=path/to/x.rpl zig build test` replays one scenario with
-// every completion printed.
+// `zig build test -Dscenario=path/to/x.rpl` replays one scenario with
+// every completion printed, the build passing the path as HARK_SCENARIO.
 test "trace one scenario" {
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
