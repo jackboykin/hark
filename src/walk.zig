@@ -946,18 +946,27 @@ fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRec
     return out.items;
 }
 
-/// A positive's authority keeps NSEC, NSEC3 and SOA only as a wildcard
-/// expansion's proof of no closer match (RFC 4035 §3.1.3.3); anywhere
-/// else they prove nothing the answer needs.
+/// The proof a reply owes (RFC 4035 §3.1.3): a denial's from the zone it
+/// speaks for, a wildcard expansion's from the wildcard's zone. A flood is
+/// kept whole for the validator to refuse.
 fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]const dns.ResourceRecord {
-    if (reply.kind == .nodata or reply.kind == .nxdomain) return rrs;
-    const expanded = for (reply.answers) |rr| {
-        if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(rr.name)) break true;
-    } else false;
-    if (expanded) return rrs;
-    var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(g.scratch.allocator(), rrs.len);
+    const a = g.scratch.allocator();
+    if (proof.proofFlood(rrs)) return rrs;
+    const negative = reply.kind == .nodata or reply.kind == .nxdomain;
+    const zone = if (negative) proof.denialZone(rrs, reply.target) else null;
+    var signers: std.ArrayList(dns.Name) = .empty;
+    if (zone) |z| try signers.append(a, z);
+    for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rdata.rrsig.signer_name);
+    var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
     for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
-        .nsec, .nsec3, .soa => {},
+        .soa => if (zone) |z| if (rr.name.eql(z)) keep.appendAssumeCapacity(rr),
+        .nsec, .nsec3 => {
+            const signer = if (rr.rtype == .rrsig) rr.rdata.rrsig.signer_name else (dnssec.findRrsigAt(rrs, rr.name, rr.rtype) orelse continue).signer_name;
+            for (signers.items) |sn| if (sn.eql(signer)) {
+                keep.appendAssumeCapacity(rr);
+                break;
+            };
+        },
         else => keep.appendAssumeCapacity(rr),
     };
     return keep.items;

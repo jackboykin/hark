@@ -544,13 +544,12 @@ const Claims = struct {
 /// The zone a claim's signature names, if it may speak for the owner
 /// (RFC 4034 §3.1.3). A signer above the answering zone authenticates no
 /// RRset of it; a denial may come from above (a folded child's), so its
-/// proofs may too. A denial is its SOA's zone's (RFC 2308 §3), or, with
-/// no SOA (a referral's word on a DS), its first proof's signer.
+/// proofs may too. A denial is the zone `proof.denialZone` names.
 fn signerOf(r: *const graph.Reply, c: Claims.Claim) ?dns.Name {
     const signer = switch (c.is) {
         .rrset => (dnssec.findRrsigAt(r.answers, c.owner, c.rtype) orelse return null).signer_name,
         .proof => (dnssec.findRrsigAt(r.authorities, c.owner, c.rtype) orelse return null).signer_name,
-        .denial => denialZone(r) orelse return null,
+        .denial => proof.denialZone(r.authorities, r.target) orelse return null,
         .synthesised, .empty => return null,
     };
     if (!proof.deepestApex(c.owner, c.rtype).isSubdomainOf(signer)) return null;
@@ -584,19 +583,6 @@ const Probe = struct {
         }
     }
 };
-
-fn denialZone(r: *const graph.Reply) ?dns.Name {
-    var zone: ?dns.Name = null;
-    for (r.authorities) |rr| if (rr.rtype == .soa and r.target.isSubdomainOf(rr.name)) {
-        if (zone == null or rr.name.labels.len > zone.?.labels.len) zone = rr.name;
-    };
-    if (zone) |z| return z;
-    for (r.authorities) |rr| if (rr.rtype == .rrsig) switch (rr.rdata.rrsig.type_covered) {
-        .nsec, .nsec3 => return rr.rdata.rrsig.signer_name,
-        else => {},
-    };
-    return null;
-}
 
 /// The NSEC, NSEC3 and SOA sets `signer` signed, with their signatures:
 /// what a derivation in its zone may read.

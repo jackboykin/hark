@@ -59,6 +59,30 @@ RANGE_BEGIN 0 100
       child.example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
       child.example. 3600 IN NSEC z.child.example. SOA RRSIG NSEC
   ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      v.example. IN AAAA
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      v.example. 3600 IN NSEC z.example. A RRSIG NSEC
+      a.child.example. 3600 IN NSEC b.child.example. A RRSIG NSEC
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      w.example. IN AAAA
+    SECTION AUTHORITY
+      . 3600 IN NSEC aaa. NS SOA RRSIG NSEC DNSKEY
+      a.child.example. 3600 IN NSEC b.child.example. A RRSIG NSEC
+      w.example. 3600 IN NSEC z.example. A RRSIG NSEC
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -74,6 +98,45 @@ ENTRY_BEGIN
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example. IN AAAA
+ENTRY_END
+
+; A set the unsigned child signed rides a denial its parent signed. No
+; proof owes it, so it is dropped unjudged.
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    v.example. IN AAAA
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    v.example. IN AAAA
+  SECTION AUTHORITY
+    example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+    v.example. 3600 IN NSEC z.example. A RRSIG NSEC
+ENTRY_END
+
+; With its SOA stripped the denial still speaks for example.: the deepest
+; signer above the name, not the first set seen, which is the root's.
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    w.example. IN AAAA
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    w.example. IN AAAA
+  SECTION AUTHORITY
+    w.example. 3600 IN NSEC z.example. A RRSIG NSEC
 ENTRY_END
 
 SCENARIO_END

@@ -256,6 +256,28 @@ fn nsec3FlagsReserved(nsec3: dns.Nsec3Data) bool {
 /// proof needs ≤3; more is refused `.bogus` before any hashing or verifying.
 pub const max_proof_records: usize = 8;
 
+/// The zone a denial of `target` speaks for: the deepest SOA at or above
+/// it (RFC 2308 §3), or with none, the deepest NSEC or NSEC3 signer at or
+/// above it.
+pub fn denialZone(authorities: []const dns.ResourceRecord, target: dns.Name) ?dns.Name {
+    var soa: ?dns.Name = null;
+    var signer: ?dns.Name = null;
+    for (authorities) |rr| {
+        const z = switch (rr.rtype) {
+            .soa => rr.name,
+            .rrsig => switch (rr.rdata.rrsig.type_covered) {
+                .nsec, .nsec3 => rr.rdata.rrsig.signer_name,
+                else => continue,
+            },
+            else => continue,
+        };
+        if (!target.isSubdomainOf(z)) continue;
+        const best = if (rr.rtype == .soa) &soa else &signer;
+        if (best.* == null or z.labels.len > best.*.?.labels.len) best.* = z;
+    }
+    return soa orelse signer;
+}
+
 pub fn proofFlood(authorities: []const dns.ResourceRecord) bool {
     var n: usize = 0;
     for (authorities) |rr| {
