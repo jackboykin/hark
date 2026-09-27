@@ -134,7 +134,6 @@ pub const Config = struct {
     max_resolve_depth: u8 = 3,
     max_flights: u32 = std.math.maxInt(u32),
     max_work_bytes: usize = std.math.maxInt(usize),
-    max_delegations: u8 = 16,
     max_negative_ttl: u32 = 3 * 3600,
     /// The first window a failure is remembered: by the server per
     /// question, by trust per zone (RFC 9520 §3.2).

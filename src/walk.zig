@@ -201,7 +201,6 @@ pub const RrsetScratch = struct {
     dname_checked: bool = false,
     started: bool = false,
     ask: Ask = .{},
-    delegations: u8 = 0,
 };
 
 pub const CutScratch = struct {
@@ -592,10 +591,10 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
                 if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
+                    // Each referral descends toward the name, so its depth
+                    // bounds the walk.
+                    std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.labels.len > zone.labels.len);
                     const s2 = g.cell(id).scratch.rrset;
-                    if (s2.delegations >= g.cfg.max_delegations)
-                        return failAsk(g, id, .{ .code = .other, .text = "too many delegations" });
-                    s2.delegations += 1;
                     _ = try absorbReferral(g, id, ref, msg, zone);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
