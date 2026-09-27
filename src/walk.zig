@@ -658,7 +658,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .nsec, .nsec3 => try proofs.append(g.scratch.allocator(), rr),
         else => {},
     };
-    const hop: Reply = .{
+    var hop: Reply = .{
         .kind = .alias,
         .aa = reply.aa,
         .answers = keep.items,
@@ -666,8 +666,8 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .target = first.rdata.cname,
         .zone = reply.zone,
         .stored_ns = reply.stored_ns,
-        .ttl = first.ttl,
     };
+    hop.ttl = replyTtl(g, hop);
     try g.publish(Key.of(&kb, .rrset, name, .cname), by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
@@ -969,8 +969,9 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
     for (rrs) |rr| if (rr.rtype == .rrsig and rr.name.eql(owner) and (covered == .any or rr.rdata.rrsig.type_covered == covered)) try keep.append(g.scratch.allocator(), rr);
 }
 
-/// The answer's shortest TTL. For an authoritative denial, min of the SOA's
-/// TTL and MINIMUM (RFC 2308 §3) from an SOA above the name denied, nothing
+/// The answer's shortest TTL, a wildcard expansion's capped by its proof's
+/// (RFC 9077 §4.1). For an authoritative denial, min of the SOA's TTL and
+/// MINIMUM (RFC 2308 §3) from an SOA above the name denied, nothing
 /// otherwise. An SOA above the zone asked (a folded child's parent) counts
 /// only signed, for the validator to judge.
 pub fn replyTtl(g: *Graph, reply: Reply) u32 {
@@ -979,6 +980,9 @@ pub fn replyTtl(g: *Graph, reply: Reply) u32 {
         .answer, .alias, .yxdomain => {
             ttl = std.math.maxInt(u32);
             for (reply.answers) |rr| if (rr.rtype != .rrsig) {
+                ttl = @min(ttl, rr.ttl);
+            };
+            for (reply.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
                 ttl = @min(ttl, rr.ttl);
             };
         },
