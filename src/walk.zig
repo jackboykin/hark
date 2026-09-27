@@ -689,15 +689,23 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
     }
 }
 
-/// The owner of the closest fresh DNAME fact above `name` (RFC 6672 §3.2).
+/// The owner of the closest DNAME fact above `name`, as `demand` would
+/// hand it: the redirect never waits on a new ask nor reads a version it
+/// did not judge.
 fn dnameAbove(g: *Graph, name: dns.Name) !?dns.Name {
     var kb: graph.KeyBuf = undefined;
     var i: usize = 1;
     while (i < name.labels.len) : (i += 1) {
         const owner: dns.Name = .{ .labels = name.labels[i..] };
-        const d = try g.peek(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
-        if (d.value.rrset.kind == .answer) return owner;
+        const d = try g.held(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
+        if (d.value.rrset.kind == .answer and dnameAt(d.value.rrset.answers, owner) != null) return owner;
     }
+    return null;
+}
+
+/// A DNAME answer reached through a CNAME may hold another name's DNAME.
+fn dnameAt(answers: []const dns.ResourceRecord, owner: dns.Name) ?dns.ResourceRecord {
+    for (answers) |rr| if (rr.rtype == .dname and rr.name.eql(owner)) return rr;
     return null;
 }
 
@@ -705,9 +713,7 @@ fn dnameAbove(g: *Graph, name: dns.Name) !?dns.Name {
 /// DNAME was taken.
 fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     const d = g.cell(did).state.fact.rrset;
-    const dname = for (d.answers) |rr| {
-        if (rr.rtype == .dname) break rr;
-    } else unreachable;
+    const dname = dnameAt(d.answers, g.cell(did).name).?;
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     try keep.appendSlice(g.scratch.allocator(), d.answers);
     if (try dns.substituteSuffix(g.scratch.allocator(), name, dname.name, dname.rdata.dname)) |target| {

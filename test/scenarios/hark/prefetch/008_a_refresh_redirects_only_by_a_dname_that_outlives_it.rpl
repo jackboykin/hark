@@ -1,0 +1,131 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: prefetch = yes
+
+SCENARIO_BEGIN a refresh redirects only by a DNAME that outlives what it refreshes
+
+; doc.example.'s DNAME lives 60 s. Asked again at 59 s, mail.doc.example.
+; is served and refreshed. The DNAME would not outlive the refresh, so
+; the refresh asks the servers rather than redirect by it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 60 IN DNAME archive.example.
+      www.doc.example. 60 IN CNAME www.archive.example.
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.archive.example. IN A
+    SECTION ANSWER
+      mail.archive.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      doc.example. IN DNAME
+    SECTION ANSWER
+      doc.example. 60 IN DNAME archive.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 60 IN DNAME archive.example.
+      mail.doc.example. 60 IN CNAME mail.archive.example.
+      mail.archive.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.archive.example. IN A
+    SECTION ANSWER
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    doc.example. IN DNAME
+ENTRY_END
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    doc.example. IN DNAME
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+
+STEP 5 TIME_PASSES ELAPSE 59
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 60 IN DNAME archive.example.
+    mail.doc.example. 60 IN CNAME mail.archive.example.
+    mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+
+STEP 8 TIME_PASSES ELAPSE 5
+
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 60 IN DNAME archive.example.
+    mail.doc.example. 60 IN CNAME mail.archive.example.
+    mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+SCENARIO_END

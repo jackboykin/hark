@@ -42,6 +42,28 @@ RANGE_BEGIN 0 100
     SECTION ANSWER
       mail.archive.example. 3600 IN A 192.0.2.10
   ENTRY_END
+
+  ; A DNAME question answered through a CNAME, with another name's DNAME.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      alt.example. IN DNAME
+    SECTION ANSWER
+      alt.example. 3600 IN CNAME a.b.c.d.e.other.example.
+      a.b.c.d.e.other.example. 3600 IN DNAME y.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.alt.example. IN A
+    SECTION ANSWER
+      www.alt.example. 3600 IN A 192.0.2.1
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -78,6 +100,40 @@ ENTRY_BEGIN
     doc.example. 3590 IN DNAME archive.example.
     mail.doc.example. 3590 IN CNAME mail.archive.example.
     mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+
+; The fact for alt.example.'s DNAME holds only a.b.c.d.e.other.example.'s:
+; it redirects nothing, and a name below alt.example. is asked for.
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    alt.example. IN DNAME
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    alt.example. IN DNAME
+ENTRY_END
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.alt.example. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.alt.example. IN A
+  SECTION ANSWER
+    www.alt.example. 3600 IN A 192.0.2.1
 ENTRY_END
 
 SCENARIO_END

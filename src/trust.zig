@@ -299,6 +299,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     var kb: graph.KeyBuf = undefined;
     const t = g.cell(rid);
+    std.debug.assert(t.state == .fact);
     const key = graph.Key.of(&kb, .secure, t.name, t.key.rtype);
     if (g.index.get(key)) |sid| {
         const c = g.cell(sid);

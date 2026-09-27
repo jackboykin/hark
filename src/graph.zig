@@ -912,15 +912,27 @@ pub const Graph = struct {
     /// old its evidence, so it is judged again.
     fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
         const live = g.index.get(key);
-        if (g.stored(key)) |e| {
-            if (live) |id| if (g.cell(id).blob == e.blob) return id;
-            return try g.materialise(key, name, e);
-        }
-        if (live) |id| {
-            const c = g.cell(id);
-            if (!c.settled() or g.serves(id)) return id;
-        }
-        return null;
+        if (g.served(key, live)) |s| return switch (s) {
+            .stored => |e| g.liveVersion(live, e) orelse try g.materialise(key, name, e),
+            .live => |id| id,
+        };
+        const id = live orelse return null;
+        return if (g.cell(id).settled()) null else id;
+    }
+
+    /// What `demand` hands the running rule without running it; the one
+    /// predicate `lookup`, `holds` and `held` share.
+    const Served = union(enum) { stored: store.Entry, live: CellId };
+
+    fn served(g: *Graph, key: Key, live: ?CellId) ?Served {
+        if (g.stored(key)) |e| return .{ .stored = e };
+        const id = live orelse return null;
+        return if (g.cell(id).settled() and g.serves(id)) .{ .live = id } else null;
+    }
+
+    fn liveVersion(g: *Graph, live: ?CellId, e: store.Entry) ?CellId {
+        const id = live orelse return null;
+        return if (g.cell(id).blob == e.blob) id else null;
     }
 
     /// The stored fact `demand` would hand the running rule.
@@ -930,11 +942,34 @@ pub const Graph = struct {
         return if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) e else null;
     }
 
-    /// Would `demand` settle `key` for the running rule without running it?
+    /// Would `demand` hand the running rule a fact for `key` without
+    /// running it?
     pub fn holds(g: *Graph, key: Key) bool {
-        if (g.stored(key) != null) return true;
-        const id = g.index.get(key) orelse return false;
-        return g.cell(id).state == .fact and g.serves(id);
+        return switch (g.served(key, g.index.get(key)) orelse return false) {
+            .stored => true,
+            .live => |id| g.cell(id).state == .fact,
+        };
+    }
+
+    /// The fact `demand` would hand the running rule for `key` without
+    /// running it: the same version, not merely a fresh one.
+    pub fn held(g: *Graph, key: Key) !?Fact {
+        const live = g.index.get(key);
+        return switch (g.served(key, live) orelse return null) {
+            .stored => |e| try g.factOf(live, e),
+            .live => |id| g.liveFact(id),
+        };
+    }
+
+    /// A stored fact, read from its live version when there is one.
+    fn factOf(g: *Graph, live: ?CellId, e: store.Entry) !Fact {
+        if (g.liveVersion(live, e)) |id| if (g.liveFact(id)) |f| return .{ .value = f.value, .expires_ns = e.expires_ns };
+        return .{ .value = try store.Store.parse(g.scratch.allocator(), e.blob), .expires_ns = e.expires_ns };
+    }
+
+    fn liveFact(g: *Graph, id: CellId) ?Fact {
+        const c = g.cell(id);
+        return if (c.state == .fact) .{ .value = c.state.fact, .expires_ns = c.expires_ns } else null;
     }
 
     /// A live fact serves the running rule while it outlives the payer's
@@ -1012,12 +1047,9 @@ pub const Graph = struct {
     /// No cell, no wait: `demand` is the only pin.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.index.get(key);
-        if (g.store.get(key, g.now())) |e| {
-            if (live) |id| if (g.cell(id).blob == e.blob) return .{ .value = g.cell(id).state.fact, .expires_ns = e.expires_ns };
-            return .{ .value = try store.Store.parse(g.scratch.allocator(), e.blob), .expires_ns = e.expires_ns };
-        }
-        if (live) |id| if (g.fresh(id)) return .{ .value = g.cell(id).state.fact, .expires_ns = g.cell(id).expires_ns };
-        return null;
+        if (g.store.get(key, g.now())) |e| return try g.factOf(live, e);
+        const id = live orelse return null;
+        return if (g.fresh(id)) g.liveFact(id) else null;
     }
 
     /// Null on a cycle, or on new work for an orphan. New work that failed
