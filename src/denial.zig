@@ -97,7 +97,7 @@ const Zone = struct {
 };
 
 pub const Index = struct {
-    zones: std.StringHashMapUnmanaged(Zone) = .empty,
+    zones: std.array_hash_map.String(Zone) = .empty,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator, st: *store.Store) void {
         var it = ix.zones.iterator();
@@ -117,20 +117,45 @@ pub fn evicted(g: *Graph, key: graph.Key) void {
     const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
     if (key.rtype == .soa) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
-        if (g.denial.zones.getPtr(owner.formatLower(&buf))) |z| z.release(g);
+        const i = g.denial.zones.getIndex(owner.formatLower(&buf)) orelse return;
+        g.denial.zones.values()[i].release(g);
+        dropIfEmpty(g, i);
         return;
     }
     for (0..owner.labels.len + 1) |i| {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         const zone: dns.Name = .{ .labels = owner.labels[i..] };
-        const z = g.denial.zones.getPtr(zone.formatLower(&buf)) orelse continue;
+        const zi = g.denial.zones.getIndex(zone.formatLower(&buf)) orelse continue;
+        const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
         if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(owner)) {
             z.spans.items[pos].deinit(g.gpa, &g.store);
             _ = z.spans.orderedRemove(pos);
+            dropIfEmpty(g, zi);
             return;
         }
     }
+}
+
+fn dropIfEmpty(g: *Graph, i: usize) void {
+    const z = &g.denial.zones.values()[i];
+    if (z.spans.items.len != 0 or z.soa != null) return;
+    z.spans.deinit(g.gpa);
+    const owned = g.denial.zones.keys()[i];
+    g.denial.zones.swapRemoveAt(i);
+    g.gpa.free(owned);
+}
+
+fn zoneFor(g: *Graph, key: []const u8) !*Zone {
+    const gop = try g.denial.zones.getOrPut(g.gpa, key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{};
+        gop.key_ptr.* = g.gpa.dupe(u8, gop.key_ptr.*) catch |e| {
+            g.denial.zones.swapRemoveAt(gop.index);
+            return e;
+        };
+    }
+    return gop.value_ptr;
 }
 
 /// A proof carries at most this many NSECs (closest encloser, next closer,
@@ -143,16 +168,9 @@ const max_proofs = 8;
 pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
     var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const gop = try g.denial.zones.getOrPut(g.gpa, signer.formatLower(&buf));
-    if (!gop.found_existing) {
-        gop.value_ptr.* = .{};
-        gop.key_ptr.* = g.gpa.dupe(u8, gop.key_ptr.*) catch |e| {
-            g.denial.zones.removeByPtr(gop.key_ptr);
-            return e;
-        };
-    }
-    const z = gop.value_ptr;
-    z.prune(g);
+    const zkey = signer.formatLower(&buf);
+    defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
+    if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
     var proofs: usize = 0;
     for (r.authorities) |rr| {
         if ((rr.rtype != .nsec and rr.rtype != .soa) or !rr.name.isSubdomainOf(signer)) continue;
@@ -162,7 +180,12 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
+        // `publish` can re-enter `evicted` and drop this zone: look it up after.
         const judged = (try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires) orelse continue).ref();
+        const z = zoneFor(g, zkey) catch |e| {
+            g.store.unref(judged);
+            return e;
+        };
         if (rr.rtype == .soa) {
             z.release(g);
             z.soa = .{ .judged = judged, .expires_ns = expires };
@@ -285,4 +308,34 @@ fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !vo
         a.ttl = rr.ttl -| age;
         try out.append(g.scratch.allocator(), a);
     }
+}
+
+const testing = std.testing;
+
+fn testGraph(ctx: *u8, now: *const i64, wall: *const i64) !Graph {
+    const Stub = struct {
+        fn send(_: *anyopaque, _: graph.Exchange) anyerror!void {}
+        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+    };
+    return Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = ctx, .now_ns = now, .wall_sec = wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+}
+
+test "re-absorbing a spanless zone survives the store replacing its SOA" {
+    var now: i64 = std.time.ns_per_s;
+    var wall: i64 = 0;
+    var ctx: u8 = 0;
+    var g = try testGraph(&ctx, &now, &wall);
+    defer g.deinit();
+    g.attach();
+
+    const zone: dns.Name = .{ .labels = &.{@as([]const u8, "example")} };
+    const soa: RR = .{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } };
+    const reply: graph.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
+
+    try absorb(&g, 0, zone, reply, now + 3600 * std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
+
+    try absorb(&g, 0, zone, reply, now + 3600 * std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
+    try testing.expect(g.denial.zones.getPtr("example").?.soa != null);
 }
