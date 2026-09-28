@@ -1,0 +1,92 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a cached DNAME answers a sibling name whose own cut probe goes silent
+
+; RFC 6672 §3.4.1: a cached DNAME answers before servers are sought.
+; STEP 1 caches `doc.example. DNAME archive.example.` secure; by STEP 3
+; the probe for `cut(doc.example.)` goes silent, and the answer must
+; still come from memory.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION ANSWER
+      example. 3600 IN A 192.0.2.1
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.doc.example. IN A
+    SECTION ANSWER
+      doc.example. 3600 IN DNAME archive.example.
+      www.doc.example. 3600 IN CNAME www.archive.example.
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.archive.example. IN A
+    SECTION ANSWER
+      mail.archive.example. 3600 IN A 192.0.2.10
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      doc.example. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.doc.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.doc.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer ttl
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    mail.doc.example. 3600 IN CNAME mail.archive.example.
+    mail.archive.example. 3600 IN A 192.0.2.10
+ENTRY_END
+
+SCENARIO_END

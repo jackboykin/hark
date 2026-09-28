@@ -552,16 +552,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
-        // Indexed proofs deny the name without a packet.
-        if (s.cut == .none and try denial.deny(g, id)) return;
-        const from = proof.deepestApex(name, qtype);
-        const cut = switch (try start(g, id, name, from, &s.cut)) {
-            .pending => return,
-            .none => return g.fail(id, unreachable_authority),
-            .failed => |why| return g.fail(id, why),
-            .cut => |cid| g.cell(cid),
-        };
-        // RFC 6672: a secure DNAME above the name redirects it, asking nobody.
+        // RFC 6672 §3.4.1: a cached DNAME answers before any cut is sought.
         if (!s.dname_checked) {
             s.dname_checked = true;
             if (try dnameAbove(g, name)) |owner| s.dname = .wrap(try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner));
@@ -574,6 +565,15 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
             }
         }
+        // Indexed proofs deny the name without a packet.
+        if (s.cut == .none and try denial.deny(g, id)) return;
+        const from = proof.deepestApex(name, qtype);
+        const cut = switch (try start(g, id, name, from, &s.cut)) {
+            .pending => return,
+            .none => return g.fail(id, unreachable_authority),
+            .failed => |why| return g.fail(id, why),
+            .cut => |cid| g.cell(cid),
+        };
         s.ask.reset(cut.state.fact.cut.zone);
         var glue: std.ArrayList(na.Address) = .empty;
         for (cut.state.fact.cut.glue) |gl| if (gl.live(g.now())) try glue.append(g.scratch.allocator(), gl.addr);
