@@ -132,6 +132,9 @@ fn send(e: *Edge, ex: Exchange) !void {
 }
 
 fn open(e: *Edge, ex: Exchange) !Flight {
+    // Reserved before the fd exists, so nothing after registering it can fail.
+    try e.timers.ensureUnusedCapacity(e.gpa, 1);
+    try e.flights.ensureUnusedCapacity(e.gpa, 1);
     const kind: u32 = if (ex.transport == .udp) posix.SOCK.DGRAM else posix.SOCK.STREAM;
     const fd = try sys.socket(na.afU32(ex.server), kind | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
