@@ -285,8 +285,7 @@ fn floorOf(g: *graph.Graph, ret: Retention, r: store.Rrset) u32 {
     return @min(ret.min_ttl, @as(u32, @intCast(std.math.clamp(retained, 0, std.math.maxInt(u32)))));
 }
 
-fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob) Hop {
-    const r: store.Rrset = .of(b);
+fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob, r: store.Rrset) Hop {
     return .{ .blob = b, .rrset = r, .floor = floorOf(g, ret, r) };
 }
 
@@ -311,7 +310,8 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
     const hops = try arena.alloc(Hop, a.hops.len);
     for (hops, a.hops, 0..) |*hop, h, i| {
         // Every rrset cell settles or loads through a blob.
-        hop.* = hopOf(g, ret, g.cell(h).blob.?);
+        const b = g.cell(h).blob.?;
+        hop.* = hopOf(g, ret, b, .of(b));
         // A failed verdict proved nothing, so it bounds nothing (CD only).
         if (i < a.judged.len and g.cell(a.judged[i]).failure() == null)
             hop.life = lifeOf(g, g.cell(a.judged[i]).state.fact.secure.proven_until_ns);
@@ -332,7 +332,7 @@ pub fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question,
     var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
-        hop.* = hopOf(g, ret, h.blob);
+        hop.* = hopOf(g, ret, h.blob, h.rrset);
         const life: store.Life = .of(hop.rrset.stored_ns, h.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
         if (judged) {
@@ -357,7 +357,7 @@ pub fn floored(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Questio
     }
     if (!expired) return null;
     const hops = try arena.alloc(Hop, chain.len);
-    for (hops, chain) |*hop, h| hop.* = hopOf(g, ret, h.blob);
+    for (hops, chain) |*hop, h| hop.* = hopOf(g, ret, h.blob, h.rrset);
     return try shape(arena, g, q, c, minimal, hops, false, true);
 }
 
@@ -373,7 +373,7 @@ pub fn stale(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question,
     for (hops, chain) |*hop, h| {
         const until = retainedUntil(g, ret, h.rrset);
         window = @min(window, until + @as(i64, ret.serve_stale_ttl) * std.time.ns_per_s);
-        hop.* = hopOf(g, ret, h.blob);
+        hop.* = hopOf(g, ret, h.blob, h.rrset);
         hop.stale = g.now() >= until;
         any = any or hop.stale;
     }
