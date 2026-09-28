@@ -1,10 +1,11 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: prefetch = yes
 
-SCENARIO_BEGIN a short TTL is never refreshed
+SCENARIO_BEGIN a hit before the last tenth is not refreshed
 
-; A 5 s record hit with 1 s left is a miss at 5 s all the same:
-; refreshing it would double a steering zone's traffic (BIND's 9 s floor).
+; A 5 s record hit with 1 s left is short of its last half second: no
+; refresh leaves, and the ask at 5 s is a miss. The window scales with
+; the life, so a steering zone's short TTLs are never doubled.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1

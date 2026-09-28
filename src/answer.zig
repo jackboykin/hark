@@ -323,25 +323,25 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
     return @intCast(@min(@max(@divTrunc(proven_until_ns - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
 }
 
-/// Null inside the refresh window, where the graph decides on prefetch:
-/// a hop born too short to refresh declines its last 2 s.
+/// Null once the life the answer ends with is in its last tenth, where
+/// the graph decides on prefetch.
 pub fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
     const judged = g.cfg.trust_anchor != null;
     var secure = judged;
-    var expires: i64 = std.math.maxInt(i64);
+    var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
         hop.* = hopOf(g, ret, h.blob);
-        expires = @min(expires, h.expires_ns);
+        const life: store.Life = .of(hop.rrset.stored_ns, h.expires_ns, h.blob.verdict);
+        if (first == null or life.end_ns < first.?.end_ns) first = life;
         if (judged) {
             const v = h.blob.verdict;
             secure = secure and v.chain().status == .secure;
             hop.life = lifeOf(g, v.proven_until_ns);
-            expires = @min(expires, v.until_ns);
         }
     }
-    if (g.cfg.prefetch and expires <= g.now() + graph.refresh_window_ns) return null;
+    if (g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
     return try shape(arena, g, q, c, minimal, hops, secure, true);
 }
 

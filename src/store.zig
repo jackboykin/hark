@@ -17,12 +17,16 @@ const RR = dns.ResourceRecord;
 /// `secure(rrset)` over exactly these bytes.
 pub const Verdict = extern struct {
     status: u8 = 0,
-    _pad: [7]u8 = @splat(0),
+    _pad: [3]u8 = @splat(0),
+    judged_s: u32 = 0,
     proven_until_ns: i64 = 0,
     until_ns: i64 = 0,
 
-    pub fn stamp(v: *Verdict, c: trust.Chain, until_ns: i64) void {
-        v.* = .{ .status = @backingInt(c.status), .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
+    /// A verdict ending where it did is the same life: it keeps its
+    /// judgment.
+    pub fn stamp(v: *Verdict, c: trust.Chain, until_ns: i64, now_ns: i64) void {
+        const judged_s = if (v.until_ns == until_ns) v.judged_s else @as(u32, @intCast(@divFloor(now_ns, std.time.ns_per_s)));
+        v.* = .{ .status = @backingInt(c.status), .judged_s = judged_s, .proven_until_ns = c.proven_until_ns, .until_ns = until_ns };
     }
 
     /// Zeroed is never judged.
@@ -65,6 +69,22 @@ pub const Entry = struct {
     blob: *Blob,
     expires_ns: i64,
     stored_ns: i64 = 0,
+};
+
+/// While a version serves: from its storing to its expiry, or from its
+/// verdict's judgment to the verdict's end when that comes first.
+pub const Life = struct {
+    start_ns: i64,
+    end_ns: i64,
+
+    pub fn of(stored_ns: i64, expires_ns: i64, v: Verdict) Life {
+        if (v.judged() and v.until_ns < expires_ns) return .{ .start_ns = @as(i64, v.judged_s) * std.time.ns_per_s, .end_ns = v.until_ns };
+        return .{ .start_ns = stored_ns, .end_ns = expires_ns };
+    }
+
+    pub fn inLastTenth(l: Life, now_ns: i64) bool {
+        return now_ns < l.end_ns and l.end_ns - now_ns <= @divTrunc(l.end_ns - l.start_ns, 10);
+    }
 };
 
 pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key) void };

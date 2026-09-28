@@ -32,9 +32,6 @@ const max_servers = delegation.max_servers_per_level;
 
 const max_hedge = 3;
 
-/// BIND's `prefetch 2 9`, the 9: or steering zones double.
-const refresh_floor_s = 9;
-
 pub const Attempt = struct { exchange: CellId, server: u8, transport: Transport, case: graph.Case };
 
 /// The sibling loop, hedged: the next server starts a stagger after the
@@ -320,8 +317,8 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     }
     try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .judged = s.judged[0..s.nj] }, expires);
     // Best effort.
-    if (kind == .answer and g.cfg.prefetch and refreshable(g, s, expires))
-        g.refresh(g.cell(id).key, g.cell(id).name) catch {};
+    if (kind == .answer and g.cfg.prefetch) if (lapsing(g, s.hops[0..s.n])) |end|
+        g.refresh(g.cell(id).key, g.cell(id).name, end) catch {};
 }
 
 /// A refresh's inputs are its point; its own answer is nobody's.
@@ -336,15 +333,15 @@ fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
     try g.fail(id, why);
 }
 
-/// Lapses inside the window, and no lapsing hop was born short.
-fn refreshable(g: *Graph, s: *const AnswerScratch, expires: i64) bool {
-    const window = graph.refresh_window_ns;
-    if (expires <= g.now() or expires > g.now() + window) return false;
-    for (s.hops[0..s.n]) |h| {
+fn lapsing(g: *Graph, hops: []const CellId) ?i64 {
+    var first: ?store.Life = null;
+    for (hops) |h| {
         const c = g.cell(h);
-        if (c.expires_ns <= g.now() + window and c.state.fact.rrset.ttl <= refresh_floor_s) return false;
+        const life: store.Life = .of(c.state.fact.rrset.stored_ns, c.expires_ns, if (c.blob) |b| b.verdict else .{});
+        if (first == null or life.end_ns < first.?.end_ns) first = life;
     }
-    return true;
+    const life = first orelse return null;
+    return if (life.inLastTenth(g.now())) life.end_ns else null;
 }
 
 /// `cut(name)`: from `cut(parent(name))`, probe `name A` at the parent's

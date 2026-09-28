@@ -316,8 +316,10 @@ pub const Budget = struct {
     deadline_ns: i64,
     /// The roots sharing it: a question and the key fetches its walk began.
     refs: u32 = 1,
-    /// When a refresh began; 0 for a client.
+    /// When a refresh began, and when the life it replaces ends; 0 for a
+    /// client.
     refresh_ns: i64 = 0,
+    lapses_ns: i64 = 0,
     /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: rrsig.ValidationBudget = .{},
 };
@@ -333,9 +335,7 @@ const max_failed = 4096;
 
 const Refusal = struct { until_ns: i64, why: Failure };
 
-/// BIND's `prefetch 2`.
-pub const refresh_window_ns = 2 * std.time.ns_per_s;
-/// So a refresh does not time the client.
+/// So a refresh does not time the client; never past half the life left.
 const refresh_jitter_ns = std.time.ns_per_s;
 
 /// The model should cost less than a parse.
@@ -599,15 +599,16 @@ pub const Graph = struct {
     }
 
     /// One per key at a time; holds itself until it settles.
-    pub fn refresh(g: *Graph, key: Key, name: dns.Name) !void {
+    pub fn refresh(g: *Graph, key: Key, name: dns.Name, lapses_ns: i64) !void {
         const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
         if (g.index.contains(rkey)) return;
         if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.refused += 1;
             return;
         }
-        const at = g.now() + g.edge.rng.intRangeLessThan(i64, 0, refresh_jitter_ns);
-        const id = try g.newRoot(rkey, name, .{ .deadline_ns = 0, .refresh_ns = g.now() });
+        const jitter = @min(refresh_jitter_ns, @divTrunc(lapses_ns - g.now(), 2));
+        const at = g.now() + if (jitter > 0) g.edge.rng.intRangeLessThan(i64, 0, jitter) else 0;
+        const id = try g.newRoot(rkey, name, .{ .deadline_ns = 0, .refresh_ns = g.now(), .lapses_ns = lapses_ns });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.wake(id, at);
@@ -833,7 +834,7 @@ pub const Graph = struct {
             },
             .secure => |v| {
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
-                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, c.expires_ns);
+                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
             },
             .answer, .exchange, .refresh, .keys => {},
         }
@@ -909,7 +910,7 @@ pub const Graph = struct {
     }
 
     pub fn bound(g: *const Graph, budget: *const Budget) i64 {
-        return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.refresh_ns + refresh_window_ns);
+        return if (budget.refresh_ns == 0) g.now() else @max(g.now(), budget.lapses_ns);
     }
 
     /// Evidence stored since the refresh began counts, inclusive: the edge

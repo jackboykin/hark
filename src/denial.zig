@@ -79,18 +79,18 @@ const Zone = struct {
         const pos = z.position(name);
         if (pos == z.spans.items.len) return null;
         const sp = &z.spans.items[pos];
-        return if (sp.owner.eql(name) and sp.expires_ns > g.now()) sp else null;
+        return if (sp.owner.eql(name) and sp.expires_ns > g.bound(g.payer)) sp else null;
     }
 
-    /// The live span whose range holds `name` (RFC 6840 §4.1 geometry); the
-    /// last owner wraps to cover what sorts before the first.
+    /// The span whose range holds `name` (RFC 6840 §4.1); the last owner
+    /// wraps to cover what sorts before the first.
     fn span(z: *const Zone, g: *Graph, name: dns.Name) ?*const Span {
         const n = z.spans.items.len;
         if (n == 0) return null;
         const pos = z.position(name);
         for ([_]usize{ if (pos > 0) pos - 1 else n - 1, n - 1 }) |i| {
             const sp = &z.spans.items[i];
-            if (sp.expires_ns > g.now() and proof.nsecCovers(sp.owner, sp.nsec, name)) return sp;
+            if (sp.expires_ns > g.bound(g.payer) and proof.nsecCovers(sp.owner, sp.nsec, name)) return sp;
         }
         return null;
     }
@@ -226,7 +226,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     const qtype = g.cell(id).key.rtype;
     const now = g.now();
     const held = z.soa orelse return false;
-    if (held.expires_ns <= now) return false;
+    if (held.expires_ns <= g.bound(g.payer)) return false;
     var proofs: [2]*const Span = undefined;
     var n: usize = 1;
     var nxdomain = false;
@@ -273,7 +273,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         if (rr.rtype == .soa) break rr.rdata.soa.minimum;
     } else 0;
     try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
-    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires);
+    g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);
     return true;
 }
 
