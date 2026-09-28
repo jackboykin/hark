@@ -1,0 +1,56 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a chain that passes an owner twice is SERVFAIL
+
+; a. is b., and b.'s reply leads back through a. and on to c. The chain
+; revisits a.: a loop (RFC 1034 3.6.2), though it never ends where it began.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.example. IN A
+    SECTION ANSWER
+      a.example. 3600 IN CNAME b.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.example. IN A
+    SECTION ANSWER
+      b.example. 3600 IN CNAME a.example.
+      a.example. 3600 IN CNAME c.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.example. IN A
+    SECTION ANSWER
+      c.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    a.example. IN A
+ENTRY_END
+
+SCENARIO_END
