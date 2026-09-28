@@ -51,6 +51,7 @@ pub const RType = enum(u16) {
     cname = 5,
     soa = 6,
     ptr = 12,
+    hinfo = 13,
     mx = 15,
     txt = 16,
     rp = 17,

@@ -156,9 +156,6 @@ pub const Diag = struct {
 
 pub const Error = error{ Parse, UnsupportedRType } || dns.Error;
 
-/// Not in the RType enum; the resolver synthesises it as an unknown type.
-pub const hinfo: dns.RType = @fromBackingInt(13);
-
 /// Unbound's `server:` … `CONFIG_END` prelude is lifted as the Python
 /// harness does: stripped, qmin and minimal-responses honoured, the first
 /// RANGE's ADDRESS the root hint. No address remapping: nothing here binds
@@ -668,7 +665,7 @@ const Parser = struct {
                 } };
             },
             else => {
-                if (rtype != hinfo) return error.UnsupportedRType;
+                if (rtype != .hinfo) return error.UnsupportedRType;
                 // Wire form, as the resolver synthesises it (RFC 8482).
                 var wire: std.ArrayList(u8) = .empty;
                 for (try p.charStrings(toks)) |str| {
@@ -854,7 +851,7 @@ fn rtypeFromText(t: []const u8) ?dns.RType {
         .{ "OPT", dns.RType.opt },               .{ "DS", dns.RType.ds },         .{ "RRSIG", dns.RType.rrsig },
         .{ "NSEC", dns.RType.nsec },             .{ "DNSKEY", dns.RType.dnskey }, .{ "NSEC3", dns.RType.nsec3 },
         .{ "NSEC3PARAM", dns.RType.nsec3param }, .{ "SVCB", dns.RType.svcb },     .{ "HTTPS", dns.RType.https },
-        .{ "ANY", dns.RType.any },               .{ "HINFO", hinfo },
+        .{ "ANY", dns.RType.any },               .{ "HINFO", dns.RType.hinfo },
     };
     inline for (table) |row| if (mem.eql(u8, u, row[0])) return row[1];
     return null;

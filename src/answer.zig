@@ -125,7 +125,7 @@ pub fn special(arena: Allocator, q: dns.Question, d64: ?Dns64) !?Served {
 
 /// RFC 8482: ANY is answered with a synthetic HINFO, asking nobody.
 pub fn hinfo(arena: Allocator, q: dns.Question) !Served {
-    const rr: dns.ResourceRecord = .{ .name = q.name, .rtype = @fromBackingInt(13), .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } };
+    const rr: dns.ResourceRecord = .{ .name = q.name, .rtype = .hinfo, .rclass = .in, .ttl = 0, .rdata = .{ .unknown = "\x07RFC8482\x00" } };
     return .{ .rcode = .no_error, .question = q, .answers = try wireAll(arena, &.{rr}), .cacheable = false };
 }
 
