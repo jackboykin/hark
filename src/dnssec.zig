@@ -990,6 +990,30 @@ test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bo
     );
 }
 
+test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
+    // RFC 4035 §5.3.1. The signature is valid for this RRset; only the
+    // record carrying it moved.
+    const now: u32 = 1_700_000_000;
+    const recs = [_]dns.ResourceRecord{
+        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
+    };
+    var sig_bytes: [64]u8 = undefined;
+    var pub_bytes: [32]u8 = undefined;
+    const signed = try rrsig.testSignRrset(&recs, .a, rrsig.test_owner, .ed25519, &sig_bytes, &pub_bytes);
+    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, signed.dnskey)};
+    const sig_at = struct {
+        fn f(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
+            return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } };
+        }
+    }.f;
+
+    var budget: rrsig.ValidationBudget = .{};
+    const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.{ .labels = &.{ "other", "com" } }, signed.rrsig) };
+    try testing.expect(validateRrset(&moved, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) == null);
+    const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
+    try testing.expect(validateRrset(&home, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) != null);
+}
+
 test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     // Same-owner laundering on the answer-validation path.
     const tag = rrsig.keyTag(test_ecdsa_dnskey);
