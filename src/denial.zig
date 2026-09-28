@@ -268,7 +268,11 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .stored_ns = now,
     };
     reply.ttl = @min(walk.replyTtl(g, reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
-    try g.settle(id, .{ .rrset = reply }, walk.replyExpiry(reply));
+    // RFC 2308 §5: the SOA's minimum may end it before its proofs do.
+    const minimum = for (soa.answers) |rr| {
+        if (rr.rtype == .soa) break rr.rdata.soa.minimum;
+    } else 0;
+    try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires);
     return true;
 }
