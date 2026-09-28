@@ -1065,6 +1065,19 @@ pub fn replyExpiry(reply: anytype) i64 {
     return reply.stored_ns + @as(i64, reply.ttl) * std.time.ns_per_s;
 }
 
+/// Rounded up: a TTL less its age never promises a fraction more than
+/// is left.
+pub fn ageOf(stored_ns: i64, now_ns: i64) u32 {
+    return @intCast(@divFloor(now_ns - stored_ns + std.time.ns_per_s - 1, std.time.ns_per_s));
+}
+
+test "an age rounds up to the whole second" {
+    try std.testing.expectEqual(0, ageOf(7, 7));
+    try std.testing.expectEqual(1, ageOf(7, 8));
+    try std.testing.expectEqual(1, ageOf(0, std.time.ns_per_s));
+    try std.testing.expectEqual(2, ageOf(0, std.time.ns_per_s + 1));
+}
+
 // ── The sibling loop ───────────────────────────────────────────────
 
 fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {

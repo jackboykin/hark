@@ -275,7 +275,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
 
 /// Append `rrs` with the TTL they have left.
 fn aged(g: *Graph, out: *std.ArrayList(RR), rrs: []const RR, stored_ns: i64) !void {
-    const age: u32 = @intCast(@divTrunc(g.now() - stored_ns, std.time.ns_per_s));
+    const age = walk.ageOf(stored_ns, g.now());
     for (rrs) |rr| {
         var a = rr;
         a.ttl = rr.ttl -| age;

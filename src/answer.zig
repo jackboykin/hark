@@ -399,7 +399,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     for (hops, held) |hop, *h| {
         h.* = hop.blob.ref();
         last = hop;
-        age = @intCast(@divTrunc(g.now() - hop.rrset.stored_ns, std.time.ns_per_s));
+        age = walk.ageOf(hop.rrset.stored_ns, g.now());
         life = hop.life;
         stale_any = stale_any or hop.stale;
         // A denial's life is the reply's, not a record's.
@@ -419,7 +419,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     // client needs each to validate the chain (RFC 6672 §5.3.3).
     const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
-        const hop_age: u32 = @intCast(@divTrunc(g.now() - hop.rrset.stored_ns, std.time.ns_per_s));
+        const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
         try appendAged(arena, &authorities, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = true, .positive = true, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
     }
     try appendAged(arena, &authorities, r.sections[1], keep, age, life, last.floor, last.stale);
