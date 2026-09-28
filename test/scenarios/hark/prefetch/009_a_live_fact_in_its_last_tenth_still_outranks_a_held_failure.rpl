@@ -1,0 +1,156 @@
+; hark: root-hints = 127.0.10.1
+; hark: prefetch = yes
+
+SCENARIO_BEGIN a live fact in its last tenth still outranks a held failure
+
+; www fails three times, backing the client's held window off to 40 s
+; (until 78 s); the graph's own flat 5 s refusal lapses well inside
+; that, at 43 s. A CD ask at 44 s reaches the recovered authority and
+; stores www with a 20 s life. Asked again at 63 s, inside that life's
+; last tenth, where the graph itself would refresh it, the plain client
+; must still be served from that live fact: the held failure has
+; nowhere else to send it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 10
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA SERVFAIL
+    SECTION QUESTION
+      www.example.com. IN A
+  ENTRY_END
+RANGE_END
+RANGE_BEGIN 13 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 20 IN A 10.20.30.40
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 6
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 11
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 9 TIME_PASSES ELAPSE 21
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 12 TIME_PASSES ELAPSE 6
+
+STEP 13 QUERY
+ENTRY_BEGIN
+  REPLY RD CD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 14 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA CD NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. IN A 10.20.30.40
+ENTRY_END
+
+STEP 15 TIME_PASSES ELAPSE 19
+
+STEP 16 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 17 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. IN A 10.20.30.40
+ENTRY_END
+
+SCENARIO_END

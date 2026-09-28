@@ -152,8 +152,9 @@ pub const Retention = struct {
 };
 
 /// The client path, in the one order serve and the replay both take:
-/// RFC 6761, RFC 8482, RRSIG, the failure cache, memory, then the graph, which
-/// each drives its own way; past the client's patience, stale.
+/// RFC 6761, RFC 8482, RRSIG, a fact still live, the failure cache, then
+/// memory past its floor or the graph, which each drives its own way;
+/// past the client's patience, stale.
 pub const Desk = struct {
     g: *graph.Graph,
     retention: Retention,
@@ -185,20 +186,26 @@ pub const Desk = struct {
         // unvalidated, the RRSIGs are data.
         if (q.qtype == .rrsig and d.g.cfg.trust_anchor != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
-        if (d.failures.get(q, c.cd, d.g.now())) |ede| switch (ede.code) {
-            // A hold with nothing left to serve asks afresh.
-            .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
-            else => return .{ .held = servfail(q, ede) },
-        };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
+        if (d.failures.get(q, c.cd, d.g.now())) |ede| {
+            // Held, the graph is closed: memory serves the last tenth too.
+            if (try d.memory(arena, q, c, .live)) |s| return .{ .recalled = try d.derived(q, c, s) };
+            switch (ede.code) {
+                // A hold with nothing left to serve asks afresh.
+                .stale_answer, .stale_nxdomain_answer => if (try d.memory(arena, q, c, .stale)) |s| return .{ .replayed = s },
+                else => return .{ .held = servfail(q, ede) },
+            }
+        }
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };
         return .graph;
     }
 
-    pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: enum { fresh, floored, stale }) !?Served {
+    /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.
+    pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: enum { fresh, live, floored, stale }) !?Served {
         const aq = try d.asked(arena, q, c);
         const served = try switch (how) {
-            .fresh => fresh(arena, d.g, d.retention, aq, c, d.minimal),
+            .fresh => fresh(arena, d.g, d.retention, aq, c, d.minimal, true),
+            .live => fresh(arena, d.g, d.retention, aq, c, d.minimal, false),
             .floored => floored(arena, d.g, d.retention, aq, c, d.minimal),
             .stale => stale(arena, d.g, d.retention, aq, c, d.minimal),
         } orelse return null;
@@ -323,9 +330,7 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
     return @intCast(@min(@max(@divTrunc(proven_until_ns - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
 }
 
-/// Null once the life the answer ends with is in its last tenth, where
-/// the graph decides on prefetch.
-pub fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
+fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool, yield_last_tenth: bool) !?Served {
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
     const judged = g.cfg.trust_anchor != null;
     var secure = judged;
@@ -341,7 +346,7 @@ pub fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question,
             hop.life = lifeOf(g, v.proven_until_ns);
         }
     }
-    if (g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
+    if (yield_last_tenth and g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
     return try shape(arena, g, q, c, minimal, hops, secure, true);
 }
 
