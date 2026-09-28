@@ -425,24 +425,38 @@ const test_dnskey = dns.DnskeyData{
     .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD },
 };
 
-test "DS hash verification - sha1 and sha384 digest types" {
-    // verifyDs's three digest arms collapse to one comptime helper; exercise
-    // the sha1 and sha384 instantiations (the ML-DSA-44 vector pins sha256).
-    const d1 = try dsDigest(Sha1, rrsig.test_owner, test_dnskey);
-    try verifyDs(.{
-        .key_tag = rrsig.keyTag(test_dnskey),
-        .algorithm = .rsasha256,
+test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify" {
+    const Case = struct { owner: dns.Name, flags: u16, algorithm: dns.DnssecAlgorithm, key_b64: []const u8, tag: u16, digest_type: dns.DigestType, digest_hex: []const u8 };
+    for ([_]Case{ .{
+        .owner = .{ .labels = &.{ "dskey", "example", "com" } },
+        .flags = 256,
+        .algorithm = .rsasha1,
+        .key_b64 = "AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMzNXxeYCmZ" ++
+            "DRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJBjEVv5f2wwjM9Xzc" ++
+            "nOf+EPbtG9DMBmADjFDc2w/rljwvFw==",
+        .tag = 60485,
         .digest_type = .sha1,
-        .digest = &d1,
-    }, test_dnskey, rrsig.test_owner);
-
-    const d384 = try dsDigest(Sha384, rrsig.test_owner, test_dnskey);
-    try verifyDs(.{
-        .key_tag = rrsig.keyTag(test_dnskey),
-        .algorithm = .rsasha256,
+        .digest_hex = "2BB183AF5F22588179A53B0A98631FAD1A292118",
+    }, .{
+        .owner = .{ .labels = &.{ "example", "net" } },
+        .flags = 257,
+        .algorithm = .ecdsap384sha384,
+        .key_b64 = "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RCOpgQ6K8X" ++
+            "1DRSEkrbYQ+OB+v8/uX45NBwY8rp65F6Glur8I/mlVNgF6W/qTI37m40",
+        .tag = 10771,
         .digest_type = .sha384,
-        .digest = &d384,
-    }, test_dnskey, rrsig.test_owner);
+        .digest_hex = "72d7b62976ce06438e9c0bf319013cf801f09ecc84b8d7e9495f27e305c6a9b0" ++
+            "563a9b5f4d288405c3008a946df983d6",
+    } }) |c| {
+        var key: [130]u8 = undefined;
+        const key_len = try std.base64.standard.Decoder.calcSizeForSlice(c.key_b64);
+        try std.base64.standard.Decoder.decode(key[0..key_len], c.key_b64);
+        var digest: [48]u8 = undefined;
+        const d = try std.fmt.hexToBytes(&digest, c.digest_hex);
+        const dnskey: dns.DnskeyData = .{ .flags = c.flags, .protocol = 3, .algorithm = c.algorithm, .public_key = key[0..key_len] };
+        try testing.expectEqual(c.tag, rrsig.keyTag(dnskey));
+        try verifyDs(.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }, dnskey, c.owner);
+    }
 }
 
 test "anySupportedDs: unsupported algorithm or digest contributes no path" {
