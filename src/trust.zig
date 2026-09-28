@@ -201,13 +201,13 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     const clock = graph.Tally.clock(&g.tally.verify_ns);
     defer clock.stop();
     const now = g.wallNow();
-    const expires = @min(rs.expires_ns, keys.expires_ns);
     switch (r.kind) {
         .answer => {
             const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus;
+            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
-            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(expires, capExpiry(g, rrsig.ttlCap(sig, now))));
+            try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires_ns, keys.expires_ns));
         },
         .nodata, .nxdomain => {
             // RFC 4034 §3.1.3.
@@ -216,7 +216,8 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             var cap: u32 = std.math.maxInt(u32);
             if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
                 return .bogus;
-            const until = @min(expires, capExpiry(g, cap));
+            g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap));
+            const until = @min(rs.expires_ns, keys.expires_ns);
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
                 .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
                 // A signed denial of the DS showing no delegation: no zone.
@@ -292,8 +293,9 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const now = g.wallNow();
     const sig = dnssec.validateDnskeyRrset(r.answers, ds_data.items, zone, now, budget, &g.verify_memo) catch
         return failChain(g, id, s.rrset.unwrap().?);
+    g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
-    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(@min(rs.expires_ns, ds.expires_ns), capExpiry(g, rrsig.ttlCap(sig, now))));
+    try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires_ns, ds.expires_ns));
 }
 
 /// The judgement of one rrset version; a fresh cell per version, since
@@ -471,6 +473,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         }
     }
     const chain: Chain = if (s.status == .secure) .{ .status = .secure, .proven_until_ns = s.proven } else .{ .status = .insecure };
+    if (s.status == .secure) g.authenticUntil(s.target, s.proven);
     try g.settle(id, .{ .secure = chain }, @min(until, s.expires));
     return null;
 }

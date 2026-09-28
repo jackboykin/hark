@@ -119,7 +119,8 @@ def run_scenario(path: Path, lift: bool = False) -> None:
         raise AssertionError(
             f"{path}: scenario must declare `; hark: root-hints = <ip>[, ...]` in header"
         )
-    with scenario_env(scenario) as (resp, proc):
+    validity = datetime.timedelta(seconds=scenario.sig_validity) if scenario.sig_validity is not None else None
+    with scenario_env(scenario, sig_validity=validity) as (resp, proc):
         _run_steps(scenario, resp, proc, path)
 
 

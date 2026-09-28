@@ -132,6 +132,8 @@ pub const Scenario = struct {
     client_timeout_ms: u32 = 5000,
     /// Zones the harness signs; the first must be the root.
     dnssec_zones: []const []const u8 = &.{},
+    /// Seconds the harness's signatures stay valid; null, a year.
+    sig_validity: ?u32 = null,
 };
 
 const no_flags: dns.Header.Flags = .{
@@ -255,6 +257,8 @@ const Parser = struct {
             s.serve_stale_ttl = try p.int(u32, val);
         } else if (mem.eql(u8, key, "min-ttl")) {
             s.min_ttl = try p.int(u32, val);
+        } else if (mem.eql(u8, key, "sig-validity")) {
+            s.sig_validity = try p.int(u32, val);
         } else if (mem.eql(u8, key, "prefetch")) {
             s.prefetch = yes(val);
         } else if (mem.eql(u8, key, "client-timeout")) {

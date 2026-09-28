@@ -23,6 +23,7 @@ Hark-only extensions:
   - ; hark: prefetch = yes                  header directive (optional)
   - ; hark: client-timeout = <seconds>      header directive: how long each QUERY waits (default 5)
   - ; hark: dnssec-zone = <name>            declare a zone the harness signs
+  - ; hark: sig-validity = <seconds>        signatures the harness mints expire this far out (default a year)
   - SIGN_AS <zone>                          force this entry's signer (forgeries)
   - WILDCARD <owner>                        sign this entry's answers as expansions of wildcard <owner>
   - <child> <ttl> IN DS PLACEHOLDER [<zone>] real digest substituted at load; <zone> plants another zone's digest at this owner (one per owner)
@@ -192,6 +193,8 @@ class Scenario:
     # trust anchors at root only, so the first declared zone must be the
     # root in the scripted setup (typically ".").
     dnssec_zones: list[str] = dataclasses.field(default_factory=list)
+    # Seconds the harness's signatures stay valid; None, a year.
+    sig_validity: int | None = None
     # DNS rebinding protection. `None` means harness default (off — test
     # scenarios deliberately use TEST-NET / RFC 1918 addresses for their
     # scripted authoritatives, and production-side rebinding scrubbing
@@ -291,6 +294,8 @@ class _Parser:
             self.scenario.prefetch = val.strip().lower() in ("yes", "true", "1")
         elif key == "min-ttl":
             self.scenario.min_ttl = int(val.strip())
+        elif key == "sig-validity":
+            self.scenario.sig_validity = int(val.strip())
         elif key == "client-timeout":
             self.scenario.client_timeout = float(val.strip())
         elif key == "dnssec-zone":

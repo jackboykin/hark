@@ -895,6 +895,14 @@ pub const Graph = struct {
         return if (r.until_ns > g.now()) r.why else null;
     }
 
+    /// RFC 4035 §5.3.3: an rrset accepted as authentic ends with the
+    /// signatures that authenticated it.
+    pub fn authenticUntil(g: *Graph, id: CellId, until_ns: i64) void {
+        const c = g.cell(id);
+        c.expires_ns = @min(c.expires_ns, until_ns);
+        if (c.blob) |b| g.store.shorten(c.key, b, until_ns);
+    }
+
     pub fn fresh(g: *Graph, id: CellId) bool {
         const c = g.cell(id);
         return c.settled() and c.expires_ns > g.now();

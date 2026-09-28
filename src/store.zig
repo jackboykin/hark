@@ -126,6 +126,13 @@ pub const Store = struct {
         return s.map.get(key);
     }
 
+    /// Only this version; a newer one is not its business.
+    pub fn shorten(s: *Store, key: Key, blob: *Blob, until_ns: i64) void {
+        const i = s.map.getIndex(key) orelse return;
+        const e = &s.map.values()[i];
+        if (e.blob == blob) e.expires_ns = @min(e.expires_ns, until_ns);
+    }
+
     /// Forgets this version of a fact; a newer version is not its business.
     pub fn drop(s: *Store, key: Key, blob: *Blob) void {
         const i = s.map.getIndex(key) orelse return;
