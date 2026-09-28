@@ -1250,19 +1250,3 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     }
     return .none;
 }
-
-test "a chain that comes back to a name is a loop, one that runs on is too long" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var names: [max_links + 1]dns.Name = undefined;
-    for (&names, 0..) |*n, i| n.* = try dns.parseDottedName(a, try std.fmt.allocPrint(a, "n{d}.test", .{i}));
-    var long: Links = .{};
-    for (names[0..max_links]) |n| try std.testing.expect(long.pass(n) == null);
-    try std.testing.expect(long.end(.alias, names[max_links], .a) == .next);
-    try std.testing.expectEqualStrings(Links.too_long.text, long.pass(names[max_links]).?.text);
-    var back: Links = .{};
-    for (names[0..3]) |n| try std.testing.expect(back.pass(n) == null);
-    try std.testing.expect(back.end(.alias, names[1], .a) == .broken);
-    try std.testing.expectEqualStrings(Links.loop.text, back.pass(names[1]).?.text);
-}

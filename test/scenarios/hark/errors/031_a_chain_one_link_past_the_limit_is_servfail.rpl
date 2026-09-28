@@ -1,0 +1,203 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a chain one link past the limit is SERVFAIL
+
+; hark follows 14 CNAME links for a question. n1. reaches its address in
+; 14; n0. needs 15 and is a failure, never a NOERROR carrying the chain.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n0.example. IN A
+    SECTION ANSWER
+      n0.example. 3600 IN CNAME n1.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n1.example. IN A
+    SECTION ANSWER
+      n1.example. 3600 IN CNAME n2.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n2.example. IN A
+    SECTION ANSWER
+      n2.example. 3600 IN CNAME n3.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n3.example. IN A
+    SECTION ANSWER
+      n3.example. 3600 IN CNAME n4.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n4.example. IN A
+    SECTION ANSWER
+      n4.example. 3600 IN CNAME n5.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n5.example. IN A
+    SECTION ANSWER
+      n5.example. 3600 IN CNAME n6.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n6.example. IN A
+    SECTION ANSWER
+      n6.example. 3600 IN CNAME n7.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n7.example. IN A
+    SECTION ANSWER
+      n7.example. 3600 IN CNAME n8.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n8.example. IN A
+    SECTION ANSWER
+      n8.example. 3600 IN CNAME n9.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n9.example. IN A
+    SECTION ANSWER
+      n9.example. 3600 IN CNAME n10.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n10.example. IN A
+    SECTION ANSWER
+      n10.example. 3600 IN CNAME n11.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n11.example. IN A
+    SECTION ANSWER
+      n11.example. 3600 IN CNAME n12.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n12.example. IN A
+    SECTION ANSWER
+      n12.example. 3600 IN CNAME n13.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n13.example. IN A
+    SECTION ANSWER
+      n13.example. 3600 IN CNAME n14.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n14.example. IN A
+    SECTION ANSWER
+      n14.example. 3600 IN CNAME n15.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      n15.example. IN A
+    SECTION ANSWER
+      n15.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    n1.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    n1.example. IN A
+  SECTION ANSWER
+    n1.example. 3600 IN CNAME n2.example.
+    n2.example. 3600 IN CNAME n3.example.
+    n3.example. 3600 IN CNAME n4.example.
+    n4.example. 3600 IN CNAME n5.example.
+    n5.example. 3600 IN CNAME n6.example.
+    n6.example. 3600 IN CNAME n7.example.
+    n7.example. 3600 IN CNAME n8.example.
+    n8.example. 3600 IN CNAME n9.example.
+    n9.example. 3600 IN CNAME n10.example.
+    n10.example. 3600 IN CNAME n11.example.
+    n11.example. 3600 IN CNAME n12.example.
+    n12.example. 3600 IN CNAME n13.example.
+    n13.example. 3600 IN CNAME n14.example.
+    n14.example. 3600 IN CNAME n15.example.
+    n15.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    n0.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    n0.example. IN A
+ENTRY_END
+
+SCENARIO_END
