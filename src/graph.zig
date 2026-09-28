@@ -354,16 +354,19 @@ pub const Tally = struct {
     reaches: u64 = 0,
     reaches_visits: u64 = 0,
 
+    /// Only the replay reads the timings; serve skips the clock reads.
+    pub const timed = @import("builtin").is_test;
+
     pub const Clock = struct {
         t0: i128,
         into: *u64,
         pub fn stop(c: Clock) void {
-            c.into.* += @intCast(monotonic.nowNs() - c.t0);
+            if (timed) c.into.* += @intCast(monotonic.nowNs() - c.t0);
         }
     };
 
     pub fn clock(into: *u64) Clock {
-        return .{ .t0 = monotonic.nowNs(), .into = into };
+        return .{ .t0 = if (timed) monotonic.nowNs() else 0, .into = into };
     }
 };
 
@@ -1227,7 +1230,7 @@ pub const Graph = struct {
         const created_before = g.created;
         defer if (g.cell(id).live and !g.cell(id).settled() and g.created == created_before) {
             g.tally.reruns += 1;
-            g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
+            if (Tally.timed) g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
         };
         switch (g.cell(id).key.kind) {
             .cut => try walk.runCut(g, id),
