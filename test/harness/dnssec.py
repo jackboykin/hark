@@ -8,7 +8,6 @@ DS, exported via `ds_presentation()`, plugs into hark's test-only
 
 Signatures are minted with generous time bounds (inception −1d,
 expiration +1y) so the synthetic test clock never expires them mid-scenario.
-Tests probing proof-lifetime behavior shrink the window via `sig_validity`.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ _DS_DIGEST = dns.dnssec.DSDigest.SHA256
 # RFC 4034 §2.1.1: ZONE flag (bit 7). KSK (bit 15 = SEP) would let us
 # split signing roles; harness doesn't need the distinction.
 _DNSKEY_FLAGS = 256
+_SIG_VALIDITY = datetime.timedelta(days=365)
 
 
 @dataclasses.dataclass
@@ -40,7 +40,6 @@ class KeyMaterial:
     private_key: ec.EllipticCurvePrivateKey
     dnskey: dns.rdtypes.ANY.DNSKEY.DNSKEY
     ds: dns.rdtypes.ANY.DS.DS
-    sig_validity: datetime.timedelta = datetime.timedelta(days=365)
     # Pre-signed `[DNSKEY rrset, RRSIG rrset]` answer for DNSKEY queries
     # against this zone. Built once at construction so DNSKEY synthesis
     # on the hot path is a list copy, not an ECDSA signature.
@@ -54,7 +53,7 @@ class KeyMaterial:
         return dns.rrset.from_rdata(self.zone_name, 3600, self.dnskey)
 
     @classmethod
-    def generate(cls, zone_name: str, sig_validity: datetime.timedelta | None = None) -> KeyMaterial:
+    def generate(cls, zone_name: str) -> KeyMaterial:
         name = dns.name.from_text(zone_name)
         private_key = ec.generate_private_key(ec.SECP256R1())
         dnskey = dns.dnssec.make_dnskey(
@@ -63,9 +62,7 @@ class KeyMaterial:
             flags=_DNSKEY_FLAGS,
         )
         ds = dns.dnssec.make_ds(name=name, key=dnskey, algorithm=_DS_DIGEST)
-        if sig_validity is None:
-            sig_validity = cls.sig_validity
-        return cls(zone_name=name, private_key=private_key, dnskey=dnskey, ds=ds, sig_validity=sig_validity)
+        return cls(zone_name=name, private_key=private_key, dnskey=dnskey, ds=ds)
 
     def sign(self, rrset: dns.rrset.RRset) -> dns.rrset.RRset:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -75,7 +72,7 @@ class KeyMaterial:
             signer=self.zone_name,
             dnskey=self.dnskey,
             inception=now - datetime.timedelta(days=1),
-            expiration=now + self.sig_validity,
+            expiration=now + _SIG_VALIDITY,
         )
         return dns.rrset.from_rdata(rrset.name, rrset.ttl, rrsig)
 

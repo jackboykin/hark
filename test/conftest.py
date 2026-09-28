@@ -11,7 +11,6 @@ Each `.rpl` file under `scenarios/` becomes one pytest item. Running it:
 from __future__ import annotations
 
 import contextlib
-import datetime
 import ipaddress
 import os
 import re
@@ -119,18 +118,16 @@ def run_scenario(path: Path, lift: bool = False) -> None:
         raise AssertionError(
             f"{path}: scenario must declare `; hark: root-hints = <ip>[, ...]` in header"
         )
-    validity = datetime.timedelta(seconds=scenario.sig_validity) if scenario.sig_validity is not None else None
-    with scenario_env(scenario, sig_validity=validity) as (resp, proc):
+    with scenario_env(scenario) as (resp, proc):
         _run_steps(scenario, resp, proc, path)
 
 
 @contextlib.contextmanager
-def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | None = None, cache_size: int | None = None):
+def scenario_env(scenario: rpl.Scenario, *, cache_size: int | None = None):
     """Responder + hark wired for `scenario`; yields `(resp, proc)`.
 
     Shared by the .rpl step-runner and python tests that drive their own
-    queries (e.g. TTL-bound assertions .rpl CHECK_ANSWER cannot express).
-    `sig_validity` shrinks the harness RRSIG window for proof-lifetime tests.
+    queries.
     """
     binary = hark_proc.find_hark_binary()
 
@@ -175,7 +172,7 @@ def scenario_env(scenario: rpl.Scenario, *, sig_validity: datetime.timedelta | N
     # on-the-fly RRSIG signing. The parser already enforces that the first
     # zone is `.` (hark validates trust anchors at root only).
     signers = [
-        harness_dnssec.KeyMaterial.generate(z, sig_validity=sig_validity)
+        harness_dnssec.KeyMaterial.generate(z)
         for z in scenario.dnssec_zones
     ]
     if signers:
