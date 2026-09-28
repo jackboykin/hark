@@ -537,9 +537,8 @@ fn verifyRsa(comptime Hash: type, signature: []const u8, digest: *const [Hash.di
     // RsaFe.fromBytes alone only bounds it below the modulus (511 bytes).
     if (exponent.len > 8) return error.InvalidKey;
 
-    // 1024-bit minimum (RFC 6781 recommends 2048, but 1024-bit ZSKs are still
-    // common, TLDs included). No step: RFC 3110 fixes no size and the wild
-    // has odd ones (gob.cl's KSK is 2024 bits; an 8-byte step SERVFAILed it).
+    // RFC 3110 §3 allows 512 bits; 1024 is hark's floor, as 1024-bit ZSKs
+    // are still common, TLDs included. No step: gob.cl's KSK is 2024 bits.
     if (modulus.len < 128 or modulus.len > 512) return error.InvalidKey;
     if (signature.len != modulus.len) return error.InvalidSignature;
 
