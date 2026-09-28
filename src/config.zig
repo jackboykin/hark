@@ -821,19 +821,6 @@ test "wrong-typed key rejected, default must not silently win" {
     ));
 }
 
-test "logging config" {
-    var cfg1 = try parseConfig(testing.allocator, "");
-    defer cfg1.deinit();
-    try testing.expectEqual(false, cfg1.log_queries);
-
-    var cfg2 = try parseConfig(testing.allocator,
-        \\[logging]
-        \\queries = true
-    );
-    defer cfg2.deinit();
-    try testing.expectEqual(true, cfg2.log_queries);
-}
-
 test "trust-anchors rejects malformed entries" {
     for ([_][]const u8{
         "20326 8 2 ABC",

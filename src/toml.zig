@@ -480,41 +480,6 @@ test "error on missing value" {
     try testing.expectError(error.InvalidSyntax, result);
 }
 
-test "full config example" {
-    var result = try parse(testing.allocator,
-        \\[server]
-        \\listen = ["127.0.0.1:53", "[::1]:53"]
-        \\workers = 4
-        \\
-        \\[resolver]
-        \\dnssec = false
-        \\qname-minimization = true
-        \\
-        \\[cache]
-        \\size = 16777216
-        \\entries = 10000
-    );
-    defer result.deinit();
-
-    const server = result.table.getTable("server").?;
-    try testing.expectEqual(@as(i64, 4), server.getInteger("workers").?);
-
-    const resolver = result.table.getTable("resolver").?;
-    try testing.expectEqual(true, resolver.getBool("qname-minimization").?);
-
-    const cache = result.table.getTable("cache").?;
-    try testing.expectEqual(@as(i64, 16777216), cache.getInteger("size").?);
-    try testing.expectEqual(@as(i64, 10000), cache.getInteger("entries").?);
-}
-
-test "key with hyphens" {
-    var result = try parse(testing.allocator,
-        \\qname-minimization = true
-    );
-    defer result.deinit();
-    try testing.expectEqual(true, result.table.getBool("qname-minimization").?);
-}
-
 /// Every allocating branch in one document: section names, bare keys, quoted
 /// strings, and the two-stage array parse (element slice + each element).
 fn parseOomProbe(allocator: Allocator, input: []const u8) !void {

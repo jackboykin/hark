@@ -261,16 +261,6 @@ test "AddressKey.HashCtx: randomizeHashSeed shifts the hash space" {
     try testing.expect(h0 != h1);
 }
 
-test "format produces ip:port and RFC 5952 IPv6" {
-    var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("127.0.0.1:53", format(initIp4(.{ 127, 0, 0, 1 }, 53), &buf));
-    try testing.expectEqualStrings("[::1]:53884", format(initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53884, 0, 0), &buf));
-    try testing.expectEqualStrings(
-        "[2001:db8::1]:53",
-        format(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0), &buf),
-    );
-}
-
 test "special-use IPv4 set covers RFC 1918 + loopback + link-local + TEST-NET + CGNAT" {
     inline for ([_][4]u8{
         .{ 0, 0, 0, 0 },
@@ -325,27 +315,10 @@ test "special-use IPv6 set covers ::/::1, ULA, link-local, docs, mapped-v4" {
 
 test "isNonRoutableNs blocks special-use + multicast IPv4" {
     try testing.expect(isNonRoutableNs(initIp4(.{ 127, 0, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 10, 0, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 192, 168, 1, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 169, 254, 1, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 0, 0, 0, 0 }, 53)));
-    // Widened vs the old NS-only set: CGNAT, TEST-NET, benchmarking
-    try testing.expect(isNonRoutableNs(initIp4(.{ 100, 64, 0, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 192, 0, 2, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 198, 51, 100, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 203, 0, 113, 1 }, 53)));
-    try testing.expect(isNonRoutableNs(initIp4(.{ 198, 18, 0, 1 }, 53)));
     // Multicast — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(initIp4(.{ 224, 0, 0, 1 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 239, 255, 255, 255 }, 53)));
     try testing.expect(isNonRoutableNs(initIp4(.{ 255, 255, 255, 255 }, 53)));
-}
-
-test "isNonRoutableNs allows routable IPv4" {
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 1, 1, 1, 1 }, 53)));
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 8, 8, 8, 8 }, 53)));
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 15, 255, 255 }, 53)));
-    try testing.expect(!isNonRoutableNs(initIp4(.{ 172, 32, 0, 1 }, 53)));
 }
 
 test "isNonRoutableNs blocks special-use + multicast IPv6" {

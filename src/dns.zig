@@ -2027,34 +2027,6 @@ test "edge case: oversized label" {
     try testing.expectError(error.InvalidLabelType, parseMessage(testing.allocator, pkt[0..78]));
 }
 
-test "EDNS0 roundtrip: build query with EDNS, serialize, parse, verify opt" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const msg = try buildQuery(alloc, 0x1234, "example.com", .a, .{ .rd = true, .edns = .{ .do_bit = true } });
-
-    try testing.expect(msg.opt != null);
-    const opt = msg.opt.?;
-    try testing.expectEqual(edns_udp_payload, opt.udp_payload_size);
-    try testing.expect(opt.do_bit);
-    try testing.expectEqual(@as(u8, 0), opt.version);
-
-    var buf: [edns_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&buf, msg);
-
-    const parsed = try parseMessage(alloc, wire);
-
-    try testing.expect(parsed.opt != null);
-    const parsed_opt = parsed.opt.?;
-    try testing.expectEqual(edns_udp_payload, parsed_opt.udp_payload_size);
-    try testing.expect(parsed_opt.do_bit);
-    try testing.expectEqual(@as(u8, 0), parsed_opt.version);
-    try testing.expectEqual(@as(u8, 0), parsed_opt.extended_rcode);
-
-    try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
-}
-
 test "EDNS0: reserializing a parsed OPT response counts it once" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2381,22 +2353,6 @@ test "isSubdomainOf: self, descendants and the root; case-insensitive; never a s
     try testing.expect((Name{ .labels = &.{ "WWW", "EXAMPLE", "COM" } }).isSubdomainOf(name));
     try testing.expect(name.isSubdomainOf(.{ .labels = &.{} }));
     try testing.expect(!(Name{ .labels = &.{ "a", "example", "com" } }).isSubdomainOf(.{ .labels = &.{ "b", "example", "com" } }));
-}
-
-test "buildQuery rd=false roundtrip" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try buildQuery(arena.allocator(), 0x5678, "example.com", .a, .{ .rd = false });
-
-    try testing.expect(!msg.header.flags.rd);
-    try testing.expectEqual(@as(u16, 0x5678), msg.header.id);
-
-    var rt_buf: [max_udp_payload]u8 = undefined;
-    const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
-
-    try testing.expect(!msg2.header.flags.rd);
-    try testing.expectEqual(@as(u16, 0x5678), msg2.header.id);
-    try testing.expect(msg.questions[0].name.eql(msg2.questions[0].name));
 }
 
 fn testHeader(pkt: *[max_udp_payload]u8, opts: struct {

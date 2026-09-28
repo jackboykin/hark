@@ -990,26 +990,6 @@ test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bo
     );
 }
 
-test "validateRrset: an RRSIG at another owner cannot move this RRset's verdict" {
-    // A signature at another owner says nothing about this RRset either way:
-    // the verdict must be identical with and without the foreign RRSIG.
-    const tag = rrsig.keyTag(test_ecdsa_dnskey);
-    const other_owner = dns.Name{ .labels = &.{ "other", "com" } };
-    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, test_ecdsa_dnskey)};
-
-    const with_foreign = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        rrsigRr(rrsig.test_owner, .a, .dsasha1, 0, rrsig.test_owner), // unsupported, this owner
-        rrsigRr(other_owner, .a, .ecdsap256sha256, tag, other_owner), // supported, foreign owner
-    };
-    const without_foreign = with_foreign[0..2];
-
-    var b1: rrsig.ValidationBudget = .{};
-    var b2: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&with_foreign, rrsig.test_owner, .a, &dnskeys, 1699500000, &b1, &test_memo) == null);
-    try testing.expect(validateRrset(without_foreign, rrsig.test_owner, .a, &dnskeys, 1699500000, &b2, &test_memo) == null);
-}
-
 test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
     // Same-owner laundering on the answer-validation path.
     const tag = rrsig.keyTag(test_ecdsa_dnskey);

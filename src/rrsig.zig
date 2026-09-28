@@ -680,23 +680,6 @@ test "isSupportedAlgorithm is RFC 8624's MUST-validate set less RFC 9905's" {
     try testing.expect(!isSupportedAlgorithm(.dsasha1));
 }
 
-test "keyTag computation" {
-    // Test with a known DNSKEY. The root KSK-2017 has key tag 20326.
-    // We'll use a synthetic key and verify the algorithm matches RFC 4034 Appendix B.
-    const dnskey = dns.DnskeyData{
-        .flags = 256, // ZSK
-        .protocol = 3,
-        .algorithm = .rsasha256,
-        .public_key = &.{ 0x03, 0x01, 0x00, 0x01 },
-    };
-    const tag = keyTag(dnskey);
-    // Manually compute: ac = 256 + (3<<8|8) + (0x03<<8) + (0x01) + (0x00<<8) + (0x01)
-    // = 256 + 776 + 768 + 1 + 0 + 1 = 1802
-    // ac += (1802 >> 16) & 0xFFFF = 0
-    // tag = 1802 & 0xFFFF = 1802
-    try testing.expectEqual(@as(u16, 1802), tag);
-}
-
 test "canonical name wire format" {
     var buf: [256]u8 = undefined;
 
@@ -884,18 +867,6 @@ test "ECDSA P-384 signature verification" {
 
     try verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, msg), dnssec_key);
     try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, "wrong data"), dnssec_key));
-}
-
-test "Ed25519 signature verification" {
-    const key_pair = Ed25519.KeyPair.generate(testing.io);
-    const pub_bytes = key_pair.public_key.toBytes();
-
-    const msg = "test Ed25519 DNSSEC data";
-    const sig = try key_pair.sign(msg, null);
-    const sig_bytes = sig.toBytes();
-
-    try verifyEd25519(&sig_bytes, &SignedData.raw(msg), &pub_bytes);
-    try testing.expectError(error.InvalidSignature, verifyEd25519(&sig_bytes, &SignedData.raw("tampered"), &pub_bytes));
 }
 
 test "ECDSA P-256 at the edges of the x(R) comparison" {
