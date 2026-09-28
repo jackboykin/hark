@@ -432,6 +432,11 @@ pub const Cell = struct {
     /// Everything the cell owns; freed with it.
     arena: std.heap.ArenaAllocator,
 
+    comptime {
+        // Scratch is a pointer: the slot bound is not the largest kind's.
+        std.debug.assert(@sizeOf(Cell) <= 384);
+    }
+
     pub const State = union(enum) { pending, fact: Value, failure: Failure };
 
     pub fn settled(c: *const Cell) bool {
@@ -1327,11 +1332,6 @@ pub const Graph = struct {
         return id;
     }
 };
-
-test "a cell is a few words" {
-    // Scratch is a pointer: the slot bound is not the largest kind's.
-    try std.testing.expect(@sizeOf(Cell) <= 384);
-}
 
 test "a cell replacing an expired one takes over the index entry's key" {
     var kb: KeyBuf = undefined;

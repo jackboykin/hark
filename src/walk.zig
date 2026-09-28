@@ -65,6 +65,9 @@ pub const Ask = struct {
 
     comptime {
         std.debug.assert(max_servers < 32);
+        // A waiting walk's scratch is a comptime constant, not a stack; the
+        // server list is most of it.
+        std.debug.assert(@sizeOf(Ask) <= 640);
     }
 
     const Result = union(enum) {
@@ -1246,12 +1249,6 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     }
     return .none;
-}
-
-test "an ask has a static bound" {
-    // A waiting walk's scratch is a comptime constant, not a stack; the
-    // server list is most of it.
-    try std.testing.expect(@sizeOf(Ask) <= 640);
 }
 
 test "a chain that comes back to a name is a loop, one that runs on is too long" {
