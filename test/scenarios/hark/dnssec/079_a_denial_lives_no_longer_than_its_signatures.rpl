@@ -1,7 +1,6 @@
 ; hark: root-hints = 127.0.10.1
 ; hark: dnssec-zone = .
 ; hark: sig-validity = 100
-; sim-only: the sim mints its signatures once; live, each reply is signed afresh
 
 SCENARIO_BEGIN a denial lives no longer than its signatures
 

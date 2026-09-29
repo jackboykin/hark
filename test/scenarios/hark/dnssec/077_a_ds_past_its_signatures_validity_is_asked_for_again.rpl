@@ -2,7 +2,6 @@
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
 ; hark: sig-validity = 100
-; sim-only: the sim mints its signatures once; live, each reply is signed afresh
 
 SCENARIO_BEGIN a DS past its signatures' validity is asked for again
 
