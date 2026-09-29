@@ -63,13 +63,22 @@ RANGE_END
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.3
   ENTRY_BEGIN
-    MATCH opcode subdomain
+    MATCH opcode qname qtype
     ADJUST copy_id copy_query unsigned
     REPLY QR AA NOERROR
     SECTION QUESTION
-      uni.edu.example. IN A
+      www.uni.edu.example. IN A
     SECTION ANSWER
-      uni.edu.example. 3600 IN A 192.0.2.1
+      www.uni.edu.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www2.uni.edu.example. IN A
+    SECTION ANSWER
+      www2.uni.edu.example. 3600 IN A 192.0.2.2
   ENTRY_END
 RANGE_END
 
@@ -98,10 +107,12 @@ ENTRY_END
 
 STEP 4 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question answer
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     www2.uni.edu.example. IN A
+  SECTION ANSWER
+    www2.uni.edu.example. 3600 IN A 192.0.2.2
 ENTRY_END
 
 STEP 5 CHECK_MAX_QUERIES 8
@@ -116,10 +127,12 @@ ENTRY_END
 
 STEP 7 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question answer
   REPLY QR RD RA NOERROR
   SECTION QUESTION
     www.uni.edu.example. IN A
+  SECTION ANSWER
+    www.uni.edu.example. 3600 IN A 192.0.2.1
 ENTRY_END
 
 SCENARIO_END
