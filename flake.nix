@@ -47,7 +47,7 @@
         bench = pkgs.mkShell {
           packages = with pkgs; [
             (zigFor z)
-            nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck valgrind
+            nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck valgrind strace
             unbound pdns-recursor knot-resolver_6 bind
             python3 go_1_27
           ];
