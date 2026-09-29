@@ -405,7 +405,7 @@ ENTRY_END
 
 STEP 6 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.sec.example. IN A
@@ -420,7 +420,7 @@ ENTRY_END
 
 STEP 8 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.unsig.example. IN A
@@ -435,7 +435,7 @@ ENTRY_END
 
 STEP 10 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.forged.example. IN A
@@ -450,7 +450,7 @@ ENTRY_END
 
 STEP 12 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.denied.example. IN A
@@ -465,7 +465,7 @@ ENTRY_END
 
 STEP 14 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.own.example. IN A
@@ -514,7 +514,7 @@ ENTRY_END
 
 STEP 20 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.stray.example. IN A

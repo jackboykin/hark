@@ -74,7 +74,7 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     a.example. IN A
@@ -89,7 +89,7 @@ ENTRY_END
 
 STEP 4 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     b.example. IN A
@@ -109,7 +109,7 @@ ENTRY_END
 
 STEP 8 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     c.example. IN A

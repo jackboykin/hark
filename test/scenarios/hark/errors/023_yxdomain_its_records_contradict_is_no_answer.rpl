@@ -44,14 +44,14 @@ RANGE_END
 
 STEP 1 QUERY
 ENTRY_BEGIN
-  REPLY RD
+  REPLY RD EDNS
   SECTION QUESTION
     a.example. IN A
 ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=22
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     a.example. IN A
@@ -59,14 +59,14 @@ ENTRY_END
 
 STEP 3 QUERY
 ENTRY_BEGIN
-  REPLY RD
+  REPLY RD EDNS
   SECTION QUESTION
     fit.doc.example. IN A
 ENTRY_END
 
 STEP 4 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=22
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     fit.doc.example. IN A
@@ -74,14 +74,14 @@ ENTRY_END
 
 STEP 5 QUERY
 ENTRY_BEGIN
-  REPLY RD
+  REPLY RD EDNS
   SECTION QUESTION
     aaaaaaaaaaaaaaaaaaaa.long.example. IN A
 ENTRY_END
 
 STEP 6 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH rcode question
+  MATCH rcode question ede=22
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     aaaaaaaaaaaaaaaaaaaa.long.example. IN A

@@ -94,7 +94,7 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags rcode question answer
+  MATCH flags rcode question answer ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     d.example. IN A

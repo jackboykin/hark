@@ -69,7 +69,7 @@ STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
   ; `MATCH flags` covers rcode and AD: the assertion fails if hark either
   ; answers NOERROR or sets AD on the forged redirect.
-  MATCH flags question
+  MATCH flags question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     www.example. IN A
