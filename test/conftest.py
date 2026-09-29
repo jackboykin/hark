@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from harness import client, hark_proc, responder, rpl, unbound_lift
+from harness import client, hark_proc, responder, rpl
 from harness import dnssec as harness_dnssec
 
 
@@ -45,9 +45,6 @@ HARK_LISTEN = ("127.0.0.1", 5354 + _worker_offset() * 10)
 
 # ── Scenario collection ────────────────────────────────────────────────────
 
-UNBOUND_CORPUS = Path(__file__).resolve().parent / "corpus" / "unbound"
-
-
 class RplFile(pytest.File):
     """Pytest File collector for in-tree `.rpl` scenarios."""
 
@@ -61,33 +58,15 @@ class RplFile(pytest.File):
 
 
 class RplItem(pytest.Item):
-    def __init__(self, *, name: str, parent, scenario_path: Path | None = None, lift: bool = False):
+    def __init__(self, *, name: str, parent):
         super().__init__(name, parent)
-        self.scenario_path = scenario_path if scenario_path is not None else Path(parent.path)
-        self.lift = lift  # True for Unbound corpus paths; runs the lift transform
+        self.scenario_path = Path(parent.path)
 
     def runtest(self):
-        run_scenario(self.scenario_path, lift=self.lift)
+        run_scenario(self.scenario_path)
 
     def reportinfo(self):
         return self.scenario_path, 0, f"scenario: {self.name}"
-
-
-class LiftedManifestCollector(pytest.Module):
-    """Surfaces every manifest entry as a pytest item. Entries with an
-    `xfail_reason` get a strict `xfail` marker — they run, and if hark
-    ever passes one the suite fails so the marker can be revisited.
-    Nothing in the manifest is skipped."""
-
-    def collect(self):
-        from scenarios.lifted import manifest as lifted_manifest
-        for entry in lifted_manifest.MANIFEST:
-            scenario_path = UNBOUND_CORPUS / entry.filename
-            name = f"{entry.category}/{Path(entry.filename).stem}"
-            item = RplItem.from_parent(self, name=name, scenario_path=scenario_path, lift=True)
-            if entry.xfail_reason is not None:
-                item.add_marker(pytest.mark.xfail(reason=entry.xfail_reason, strict=True))
-            yield item
 
 
 def pytest_sessionstart(session):
@@ -99,21 +78,14 @@ def pytest_sessionstart(session):
 def pytest_collect_file(parent, file_path: Path):
     if file_path.suffix == ".rpl":
         return RplFile.from_parent(parent, path=file_path)
-    # The manifest module is the single collection entry-point for the
-    # Unbound corpus — pick it up here, not via .rpl auto-discovery.
-    if file_path.name == "manifest.py" and file_path.parent.name == "lifted":
-        return LiftedManifestCollector.from_parent(parent, path=file_path)
     return None
 
 
 # ── Scenario runner ────────────────────────────────────────────────────────
 
 
-def run_scenario(path: Path, lift: bool = False) -> None:
-    text = path.read_text()
-    if lift:
-        text = unbound_lift.lift_unbound_text(text)
-    scenario = rpl.parse_text(path, text)
+def run_scenario(path: Path) -> None:
+    scenario = rpl.parse(path)
     if not scenario.root_hints:
         raise AssertionError(
             f"{path}: scenario must declare `; hark: root-hints = <ip>[, ...]` in header"

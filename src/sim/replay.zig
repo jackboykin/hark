@@ -595,8 +595,8 @@ test "hark walk scenarios settle to today's answers" {
     try testing.expectEqual(0, r.failed);
 }
 
-// test/scenarios/lifted/manifest.py's xfails, strict: a pass there is a
-// divergence note to revisit.
+// Divergences from Unbound, strict: a pass is a note in
+// test/corpus/unbound/DIVERGENCES.md to revisit.
 test "lifted unbound walk scenarios settle to today's answers" {
     const r = try replayDir("test/corpus/unbound", 4, &.{
         "iter_resolve_minimised.rpl",

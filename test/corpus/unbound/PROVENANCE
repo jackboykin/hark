@@ -4,9 +4,8 @@ Date:      2026-05-08
 Path:      testdata/
 
 These .rpl scenarios are testbound fixtures from Unbound. We don't compile
-or link any Unbound source — only the text fixtures are used, transformed
-on-the-fly by test/harness/unbound_lift.py and indexed by
-test/scenarios/lifted/manifest.py.
+or link any Unbound source — only the text fixtures are used, lifted as
+the sim parses them (src/sim/rpl.zig). Where hark differs: DIVERGENCES.md.
 
 Licensed under Unbound's BSD-3-Clause; see LICENSE in this directory.
 

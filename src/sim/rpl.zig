@@ -156,10 +156,9 @@ pub const Diag = struct {
 
 pub const Error = error{ Parse, UnsupportedRType } || dns.Error;
 
-/// Unbound's `server:` … `CONFIG_END` prelude is lifted as the Python
-/// harness does: stripped, qmin and minimal-responses honoured, the first
-/// RANGE's ADDRESS the root hint. No address remapping: nothing here binds
-/// a socket.
+/// Unbound's `server:` … `CONFIG_END` prelude is lifted: stripped, qmin and
+/// minimal-responses honoured, the first RANGE's ADDRESS the root hint. No
+/// address remapping: nothing here binds a socket.
 pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) Error!Scenario {
     var p: Parser = .{ .arena = arena, .diag = diag, .lines = mem.splitScalar(u8, text, '\n') };
     return p.parse(text);
@@ -173,7 +172,7 @@ const Parser = struct {
     /// The current significant line, held until `advance`.
     cur: ?[]const u8 = null,
     /// The lifted corpus's root hint and the default for an ADDRESS-less
-    /// RANGE, as in the Python lifter.
+    /// RANGE.
     first_address: ?na.Address = null,
     scenario: Scenario = .{},
 
@@ -301,8 +300,7 @@ const Parser = struct {
         return p.fail("missing SCENARIO_END");
     }
 
-    /// Skip the corpus prelude to CONFIG_END, reading the two knobs the
-    /// lifter translates.
+    /// Skip the corpus prelude to CONFIG_END, reading the two knobs it sets.
     fn lift(p: *Parser, text: []const u8) Error!void {
         const end = mem.indexOf(u8, text, "CONFIG_END") orelse return;
         const prelude = text[0..end];

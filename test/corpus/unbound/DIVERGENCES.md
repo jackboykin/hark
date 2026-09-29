@@ -1,20 +1,13 @@
 # Cross-cutting divergences: hark vs. Unbound
 
-This is the human-readable companion to `manifest.py`. The manifest is the
-machine-checked source of truth: every lifted Unbound `.rpl` scenario runs,
-and each one that hark answers differently carries an `xfail_reason` string
-and runs **xfail-strict** — if hark ever starts matching Unbound on that
-scenario, pytest reports an *unexpected pass* and the suite goes red, forcing
-whoever closed the gap to come back and revise this picture.
+The sim replays every vendored Unbound `.rpl` here, and the ones hark
+answers differently are listed in `src/sim/replay.zig` as expected failures,
+strict: if hark ever matches Unbound on one, the gate goes red and this
+picture needs revisiting. This doc groups them by underlying reason and says
+whether each is a deliberate choice, an unimplemented feature, or a limit of
+the fixtures.
 
-So the manifest tells you *which* scenarios diverge, one line each. This doc
-groups them into the handful of underlying reasons and says, for each,
-whether it is a deliberate choice, an unimplemented feature, or a limit of
-the test harness.
-
-The lifted `.rpl` fixtures themselves are vendored from Unbound under
-BSD-3-Clause; see `../../corpus/unbound/PROVENANCE` for the upstream commit
-and refresh procedure.
+The fixtures are vendored under BSD-3-Clause; see `PROVENANCE`.
 
 ---
 
@@ -66,7 +59,7 @@ DNAME → CNAME synthesis (RFC 6672) is implemented: from a DNAME in the
 response, and from a cached one. Each remaining scenario fails for its own
 unrelated reason.
 
-`iter_dname_ttl` — **harness limit.** Everything but the AD bit matches,
+`iter_dname_ttl` — **fixture limit.** Everything but the AD bit matches,
 including the §2.2 TTL of the cache-synthesised CNAME. Its zones are signed
 with Unbound's testbound-only `fake-sha1` under trust anchors declared in the
 `server:` prelude that the lifter strips, so no conformant validator can
@@ -85,7 +78,7 @@ answers NOERROR with the partial chain; hark treats a CNAME loop as an error
 and SERVFAILs (RFC 1034 §3.6.2 asks for an error, without naming one). That
 is a loop-signalling choice, not a DNAME one.
 
-**Verdict:** one harness limit and two choices hark makes elsewhere and
+**Verdict:** one fixture limit and two choices hark makes elsewhere and
 would have to reverse globally; none of it is a DNAME gap.
 
 ---
@@ -94,12 +87,9 @@ would have to reverse globally; none of it is a DNAME gap.
 
 **Scenarios:** `iter_domain_sale.rpl`, `iter_domain_sale_nschange.rpl`
 
-These exercise TTL expiry over a simulated clock advance. Hark *does* model
-the clock — a synthetic monotonic clock behind `-Dtesting=true`
-(`src/monotonic.zig:advanceTestClock`), driven by the harness via a control
-query `_advance-clock.<N>.testharness.invalid.` on each `STEP n TIME_PASSES`
-— and the TTL math is correct, which
-`regression/007_time_passes_actually_advances_the_clock.rpl` asserts directly.
+These exercise TTL expiry over a clock advance. The TTL math is correct,
+which `regression/007_time_passes_actually_advances_the_clock.rpl` asserts
+directly.
 
 The divergence is elsewhere: the scenarios' `MATCH all` also asserts the
 AUTHORITY section, and hark intentionally strips AUTHORITY NS records from
@@ -135,17 +125,17 @@ is the stale-glue gap below, not something this scenario discriminates on.
 
 The broader "one failing NS must not condemn the resolution" story (RFC 1034
 §5.3.3) is **fixed**: any rcode but an answer's moves to a sibling
-(`../hark/errors/001_any_rcode_but_an_answers_moves_to_a_sibling.rpl`).
+(`../../scenarios/hark/errors/001_any_rcode_but_an_answers_moves_to_a_sibling.rpl`).
 
 **Verdict:** sibling-fallthrough closed; stale-glue re-resolution is the live
 remainder.
 
 ---
 
-## Fixtures deliberately not vendored
+## Fixtures not vendored
 
-Two reasons an upstream `.rpl` is absent from `../../corpus/unbound/`
-entirely rather than run-as-xfail:
+Upstream `.rpl`s absent from this directory rather than run as expected
+failures:
 
 ### Non-portable upstream signatures
 
@@ -155,26 +145,22 @@ Both depend on Unbound testbound-only machinery: `fake-sha1: yes`, the
 `val-override-date` clock override, and a hardcoded test key fused into the
 Unbound binary. The DNSSEC signatures in these fixtures are unverifiable by
 *any* conformant validator, so there is nothing for hark to match. Equivalent
-coverage is hark-authored under `../hark/dnssec/` using the harness's real
-ECDSA signing.
+coverage is hark-authored under `../../scenarios/hark/dnssec/`, signed for
+real.
 
-### Harness can't run it
+### Not yet tried
 
 **File:** `iter_donotq127.rpl`
 
-Asserts hark refuses to query 127/8 upstreams — but the test harness itself
-*requires* 127/8 (the responder binds `127.0.10.x`). Running it would need a
-per-CIDR `allow-loopback-upstreams` whitelist in hark plus a lifter rule to
-exempt specific 127/8 IPs from loopback remapping. The underlying behaviour
-is covered by the `isNonRoutableNs` unit test in `src/net_address.zig`.
+Asserts hark refuses to query 127/8 upstreams. It was left out because the
+live harness's responders bound `127.0.10.x`; the sim binds nothing, so it
+may run as is. The behaviour is covered by the `isNonRoutableNs` unit test in
+`src/net_address.zig`.
 
 ---
 
 ## A note on the CNAME cluster
 
 The `iter_cname_*` family (`_double`, `_minimise`, `_nx`, `_qnamecopy`,
-`_cache`) once carried hark's largest divergence cluster — this document's
-predecessor was named for it. As of the current manifest they all pass; the
-only CNAME-adjacent live gap is the stale-glue re-resolution under §5. The
-xfail-strict guard means that if a regression reopens any of them, the suite
-will say so.
+`_cache`) all pass; the only CNAME-adjacent gap is the stale-glue
+re-resolution under §5. If a regression reopens any of them, the gate says so.

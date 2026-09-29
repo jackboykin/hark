@@ -220,13 +220,7 @@ _HARK_DIRECTIVE_RE = re.compile(r"^\s*;\s*hark\s*:\s*([a-z0-9\-]+)\s*=\s*(.+?)\s
 
 
 def parse(path: Path) -> Scenario:
-    """Parse hark-shaped .rpl. Callers handling lifted Unbound corpus must
-    run text through `unbound_lift.lift_unbound_text` first."""
-    return parse_text(path, path.read_text())
-
-
-def parse_text(path: Path, text: str) -> Scenario:
-    return _Parser(path, text.splitlines()).parse()
+    return _Parser(path, path.read_text().splitlines()).parse()
 
 
 class _ParseError(Exception):
