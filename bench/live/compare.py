@@ -34,7 +34,7 @@ for name, rounds in passes.items():
     ms = [[r["r"][i][4] for rnd in rounds for r in rnd if not failed(r["r"][i])] for i in (0, 1)]
     for p in (50, 90, 99):
         o, n = pct(ms[0], p), pct(ms[1], p)
-        print(f"{name} ms p{p:<14} {o:10.1f} {n:10.1f}  {100 * (n - o) / o if o else 0:+.1f}%")
+        print(f"{name} ms p{p:<14} {o:10.2f} {n:10.2f}  {100 * (n - o) / o if o else 0:+.1f}%")
 
 d = [collections.defaultdict(list), collections.defaultdict(list)]
 for rnd in passes["cold"]:

@@ -32,7 +32,7 @@ var client = &dns.Client{Transport: &dns.Transport{Dialer: &net.Dialer{Timeout: 
 // [rcode, ad, ede, answers, ms]
 func ask(addr, name string) []any {
 	t := time.Now()
-	ms := func() int64 { return time.Since(t).Round(time.Millisecond).Milliseconds() }
+	ms := func() float64 { return float64(time.Since(t).Microseconds()) / 1000 }
 	m := dns.NewMsg(name, dns.TypeA)
 	m.UDPSize, m.Security = 1232, true
 	r, _, err := client.Exchange(context.Background(), m, "udp", addr)
