@@ -61,7 +61,7 @@ pub const Sim = struct {
     log: std.ArrayList(LogRow) = .empty,
     reply_buf: [65535]u8 = undefined,
 
-    pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, seed: u64) !Sim {
+    pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, seed: u64) !Sim {
         var s: Sim = .{
             .arena = arena,
             .scenario = scenario,
@@ -70,7 +70,7 @@ pub const Sim = struct {
             .prng = std.Random.DefaultPrng.init(seed),
             .gpa = gpa,
         };
-        s.signer = try sign.Signer.init(arena, scenario, seed, s.wall_sec);
+        s.signer = try sign.Signer.init(arena, scenario, mint, s.wall_sec);
         s.ranges = try s.signer.bake(scenario.ranges);
         return s;
     }

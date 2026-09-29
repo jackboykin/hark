@@ -1,5 +1,5 @@
 //! The simulator's signer: test/harness/dnssec.py and the responder's
-//! pre-baking, from the seed. One ECDSA P-256 key per declared zone (RFC
+//! pre-baking. One ECDSA P-256 key per declared zone, from its name (RFC
 //! 6605, flags 256, SHA-256 DS); a placeholder DS takes the child's digest;
 //! every RRset gets an RRSIG from the zone the cut rules say owns it,
 //! inception a day back, expiry a year out unless `sig-validity` says.
@@ -23,9 +23,8 @@ pub const Key = struct {
     key_tag: u16,
     ds: dns.DsData,
 
-    fn init(arena: Allocator, zone: dns.Name, seed: u64) !Key {
+    fn init(arena: Allocator, zone: dns.Name) !Key {
         var h = Sha256.init(.{});
-        h.update(mem.asBytes(&seed));
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         h.update(zone.formatLower(&buf));
         const pair = try Ecdsa.KeyPair.generateDeterministic(h.finalResult());
@@ -43,9 +42,23 @@ pub const Key = struct {
     }
 };
 
-pub const Signer = struct {
+/// A scenario's keys and every signature made with them, kept across its
+/// runs: signing is deterministic, so a set signed again is the same bytes.
+pub const Mint = struct {
     arena: Allocator,
     keys: []Key,
+    signatures: std.AutoHashMapUnmanaged([32]u8, [64]u8) = .empty,
+
+    pub fn init(arena: Allocator, scenario: *const rpl.Scenario) !Mint {
+        const keys = try arena.alloc(Key, scenario.dnssec_zones.len);
+        for (keys, scenario.dnssec_zones) |*k, z| k.* = try Key.init(arena, try dns.parseDottedName(arena, z));
+        return .{ .arena = arena, .keys = keys };
+    }
+};
+
+pub const Signer = struct {
+    arena: Allocator,
+    mint: *Mint,
     /// Wall seconds at minting.
     now: i64,
     validity: i64,
@@ -55,20 +68,18 @@ pub const Signer = struct {
 
     const Served = struct { address: na.Address, key: *const Key };
 
-    pub fn init(arena: Allocator, scenario: *const rpl.Scenario, seed: u64, wall_sec: i64) !Signer {
-        const keys = try arena.alloc(Key, scenario.dnssec_zones.len);
-        for (keys, scenario.dnssec_zones) |*k, z| k.* = try Key.init(arena, try dns.parseDottedName(arena, z), seed);
-        return .{ .arena = arena, .keys = keys, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400 };
+    pub fn init(arena: Allocator, scenario: *const rpl.Scenario, mint: *Mint, wall_sec: i64) !Signer {
+        return .{ .arena = arena, .mint = mint, .now = wall_sec, .validity = scenario.sig_validity orelse 365 * 86400 };
     }
 
     /// The first declared zone's DS: the root, by the loader's rule.
     pub fn anchor(self: *const Signer) ?dns.DsData {
-        return if (self.keys.len > 0) self.keys[0].ds else null;
+        return if (self.mint.keys.len > 0) self.mint.keys[0].ds else null;
     }
 
     /// The ranges with placeholder DS records filled in and RRSIGs appended.
     pub fn bake(self: *Signer, ranges: []const rpl.Range) ![]const rpl.Range {
-        if (self.keys.len == 0) return ranges;
+        if (self.mint.keys.len == 0) return ranges;
         const out = try self.arena.dupe(rpl.Range, ranges);
         for (out) |*r| {
             const entries = try self.arena.dupe(rpl.Entry, r.entries);
@@ -161,7 +172,7 @@ pub const Signer = struct {
 
     fn deepest(self: *const Signer, owner: dns.Name, strictly_above: bool) ?*const Key {
         var best: ?*const Key = null;
-        for (self.keys) |*k| {
+        for (self.mint.keys) |*k| {
             if (!owner.isSubdomainOf(k.zone) or (strictly_above and k.zone.eql(owner))) continue;
             if (best == null or k.zone.labels.len > best.?.zone.labels.len) best = k;
         }
@@ -169,7 +180,7 @@ pub const Signer = struct {
     }
 
     fn keyNamed(self: *const Signer, zone: dns.Name) ?*const Key {
-        for (self.keys) |*k| if (k.zone.eql(zone)) return k;
+        for (self.mint.keys) |*k| if (k.zone.eql(zone)) return k;
         return null;
     }
 
@@ -195,9 +206,15 @@ pub const Signer = struct {
         };
         var buf: [8192]u8 = undefined;
         const data = try rrsig.buildSignedData(&buf, sig, set);
-        var s = try key.pair.signer(null);
-        data.feed(&s);
-        sig.signature = try self.arena.dupe(u8, &(try s.finalize()).toBytes());
+        var h = Sha256.init(.{});
+        data.feed(&h);
+        const minted = try self.mint.signatures.getOrPut(self.mint.arena, h.finalResult());
+        if (!minted.found_existing) {
+            var s = try key.pair.signer(null);
+            data.feed(&s);
+            minted.value_ptr.* = (try s.finalize()).toBytes();
+        }
+        sig.signature = try self.arena.dupe(u8, minted.value_ptr);
         return .{ .name = head.name, .rtype = .rrsig, .rclass = .in, .ttl = head.ttl, .rdata = .{ .rrsig = sig } };
     }
 

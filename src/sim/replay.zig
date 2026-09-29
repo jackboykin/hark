@@ -8,6 +8,7 @@ const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sim = @import("sim.zig");
+const sign = @import("sign.zig");
 const graph = @import("../graph.zig");
 const answer = @import("../answer.zig");
 const response = @import("../response.zig");
@@ -32,12 +33,12 @@ pub const Options = struct {
     trace: bool = false,
 };
 
-fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, opts: Options, report: *Report) !void {
+fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, opts: Options, report: *Report) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var s = try sim.Sim.init(arena, gpa, scenario, opts.seed);
+    var s = try sim.Sim.init(arena, gpa, scenario, mint, opts.seed);
     defer s.deinit();
     var g = try graph.Graph.init(gpa, .{
         .qmin = scenario.qmin orelse true,
@@ -437,11 +438,11 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
 
-/// One scenario under one seed, run twice.
+/// One scenario under every seed, each run twice.
 const Job = struct {
     path: []const u8,
     scenario: rpl.Scenario,
-    seed: u64,
+    seeds: u64,
     expect_fail: bool,
     failed: bool = false,
     tally: graph.Tally = .{},
@@ -449,7 +450,7 @@ const Job = struct {
 };
 
 /// Replay every scenario under `root` across `seeds`, checking
-/// that one seed replays to one upstream query log. The runs share
+/// that one seed replays to one upstream query log. Scenarios share
 /// nothing, so debug spreads them over every core.
 fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed {
     const io = testing.io;
@@ -477,8 +478,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         var expect_fail = false;
         for (xfail) |x| expect_fail = expect_fail or mem.eql(u8, x, ent.basename);
         const path = try arena.dupe(u8, ent.path);
-        var seed: u64 = 1;
-        while (seed <= seeds) : (seed += 1) try jobs.append(arena, .{ .path = path, .scenario = scenario, .seed = seed, .expect_fail = expect_fail });
+        try jobs.append(arena, .{ .path = path, .scenario = scenario, .seeds = seeds, .expect_fail = expect_fail });
     }
     var next: std.atomic.Value(usize) = .init(0);
     var leaked: std.atomic.Value(bool) = .init(false);
@@ -491,7 +491,7 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
     for (jobs.items) |j| {
         inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(r.tally, f) += @field(j.tally, f);
         r.cells += j.cells;
-        r.scenarios += 1;
+        r.scenarios += j.seeds;
         r.failed += @intFromBool(j.failed);
     }
     if (leaked.load(.monotonic)) r.failed += 1;
@@ -531,29 +531,41 @@ fn replayJobs(jobs: []Job, next: *std.atomic.Value(usize), leaked: *std.atomic.V
 }
 
 fn replayJob(gpa: Allocator, j: *Job) void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var mint = sign.Mint.init(arena_state.allocator(), &j.scenario) catch |err| {
+        j.failed = true;
+        std.debug.print("{s}: keys: {t}\n", .{ j.path, err });
+        return;
+    };
+    var seed: u64 = 1;
+    while (seed <= j.seeds) : (seed += 1) replaySeed(gpa, j, &mint, seed);
+}
+
+fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     var first: Report = .{};
     defer gpa.free(first.log);
-    const result = runScenario(gpa, &j.scenario, .{ .seed = j.seed }, &first);
-    j.tally = first.tally;
-    j.cells = first.cells;
+    const result = runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &first);
+    inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(j.tally, f) += @field(first.tally, f);
+    j.cells += first.cells;
     if (j.expect_fail) {
         if (result) |_| {
             j.failed = true;
-            std.debug.print("{s}: passed but is marked xfail\n", .{j.path});
+            std.debug.print("{s} (seed {d}): passed but is marked xfail\n", .{ j.path, seed });
         } else |_| {}
         return;
     }
     result catch |err| {
         j.failed = true;
-        std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, j.seed, first.phase, first.step, first.msg, @errorName(err), first.log });
+        std.debug.print("{s} (seed {d}): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, first.phase, first.step, first.msg, @errorName(err), first.log });
         return;
     };
     var second: Report = .{};
     defer gpa.free(second.log);
-    runScenario(gpa, &j.scenario, .{ .seed = j.seed }, &second) catch {};
+    runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &second) catch {};
     if (!mem.eql(u8, first.log, second.log)) {
         j.failed = true;
-        std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ j.path, j.seed });
+        std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ j.path, seed });
     }
 }
 
@@ -584,7 +596,8 @@ test "trace one scenario" {
     const scenario = try rpl.parse(arena, text, &diag);
     var report: Report = .{};
     defer testing.allocator.free(report.log);
-    const result = runScenario(testing.allocator, &scenario, .{ .seed = 1, .trace = true }, &report);
+    var mint = try sign.Mint.init(arena, &scenario);
+    const result = runScenario(testing.allocator, &scenario, &mint, .{ .seed = 1, .trace = true }, &report);
     std.debug.print("{t} step {d}: {s}\n{s}", .{ report.phase, report.step, report.msg, report.log });
     try result;
 }
@@ -689,7 +702,8 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
     const q = scenario.steps[0].entry.?.questions[0];
     const ns1 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 3 }, 53));
     const ns2 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 4 }, 53));
-    var s = try sim.Sim.init(arena, testing.allocator, &scenario, seed);
+    var mint = try sign.Mint.init(arena, &scenario);
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, seed);
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger_ms }, s.edge());
     defer g.deinit();
@@ -805,7 +819,8 @@ test "the door counts exchanges in flight" {
     , &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     const other = try dns.parseDottedName(arena, "other.example.com.");
-    var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
+    var mint = try sign.Mint.init(arena, &scenario);
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
     defer g.deinit();
@@ -854,7 +869,8 @@ test "an exchange that never left the host writes no estimate" {
         \\SCENARIO_END
     , &diag);
     const q = scenario.steps[0].entry.?.questions[0];
-    var s = try sim.Sim.init(arena, testing.allocator, &scenario, 1);
+    var mint = try sign.Mint.init(arena, &scenario);
+    var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
     defer g.deinit();
