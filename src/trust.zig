@@ -8,6 +8,7 @@ const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 const graph = @import("graph.zig");
 const denial = @import("denial.zig");
+const store = @import("store.zig");
 const walk = @import("walk.zig");
 
 const Graph = graph.Graph;
@@ -94,17 +95,55 @@ const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validati
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
-/// to set (RFC 4035 §4.7). With the validation budget spent nothing was
+/// to set (RFC 4035 §4.7). If `claim` is the CNAME at the name, its copy
+/// in the alias goes too. With the validation budget spent nothing was
 /// proven: the stop is the limit's, named, and a zone draining its own
 /// budget must not drop a victim's bytes.
-fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
+fn failBogus(g: *Graph, id: CellId, rid: CellId, claim: ?Claims.Claim) !void {
     if (budgetSpent(g)) |why| return g.fail(id, why);
     if (!g.spent(g.payer)) {
         const t = g.cell(rid);
         t.expires_ns = @min(t.expires_ns, g.now());
         if (t.blob) |b| g.store.drop(t.key, b);
+        if (claim) |c| if (c.is == .rrset and c.rtype == .cname and c.owner.eql(t.name)) try dropAlias(g, t);
     }
     try g.fail(id, .{ .code = .dnssec_bogus });
+}
+
+fn dropAlias(g: *Graph, t: *const graph.Cell) !void {
+    var kb: graph.KeyBuf = undefined;
+    const key = graph.Key.of(&kb, .rrset, t.name, .cname);
+    const failed = t.state.fact.rrset.answers;
+    if (g.index.get(key)) |id| {
+        const c = g.cell(id);
+        if (c.state == .fact and provesNoMore(c.state.fact.rrset.answers, failed)) c.expires_ns = @min(c.expires_ns, g.now());
+    }
+    const e = g.store.any(key) orelse return;
+    const v = try store.Store.parse(g.scratch.allocator(), e.blob);
+    if (provesNoMore(v.rrset.answers, failed)) g.store.drop(key, e.blob);
+}
+
+fn provesNoMore(alias: []const RR, failed: []const RR) bool {
+    return for (alias) |rr| {
+        const had = for (failed) |f| {
+            if (f.rtype == rr.rtype and f.name.eql(rr.name) and sameRdata(f, rr)) break true;
+        } else false;
+        if (!had) break false;
+    } else true;
+}
+
+/// An alias holds only a CNAME and its signatures.
+fn sameRdata(a: RR, b: RR) bool {
+    return switch (a.rdata) {
+        .cname => |t| t.eql(b.rdata.cname),
+        .rrsig => |s| {
+            const o = b.rdata.rrsig;
+            return s.type_covered == o.type_covered and s.algorithm == o.algorithm and s.labels == o.labels and
+                s.original_ttl == o.original_ttl and s.sig_expiration == o.sig_expiration and s.sig_inception == o.sig_inception and
+                s.key_tag == o.key_tag and s.signer_name.eql(o.signer_name) and std.mem.eql(u8, s.signature, o.signature);
+        },
+        else => false,
+    };
 }
 
 /// The validation budget spent is the asker's limit, never bogus. A query
@@ -121,7 +160,7 @@ fn budgetSpent(g: *Graph) ?Failure {
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
     if (!g.spent(g.payer)) try g.remember(g.cell(id).key, refused);
-    try failBogus(g, id, rid);
+    try failBogus(g, id, rid, null);
 }
 
 fn capExpiry(g: *Graph, cap: u32) i64 {
@@ -367,7 +406,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
                 s.fault = null;
                 s.probe = .{};
             },
-            .none => return if (s.fault.?.failure(g)) |why| g.fail(id, why) else failBogus(g, id, s.target),
+            .none => return if (s.fault.?.failure(g)) |why| g.fail(id, why) else failBogus(g, id, s.target, c),
         }
     }
 }
@@ -384,7 +423,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
     const within = if (zd.status == .absent) proof.authoritySigner(zd.records).? else r.zone;
     if (!s.fetched) {
         if (flooded(r, qtype)) {
-            try failBogus(g, id, s.target);
+            try failBogus(g, id, s.target, null);
             return null;
         }
         s.fetched = true;
