@@ -49,6 +49,16 @@ RANGE_BEGIN 0 100
       example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
       www.example. 3600 IN NSEC z.example. A RRSIG NSEC
   ENTRY_END
+  ; Asked directly, www.example returns its real, signed A.
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
   ; The unsigned child's CNAME is insecure; the A beside it is a signed
   ; name's, forged.
   ENTRY_BEGIN
