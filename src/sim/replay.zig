@@ -94,7 +94,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
                     report.msg = "CHECK_ANSWER before any QUERY";
                     return error.ScenarioFailed;
                 };
-                if (answerMismatch(actual, st.entry.?, true)) |why| {
+                if (answerMismatch(actual, st.entry.?, .cold)) |why| {
                     if (opts.trace) printSections(actual);
                     report.msg = why;
                     return error.ScenarioFailed;
@@ -147,7 +147,8 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
 /// the same and from memory alone unless the answer was never a fact (TTL
 /// 0). A cell that expired as it settled, or a memoised head that lost its
 /// chain, shows up as an upstream query or a different answer. The last
-/// check of a question is in force; TTLs have aged and are not compared.
+/// check of a question is in force; TTLs have aged and are not compared,
+/// and a failure still held answers Cached Error (RFC 8914 §4.14).
 fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
@@ -165,7 +166,7 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
-        if (answerMismatch(actual.msg, check.entry.?, false)) |why| {
+        if (answerMismatch(actual.msg, check.entry.?, .warm)) |why| {
             report.msg = why;
             return error.ScenarioFailed;
         }
@@ -301,10 +302,10 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
 
 // ── CHECK_ANSWER ───────────────────────────────────────────────────────
 
-fn answerMismatch(actual: dns.Message, e: rpl.Entry, compare_ttl: bool) ?[]const u8 {
+fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) ?[]const u8 {
     var m = e.match;
     if (m.isEmpty()) m.all = true;
-    m.ttl = m.ttl and compare_ttl;
+    m.ttl = m.ttl and pass == .cold;
     if (m.all) {
         m.rcode = true;
         m.flags = true;
@@ -326,8 +327,11 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, compare_ttl: bool) ?[]const
     if (m.additional and !sectionEql(actual.additionals, e.additionals, m.ttl)) return "ADDITIONAL mismatch";
     if (e.ede) |want| {
         const opt = actual.opt orelse return "EDE mismatch";
+        const held: u16 = @intFromEnum(dns.Ede.Code.cached_error);
         for (opt.options) |o| {
-            if (o.code == dns.edns_opt_ede and o.data.len >= 2 and mem.readInt(u16, o.data[0..2], .big) == want) break;
+            if (o.code != dns.edns_opt_ede or o.data.len < 2) continue;
+            const code = mem.readInt(u16, o.data[0..2], .big);
+            if (code == want or (pass == .warm and code == held)) break;
         } else return "EDE mismatch";
     }
     return null;
