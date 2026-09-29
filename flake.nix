@@ -49,7 +49,7 @@
             (zigFor z)
             nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck
             unbound pdns-recursor knot-resolver_6 bind
-            (python3.withPackages (p: [ p.dnspython ]))
+            python3 go_1_27
           ];
         };
       });

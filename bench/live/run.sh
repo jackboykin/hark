@@ -10,6 +10,7 @@ OUT=${OUT:-$D/out/$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 R=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$R"' EXIT
+go build -C "$D/../../test" -o "$R/ask" ask.go || exit 1
 up() { # label=side port round
   local log=$OUT/${1%%=*}.$3.log side=${1#*=}
   if [[ $side == unbound ]]; then
@@ -30,7 +31,7 @@ for r in $(seq "$ROUNDS"); do
   PIDS=()
   up "$A" 5361 "$r"
   up "$B" 5362 "$r"
-  for pass in ${PASSES:-cold hot}; do python3 "$D/ask.py" "$NAMES" "$RATE" "$OUT/$r.$pass.jsonl" 5361 5362; done
+  for pass in ${PASSES:-cold hot}; do "$R/ask" "$NAMES" "$RATE" "$OUT/$r.$pass.jsonl" 5361 5362; done
   grep -E 'VmHWM|VmRSS' "/proc/${PIDS[0]}/status" >"$OUT/${A%%=*}.$r.mem"
   grep -E 'VmHWM|VmRSS' "/proc/${PIDS[1]}/status" >"$OUT/${B%%=*}.$r.mem"
   kill -TERM "${PIDS[@]}"
