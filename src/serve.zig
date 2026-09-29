@@ -360,8 +360,7 @@ const Server = struct {
     /// Answered once, at any age: worth new work while the core is behind,
     /// unlike a name never seen (a random-subdomain flood).
     fn known(s: *Server, q: dns.Question) bool {
-        var kb: graph.KeyBuf = undefined;
-        return s.g.store.any(graph.Key.of(&kb, .rrset, q.name, q.qtype)) != null;
+        return s.g.storedHop(q.name, q.qtype, .any) != null;
     }
 
     /// Parks `p` on the cell it waits for; released if it cannot be.

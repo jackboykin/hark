@@ -57,6 +57,8 @@ pub const RType = enum(u16) {
     rp = 17,
     afsdb = 18,
     rt = 21,
+    /// May sit beside a CNAME (RFC 4035 §2.5).
+    key = 25,
     px = 26,
     aaaa = 28,
     srv = 33,

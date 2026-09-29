@@ -268,11 +268,21 @@ pub const Links = struct {
     }
 };
 
-/// `answer(name, type)`: `rrset(name, type)`, then each alias's target
-/// until an RRset ends the chain. Length and loop checks run at demand
-/// time; a chain that fails them is a resolution failure, like a failed hop.
+/// Can a CNAME at a name answer a `qtype` question there? A CNAME is the
+/// name's only data, so yes (RFC 1034 §3.6.2), except for the CNAME itself
+/// and the types allowed beside it (RFC 4035 §2.5).
+pub fn cnameAnswers(qtype: dns.RType) bool {
+    return switch (qtype) {
+        .cname, .rrsig, .nsec, .key => false,
+        else => true,
+    };
+}
+
+/// `answer(name, type)`: follows aliases from `name`, one hop per name as
+/// `Graph.demandHop` picks, until an RRset ends the chain. Length and loop
+/// checks run at demand time; a chain that fails them is a resolution
+/// failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
@@ -307,7 +317,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             }
         }
         // Nothing waits on an answer, so only an orphaned root is refused.
-        s.hops[s.n] = try g.demand(id, Key.of(&kb, .rrset, next, qtype), next) orelse
+        s.hops[s.n] = try g.demandHop(id, next, qtype) orelse
             return failAnswer(g, id, unreachable_authority);
         s.n += 1;
     }

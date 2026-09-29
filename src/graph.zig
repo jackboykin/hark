@@ -925,9 +925,8 @@ pub const Graph = struct {
     /// reads the clock once per event, so a refresh shares an instant with
     /// what its trigger fetched. A verdict is stored when judged, however
     /// old its evidence, so it is judged again.
-    fn lookup(g: *Graph, key: Key, name: dns.Name) !?CellId {
-        const live = g.index.get(key);
-        if (g.served(key, live)) |s| return switch (s) {
+    fn lookup(g: *Graph, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
+        if (found) |s| return switch (s) {
             .stored => |e| g.liveVersion(live, e) orelse try g.materialise(key, name, e),
             .live => |id| id,
         };
@@ -1036,14 +1035,12 @@ pub const Graph = struct {
     /// rule would have work to do: a hop not stored, not judged or no
     /// longer proven (DNSSEC on), or a broken chain. The blobs are the
     /// store's; the caller refs what it keeps.
-    pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: enum { fresh, any }) !?[]const Recalled {
+    pub fn recall(g: *Graph, arena: Allocator, name: dns.Name, qtype: dns.RType, age: Age) !?[]const Recalled {
         var hops: std.ArrayList(Recalled) = .empty;
         var links: walk.Links = .{};
         var next = name;
         while (true) {
-            var kb: KeyBuf = undefined;
-            const key = Key.of(&kb, .rrset, next, qtype);
-            const e = (if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key)) orelse return null;
+            const e = g.storedHop(next, qtype, age) orelse return null;
             const v = e.blob.verdict;
             if (g.cfg.trust_anchor != null and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
             const r: store.Rrset = .of(e.blob);
@@ -1063,6 +1060,22 @@ pub const Graph = struct {
         }
     }
 
+    pub const Age = enum { fresh, any };
+
+    /// `demandHop`, read from the store. Inline: it is a hit's lookup.
+    pub inline fn storedHop(g: *Graph, name: dns.Name, qtype: dns.RType, age: Age) ?store.Entry {
+        var kb: KeyBuf = undefined;
+        const own = @call(.always_inline, Key.of, .{ &kb, .rrset, name, qtype });
+        if (g.entry(own, age)) |e| return e;
+        if (!walk.cnameAnswers(qtype)) return null;
+        const e = g.entry(.{ .kind = .rrset, .rtype = .cname, .name = own.name }, age) orelse return null;
+        return if (store.Rrset.of(e.blob).kind == .alias) e else null;
+    }
+
+    inline fn entry(g: *Graph, key: Key, age: Age) ?store.Entry {
+        return if (age == .fresh) g.store.get(key, g.now()) else g.store.any(key);
+    }
+
     /// No cell, no wait: `demand` is the only pin.
     pub fn peek(g: *Graph, key: Key) !?Fact {
         const live = g.index.get(key);
@@ -1074,7 +1087,32 @@ pub const Graph = struct {
     /// Null on a cycle, or on new work for an orphan. New work that failed
     /// recently settles as that failure, its rule never run.
     pub fn demand(g: *Graph, by: CellId, key: Key, name: dns.Name) !?CellId {
-        if (try g.lookup(key, name)) |id| {
+        const live = g.index.get(key);
+        return g.demandFound(by, key, name, live, g.served(key, live));
+    }
+
+    /// `demand` for a step of an answer's chain at `name`: the type's own
+    /// set where held, as it may hold more of the chain; else an alias held
+    /// at the name; else the own set, to fetch. Each key is read once.
+    pub fn demandHop(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType) !?CellId {
+        var kb: KeyBuf = undefined;
+        const own = Key.of(&kb, .rrset, name, qtype);
+        const live = g.index.get(own);
+        const found = g.served(own, live);
+        const holds_own = if (found) |s| s == .stored or g.cell(s.live).state == .fact else false;
+        if (!holds_own and walk.cnameAnswers(qtype)) {
+            const alias: Key = .{ .kind = .rrset, .rtype = .cname, .name = own.name };
+            const alias_live = g.index.get(alias);
+            if (g.served(alias, alias_live)) |s| if (switch (s) {
+                .stored => |e| store.Rrset.of(e.blob).kind == .alias,
+                .live => |id| g.cell(id).state == .fact and g.cell(id).state.fact.rrset.kind == .alias,
+            }) return g.demandFound(by, alias, name, alias_live, s);
+        }
+        return g.demandFound(by, own, name, live, found);
+    }
+
+    fn demandFound(g: *Graph, by: CellId, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
+        if (try g.lookup(key, name, live, found)) |id| {
             if (!g.fresh(id) and g.reaches(by, id)) return null;
             try g.pin(id, by);
             return id;

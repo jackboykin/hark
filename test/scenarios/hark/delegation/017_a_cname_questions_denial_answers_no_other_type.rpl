@@ -1,0 +1,78 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a cname question's denial answers no other type
+
+; www.example has an address but no CNAME. Asking for its CNAME stores a
+; NODATA where an alias would be. That is not an alias, so the AAAA
+; question still goes upstream.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN CNAME
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. hostmaster.example. 1 3600 600 86400 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN AAAA
+    SECTION ANSWER
+      www.example. 300 IN AAAA 2001:db8::1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN CNAME
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN CNAME
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN AAAA
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN AAAA
+  SECTION ANSWER
+    www.example. 300 IN AAAA 2001:db8::1
+ENTRY_END
+
+SCENARIO_END
