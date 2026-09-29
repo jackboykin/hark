@@ -33,12 +33,22 @@ RANGE_BEGIN 0 4
       b.example. IN DS
     SECTION AUTHORITY
       example. 60 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 60
-      b.example. 60 IN NSEC z.example. NS RRSIG NSEC
+      b.example. 60 IN NSEC www.example. NS RRSIG NSEC
   ENTRY_END
 RANGE_END
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 3600
+      www.example. 3600 IN NSEC z.example. A RRSIG NSEC
+  ENTRY_END
   ; The unsigned child's CNAME is insecure; the A beside it is a signed
   ; name's, forged.
   ENTRY_BEGIN
@@ -75,7 +85,7 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags rcode question answer
+  MATCH flags rcode question answer ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     x.b.example. IN A
@@ -111,7 +121,7 @@ ENTRY_END
 
 STEP 7 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags rcode question
+  MATCH flags rcode question ede=6
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     x.example. IN A
