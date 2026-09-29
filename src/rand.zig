@@ -6,6 +6,15 @@ const linux = std.os.linux;
 
 threadlocal var csprng: ?std.Random.DefaultCsprng = null;
 
+/// Seeds every hash of what a stranger picks (names, server addresses), so
+/// nobody can grind keys offline into one bucket. Set once, before anything
+/// is hashed; 0 in tests, so replays repeat.
+pub var hash_seed: u64 = 0;
+
+pub fn randomizeHashSeed() void {
+    hash_seed = thread.int(u64);
+}
+
 pub const thread: std.Random = .{ .ptr = undefined, .fillFn = fill };
 
 fn fill(_: *anyopaque, buf: []u8) void {

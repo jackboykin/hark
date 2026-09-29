@@ -7,16 +7,6 @@ const mem = std.mem;
 const sys = @import("sys_union.zig");
 const rand = @import("rand.zig");
 
-/// Hash seed randomized at startup so an authoritative server serving crafted
-/// glue addresses can't engineer bucket collisions against the graph's
-/// per-server estimates. Stays 0 in tests (deterministic); production calls
-/// `randomizeHashSeed`.
-var hash_seed: u64 = 0;
-
-pub fn randomizeHashSeed() void {
-    hash_seed = rand.thread.int(u64);
-}
-
 pub const Address = std.Io.net.IpAddress;
 pub const Ip6 = std.Io.net.Ip6Address;
 
@@ -81,7 +71,7 @@ pub const AddressKey = struct {
             const lo = mem.readInt(u64, key.addr[0..8], .little);
             const hi = mem.readInt(u64, key.addr[8..16], .little);
             const tag = (@as(u64, key.family) << 16) | key.port;
-            var h: u64 = hash_seed ^ 0xcbf29ce484222325;
+            var h: u64 = rand.hash_seed ^ 0xcbf29ce484222325;
             h ^= lo;
             h *%= 0x100000001b3;
             h ^= hi;
@@ -250,13 +240,13 @@ test "AddressKey.HashCtx: eql peers hash equal, distinct peers diverge" {
     try testing.expect(ctx.hash(a) != ctx.hash(e));
 }
 
-test "AddressKey.HashCtx: randomizeHashSeed shifts the hash space" {
+test "AddressKey.HashCtx: the hash seed shifts the hash space" {
     const ctx: AddressKey.HashCtx = .{};
     const k = AddressKey.fromAddress(initIp4(.{ 1, 2, 3, 4 }, 53));
     const h0 = ctx.hash(k);
-    const saved = hash_seed;
-    defer hash_seed = saved;
-    hash_seed = 0xdeadbeefcafef00d;
+    const saved = rand.hash_seed;
+    defer rand.hash_seed = saved;
+    rand.hash_seed = 0xdeadbeefcafef00d;
     const h1 = ctx.hash(k);
     try testing.expect(h0 != h1);
 }

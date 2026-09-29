@@ -11,6 +11,7 @@ const posix = std.posix;
 const mem = std.mem;
 const build_options = @import("build_options");
 const na = @import("net_address.zig");
+const rand = @import("rand.zig");
 const sys = @import("sys_union.zig");
 const acl = @import("acl.zig");
 const config = @import("config.zig");
@@ -697,7 +698,7 @@ const Server = struct {
 };
 
 pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
-    na.randomizeHashSeed();
+    rand.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
     const anchors = cfg.trustAnchors();

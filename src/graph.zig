@@ -12,6 +12,7 @@
 //! trust in trust.zig, aggressive denial in denial.zig; one core.
 const std = @import("std");
 const builtin = @import("builtin");
+const rand = @import("rand.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
@@ -118,7 +119,7 @@ pub const Key = struct {
     }
 
     fn hashName(name: []const u8) u32 {
-        return @truncate(std.hash.Wyhash.hash(0, name));
+        return @truncate(std.hash.Wyhash.hash(rand.hash_seed, name));
     }
 
     /// A Fibonacci multiply, folded: the kind and type reach the low bits,
@@ -1405,7 +1406,7 @@ test "a cell replacing an expired one takes over the index entry's key" {
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1432,7 +1433,7 @@ test "a joiner starts nothing, and past the work ceiling joins only what is sett
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{}, .max_work_bytes = 1 }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{}, .max_work_bytes = 1 }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1458,7 +1459,7 @@ test "an evicted root cut is re-derived, not walked" {
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     const root_cut: Key = .init(.cut, "", .a);
     g.store.drop(root_cut, g.store.any(root_cut).?.blob);
@@ -1480,7 +1481,7 @@ test "a shared cell is paid by a waiting question with room, not its first deman
         fn send(_: *anyopaque, _: Exchange) anyerror!void {}
         fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
     };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1504,4 +1505,13 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.payer = &g.unpaid;
     g.unhold(first);
     g.unhold(second);
+}
+
+test "a key's name hash follows the process seed" {
+    const saved = rand.hash_seed;
+    defer rand.hash_seed = saved;
+    const a: Key = .init(.rrset, "www.example", .a);
+    rand.hash_seed = 0xdeadbeefcafef00d;
+    const b: Key = .init(.rrset, "www.example", .a);
+    try std.testing.expect(a.name_hash != b.name_hash);
 }

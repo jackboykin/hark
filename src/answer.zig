@@ -6,6 +6,7 @@ const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
 const store = @import("store.zig");
+const rand = @import("rand.zig");
 const dns64 = @import("dns64.zig");
 const special_use = @import("special_use.zig");
 
@@ -536,9 +537,17 @@ fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
 /// RFC's 5 minutes; an answer forgets it. Keyed (qname, qtype, CD), since a
 /// CD client is owed bogus data. Policy over no fact, so it is the server's.
 pub const Failures = struct {
-    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    map: std.HashMapUnmanaged([]const u8, Entry, Seeded, std.hash_map.default_max_load_percentage) = .empty,
 
     const Entry = struct { until_ns: i64, window_s: u32, ede: dns.Ede };
+    const Seeded = struct {
+        pub fn hash(_: Seeded, k: []const u8) u64 {
+            return std.hash.Wyhash.hash(rand.hash_seed, k);
+        }
+        pub fn eql(_: Seeded, a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
     const max_window_s = 300;
     const max_entries = 4096;
 
