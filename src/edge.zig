@@ -232,10 +232,12 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
 fn fire(e: *Edge) !void {
     while (e.timers.peek()) |t| {
         if (t.at_ns > e.now_ns) break;
+        // Reserved before the timer leaves the heap, so its event can't be lost.
+        try e.queue.ensureUnusedCapacity(e.gpa, 1);
         _ = e.timers.pop();
         switch (t.kind) {
-            .wake => try e.push(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
-            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) try e.push(e.finish(t.id, .timeout)),
+            .wake => e.queue.appendAssumeCapacity(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
+            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) e.queue.appendAssumeCapacity(e.finish(t.id, .timeout)),
         }
     }
 }
@@ -310,4 +312,24 @@ test "a consumer that stops between events leaves nothing behind" {
 
     try std.testing.expect((try e.next(std.math.maxInt(i64))).? == .client);
     try std.testing.expectEqual(2, e.batch_len);
+}
+
+test "a timer whose event can't be queued stays due" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var e = try Edge.init(failing.allocator());
+    defer e.deinit();
+
+    const server = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer sys.close(server);
+    try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    var sa: na.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    try sys.getsockname(server, &sa.any, &sa_len);
+    try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = 0 });
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, e.next(0));
+    failing.fail_index = std.math.maxInt(usize);
+    const ev = ((try e.next(0)) orelse return error.TestUnexpectedResult).exchange;
+    try std.testing.expect(ev.id == 1 and ev.completion == .timeout);
 }
