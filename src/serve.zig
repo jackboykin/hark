@@ -747,10 +747,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             continue;
         };
         switch (ev) {
-            .exchange => |x| {
-                defer if (x.completion == .reply) gpa.free(x.completion.reply);
-                try g.complete(x.id, x.completion);
-            },
+            .exchange => |x| try g.complete(x.id, x.completion),
             .client => |c| try s.onClient(c.token, c.events),
         }
         try s.settle();

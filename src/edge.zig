@@ -19,7 +19,7 @@ const Exchange = graph.Exchange;
 const Edge = @This();
 
 pub const Event = union(enum) {
-    /// Reply bytes are the consumer's to free.
+    /// Reply bytes are borrowed until the next call to `next`.
     exchange: struct { id: CellId, completion: Completion },
     client: struct { token: u32, events: u32 },
 };
@@ -66,8 +66,15 @@ wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
 flights: std.AutoHashMapUnmanaged(CellId, Flight) = .empty,
+/// Events that own nothing.
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
+/// A reply is read only when its turn comes, so the consumer may stop at
+/// any event.
+batch: [64]linux.epoll_event = undefined,
+batch_len: usize = 0,
+batch_at: usize = 0,
+rx: [dns.max_message_len]u8 = undefined,
 
 pub fn init(gpa: Allocator) !Edge {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -166,10 +173,9 @@ fn close(e: *Edge, f: Flight) void {
     }
 }
 
-fn finish(e: *Edge, id: CellId, completion: Completion) !void {
-    const f = e.flights.fetchRemove(id) orelse return;
-    e.close(f.value);
-    try e.push(.{ .exchange = .{ .id = id, .completion = completion } });
+fn finish(e: *Edge, id: CellId, completion: Completion) Event {
+    e.close(e.flights.fetchRemove(id).?.value);
+    return .{ .exchange = .{ .id = id, .completion = completion } };
 }
 
 fn schedule(e: *Edge, at_ns: i64, id: CellId, gen: u32, kind: @FieldType(Timer, "kind")) !u32 {
@@ -197,6 +203,11 @@ fn pop(e: *Edge) ?Event {
 pub fn next(e: *Edge, until_ns: i64) !?Event {
     while (true) {
         if (e.pop()) |ev| return ev;
+        while (e.batch_at < e.batch_len) {
+            const polled = e.batch[e.batch_at];
+            e.batch_at += 1;
+            if (try e.ready(polled)) |ev| return ev;
+        }
         e.tick();
         try e.fire();
         if (e.pop()) |ev| return ev;
@@ -205,15 +216,14 @@ pub fn next(e: *Edge, until_ns: i64) !?Event {
         if (e.timers.peek()) |t| wake_at = @min(wake_at, t.at_ns);
         const left = @max(wake_at - e.now_ns, 0);
         const ms: i32 = @intCast(@min(std.math.divCeil(i64, left, std.time.ns_per_ms) catch unreachable, std.math.maxInt(i32)));
-        var evs: [64]linux.epoll_event = undefined;
-        const rc = linux.epoll_wait(e.epfd, &evs, evs.len, ms);
-        const n: usize = switch (linux.errno(rc)) {
+        const rc = linux.epoll_wait(e.epfd, &e.batch, e.batch.len, ms);
+        e.batch_len = switch (linux.errno(rc)) {
             .SUCCESS => rc,
             .INTR => 0,
             else => return error.EpollWaitFailed,
         };
+        e.batch_at = 0;
         e.tick();
-        for (evs[0..n]) |ev| try e.ready(ev);
     }
 }
 
@@ -225,37 +235,36 @@ fn fire(e: *Edge) !void {
         _ = e.timers.pop();
         switch (t.kind) {
             .wake => try e.push(.{ .exchange = .{ .id = t.id, .completion = .{ .wake = t.gen } } }),
-            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) try e.finish(t.id, .timeout),
+            .timeout => if (e.flights.get(t.id)) |f| if (f.seq == t.gen) try e.push(e.finish(t.id, .timeout)),
         }
     }
 }
 
-fn ready(e: *Edge, ev: linux.epoll_event) !void {
+fn ready(e: *Edge, ev: linux.epoll_event) !?Event {
     const d = ev.data.u64;
-    if (d & client_tag != 0) return e.push(.{ .client = .{ .token = @truncate(d), .events = ev.events } });
+    if (d & client_tag != 0) return .{ .client = .{ .token = @truncate(d), .events = ev.events } };
     const id: CellId = @truncate(d);
-    const f = e.flights.getPtr(id) orelse return;
+    const f = e.flights.getPtr(id) orelse return null;
     if (f.tcp) |t| return e.readyTcp(id, f.fd, t);
-    var buf: [dns.max_message_len]u8 = undefined;
-    const rc = linux.recvfrom(f.fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
-    switch (linux.errno(rc)) {
-        .SUCCESS => try e.finish(id, .{ .reply = try e.gpa.dupe(u8, buf[0..rc]) }),
-        .AGAIN, .INTR => {},
+    const rc = linux.recvfrom(f.fd, &e.rx, e.rx.len, linux.MSG.DONTWAIT, null, null);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => e.finish(id, .{ .reply = e.rx[0..rc] }),
+        .AGAIN, .INTR => null,
         // ICMP unreachable and kin: nobody there.
-        else => try e.finish(id, .timeout),
-    }
+        else => e.finish(id, .timeout),
+    };
 }
 
-fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !void {
+fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !?Event {
     if (t.written < t.query.len) {
         const rc = linux.write(fd, t.query[t.written..].ptr, t.query.len - t.written);
         switch (linux.errno(rc)) {
             .SUCCESS => t.written += rc,
-            .AGAIN, .INTR => return,
+            .AGAIN, .INTR => return null,
             else => return e.finish(id, .timeout),
         }
         if (t.written == t.query.len) try e.ctl(linux.EPOLL.CTL_MOD, fd, linux.EPOLL.IN, id);
-        return;
+        return null;
     }
     const rc = linux.read(fd, t.reply[t.got..].ptr, t.reply.len - t.got);
     switch (linux.errno(rc)) {
@@ -263,10 +272,42 @@ fn readyTcp(e: *Edge, id: CellId, fd: posix.fd_t, t: *Tcp) !void {
             if (rc == 0) return e.finish(id, .timeout);
             t.got += rc;
         },
-        .AGAIN, .INTR => return,
+        .AGAIN, .INTR => return null,
         else => return e.finish(id, .timeout),
     }
-    if (t.got < 2) return;
+    if (t.got < 2) return null;
     const len = mem.readInt(u16, t.reply[0..2], .big);
-    if (t.got >= 2 + @as(usize, len)) try e.finish(id, .{ .reply = try e.gpa.dupe(u8, t.reply[2..][0..len]) });
+    if (t.got < 2 + @as(usize, len)) return null;
+    // Copied out before `finish` frees the buffer.
+    @memcpy(e.rx[0..len], t.reply[2..][0..len]);
+    return e.finish(id, .{ .reply = e.rx[0..len] });
+}
+
+test "a consumer that stops between events leaves nothing behind" {
+    var e = try Edge.init(std.testing.allocator);
+    defer e.deinit();
+
+    const server = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer sys.close(server);
+    try na.bindTo(server, &na.initIp4(.{ 127, 0, 0, 1 }, 0));
+    var sa: na.PosixAddress = undefined;
+    var sa_len: posix.socklen_t = @sizeOf(na.PosixAddress);
+    try sys.getsockname(server, &sa.any, &sa_len);
+    try e.send(.{ .id = 1, .server = na.fromSockaddr(&sa), .transport = .udp, .wire = "ask", .deadline_ns = std.math.maxInt(i64) });
+
+    var stop: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&stop, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    defer for (stop) |fd| sys.close(fd);
+    try e.watch(stop[0], 0, linux.EPOLL.IN);
+    _ = try sys.write(stop[1], "x");
+
+    var buf: [8]u8 = undefined;
+    const n = linux.recvfrom(server, &buf, buf.len, 0, &sa.any, &sa_len);
+    if (linux.errno(n) != .SUCCESS) return error.RecvFailed;
+    _ = try sys.sendto(server, "reply", 0, &sa.any, sa_len);
+    var pfd: [1]linux.pollfd = .{.{ .fd = e.flights.get(1).?.fd, .events = linux.POLL.IN, .revents = 0 }};
+    if (linux.errno(linux.poll(&pfd, 1, -1)) != .SUCCESS) return error.PollFailed;
+
+    try std.testing.expect((try e.next(std.math.maxInt(i64))).? == .client);
+    try std.testing.expectEqual(2, e.batch_len);
 }

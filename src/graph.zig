@@ -58,7 +58,7 @@ pub const Exchange = struct {
 };
 
 pub const Completion = union(enum) {
-    /// Bytes the cell may hold: they are parsed in place.
+    /// Borrowed for the call: the cell parses its own copy.
     reply: []const u8,
     timeout,
     /// Never left the host: out of sockets, buffers or memory. Says
