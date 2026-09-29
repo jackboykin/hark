@@ -20,11 +20,10 @@ SCENARIO_BEGIN bogus RRSIG must SERVFAIL with no AD bit
 ; a key_tag colliding with the random per-run harness DNSKEY (impractical
 ; in a static .rpl). Both paths must classify as bogus; this covers one.
 ;
-; Mechanism: the responder's `_has_covering_rrsig` check skips harness
-; signing when the entry already declares an RRSIG covering the target
-; rdtype (responder.py:349). So the bogus signature reaches hark verbatim,
-; and the harness still synthesizes a legitimate `. DNSKEY` answer when
-; hark fetches it.
+; Mechanism: the harness skips signing a set when the entry already
+; declares an RRSIG covering its rdtype. So the bogus signature reaches
+; hark verbatim, and the harness still synthesizes a legitimate `. DNSKEY`
+; answer when hark fetches it.
 ;
 ; Expected: rcode=SERVFAIL, AD=0, no answer section. If hark ever returns
 ; NOERROR + AD=1 here, the validator is forging trust.
@@ -42,7 +41,7 @@ RANGE_BEGIN 0 100
       example. 3600 IN A 192.0.2.1
       ; Hand-rolled bogus RRSIG: alg 13 (ECDSAP256SHA256), key_tag 1 (won't
       ; match the harness's randomly-generated DNSKEY), zero signature
-      ; bytes. dnspython parses this; harness sees a covering RRSIG and
+      ; bytes. The harness sees a covering RRSIG and
       ; doesn't overwrite it.
       example. 3600 IN RRSIG A 13 1 3600 20990101000000 20200101000000 1 . AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   ENTRY_END

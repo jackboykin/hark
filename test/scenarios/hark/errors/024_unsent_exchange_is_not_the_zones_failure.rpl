@@ -1,5 +1,5 @@
 ; hark: root-hints = 127.0.10.1
-; sim-only: a socket refused at the host is the sim's to stage; live, harness/test_fd_exhaustion.py covers the edge
+; sim-only: a socket refused at the host is the sim's to stage; live, test/fd_test.go covers the edge
 ; hark: qname-minimisation = no
 
 SCENARIO_BEGIN an exchange that never left the host is not the zone's failure

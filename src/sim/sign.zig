@@ -1,5 +1,4 @@
-//! The simulator's signer: test/harness/dnssec.py and the responder's
-//! pre-baking. One ECDSA P-256 key per declared zone, from its name (RFC
+//! The simulator's signer. One ECDSA P-256 key per declared zone, from its name (RFC
 //! 6605, flags 256, SHA-256 DS); a placeholder DS takes the child's digest;
 //! every RRset gets an RRSIG from the zone the cut rules say owns it,
 //! inception a day back, expiry a year out unless `sig-validity` says.
@@ -89,8 +88,8 @@ pub const Signer = struct {
         return out;
     }
 
-    /// responder.py `_delegation_cuts`: a DS owner is a cut; a referral
-    /// (empty answer, NS and no SOA in authority) cuts at the NS owner too.
+    /// A DS owner is a cut; a referral (empty answer, NS and no SOA in
+    /// authority) cuts at the NS owner too.
     fn bakeEntry(self: *Signer, e: *rpl.Entry, address: na.Address) !void {
         if (e.unsigned) return;
         const forced = if (e.sign_as) |z| self.keyNamed(z) else null;
@@ -148,9 +147,9 @@ pub const Signer = struct {
         return out.items;
     }
 
-    /// responder.py `_signer_for`: the deepest signed zone enclosing the
-    /// owner; a DS, or an NSEC exactly at a cut, is the parent's; anything
-    /// else at or below a cut is nobody's here.
+    /// The deepest signed zone enclosing the owner; a DS, or an NSEC exactly
+    /// at a cut, is the parent's; anything else at or below a cut is nobody's
+    /// here.
     fn keyFor(self: *const Signer, owner: dns.Name, rtype: dns.RType, cuts: []const dns.Name) ?*const Key {
         if (rtype == .ds) return self.deepest(owner, true);
         for (cuts) |c| if (c.eql(owner) and rtype == .nsec) return self.deepest(owner, true);

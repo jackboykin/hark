@@ -9,7 +9,7 @@ Distinctive features:
 
 ## Building
 
-Requires Zig 0.17 nightly and Linux 6.1+. The flake packages master as `packages.default`, and `nix develop` gives the pinned Zig nightly and the test harness's Python.
+Requires Zig 0.17 nightly and Linux 6.1+. The flake packages master as `packages.default`, and `nix develop` gives the pinned Zig nightly and the Go the live harness runs on.
 
 ```console
 zig build
@@ -17,7 +17,7 @@ zig build test
 zig build -Doptimize=ReleaseSafe
 ```
 
-Binary at `zig-out/bin/hark`. Python test harness under `test/`: `nix develop -c sh -c 'cd test && pytest'`.
+Binary at `zig-out/bin/hark`. Live harness under `test/`: `nix develop -c sh -c 'cd test && go test ./...'`.
 
 ## Running
 

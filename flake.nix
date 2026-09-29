@@ -42,7 +42,6 @@
           packages = [
             (zigFor z)
             pkgs.go_1_27
-            (pkgs.python3.withPackages (p: with p; [ dnspython cryptography pytest pytest-timeout pytest-xdist ]))
           ];
         };
         bench = pkgs.mkShell {

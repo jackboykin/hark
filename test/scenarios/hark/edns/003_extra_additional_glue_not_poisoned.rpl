@@ -21,9 +21,8 @@ SCENARIO_BEGIN extra unsolicited records in ADDITIONAL do not poison the answer
 ; the client wouldn't see the legitimate 93.184.216.34 ANSWER.
 ;
 ; This is the closest the harness can get to RFC 8914 / RFC 6891 §6.1.2
-; unknown-EDNS-option pass-through territory: the auth-side responder
-; cannot emit a controlled OPT record (dnspython auto-adds its own
-; OPT, see ./opt_record_passthrough.gap), so we settle for "extra
+; unknown-EDNS-option pass-through territory: the responder owns its
+; reply's OPT, so a scenario cannot author one, and we settle for "extra
 ; advisory records in ADDITIONAL are ignored" as the closest viable
 ; signal.
 

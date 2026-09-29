@@ -16,10 +16,10 @@ SCENARIO_BEGIN glueless NS fan-out resolves within the tree-wide query budget
 ; resolves in a handful of upstream queries (measured 15), and
 ; CHECK_MAX_QUERIES pins that. It catches gross over-querying — broken per-depth
 ; NS-fetch caps, lost dedup, a re-resolution loop. It does NOT by itself reach
-; the amplification scale that exercises the budget cap (that needs a deep tree
-; of unique glueless names — see test/harness/test_nxns_amplification.py, which
-; drives one client query into a ~500-node fan-out and asserts it stays
-; bounded). The two together cover the path end to end.
+; amplification scale (that needs a deep tree of unique glueless names — see
+; test/nxns_test.go, where the per-referral NS-fetch cap and the depth cap
+; hold one client query to 40 upstream queries, inside the budget, and the
+; test pins them there). The two together cover the path end to end.
 ;
 ; Topology (avoids RFC 6761 special-use TLDs like .test/.example)
 ;   root  127.0.10.1  delegates com. (-> .2) and org. (-> .3)

@@ -1,5 +1,5 @@
 //! Replay a `.rpl` scenario against the graph in the simulator: the
-//! graph's test suite. Mirrors test/conftest.py `_run_steps` and test/harness/client.py.
+//! graph's test suite.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -388,8 +388,7 @@ fn rdataEql(a: dns.RData, b: dns.RData) bool {
         .ds => |v| v.key_tag == b.ds.key_tag and v.algorithm == b.ds.algorithm and v.digest_type == b.ds.digest_type and mem.eql(u8, v.digest, b.ds.digest),
         .nsec => |v| v.next_domain_name.eql(b.nsec.next_domain_name) and mem.eql(u8, v.type_bit_maps, b.nsec.type_bit_maps),
         .dnskey => |v| v.flags == b.dnskey.flags and v.algorithm == b.dnskey.algorithm and mem.eql(u8, v.public_key, b.dnskey.public_key),
-        // A scenario cannot spell a signature minted at run time; the
-        // Python harness matches the header too.
+        // A scenario cannot spell a signature minted at run time.
         .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.labels == b.rrsig.labels and v.signer_name.eql(b.rrsig.signer_name),
         .unknown => |v| std.ascii.eqlIgnoreCase(v, b.unknown),
         else => false,

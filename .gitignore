@@ -2,8 +2,6 @@
 .envrc
 zig-out/
 .zig-cache/
-__pycache__/
-.pytest_cache/
 .claude/
 result
 bench/peers/out/

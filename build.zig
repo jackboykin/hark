@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) !void {
 
     // Test-only knobs (upstream-port, allow-loopback-upstreams) only parse
     // when this is true. Default false keeps production builds clean; the
-    // pytest harness runs `zig build -Dtesting=true`.
+    // live harness runs `zig build -Dtesting=true`.
     const testing_enabled = b.option(bool, "testing", "Enable test-only config knobs") orelse false;
     const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse
         (optimize != .debug);

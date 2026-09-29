@@ -1,6 +1,6 @@
 //! Loader for `.rpl` scenarios: the hark dialect of Unbound's testbound
-//! format plus the vendored corpus. Mirrors test/harness/rpl.py; whatever
-//! the Python parser accepts, this must too.
+//! format plus the vendored corpus. Whatever test/rpl.go accepts, this
+//! must too.
 //!
 //! Everything is allocated from the caller's arena, never freed piecemeal.
 const std = @import("std");
@@ -16,7 +16,7 @@ const dns64 = @import("../dns64.zig");
 const default_ttl: u32 = 3600;
 
 /// MATCH flags from every context; which ones a context honours is the
-/// runner's business. An unknown flag is a parse error, as in Python.
+/// runner's business. An unknown flag is a parse error.
 pub const Match = packed struct {
     opcode: bool = false,
     qname: bool = false,

@@ -1,6 +1,6 @@
 //! The simulator: network, clock and randomness from a seed; stands in for
-//! the edge. Serves RANGE entries as test/harness/responder.py does, after
-//! a seeded per-server latency, and logs every upstream query.
+//! the edge. Serves RANGE entries after a seeded per-server latency and
+//! logs every upstream query.
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -106,7 +106,7 @@ pub const Sim = struct {
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
         if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         const q = query.questions[0];
-        // RFC 8109 root priming is not logged, as in the Python responder.
+        // RFC 8109 root priming is not logged.
         if (!(q.name.labels.len == 0 and q.qtype == .ns))
             try s.log.append(s.gpa, .{ .server = ex.server, .qname = try dns.cloneNameFlat(s.arena, q.name, false), .qtype = q.qtype, .transport = ex.transport });
         if (s.pending_drops > 0) {
@@ -234,8 +234,7 @@ pub const Sim = struct {
         return null;
     }
 
-    /// responder.py `_entry_matches_query`: an empty MATCH means
-    /// `question` (qname, qtype, qclass).
+    /// An empty MATCH means `question` (qname, qtype, qclass).
     fn entryMatches(e: *const rpl.Entry, q: dns.Question, transport: Transport) bool {
         if (e.questions.len == 0) return false;
         var m = e.match;

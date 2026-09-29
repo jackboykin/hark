@@ -25,7 +25,7 @@ SCENARIO_BEGIN aggressive NSEC synthesises NXDOMAIN for sibling in cached range 
 ;
 ; Step 3 queries `b2. A`. The scenario declares ONLY ONE upstream entry
 ; (for `b.`). If hark goes upstream for `b2.`, the responder returns
-; REFUSED (responder.py:244, default for unmatched queries), hark
+; REFUSED (the default for unmatched queries), hark
 ; surfaces SERVFAIL, and step 4's `MATCH flags … AD NXDOMAIN` fails.
 ;
 ; The only path that produces NXDOMAIN with AD=1 for `b2.` without an
