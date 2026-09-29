@@ -515,7 +515,7 @@ test "a fact survives the blob byte for byte" {
         .minimum = 5,
     } } }};
     const reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = &rrs, .authorities = &soa, .target = owner, .zone = zone, .ede = .other, .stored_ns = 123, .ttl = 300 };
-    const key: Key = .{ .kind = .rrset, .rtype = .a, .name = "www.example.com" };
+    const key: Key = .init(.rrset, "www.example.com", .a);
 
     const blob = try s.build(.{ .rrset = reply });
     try s.put(key, blob, 1000, 0);
@@ -585,7 +585,7 @@ test "the cap holds by eviction and admission" {
     var names: [64][8]u8 = undefined;
     for (0..64) |i| {
         _ = try std.fmt.bufPrint(&names[i], "k{d}", .{i});
-        const key: Key = .{ .kind = .cut, .name = std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3] };
+        const key: Key = .init(.cut, std.mem.sliceTo(&names[i], 0)[0..if (i < 10) 2 else 3], .a);
         const blob = try s.build(.{ .cut = .{ .zone = zone } });
         s.put(key, blob, 10, 0) catch |err| {
             try testing.expectEqual(error.Refused, err);
@@ -595,7 +595,7 @@ test "the cap holds by eviction and admission" {
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
     try testing.expect(s.refusals > 0);
-    const key: Key = .{ .kind = .cut, .name = "again" };
+    const key: Key = .init(.cut, "again", .a);
     const again = try s.build(.{ .cut = .{ .zone = zone } });
     try testing.expectError(error.Refused, s.put(key, again, 10, 0));
     try s.put(key, again, 10, 0);
@@ -616,7 +616,7 @@ test "a replaced version leaves as one evicted" {
     };
     s.on_evict = .{ .ctx = &gone, .f = count.f };
     const zone: dns.Name = .{ .labels = &.{"x"} };
-    const key: Key = .{ .kind = .cut, .name = "x" };
+    const key: Key = .init(.cut, "x", .a);
     try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
     try testing.expectEqual(0, gone);
     try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);

@@ -11,6 +11,7 @@
 //! The rules live beside it: the delegation walk in walk.zig, the chain of
 //! trust in trust.zig, aggressive denial in denial.zig; one core.
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
@@ -97,16 +98,38 @@ pub const KeyBuf = [dns.max_dotted_len + 1]u8;
 
 pub const Key = struct {
     kind: Kind,
-    rtype: dns.RType = .a,
+    rtype: dns.RType,
     name: []const u8,
+    /// `name`'s, taken once: every key at the name mixes its own from it.
+    name_hash: u32,
 
     /// Borrows `buf`: whatever keeps a key dupes its name (`newCell`, `remember`).
     pub fn of(buf: *KeyBuf, kind: Kind, name: dns.Name, rtype: dns.RType) Key {
-        return .{ .kind = kind, .rtype = rtype, .name = name.formatLower(buf) };
+        return .init(kind, name.formatLower(buf), rtype);
     }
 
+    pub fn init(kind: Kind, name: []const u8, rtype: dns.RType) Key {
+        return .{ .kind = kind, .rtype = rtype, .name = name, .name_hash = hashName(name) };
+    }
+
+    /// Another key at the same name, whose hash it keeps.
+    pub fn at(k: Key, kind: Kind, rtype: dns.RType) Key {
+        return .{ .kind = kind, .rtype = rtype, .name = k.name, .name_hash = k.name_hash };
+    }
+
+    fn hashName(name: []const u8) u32 {
+        return @truncate(std.hash.Wyhash.hash(0, name));
+    }
+
+    /// A Fibonacci multiply, folded: the kind and type reach the low bits,
+    /// which pick the slot. Keys at one name land in related slots; probing
+    /// ran no longer for it than under a full mix, which takes three
+    /// multiplies.
     pub fn hash(k: Key) u64 {
-        return std.hash.Wyhash.hash(@as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype), k.name);
+        if (builtin.mode == .debug) std.debug.assert(k.name_hash == hashName(k.name));
+        const x = @as(u64, k.name_hash) << 32 | @as(u64, @backingInt(k.kind)) << 16 | @backingInt(k.rtype);
+        const p = @as(u128, x) * 0x9e3779b97f4a7c15;
+        return @truncate(p ^ p >> 64);
     }
 
     pub fn eql(a: Key, b: Key) bool {
@@ -355,7 +378,7 @@ pub const Tally = struct {
     reaches_visits: u64 = 0,
 
     /// Only the replay reads the timings; serve skips the clock reads.
-    pub const timed = @import("builtin").is_test;
+    pub const timed = builtin.is_test;
 
     pub const Clock = struct {
         t0: i128,
@@ -502,7 +525,7 @@ pub const Graph = struct {
         errdefer g.deinit();
         if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
-        _ = try g.fact(.{ .kind = .cut, .name = "" }, .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
+        _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
     }
 
@@ -608,7 +631,7 @@ pub const Graph = struct {
 
     /// One per key at a time; holds itself until it settles.
     pub fn refresh(g: *Graph, key: Key, name: dns.Name, lapses_ns: i64) !void {
-        const rkey: Key = .{ .kind = .refresh, .rtype = key.rtype, .name = key.name };
+        const rkey = key.at(.refresh, key.rtype);
         if (g.index.contains(rkey)) return;
         if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.refused += 1;
@@ -716,7 +739,8 @@ pub const Graph = struct {
         var arena = std.heap.ArenaAllocator.init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
-        const own_key: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try arena.allocator().dupe(u8, key.name) };
+        var own_key = key;
+        own_key.name = try arena.allocator().dupe(u8, key.name);
         const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
         if (reused == null) try g.cells.append(g.gpa, c);
         errdefer if (reused == null) {
@@ -893,7 +917,8 @@ pub const Graph = struct {
             g.failed.swapRemoveAt(at);
             g.gpa.free(old.name);
         }
-        const own: Key = .{ .kind = key.kind, .rtype = key.rtype, .name = try g.gpa.dupe(u8, key.name) };
+        var own = key;
+        own.name = try g.gpa.dupe(u8, key.name);
         errdefer g.gpa.free(own.name);
         try g.failed.put(g.gpa, own, r);
     }
@@ -1068,7 +1093,7 @@ pub const Graph = struct {
         const own = @call(.always_inline, Key.of, .{ &kb, .rrset, name, qtype });
         if (g.entry(own, age)) |e| return e;
         if (!walk.cnameAnswers(qtype)) return null;
-        const e = g.entry(.{ .kind = .rrset, .rtype = .cname, .name = own.name }, age) orelse return null;
+        const e = g.entry(own.at(.rrset, .cname), age) orelse return null;
         return if (store.Rrset.of(e.blob).kind == .alias) e else null;
     }
 
@@ -1091,17 +1116,16 @@ pub const Graph = struct {
         return g.demandFound(by, key, name, live, g.served(key, live));
     }
 
-    /// `demand` for a step of an answer's chain at `name`: the type's own
-    /// set where held, as it may hold more of the chain; else an alias held
-    /// at the name; else the own set, to fetch. Each key is read once.
-    pub fn demandHop(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType) !?CellId {
-        var kb: KeyBuf = undefined;
-        const own = Key.of(&kb, .rrset, name, qtype);
+    /// `demand` for a step of an answer's chain, `own` the rrset at `name`:
+    /// the type's own set where held, as it may hold more of the chain;
+    /// else an alias held at the name; else the own set, to fetch. Each key
+    /// is read once.
+    pub fn demandHop(g: *Graph, by: CellId, own: Key, name: dns.Name) !?CellId {
         const live = g.index.get(own);
         const found = g.served(own, live);
         const holds_own = if (found) |s| s == .stored or g.cell(s.live).state == .fact else false;
-        if (!holds_own and walk.cnameAnswers(qtype)) {
-            const alias: Key = .{ .kind = .rrset, .rtype = .cname, .name = own.name };
+        if (!holds_own and walk.cnameAnswers(own.rtype)) {
+            const alias = own.at(.rrset, .cname);
             const alias_live = g.index.get(alias);
             if (g.served(alias, alias_live)) |s| if (switch (s) {
                 .stored => |e| store.Rrset.of(e.blob).kind == .alias,
@@ -1340,7 +1364,7 @@ pub const Graph = struct {
             }
             return null;
         }
-        const id = try g.newCell(.{ .kind = .exchange, .name = "" }, qname);
+        const id = try g.newCell(.init(.exchange, "", .a), qname);
         try g.pin(id, by);
         budget.queries += 1;
         g.cell(id).holds += 1;
@@ -1436,7 +1460,7 @@ test "an evicted root cut is re-derived, not walked" {
     };
     var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = @import("rand.zig").thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
     defer g.deinit();
-    const root_cut: Key = .{ .kind = .cut, .name = "" };
+    const root_cut: Key = .init(.cut, "", .a);
     g.store.drop(root_cut, g.store.any(root_cut).?.blob);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

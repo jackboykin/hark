@@ -283,6 +283,7 @@ pub fn cnameAnswers(qtype: dns.RType) bool {
 /// checks run at demand time; a chain that fails them is a resolution
 /// failure, like a failed hop.
 pub fn runAnswer(g: *Graph, id: CellId) !void {
+    var kb: graph.KeyBuf = undefined;
     const kind = g.cell(id).key.kind;
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.answer;
@@ -316,8 +317,10 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 .broken => |why| return failAnswer(g, id, why),
             }
         }
+        // The first step is at the answer's own name, keyed already.
+        const own = if (s.n == 0) g.cell(id).key.at(.rrset, qtype) else Key.of(&kb, .rrset, next, qtype);
         // Nothing waits on an answer, so only an orphaned root is refused.
-        s.hops[s.n] = try g.demandHop(id, next, qtype) orelse
+        s.hops[s.n] = try g.demandHop(id, own, next) orelse
             return failAnswer(g, id, unreachable_authority);
         s.n += 1;
     }

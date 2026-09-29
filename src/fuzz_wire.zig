@@ -192,7 +192,7 @@ test "fuzz: store round trip" {
             const owner = if (msg.questions.len > 0) msg.questions[0].name else dns.Name{ .labels = &.{} };
             const reply: graph.Reply = .{ .kind = .answer, .aa = msg.header.flags.aa, .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals, .target = owner, .zone = owner, .ttl = 1 };
             var buf: [dns.max_dotted_len + 1]u8 = undefined;
-            const key: graph.Key = .{ .kind = .rrset, .rtype = if (msg.questions.len > 0) msg.questions[0].qtype else .a, .name = owner.formatLower(&buf) };
+            const key: graph.Key = .of(&buf, .rrset, owner, if (msg.questions.len > 0) msg.questions[0].qtype else .a);
             const blob = st.build(.{ .rrset = reply }) catch return;
             st.put(key, blob, 10, 0) catch st.unref(blob);
             const got = st.get(key, 0) orelse return;
