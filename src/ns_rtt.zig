@@ -33,7 +33,6 @@ const max_timeout_ms: u32 = 10_000;
 /// Consecutive timeouts before marking dead (Knot).
 const dead_threshold: u8 = 4;
 
-/// Not shorter than `dead_probe_timeout_ms`, so probes never overlap.
 const dead_duration_ms: i64 = 2_000;
 const dead_max_shifts: u8 = 4;
 
@@ -110,6 +109,11 @@ pub const RttState = struct {
         if (s.consecutive_timeouts < dead_threshold) return false;
         s.dead_until_ms = now_ms + s.deadWindowMs();
         return s.consecutive_timeouts == dead_threshold;
+    }
+
+    pub fn sent(s: *RttState, now_ms: i64, timeout_ms: u32) void {
+        if (s.consecutive_timeouts >= dead_threshold and s.dead_until_ms <= now_ms)
+            s.dead_until_ms = now_ms + timeout_ms + 1;
     }
 
     pub fn isDead(s: RttState, now_ms: i64) bool {
@@ -190,7 +194,7 @@ test "timeouts inflate the RTO but leave the hedge stagger" {
     try testing.expectEqual(hedge, s.hedgeStagger());
 }
 
-test "the threshold timeout marks dead; the window lapses and escalates to a cap" {
+test "the threshold timeout marks dead; the window lapses to one probe and escalates to a cap" {
     var s: RttState = .unknown;
     s.observe(100_000, 1000);
     for (0..dead_threshold - 1) |_| try testing.expect(!s.observeTimeout(1000));
@@ -198,6 +202,9 @@ test "the threshold timeout marks dead; the window lapses and escalates to a cap
     try testing.expect(s.isDead(1000));
     try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, .udp));
     try testing.expect(!s.isDead(1000 + dead_duration_ms));
+    s.sent(1000 + dead_duration_ms, 6000);
+    try testing.expect(s.isDead(9000));
+    try testing.expect(!s.isDead(9001));
     for (0..dead_max_shifts + 3) |_| try testing.expect(!s.observeTimeout(1000));
     try testing.expectEqual(dead_duration_ms << dead_max_shifts, s.deadWindowMs());
     s.observe(100_000, 1000);

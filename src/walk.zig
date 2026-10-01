@@ -1166,7 +1166,8 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
 fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
     a.tried |= Ask.bit(server);
     const key = a.servers[server];
-    const state = g.rtt.get(key) orelse ns_rtt.RttState.unknown;
+    const est = g.rtt.getPtr(key);
+    const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
     const timeout_ms = state.timeout(a.nattempts == 0 and last, transport);
     // Silent past the capped wait is silent, however long the last is given.
     const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms, state.timeout(false, transport)) orelse {
@@ -1175,6 +1176,7 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
         a.fetched_unglued = true;
         return null;
     };
+    if (est) |s| s.sent(g.nowMs(), timeout_ms);
     a.attempts[a.nattempts] = .{ .exchange = ex, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
     return state;

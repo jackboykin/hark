@@ -1334,7 +1334,7 @@ pub const Graph = struct {
         return gop.value_ptr;
     }
 
-    fn nowMs(g: *const Graph) i64 {
+    pub fn nowMs(g: *const Graph) i64 {
         return @divTrunc(g.now(), std.time.ns_per_ms);
     }
 
