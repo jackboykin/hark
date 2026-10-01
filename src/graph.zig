@@ -1384,10 +1384,9 @@ pub const Graph = struct {
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
         // Silent past the capped wait is silent, however long this send waits.
         const owed_at = g.now() + @as(i64, state.timeout(false, transport)) * std.time.ns_per_ms;
-        const timeout_ms = state.timeout(uncapped, transport);
-        const timeout_at = g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms;
+        const timeout_at = g.now() + @as(i64, state.timeout(uncapped, transport)) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
-        if (est) |s| s.sent(g.nowMs(), timeout_ms);
+        if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         const addr = server.toAddress();
         sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };

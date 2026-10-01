@@ -107,13 +107,12 @@ pub const RttState = struct {
         }
         if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
         if (s.consecutive_timeouts < dead_threshold) return false;
-        s.dead_until_ms = now_ms + s.deadWindowMs();
+        s.dead_until_ms = @max(s.dead_until_ms, now_ms + s.deadWindowMs());
         return s.consecutive_timeouts == dead_threshold;
     }
 
-    pub fn sent(s: *RttState, now_ms: i64, timeout_ms: u32) void {
-        if (s.consecutive_timeouts >= dead_threshold and s.dead_until_ms <= now_ms)
-            s.dead_until_ms = now_ms + timeout_ms + 1;
+    pub fn sent(s: *RttState, due_ms: i64) void {
+        if (s.consecutive_timeouts >= dead_threshold) s.dead_until_ms = @max(s.dead_until_ms, due_ms);
     }
 
     pub fn isDead(s: RttState, now_ms: i64) bool {
@@ -202,7 +201,7 @@ test "the threshold timeout marks dead; the window lapses to one probe and escal
     try testing.expect(s.isDead(1000));
     try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, .udp));
     try testing.expect(!s.isDead(1000 + dead_duration_ms));
-    s.sent(1000 + dead_duration_ms, 6000);
+    s.sent(9001);
     try testing.expect(s.isDead(9000));
     try testing.expect(!s.isDead(9001));
     for (0..dead_max_shifts + 3) |_| try testing.expect(!s.observeTimeout(1000));
