@@ -1,24 +1,17 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// Initial timeout for unknown servers (Unbound 376, Knot 400).
 const initial_timeout_ms: u32 = 400;
 
-/// Minimum RTO floor. With the rttvar floor (srtt/4) guaranteeing
-/// jitter headroom, this only catches degenerate sub-millisecond RTTs.
-/// Per round trip; a cold exchange gets one per `Transport.coldRtts`. At
-/// 50 a two-round-trip exchange to a 20 ms server timed out once in ~400.
+/// At 50 a two-round-trip exchange to a 20 ms server timed out once in ~400.
 const min_timeout_ms: u32 = 100;
 const min_stagger_ms: u32 = 50;
 
-/// How a query reaches a server. The estimate is the exchange leg on an
-/// established path, the same quantity on every transport; a cold
-/// exchange first pays the handshake.
 pub const Transport = enum {
     udp,
     tcp,
 
-    /// Round trips a cold exchange costs, handshake included.
+    /// Handshake included.
     fn coldRtts(t: Transport) u32 {
         return switch (t) {
             .udp => 1,
@@ -27,31 +20,23 @@ pub const Transport = enum {
     }
 };
 
-/// Maximum RTO cap (Knot).
 const max_timeout_ms: u32 = 10_000;
 
-/// Consecutive timeouts before marking dead (Knot).
 const dead_threshold: u8 = 4;
 
 const dead_duration_ms: i64 = 2_000;
 const dead_max_shifts: u8 = 4;
 
-/// Knot KR_CONN_RTT_MAX.
 const dead_probe_timeout_ms: u32 = 2_000;
 
-/// Maximum backoff doublings (Knot: cap at 256x initial).
 const max_backoff_shifts: u8 = 8;
 
-/// Servers tracked at once; past it an arbitrary one is forgotten and
-/// reverts to `initial_timeout_ms`. Every glue address is attacker-chosen.
+/// Every glue address is attacker-chosen.
 pub const max_entries: u32 = 4_096;
 
-/// Hedge stagger = `hedge_multiplier × min_rtt`. 3× lands roughly at p95 for
-/// well-behaved RTT distributions (Dean–Barroso "Tail at Scale", CACM 2013).
+/// Roughly p95 of a well-behaved RTT distribution (Dean–Barroso, "The Tail at Scale").
 const hedge_multiplier: u32 = 3;
 
-/// Re-anchor min_rtt after this long without a new minimum — lets the floor
-/// track upward on route changes that move the path's true floor.
 const hedge_decay_ms: i64 = 30_000;
 
 const max_hedge_stagger_ms: u32 = 300;
@@ -59,33 +44,29 @@ const max_hedge_stagger_ms: u32 = 300;
 /// Estimates closer than this are noise.
 const band_us: i64 = 50 * std.time.us_per_ms;
 
-/// Below every live band.
 pub const dead_band = std.math.maxInt(i64);
 
-/// Non-last server cap (Knot KR_CONN_RTT_MAX, RFC 1035 §4.2.1 ≥2 s).
+/// RFC 1035 §4.2.1 ≥2 s.
 const failover_timeout_cap_ms: u32 = 2000;
 
-/// One server's estimate.
 pub const RttState = struct {
-    /// 0 until the first observation.
     srtt_us: i64 = 0,
     rttvar_us: i64 = 0,
     consecutive_timeouts: u8 = 0,
     dead_until_ms: i64 = 0,
-    /// Windowed minimum; 0 until a reply.
     min_rtt_us: i64 = 0,
     min_rtt_stamp_ms: i64 = 0,
 
     pub const unknown: RttState = .{};
 
-    /// A reply after `rtt_us`, whatever its rcode.
+    /// Any reply, whatever its rcode.
     pub fn observe(s: *RttState, rtt_us: i64, now_ms: i64) void {
         const rtt = @max(rtt_us, 1);
         if (s.srtt_us == 0) {
             s.srtt_us = rtt;
             s.rttvar_us = @divTrunc(rtt, 2);
         } else {
-            // RFC 6298 EWMA update
+            // RFC 6298
             const delta: i64 = @intCast(@abs(s.srtt_us - rtt));
             s.rttvar_us = 3 * @divTrunc(s.rttvar_us, 4) + @divTrunc(delta, 4);
             s.srtt_us = 7 * @divTrunc(s.srtt_us, 8) + @divTrunc(rtt, 8);
@@ -99,7 +80,6 @@ pub const RttState = struct {
         s.dead_until_ms = 0;
     }
 
-    /// True on the timeout that marks the server dead.
     pub fn observeTimeout(s: *RttState, now_ms: i64) bool {
         if (s.srtt_us == 0) {
             s.srtt_us = @as(i64, initial_timeout_ms) * 1000;
@@ -124,15 +104,12 @@ pub const RttState = struct {
         return if (s.isDead(now_ms)) dead_band else @divTrunc(s.srtt_us, band_us);
     }
 
-    /// What a cold exchange over `transport` needs. A non-last server is
-    /// capped so a walk can still fail over.
     pub fn timeout(s: RttState, is_last: bool, transport: Transport) u32 {
         const base = s.rto();
         const want = if (is_last) base else @min(base, failover_timeout_cap_ms);
         return want * transport.coldRtts();
     }
 
-    /// Null until a reply.
     pub fn hedgeStagger(s: RttState) ?u32 {
         if (s.min_rtt_us <= 0) return null;
         const stagger_ms: u32 = @intCast(@max(1, @divTrunc(@as(i64, hedge_multiplier) * s.min_rtt_us, 1000)));
@@ -141,10 +118,8 @@ pub const RttState = struct {
 
     fn rto(s: RttState) u32 {
         if (s.srtt_us == 0) return initial_timeout_ms;
-        // RTO = srtt + 4 * rttvar (RFC 6298), but never tighter than 2× the
-        // smoothed RTT. Without this floor, consistent RTTs drive rttvar → 0
-        // and the timeout converges to exactly the RTT — any jitter causes
-        // a timeout that cascades into repeated failures.
+        // RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0
+        // and then any jitter times out.
         const base_us = @max(s.srtt_us + 4 * s.rttvar_us, 2 * s.srtt_us);
         const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
 
@@ -217,7 +192,6 @@ test "a cold exchange costs the transport's round trips of the estimate" {
     const udp = s.timeout(true, .udp);
     try testing.expect(udp > min_timeout_ms);
     try testing.expectEqual(udp * 2, s.timeout(true, .tcp));
-    // The failover cap bounds one round trip; the cold total is above it.
     for (0..3) |_| _ = s.observeTimeout(1000);
     try testing.expect(s.timeout(true, .udp) > failover_timeout_cap_ms);
     try testing.expectEqual(failover_timeout_cap_ms * 2, s.timeout(false, .tcp));
