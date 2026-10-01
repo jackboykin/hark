@@ -1334,7 +1334,7 @@ pub const Graph = struct {
         return gop.value_ptr;
     }
 
-    pub fn nowMs(g: *const Graph) i64 {
+    fn nowMs(g: *const Graph) i64 {
         return @divTrunc(g.now(), std.time.ns_per_ms);
     }
 
@@ -1348,10 +1348,11 @@ pub const Graph = struct {
 
     // ── Exchanges ──────────────────────────────────────────────────────
 
+    pub const Sent = struct { id: CellId, est: ns_rtt.RttState };
+
     /// Null, like `demand`, when the payer's budget or deadline, or the
-    /// asker's orphaning, refuses the work. `owed_ms` is the wait a server
-    /// is owed to count as silent.
-    pub fn exchange(g: *Graph, by: CellId, server: na.Address, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, timeout_ms: u32, owed_ms: u32) !?CellId {
+    /// asker's orphaning, refuses the work.
+    pub fn exchange(g: *Graph, by: CellId, server: na.AddressKey, transport: Transport, case: Case, qname: dns.Name, qtype: dns.RType, uncapped: bool) !?Sent {
         std.debug.assert(case == .random or transport == .tcp);
         // The run's payer may spend itself mid-run while another waiter
         // still has room: the shared work goes on at that one's cost.
@@ -1379,20 +1380,27 @@ pub const Graph = struct {
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);
-        const owed_at = g.now() + @as(i64, @min(owed_ms, timeout_ms)) * std.time.ns_per_ms;
+        const est = g.rtt.getPtr(server);
+        const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
+        // Silent past the capped wait is silent, however long this send waits.
+        const owed_at = g.now() + @as(i64, state.timeout(false, transport)) * std.time.ns_per_ms;
+        const timeout_ms = state.timeout(uncapped, transport);
         const timeout_at = g.now() + @as(i64, timeout_ms) * std.time.ns_per_ms;
-        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = server, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
+        const deadline_ns = @min(budget.deadline_ns, timeout_at);
+        if (est) |s| s.sent(g.nowMs(), timeout_ms);
+        const addr = server.toAddress();
+        sc.* = .{ .id = qid, .sent_name = msg.questions[0].name, .qtype = qtype, .server = addr, .transport = transport, .case = case, .sent_ns = g.now(), .cut_short = budget.deadline_ns <= owed_at };
         g.cell(id).scratch = .{ .exchange = sc };
         try g.edge.send(.{
             .id = id,
-            .server = server,
+            .server = addr,
             .transport = transport,
             .wire = wire,
-            .deadline_ns = @min(budget.deadline_ns, timeout_at),
+            .deadline_ns = deadline_ns,
         });
         g.flights += 1;
         if (transport == .udp) g.stats.resolver.udp += 1 else g.stats.resolver.tcp += 1;
-        return id;
+        return .{ .id = id, .est = state };
     }
 };
 
@@ -1497,10 +1505,10 @@ test "a shared cell is paid by a waiting question with room, not its first deman
     g.cell(second).scratch.answer.budget.queries = g.cfg.max_queries;
     try testing.expectEqual(g.cell(first).scratch.answer.budget, g.payerOf(shared).?);
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expectEqual(null, try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000, 1000));
+    try testing.expectEqual(null, try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .udp, .random, host, .a, true));
     g.cell(second).scratch.answer.budget.queries = 0;
     g.payer = g.cell(first).scratch.answer.budget;
-    try testing.expect(try g.exchange(shared, na.initIp4(.{ 127, 0, 0, 1 }, 53), .udp, .random, host, .a, 1000, 1000) != null);
+    try testing.expect(try g.exchange(shared, .fromAddress(na.initIp4(.{ 127, 0, 0, 1 }, 53)), .udp, .random, host, .a, true) != null);
     try testing.expectEqual(1, g.cell(second).scratch.answer.budget.queries);
     g.payer = &g.unpaid;
     g.unhold(first);

@@ -1160,26 +1160,18 @@ fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
     return dnssec.dsExceedsUdp(ds.value.rrset.answers);
 }
 
-/// One attempt on the estimate's timeout; only `last`, alone in flight,
-/// waits uncapped.
 /// Null: refused, so launch nothing more; what is in flight may still answer.
 fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Transport, case: graph.Case, qname: dns.Name, qtype: dns.RType) !?ns_rtt.RttState {
     a.tried |= Ask.bit(server);
-    const key = a.servers[server];
-    const est = g.rtt.getPtr(key);
-    const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
-    const timeout_ms = state.timeout(a.nattempts == 0 and last, transport);
-    // Silent past the capped wait is silent, however long the last is given.
-    const ex = try g.exchange(id, key.toAddress(), transport, case, qname, qtype, timeout_ms, state.timeout(false, transport)) orelse {
+    const ex = try g.exchange(id, a.servers[server], transport, case, qname, qtype, a.nattempts == 0 and last) orelse {
         a.cut_short = a.cut_short or !a.retried;
         a.tried = Ask.bit(a.nservers) - 1;
         a.fetched_unglued = true;
         return null;
     };
-    if (est) |s| s.sent(g.nowMs(), timeout_ms);
-    a.attempts[a.nattempts] = .{ .exchange = ex, .server = server, .transport = transport, .case = case };
+    a.attempts[a.nattempts] = .{ .exchange = ex.id, .server = server, .transport = transport, .case = case };
     a.nattempts += 1;
-    return state;
+    return ex.est;
 }
 
 /// The server set for `a.zone`: hints at the root, else the addresses
