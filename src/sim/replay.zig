@@ -327,7 +327,7 @@ fn answerMismatch(actual: dns.Message, e: rpl.Entry, pass: enum { cold, warm }) 
     if (m.additional and !sectionEql(actual.additionals, e.additionals, m.ttl)) return "ADDITIONAL mismatch";
     if (e.ede) |want| {
         const opt = actual.opt orelse return "EDE mismatch";
-        const held: u16 = @intFromEnum(dns.Ede.Code.cached_error);
+        const held: u16 = @backingInt(dns.Ede.Code.cached_error);
         for (opt.options) |o| {
             if (o.code != dns.edns_opt_ede or o.data.len < 2) continue;
             const code = mem.readInt(u16, o.data[0..2], .big);
