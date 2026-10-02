@@ -340,7 +340,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
 /// The judgement of one rrset version; a fresh cell per version, since
 /// the verdict is about those bytes; one already stamped on them settles
 /// the cell without a rule.
-pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
+pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !?CellId {
     var kb: graph.KeyBuf = undefined;
     const t = g.cell(rid);
     std.debug.assert(t.state == .fact);
@@ -348,10 +348,7 @@ pub fn demandSecure(g: *Graph, by: CellId, rid: CellId) !CellId {
     if (g.index.get(key)) |sid| {
         const c = g.cell(sid);
         const same = c.scratch.secure.target == rid and c.scratch.secure.target_gen == t.gen;
-        if (same and (!c.settled() or g.serves(sid))) {
-            try g.pin(sid, by);
-            return sid;
-        }
+        if (same and (!c.settled() or g.serves(sid))) return g.join(by, sid);
     }
     const sid = try g.newCell(key, t.name);
     g.cell(sid).scratch.secure.* = .{ .target = rid, .target_gen = t.gen };

@@ -1,0 +1,115 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN an address judged by keys only it can fetch fails at once
+
+; example. is served by ns1.example., glued, and ns2.example., not. ns1
+; refuses the zone's DNSKEY, so the keys that judge ns2's address can be
+; fetched only from ns2: at the address under judgement.
+;
+; The first ask fails for want of the keys and leaves the cut and ns2's
+; address in memory. Past the failure window a client asks for that
+; address itself, so its judgement starts first and waits on the keys;
+; the key fetch then needs the address, whose judgement is the one in
+; progress. The address fails there. Joining the judgement would leave
+; all three waiting on each other until the client's deadline, and
+; unfreed after it.
+;
+; Topology
+;   root  127.0.10.1   delegates example. with a DS, glue for ns1 only
+;   ns1   127.0.10.2   answers www and ns2.example. A, refuses the DNSKEY
+;   ns2   127.0.10.3   would answer the DNSKEY
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns1.example.
+      example. 3600 IN NS ns2.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns1.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns2.example. IN A
+    SECTION ANSWER
+      ns2.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      example. IN DNSKEY
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns2.example. IN A
+    SECTION ANSWER
+      ns2.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 6
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    ns2.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    ns2.example. IN A
+ENTRY_END
+
+SCENARIO_END

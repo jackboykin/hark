@@ -1137,15 +1137,17 @@ pub const Graph = struct {
     }
 
     fn demandFound(g: *Graph, by: CellId, key: Key, name: dns.Name, live: ?CellId, found: ?Served) !?CellId {
-        if (try g.lookup(key, name, live, found)) |id| {
-            if (!g.fresh(id) and g.reaches(by, id)) return null;
-            try g.pin(id, by);
-            return id;
-        }
+        if (try g.lookup(key, name, live, found)) |id| return g.join(by, id);
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name);
         try g.pin(id, by);
         if (g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
+        return id;
+    }
+
+    pub fn join(g: *Graph, by: CellId, id: CellId) !?CellId {
+        if (!g.fresh(id) and g.reaches(by, id)) return null;
+        try g.pin(id, by);
         return id;
     }
 

@@ -299,7 +299,8 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             // never signed (RFC 4035 §2.2): nothing can judge them.
             const signatures = qtype == .rrsig and last.state.fact.rrset.kind == .answer;
             if (g.cfg.trust_anchor != null and s.nj == i and !signatures) {
-                s.judged[i] = try trust.demandSecure(g, id, s.hops[i]);
+                s.judged[i] = try trust.demandSecure(g, id, s.hops[i]) orelse
+                    return failAnswer(g, id, unreachable_authority);
                 s.nj += 1;
             }
             var links: Links = .{};
@@ -525,7 +526,10 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
             if (g.cfg.trust_anchor != null) {
                 const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
                 if (slot.* == .none) slot.* = .wrap(try trust.demandSecure(g, id, rid));
-                const j = g.cell(slot.*.unwrap().?);
+                const j = g.cell(slot.*.unwrap() orelse {
+                    failed = failed orelse unreachable_authority;
+                    continue;
+                });
                 if (!j.settled()) {
                     pending = true;
                     continue;
