@@ -9,7 +9,7 @@ Distinctive features:
 
 ## Building
 
-Requires Zig 0.17 nightly and Linux 6.1+. The flake packages master as `packages.default`, and `nix develop` gives the pinned Zig nightly and the Go the live harness runs on.
+Requires Zig 0.17 nightly and Linux 6.1+. Bring your own `zig`; `nix develop` adds the Go the live harness runs on.
 
 ```console
 zig build

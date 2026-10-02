@@ -1,52 +1,20 @@
 {
   description = "hark, a validating recursive resolver";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    zig = {
-      url = "github:mitchellh/zig-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-  outputs = { self, nixpkgs, zig }:
+  outputs = { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
-      forAll = f: lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (s: f nixpkgs.legacyPackages.${s} zig.packages.${s});
-      zigFor = z: z."master-2026-09-20";
-      version = builtins.head (builtins.match ''.*\.version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon));
+      forAll = f: lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (s: f nixpkgs.legacyPackages.${s});
     in
     {
-      packages = forAll (pkgs: z: {
-        default = pkgs.stdenv.mkDerivation {
-          pname = "hark";
-          version = "${version}+${self.shortRev or "dirty"}";
-          src = lib.fileset.toSource {
-            root = ./.;
-            fileset = lib.fileset.unions [ ./build.zig ./build.zig.zon ./src ];
-          };
-          nativeBuildInputs = [ (zigFor z) ];
-          installPhase = ''
-            ZIG_GLOBAL_CACHE_DIR=$TMPDIR zig build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix $out
-          '';
-          meta = {
-            license = lib.licenses.mit;
-            platforms = lib.platforms.linux;
-            mainProgram = "hark";
-          };
-        };
-      });
-
-      devShells = forAll (pkgs: z: {
+      devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = [
-            (zigFor z)
-            pkgs.go_1_27
-          ];
+          packages = [ pkgs.go_1_27 ];
         };
         bench = pkgs.mkShell {
           packages = with pkgs; [
-            (zigFor z)
             nsd dnsperf iproute2 util-linux bind.dnsutils shellcheck valgrind strace
             unbound pdns-recursor knot-resolver_6 bind
             python3 go_1_27
