@@ -188,7 +188,7 @@ pub const Signer = struct {
         try self.served.append(self.arena, .{ .address = address, .key = key });
     }
 
-    /// One RRSIG over `set` (one owner, type and TTL); with `wildcard`, as
+    /// One RRSIG over `set` (one owner and type); with `wildcard`, as
     /// an expansion of that owner.
     pub fn sign(self: *Signer, key: *const Key, set: []const RR, wildcard: ?dns.Name) !RR {
         const head = set[0];

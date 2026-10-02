@@ -692,17 +692,18 @@ fn firstOfRrset(rrs: []const RR, i: usize) bool {
 /// referral to a stub.
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !graph.Reply {
     var keep: std.ArrayList(RR) = .empty;
-    var ttl: u32 = std.math.maxInt(u32);
-    var any = false;
     for (msg.authorities) |rr| if (rr.name.eql(child) and (rr.rtype == .ds or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds))) {
         try keep.append(g.scratch.allocator(), rr);
-        if (rr.rtype == .ds) {
-            ttl = @min(ttl, rr.ttl);
-            any = true;
-        }
     };
-    // Signatures over no DS are no answer.
-    if (any) return .{ .kind = .answer, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now(), .ttl = ttl };
+    // Bound as any answer is; signatures over no DS are dropped, and are
+    // no answer.
+    const answers = try walk.bindSigs(g, keep.items);
+    if (answers.len > 0) {
+        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = answers, .zone = zone, .stored_ns = g.now() };
+        reply.ttl = walk.replyTtl(g, reply);
+        return reply;
+    }
+    var ttl: u32 = std.math.maxInt(u32);
     var proofs: std.ArrayList(RR) = .empty;
     for (msg.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
         .nsec, .nsec3 => {

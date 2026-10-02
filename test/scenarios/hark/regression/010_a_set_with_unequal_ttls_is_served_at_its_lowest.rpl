@@ -1,0 +1,59 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a set with unequal TTLs is served at its lowest
+
+; RFC 2181 §5.2: the TTLs of one RRset must be the same; where an
+; authoritative answer's differ, every record is treated as if it carried
+; the lowest. Handed on as received, the set would reach the client
+; broken the same way, and one record would claim five times the life the
+; set has.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 300 IN A 192.0.2.1
+      www.example. 60 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer ttl
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 60 IN A 192.0.2.1
+    www.example. 60 IN A 192.0.2.2
+ENTRY_END
+
+SCENARIO_END

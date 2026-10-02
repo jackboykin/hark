@@ -949,7 +949,7 @@ fn hasSig(rrs: []const dns.ResourceRecord, sig: dns.ResourceRecord) bool {
 /// crowded out.
 const max_sigs_per_set = 8;
 
-fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
+pub fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
     for (rrs) |rr| {
         if (rr.rtype == .rrsig) break;
     } else return rrs;
@@ -989,8 +989,8 @@ fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRec
     // Stable: a set, then its usable signatures, then the rest, each in
     // the reply's order.
     std.mem.sort(u32, at, by, By.lessThan);
-    const keep = try a.alloc(bool, rrs.len);
-    @memset(keep, true);
+    // Per record: the TTL it leaves with, null if dropped.
+    const ttls = try a.alloc(?u32, rrs.len);
     var i: usize = 0;
     while (i < at.len) {
         var j = i + 1;
@@ -1000,16 +1000,30 @@ fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRec
         // first agrees.
         var first: ?dns.Name = null;
         var kept: usize = 0;
-        for (at[i..j]) |k| if (rrs[k].rtype == .rrsig) {
-            const signer = rrs[k].rdata.rrsig.signer_name;
-            first = first orelse signer;
-            keep[k] = covers and kept < max_sigs_per_set and signer.eql(first.?);
-            kept += @intFromBool(keep[k]);
+        // A set's signatures carry its TTL (RFC 4034 §3): the lowest
+        // among them.
+        var ttl: u32 = std.math.maxInt(u32);
+        for (at[i..j]) |k| {
+            var keep = true;
+            if (rrs[k].rtype == .rrsig) {
+                const signer = rrs[k].rdata.rrsig.signer_name;
+                first = first orelse signer;
+                keep = covers and kept < max_sigs_per_set and signer.eql(first.?);
+                kept += @intFromBool(keep);
+            }
+            ttls[k] = if (keep) rrs[k].ttl else null;
+            if (keep) ttl = @min(ttl, rrs[k].ttl);
+        }
+        for (at[i..j]) |k| if (ttls[k] != null) {
+            ttls[k] = ttl;
         };
         i = j;
     }
     var out: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
-    for (rrs, keep) |rr, k| if (k) out.appendAssumeCapacity(rr);
+    for (rrs, ttls) |rr, ttl| if (ttl) |t| {
+        out.appendAssumeCapacity(rr);
+        out.items[out.items.len - 1].ttl = t;
+    };
     return out.items;
 }
 

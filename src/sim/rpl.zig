@@ -523,12 +523,11 @@ const Parser = struct {
     /// Same-(owner, type) RRs stay adjacent in first-seen order, so an
     /// RRset asserts as one unit.
     fn addRr(p: *Parser, list: *std.ArrayList(dns.ResourceRecord), ds_from: *std.ArrayList(DsFrom), line: []const u8) Error!void {
-        var record = try p.parseRr(line, ds_from);
+        const record = try p.parseRr(line, ds_from);
         for (list.items, 0..) |existing, i| {
             if (existing.rtype == record.rtype and existing.name.eql(record.name)) {
                 var j = i + 1;
                 while (j < list.items.len and list.items[j].rtype == record.rtype and list.items[j].name.eql(record.name)) j += 1;
-                record.ttl = existing.ttl;
                 try list.insert(p.arena, j, record);
                 return;
             }

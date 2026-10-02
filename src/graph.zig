@@ -688,6 +688,7 @@ pub const Graph = struct {
                         rr.name = try dns.cloneNameLower(arena, rr.name);
                         try dns.lowercaseRDataNames(arena, &rr.rdata);
                     }
+                    dns.levelTtls(@constCast(section));
                 }
                 break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
             },
