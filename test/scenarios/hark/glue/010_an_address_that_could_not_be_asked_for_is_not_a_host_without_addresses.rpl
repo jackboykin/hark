@@ -1,0 +1,154 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN an address that could not be asked for is not a host without addresses
+
+; x. is served by ns.y. and y. by ns.x., each delegated for thirty seconds
+; with glue for ten. Twenty seconds on both cuts stand without an address,
+; and asking for ns.x. A needs ns.y.'s address, which needs ns.x.'s: the
+; lookup waits on itself and cannot be made. The host's AAAA is a denial
+; held for an hour. One family denied and the other never asked is no
+; proof the host has no address: recorded as one, it would outlive both
+; cuts and keep other., served by ns.x. without glue, unreachable for the
+; denial's hour.
+;
+; Topology
+;   root  127.0.10.1   delegates x. and y. (glue) and other. (none)
+;   ns    127.0.10.2   serves all three
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      x. IN A
+    SECTION AUTHORITY
+      x. 30 IN NS ns.y.
+    SECTION ADDITIONAL
+      ns.y. 10 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      y. IN A
+    SECTION AUTHORITY
+      y. 30 IN NS ns.x.
+    SECTION ADDITIONAL
+      ns.x. 10 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.x.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.x. IN AAAA
+    SECTION AUTHORITY
+      x. 3600 IN SOA ns.y. hostmaster.x. 1 1800 900 604800 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.y. IN AAAA
+    SECTION AUTHORITY
+      y. 3600 IN SOA ns.x. hostmaster.y. 1 1800 900 604800 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.x. IN A
+    SECTION ANSWER
+      ns.x. 3600 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.other. IN A
+    SECTION ANSWER
+      www.other. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.x. IN AAAA
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ns.x. IN AAAA
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.y. IN AAAA
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ns.y. IN AAAA
+ENTRY_END
+
+; The glue has lapsed, the cuts have not.
+STEP 5 TIME_PASSES ELAPSE 20
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.x. IN A
+ENTRY_END
+
+; The cuts have lapsed too: the root hands out the glue again.
+STEP 7 TIME_PASSES ELAPSE 20
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.other. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.other. IN A
+  SECTION ANSWER
+    www.other. 300 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

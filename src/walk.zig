@@ -509,7 +509,11 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     var denied: i64 = std.math.maxInt(i64);
     var failed: ?Failure = null;
     for ([_]dns.RType{ .a, .aaaa }) |rtype| {
-        const rid = (if (rtype == .a) s.a else s.aaaa).unwrap() orelse continue;
+        // Unasked is not denied.
+        const rid = (if (rtype == .a) s.a else s.aaaa).unwrap() orelse {
+            failed = failed orelse unreachable_authority;
+            continue;
+        };
         const c = g.cell(rid);
         if (!c.settled()) {
             pending = true;
