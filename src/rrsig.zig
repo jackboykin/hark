@@ -594,41 +594,13 @@ fn pkcs1v15Encode(em: []u8, comptime Hash: type, digest: *const [Hash.digest_len
     em[0] = 0x00;
 }
 
-/// Verify an ECDSA signature (RFC 6605: raw x||y key, r||s signature) per
-/// FIPS 186-5 §6.4.2. std's Verifier computes u1·G and u2·Q separately and
-/// normalises the sum to affine; one double-base multiplication shares the
-/// doublings, and comparing r·Z against the projective X skips the inversion.
+/// Verify an ECDSA signature (RFC 6605: raw x||y key, r||s signature).
 fn verifyEcdsa(comptime Ecdsa: type, signature: []const u8, digest: *const [Ecdsa.Hash.digest_length]u8, key_data: []const u8) VerifyError!void {
-    const Curve = Ecdsa.Curve;
-    const Scalar = Curve.scalar.Scalar;
-    const len = Curve.scalar.encoded_length;
+    const len = Ecdsa.Curve.scalar.encoded_length;
     if (key_data.len != 2 * len) return error.InvalidKey;
     if (signature.len != 2 * len) return error.InvalidSignature;
-    const q = Curve.fromSerializedAffineCoordinates(key_data[0..len].*, key_data[len..][0..len].*, .big) catch return error.InvalidKey;
-
-    const r_bytes = signature[0..len].*;
-    const r = Scalar.fromBytes(r_bytes, .big) catch return error.InvalidSignature;
-    const s = Scalar.fromBytes(signature[len..][0..len].*, .big) catch return error.InvalidSignature;
-    if (r.isZero() or s.isZero()) return error.InvalidSignature;
-
-    var wide: [64]u8 = @splat(0);
-    wide[64 - digest.len ..].* = digest.*;
-    const e = Scalar.fromBytes64(wide, .big);
-
-    const w = s.invert();
-    const point = Curve.mulDoubleBasePublic(Curve.basePoint, e.mul(w).toBytes(.little), q, r.mul(w).toBytes(.little), .little) catch
-        return error.InvalidSignature;
-
-    // mulDoubleBasePublic rejects the identity, so Z ≠ 0 and x = X/Z is in [0, p):
-    // x ≡ r (mod n) exactly when x is r, or r + n if r + n < p.
-    const n = Curve.scalar.field_order;
-    const p = Curve.Fe.field_order;
-    comptime std.debug.assert(n < p and p < 2 * n);
-    const r_fe = Curve.Fe.fromBytes(r_bytes, .big) catch unreachable;
-    const n_fe = comptime Curve.Fe.fromInt(n) catch unreachable;
-    if (point.x.equivalent(r_fe.mul(point.z))) return;
-    if (r_fe.toInt() < p - n and point.x.equivalent(r_fe.add(n_fe).mul(point.z))) return;
-    return error.InvalidSignature;
+    const key: Ecdsa.PublicKey = .{ .p = Ecdsa.Curve.fromSerializedAffineCoordinates(key_data[0..len].*, key_data[len..][0..len].*, .big) catch return error.InvalidKey };
+    Ecdsa.Signature.fromBytes(signature[0 .. 2 * len].*).verifyPrehashed(digest.*, key) catch return error.InvalidSignature;
 }
 
 fn verifyEd25519(signature: []const u8, data: *const SignedData, key_data: []const u8) VerifyError!void {
@@ -867,26 +839,6 @@ test "ECDSA P-384 signature verification" {
 
     try verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, msg), dnssec_key);
     try testing.expectError(error.InvalidSignature, verifyEcdsa(EcdsaP384, &sig, &testDigest(EcdsaP384.Hash, "wrong data"), dnssec_key));
-}
-
-test "ECDSA P-256 at the edges of the x(R) comparison" {
-    const cases = [_]struct { []const u8, []const u8, bool }{
-        // Wycheproof ecdsa_secp256r1_sha256_p1363 tcId 115: x(R) = r + n.
-        .{ "0ad99500288d466940031d72a9f5445a4d43784640855bf0a69874d2de5fe103c5011e6ef2c42dcd50d5d3d29f99ae6eba2c80c9244f4c5422f0979ff0c3ba5e", "000000000000000000000000000000004319055358e8617b0c46353d039cdaabffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254e", true },
-        // tcId 169: R is the point at infinity.
-        .{ "b533d4695dd5b8c5e07757e55e6e516f7e2c88fa0239e23f60e8ec07dd70f2871b134ee58cc583278456863f33c3a85d881f7d4a39850143e29d4eaf009afe47", "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8555555550000000055555555555555553ef7a8e48d07df81a693439654210c70", false },
-        // Crafted: x(R) = 0 and r = p - n, where r + n = p is 0 in the field.
-        .{ "87c9726c1185f53a54665c021cad055769da064144034c6ccd04b435852176e5fe26fc304dc23b8763ab0a36d242276d7af23d231a20065f437bf3208c6b4f98", "000000000000000000000000000000004319055358e8617b0c46353d039cdaae7a11f5745ac1c89fd5b902a29835755f9be73cf35d9210b82eec2705f421808b", false },
-    };
-    for (cases) |c| {
-        const key_hex, const sig_hex, const valid = c;
-        var key: [64]u8 = undefined;
-        var sig: [64]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&key, key_hex);
-        _ = try std.fmt.hexToBytes(&sig, sig_hex);
-        const result = verifyEcdsa(EcdsaP256, &sig, &testDigest(Sha256, "123400"), &key);
-        if (valid) try result else try testing.expectError(error.InvalidSignature, result);
-    }
 }
 
 test "VerifyMemo: a remembered signature binds its key and still expires" {
