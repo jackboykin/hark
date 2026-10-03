@@ -55,7 +55,7 @@ func startHark(ctx context.Context, t *testing.T, bin string, sc *scenario, port
 		if err := os.WriteFile(cfg, []byte(sc.config.toml(listen, port, sc.rootHints, anchor)), 0o644); err != nil {
 			return nil, err
 		}
-		if err := h.start(ctx, bin, cfg); err != nil {
+		if err := h.start(ctx, bin, cfg, sc.config.nofile); err != nil {
 			return nil, err
 		}
 		err = h.ready()
@@ -82,13 +82,17 @@ func (h *hark) stopped(t *testing.T) {
 	}
 }
 
-func (h *hark) start(ctx context.Context, bin, cfg string) error {
+func (h *hark) start(ctx context.Context, bin, cfg string, nofile int) error {
 	log, err := os.Create(h.logPath)
 	if err != nil {
 		return err
 	}
 	defer log.Close()
-	h.cmd = exec.CommandContext(ctx, bin, "serve", "--config", cfg, "--verbose")
+	args := []string{bin, "serve", "--config", cfg, "--verbose"}
+	if nofile > 0 {
+		args = append([]string{"sh", "-c", fmt.Sprintf(`ulimit -n %d && exec "$0" "$@"`, nofile)}, args...)
+	}
+	h.cmd = exec.CommandContext(ctx, args[0], args[1:]...)
 	h.cmd.Stdout, h.cmd.Stderr = log, log
 	// Pdeathsig follows the forking thread, and the runtime retires a thread
 	// only when a goroutine locked to it exits; nothing here locks one.

@@ -35,6 +35,7 @@ type config struct {
 	// Set by tests alone; zero is hark's default.
 	cacheSize, tcpIdleMs int
 	allowFrom            []string
+	nofile               int
 }
 
 type rangeBlock struct {

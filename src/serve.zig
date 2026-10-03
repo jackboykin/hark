@@ -127,16 +127,23 @@ const Server = struct {
     late: std.Deque(Tenant) = .empty,
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
+    freed: std.ArrayList(u32) = .empty,
     scratch: std.heap.ArenaAllocator,
     stopping: bool = false,
+    listeners: std.ArrayList(posix.fd_t) = .empty,
+    conns: u32 = 0,
+    max_conns: u32,
+    paused: bool = false,
 
     fn token(s: *Server, w: Watched) !u32 {
-        for (s.watched.items, 0..) |*x, i| if (x.w == .free) {
+        if (s.freed.pop()) |i| {
+            const x = &s.watched.items[i];
             x.gen +%= 1;
             x.w = w;
-            return @intCast(i | (x.gen << slot_bits));
-        };
+            return i | (x.gen << slot_bits);
+        }
         std.debug.assert(s.watched.items.len <= slot_mask);
+        try s.freed.ensureTotalCapacity(s.gpa, s.watched.items.len + 1);
         try s.watched.append(s.gpa, .{ .w = w });
         return @intCast(s.watched.items.len - 1);
     }
@@ -158,8 +165,10 @@ const Server = struct {
         const udp = try listenOn(addr, posix.SOCK.DGRAM);
         try s.e.watch(udp, try s.token(.{ .udp = udp }), linux.EPOLL.IN);
         const tcp = try listenOn(addr, posix.SOCK.STREAM);
-        // Edge-triggered: an EMFILE accept must not re-fire until the next arrival.
+        // Edge-triggered, so a paused listener doesn't spin the loop; `reopen`
+        // drains what queued meanwhile.
         try s.e.watch(tcp, try s.token(.{ .listen = tcp }), linux.EPOLL.IN | linux.EPOLL.ET);
+        try s.listeners.append(s.gpa, tcp);
         var ab: [64]u8 = undefined;
         log.info("listening on {s}", .{na.format(addr, &ab)});
     }
@@ -169,7 +178,10 @@ const Server = struct {
         if (x.gen << slot_bits != tok & ~@as(u32, slot_mask)) return;
         switch (x.w) {
             .udp => |fd| try s.readUdp(fd),
-            .listen => |fd| try s.accept(fd),
+            .listen => |fd| if (!try s.accept(fd) and !s.paused) {
+                s.paused = true;
+                s.g.stats.clients.paused += 1;
+            },
             .conn => |c| if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c, events),
             .signal => |fd| s.onSignal(fd),
             .free => {},
@@ -193,15 +205,19 @@ const Server = struct {
         }
     }
 
-    fn accept(s: *Server, fd: posix.fd_t) !void {
+    fn accept(s: *Server, fd: posix.fd_t) !bool {
         while (true) {
+            if (s.conns >= s.max_conns) return false;
             var pa: na.PosixAddress = undefined;
             var len: posix.socklen_t = @sizeOf(na.PosixAddress);
             const rc = linux.accept4(fd, &pa.any, &len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
-                .CONNABORTED, .INTR => continue,
-                else => return,
+                .AGAIN => return true,
+                .MFILE, .NFILE, .NOBUFS, .NOMEM => return false,
+                .BADF, .FAULT, .INVAL, .NOTSOCK => unreachable,
+                // accept(2): the rest are one connection's.
+                else => continue,
             }
             const cfd: posix.fd_t = @intCast(rc);
             const addr = na.fromSockaddr(&pa);
@@ -215,7 +231,15 @@ const Server = struct {
             c.* = .{ .fd = cfd, .addr = addr, .token = 0, .last_ns = s.e.now_ns };
             c.token = try s.token(.{ .conn = c });
             try s.e.watch(c.fd, c.token, linux.EPOLL.IN);
+            s.conns += 1;
         }
+    }
+
+    fn reopen(s: *Server) !void {
+        if (!s.paused or s.conns >= s.max_conns) return;
+        var drained = true;
+        for (s.listeners.items) |fd| drained = try s.accept(fd) and drained;
+        s.paused = !drained;
     }
 
     fn readTcp(s: *Server, c: *Conn, events: u32) !void {
@@ -267,6 +291,8 @@ const Server = struct {
         s.timers.deinit(s.gpa);
         s.desk.deinit();
         s.watched.deinit(s.gpa);
+        s.freed.deinit(s.gpa);
+        s.listeners.deinit(s.gpa);
         s.scratch.deinit();
     }
 
@@ -276,6 +302,8 @@ const Server = struct {
         };
         sys.close(c.fd);
         s.watched.items[c.token & slot_mask].w = .free;
+        s.freed.appendAssumeCapacity(c.token & slot_mask);
+        s.conns -= 1;
         c.out.deinit(s.gpa);
         s.gpa.destroy(c);
     }
@@ -712,14 +740,14 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .store_bytes = cfg.cache_size,
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
-        .max_flights = flightShare(),
+        .max_flights = fdShare(2),
         .max_work_bytes = cfg.cache_size,
         .trace = trace,
     }, e.edge());
     defer g.deinit();
     g.attach();
     e.work = g.work.allocator();
-    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa) };
+    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
@@ -738,6 +766,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             sweep_at = e.now_ns + std.time.ns_per_s;
             s.sweep();
         }
+        try s.reopen();
         if (e.now_ns >= stats_at) {
             stats_at = e.now_ns + stats_every;
             logStats(&g);
@@ -758,11 +787,11 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
 
 const stats_every = 5 * std.time.ns_per_min;
 
-/// Half the fd limit `main` raised: an exchange holds a socket, and
-/// clients, listeners and the loop need the rest.
-fn flightShare() u32 {
+/// A part of the fd limit `main` raised: flights get half and TCP clients
+/// a quarter, so idle clients can't take the sockets upstream needs.
+fn fdShare(part: u32) u32 {
     const lim = posix.getrlimit(.NOFILE) catch return std.math.maxInt(u32);
-    return @intCast(@min(lim.cur / 2, std.math.maxInt(u32)));
+    return @intCast(@min(lim.cur / part, std.math.maxInt(u32)));
 }
 
 /// Cumulative since start, one line per plane. Every five minutes, on
@@ -772,8 +801,8 @@ fn logStats(g: *graph.Graph) void {
     const r = g.stats.resolver;
     const t = g.stats.trust;
     const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  shed {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.shed, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
+    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  shed {d}  paused {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
+        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.shed, c.paused, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
     log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
         r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.keys, r.refused,

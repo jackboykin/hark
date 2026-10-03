@@ -2,6 +2,7 @@ package harness
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"testing"
@@ -29,14 +30,19 @@ RANGE_END
 SCENARIO_END
 `
 
-func lowestFreeFD(t *testing.T, pid int) int {
+func openFDs(t *testing.T, pid int) []os.DirEntry {
 	t.Helper()
 	fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fds
+}
+
+func lowestFreeFD(t *testing.T, pid int) int {
+	t.Helper()
 	used := map[int]bool{}
-	for _, fd := range fds {
+	for _, fd := range openFDs(t, pid) {
 		n, _ := strconv.Atoi(fd.Name())
 		used[n] = true
 	}
@@ -69,5 +75,37 @@ func TestFDExhaustionIsUnsentNotATimeout(t *testing.T) {
 	s := stats(t, h, "stats resolver", "unsent", "timeout")
 	if unsent, timeout := s[0], s[1]; unsent < 1 || timeout != 0 {
 		t.Errorf("unsent %d timeout %d, want unsent at least 1 and no timeout", unsent, timeout)
+	}
+}
+
+func TestTCPFloodLeavesUpstreamItsSockets(t *testing.T) {
+	t.Parallel()
+	const nofile = 64
+	_, h := launchText(t, oneAuthority, func(c *config) { c.nofile = nofile; c.tcpIdleMs = 60000 })
+	pid := h.cmd.Process.Pid
+	var flood []net.Conn
+	defer func() {
+		for _, c := range flood {
+			c.Close()
+		}
+	}()
+	for range 2 * nofile {
+		c, err := net.DialTimeout("tcp", h.addr.String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flood = append(flood, c)
+	}
+	for n, prev := 0, -1; n != prev; time.Sleep(100 * time.Millisecond) {
+		prev, n = n, len(openFDs(t, pid))
+	}
+	wantRcode(t, h.addr, "a.example.com.", dns.RcodeSuccess, 5*time.Second)
+	for _, c := range flood {
+		c.Close()
+	}
+	flood = nil
+	r, err := ask(t.Context(), "tcp", h.addr, "b.example.com.", 5*time.Second)
+	if err != nil || r.Rcode != dns.RcodeSuccess {
+		t.Fatalf("tcp after the flood: %v %v", r, err)
 	}
 }
