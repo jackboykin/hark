@@ -540,15 +540,18 @@ const Parser = struct {
             ttl = try p.int(u32, t);
             t = toks.next() orelse return p.fail("RR needs a type");
         }
-        if (eqlLower(t, "in")) {
+        var class: dns.RClass = .in;
+        inline for (.{ "in", "ch", "hs" }, .{ 1, 3, 4 }) |text, code| if (eqlLower(t, text)) {
+            class = @fromBackingInt(code);
             t = toks.next() orelse return p.fail("RR needs a type");
-        } else if (eqlLower(t, "ch") or eqlLower(t, "hs")) return p.fail("only class IN is supported");
+            break;
+        };
         if (isDigits(t)) {
             ttl = try p.int(u32, t);
             t = toks.next() orelse return p.fail("RR needs a type");
         }
         const rtype = rtypeFromText(t) orelse return p.fail("unknown RR type");
-        return .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) };
+        return .{ .name = owner, .rtype = rtype, .rclass = class, .ttl = ttl, .rdata = try p.rdata(rtype, owner, &toks, ds_from) };
     }
 
     fn rdata(p: *Parser, rtype: dns.RType, owner: dns.Name, toks: *mem.TokenIterator(u8, .any), ds_from: *std.ArrayList(DsFrom)) Error!dns.RData {

@@ -685,11 +685,17 @@ pub const Graph = struct {
                 if (msg.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent_name, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // 0x20 case checked; every name is a lowercase fact from here.
-                inline for (.{ msg.answers, msg.authorities, msg.additionals }) |section| {
-                    for (@constCast(section)) |*rr| {
-                        rr.name = try dns.cloneNameLower(arena, rr.name);
-                        try dns.lowercaseRDataNames(arena, &rr.rdata);
-                    }
+                // Asked in IN, a record of another class answers nothing.
+                inline for (.{ &msg.answers, &msg.authorities, &msg.additionals }) |section| {
+                    const rrs = @constCast(section.*);
+                    var n: usize = 0;
+                    for (rrs) |rr| if (rr.rclass == .in) {
+                        rrs[n] = rr;
+                        rrs[n].name = try dns.cloneNameLower(arena, rr.name);
+                        try dns.lowercaseRDataNames(arena, &rrs[n].rdata);
+                        n += 1;
+                    };
+                    section.* = rrs[0..n];
                 }
                 const scratch = g.scratch.allocator();
                 const wall = g.wallNow();

@@ -118,15 +118,15 @@ pub const Signer = struct {
         // Signing appends to `out`, which may move it.
         const originals = try self.arena.dupe(RR, out.items);
         for (originals, 0..) |head, i| {
-            if (head.rtype == .rrsig) continue;
+            if (head.rtype == .rrsig or head.rclass != .in) continue;
             var first = true;
-            for (originals[0..i]) |prev| first = first and !(prev.rtype == head.rtype and prev.name.eql(head.name));
+            for (originals[0..i]) |prev| first = first and !(prev.rclass == .in and prev.rtype == head.rtype and prev.name.eql(head.name));
             if (!first) continue;
             // RFC 6672 §5.3.1: a CNAME synthesised under a DNAME travels
             // unsigned.
             var synthesised = false;
             if (head.rtype == .cname) for (originals) |o| {
-                synthesised = synthesised or (o.rtype == .dname and !head.name.eql(o.name) and head.name.isSubdomainOf(o.name));
+                synthesised = synthesised or (o.rclass == .in and o.rtype == .dname and !head.name.eql(o.name) and head.name.isSubdomainOf(o.name));
             };
             if (synthesised) continue;
             const key = forced orelse self.keyFor(head.name, head.rtype, cuts) orelse continue;
@@ -134,11 +134,11 @@ pub const Signer = struct {
             // A signature of a reserved algorithm (123-251, RFC 6014 §4)
             // is stuffing, not the set's: the set is still signed.
             var covered = false;
-            for (originals) |o| covered = covered or (o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
+            for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
             if (covered) continue;
             var set: [rrsig.SignedData.max_entries]RR = undefined;
             var n: usize = 0;
-            for (originals) |rr| if (rr.rtype == head.rtype and rr.name.eql(head.name)) {
+            for (originals) |rr| if (rr.rclass == .in and rr.rtype == head.rtype and rr.name.eql(head.name)) {
                 set[n] = rr;
                 n += 1;
             };
