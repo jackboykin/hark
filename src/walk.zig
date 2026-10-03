@@ -850,7 +850,11 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         passed = keep.items.len;
-        for (msg.answers) |rr| {
+        // Nothing lives below a DNAME's owner (RFC 6672 §2.4): its
+        // substitution is the alias, whatever the reply holds at `cur`.
+        const dname = deepestDname(msg.answers, cur, zone);
+        const here: []const dns.ResourceRecord = if (dname == null) msg.answers else &.{};
+        for (here) |rr| {
             if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and rr.rtype == qtype) {
                 // A chain back to a link it passed ends at that link's
                 // signatures, kept bound with it and once (RFC 2181 §5).
@@ -860,17 +864,13 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
                 if (rr.rtype == .cname) asked_alias = rr.rdata.cname;
             }
         }
-        const dname = deepestDname(msg.answers, cur, zone);
         if (answered) {
             // Asked for RRSIG, collecting already took every signature.
-            if (qtype != .rrsig) try keepSigs(g, &keep, msg.answers, cur, qtype);
-            // A CNAME asked for under a DNAME is its synthesis, unsigned:
-            // the DNAME is what proves it.
-            if (qtype == .cname) if (dname) |d| try keepDname(g, &keep, msg.answers, d);
+            if (qtype != .rrsig) try keepSigs(g, &keep, here, cur, qtype);
             break;
         }
         var cname: ?dns.ResourceRecord = null;
-        for (msg.answers) |rr| if (rr.rtype == .cname and rr.name.eql(cur) and rr.name.isSubdomainOf(zone)) {
+        for (here) |rr| if (rr.rtype == .cname and rr.name.eql(cur) and rr.name.isSubdomainOf(zone)) {
             cname = rr;
             break;
         };
@@ -882,17 +882,15 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         }
         if (dname) |d| {
             try keepDname(g, &keep, msg.answers, d);
-            if (cname == null) {
-                const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
-                    overflow = true;
-                    break;
-                };
-                cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
-            }
+            const target = try dns.substituteSuffix(g.scratch.allocator(), cur, d.name, d.rdata.dname) orelse {
+                overflow = true;
+                break;
+            };
+            cname = .{ .name = cur, .rtype = .cname, .rclass = .in, .ttl = d.ttl, .rdata = .{ .cname = target } };
         }
         const c = cname orelse break;
         try keep.append(g.scratch.allocator(), c);
-        try keepSigs(g, &keep, msg.answers, cur, .cname);
+        try keepSigs(g, &keep, here, cur, .cname);
         if (qtype == .cname) {
             answered = true;
             asked_alias = c.rdata.cname;

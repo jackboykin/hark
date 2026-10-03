@@ -1,15 +1,8 @@
 ; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
 ; hark: dnssec-zone = .
 
-SCENARIO_BEGIN a synthesized CNAME that is not the DNAME's derivation is a forgery
-
-; 019's dark twin. The CNAME rides unsigned on the DNAME's authority, so
-; the *only* thing authenticating it is the derivation itself: swap the
-; DNAME owner's suffix, keep the prefix. Here the target points somewhere
-; else entirely — an injector choosing the redirect. Inheriting the
-; DNAME's signer instead of re-deriving would wave this through.
-;
-; Expected: SERVFAIL, AD=0.
+SCENARIO_BEGIN a CNAME below a signed DNAME is its derivation, whatever the server sent
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -25,6 +18,16 @@ RANGE_BEGIN 0 100
       www.doc.example. 3600 IN CNAME www.evil.example.
       www.evil.example. 3600 IN A 192.0.2.66
   ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.archive.example. IN A
+    SECTION ANSWER
+      www.archive.example. 3600 IN A 192.0.2.9
+  ENTRY_END
 RANGE_END
 
 STEP 1 QUERY
@@ -36,10 +39,14 @@ ENTRY_END
 
 STEP 2 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags question ede=6
-  REPLY QR RD RA SERVFAIL
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
   SECTION QUESTION
     www.doc.example. IN A
+  SECTION ANSWER
+    doc.example. 3600 IN DNAME archive.example.
+    www.doc.example. 3600 IN CNAME www.archive.example.
+    www.archive.example. 3600 IN A 192.0.2.9
 ENTRY_END
 
 SCENARIO_END
