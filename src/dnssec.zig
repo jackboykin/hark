@@ -378,7 +378,7 @@ pub fn setAt(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType)
     return &.{};
 }
 
-fn covers(rr: dns.ResourceRecord) dns.RType {
+pub fn covers(rr: dns.ResourceRecord) dns.RType {
     return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
 }
 

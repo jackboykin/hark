@@ -848,19 +848,22 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         // substitution is the alias, whatever the reply holds at `cur`.
         const dname = deepestDname(msg.answers, cur, zone);
         const here: []const dns.ResourceRecord = if (dname == null) msg.answers else &.{};
+        // A chain back to a DNAME it passed ends at its owner, where that set
+        // and its signatures are already kept (RFC 2181 §5).
+        const looped = for (keep.items[0..passed]) |k| {
+            if (k.rtype == .dname and k.name.eql(cur)) break true;
+        } else false;
         for (here) |rr| {
             if (collect and rr.name.eql(cur) and rr.name.isSubdomainOf(zone) and rr.rtype == qtype) {
-                // A chain back to a link it passed ends at that link's
-                // signatures, kept bound with it and once (RFC 2181 §5).
                 answered = true;
-                if (qtype == .rrsig and hasSig(keep.items[0..passed], rr)) continue;
+                if (looped and dnssec.covers(rr) == .dname) continue;
                 try keep.append(g.scratch.allocator(), rr);
                 if (rr.rtype == .cname) asked_alias = rr.rdata.cname;
             }
         }
         if (answered) {
             // Asked for RRSIG, collecting already took every signature.
-            if (qtype != .rrsig) try keepSigs(g, &keep, here, cur, qtype);
+            if (qtype != .rrsig and keep.items.len > passed) try keepSigs(g, &keep, here, cur, qtype);
             break;
         }
         var cname: ?dns.ResourceRecord = null;
@@ -917,16 +920,6 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     reply.authorities = try proofsNeeded(g, authorities, reply);
     reply.ttl = replyTtl(g, reply);
     return .{ .reply = reply };
-}
-
-fn hasSig(rrs: []const dns.ResourceRecord, sig: dns.ResourceRecord) bool {
-    const s = sig.rdata.rrsig;
-    for (rrs) |rr| {
-        if (rr.rtype != .rrsig or !rr.name.eql(sig.name)) continue;
-        const r = rr.rdata.rrsig;
-        if (r.type_covered == s.type_covered and std.mem.eql(u8, r.signature, s.signature)) return true;
-    }
-    return false;
 }
 
 /// The proof a reply owes (RFC 4035 §3.1.3): a denial's from the zone it
