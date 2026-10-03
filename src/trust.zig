@@ -262,7 +262,7 @@ pub fn runAhead(g: *Graph, id: CellId) !void {
 }
 
 /// Every cut from `zone` up is proven secure or, unproven yet, delegated
-/// with a DS, to the root or to a cut proven secure.
+/// with a DS hark can follow, to the root or to a cut proven secure.
 pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
     var kb: graph.KeyBuf = undefined;
     var z = zone;
@@ -270,7 +270,7 @@ pub fn signedDown(g: *Graph, zone: dns.Name) !bool {
         if (try g.peek(graph.Key.of(&kb, .ds, z, .a))) |f| return f.value.ds.status == .secure;
         if (z.labels.len == 0) return true;
         const ds = try g.peek(graph.Key.of(&kb, .rrset, z, .ds)) orelse return false;
-        if (ds.value.rrset.kind != .answer) return false;
+        if (ds.value.rrset.kind != .answer or !dnssec.anySupportedDs(ds.value.rrset.answers)) return false;
         // The DS came from the zone above, whichever cut lies between.
         const above = ds.value.rrset.zone;
         if (!proof.isProperAncestor(above, z)) return false;

@@ -68,4 +68,7 @@ ENTRY_BEGIN
     www.example. 3600 IN A 192.0.2.1
 ENTRY_END
 
+; The referral, the root's keys, www.example. A: never example.'s keys.
+STEP 3 CHECK_MAX_QUERIES 3
+
 SCENARIO_END
