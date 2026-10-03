@@ -436,9 +436,9 @@ const Parser = struct {
             } else switch (section orelse return p.fail("RR outside SECTION")) {
                 .question => try questions.append(p.arena, try p.question(line)),
                 .query_log => try query_log.append(p.arena, try p.queryLogRow(line)),
-                .answer => try p.addRr(&answers, &ds_from, line),
-                .authority => try p.addRr(&authorities, &ds_from, line),
-                .additional => try p.addRr(&additionals, &ds_from, line),
+                .answer => try answers.append(p.arena, try p.parseRr(line, &ds_from)),
+                .authority => try authorities.append(p.arena, try p.parseRr(line, &ds_from)),
+                .additional => try additionals.append(p.arena, try p.parseRr(line, &ds_from)),
             }
         }
         return p.fail("missing ENTRY_END");
@@ -518,21 +518,6 @@ const Parser = struct {
             .qtype = rtypeFromText(qtype) orelse return p.fail("bad QUERY_LOG qtype"),
             .dest = if (dest) |d| try p.parseAddr(d) else null,
         };
-    }
-
-    /// Same-(owner, type) RRs stay adjacent in first-seen order, so an
-    /// RRset asserts as one unit.
-    fn addRr(p: *Parser, list: *std.ArrayList(dns.ResourceRecord), ds_from: *std.ArrayList(DsFrom), line: []const u8) Error!void {
-        const record = try p.parseRr(line, ds_from);
-        for (list.items, 0..) |existing, i| {
-            if (existing.rtype == record.rtype and existing.name.eql(record.name)) {
-                var j = i + 1;
-                while (j < list.items.len and list.items[j].rtype == record.rtype and list.items[j].name.eql(record.name)) j += 1;
-                try list.insert(p.arena, j, record);
-                return;
-            }
-        }
-        try list.append(p.arena, record);
     }
 
     /// `name [ttl] [class] type rdata…` in any of testbound's orders.
