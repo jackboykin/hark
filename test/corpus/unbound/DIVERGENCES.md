@@ -114,21 +114,24 @@ past its usefulness — so hark serves cached positive answers without it.
 
 ---
 
-## 5. Multi-NS fallthrough & stale-glue re-resolution — *mostly closed*
+## 5. An NS name that is an alias — *deliberate (spec)*
 
-Not its own lifted scenario, but the connective tissue between several:
-`iter_cname_cache.rpl` (must-pass, and passing) exercises the case where one
-NS's glue TTL expires and the remaining siblings all SERVFAIL. The theoretical
-remainder — hark does not re-resolve an expired NS's address, so a shape this
-scenario does not reach could give up where a re-resolving resolver recovers —
-is the stale-glue gap below, not something this scenario discriminates on.
+**Scenario:** `iter_cname_cache.rpl`
+
+`example.com.` is served by `ns.example.com.`, a CNAME to `ns.bla.nl.`, and
+by `ns2.example.com.`, which always SERVFAILs. Unbound follows the alias to
+reach the zone. RFC 2181 §10.3 says an NS name MUST NOT be an alias, and hark
+does not follow one: such a name has no address, for as long as the CNAME
+lives. With the only other server failing, the query SERVFAILs.
+
+The breakage is the delegation's to fix, and following the alias means
+trusting an address whose cause is a record at another name, in another zone.
+
+**Verdict:** not a bug.
 
 The broader "one failing NS must not condemn the resolution" story (RFC 1034
-§5.3.3) is **fixed**: any rcode but an answer's moves to a sibling
-(`../../scenarios/hark/errors/001_any_rcode_but_an_answers_moves_to_a_sibling.rpl`).
-
-**Verdict:** sibling-fallthrough closed; stale-glue re-resolution is the live
-remainder.
+§5.3.3) is covered by
+`../../scenarios/hark/errors/001_any_rcode_but_an_answers_moves_to_a_sibling.rpl`.
 
 ---
 
@@ -161,6 +164,6 @@ may run as is. The behaviour is covered by the `isNonRoutableNs` unit test in
 
 ## A note on the CNAME cluster
 
-The `iter_cname_*` family (`_double`, `_minimise`, `_nx`, `_qnamecopy`,
-`_cache`) all pass; the only CNAME-adjacent gap is the stale-glue
-re-resolution under §5. If a regression reopens any of them, the gate says so.
+The `iter_cname_*` family (`_double`, `_minimise`, `_nx`, `_qnamecopy`)
+all pass; `_cache` is §5. If a regression reopens any of them, the gate says
+so.

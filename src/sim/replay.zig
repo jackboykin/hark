@@ -623,6 +623,7 @@ test "lifted unbound walk scenarios settle to today's answers" {
         "iter_dname_ttl0.rpl",
         "iter_domain_sale.rpl",
         "iter_domain_sale_nschange.rpl",
+        "iter_cname_cache.rpl",
     });
     try testing.expectEqual(18, r.parsed);
     try testing.expectEqual(0, r.failed);

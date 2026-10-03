@@ -210,9 +210,6 @@ pub const CutScratch = struct {
 /// non-authoritative denial) still answers the rule that asked for it
 /// instead of being re-demanded on every wake.
 pub const AddrScratch = struct {
-    /// The NS name, or the target of its one allowed CNAME hop.
-    host: ?dns.Name = null,
-    hopped: bool = false,
     a: OptionalCellId = .none,
     aaaa: OptionalCellId = .none,
     judge_a: OptionalCellId = .none,
@@ -481,24 +478,17 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
 }
 
 /// `addr(host)`: glue seeds it provisionally (`absorbReferral`); else
-/// the A and AAAA RRsets one level deeper, through at most one CNAME hop.
+/// the A and AAAA RRsets one level deeper. An NS name must not be an alias
+/// (RFC 2181 §10.3): one that is has no address.
 pub fn runAddr(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
     const s = g.cell(id).scratch.addr;
-    if (s.host == null) {
-        s.host = g.cell(id).name;
-        if (try g.peek(Key.of(&kb, .rrset, s.host.?, .cname))) |cname| if (cname.value.rrset.kind == .alias) {
-            s.host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), cname.value.rrset.target, false);
-            s.hopped = true;
-        };
-    }
-    const host = s.host.?;
+    const host = g.cell(id).name;
     if (s.a == .none) s.a = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .a), host));
     if (s.aaaa == .none) s.aaaa = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .aaaa), host));
     var addrs: std.ArrayList(na.Address) = .empty;
     var pending = false;
-    var alias: ?dns.Name = null;
     // A denial of one family does not age the other's addresses; an
     // empty set lives only as long as the shortest denial.
     var expires: i64 = std.math.maxInt(i64);
@@ -539,25 +529,19 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
                     continue;
                 }
             }
-            if (r.kind == .answer) {
-                for (r.answers) |rr| {
-                    if (rr.rtype != rtype or !rr.name.eql(host)) continue;
-                    if (g.cfg.addr_policy.address(rr)) |a| {
-                        try addrs.append(g.scratch.allocator(), a);
-                        n += 1;
-                    }
+            if (r.kind == .answer) for (r.answers) |rr| {
+                if (rr.rtype != rtype or !rr.name.eql(host)) continue;
+                if (g.cfg.addr_policy.address(rr)) |a| {
+                    try addrs.append(g.scratch.allocator(), a);
+                    n += 1;
                 }
-            } else if (alias == null) alias = r.target;
+            };
         }
         if (n > 0) expires = @min(expires, c.expires_ns) else denied = @min(denied, c.expires_ns);
     }
     if (pending) return;
     if (addrs.items.len == 0) {
-        if (alias) |target| if (!s.hopped) {
-            s.* = .{ .host = try dns.cloneNameFlat(g.cell(id).arena.allocator(), target, false), .hopped = true };
-            return runAddr(g, id);
-        };
-        // Only denials make an empty set a fact.
+        // Only denials and aliases make an empty set a fact.
         if (failed) |why| return g.fail(id, why);
         expires = denied;
     }
