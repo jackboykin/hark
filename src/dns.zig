@@ -1351,12 +1351,6 @@ pub const Serializer = struct {
         self.pos += data.len;
     }
 
-    fn writeHeader(self: *Serializer, hdr: Header) Error!void {
-        try self.ensureSpace(12);
-        hdr.serialize(self.buf[self.pos..][0..12]);
-        self.pos += 12;
-    }
-
     /// `compress` only for owner names and RFC 1035 rdata (RFC 3597 §4).
     fn writeName(self: *Serializer, name: Name, compress: bool) Error!void {
         if (compress and self.names != null) {
@@ -1601,12 +1595,15 @@ pub fn Sections(comptime R: type) type {
     };
 }
 
+/// The header goes last and counts only records that fit in one message,
+/// so each count fits a u16.
 pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
-    var ser = Serializer{ .buf = buf, .pos = 0, .names = &names };
+    var ser = Serializer{ .buf = buf[0..@min(buf.len, max_message_len)], .pos = 0, .names = &names };
     const write = if (R == WireRecord) Serializer.writeWireRecord else Serializer.writeResourceRecord;
 
-    try ser.writeHeader(sections.header(hdr, questions.len, opt != null));
+    try ser.ensureSpace(12);
+    ser.pos = 12;
     for (questions) |q| try ser.writeQuestion(q);
     ends.questions = ser.pos;
     for (sections.answers) |rr| try write(&ser, rr);
@@ -1616,6 +1613,7 @@ pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, compti
     for (sections.additionals) |rr| try write(&ser, rr);
     if (opt) |o| try ser.writeOpt(o);
 
+    sections.header(hdr, questions.len, opt != null).serialize(buf[0..12]);
     return buf[0..ser.pos];
 }
 
@@ -1978,12 +1976,9 @@ test "a record written from its stored bytes is the record written from its fiel
         var want_buf: [512]u8 = undefined;
         var got_buf: [512]u8 = undefined;
         const want = try serializeMessage(&want_buf, .{ .header = mem.zeroes(Header), .questions = q, .answers = &.{ aged, aged } });
-        var names: NameTable = .{};
-        var ser: Serializer = .{ .buf = &got_buf, .pos = 0, .names = &names };
-        try ser.writeHeader((Sections(ResourceRecord){ .answers = &.{ aged, aged } }).header(mem.zeroes(Header), 1, false));
-        try ser.writeQuestion(q[0]);
-        for (0..2) |_| try ser.writeWireRecord(wr);
-        try testing.expectEqualSlices(u8, want, got_buf[0..ser.pos]);
+        var ends: SectionEnds = .{};
+        const got = try serializeEnds(&got_buf, mem.zeroes(Header), q, WireRecord, .{ .answers = &.{ wr, wr } }, null, &ends);
+        try testing.expectEqualSlices(u8, want, got);
     }
 }
 

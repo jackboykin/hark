@@ -130,11 +130,12 @@ pub fn buildResponseWire(
         if (end == 0) continue;
         var ser = dns.Serializer{ .buf = wire_buf, .pos = end };
         if (opt) |o| ser.writeOpt(o) catch continue;
-        var cut = sections.header(hdr, ctx.questions.len, opt != null);
+        const kept: dns.Sections(dns.WireRecord) = .{
+            .answers = if (dropped < 3) answers else &.{},
+            .authorities = if (dropped < 2) authorities else &.{},
+        };
+        var cut = kept.header(hdr, ctx.questions.len, opt != null);
         cut.flags.tc = dropped >= 2;
-        cut.ar_count = @intFromBool(opt != null);
-        if (dropped >= 2) cut.ns_count = 0;
-        if (dropped >= 3) cut.an_count = 0;
         cut.serialize(wire_buf[0..12]);
         if (ser.pos <= ctx.max_udp_payload or dropped == 3) return wire_buf[0..@min(ser.pos, ctx.max_udp_payload)];
     }
@@ -387,6 +388,33 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
         try testing.expectEqual(@as(usize, 0), parsed.additionals.len);
         try testing.expectEqual(dns.edns_udp_payload, parsed.opt.?.udp_payload_size);
     };
+}
+
+test "buildResponseWire: an authority section past a u16 of records truncates" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const name = try dns.parseDottedName(a, "example.com");
+    const nsec: dns.WireRecord = try .from(a, .{ .name = name, .rtype = .nsec, .rclass = .in, .ttl = 300, .rdata = .{ .nsec = .{ .next_domain_name = name, .type_bit_maps = "" } } });
+    const authorities = try a.alloc(dns.WireRecord, 1 << 16);
+    @memset(authorities, nsec);
+
+    var buf: [dns.max_message_len]u8 = undefined;
+    const wire = buildResponseWire(&buf, .{
+        .query_id = 1,
+        .opcode = .query,
+        .rd = true,
+        .cd = false,
+        .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
+        .client_edns = false,
+        .client_do = true,
+        .client_wants_ad = false,
+        .max_udp_payload = dns.max_message_len,
+    }, .{ .rcode = .name_error, .authorities = authorities }, a).?;
+    const parsed = try dns.parseMessage(a, wire);
+    try testing.expect(parsed.header.flags.tc);
+    try testing.expectEqual(@as(u16, 0), parsed.header.ns_count);
 }
 
 test "serializeErrorResponse answers an EDNS query with OPT (RFC 6891 §6.1.1)" {
