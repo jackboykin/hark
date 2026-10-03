@@ -7,6 +7,7 @@
 //! verdict is `validateNegativeProof`'s.
 const std = @import("std");
 const dns = @import("dns.zig");
+const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
 const graph = @import("graph.zig");
 const walk = @import("walk.zig");
@@ -172,11 +173,11 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
     defer if (g.denial.zones.getIndex(zkey)) |i| dropIfEmpty(g, i);
     if (g.denial.zones.getPtr(zkey)) |z| z.prune(g);
     var proofs: usize = 0;
-    for (r.authorities) |rr| {
+    for (r.authorities, 0..) |rr, i| {
         if ((rr.rtype != .nsec and rr.rtype != .soa) or !rr.name.isSubdomainOf(signer)) continue;
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
-        const rrs = try withSigs(g, r.authorities, rr);
+        const rrs = dnssec.setFrom(r.authorities, i);
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
@@ -212,14 +213,6 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
 fn minimal(rr: RR) bool {
     const next = rr.rdata.nsec.next_domain_name;
     return next.labels.len == rr.name.labels.len + 1 and next.labels[0].len == 1 and next.labels[0][0] == 0 and next.isSubdomainOf(rr.name);
-}
-
-/// `rr` followed by the signatures over it, already bounded by the walk.
-fn withSigs(g: *Graph, rrs: []const RR, rr: RR) ![]const RR {
-    var keep: std.ArrayList(RR) = .empty;
-    try keep.append(g.scratch.allocator(), rr);
-    for (rrs) |s| if (s.rtype == .rrsig and s.name.eql(rr.name) and s.rdata.rrsig.type_covered == rr.rtype) try keep.append(g.scratch.allocator(), s);
-    return keep.items;
 }
 
 /// Settle `rrset(name, type)` as a denial from indexed proofs, if the

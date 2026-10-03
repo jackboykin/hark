@@ -202,7 +202,8 @@ pub const Addr = struct {
 };
 
 /// The RRset at (name, type), as the reply sections that settled it, so
-/// the client sees what the authority said.
+/// the client sees what the authority said. A section holds each set
+/// whole and together, followed by its signatures (`dnssec.bindSets`).
 pub const Reply = struct {
     kind: Of,
     aa: bool,

@@ -365,6 +365,19 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bar
     return rrs[0..n];
 }
 
+/// The set `rrs[i]` heads and its signatures, as `bindSets` lays them out.
+pub fn setFrom(rrs: []const dns.ResourceRecord, i: usize) []const dns.ResourceRecord {
+    const t = covers(rrs[i]);
+    var j = i + 1;
+    while (j < rrs.len and covers(rrs[j]) == t and rrs[j].name.eql(rrs[i].name)) j += 1;
+    return rrs[i..j];
+}
+
+pub fn setAt(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType) []const dns.ResourceRecord {
+    for (rrs, 0..) |rr, i| if (rr.rtype == rtype and rr.name.eql(owner)) return setFrom(rrs, i);
+    return &.{};
+}
+
 fn covers(rr: dns.ResourceRecord) dns.RType {
     return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
 }

@@ -672,13 +672,11 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     if (qtype == .cname or reply.answers.len == 0) return;
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
-    var keep: std.ArrayList(dns.ResourceRecord) = .empty;
-    try keep.append(g.scratch.allocator(), first);
-    try keepSigs(g, &keep, reply.answers, name, .cname);
+    const set = dnssec.setFrom(reply.answers, 0);
     // A wildcard's expansion travels with its proof of no closer match.
     var proofs: std.ArrayList(dns.ResourceRecord) = .empty;
-    const expanded = for (keep.items[1..]) |sig| {
-        if (sig.rdata.rrsig.labels < rrsig.signedLabels(name)) break true;
+    const expanded = for (set) |rr| {
+        if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(name)) break true;
     } else false;
     if (expanded) for (reply.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
         .nsec, .nsec3 => try proofs.append(g.scratch.allocator(), rr),
@@ -687,7 +685,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     var hop: Reply = .{
         .kind = .alias,
         .aa = reply.aa,
-        .answers = keep.items,
+        .answers = set,
         .authorities = proofs.items,
         .target = first.rdata.cname,
         .zone = reply.zone,
@@ -701,12 +699,9 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
 /// so later names under it redirect from memory.
 fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
     var kb: graph.KeyBuf = undefined;
-    for (reply.answers) |d| {
+    for (reply.answers, 0..) |d, i| {
         if (d.rtype != .dname) continue;
-        var keep: std.ArrayList(dns.ResourceRecord) = .empty;
-        try keep.append(g.scratch.allocator(), d);
-        try keepSigs(g, &keep, reply.answers, d.name, .dname);
-        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = dnssec.setFrom(reply.answers, i), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         _ = try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -816,8 +811,7 @@ fn deepestDname(answers: []const dns.ResourceRecord, cur: dns.Name, zone: dns.Na
 /// A chain may pass one DNAME twice; its set is kept once.
 fn keepDname(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), answers: []const dns.ResourceRecord, d: dns.ResourceRecord) !void {
     for (keep.items) |k| if (k.rtype == .dname and k.name.eql(d.name)) return;
-    try keep.append(g.scratch.allocator(), d);
-    try keepSigs(g, keep, answers, d.name, .dname);
+    try keep.appendSlice(g.scratch.allocator(), dnssec.setAt(answers, d.name, .dname));
 }
 
 /// What a kept, non-referral reply says about (name, type). The answer

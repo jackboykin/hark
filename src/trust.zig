@@ -653,17 +653,15 @@ const Probe = struct {
 /// left out. Proof claims come first, so all are judged.
 fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, verified: @FieldType(SecureScratch, "verified"), signer: dns.Name) ![]const RR {
     const rrs = r.authorities;
-    var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), rrs.len);
+    var keep: std.ArrayList(RR) = .empty;
     var it: Claims = .{ .r = r, .qtype = qtype };
     while (it.next()) |c| {
         if (c.is != .proof) break;
         if (!verified.isSet(c.slot)) continue;
-        const sig = dnssec.findRrsigAt(rrs, c.owner, c.rtype) orelse continue;
+        const set = dnssec.setAt(rrs, c.owner, c.rtype);
+        const sig = dnssec.findRrsigAt(set, c.owner, c.rtype) orelse continue;
         if (!sig.signer_name.eql(signer)) continue;
-        for (rrs) |rr| {
-            const t = if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
-            if (t == c.rtype and rr.name.eql(c.owner)) keep.appendAssumeCapacity(rr);
-        }
+        try keep.appendSlice(g.scratch.allocator(), set);
     }
     return keep.items;
 }
@@ -672,18 +670,10 @@ fn synthesisedUnder(rr: RR, dname: RR) bool {
     return rr.rtype == .cname and rr.name.labels.len > dname.name.labels.len and rr.name.isSubdomainOf(dname.name);
 }
 
-/// Classify keeps an answer set's records together, so its neighbour
-/// answers for all but its first: one huge answer set costs n, not n².
-/// The authority is not so kept, but holds a proof's few sets.
+/// A reply's sets sit together: a record heads its set unless the one
+/// before is of it.
 fn firstOfRrset(rrs: []const RR, i: usize) bool {
-    const same = struct {
-        fn f(p: RR, q: RR) bool {
-            return p.rtype == q.rtype and p.name.eql(q.name);
-        }
-    }.f;
-    if (i > 0 and same(rrs[i - 1], rrs[i])) return false;
-    for (rrs[0..i]) |p| if (same(p, rrs[i])) return false;
-    return true;
+    return i == 0 or rrs[i - 1].rtype != rrs[i].rtype or !rrs[i - 1].name.eql(rrs[i].name);
 }
 
 /// What a referral from `zone` says about `rrset(child, DS)`: the signed
@@ -691,12 +681,9 @@ fn firstOfRrset(rrs: []const RR, i: usize) bool {
 /// nothing else of it: the child's NS in a denial's authority reads as a
 /// referral to a stub.
 pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) !graph.Reply {
-    var keep: std.ArrayList(RR) = .empty;
-    for (msg.authorities) |rr| if (rr.name.eql(child) and (rr.rtype == .ds or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds))) {
-        try keep.append(g.scratch.allocator(), rr);
-    };
-    if (keep.items.len > 0) {
-        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now() };
+    const ds = dnssec.setAt(msg.authorities, child, .ds);
+    if (ds.len > 0) {
+        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = ds, .zone = zone, .stored_ns = g.now() };
         reply.ttl = walk.replyTtl(g, reply);
         return reply;
     }
