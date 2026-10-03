@@ -166,7 +166,7 @@ const max_proofs = 8;
 /// A secure negative's SOA and NSECs, verified under `signer`, become
 /// facts for as long as the verdict holds, their TTL runs and the negative
 /// cap allows (RFC 8198 §5.4).
-pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
+pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
     var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     const zkey = signer.formatLower(&buf);
@@ -181,8 +181,8 @@ pub fn absorb(g: *Graph, by: CellId, signer: dns.Name, r: graph.Reply, expires_n
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
-        // `publish` can re-enter `evicted` and drop this zone: look it up after.
-        const judged = (try g.publish(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), by, .{ .rrset = fact }, expires) orelse continue).ref();
+        // `fact` can re-enter `evicted` and drop this zone: look it up after.
+        const judged = (try g.fact(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {
             g.store.unref(judged);
             return e;
@@ -290,6 +290,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
     } else 0;
     try g.settle(id, .{ .rrset = reply }, @min(expires, now + @as(i64, minimum) * std.time.ns_per_s));
     g.cell(id).blob.?.verdict.stamp(.{ .status = .secure, .proven_until_ns = expires }, expires, now);
+    try g.keep(id);
     return true;
 }
 
@@ -325,10 +326,10 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
     const soa: RR = .{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } };
     const reply: graph.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
-    try absorb(&g, 0, zone, reply, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
 
-    try absorb(&g, 0, zone, reply, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
     try testing.expect(g.denial.zones.getPtr("example").?.soa != null);
 }

@@ -91,8 +91,8 @@ pub const Edge = struct {
 };
 
 /// `refresh`: `answer` derived again for the store; nobody waits.
-/// `keys`: a signed zone's `dnskey` fetched while the walk descends.
-pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, keys };
+/// `ahead`: an rrset's judge, started before anyone asks.
+pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, ahead };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -291,7 +291,7 @@ pub const Value = union(Kind) {
     secure: trust.Chain,
     exchange: Outcome,
     refresh: void,
-    keys: void,
+    ahead: void,
 };
 
 /// Bytes held by work in progress, counted where they are allocated: cell
@@ -353,7 +353,7 @@ pub const Budget = struct {
 /// Cumulative since start; `serve.zig` prints them.
 pub const Stats = struct {
     clients: struct { udp: u64 = 0, tcp: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, refused: u64 = 0, other: u64 = 0, dropped: u64 = 0, abandoned: u64 = 0, late: u64 = 0, reaped: u64 = 0, shed: u64 = 0, paused: u64 = 0, echoed: u64 = 0, echo_ms: u64 = 0, hit: u64 = 0, recalled: u64 = 0, miss: u64 = 0, stale: u64 = 0 } = .{},
-    resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, unsent: u64 = 0, retry: u64 = 0, refresh: u64 = 0, keys: u64 = 0, refused: u64 = 0 } = .{},
+    resolver: struct { udp: u64 = 0, tcp: u64 = 0, timeout: u64 = 0, unsent: u64 = 0, retry: u64 = 0, refresh: u64 = 0, ahead: u64 = 0, refused: u64 = 0 } = .{},
     trust: struct { secure: u64 = 0, insecure: u64 = 0, bogus: u64 = 0 } = .{},
 };
 
@@ -420,7 +420,7 @@ pub const Scratch = union(enum) {
     dnskey: *trust.DnskeyScratch,
     secure: *trust.SecureScratch,
     exchange: *ExchangeScratch,
-    keys: *trust.KeysScratch,
+    ahead: *trust.AheadScratch,
 
     fn init(kind: Kind, arena: Allocator) !Scratch {
         return switch (kind) {
@@ -615,21 +615,28 @@ pub const Graph = struct {
         g.release(id);
     }
 
-    /// `dnskey(zone)` fetched ahead of need for a question's own walk, on
-    /// its payer; one per zone at a time, holding itself until it settles.
+    /// `dnskey(zone)` ahead of need, for a question's own walk only.
     pub fn fetchKeys(g: *Graph, by: CellId, zone: dns.Name) !void {
         var kb: KeyBuf = undefined;
         if (g.spent(g.payer) or g.level(by) > 0) return;
-        const key = Key.of(&kb, .keys, zone, .a);
-        if (g.index.contains(key)) return;
-        const id = try g.newCell(key, zone);
-        g.cell(id).scratch.keys.budget = g.payer;
+        _ = try g.ahead(Key.of(&kb, .rrset, zone, .dnskey), zone);
+    }
+
+    /// One per key at a time, holding itself until its judge settles, on the
+    /// running payer's budget; null once that is spent.
+    fn ahead(g: *Graph, key: Key, name: dns.Name) !?CellId {
+        if (g.spent(g.payer)) return null;
+        const akey = key.at(.ahead, key.rtype);
+        if (g.index.get(akey)) |id| if (!g.cell(id).settled()) return id;
+        const id = try g.newCell(akey, name);
+        g.cell(id).scratch.ahead.budget = g.payer;
         g.payer.refs += 1;
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
         try g.ready.append(g.gpa, id);
-        g.stats.resolver.keys += 1;
-        if (g.cfg.trace) std.debug.print("  keys {s}\n", .{key.name});
+        g.stats.resolver.ahead += 1;
+        if (g.cfg.trace) std.debug.print("  ahead {s} {t}\n", .{ key.name, key.rtype });
+        return id;
     }
 
     /// One per key at a time; holds itself until it settles.
@@ -873,18 +880,36 @@ pub const Graph = struct {
                 const blob = try g.store.build(value);
                 c.blob = blob;
                 c.state.fact = try store.Store.parse(c.arena.allocator(), blob);
-                if (expires_ns > g.now()) g.store.put(c.key, blob.ref(), expires_ns, g.now()) catch |err| {
-                    g.store.unref(blob);
-                    if (err != error.Refused) return err;
-                };
+                if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
             },
             .secure => |v| {
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
-                if (g.cell(c.scratch.secure.target).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
+                const t = c.scratch.secure.target;
+                if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
+                try g.keep(t);
             },
-            .answer, .exchange, .refresh, .keys => {},
+            .answer, .exchange, .refresh, .ahead => {},
         }
         try g.woken(id, value == .answer);
+    }
+
+    /// With DNSSEC on, an rrset is no fact until judged: its bytes wait in
+    /// their cell and die with it unless their judge keeps them.
+    pub fn awaitsVerdict(g: *const Graph, kind: Kind) bool {
+        return kind == .rrset and g.cfg.trust_anchor != null;
+    }
+
+    /// The one way into the store, aged from when the bytes arrived.
+    pub fn keep(g: *Graph, id: CellId) !void {
+        const c = g.cell(id);
+        const blob = c.blob orelse return;
+        if (c.expires_ns <= g.now()) return;
+        if (g.store.any(c.key)) |e| if (e.blob == blob) return;
+        const at = if (c.state.fact == .rrset) c.state.fact.rrset.stored_ns else g.now();
+        g.store.put(c.key, blob.ref(), c.expires_ns, at) catch |err| {
+            g.store.unref(blob);
+            if (err != error.Refused) return err;
+        };
     }
 
     /// Settles on no fact (`Failure`): nothing is stored, nothing outlives
@@ -913,7 +938,7 @@ pub const Graph = struct {
             c.inputs.clearRetainingCapacity();
         }
         // The run's hold still pins a self-held root; one release, below.
-        if (c.key.kind == .refresh or c.key.kind == .keys) c.holds -= 1;
+        if (c.key.kind == .refresh or c.key.kind == .ahead) c.holds -= 1;
         g.release(id);
     }
 
@@ -1192,7 +1217,7 @@ pub const Graph = struct {
     fn budgetOf(c: *const Cell) ?*Budget {
         return switch (c.scratch) {
             .answer => |a| a.budget,
-            .keys => |k| k.budget,
+            .ahead => |k| k.budget,
             else => null,
         };
     }
@@ -1260,17 +1285,28 @@ pub const Graph = struct {
         return false;
     }
 
-    /// Evidence from a referral or a denial at a probe name: settles a
-    /// cell in progress for the key, except the publisher's own; else a
-    /// fact. The bytes the store kept, borrowed; null when it kept none.
-    pub fn publish(g: *Graph, key: Key, by: CellId, value: Value, expires_ns: i64) !?*store.Blob {
-        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled()) {
-            try g.settle(id, value, expires_ns);
-            return g.kept(key, g.cell(id).blob);
-        };
-        return g.fact(key, value, expires_ns);
+    /// What a reply says for another key: settles a cell in progress for it,
+    /// except the publisher's own; else a fact, or, awaiting a verdict, held
+    /// by an `ahead` root for its judge. A served version stands: bytes
+    /// nobody judged displace none.
+    pub fn publish(g: *Graph, key: Key, name: dns.Name, by: CellId, value: Value, expires_ns: i64) !void {
+        if (g.index.get(key)) |id| if (id != by and !g.cell(id).settled()) return g.settle(id, value, expires_ns);
+        if (!g.awaitsVerdict(key.kind)) {
+            _ = try g.fact(key, value, expires_ns);
+            return;
+        }
+        if (expires_ns <= g.now() or g.holds(key)) return;
+        const root = try g.ahead(key, name) orelse return;
+        const s = g.cell(root).scratch.ahead;
+        if (s.rrset != .none) return;
+        const id = try g.newCell(key, name);
+        try g.pin(id, root);
+        s.rrset = .wrap(id);
+        try g.settle(id, value, expires_ns);
     }
 
+    /// Judged already, or of a kind nobody judges. The bytes the store
+    /// kept, borrowed; null when it kept none.
     pub fn fact(g: *Graph, key: Key, value: Value, expires_ns: i64) !?*store.Blob {
         if (expires_ns <= g.now()) return null;
         const blob = try g.store.build(value);
@@ -1323,7 +1359,7 @@ pub const Graph = struct {
             .ds => try trust.runDs(g, id),
             .dnskey => try trust.runDnskey(g, id),
             .secure => try trust.runSecure(g, id),
-            .keys => try trust.runKeys(g, id),
+            .ahead => try trust.runAhead(g, id),
             .exchange => {},
         }
     }

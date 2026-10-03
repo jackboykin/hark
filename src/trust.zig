@@ -40,10 +40,11 @@ pub const DsScratch = struct {
     probe: Probe = .{},
 };
 pub const DnskeyScratch = struct { ds: OptionalCellId = .none, rrset: OptionalCellId = .none };
-pub const KeysScratch = struct {
-    /// The payer of the walk that met the delegation, shared.
+pub const AheadScratch = struct {
+    /// The payer of the walk that began it, shared.
     budget: *graph.Budget = undefined,
-    keys: OptionalCellId = .none,
+    rrset: OptionalCellId = .none,
+    judge: OptionalCellId = .none,
 };
 pub const SecureScratch = struct {
     /// The rrset version under judgement; ids recycle, so its generation too.
@@ -52,7 +53,7 @@ pub const SecureScratch = struct {
     /// `ds(zone)`: is the answering zone expected to sign at all.
     zone_ds: OptionalCellId = .none,
     /// `dnskey(signer)` of the claim at `next`, held one at a time: the
-    /// rest are fetched alongside by `keys` roots.
+    /// rest are fetched alongside by `ahead` roots.
     key: OptionalCellId = .none,
     /// The reply was checked for a flood and its signers' keys fetched.
     fetched: bool = false,
@@ -95,7 +96,8 @@ const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validati
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
 /// Proven bogus, the bytes end with the verdict: their TTL was the forger's
-/// to set (RFC 4035 §4.7). If `claim` is the CNAME at the name, its copy
+/// to set (RFC 4035 §4.7), and a version an earlier verdict kept leaves
+/// the store. If `claim` is the CNAME at the name, its copy
 /// in the alias goes too. With the validation budget spent nothing was
 /// proven: the stop is the limit's, named, and a zone draining its own
 /// budget must not drop a victim's bytes.
@@ -214,7 +216,10 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .pending => {},
         .cut_short => try g.fail(id, no_chain),
         .stopped => |why| try g.fail(id, why),
-        .insecure => |until| try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
+        .insecure => |until| {
+            try g.keep(s.rrset.unwrap().?);
+            try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
+        },
         .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
 }
@@ -246,6 +251,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                 return .bogus;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
+            try g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = status, .records = r.answers } }, @min(rs.expires_ns, keys.expires_ns));
         },
         .nodata, .nxdomain => {
@@ -258,10 +264,16 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap));
             const until = @min(rs.expires_ns, keys.expires_ns);
             switch (proof.classifyDelegation(r.authorities, zone, signer, budget)) {
-                .unsigned => try g.settle(id, .{ .ds = .{ .status = .insecure } }, until),
+                .unsigned => {
+                    try g.keep(s.rrset.unwrap().?);
+                    try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
+                },
                 // A signed denial of the DS showing no delegation: no zone.
                 .unproven => switch (proof.validateNegativeProof(r.authorities, zone, .ds, r.kind == .nxdomain, signer, budget)) {
-                    .secure => try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until),
+                    .secure => {
+                        try g.keep(s.rrset.unwrap().?);
+                        try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
+                    },
                     else => try g.fail(id, budgetSpent(g) orelse no_cut),
                 },
                 .bogus => try g.fail(id, budgetSpent(g) orelse no_cut),
@@ -272,16 +284,20 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     return null;
 }
 
-/// `keys(zone)`: a root with no fact of its own, holding `dnskey(zone)`
-/// until it settles, so the chain of trust overlaps the walk below
-/// (Unbound's prefetch-key).
-pub fn runKeys(g: *Graph, id: CellId) !void {
+/// `ahead(name, type)` holds the judge of `rrset(name, type)` until it
+/// settles: `dnskey` for keys, so the chain of trust overlaps the walk
+/// below; `ds` for a referral's DS; `secure` for whatever else a reply
+/// published.
+pub fn runAhead(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
-    const s = g.cell(id).scratch.keys;
-    const zone = g.cell(id).name;
-    if (s.keys == .none) s.keys = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, zone, .a), zone) orelse
-        return g.settle(id, .keys, g.now()));
-    if (g.cell(s.keys.unwrap().?).settled()) try g.settle(id, .keys, g.now());
+    const s = g.cell(id).scratch.ahead;
+    const name = g.cell(id).name;
+    if (s.judge == .none) s.judge = .wrap(switch (g.cell(id).key.rtype) {
+        .dnskey => try g.demand(id, graph.Key.of(&kb, .dnskey, name, .a), name),
+        .ds => try g.demand(id, graph.Key.of(&kb, .ds, name, .a), name),
+        else => try demandSecure(g, id, s.rrset.unwrap() orelse return g.settle(id, .ahead, g.now())),
+    } orelse return g.settle(id, .ahead, g.now()));
+    if (g.cell(s.judge.unwrap().?).settled()) try g.settle(id, .ahead, g.now());
 }
 
 /// Every cut from `zone` up is proven secure or, unproven yet, delegated
@@ -334,6 +350,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
         return failChain(g, id, s.rrset.unwrap().?);
     g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
     const keys = try dnssec.usableKeys(g.scratch.allocator(), r.answers, ds_data.items);
+    try g.keep(s.rrset.unwrap().?);
     try g.settle(id, .{ .dnskey = .{ .status = .secure, .records = keys } }, @min(rs.expires_ns, ds.expires_ns));
 }
 
@@ -472,7 +489,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                         .secure => {
                             var only = r.*;
                             only.authorities = own;
-                            try denial.absorb(g, id, signer, only, @min(until, kc.expires_ns, s.proven));
+                            try denial.absorb(g, signer, only, @min(until, kc.expires_ns, s.proven));
                         },
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,

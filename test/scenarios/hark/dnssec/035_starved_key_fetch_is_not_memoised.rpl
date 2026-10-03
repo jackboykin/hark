@@ -6,13 +6,14 @@
 
 SCENARIO_BEGIN a DNSKEY fetch refused by one client's budget is no verdict for the next client
 
-; The first client spends its three exchanges on the referral, the answer
-; and the root DNSKEY; its dnskey(example) fetch is refused and it
-; SERVFAILs. dnskey(example) is shared: memoising that refusal as bogus
-; for the SERVFAIL window failed every name under a TLD for 5 s whenever
-; one asker's budget or orphaning starved the TLD's key fetch (live:
-; ~40 .org names in one cold second). The second client, on a fresh
-; budget with the cuts cached, must get NOERROR with AD.
+; The first client spends its three exchanges before its keys are judged;
+; its next fetch is refused and it SERVFAILs. dnskey(example) is shared:
+; memoising that refusal as bogus for the SERVFAIL window failed every
+; name under a TLD for 5 s whenever one asker's budget or orphaning
+; starved the TLD's key fetch (live: ~40 .org names in one cold second).
+; Nothing the first judged, nothing of it is kept: the second, on a fresh
+; budget, needs four exchanges and is stopped by its own limit, never by
+; a verdict. What it judged is kept, so the third gets AD.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -78,12 +79,10 @@ ENTRY_END
 
 STEP 4 CHECK_ANSWER
 ENTRY_BEGIN
-  MATCH flags answer question
-  REPLY QR RD RA AD NOERROR
+  MATCH rcode question ede=0
+  REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     b.example. IN A
-  SECTION ANSWER
-    b.example. 3600 IN A 192.0.2.2
 ENTRY_END
 
 ; The first client, asked again, is tried again: its budget was its own.
@@ -100,6 +99,23 @@ ENTRY_BEGIN
   REPLY QR RD RA AD NOERROR
   SECTION QUESTION
     a.example. IN A
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    b.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    b.example. IN A
+  SECTION ANSWER
+    b.example. 3600 IN A 192.0.2.2
 ENTRY_END
 
 SCENARIO_END

@@ -115,7 +115,9 @@ ENTRY_BEGIN
     www2.uni.edu.example. 3600 IN A 192.0.2.2
 ENTRY_END
 
-STEP 5 CHECK_MAX_QUERIES 8
+; What the first question fetched and never judged went with it: the
+; second asks for it again.
+STEP 5 CHECK_MAX_QUERIES 9
 
 ; Asked again, it is tried again: a limit is no failure of the question's.
 STEP 6 QUERY

@@ -11,7 +11,7 @@ SCENARIO_BEGIN an rrsig question is declined when validating and answered as dat
 ; EDE 21, asking nobody. With CD set they are data, never AD, an RRSIG
 ; over an RRSIG kept once (RFC 2181 §5): in a signed zone, and at the end
 ; of a signed DNAME's chain, whose links prove nothing about the
-; signatures there.
+; signatures there. Nothing judges them, so nothing keeps them either.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -112,6 +112,15 @@ RANGE_BEGIN 0 100
     ADJUST copy_id copy_query
     REPLY QR AA NOERROR
     SECTION QUESTION
+      b.example. IN RRSIG
+    SECTION ANSWER
+      b.example. 3600 IN DNAME example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
       x.example. IN A
     SECTION ANSWER
       x.example. 3600 IN A 192.0.2.1
@@ -163,7 +172,7 @@ ENTRY_BEGIN
     www.example. 3600 IN RRSIG RRSIG 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ENTRY_END
 
-; Asked again: nothing judged, nothing refetched.
+; Asked again: never kept, so asked of the servers again.
 STEP 6 QUERY
 ENTRY_BEGIN
   REPLY RD DO CD
@@ -182,7 +191,7 @@ ENTRY_BEGIN
     www.example. 3600 IN RRSIG RRSIG 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ENTRY_END
 
-STEP 8 CHECK_MAX_QUERIES 4
+STEP 8 CHECK_MAX_QUERIES 5
 
 STEP 9 QUERY
 ENTRY_BEGIN

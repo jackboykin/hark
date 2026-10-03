@@ -1,0 +1,115 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a spoofed referral leaves a verified DS denial standing
+
+; example. delegates child.example. unsigned: its referral carries the
+; signed NSEC at the cut, NS bit and no DS (RFC 4035 §3.1.4.1), TTL 3600.
+; The cut's NS lives 300 s, and so does example.'s DS at the root, so at
+; step 4 both the cut and ds(child.example.) have lapsed while the verified
+; denial in rrset(child.example., DS) still has ~3200 s to live.
+;
+; Step 4: hark asks example. again and an off-path attacker wins the race
+; with a forged, unsigned referral: the same NS and glue, plus a DS it
+; cannot sign. Bytes nobody judged never displace a judged set still live
+; (RFC 2181 §5.4.1): ds(child.example.) is proven again from the denial,
+; and the answer stays insecure.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 300 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+; example.'s honest server.
+RANGE_BEGIN 0 3
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 300 IN NS ns.child.example.
+      child.example. 3600 IN NSEC ns.example. NS RRSIG NSEC
+    SECTION ADDITIONAL
+      ns.child.example. 300 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+; The attacker's one packet: a referral it cannot sign.
+RANGE_BEGIN 4 5
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query unsigned
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 300 IN NS ns.child.example.
+      child.example. 3600 IN DS 4242 13 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    SECTION ADDITIONAL
+      ns.child.example. 300 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 400
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+SCENARIO_END

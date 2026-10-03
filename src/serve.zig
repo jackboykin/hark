@@ -804,8 +804,8 @@ fn logStats(g: *graph.Graph) void {
     log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  shed {d}  paused {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
         c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.shed, c.paused, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
     });
-    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  keys {d}  refused {d}", .{
-        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.keys, r.refused,
+    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  ahead {d}  refused {d}", .{
+        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.ahead, r.refused,
     });
     log.info("stats trust     secure {d}  insecure {d}  bogus {d} | verifies {d}  recalled {d}", .{ t.secure, t.insecure, t.bogus, g.verify_memo.misses, g.verify_memo.hits });
     log.info("stats store     {d} KiB in {d} facts  in cells {d} KiB | evicted {d}  refused {d}", .{
