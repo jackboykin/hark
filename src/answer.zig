@@ -406,6 +406,10 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     var age: u32 = 0;
     var life: u32 = 0;
     var stale_any = false;
+    // A chain back to a DNAME it passed meets that set again at its owner,
+    // asked for it or its signatures: it goes out once (RFC 2181 §5).
+    var once: Seen = .{ .bound = n };
+    const repeats = hops.len > 1 and (q.qtype == .dname or q.qtype == .rrsig);
     for (hops, held) |hop, *h| {
         h.* = hop.blob.ref();
         last = hop;
@@ -417,7 +421,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
             age = 0;
             life = stale_hold_s;
         }
-        try appendAged(arena, &answers, null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
+        try appendAged(arena, &answers, if (repeats) &once else null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
     }
     const r = last.rrset;
     // Unbound's positive_answer() carve-out: NS asked, the NS and glue are the answer (RFC 8109 priming).
