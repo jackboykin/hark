@@ -1,0 +1,135 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = child.example.
+; hark: dnssec-zone = sub.child.example.
+
+SCENARIO_BEGIN a delegation below a folded child is judged by its signer
+
+; hark holds child.example.'s NS when the operator folds the child back
+; into example., which now delegates sub.child.example. itself. Past the
+; child's DS TTL its parent proves it no zone, so the cut hark still asks
+; from is no zone either. The DS in the referral below it is example.'s,
+; signed by example.: the zone that proved the child no cut speaks for
+; what lies under it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      child.example. IN A
+    SECTION AUTHORITY
+      child.example. 3600 IN NS ns.child.example.
+      child.example. 10 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.child.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.child.example. IN A
+    SECTION ANSWER
+      www.child.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+; The fold: child.example. is an empty non-terminal of example.
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      child.example. IN DS
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 3600
+      c.example. 3600 IN NSEC sub.child.example. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+; The child's old server now serves example. and refers on.
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    SIGN_AS example.
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.child.example. IN A
+    SECTION AUTHORITY
+      sub.child.example. 3600 IN NS ns.sub.child.example.
+      sub.child.example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.sub.child.example. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.child.example. IN A
+    SECTION ANSWER
+      www.sub.child.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+; Only to hold the cut: the fold ends this answer.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.child.example. IN A
+ENTRY_END
+
+STEP 2 TIME_PASSES ELAPSE 20
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.sub.child.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.sub.child.example. IN A
+  SECTION ANSWER
+    www.sub.child.example. 3600 IN A 192.0.2.2
+ENTRY_END
+
+SCENARIO_END

@@ -197,10 +197,10 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
     switch (parent_keys.state.fact.dnskey.status) {
-        .secure => {},
+        // The walk's parent proven no zone: the zone above it speaks for
+        // the child, and the DS names it.
+        .secure, .absent => {},
         .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires_ns),
-        // The walk's parent proven no zone: nothing speaks for the child.
-        .absent => return g.fail(id, no_chain),
     }
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .ds), zone) orelse
         return g.fail(id, no_chain));
