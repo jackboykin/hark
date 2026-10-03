@@ -403,16 +403,13 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     const cut = try absorbReferral(g, id, ref, msg, pc.zone);
                     try g.settle(id, cut.value, cut.expires_ns);
                 },
-                .answered => try g.settle(id, inside, parent.expires_ns),
-                // An authoritative denial is a fact; NXDOMAIN ends minimising
-                // below it. A positive answer is not: the parent may serve
-                // occluded data for a name it delegated (bailiwick/006).
-                .nodata => {
-                    _ = try publishDenial(g, id, kept, name);
-                    try g.settle(id, inside, parent.expires_ns);
-                },
+                // Each puts the name inside the parent's zone. Only an
+                // NXDOMAIN is published, as deeper cuts read it (RFC 8020).
+                // An answer may be data the parent occludes (bailiwick/006);
+                // a NODATA is read by nothing and would cost a judgement.
+                .answered, .nodata => try g.settle(id, inside, parent.expires_ns),
                 .nxdomain => {
-                    const until = try publishDenial(g, id, kept, name) orelse return g.fail(id, unplaced);
+                    const until = try publishNxdomain(g, id, kept, name) orelse return g.fail(id, unplaced);
                     try g.settle(id, inside, @min(parent.expires_ns, until));
                 },
                 .failed => try g.fail(id, unplaced),
@@ -421,8 +418,8 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     }
 }
 
-/// An authoritative denial at a probe name, published; when it lapses.
-fn publishDenial(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
+/// An authoritative NXDOMAIN at a probe name, published; when it lapses.
+fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
     var kb: graph.KeyBuf = undefined;
     if (!kept.msg.header.flags.aa) return null;
     const reply = switch (kept.verdict) {
