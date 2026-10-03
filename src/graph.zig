@@ -19,6 +19,7 @@ const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 const delegation = @import("delegation.zig");
 const rrsig = @import("rrsig.zig");
+const dnssec = @import("dnssec.zig");
 const monotonic = @import("monotonic.zig");
 const ns_rtt = @import("ns_rtt.zig");
 const trust = @import("trust.zig");
@@ -679,7 +680,7 @@ pub const Graph = struct {
                 defer clock.stop();
                 g.tally.parses += 1;
                 const bytes = try arena.dupe(u8, borrowed);
-                const msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
+                var msg = dns.parseMessage(arena, bytes) catch break :blk .malformed;
                 if (msg.header.id != sc.id) break :blk .mismatch;
                 dns.validateResponse(msg, sc.sent_name, sc.qtype, sc.case == .random) catch break :blk .mismatch;
                 // 0x20 case checked; every name is a lowercase fact from here.
@@ -688,8 +689,12 @@ pub const Graph = struct {
                         rr.name = try dns.cloneNameLower(arena, rr.name);
                         try dns.lowercaseRDataNames(arena, &rr.rdata);
                     }
-                    dns.levelTtls(@constCast(section));
                 }
+                const scratch = g.scratch.allocator();
+                const wall = g.wallNow();
+                msg.answers = try dnssec.bindSets(scratch, @constCast(msg.answers), wall, sc.qtype == .rrsig);
+                msg.authorities = try dnssec.bindSets(scratch, @constCast(msg.authorities), wall, false);
+                msg.additionals = try dnssec.bindSets(scratch, @constCast(msg.additionals), wall, false);
                 break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
             },
         };

@@ -687,7 +687,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     var hop: Reply = .{
         .kind = .alias,
         .aa = reply.aa,
-        .answers = try bindSigs(g, keep.items),
+        .answers = keep.items,
         .authorities = proofs.items,
         .target = first.rdata.cname,
         .zone = reply.zone,
@@ -706,7 +706,7 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         var keep: std.ArrayList(dns.ResourceRecord) = .empty;
         try keep.append(g.scratch.allocator(), d);
         try keepSigs(g, &keep, reply.answers, d.name, .dname);
-        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = try bindSigs(g, keep.items), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
+        const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = keep.items, .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         _ = try g.publish(Key.of(&kb, .rrset, d.name, .dname), by, .{ .rrset = dname }, replyExpiry(dname));
     }
 }
@@ -906,12 +906,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     var reply: Reply = .{
         .kind = if (overflow) .yxdomain else if (answered) .answer else if (hops > 0) .alias else .nodata,
         .aa = msg.header.flags.aa,
-        // Asked for RRSIG, the signatures at the end are the data, bound
-        // to no set; the links' stay bound.
-        .answers = if (qtype == .rrsig and answered)
-            try std.mem.concat(g.scratch.allocator(), dns.ResourceRecord, &.{ try bindSigs(g, keep.items[0..passed]), keep.items[passed..] })
-        else
-            try bindSigs(g, keep.items),
+        .answers = keep.items,
         .additionals = if (left) try inZone(g, msg.additionals, zone) else msg.additionals,
         .target = cur,
         .zone = zone,
@@ -925,7 +920,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     };
     if (msg.header.flags.rcode == .name_error and !unread) reply.kind = .nxdomain;
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
-    reply.authorities = try proofsNeeded(g, try bindSigs(g, authorities), reply);
+    reply.authorities = try proofsNeeded(g, authorities, reply);
     reply.ttl = replyTtl(g, reply);
     return .{ .reply = reply };
 }
@@ -938,91 +933,6 @@ fn hasSig(rrs: []const dns.ResourceRecord, sig: dns.ResourceRecord) bool {
         if (r.type_covered == s.type_covered and std.mem.eql(u8, r.signature, s.signature)) return true;
     }
     return false;
-}
-
-/// Every signature bound to a set it covers and to one signer, the rest
-/// dropped, so nothing unjudged travels beside what is judged (RFC 4035
-/// §3.2.3). Sorted, so a stuffed reply costs n log n, not n². Eight per
-/// set, usable first, as Unbound's MAX_VALIDATE_RRSIGS: a rollover is not
-/// crowded out.
-const max_sigs_per_set = 8;
-
-pub fn bindSigs(g: *Graph, rrs: []const dns.ResourceRecord) ![]const dns.ResourceRecord {
-    for (rrs) |rr| {
-        if (rr.rtype == .rrsig) break;
-    } else return rrs;
-    // Records by owner and the type they are or cover.
-    const By = struct {
-        rrs: []const dns.ResourceRecord,
-        now: u32,
-
-        fn order(c: @This(), x: u32, y: u32) std.math.Order {
-            const p = c.rrs[x];
-            const q = c.rrs[y];
-            const o = proof.canonicalNameOrder(p.name, q.name);
-            if (o != .eq) return o;
-            return std.math.order(typ(p), typ(q));
-        }
-
-        fn lessThan(c: @This(), x: u32, y: u32) bool {
-            const o = c.order(x, y);
-            return if (o != .eq) o == .lt else c.rank(x) < c.rank(y);
-        }
-
-        fn rank(c: @This(), x: u32) u2 {
-            const rr = c.rrs[x];
-            if (rr.rtype != .rrsig) return 0;
-            const sig = rr.rdata.rrsig;
-            return if (rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, c.now)) 1 else 2;
-        }
-
-        fn typ(rr: dns.ResourceRecord) u16 {
-            return @backingInt(if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype);
-        }
-    };
-    const a = g.scratch.allocator();
-    const by: By = .{ .rrs = rrs, .now = g.wallNow() };
-    const at = try a.alloc(u32, rrs.len);
-    for (at, 0..) |*x, i| x.* = @intCast(i);
-    // Stable: a set, then its usable signatures, then the rest, each in
-    // the reply's order.
-    std.mem.sort(u32, at, by, By.lessThan);
-    // Per record: the TTL it leaves with, null if dropped.
-    const ttls = try a.alloc(?u32, rrs.len);
-    var i: usize = 0;
-    while (i < at.len) {
-        var j = i + 1;
-        while (j < at.len and by.order(at[i], at[j]) == .eq) j += 1;
-        const covers = rrs[at[i]].rtype != .rrsig;
-        // Every one kept names the first's signer, so `findRrsigAt`'s
-        // first agrees.
-        var first: ?dns.Name = null;
-        var kept: usize = 0;
-        // A set's signatures carry its TTL (RFC 4034 §3): the lowest
-        // among them.
-        var ttl: u32 = std.math.maxInt(u32);
-        for (at[i..j]) |k| {
-            var keep = true;
-            if (rrs[k].rtype == .rrsig) {
-                const signer = rrs[k].rdata.rrsig.signer_name;
-                first = first orelse signer;
-                keep = covers and kept < max_sigs_per_set and signer.eql(first.?);
-                kept += @intFromBool(keep);
-            }
-            ttls[k] = if (keep) rrs[k].ttl else null;
-            if (keep) ttl = @min(ttl, rrs[k].ttl);
-        }
-        for (at[i..j]) |k| if (ttls[k] != null) {
-            ttls[k] = ttl;
-        };
-        i = j;
-    }
-    var out: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
-    for (rrs, ttls) |rr, ttl| if (ttl) |t| {
-        out.appendAssumeCapacity(rr);
-        out.items[out.items.len - 1].ttl = t;
-    };
-    return out.items;
 }
 
 /// The proof a reply owes (RFC 4035 §3.1.3): a denial's from the zone it

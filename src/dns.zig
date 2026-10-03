@@ -617,22 +617,6 @@ pub const Message = struct {
     opt: ?OptRecord = null,
 };
 
-/// A set whose TTLs differ is one at the lowest of them (RFC 2181 §5.2),
-/// whatever its source. `rrs` holds a set's records side by side.
-/// Signatures are no set: each takes its TTL from the set it is bound to.
-pub fn levelTtls(rrs: []ResourceRecord) void {
-    var i: usize = 0;
-    while (i < rrs.len) {
-        var ttl = rrs[i].ttl;
-        var j = i + 1;
-        while (j < rrs.len and rrs[j].rtype == rrs[i].rtype and rrs[j].name.eql(rrs[i].name)) : (j += 1) ttl = @min(ttl, rrs[j].ttl);
-        if (rrs[i].rtype != .rrsig) for (rrs[i..j]) |*rr| {
-            rr.ttl = ttl;
-        };
-        i = j;
-    }
-}
-
 /// Index of the first label-separating `.` at or after `start`, skipping
 /// escaped bytes. Works on any well-formed presentation string; `\DDD`
 /// digits can never be `.` so skipping one byte after `\` suffices.

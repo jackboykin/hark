@@ -7,7 +7,8 @@ SCENARIO_BEGIN a set with unequal TTLs is served at its lowest
 ; authoritative answer's differ, every record is treated as if it carried
 ; the lowest. Handed on as received, the set would reach the client
 ; broken the same way, and one record would claim five times the life the
-; set has.
+; set has. A set is its owner, class and type (RFC 2181 §5), wherever its
+; records sit: here another set comes between them.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -34,6 +35,7 @@ RANGE_BEGIN 0 100
       www.example. IN A
     SECTION ANSWER
       www.example. 300 IN A 192.0.2.1
+      www.example. 300 IN AAAA 2001:db8::1
       www.example. 60 IN A 192.0.2.2
   ENTRY_END
 RANGE_END

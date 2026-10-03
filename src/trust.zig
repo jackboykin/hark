@@ -695,11 +695,8 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     for (msg.authorities) |rr| if (rr.name.eql(child) and (rr.rtype == .ds or (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == .ds))) {
         try keep.append(g.scratch.allocator(), rr);
     };
-    // Bound as any answer is; signatures over no DS are dropped, and are
-    // no answer.
-    const answers = try walk.bindSigs(g, keep.items);
-    if (answers.len > 0) {
-        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = answers, .zone = zone, .stored_ns = g.now() };
+    if (keep.items.len > 0) {
+        var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = keep.items, .zone = zone, .stored_ns = g.now() };
         reply.ttl = walk.replyTtl(g, reply);
         return reply;
     }

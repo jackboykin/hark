@@ -283,6 +283,92 @@ pub fn findRrsigAt(
     return null;
 }
 
+/// Room for a rollover's signatures; more is stuffing.
+const max_sigs_per_set = 8;
+
+/// A section read as sets (RFC 2181 §5), in place: each set where it first
+/// appears, then the signatures bound to it, all at their lowest TTL (RFC
+/// 2181 §5.2, RFC 4035 §5.3.3). A set binds one signer's signatures, usable
+/// first, up to the cap, so nothing unjudged travels beside what is judged
+/// (RFC 4035 §3.2.3). With `bare_sigs`, signatures over no set are an RRSIG
+/// question's data and stay, unfiltered and unlevelled; without, they go.
+pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bare_sigs: bool) ![]dns.ResourceRecord {
+    if (rrs.len < 2) return if (rrs.len == 1 and rrs[0].rtype == .rrsig and !bare_sigs) rrs[0..0] else rrs;
+    const By = struct {
+        rrs: []const dns.ResourceRecord,
+        now: u32,
+
+        fn order(c: @This(), x: u32, y: u32) std.math.Order {
+            const p = c.rrs[x];
+            const q = c.rrs[y];
+            const t = std.math.order(@backingInt(covers(p)), @backingInt(covers(q)));
+            return if (t != .eq) t else proof.canonicalNameOrder(p.name, q.name);
+        }
+
+        fn lessThan(c: @This(), x: u32, y: u32) bool {
+            const o = c.order(x, y);
+            return if (o != .eq) o == .lt else c.rank(x) < c.rank(y);
+        }
+
+        fn rank(c: @This(), x: u32) u2 {
+            const rr = c.rrs[x];
+            if (rr.rtype != .rrsig) return 0;
+            const sig = rr.rdata.rrsig;
+            return if (rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, c.now)) 1 else 2;
+        }
+    };
+    const src = try scratch.dupe(dns.ResourceRecord, rrs);
+    const by: By = .{ .rrs = src, .now = now };
+    const at = try scratch.alloc(u32, rrs.len);
+    for (at, 0..) |*x, i| x.* = @intCast(i);
+    // Stable: a set keeps the order it came in.
+    std.mem.sort(u32, at, by, By.lessThan);
+    const Kept = struct { lo: u32 = 0, hi: u32 = 0 };
+    const kept = try scratch.alloc(Kept, rrs.len);
+    @memset(kept, .{});
+    var i: usize = 0;
+    while (i < at.len) {
+        var j = i + 1;
+        while (j < at.len and by.order(at[i], at[j]) == .eq) j += 1;
+        var hi = i;
+        if (src[at[i]].rtype == .rrsig) {
+            if (bare_sigs) hi = j;
+        } else {
+            var first: ?dns.Name = null;
+            var sigs: usize = 0;
+            var ttl: u32 = std.math.maxInt(u32);
+            for (at[i..j]) |k| {
+                if (src[k].rtype == .rrsig) {
+                    const signer = src[k].rdata.rrsig.signer_name;
+                    first = first orelse signer;
+                    if (sigs == max_sigs_per_set or !signer.eql(first.?)) continue;
+                    sigs += 1;
+                }
+                ttl = @min(ttl, src[k].ttl);
+                at[hi] = k;
+                hi += 1;
+            }
+            for (at[i..hi]) |k| src[k].ttl = ttl;
+        }
+        for (at[i..hi]) |k| kept[k] = .{ .lo = @intCast(i), .hi = @intCast(hi) };
+        i = j;
+    }
+    var n: usize = 0;
+    for (0..rrs.len) |r| {
+        const group = kept[r];
+        for (at[group.lo..group.hi]) |k| {
+            rrs[n] = src[k];
+            n += 1;
+            kept[k] = .{};
+        }
+    }
+    return rrs[0..n];
+}
+
+fn covers(rr: dns.ResourceRecord) dns.RType {
+    return if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype;
+}
+
 /// Validate the RRset at (`owner`, `covered_type`), trying every covering
 /// RRSIG and every key matching its tag and algorithm (RFC 6840 §5.4).
 /// `dnskey_records` must be *this* RRset's signer's keyset, which in a chain
