@@ -76,20 +76,19 @@ pub const SecureScratch = struct {
 const Fault = union(enum) {
     bogus,
     input: CellId,
-    no_chain,
+    unreachable_authority,
     no_cut,
 
     fn failure(f: Fault, g: *Graph) ?Failure {
         return switch (f) {
             .bogus => null,
             .input => |i| g.cell(i).failure().?,
-            .no_chain => no_chain,
+            .unreachable_authority => .unreachable_authority,
             .no_cut => no_cut,
         };
     }
 };
 
-const no_chain: Failure = .{ .code = .dnssec_bogus, .text = "no chain" };
 const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validation" };
 /// Verified, and still no proof of the insecure cut asked about.
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
@@ -150,12 +149,12 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
     const parent_zone = switch (try walk.start(g, id, zone, parent_name, &s.parent)) {
         .pending => return,
-        .none => return g.fail(id, no_chain),
+        .none => return g.fail(id, .unreachable_authority),
         .failed => |why| return g.fail(id, why),
         .cut => |cid| g.cell(cid).state.fact.cut.zone,
     };
     if (s.keys == .none) s.keys = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, parent_zone, .a), parent_zone) orelse
-        return g.fail(id, no_chain));
+        return g.fail(id, .unreachable_authority));
     const parent_keys = g.cell(s.keys.unwrap().?);
     if (!parent_keys.settled()) return;
     if (parent_keys.failure()) |why| return g.fail(id, why);
@@ -166,7 +165,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
         .insecure => return g.settle(id, .{ .ds = .{ .status = .insecure } }, parent_keys.expires_ns),
     }
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .ds), zone) orelse
-        return g.fail(id, no_chain));
+        return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
     if (s.fault == null) {
@@ -175,7 +174,6 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     }
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
-        .cut_short => try g.fail(id, no_chain),
         .stopped => |why| try g.fail(id, why),
         .insecure => |until| {
             try g.keep(s.rrset.unwrap().?);
@@ -198,7 +196,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     } orelse return .bogus;
     if (!proof.isProperAncestor(signer, zone)) return .bogus;
     if (s.signer == .none) s.signer = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer) orelse
-        return .no_chain);
+        return .unreachable_authority);
     const keys = g.cell(s.signer.unwrap().?);
     if (!keys.settled()) return null;
     if (keys.failure() != null) return .{ .input = s.signer.unwrap().? };
@@ -284,7 +282,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.dnskey;
     if (s.ds == .none) s.ds = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
-        return g.fail(id, no_chain));
+        return g.fail(id, .unreachable_authority));
     // Signed all the way down, proven or not yet, says the keys will be
     // needed: fetch them alongside the proof instead of a round trip per
     // level after it.
@@ -295,7 +293,7 @@ pub fn runDnskey(g: *Graph, id: CellId) !void {
     if (ds.failure()) |why| return g.fail(id, why);
     if (ds.state.fact.ds.status != .secure) return g.settle(id, .{ .dnskey = .{ .status = ds.state.fact.ds.status } }, ds.expires_ns);
     if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, graph.Key.of(&kb, .rrset, zone, .dnskey), zone) orelse
-        return g.fail(id, no_chain));
+        return g.fail(id, .unreachable_authority));
     const rs = g.cell(s.rrset.unwrap().?);
     if (!rs.settled()) return;
     if (rs.failure()) |why| return g.fail(id, why);
@@ -350,7 +348,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     const t = g.cell(s.target);
     const zone = t.state.fact.rrset.zone;
     if (s.zone_ds == .none) s.zone_ds = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, zone, .a), zone) orelse
-        return g.fail(id, no_chain));
+        return g.fail(id, .unreachable_authority));
     const zd = g.cell(s.zone_ds.unwrap().?);
     if (!zd.settled()) return;
     if (zd.failure()) |why| return g.fail(id, why);
@@ -372,7 +370,6 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
         const deepest = if (c.is == .proof and r.target.isSubdomainOf(zone)) proof.deepestApex(r.target, t.key.rtype) else proof.deepestApex(c.owner, c.rtype);
         switch (try s.probe.run(g, id, zone, deepest)) {
             .pending => return,
-            .cut_short => return g.fail(id, no_chain),
             .stopped => |why| return g.fail(id, why),
             .insecure => |until| {
                 s.expires = @min(s.expires, until);
@@ -424,7 +421,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
             .rrset, .proof, .denial => {
                 const signer = signerOf(r, c, within) orelse break :f .bogus;
                 if (!keysOf(g, s.key, signer)) s.key = .wrap(try g.demand(id, graph.Key.of(&kb, .dnskey, signer, .a), signer));
-                const kid = s.key.unwrap() orelse break :f .no_chain;
+                const kid = s.key.unwrap() orelse break :f .unreachable_authority;
                 const kc = g.cell(kid);
                 if (!kc.settled()) {
                     s.next = c.slot;
@@ -604,9 +601,9 @@ const Probe = struct {
     cell: OptionalCellId = .none,
     depth: u8 = 0,
 
-    /// `stopped`: a candidate failed on an asker's own limit, so no
-    /// candidate below it was ruled out.
-    fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, cut_short, stopped: Failure } {
+    /// `stopped`: a candidate failed on an asker's own limit, or could
+    /// not be demanded, so no candidate below it was ruled out.
+    fn run(p: *Probe, g: *Graph, id: CellId, above: dns.Name, deepest: dns.Name) !union(enum) { pending, insecure: i64, none, stopped: Failure } {
         var kb: graph.KeyBuf = undefined;
         while (true) {
             if (p.cell.unwrap()) |pid| {
@@ -620,7 +617,7 @@ const Probe = struct {
             p.depth = @max(p.depth, @as(u8, @intCast(above.labels.len))) + 1;
             if (p.depth > deepest.labels.len) return .none;
             const candidate: dns.Name = .{ .labels = deepest.labels[deepest.labels.len - p.depth ..] };
-            p.cell = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .cut_short);
+            p.cell = .wrap(try g.demand(id, graph.Key.of(&kb, .ds, candidate, .a), candidate) orelse return .{ .stopped = .unreachable_authority });
         }
     }
 };

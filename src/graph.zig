@@ -279,6 +279,10 @@ pub const Failure = struct {
     cause: enum { zone, host, asker } = .zone,
     /// No probe could place the cut: ask in full from the deepest one known.
     unplaced: bool = false,
+
+    /// Nobody answered usefully, or the walk to them was refused
+    /// (`Graph.demand`'s null): nothing more is proven.
+    pub const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
 };
 
 pub const Value = union(Kind) {

@@ -23,9 +23,6 @@ const Transport = graph.Transport;
 const Reply = graph.Reply;
 const Failure = graph.Failure;
 
-/// Nobody answered usefully, or the walk to them was refused.
-const unreachable_authority: Failure = .{ .code = .no_reachable_authority };
-
 const max_links = graph.max_links;
 
 const max_servers = delegation.max_servers_per_level;
@@ -300,7 +297,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             const signatures = qtype == .rrsig and last.state.fact.rrset.kind == .answer;
             if (g.cfg.trust_anchor != null and s.nj == i and !signatures) {
                 s.judged[i] = try trust.demandSecure(g, id, s.hops[i]) orelse
-                    return failAnswer(g, id, unreachable_authority);
+                    return failAnswer(g, id, .unreachable_authority);
                 s.nj += 1;
             }
             var links: Links = .{};
@@ -322,7 +319,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         const own = if (s.n == 0) g.cell(id).key.at(.rrset, qtype) else Key.of(&kb, .rrset, next, qtype);
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = try g.demandHop(id, own, next) orelse
-            return failAnswer(g, id, unreachable_authority);
+            return failAnswer(g, id, .unreachable_authority);
         s.n += 1;
     }
     var expires: i64 = std.math.maxInt(i64);
@@ -378,7 +375,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     const parent_name: dns.Name = .{ .labels = name.labels[1..] };
     const s = g.cell(id).scratch.cut;
     if (s.parent == .none) s.parent = .wrap(try g.demand(id, Key.of(&kb, .cut, parent_name, .a), parent_name) orelse
-        return g.fail(id, unreachable_authority));
+        return g.fail(id, .unreachable_authority));
     const parent = g.cell(s.parent.unwrap().?);
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
@@ -465,7 +462,7 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
         const why = c.failure() orelse return .{ .cut = slot.*.unwrap().? };
         if (!why.unplaced) return .{ .failed = why };
         const n = startAt(g, qname, from, false);
-        if (n.eql(c.name)) return .{ .failed = unreachable_authority };
+        if (n.eql(c.name)) return .{ .failed = .unreachable_authority };
         slot.* = .wrap(try g.demand(id, Key.of(&kb, .cut, n, .a), n) orelse return .none);
     }
 }
@@ -510,7 +507,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     for ([_]dns.RType{ .a, .aaaa }) |rtype| {
         // Unasked is not denied.
         const rid = (if (rtype == .a) s.a else s.aaaa).unwrap() orelse {
-            failed = failed orelse unreachable_authority;
+            failed = failed orelse .unreachable_authority;
             continue;
         };
         const c = g.cell(rid);
@@ -530,7 +527,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
                 const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
                 if (slot.* == .none) slot.* = .wrap(try trust.demandSecure(g, id, rid));
                 const j = g.cell(slot.*.unwrap() orelse {
-                    failed = failed orelse unreachable_authority;
+                    failed = failed orelse .unreachable_authority;
                     continue;
                 });
                 if (!j.settled()) {
@@ -593,7 +590,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         const from = proof.deepestApex(name, qtype);
         const cut = switch (try start(g, id, name, from, &s.cut)) {
             .pending => return,
-            .none => return g.fail(id, unreachable_authority),
+            .none => return g.fail(id, .unreachable_authority),
             .failed => |why| return g.fail(id, why),
             .cut => |cid| g.cell(cid),
         };
