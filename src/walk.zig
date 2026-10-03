@@ -1113,7 +1113,8 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         const names = if (cut.state.fact.cut.zone.eql(zone)) cut.state.fact.cut.names else &.{};
         var unknown: std.ArrayList(dns.Name) = .empty;
         defer unknown.deinit(g.gpa);
-        var pending = false;
+        var busy: std.ArrayList(dns.Name) = .empty;
+        defer busy.deinit(g.gpa);
         for (names) |host| {
             const key = Key.of(&kb, .addr, host, .a);
             if (try g.peek(key)) |known| {
@@ -1132,9 +1133,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                         continue;
                     }
                 } else {
-                    // In progress for someone: wait, unless it is
-                    // transitively waiting on us.
-                    if (try g.demand(id, key, host) != null) pending = true;
+                    try busy.append(g.gpa, host);
                     continue;
                 }
             }
@@ -1144,9 +1143,15 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         while (i < list.items.len) {
             if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
         }
-        // A sibling still resolving is waited for only when nothing
-        // else is left.
-        if (list.items.len == 0 and pending) return .pending;
+        // A sibling in progress for someone is waited for only when
+        // nothing else is left, and only if it isn't waiting on us.
+        if (list.items.len == 0) {
+            var pending = false;
+            for (busy.items) |host| {
+                if (try g.demand(id, Key.of(&kb, .addr, host, .a), host) != null) pending = true;
+            }
+            if (pending) return .pending;
+        }
         if (list.items.len == 0 and !a.fetched_unglued and unknown.items.len > 0) {
             a.fetched_unglued = true;
             const limit: usize = switch (g.level(id)) {
