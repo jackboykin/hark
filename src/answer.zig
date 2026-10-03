@@ -396,7 +396,11 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     const held = try arena.alloc(*store.Blob, hops.len);
     var answers: std.ArrayList(dns.WireRecord) = .empty;
     var n: usize = 0;
-    for (hops) |hop| n += hop.rrset.sections[0].len;
+    var proofs: usize = 0;
+    for (hops) |hop| {
+        n += hop.rrset.sections[0].len;
+        proofs += hop.rrset.sections[1].len;
+    }
     try answers.ensureTotalCapacityPrecise(arena, n);
     var last: Hop = undefined;
     var age: u32 = 0;
@@ -413,12 +417,13 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
             age = 0;
             life = stale_hold_s;
         }
-        try appendAged(arena, &answers, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
+        try appendAged(arena, &answers, null, hop.rrset.sections[0], .{ .section = .answer, .qtype = q.qtype, .do_bit = c.do_bit }, age, life, hop.floor, hop.stale);
     }
     const r = last.rrset;
     // Unbound's positive_answer() carve-out: NS asked, the NS and glue are the answer (RFC 8109 priming).
     const trim = minimal and q.qtype != .ns;
     var authorities: std.ArrayList(dns.WireRecord) = .empty;
+    var seen: Seen = .{ .bound = proofs };
     var additionals: std.ArrayList(dns.WireRecord) = .empty;
     // AD vouches for authority (RFC 4035 §3.2.3): under a secure verdict,
     // only the proofs it judged. Every hop's go out, minimal or not: the
@@ -426,14 +431,14 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     const keep: Keep = .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = trim, .positive = r.kind.rcode() == .no_error and answers.items.len > 0, .denial = r.kind == .nodata or r.kind == .nxdomain, .proofs_only = secure };
     for (hops[0 .. hops.len - 1]) |hop| {
         const hop_age = walk.ageOf(hop.rrset.stored_ns, g.now());
-        try appendAged(arena, &authorities, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = true, .positive = true, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
+        try appendAged(arena, &authorities, &seen, hop.rrset.sections[1], .{ .section = .authority, .qtype = q.qtype, .do_bit = c.do_bit, .trim = true, .positive = true, .denial = false, .proofs_only = true }, hop_age, hop.life, hop.floor, hop.stale);
     }
-    try appendAged(arena, &authorities, r.sections[1], keep, age, life, last.floor, last.stale);
+    try appendAged(arena, &authorities, &seen, r.sections[1], keep, age, life, last.floor, last.stale);
     if (!(trim and (r.kind == .answer or r.kind == .alias))) {
         // Nothing judges additional, so AD vouches for none of it.
         var add = keep;
         add.section = .additional;
-        if (!secure) try appendAged(arena, &additionals, r.sections[2], add, age, life, last.floor, last.stale);
+        if (!secure) try appendAged(arena, &additionals, null, r.sections[2], add, age, life, last.floor, last.stale);
     }
     const ede: ?dns.Ede = if (stale_any) // any hop: a stale alias still redirected
         .{ .code = if (r.kind == .nxdomain) .stale_nxdomain_answer else .stale_answer }
@@ -512,20 +517,49 @@ const Keep = struct {
 /// The records `keep` keeps, TTLs aged since the reply, floored to
 /// `floor` and capped by `life`; a record past its TTL in a stale reply
 /// gets the hold (RFC 8767 §4).
-fn appendAged(arena: Allocator, out: *std.ArrayList(dns.WireRecord), records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
+fn appendAged(arena: Allocator, out: *std.ArrayList(dns.WireRecord), seen: ?*Seen, records: store.Records, keep: Keep, age: u32, life: u32, floor: u32, is_stale: bool) !void {
     var it = records.iterator();
     while (it.next()) |rr| {
         if (!keep.keeps(rr)) continue;
-        // Two hops of one zone may carry one proof.
-        const dup = keep.section == .authority and for (out.items) |o| {
-            if (sameRecord(o, rr)) break true;
-        } else false;
-        if (dup) continue;
+        if (seen) |s| if (!try s.add(arena, out.items, rr)) continue;
         var aged = rr;
         aged.ttl = if (is_stale and rr.ttl <= age) stale_hold_s else @min(@max(rr.ttl, floor) -| age, life);
         try out.append(arena, aged);
     }
 }
+
+/// A shared proof goes out once. A set: the proofs are a stranger's, and
+/// a scan per record is quadratic in them. Sized at its first record, so
+/// a reply that keeps no proof pays nothing.
+const Seen = struct {
+    /// The most records it will hold.
+    bound: usize,
+    slots: []u32 = &.{},
+
+    const empty = std.math.maxInt(u32);
+
+    /// False if `out` holds `rr`; else `rr` must be appended to `out` next.
+    fn add(s: *Seen, arena: Allocator, out: []const dns.WireRecord, rr: dns.WireRecord) !bool {
+        if (s.slots.len == 0) {
+            s.slots = try arena.alloc(u32, std.math.ceilPowerOfTwoAssert(usize, 2 * s.bound));
+            @memset(s.slots, empty);
+        }
+        var i = hash(rr) & (s.slots.len - 1);
+        while (s.slots[i] != empty) : (i = (i + 1) & (s.slots.len - 1))
+            if (sameRecord(out[s.slots[i]], rr)) return false;
+        s.slots[i] = @intCast(out.len);
+        return true;
+    }
+
+    fn hash(rr: dns.WireRecord) usize {
+        var lower: [255]u8 = undefined;
+        var h: std.hash.Wyhash = .init(rand.hash_seed);
+        h.update(std.ascii.lowerString(&lower, rr.owner));
+        h.update(rr.rest[0..4]);
+        h.update(rr.rest[8..]);
+        return @truncate(h.final());
+    }
+};
 
 /// Owner, type, class and data alike; TTLs aside.
 fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
@@ -668,6 +702,23 @@ test "a client is sent what Keep keeps" {
         const keep: Keep = .{ .section = row.section, .qtype = row.qtype, .do_bit = row.do_bit, .trim = row.trim, .positive = row.positive };
         try std.testing.expectEqual(row.kept, keep.keeps(rr));
     }
+}
+
+test "a proof two hops share goes out once, owners case-folded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // NSEC, IN, TTL 3600; rdata: next name the root, an A bitmap.
+    const nsec = "\x00\x2f\x00\x01\x00\x00\x0e\x10\x00\x04\x00\x00\x01\x40";
+    const hops = [_]store.Records{
+        .{ .bytes = "\x01a\x00" ++ nsec ++ "\x01b\x00" ++ nsec, .len = 2 },
+        .{ .bytes = "\x01A\x00" ++ nsec ++ "\x01c\x00" ++ nsec, .len = 2 },
+    };
+    var out: std.ArrayList(dns.WireRecord) = .empty;
+    var seen: Seen = .{ .bound = 4 };
+    for (hops) |hop| try appendAged(a, &out, &seen, hop, .{ .section = .authority, .qtype = .a, .do_bit = true }, 0, std.math.maxInt(u32), 0, false);
+    try std.testing.expectEqual(3, out.items.len);
 }
 
 test "a failure is remembered, backs off while it persists, and an answer forgets it" {
