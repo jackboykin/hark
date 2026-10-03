@@ -284,7 +284,7 @@ pub fn findRrsigAt(
 }
 
 /// Room for a rollover's signatures; more is stuffing.
-const max_sigs_per_set = 8;
+pub const max_sigs_per_set = 8;
 
 /// A section read as sets (RFC 2181 §5), in place: each set where it first
 /// appears, then the signatures bound to it, all at their lowest TTL (RFC

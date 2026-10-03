@@ -5,6 +5,8 @@ const std = @import("std");
 const testing = std.testing;
 const Smith = testing.Smith;
 const dns = @import("dns.zig");
+const dnssec = @import("dnssec.zig");
+const rrsig = @import("rrsig.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
 const graph = @import("graph.zig");
@@ -109,6 +111,99 @@ fn checkName(alloc: std.mem.Allocator, name: dns.Name) !void {
     _ = name.formatLower(&buf);
 }
 
+const check_now = 1_700_000_000;
+
+fn usable(sig: dns.RrsigData) bool {
+    return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, check_now);
+}
+
+fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bare: bool) !void {
+    const out = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, section), check_now, bare);
+    var i: usize = 0;
+    while (i < out.len) {
+        const head = out[i];
+        const run = dnssec.setFrom(out, i);
+        i += run.len;
+        for (out[0 .. i - run.len]) |p| if (dnssec.covers(p) == dnssec.covers(head) and p.name.eql(head.name)) return error.SplitSet;
+        if (head.rtype == .rrsig) {
+            if (!bare) return error.BareSignature;
+            for (run) |rr| if (rr.rtype != .rrsig) return error.DataAfterSignature;
+            for (section) |in| if (in.rtype != .rrsig and in.rtype == dnssec.covers(head) and in.name.eql(head.name)) return error.BoundAsBare;
+            continue;
+        }
+        var signer: ?dns.Name = null;
+        var sigs: usize = 0;
+        var good: usize = 0;
+        for (run) |rr| {
+            if (rr.ttl != head.ttl) return error.UnlevelledSet;
+            if (rr.rtype != .rrsig) {
+                if (sigs > 0) return error.DataAfterSignature;
+                continue;
+            }
+            signer = signer orelse rr.rdata.rrsig.signer_name;
+            if (!rr.rdata.rrsig.signer_name.eql(signer.?)) return error.TwoSigners;
+            sigs += 1;
+            good += @intFromBool(usable(rr.rdata.rrsig));
+        }
+        var any = false;
+        var any_good = false;
+        var offered: usize = 0;
+        var offered_good: usize = 0;
+        var floor: u32 = std.math.maxInt(u32);
+        for (section) |in| if (dnssec.covers(in) == head.rtype and in.name.eql(head.name)) {
+            if (in.rtype != .rrsig) {
+                if (in.ttl < head.ttl) return error.AboveSetMinimum;
+                floor = @min(floor, in.ttl);
+                continue;
+            }
+            any = true;
+            any_good = any_good or usable(in.rdata.rrsig);
+            if (signer == null or !in.rdata.rrsig.signer_name.eql(signer.?)) continue;
+            offered += 1;
+            offered_good += @intFromBool(usable(in.rdata.rrsig));
+            floor = @min(floor, in.ttl);
+        };
+        // Past the cap, the lowest signature may be one cut.
+        if (if (offered <= dnssec.max_sigs_per_set) head.ttl != floor else head.ttl < floor) return error.LevelledWrong;
+        if (any and sigs == 0) return error.SignatureLost;
+        if (sigs != @min(offered, dnssec.max_sigs_per_set)) return error.CapMiscounted;
+        if (good != @min(offered_good, dnssec.max_sigs_per_set) or (any_good and good == 0)) return error.UsableCrowdedOut;
+    }
+    var data_in: usize = 0;
+    var data_out: usize = 0;
+    for (section) |rr| data_in += @intFromBool(rr.rtype != .rrsig);
+    for (out) |rr| data_out += @intFromBool(rr.rtype != .rrsig);
+    if (data_in != data_out) return error.DataDropped;
+    const again = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, out), check_now, bare);
+    if (again.len != out.len) return error.NotFixedPoint;
+    for (again, out) |x, y| if (x.rtype != y.rtype or x.ttl != y.ttl or !x.name.eql(y.name)) return error.NotFixedPoint;
+}
+
+/// Drawn from small pools so sets, rollovers and the cap come up; wire
+/// messages are too few and too random to reach them.
+fn pooledRR(s: *Smith) dns.ResourceRecord {
+    const owners = [_]dns.Name{ .{ .labels = &.{"example"} }, .{ .labels = &.{ "a", "example" } }, .{ .labels = &.{ "b", "example" } } };
+    const signers = [_]dns.Name{ .{ .labels = &.{"example"} }, .{ .labels = &.{"other"} }, .{ .labels = &.{} } };
+    const data = [_]dns.RType{ .a, .ns, .ds, .nsec };
+    const algorithms = [_]dns.DnssecAlgorithm{ .ecdsap256sha256, .rsasha256, @fromBackingInt(200) };
+    const ttls = [_]u32{ 0, 60, 300, 3600 };
+    const owner = owners[s.index(owners.len)];
+    const ttl = ttls[s.index(ttls.len)];
+    if (s.boolWeighted(1, 1)) return .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = "" } };
+    const lapsed = s.boolWeighted(3, 1);
+    return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
+        .type_covered = data[s.index(data.len)],
+        .algorithm = algorithms[s.index(algorithms.len)],
+        .labels = @intCast(owner.labels.len),
+        .original_ttl = ttl,
+        .sig_expiration = if (lapsed) check_now - 86400 else check_now + 86400,
+        .sig_inception = check_now - 2 * 86400,
+        .key_tag = s.value(u16),
+        .signer_name = signers[s.index(signers.len)],
+        .signature = "",
+    } } };
+}
+
 const scrub_cfg: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
 
 fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
@@ -147,6 +242,8 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
         };
     };
 
+    for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities, msg.additionals }) |section| try checkBound(alloc, section, msg.header.id & 1 == 1);
+
     var out: [70000]u8 = undefined;
     if (dns.serializeMessage(&out, msg)) |wire| {
         var again: [70000]u8 = undefined;
@@ -162,6 +259,19 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
         const once = try rebinding.scrub(alloc, records, scrub_cfg);
         if ((try rebinding.scrub(alloc, once, scrub_cfg)).len != once.len) return error.ScrubNotIdempotent;
     }
+}
+
+test "fuzz: pooled sections bind" {
+    try testing.fuzz({}, struct {
+        fn one(_: void, s: *Smith) anyerror!void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var rrs: [40]dns.ResourceRecord = undefined;
+            const n = s.valueRangeAtMost(u8, 0, rrs.len);
+            for (rrs[0..n]) |*rr| rr.* = pooledRR(s);
+            try checkBound(arena.allocator(), rrs[0..n], s.boolWeighted(1, 3));
+        }
+    }.one, .{});
 }
 
 test "fuzz: wire message chain" {
