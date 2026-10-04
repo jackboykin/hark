@@ -133,6 +133,7 @@ pub fn validateDnskeyRrset(
         const sig = rrsig_rr.rdata.rrsig;
         if (sig.type_covered != .dnskey) continue;
         if (pq and sig.algorithm != .mldsa44) continue;
+        if (!sig.signer_name.eql(zone_name)) continue;
         for (filtered, 0..) |rr, i| {
             if (!anchored[i] or key_tags[i] != sig.key_tag) continue;
             if (try rrsig.tryVerifyRrsig(sig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return sig;
@@ -237,18 +238,25 @@ const Keyset = struct {
     keys: [64]dns.DnskeyData = undefined,
     tags: [64]u16 = undefined,
     len: usize = 0,
+    zone: ?dns.Name = null,
 
     /// Null past 64 keys, the ceiling `validateDnskeyRrset` admits.
     fn init(records: []const dns.ResourceRecord) ?Keyset {
         var k: Keyset = .{};
         for (records) |rr| {
-            if (rr.rtype != .dnskey or !isValidZoneKey(rr.rdata.dnskey)) continue;
+            if (rr.rtype != .dnskey) continue;
+            k.zone = k.zone orelse rr.name;
+            if (!isValidZoneKey(rr.rdata.dnskey)) continue;
             if (k.len == k.keys.len) return null;
             k.keys[k.len] = rr.rdata.dnskey;
             k.tags[k.len] = rrsig.keyTag(rr.rdata.dnskey);
             k.len += 1;
         }
         return k;
+    }
+
+    fn signs(k: *const Keyset, sig: dns.RrsigData) bool {
+        return k.zone != null and sig.signer_name.eql(k.zone.?);
     }
 };
 
@@ -419,7 +427,7 @@ pub fn validateRrset(
         const sig = sig_rr.rdata.rrsig;
         if (sig.type_covered != covered_type) continue;
         if (!sig_rr.name.eql(owner)) continue;
-        if (!rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
+        if (!keyset.signs(sig) or !rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
 
         if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return sig;
     }
@@ -481,7 +489,7 @@ pub fn verifyAuthorityProofSigs(
             if (sig_rr.rtype != .rrsig) continue;
             const sig = sig_rr.rdata.rrsig;
             if (sig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
-            if (!rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
+            if (!keyset.signs(sig) or !rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
             // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
             // the `*.CE` NSEC under its own owner), and the proofs read the owner
             // as served: a real `*.zone NSEC` signature would verify under any.
