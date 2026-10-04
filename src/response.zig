@@ -143,15 +143,15 @@ pub fn buildResponseWire(
 }
 
 pub fn serializeErrorResponse(
-    wire_buf: []u8,
+    wire_buf: *[dns.max_udp_payload]u8,
     query_id: u16,
     opcode: dns.OpCode,
     rcode: dns.RCode,
     extended_rcode: u8,
     rd: bool,
-    questions: []const dns.Question,
+    question: ?dns.Question,
     client_opt: ?dns.OptRecord,
-) ?[]const u8 {
+) []const u8 {
     // RFC 6891 §6.1.1: an OPT in the query obliges one in the response.
     const opt: ?dns.OptRecord = if (client_opt) |o| .{
         .udp_payload_size = dns.edns_udp_payload,
@@ -179,10 +179,11 @@ pub fn serializeErrorResponse(
                 .rcode = rcode,
             },
         },
-        .questions = questions,
+        .questions = if (question) |*q| q[0..1] else &.{},
         .opt = opt,
     };
-    return dns.serializeMessage(wire_buf, msg) catch null;
+    // RFC 9619 §4: one question at most, so 12 + 259 + 11 bytes at most.
+    return dns.serializeMessage(wire_buf, msg) catch unreachable;
 }
 
 pub fn validateQuery(query: dns.Message) ?struct { rcode: dns.RCode, extended_rcode: u8 = 0 } {
@@ -268,10 +269,8 @@ test "serializeErrorResponse produces valid DNS message" {
     const a = arena.allocator();
 
     const name = try dns.parseDottedName(a, "example.com");
-    const questions: []const dns.Question = &.{.{ .name = name, .qtype = .a, .qclass = .in }};
-
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0xABCD, .query, .refused, 0, true, questions, null).?;
+    const wire = serializeErrorResponse(&buf, 0xABCD, .query, .refused, 0, true, .{ .name = name, .qtype = .a, .qclass = .in }, null);
 
     const parsed = try dns.parseMessage(a, wire);
     try testing.expectEqual(@as(u16, 0xABCD), parsed.header.id);
@@ -314,7 +313,7 @@ test "serializeErrorResponse echoes client OPCODE (RFC 1035 §4.1.1)" {
     // response to its request.
     const opcode_update: dns.OpCode = @fromBackingInt(@intCast(5));
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, &.{}, null).?;
+    const wire = serializeErrorResponse(&buf, 0x9999, opcode_update, .not_implemented, 0, false, null, null);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -419,7 +418,7 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
 
 test "serializeErrorResponse answers an EDNS query with OPT (RFC 6891 §6.1.1)" {
     var buf: [dns.max_udp_payload]u8 = undefined;
-    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, &.{}, .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 1, .do_bit = true, .options = &.{} }).?;
+    const wire = serializeErrorResponse(&buf, 0x1234, .query, .no_error, 1, false, null, .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 1, .do_bit = true, .options = &.{} });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
