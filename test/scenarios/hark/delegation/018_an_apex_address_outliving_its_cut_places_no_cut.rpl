@@ -1,0 +1,113 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN an apex address outliving its cut places no cut
+
+; example.'s apex A comes from example.'s own servers and outlives the
+; referral that placed the cut. Once the cut lapses, that A says nothing
+; about whether the root holds example.: only an answer from the root's
+; zone puts the name inside it. The cut is probed again, and www.example.
+; is never shown to the root.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 10 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 10 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION ANSWER
+      example. 3600 IN A 192.0.2.1
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH all
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    example. IN A
+  SECTION ANSWER
+    example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 20
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH all
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.2
+ENTRY_END
+
+; The root and example.'s server for example., then the root again for
+; example. alone, then www.example. at example.'s server.
+STEP 6 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 7 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 8 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    example. IN A
+ENTRY_END
+
+STEP 9 CHECK_OUT_QUERY
+ENTRY_BEGIN
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+SCENARIO_END

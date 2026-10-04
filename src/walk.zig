@@ -380,8 +380,9 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     const inside: graph.Value = .{ .cut = .{ .zone = pc.zone } };
     // No cut below a name that does not exist (RFC 8020).
     if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
-    // A fresh fact at the probe name answers it without a packet.
-    if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known|
+    // A fresh fact at the probe name from the parent's zone answers it
+    // without a packet; one from below says nothing about the parent.
+    if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known| if (known.value.rrset.zone.eql(pc.zone))
         return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
     if (!s.started) {
         s.ask.reset(pc.zone);
