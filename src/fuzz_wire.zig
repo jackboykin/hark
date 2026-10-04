@@ -7,7 +7,6 @@ const Smith = testing.Smith;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
 const proof = @import("proof.zig");
-const rrsig = @import("rrsig.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
 const graph = @import("graph.zig");
@@ -112,14 +111,8 @@ fn checkName(alloc: std.mem.Allocator, name: dns.Name) !void {
     _ = name.formatLower(&buf);
 }
 
-const check_now = 1_700_000_000;
-
-fn usable(sig: dns.RrsigData) bool {
-    return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, check_now);
-}
-
 fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bare: bool) !void {
-    const out = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, section), check_now, bare);
+    const out = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, section), bare);
     var i: usize = 0;
     while (i < out.len) {
         const head = out[i];
@@ -134,7 +127,6 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
         }
         const apex = proof.deepestApex(head.name, head.rtype);
         var sigs: usize = 0;
-        var good: usize = 0;
         for (run) |rr| {
             if (rr.ttl != head.ttl) return error.UnlevelledSet;
             if (rr.rtype != .rrsig) {
@@ -143,12 +135,8 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
             }
             if (!apex.isSubdomainOf(rr.rdata.rrsig.signer_name)) return error.SignerHoldsNoSet;
             sigs += 1;
-            good += @intFromBool(usable(rr.rdata.rrsig));
         }
-        var any = false;
-        var any_good = false;
         var offered: usize = 0;
-        var offered_good: usize = 0;
         var floor: u32 = std.math.maxInt(u32);
         for (section) |in| if (dnssec.covers(in) == head.rtype and in.name.eql(head.name)) {
             if (in.rtype != .rrsig) {
@@ -157,24 +145,18 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
                 continue;
             }
             if (!apex.isSubdomainOf(in.rdata.rrsig.signer_name)) continue;
-            any = true;
-            any_good = any_good or usable(in.rdata.rrsig);
             offered += 1;
-            offered_good += @intFromBool(usable(in.rdata.rrsig));
             floor = @min(floor, in.ttl);
         };
-        // Past the cap, the lowest signature may be one cut.
-        if (if (offered <= dnssec.max_sigs_per_set) head.ttl != floor else head.ttl < floor) return error.LevelledWrong;
-        if (any and sigs == 0) return error.SignatureLost;
-        if (sigs != @min(offered, dnssec.max_sigs_per_set)) return error.CapMiscounted;
-        if (good != @min(offered_good, dnssec.max_sigs_per_set) or (any_good and good == 0)) return error.UsableCrowdedOut;
+        if (head.ttl != floor) return error.LevelledWrong;
+        if (sigs != offered) return error.SignatureLost;
     }
     var data_in: usize = 0;
     var data_out: usize = 0;
     for (section) |rr| data_in += @intFromBool(rr.rtype != .rrsig);
     for (out) |rr| data_out += @intFromBool(rr.rtype != .rrsig);
     if (data_in != data_out) return error.DataDropped;
-    const again = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, out), check_now, bare);
+    const again = try dnssec.bindSets(alloc, try alloc.dupe(dns.ResourceRecord, out), bare);
     if (again.len != out.len) return error.NotFixedPoint;
     for (again, out) |x, y| if (x.rtype != y.rtype or x.ttl != y.ttl or !x.name.eql(y.name)) return error.NotFixedPoint;
 }
@@ -190,14 +172,13 @@ fn pooledRR(s: *Smith) dns.ResourceRecord {
     const owner = owners[s.index(owners.len)];
     const ttl = ttls[s.index(ttls.len)];
     if (s.boolWeighted(1, 1)) return .{ .name = owner, .rtype = data[s.index(data.len)], .rclass = .in, .ttl = ttl, .rdata = .{ .unknown = "" } };
-    const lapsed = s.boolWeighted(3, 1);
     return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = ttl, .rdata = .{ .rrsig = .{
         .type_covered = data[s.index(data.len)],
         .algorithm = algorithms[s.index(algorithms.len)],
         .labels = @intCast(owner.labels.len),
         .original_ttl = ttl,
-        .sig_expiration = if (lapsed) check_now - 86400 else check_now + 86400,
-        .sig_inception = check_now - 2 * 86400,
+        .sig_expiration = 0,
+        .sig_inception = 0,
         .key_tag = s.value(u16),
         .signer_name = signers[s.index(signers.len)],
         .signature = "",

@@ -128,12 +128,15 @@ pub fn validateDnskeyRrset(
     // Unless the DS advertises ML-DSA-44: then only an ML-DSA-44 RRSIG
     // counts (draft-westerbaan-dnssec-mldsa §7.2, RFC 4035 §5.3.3 policy).
     const pq = hasMlDsaDs(ds_records);
+    var tried: usize = 0;
     for (dnskey_records) |rrsig_rr| {
         if (rrsig_rr.rtype != .rrsig) continue;
         const sig = rrsig_rr.rdata.rrsig;
         if (sig.type_covered != .dnskey) continue;
         if (pq and sig.algorithm != .mldsa44) continue;
-        if (!sig.signer_name.eql(zone_name)) continue;
+        if (!sig.signer_name.eql(zone_name) or !usable(sig, now_u32)) continue;
+        if (tried == max_sigs_per_set) break;
+        tried += 1;
         for (filtered, 0..) |rr, i| {
             if (!anchored[i] or key_tags[i] != sig.key_tag) continue;
             if (try rrsig.tryVerifyRrsig(sig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return sig;
@@ -254,10 +257,6 @@ const Keyset = struct {
         }
         return k;
     }
-
-    fn signs(k: *const Keyset, sig: dns.RrsigData) bool {
-        return k.zone != null and sig.signer_name.eql(k.zone.?);
-    }
 };
 
 fn rrsetVerifiesWithAnyKey(
@@ -295,21 +294,51 @@ pub fn signedBy(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RTy
     return false;
 }
 
-/// Room for a rollover's signatures; more is stuffing.
+/// The signatures over one set worth a verify: room for a rollover's;
+/// more is stuffing.
 pub const max_sigs_per_set = 8;
+
+fn usable(sig: dns.RrsigData, now: u32) bool {
+    return rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, now);
+}
+
+/// The signatures over a set its zone's verifier weighs: the zone's own
+/// (RFC 4035 §5.3.1), usable now, up to `max_sigs_per_set`.
+pub const Weighed = struct {
+    rrs: []const dns.ResourceRecord,
+    owner: dns.Name,
+    rtype: dns.RType,
+    zone: dns.Name,
+    now: u32,
+    at: usize = 0,
+    n: usize = 0,
+
+    pub inline fn next(w: *Weighed) ?usize {
+        while (w.at < w.rrs.len and w.n < max_sigs_per_set) {
+            const i = w.at;
+            w.at += 1;
+            const rr = w.rrs[i];
+            if (rr.rtype != .rrsig) continue;
+            const sig = rr.rdata.rrsig;
+            if (sig.type_covered != w.rtype or !rr.name.eql(w.owner) or !sig.signer_name.eql(w.zone) or !usable(sig, w.now)) continue;
+            w.n += 1;
+            return i;
+        }
+        return null;
+    }
+};
 
 /// A section read as sets (RFC 2181 §5), in place: each set where it first
 /// appears, then the signatures bound to it, all at their lowest TTL (RFC
 /// 2181 §5.2, RFC 4035 §5.3.3). A set binds the signatures of every zone
-/// that could hold it (RFC 4035 §5.3.1), usable first, up to the cap;
-/// which zone does is the chain of trust's to prove, not the reply's to
-/// say. With `bare_sigs`, signatures over no set are an RRSIG question's
-/// data and stay, unfiltered and unlevelled; without, they go.
-pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bare_sigs: bool) ![]dns.ResourceRecord {
+/// that could hold it (RFC 4035 §5.3.1); which one does is the chain of
+/// trust's to prove, not the reply's to say. With `bare_sigs`, signatures
+/// over no set are an RRSIG question's data and stay, unfiltered and
+/// unlevelled; without, they go.
+pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, bare_sigs: bool) ![]dns.ResourceRecord {
     if (rrs.len < 2) return if (rrs.len == 1 and rrs[0].rtype == .rrsig and !bare_sigs) rrs[0..0] else rrs;
     const By = struct {
         rrs: []const dns.ResourceRecord,
-        now: u32,
 
         fn order(c: @This(), x: u32, y: u32) std.math.Order {
             const p = c.rrs[x];
@@ -320,18 +349,11 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bar
 
         fn lessThan(c: @This(), x: u32, y: u32) bool {
             const o = c.order(x, y);
-            return if (o != .eq) o == .lt else c.rank(x) < c.rank(y);
-        }
-
-        fn rank(c: @This(), x: u32) u2 {
-            const rr = c.rrs[x];
-            if (rr.rtype != .rrsig) return 0;
-            const sig = rr.rdata.rrsig;
-            return if (rrsig.isSupportedAlgorithm(sig.algorithm) and rrsig.inWindow(sig, c.now)) 1 else 2;
+            return if (o != .eq) o == .lt else @intFromBool(c.rrs[x].rtype == .rrsig) < @intFromBool(c.rrs[y].rtype == .rrsig);
         }
     };
     const src = try scratch.dupe(dns.ResourceRecord, rrs);
-    const by: By = .{ .rrs = src, .now = now };
+    const by: By = .{ .rrs = src };
     const at = try scratch.alloc(u32, rrs.len);
     for (at, 0..) |*x, i| x.* = @intCast(i);
     // Stable: a set keeps the order it came in.
@@ -348,13 +370,9 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bar
             if (bare_sigs) hi = j;
         } else {
             const apex = proof.deepestApex(src[at[i]].name, covers(src[at[i]]));
-            var sigs: usize = 0;
             var ttl: u32 = std.math.maxInt(u32);
             for (at[i..j]) |k| {
-                if (src[k].rtype == .rrsig) {
-                    if (sigs == max_sigs_per_set or !apex.isSubdomainOf(src[k].rdata.rrsig.signer_name)) continue;
-                    sigs += 1;
-                }
+                if (src[k].rtype == .rrsig and !apex.isSubdomainOf(src[k].rdata.rrsig.signer_name)) continue;
                 ttl = @min(ttl, src[k].ttl);
                 at[hi] = k;
                 hi += 1;
@@ -425,13 +443,9 @@ pub fn validateRrset(
     if (count == 0) return null;
     const keyset = Keyset.init(dnskey_records) orelse return null;
 
-    for (records) |sig_rr| {
-        if (sig_rr.rtype != .rrsig) continue;
-        const sig = sig_rr.rdata.rrsig;
-        if (sig.type_covered != covered_type) continue;
-        if (!sig_rr.name.eql(owner)) continue;
-        if (!keyset.signs(sig) or !rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
-
+    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32 };
+    while (it.next()) |i| {
+        const sig = records[i].rdata.rrsig;
         if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return sig;
     }
     // Nothing verified on a zone already proven secure — bogus, even when
@@ -465,6 +479,7 @@ pub fn verifyAuthorityProofSigs(
     } else return .unchecked;
     if (proof.proofFlood(authorities)) return .bogus;
     const keyset = Keyset.init(dnskey_records) orelse return .bogus;
+    const zone = keyset.zone orelse return .bogus;
 
     for (authorities, 0..) |rr, i| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
@@ -488,11 +503,9 @@ pub fn verifyAuthorityProofSigs(
         }
 
         var sig_verified = false;
-        for (authorities) |sig_rr| {
-            if (sig_rr.rtype != .rrsig) continue;
-            const sig = sig_rr.rdata.rrsig;
-            if (sig.type_covered != rr.rtype or !sig_rr.name.eql(rr.name)) continue;
-            if (!keyset.signs(sig) or !rrsig.isSupportedAlgorithm(sig.algorithm)) continue;
+        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32 };
+        while (it.next()) |j| {
+            const sig = authorities[j].rdata.rrsig;
             // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
             // the `*.CE` NSEC under its own owner), and the proofs read the owner
             // as served: a real `*.zone NSEC` signature would verify under any.
@@ -779,7 +792,7 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
             .algorithm = .rsasha256,
             .labels = 2,
             .original_ttl = 86400,
-            .sig_expiration = 0xFFFFFFFF,
+            .sig_expiration = 1700086400,
             .sig_inception = 0,
             .key_tag = ds.key_tag,
             .signer_name = rrsig.test_owner,
@@ -953,7 +966,7 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
             .algorithm = .rsasha256,
             .labels = 3,
             .original_ttl = 300,
-            .sig_expiration = 0xFFFFFFFF,
+            .sig_expiration = 1700086400,
             .sig_inception = 0,
             .key_tag = rrsig.keyTag(test_dnskey),
             .signer_name = rrsig.test_owner,

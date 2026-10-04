@@ -709,10 +709,9 @@ pub const Graph = struct {
                     section.* = rrs[0..n];
                 }
                 const scratch = g.scratch.allocator();
-                const wall = g.wallNow();
-                msg.answers = try dnssec.bindSets(scratch, @constCast(msg.answers), wall, sc.qtype == .rrsig);
-                msg.authorities = try dnssec.bindSets(scratch, @constCast(msg.authorities), wall, false);
-                msg.additionals = try dnssec.bindSets(scratch, @constCast(msg.additionals), wall, false);
+                msg.answers = try dnssec.bindSets(scratch, @constCast(msg.answers), sc.qtype == .rrsig);
+                msg.authorities = try dnssec.bindSets(scratch, @constCast(msg.authorities), false);
+                msg.additionals = try dnssec.bindSets(scratch, @constCast(msg.additionals), false);
                 break :blk .{ .reply = .{ .msg = msg, .rtt_ns = g.now() - sc.sent_ns } };
             },
         };
