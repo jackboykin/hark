@@ -896,6 +896,18 @@ pub const Graph = struct {
         try g.woken(id, value == .answer);
     }
 
+    /// An rrset's bytes as its judge read them, set before the verdict is
+    /// stamped on them (`trust.keepWeighed`).
+    pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
+        const c = g.cell(id);
+        const blob = try g.store.build(.{ .rrset = reply });
+        errdefer g.store.unref(blob);
+        const parsed = try store.Store.parse(c.arena.allocator(), blob);
+        if (c.blob) |b| g.store.unref(b);
+        c.blob = blob;
+        c.state.fact = parsed;
+    }
+
     /// With DNSSEC on, an rrset is no fact until judged: its bytes wait in
     /// their cell and die with it unless their judge keeps them.
     pub fn awaitsVerdict(g: *const Graph, kind: Kind) bool {

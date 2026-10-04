@@ -221,8 +221,8 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     const now = g.wallNow();
     switch (r.kind) {
         .answer => {
-            const sig = dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
-                return .bogus;
+            const sig = (dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
+                return .bogus).sig;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
             try g.keep(s.rrset.unwrap().?);
@@ -476,8 +476,9 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     break :f null;
                 }
                 const records = if (c.is == .proof) r.authorities else r.answers;
-                const verified = dnssec.validateRrset(records, c.owner, c.rtype, keys.records, now, budget, &g.verify_memo) orelse
+                const v = dnssec.validateRrset(records, c.owner, c.rtype, keys.records, now, budget, &g.verify_memo) orelse
                     break :f .bogus;
+                const verified = v.sig;
                 const cap = capExpiry(g, rrsig.ttlCap(verified, now));
                 s.expires = @min(s.expires, cap);
                 s.proven = @min(s.proven, cap);
@@ -486,6 +487,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     // expanded (RFC 4035 §3.1.3.3).
                     if (verified.labels != rrsig.signedLabels(c.owner)) break :f .bogus;
                     s.proved[c.slot] = @intCast(signer.labels.len);
+                    if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
                     break :f null;
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
@@ -496,6 +498,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                         .bogus, .unchecked => break :f .bogus,
                     }
                 }
+                if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
                 break :f null;
             },
         };
@@ -551,6 +554,7 @@ const Claims = struct {
         slot: u8,
         owner: dns.Name,
         rtype: dns.RType,
+        head: usize,
         is: union(enum) {
             rrset,
             proof,
@@ -567,7 +571,7 @@ const Claims = struct {
             it.p += 1;
             const rr = auth[i];
             switch (rr.rtype) {
-                .nsec, .nsec3, .soa => if (firstOfRrset(auth, i)) return it.claim(rr.name, rr.rtype, .proof),
+                .nsec, .nsec3, .soa => if (firstOfRrset(auth, i)) return it.claim(rr.name, rr.rtype, i, .proof),
                 else => {},
             }
         }
@@ -583,21 +587,21 @@ const Claims = struct {
             if (rr.rtype == .cname) for (answers) |d| {
                 if (d.rtype == .dname and synthesisedUnder(rr, d) and (dname == null or d.name.labels.len > dname.?.name.labels.len)) dname = d;
             };
-            if (dname) |d| return it.claim(rr.name, rr.rtype, .{ .synthesised = .{ .cname = rr, .dname = d } });
-            return it.claim(rr.name, rr.rtype, .rrset);
+            if (dname) |d| return it.claim(rr.name, rr.rtype, i, .{ .synthesised = .{ .cname = rr, .dname = d } });
+            return it.claim(rr.name, rr.rtype, i, .rrset);
         }
         if (it.ended) return null;
         it.ended = true;
         return switch (it.r.kind) {
-            .nodata, .nxdomain => it.claim(it.r.target, it.qtype, .denial),
+            .nodata, .nxdomain => it.claim(it.r.target, it.qtype, 0, .denial),
             else => null,
         };
     }
 
-    fn claim(it: *Claims, owner: dns.Name, rtype: dns.RType, is: @FieldType(Claim, "is")) Claim {
+    fn claim(it: *Claims, owner: dns.Name, rtype: dns.RType, head: usize, is: @FieldType(Claim, "is")) Claim {
         std.debug.assert(it.slot <= max_claims);
         defer it.slot += 1;
-        return .{ .slot = it.slot, .owner = owner, .rtype = rtype, .is = is };
+        return .{ .slot = it.slot, .owner = owner, .rtype = rtype, .head = head, .is = is };
     }
 
     fn at(r: *const graph.Reply, qtype: dns.RType, slot: u8) Claim {
@@ -664,6 +668,23 @@ fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, proved: *c
             if (rr.rtype != .rrsig or rr.rdata.rrsig.signer_name.eql(signer)) try keep.append(g.scratch.allocator(), rr);
     }
     return keep.items;
+}
+
+/// A proven set keeps only the signatures its zone's verifier weighs; the
+/// rest go before a verdict is stamped on its bytes. Only signatures go, so
+/// every claim keeps its place.
+fn keepWeighed(g: *Graph, target: CellId, r: *const graph.Reply, c: *const Claims.Claim, zone: dns.Name, now: u32) !void {
+    const section = if (c.is == .proof) r.authorities else r.answers;
+    const set = dnssec.setFrom(section, c.head);
+    var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), section.len);
+    keep.appendSliceAssumeCapacity(section[0..c.head]);
+    for (set) |rr| if (rr.rtype != .rrsig) keep.appendAssumeCapacity(rr);
+    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .now = now };
+    while (w.next()) |i| keep.appendAssumeCapacity(set[i]);
+    keep.appendSliceAssumeCapacity(section[c.head + set.len ..]);
+    var narrowed = r.*;
+    if (c.is == .proof) narrowed.authorities = keep.items else narrowed.answers = keep.items;
+    try g.narrow(target, narrowed);
 }
 
 fn synthesisedUnder(rr: RR, dname: RR) bool {

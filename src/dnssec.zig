@@ -312,21 +312,28 @@ pub const Weighed = struct {
     now: u32,
     at: usize = 0,
     n: usize = 0,
+    passed: bool = false,
 
     pub inline fn next(w: *Weighed) ?usize {
-        while (w.at < w.rrs.len and w.n < max_sigs_per_set) {
+        while (w.at < w.rrs.len) {
             const i = w.at;
             w.at += 1;
             const rr = w.rrs[i];
             if (rr.rtype != .rrsig) continue;
             const sig = rr.rdata.rrsig;
-            if (sig.type_covered != w.rtype or !rr.name.eql(w.owner) or !sig.signer_name.eql(w.zone) or !usable(sig, w.now)) continue;
+            if (sig.type_covered != w.rtype or !rr.name.eql(w.owner)) continue;
+            if (w.n == max_sigs_per_set or !sig.signer_name.eql(w.zone) or !usable(sig, w.now)) {
+                w.passed = true;
+                continue;
+            }
             w.n += 1;
             return i;
         }
         return null;
     }
 };
+
+pub const Verified = struct { sig: dns.RrsigData, unweighed: bool };
 
 /// A section read as sets (RFC 2181 §5), in place: each set where it first
 /// appears, then the signatures bound to it, all at their lowest TTL (RFC
@@ -427,7 +434,7 @@ pub fn validateRrset(
     now_u32: u32,
     budget: *rrsig.ValidationBudget,
     memo: *rrsig.VerifyMemo,
-) ?dns.RrsigData {
+) ?Verified {
     // Refuse rather than truncate: the caller sets AD on the *unpruned*
     // response, so verifying a signature over records[0..64] while
     // shipping 70 records launders the 6 attacker-appended RRs into an
@@ -446,7 +453,10 @@ pub fn validateRrset(
     var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32 };
     while (it.next()) |i| {
         const sig = records[i].rdata.rrsig;
-        if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) return sig;
+        if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) {
+            while (it.next()) |_| {}
+            return .{ .sig = sig, .unweighed = it.passed };
+        }
     }
     // Nothing verified on a zone already proven secure — bogus, even when
     // every candidate RRSIG used an unsupported algorithm: real supported
@@ -1332,7 +1342,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
     };
     var budget: rrsig.ValidationBudget = .{};
-    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?;
+    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?.sig;
     // The verifying signature's own bounds: original_ttl 300 against a
     // remaining window of 100_000_000 s. Never the junk record's 1.
     try testing.expectEqual(@as(u32, 300), rrsig.ttlCap(sig, now));
@@ -1355,7 +1365,7 @@ test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the sh
     // 60 s before the signature dies.
     const now: u32 = 1_800_000_000 - 60;
     var budget: rrsig.ValidationBudget = .{};
-    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?;
+    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?.sig;
     try testing.expectEqual(@as(u32, 60), rrsig.ttlCap(sig, now));
 }
 

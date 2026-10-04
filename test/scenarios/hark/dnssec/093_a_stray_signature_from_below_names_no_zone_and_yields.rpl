@@ -8,6 +8,8 @@ SCENARIO_BEGIN a stray signature from below names no zone and yields
 ; www.example. itself, the deepest signer that could hold the set.
 ; example. proves www.example. is no cut, so the set sits in example.,
 ; and its signature stands: one valid signature is enough (RFC 6840 §5.4).
+; Only what its verifier weighs travels with it: not the stray, nor one by
+; example. of an unassigned algorithm.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -38,6 +40,7 @@ RANGE_BEGIN 0 100
     SECTION ANSWER
       www.example. 3600 IN A 192.0.2.1
       www.example. 3600 IN RRSIG A 13 2 3600 20500101000000 20200101000000 1 www.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      www.example. 3600 IN RRSIG A 200 2 3600 20500101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   ENTRY_END
 
   ENTRY_BEGIN
@@ -67,6 +70,7 @@ ENTRY_BEGIN
     www.example. IN A
   SECTION ANSWER
     www.example. 3600 IN A 192.0.2.1
+    www.example. 3600 IN RRSIG A 13 2 3600 20500101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ENTRY_END
 
 SCENARIO_END
