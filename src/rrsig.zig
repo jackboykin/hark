@@ -46,23 +46,26 @@ pub const ValidationBudget = struct {
     max_sig_verify: u32 = max_sig_verify_per_resolution,
     nsec3_blocks_spent: u32 = 0,
     max_nsec3_blocks: u32 = max_nsec3_blocks_per_resolution,
+    /// The pot that refused a draw, if one did: only then did the limit,
+    /// not the data, end a judgement. A budget filled exactly refused none.
+    stopped: ?enum { verify, nsec3 } = null,
 
     fn consumeVerify(self: *ValidationBudget) error{ValidationBudgetExhausted}!void {
-        if (self.sig_verify_spent >= self.max_sig_verify) return error.ValidationBudgetExhausted;
+        if (self.sig_verify_spent >= self.max_sig_verify) {
+            self.stopped = self.stopped orelse .verify;
+            return error.ValidationBudgetExhausted;
+        }
         self.sig_verify_spent += 1;
     }
 
     pub fn exhausted(self: *const ValidationBudget) bool {
-        return self.sig_verify_spent >= self.max_sig_verify or self.nsec3Exhausted();
-    }
-
-    pub fn nsec3Exhausted(self: *const ValidationBudget) bool {
-        return self.nsec3_blocks_spent >= self.max_nsec3_blocks;
+        return self.sig_verify_spent >= self.max_sig_verify or self.nsec3_blocks_spent >= self.max_nsec3_blocks;
     }
 
     pub fn consumeNsec3(self: *ValidationBudget, blocks: u32) error{ValidationBudgetExhausted}!void {
         if (blocks > self.max_nsec3_blocks - @min(self.nsec3_blocks_spent, self.max_nsec3_blocks)) {
             self.nsec3_blocks_spent = self.max_nsec3_blocks;
+            self.stopped = .nsec3;
             return error.ValidationBudgetExhausted;
         }
         self.nsec3_blocks_spent += blocks;
@@ -1049,6 +1052,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
         ));
     }
     try testing.expectEqual(@as(u32, 2), budget.sig_verify_spent);
+    try testing.expect(budget.stopped == null);
     try testing.expectError(error.ValidationBudgetExhausted, verifyRrsig(
         test_window_rrsig,
         test_window_dnskey,
@@ -1057,6 +1061,7 @@ test "verifyRrsig consumes budget on entry (KeyTrap mitigation)" {
         &budget,
         &test_memo,
     ));
+    try testing.expect(budget.stopped == .verify);
 }
 
 test "verifyRrsig rejects labels below the signer's label count" {

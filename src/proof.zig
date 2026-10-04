@@ -2028,7 +2028,7 @@ test "NSEC3 iterations cost budget, never a verdict (RFC 9276 §3.2)" {
     authorities[0].rdata.nsec3.iterations = 65535;
     b = .{};
     try testing.expectEqual(SecurityStatus.bogus, validateNegativeProof(&authorities, qname, .a, true, test_root, &b));
-    try testing.expect(b.nsec3Exhausted());
+    try testing.expect(b.stopped == .nsec3);
 }
 
 test "classifyDelegation refuses mixed NSEC3 parameter sets before hashing (RFC 5155 §8.2)" {

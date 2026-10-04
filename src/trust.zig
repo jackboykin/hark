@@ -100,7 +100,7 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 /// drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     if (budgetSpent(g)) |why| return g.fail(id, why);
-    if (!g.spent(g.payer)) {
+    if (g.limit(g.payer) == null) {
         const t = g.cell(rid);
         t.expires_ns = @min(t.expires_ns, g.now());
         if (t.blob) |b| g.store.drop(t.key, b);
@@ -108,20 +108,20 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, .{ .code = .dnssec_bogus });
 }
 
-/// The validation budget spent is the asker's limit, never bogus. A query
-/// budget or deadline is named only where an input failed on it.
+/// A draw the validation budget refused is the asker's limit, never bogus.
+/// A query budget or deadline is named only where an input failed on it.
 fn budgetSpent(g: *Graph) ?Failure {
-    const b = &g.payer.validation;
-    if (b.nsec3Exhausted()) return .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker };
-    if (b.exhausted()) return .{ .code = .other, .text = "validation budget spent", .cause = .asker };
-    return null;
+    return switch (g.payer.validation.stopped orelse return null) {
+        .nsec3 => .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
+        .verify => .{ .code = .other, .text = "validation budget spent", .cause = .asker },
+    };
 }
 
 /// A zone's DS or keys proven bogus: demanding them again is refused for
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (!g.spent(g.payer)) try g.remember(g.cell(id).key, refused);
+    if (budgetSpent(g) == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, refused);
     try failBogus(g, id, rid);
 }
 
