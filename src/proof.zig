@@ -502,17 +502,6 @@ pub fn validateNegativeProof(
     return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
 }
 
-/// The zone whose keys an authority section's proofs rest on: the signer of
-/// its first RRSIG. `verifyAuthorityProofSigs` only reports .secure when every
-/// NSEC/NSEC3/SOA owner verifies under a key fetched for this name, so after
-/// a .secure verdict this name is the proof's whole authority.
-pub fn authoritySigner(authorities: []const dns.ResourceRecord) ?dns.Name {
-    for (authorities) |rr| {
-        if (rr.rtype == .rrsig) return rr.rdata.rrsig.signer_name;
-    }
-    return null;
-}
-
 const Nsec3ChainParams = union(enum) {
     params: struct { salt: []const u8, iterations: u16 },
     verdict: SecurityStatus,

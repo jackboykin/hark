@@ -189,7 +189,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     const r = rs.state.fact.rrset;
     const signer = switch (r.kind) {
         .answer => if (dnssec.findRrsigAt(r.answers, zone, .ds)) |sig| sig.signer_name else null,
-        .nodata, .nxdomain => proof.authoritySigner(r.authorities),
+        .nodata, .nxdomain => proof.denialZone(r.authorities, zone),
         // A name that is no cut may alias (a hidden-cut probe).
         .alias => return .no_cut,
         .yxdomain => null,
@@ -392,7 +392,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
     // A zone proven no cut belongs to the zone that proved it (a folded
     // child's parent).
     const zd = g.cell(s.zone_ds.unwrap().?).state.fact.ds;
-    const within = if (zd.status == .absent) proof.authoritySigner(zd.records).? else r.zone;
+    const within = if (zd.status == .absent) proof.denialZone(zd.records, r.zone).? else r.zone;
     if (!s.fetched) {
         if (flooded(r, qtype)) {
             try failBogus(g, id, s.target);
