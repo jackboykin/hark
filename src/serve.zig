@@ -111,6 +111,36 @@ const Timer = struct {
 
 const Tenant = struct { slot: u32, gen: u32 };
 
+/// Each query ends in one reply or one silent fate, or is still parked:
+/// `queries` is `replies`, `unanswered` and the process plane's `parked`.
+const Clients = struct {
+    queries: struct { udp: u64 = 0, tcp: u64 = 0 } = .{},
+    replies: struct { noerror: u64 = 0, nxdomain: u64 = 0, servfail: u64 = 0, other: u64 = 0 } = .{},
+    unanswered: struct {
+        dropped: u64 = 0,
+        /// Turned away while crowded, naming nothing in flight or answered before.
+        shed: u64 = 0,
+        /// Past the UDP timeout, or its TCP connection closed.
+        late: u64 = 0,
+        /// Late, let go to bring the work under its ceiling.
+        reaped: u64 = 0,
+    } = .{},
+    cache: struct {
+        /// Synthesized answers and held failures are neither.
+        hit: u64 = 0,
+        miss: u64 = 0,
+        stale: u64 = 0,
+    } = .{},
+    detail: struct {
+        /// Of `hit`, those from the store before the graph was asked.
+        recalled: u64 = 0,
+        /// Replies held to leave spaced as their questions came.
+        echoed: u64 = 0,
+        delay_ms: u64 = 0,
+        paused: u64 = 0,
+    } = .{},
+};
+
 const Server = struct {
     gpa: Allocator,
     cfg: *const config.ServerConfig,
@@ -133,6 +163,9 @@ const Server = struct {
     listeners: std.ArrayList(posix.fd_t) = .empty,
     conns: u32 = 0,
     max_conns: u32,
+    clients: Clients = .{},
+    started_ns: i64,
+    window: struct { at_ns: i64, clients: Clients },
     paused: bool = false,
 
     fn token(s: *Server, w: Watched) !u32 {
@@ -157,7 +190,10 @@ const Server = struct {
         if (linux.errno(rc) != .SUCCESS) return;
         for (infos[0 .. rc / @sizeOf(linux.signalfd_siginfo)]) |info| switch (@as(linux.SIG, @fromBackingInt(@intCast(info.signo)))) {
             .TERM, .INT => s.stopping = true,
-            else => logStats(s.g),
+            else => {
+                s.logCounters();
+                s.logSummary();
+            },
         };
     }
 
@@ -180,7 +216,7 @@ const Server = struct {
             .udp => |fd| try s.readUdp(fd),
             .listen => |fd| if (!try s.accept(fd) and !s.paused) {
                 s.paused = true;
-                s.g.stats.clients.paused += 1;
+                s.clients.detail.paused += 1;
             },
             .conn => |c| if (c.out.items.len != 0) try s.flush(c) else try s.readTcp(c, events),
             .signal => |fd| s.onSignal(fd),
@@ -327,11 +363,11 @@ const Server = struct {
     }
 
     fn ask(s: *Server, wire: []const u8, reply: Reply, crowded: bool) !void {
-        if (reply == .udp) s.g.stats.clients.udp += 1 else s.g.stats.clients.tcp += 1;
+        // BCP 140: a UDP reply is dropped silently, no query; over TCP `validateQuery` answers it.
+        if (wire.len < 12 or (reply == .udp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
+        if (reply == .udp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
-        // BCP 140: a UDP reply is dropped silently; over TCP `validateQuery` answers it.
-        if (wire.len < 12 or (reply == .udp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         const query = dns.parseMessage(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
             return s.sendError(reply, id, .query, .format_error, 0, wire[2] & 1 != 0, null, null);
@@ -345,16 +381,16 @@ const Server = struct {
             monotonic.advanceTestClock(secs);
             return s.send(reply, query, .{ .rcode = .no_error, .question = q, .cacheable = false }, s.e.now_ns);
         };
-        const c = &s.g.stats.clients;
+        const c = &s.clients;
         switch (try s.desk.early(arena, q, client)) {
             .synthesized, .held => |served| return s.send(reply, query, served, s.e.now_ns),
             .replayed => |served| {
-                c.hit += 1;
+                c.cache.hit += 1;
                 return s.send(reply, query, served, s.e.now_ns);
             },
             .recalled, .floored => |served| {
-                c.hit += 1;
-                c.recalled += 1;
+                c.cache.hit += 1;
+                c.detail.recalled += 1;
                 return s.send(reply, query, served, s.e.now_ns);
             },
             .graph => {},
@@ -363,11 +399,16 @@ const Server = struct {
         // BCP 140 again: turned away is silence on UDP, SERVFAIL on TCP.
         if (s.g.work.bytes >= s.g.cfg.max_work_bytes) s.reap();
         const admit: graph.Graph.Admit = if (crowded and !s.known(asked)) .join else .new;
-        const root = try s.g.demandRoot(asked.name, asked.qtype, admit) orelse {
-            if (admit == .join) c.shed += 1;
+        const root = s.g.demandRoot(asked.name, asked.qtype, admit) catch |err| {
+            const fate = switch (err) {
+                error.Full => &c.unanswered.dropped,
+                error.Novel => &c.unanswered.shed,
+                else => return err,
+            };
             // Hark's limits, not the name's failure: never noted. A close
             // would take the connection's other queries with it (RFC 7766 §6.2.1).
-            if (reply == .tcp) s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
+            if (reply == .tcp) return s.send(reply, query, answer.servfail(q, .{ .code = .over_quota }), s.e.now_ns);
+            fate.* += 1;
             return;
         };
         try s.g.drain();
@@ -377,7 +418,7 @@ const Server = struct {
             // Recall declined what the graph holds: inside the refresh window, a
             // verdict it could not stamp, a put the store refused, DNS64's A.
             if (s.g.cell(root).settled()) if (try s.shape(arena, &p, q, client)) |served| {
-                c.hit += 1;
+                c.cache.hit += 1;
                 try s.answered(reply, query, served, p.asked_ns, s.e.now_ns);
                 return s.release(p);
             };
@@ -440,8 +481,8 @@ const Server = struct {
 
     fn ready(s: *Server, i: u32) !void {
         const p = &s.pending.items[i];
-        if (p.reply == .udp and p.reply.udp.fd == -1) {
-            s.g.stats.clients.abandoned += 1;
+        if (left(p.*)) {
+            s.clients.unanswered.late += 1;
             return s.vacate(i);
         }
         _ = s.scratch.reset(.retain_capacity);
@@ -462,11 +503,11 @@ const Server = struct {
             try s.timers.push(s.gpa, .{ .at_ns = leaves_ns, .slot = i, .gen = p.gen });
             p.at_ns = leaves_ns;
             p.echoed = true;
-            s.g.stats.clients.echoed += 1;
-            s.g.stats.clients.echo_ms += @intCast(@divTrunc(echo, std.time.ns_per_ms));
+            s.clients.detail.echoed += 1;
+            s.clients.detail.delay_ms += @intCast(@divTrunc(echo, std.time.ns_per_ms));
             return;
         }
-        s.g.stats.clients.miss += 1;
+        s.clients.cache.miss += 1;
         try s.answered(p.reply, query, served, p.asked_ns, leaves_ns);
         s.vacate(i);
     }
@@ -525,7 +566,7 @@ const Server = struct {
             try s.late.pushBack(s.gpa, .{ .slot = i, .gen = p.gen });
             return false;
         }
-        s.g.stats.clients.late += 1;
+        s.clients.unanswered.late += 1;
         return true;
     }
 
@@ -536,7 +577,7 @@ const Server = struct {
         while (s.g.work.bytes >= s.g.cfg.max_work_bytes) {
             const l = s.late.popFront() orelse return;
             const i = s.parkedAs(l) orelse continue;
-            s.g.stats.clients.reaped += 1;
+            s.clients.unanswered.reaped += 1;
             s.unpark(i);
             s.vacate(i);
         }
@@ -550,7 +591,7 @@ const Server = struct {
     /// RFC 8767 §5: past the client's patience, stale if there is any, held;
     /// the resolution goes on without it.
     fn impatient(s: *Server, p: *Pending) !bool {
-        if (p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
+        if (left(p.*) or p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
         p.stale_tried = true;
         _ = s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
@@ -558,9 +599,50 @@ const Server = struct {
         const q = query.questions[0];
         const client = answer.Client.fromQuery(query);
         const served = try s.desk.memory(arena, q, client, .stale) orelse return false;
-        s.g.stats.clients.miss += 1;
+        s.clients.cache.miss += 1;
         try s.answered(p.reply, query, served, p.asked_ns, s.e.now_ns);
         return true;
+    }
+
+    fn logSummary(s: *Server) void {
+        const now = s.e.now_ns;
+        summaryLine("total", .{ .now = s.clients, .then = .{}, .ns = now - s.started_ns }, "");
+        var rb: [32]u8 = undefined;
+        const rss = std.fmt.bufPrint(&rb, ", rss {d}MiB", .{(rssBytes() orelse 0) >> 20}) catch unreachable;
+        summaryLine("window", .{ .now = s.clients, .then = s.window.clients, .ns = now - s.window.at_ns }, rss);
+        s.window = .{ .at_ns = now, .clients = s.clients };
+    }
+
+    fn logCounters(s: *Server) void {
+        const g = s.g;
+        const c = s.clients;
+        const parked = s.pending.items.len - s.vacant.items.len;
+        if (build_options.testing_enabled) std.debug.assert(sum(c.queries) == sum(c.replies) + sum(c.unanswered) + parked);
+        logCounts("clients", c);
+        logCounts("resolver", g.stats.resolver);
+        logCounts("trust", g.stats.trust);
+        logCounts("verify_memo", .{ .hits = g.verify_memo.hits, .misses = g.verify_memo.misses });
+        logCounts("store", .{
+            .held = Kib{ .bytes = g.store.held },
+            .facts = g.store.map.count(),
+            // Versions the map let go of that a cell or a reply still holds.
+            .pinned = Kib{ .bytes = g.store.bytes - g.store.held },
+            .evictions = g.store.evictions,
+            .unadmitted = g.store.unadmitted,
+        });
+        logCounts("process", .{
+            .rss = Kib{ .bytes = rssBytes() orelse 0 },
+            .live = g.live,
+            .flights = g.flights,
+            .parked = parked,
+            .work = Kib{ .bytes = g.work.bytes },
+        });
+    }
+
+    /// Its TCP connection closed; `drop` left it the UDP timeout to keep
+    /// its resolution wanted.
+    fn left(p: Pending) bool {
+        return p.reply == .udp and p.reply.udp.fd == -1;
     }
 
     fn patience(p: Pending) i64 {
@@ -586,7 +668,7 @@ const Server = struct {
         // Its waiter kept the resolution going; past a UDP client's
         // timeout the outcome is noted and the reply goes nowhere.
         if (reply == .udp and leaves_ns - asked_ns >= answer.client_timeout_ms * std.time.ns_per_ms) {
-            s.g.stats.clients.late += 1;
+            s.clients.unanswered.late += 1;
             return served.release(&s.g.store);
         }
         s.send(reply, query, served, asked_ns);
@@ -595,14 +677,14 @@ const Server = struct {
     fn shape(s: *Server, arena: Allocator, p: *Pending, q: dns.Question, client: answer.Client) !?answer.Served {
         if (p.a) |a| if (!s.g.cell(a).settled()) return null;
         const served = try s.desk.built(arena, p.root, q, client);
-        if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (try s.g.demandRoot(aq.name, aq.qtype, .new)) |a| {
+        if (p.a == null) if (s.desk.wantsA(q, client, served)) |aq| if (s.g.demandRoot(aq.name, aq.qtype, .new)) |a| {
             p.a = a;
             try s.g.drain();
             if (!s.g.cell(a).settled()) {
                 served.release(&s.g.store);
                 return null;
             }
-        };
+        } else |err| if (err != error.Full) return err;
         return try s.desk.finish(arena, q, client, served, p.a);
     }
 
@@ -613,16 +695,15 @@ const Server = struct {
     }
 
     fn count(s: *Server, rcode: dns.RCode, ede: ?dns.Ede) void {
-        const c = &s.g.stats.clients;
+        const r = &s.clients.replies;
         switch (rcode) {
-            .no_error => {},
-            .name_error => c.nxdomain += 1,
-            .server_failure => c.servfail += 1,
-            .refused => c.refused += 1,
-            else => c.other += 1,
+            .no_error => r.noerror += 1,
+            .name_error => r.nxdomain += 1,
+            .server_failure => r.servfail += 1,
+            else => r.other += 1,
         }
         if (ede) |e| if (e.code == .stale_answer) {
-            c.stale += 1;
+            s.clients.cache.stale += 1;
         };
     }
 
@@ -747,7 +828,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer g.deinit();
     g.attach();
     e.work = g.work.allocator();
-    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa) };
+    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
@@ -769,7 +850,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         try s.reopen();
         if (e.now_ns >= stats_at) {
             stats_at = e.now_ns + stats_every;
-            logStats(&g);
+            s.logSummary();
         }
         const ev = try e.next(@min(e.now_ns + std.time.ns_per_s, s.nextTimer())) orelse {
             try s.settle();
@@ -781,7 +862,8 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         }
         try s.settle();
     }
-    logStats(&g);
+    s.logCounters();
+    s.logSummary();
     log.info("shutting down", .{});
 }
 
@@ -794,31 +876,100 @@ fn fdShare(part: u32) u32 {
     return @intCast(@min(lim.cur / part, std.math.maxInt(u32)));
 }
 
-/// Cumulative since start, one line per plane. Every five minutes, on
-/// USR1/HUP, and at exit.
-fn logStats(g: *graph.Graph) void {
-    const c = g.stats.clients;
-    const r = g.stats.resolver;
-    const t = g.stats.trust;
-    const served = c.hit + c.miss;
-    log.info("stats clients   {d} queries  udp {d}  tcp {d} | nxdomain {d}  servfail {d}  refused {d}  other {d}  dropped {d}  abandoned {d}  late {d}  reaped {d}  shed {d}  paused {d}  echoed {d} (+{d} ms) | resolved {d}  hit {d}% (recalled {d}%)  stale {d}", .{
-        c.udp + c.tcp, c.udp, c.tcp, c.nxdomain, c.servfail, c.refused, c.other, c.dropped, c.abandoned, c.late, c.reaped, c.shed, c.paused, c.echoed, if (c.echoed > 0) c.echo_ms / c.echoed else 0, served, pct(c.hit, served), pct(c.recalled, served), c.stale,
-    });
-    log.info("stats resolver  {d} exchanges  udp {d}  tcp {d} | timeout {d}  unsent {d}  retry {d} | refresh {d}  ahead {d}  refused {d}", .{
-        r.udp + r.tcp, r.udp, r.tcp, r.timeout, r.unsent, r.retry, r.refresh, r.ahead, r.refused,
-    });
-    log.info("stats trust     secure {d}  insecure {d}  bogus {d} | verifies {d}  recalled {d}", .{ t.secure, t.insecure, t.bogus, g.verify_memo.misses, g.verify_memo.hits });
-    log.info("stats store     {d} KiB in {d} facts  in cells {d} KiB | evicted {d}  refused {d}", .{
-        g.store.held / 1024, g.store.map.count(), (g.store.bytes - g.store.held) / 1024, g.store.evictions, g.store.refusals,
-    });
-    log.info("stats process   rss {d} MiB  live cells {d}  in flight {d}  work {d} KiB", .{ rssMiB() orelse 0, g.live, g.flights, g.work.bytes / 1024 });
+/// Each counter under `path`, named by its field path.
+fn logCounts(comptime path: []const u8, v: anytype) void {
+    const T = @TypeOf(v);
+    if (@typeInfo(T) == .@"struct" and !@hasDecl(T, "format")) {
+        inline for (@typeInfo(T).@"struct".field_names) |n| logCounts(path ++ "." ++ n, @field(v, n));
+        return;
+    }
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, if (@typeInfo(T) == .@"struct") "{f}" else "{d}", .{v}) catch unreachable;
+    log.info("stats {s: <27} {s: >12}", .{ path, text });
 }
 
-fn pct(n: u64, of: u64) u64 {
-    return if (of > 0) n * 100 / of else 0;
+fn sum(group: anytype) u64 {
+    var n: u64 = 0;
+    inline for (@typeInfo(@TypeOf(group)).@"struct".field_names) |f| n += @field(group, f);
+    return n;
 }
 
-fn rssMiB() ?u64 {
+/// Padded so both lines' figures line up.
+fn summaryLine(comptime what: []const u8, summary: Summary, tail: []const u8) void {
+    var buf: [32]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, what ++ " ({f}):", .{Span{ .ns = summary.ns }}) catch unreachable;
+    log.info("stats {s: <17}{f}{s}", .{ head, summary, tail });
+}
+
+const Summary = struct {
+    now: Clients,
+    then: Clients,
+    ns: i64,
+
+    pub fn format(s: Summary, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const queries = minus(s.now.queries, s.then.queries);
+        const replies = minus(s.now.replies, s.then.replies);
+        const unanswered = minus(s.now.unanswered, s.then.unanswered);
+        const cache = minus(s.now.cache, s.then.cache);
+        const n = sum(queries);
+        // Tenths of a query a second; u128, as a count times ns overflows u64.
+        const tenths: u64 = if (s.ns > 0) @intCast(@as(u128, n) * 10 * std.time.ns_per_s / @as(u128, @intCast(s.ns))) else 0;
+        try w.print("{d} queries, {d}.{d} qps, {f} hit, {d} servfail, {d} unanswered", .{
+            n,
+            tenths / 10,
+            tenths % 10,
+            Percent.of(cache.hit, cache.hit + cache.miss),
+            replies.servfail,
+            sum(unanswered),
+        });
+    }
+
+    fn minus(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+        var out = a;
+        inline for (@typeInfo(@TypeOf(a)).@"struct".field_names) |f| @field(out, f) -= @field(b, f);
+        return out;
+    }
+};
+
+const Span = struct {
+    ns: i64,
+
+    pub fn format(s: Span, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const t: u64 = @intCast(@divTrunc(@max(s.ns, 0), std.time.ns_per_s));
+        const days = t / 86400;
+        const h = t % 86400 / 3600;
+        const m = t % 3600 / 60;
+        const sec = t % 60;
+        if (days > 0) return w.print("{d}d {d}h", .{ days, h });
+        if (h > 0) return w.print("{d}h {d}m", .{ h, m });
+        if (m > 0) return w.print("{d}m {d}s", .{ m, sec });
+        if (sec > 0) return w.print("{d}s", .{sec});
+        try w.print("{d}ms", .{@divTrunc(@max(s.ns, 0), std.time.ns_per_ms)});
+    }
+};
+
+const Kib = struct {
+    bytes: u64,
+
+    pub fn format(k: Kib, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d}KiB", .{k.bytes / 1024});
+    }
+};
+
+/// To a tenth: at a 99% hit rate, 99.0 and 99.8 are five times the misses apart.
+const Percent = struct {
+    permille: u64,
+
+    fn of(n: u64, total: u64) Percent {
+        return .{ .permille = if (total > 0) n * 1000 / total else 0 };
+    }
+
+    pub fn format(p: Percent, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d}.{d}%", .{ p.permille / 10, p.permille % 10 });
+    }
+};
+
+fn rssBytes() ?u64 {
     var buf: [128]u8 = undefined;
     const rc = linux.open("/proc/self/statm", .{}, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
@@ -829,7 +980,7 @@ fn rssMiB() ?u64 {
     var it = mem.tokenizeScalar(u8, buf[0..n], ' ');
     _ = it.next();
     const pages = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
-    return pages * std.heap.pageSize() / (1024 * 1024);
+    return pages * std.heap.pageSize();
 }
 
 /// Past `crowded_eighths` of its receive buffer (SO_MEMINFO, Linux 4.12):

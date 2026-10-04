@@ -244,7 +244,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     unholdAll(g, held);
     const deadline = s.now_ns + @as(i64, scenario.client_timeout_ms) * std.time.ns_per_ms;
     const asked = try desk.asked(arena, q, client);
-    const root = (try g.demandRoot(asked.name, asked.qtype, .new)).?;
+    const root = try g.demandRoot(asked.name, asked.qtype, .new);
     held[0] = root;
     try g.drain();
     // RFC 8767 §5: stale at the client's patience, as serve does.
@@ -261,7 +261,7 @@ fn shapeClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const 
     }
     const served = try desk.built(arena, root, q, client);
     const aq = desk.wantsA(q, client, served) orelse return try desk.finish(arena, q, client, served, null);
-    const a = (try g.demandRoot(aq.name, aq.qtype, .new)).?;
+    const a = try g.demandRoot(aq.name, aq.qtype, .new);
     held[1] = a;
     try g.drain();
     if (!try settleBy(g, s, a, deadline)) {
@@ -717,7 +717,7 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
     const horizon = start + 10 * std.time.ns_per_s;
     var ns1_ms: ?i64 = null;
     var ns2_ms: ?i64 = null;
-    const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
+    const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
     while (!g.cell(root).settled()) {
         const ev = s.next(horizon) orelse return error.TestUnexpectedResult;
@@ -828,14 +828,13 @@ test "the door counts exchanges in flight" {
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .max_flights = 1 }, s.edge());
     defer g.deinit();
-    const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
+    const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
     try testing.expectEqual(1, g.budgets);
     try testing.expectEqual(1, g.flights);
     // New work is turned away; the same question joins the one in progress.
-    try testing.expectEqual(null, try g.demandRoot(other, .a, .new));
-    try testing.expectEqual(root, (try g.demandRoot(q.name, q.qtype, .new)).?);
-    try testing.expectEqual(1, g.stats.clients.dropped);
+    try testing.expectError(error.Full, g.demandRoot(other, .a, .new));
+    try testing.expectEqual(root, try g.demandRoot(q.name, q.qtype, .new));
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.flights);
     g.unhold(root);
@@ -879,11 +878,11 @@ test "an exchange that never left the host writes no estimate" {
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true } }, s.edge());
     defer g.deinit();
     s.pending_unsent = 1;
-    const root = (try g.demandRoot(q.name, q.qtype, .new)).?;
+    const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
     while (s.next(s.now_ns + 10 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expect(g.cell(root).failure() == null);
-    try testing.expectEqual(1, g.stats.resolver.unsent);
+    try testing.expectEqual(1, g.stats.resolver.faults.unsent);
     // Only replies wrote it: a timeout would have started it at 400 ms.
     const server = na.AddressKey.fromAddress(scenario.root_hints[0]);
     try testing.expect(g.rtt.get(server).?.srtt_us < 50 * std.time.us_per_ms);

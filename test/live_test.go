@@ -57,33 +57,28 @@ func wantSilence(t *testing.T, addr netip.AddrPort, name string, timeout time.Du
 
 func timedOut(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }
 
-var counter = regexp.MustCompile(`([a-z]+) (\d+)`)
-
-func stats(t *testing.T, h *hark, prefix string, names ...string) []int {
+// stats reads dotted counters (clients.unanswered.reaped) off a fresh USR1 dump,
+// which ends with its window line.
+func stats(t *testing.T, h *hark, names ...string) []int {
 	t.Helper()
-	before := strings.Count(h.log(), prefix)
+	before := strings.Count(h.log(), "stats window (")
 	if err := h.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
 		t.Fatal(err)
 	}
 	log := h.log()
-	for deadline := time.Now().Add(2 * time.Second); strings.Count(log, prefix) == before; log = h.log() {
+	for deadline := time.Now().Add(2 * time.Second); strings.Count(log, "stats window (") == before; log = h.log() {
 		if time.Now().After(deadline) {
-			t.Fatalf("no %q line within 2s; log:\n%s", prefix, log)
+			t.Fatalf("no stats dump within 2s; log:\n%s", log)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	line, _, _ := strings.Cut(log[strings.LastIndex(log, prefix):], "\n")
-	counts := map[string]int{}
-	for _, m := range counter.FindAllStringSubmatch(line, -1) {
-		counts[m[1]], _ = strconv.Atoi(m[2])
-	}
 	out := make([]int, len(names))
 	for i, name := range names {
-		n, ok := counts[name]
-		if !ok {
-			t.Fatalf("no %s counter in %q", name, line)
+		m := regexp.MustCompile(`stats ` + regexp.QuoteMeta(name) + ` +(\d+)`).FindAllStringSubmatch(log, -1)
+		if m == nil {
+			t.Fatalf("no %s counter in log:\n%s", name, log)
 		}
-		out[i] = n
+		out[i], _ = strconv.Atoi(m[len(m)-1][1])
 	}
 	return out
 }

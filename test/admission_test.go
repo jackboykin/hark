@@ -146,7 +146,7 @@ func TestLateWaitersMakeRoomForNewQuestions(t *testing.T) {
 	fire(t, h, "b.live.")
 	advance(t, h, 2)
 	wantRcode(t, h.addr, "c.live.", dns.RcodeSuccess, 2*time.Second)
-	if n := stats(t, h, "stats clients", "reaped")[0]; n == 0 {
+	if n := stats(t, h, "clients.unanswered.reaped")[0]; n == 0 {
 		t.Error("no client was reaped")
 	}
 }
@@ -223,7 +223,7 @@ func TestACrowdedQueueShedsNovelNamesOnly(t *testing.T) {
 	if n := answered["novel.live."]; n != 0 {
 		t.Errorf("novel.live. answered %d times, want 0", n)
 	}
-	if n := stats(t, h, "stats clients", "shed")[0]; n != 1 {
+	if n := stats(t, h, "clients.unanswered.shed")[0]; n != 1 {
 		t.Errorf("shed %d, want 1", n)
 	}
 	wantRcode(t, h.addr, "novel.live.", dns.RcodeSuccess, 5*time.Second)

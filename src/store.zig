@@ -104,7 +104,7 @@ pub const Store = struct {
     door: [door_bits / 8]u8 = @splat(0),
     door_set: u32 = 0,
     evictions: u64 = 0,
-    refusals: u64 = 0,
+    unadmitted: u64 = 0,
     /// Fires as a key's version leaves the map: evicted, dropped or
     /// replaced.
     on_evict: ?OnEvict = null,
@@ -170,7 +170,7 @@ pub const Store = struct {
         } else {
             errdefer s.map.swapRemoveAt(gop.index);
             if (s.held + blob.len > s.cap and !s.knock(key)) {
-                s.refusals += 1;
+                s.unadmitted += 1;
                 return error.Refused;
             }
             gop.key_ptr.name = try s.gpa.dupe(u8, key.name);
@@ -594,7 +594,7 @@ test "the cap holds by eviction and admission" {
     }
     try testing.expect(s.held <= 2048);
     try testing.expect(s.evictions > 0);
-    try testing.expect(s.refusals > 0);
+    try testing.expect(s.unadmitted > 0);
     const key: Key = .init(.cut, "again", .a);
     const again = try s.build(.{ .cut = .{ .zone = zone } });
     try testing.expectError(error.Refused, s.put(key, again, 10, 0));

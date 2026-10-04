@@ -156,7 +156,7 @@ pub const Ask = struct {
     /// Once more, skipping the dead unless all are.
     fn retry(a: *Ask, g: *Graph) void {
         a.retried = true;
-        g.stats.resolver.retry += 1;
+        g.stats.resolver.detail.retry += 1;
         a.tried = 0;
         for (a.servers[0..a.nservers], 0..) |s, i| if (g.isDead(s)) {
             a.tried |= bit(i);

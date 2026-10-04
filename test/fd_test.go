@@ -72,7 +72,7 @@ func TestFDExhaustionIsUnsentNotATimeout(t *testing.T) {
 	}
 	wantRcode(t, h.addr, "b.example.com.", dns.RcodeSuccess, 5*time.Second)
 
-	s := stats(t, h, "stats resolver", "unsent", "timeout")
+	s := stats(t, h, "resolver.faults.unsent", "resolver.faults.timeout")
 	if unsent, timeout := s[0], s[1]; unsent < 1 || timeout != 0 {
 		t.Errorf("unsent %d timeout %d, want unsent at least 1 and no timeout", unsent, timeout)
 	}

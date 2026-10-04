@@ -59,12 +59,13 @@ hark_start() { # bin
 }
 hark_stop() { kill "$PID"; wait "$PID" 2>/dev/null; }
 
-# The latest cumulative stats clients line, freshly printed.
+# A fresh stats dump: the counters, then the summary, ending with its window line.
 hark_stats() {
-  local n; n=$(grep -c 'stats clients' "$R/hark.log")
+  local l; l=$(wc -l <"$R/hark.log")
   kill -USR1 "$PID"
-  while (( $(grep -c 'stats clients' "$R/hark.log") == n )); do sleep 0.02; done
-  grep 'stats clients' "$R/hark.log" | tail -1
+  until tail -n +"$((l + 1))" "$R/hark.log" | grep -q 'stats clients\.queries\.udp' &&
+    tail -n +"$((l + 1))" "$R/hark.log" | grep -q 'stats window ('; do sleep 0.02; done
+  tail -n +"$((l + 1))" "$R/hark.log"
 }
 
 # Whole-core time for CPU_RES from /proc/stat, softirq included: process

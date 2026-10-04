@@ -3,7 +3,7 @@
   loss  probe loses nothing up to 4x the ceiling
   p99   probe p99 <= P99_MS (7: 5 ms plus 2 ms slack) at every level
   good  miss goodput >= 0.95x the ceiling at every level
-  acct  hark's unsent (dropped + abandoned + late + reaped) plus kernel drops
+  acct  hark's unanswered (dropped + shed + late + reaped) plus kernel drops
         on the listener and the generators equals offered - answered within 0.1%
   unsat the core was under 97% busy: at 1x and above the load did not reach
         hark, so the run proves nothing
@@ -16,8 +16,7 @@ P99 = float(os.environ.get('P99_MS', 7))
 meta = dict(kv.split('=') for kv in open(f'{D}/meta').read().split())
 ceiling, length = float(meta['ceiling']), float(meta['len'])
 num = lambda key, text: int((re.search(key + r':\s+(\d+)', text) or [0, 0])[1])
-# A counter an older build does not print counts 0.
-unsent = lambda line: sum(int((re.search(k + r' (\d+)', line) or [0, 0])[1]) for k in ('dropped', 'abandoned', 'late', 'reaped'))
+unsent = lambda dump: sum(int(n) for n in re.findall(r'stats clients\.unanswered\.\w+\s+(\d+)', dump))
 
 cbusy = float((re.search(r'busy ([\d.]+)', open(f'{D}/ceiling').read()) or [0, 0])[1])
 if cbusy < 97: sys.exit(f"INVALID: the miss ceiling ({ceiling:.0f} qps) was measured at {cbusy:.1f}% core busy")

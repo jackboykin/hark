@@ -13,6 +13,10 @@ def failed(x):
 def shape(ans):
     return sorted({a.rsplit("|", 1)[0] for a in ans})
 
+def plane(log, name):
+    """The last dump's `stats <name>.<counter>` values."""
+    return {k: int(v) for k, v in re.findall(rf"stats {name}\.([a-z_.]+)\s+(\d+)", log)} or None
+
 def bucket(a, b):
     if a[0] == b[0] and failed(a):
         return f"both {a[0]}"
@@ -48,18 +52,16 @@ for i, side in enumerate(sides):
         mem = dict(l.split(":") for l in open(base + ".mem"))
         d[i]["VmHWM KiB"].append(int(mem["VmHWM"].split()[0]))
         log = open(base + ".log").read()
-        m = re.findall(r"stats resolver\s+(\d+) exchanges\s+udp (\d+)\s+tcp (\d+) \| timeout (\d+)", log)
-        if m:
-            d[i]["exchanges"].append(int(m[-1][0]))
-            d[i]["upstream tcp"].append(int(m[-1][2]))
-            d[i]["upstream timeouts"].append(int(m[-1][3]))
-        t = re.findall(r"stats trust\s+secure (\d+)\s+insecure (\d+)\s+bogus (\d+)", log)
-        if t:
-            d[i]["bogus"].append(int(t[-1][2]))
-        s = re.findall(r"stats store\s+(\d+) KiB in (\d+) facts", log)
-        if s:
-            d[i]["store KiB"].append(int(s[-1][0]))
-            d[i]["store facts"].append(int(s[-1][1]))
+        r, t, s = (plane(log, p) for p in ("resolver", "trust", "store"))
+        if r is not None:
+            d[i]["exchanges"].append(r["exchanges.udp"] + r["exchanges.tcp"])
+            d[i]["upstream tcp"].append(r["exchanges.tcp"])
+            d[i]["upstream timeouts"].append(r["faults.timeout"])
+        if t is not None:
+            d[i]["bogus"].append(t["bogus"])
+        if s is not None:
+            d[i]["store KiB"].append(s["held"])
+            d[i]["store facts"].append(s["facts"])
 for k in ["cold ad", "cold servfail", "cold failed", "exchanges", "upstream tcp", "upstream timeouts", "bogus", "store KiB", "store facts", "VmHWM KiB"]:
     o, n = (f"{st.median(x[k]):10.1f}" if x.get(k) else f"{'-':>10s}" for x in d)
     print(f"{k:22s} {o} {n}")
