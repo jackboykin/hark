@@ -238,24 +238,26 @@ pub fn anySupportedDs(records: []const dns.ResourceRecord) bool {
 
 /// Zone keys with tags computed once per call, not per RRSIG tried (TagTrap).
 const Keyset = struct {
-    keys: [64]dns.DnskeyData = undefined,
-    tags: [64]u16 = undefined,
-    len: usize = 0,
-    zone: ?dns.Name = null,
+    keys: [64]dns.DnskeyData,
+    tags: [64]u16,
+    len: usize,
+    zone: ?dns.Name,
 
-    /// Null past 64 keys, the ceiling `validateDnskeyRrset` admits.
-    fn init(records: []const dns.ResourceRecord) ?Keyset {
-        var k: Keyset = .{};
+    /// False past 64 keys, the ceiling `validateDnskeyRrset` admits. Filled
+    /// in place, since copying out 1.7 KB costs more than the fill.
+    fn init(k: *Keyset, records: []const dns.ResourceRecord) bool {
+        k.len = 0;
+        k.zone = null;
         for (records) |rr| {
             if (rr.rtype != .dnskey) continue;
             k.zone = k.zone orelse rr.name;
             if (!isValidZoneKey(rr.rdata.dnskey)) continue;
-            if (k.len == k.keys.len) return null;
+            if (k.len == k.keys.len) return false;
             k.keys[k.len] = rr.rdata.dnskey;
             k.tags[k.len] = rrsig.keyTag(rr.rdata.dnskey);
             k.len += 1;
         }
-        return k;
+        return true;
     }
 };
 
@@ -448,7 +450,8 @@ pub fn validateRrset(
         count += 1;
     }
     if (count == 0) return null;
-    const keyset = Keyset.init(dnskey_records) orelse return null;
+    var keyset: Keyset = undefined;
+    if (!keyset.init(dnskey_records)) return null;
 
     var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32 };
     while (it.next()) |i| {
@@ -488,7 +491,8 @@ pub fn verifyAuthorityProofSigs(
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
     } else return .unchecked;
     if (proof.proofFlood(authorities)) return .bogus;
-    const keyset = Keyset.init(dnskey_records) orelse return .bogus;
+    var keyset: Keyset = undefined;
+    if (!keyset.init(dnskey_records)) return .bogus;
     const zone = keyset.zone orelse return .bogus;
 
     for (authorities, 0..) |rr, i| {
