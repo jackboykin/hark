@@ -567,7 +567,7 @@ const Seen = struct {
 
 /// Owner, type, class and data alike; TTLs aside.
 fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
-    return std.ascii.eqlIgnoreCase(a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
+    return dns.eqlIgnoreCase(a.owner, b.owner) and std.mem.eql(u8, a.rest[0..4], b.rest[0..4]) and std.mem.eql(u8, a.rest[8..], b.rest[8..]);
 }
 
 /// RFC 9520 §3.2's failure cache: a question that failed is answered here,
