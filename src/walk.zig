@@ -917,12 +917,12 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
     for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
         .soa => if (zone) |z| if (rr.name.eql(z)) keep.appendAssumeCapacity(rr),
-        .nsec, .nsec3 => {
-            const signer = if (rr.rtype == .rrsig) rr.rdata.rrsig.signer_name else (dnssec.findRrsigAt(rrs, rr.name, rr.rtype) orelse continue).signer_name;
-            for (signers.items) |sn| if (sn.eql(signer)) {
+        .nsec, .nsec3 => for (signers.items) |sn| {
+            const signed = if (rr.rtype == .rrsig) rr.rdata.rrsig.signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
+            if (signed) {
                 keep.appendAssumeCapacity(rr);
                 break;
-            };
+            }
         },
         else => keep.appendAssumeCapacity(rr),
     };
@@ -958,10 +958,7 @@ pub fn replyTtl(g: *Graph, reply: Reply) u32 {
             var found = false;
             for (reply.authorities) |rr| {
                 if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
-                if (!rr.name.isSubdomainOf(reply.zone)) {
-                    const sig = dnssec.findRrsigAt(reply.authorities, rr.name, .soa) orelse continue;
-                    if (!sig.signer_name.eql(rr.name)) continue;
-                }
+                if (!rr.name.isSubdomainOf(reply.zone) and !dnssec.signedBy(reply.authorities, rr.name, .soa, rr.name)) continue;
                 ttl = @min(ttl, @min(rr.ttl, rr.rdata.soa.minimum));
                 found = true;
             }

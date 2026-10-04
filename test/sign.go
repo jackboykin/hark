@@ -147,10 +147,11 @@ func (s *signer) section(e *entry, rrs []dns.RR, cuts []string, forced *key, add
 				s.served[addr] = append(s.served[addr], k)
 			}
 		}
-		// A reserved algorithm (RFC 6014 §4) is stuffing, not a signature.
+		// A signature by another zone, or of a reserved algorithm (RFC 6014
+		// §4), is stuffing, not the set's.
 		if slices.ContainsFunc(originals, func(o dns.RR) bool {
 			sig, ok := o.(*dns.RRSIG)
-			return ok && strings.EqualFold(sig.Hdr.Name, owner) && sig.TypeCovered == t && (sig.Algorithm < 123 || sig.Algorithm > 251)
+			return ok && strings.EqualFold(sig.Hdr.Name, owner) && sig.TypeCovered == t && strings.EqualFold(sig.SignerName, k.zone) && (sig.Algorithm < 123 || sig.Algorithm > 251)
 		}) {
 			continue
 		}

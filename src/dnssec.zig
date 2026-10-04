@@ -275,20 +275,24 @@ fn rrsetVerifiesWithAnyKey(
     return false;
 }
 
-/// The RRSIG covering (`owner`, `covered_type`). Owner-scoped: one response
-/// can hold several RRsets of a type at different names, each with its own
-/// signer — the hops of a CNAME chain.
-pub fn findRrsigAt(
-    records: []const dns.ResourceRecord,
-    owner: dns.Name,
-    covered_type: dns.RType,
-) ?dns.RrsigData {
-    for (records) |rr| {
-        if (rr.rtype != .rrsig) continue;
-        const sig = rr.rdata.rrsig;
-        if (sig.type_covered == covered_type and rr.name.eql(owner)) return sig;
+/// The deepest signer of (`owner`, `rtype`) in `rrs` shallower than `below`
+/// labels. `bindSets` binds only signers that could hold the set (RFC 4035
+/// §5.3.1), each on the owner's path to the root, so depth alone picks.
+pub fn signerBelow(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType, below: usize) ?dns.Name {
+    var best: ?dns.Name = null;
+    for (rrs) |rr| {
+        if (rr.rtype != .rrsig or rr.rdata.rrsig.type_covered != rtype or !rr.name.eql(owner)) continue;
+        const z = rr.rdata.rrsig.signer_name;
+        if (z.labels.len < below and (best == null or z.labels.len > best.?.labels.len)) best = z;
     }
-    return null;
+    return best;
+}
+
+pub fn signedBy(rrs: []const dns.ResourceRecord, owner: dns.Name, rtype: dns.RType, signer: dns.Name) bool {
+    for (rrs) |rr| {
+        if (rr.rtype == .rrsig and rr.rdata.rrsig.type_covered == rtype and rr.name.eql(owner) and rr.rdata.rrsig.signer_name.eql(signer)) return true;
+    }
+    return false;
 }
 
 /// Room for a rollover's signatures; more is stuffing.
@@ -296,10 +300,11 @@ pub const max_sigs_per_set = 8;
 
 /// A section read as sets (RFC 2181 §5), in place: each set where it first
 /// appears, then the signatures bound to it, all at their lowest TTL (RFC
-/// 2181 §5.2, RFC 4035 §5.3.3). A set binds one signer's signatures, usable
-/// first, up to the cap, so nothing unjudged travels beside what is judged
-/// (RFC 4035 §3.2.3). With `bare_sigs`, signatures over no set are an RRSIG
-/// question's data and stay, unfiltered and unlevelled; without, they go.
+/// 2181 §5.2, RFC 4035 §5.3.3). A set binds the signatures of every zone
+/// that could hold it (RFC 4035 §5.3.1), usable first, up to the cap;
+/// which zone does is the chain of trust's to prove, not the reply's to
+/// say. With `bare_sigs`, signatures over no set are an RRSIG question's
+/// data and stay, unfiltered and unlevelled; without, they go.
 pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bare_sigs: bool) ![]dns.ResourceRecord {
     if (rrs.len < 2) return if (rrs.len == 1 and rrs[0].rtype == .rrsig and !bare_sigs) rrs[0..0] else rrs;
     const By = struct {
@@ -342,14 +347,12 @@ pub fn bindSets(scratch: mem.Allocator, rrs: []dns.ResourceRecord, now: u32, bar
         if (src[at[i]].rtype == .rrsig) {
             if (bare_sigs) hi = j;
         } else {
-            var first: ?dns.Name = null;
+            const apex = proof.deepestApex(src[at[i]].name, covers(src[at[i]]));
             var sigs: usize = 0;
             var ttl: u32 = std.math.maxInt(u32);
             for (at[i..j]) |k| {
                 if (src[k].rtype == .rrsig) {
-                    const signer = src[k].rdata.rrsig.signer_name;
-                    first = first orelse signer;
-                    if (sigs == max_sigs_per_set or !signer.eql(first.?)) continue;
+                    if (sigs == max_sigs_per_set or !apex.isSubdomainOf(src[k].rdata.rrsig.signer_name)) continue;
                     sigs += 1;
                 }
                 ttl = @min(ttl, src[k].ttl);

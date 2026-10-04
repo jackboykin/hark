@@ -131,10 +131,11 @@ pub const Signer = struct {
             if (synthesised) continue;
             const key = forced orelse self.keyFor(head.name, head.rtype, cuts) orelse continue;
             if (forced == null) try self.register(address, key);
-            // A signature of a reserved algorithm (123-251, RFC 6014 §4)
-            // is stuffing, not the set's: the set is still signed.
+            // A signature by another zone, or of a reserved algorithm
+            // (123-251, RFC 6014 §4), is stuffing, not the set's: the set
+            // is still signed.
             var covered = false;
-            for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
+            for (originals) |o| covered = covered or (o.rclass == .in and o.rtype == .rrsig and o.name.eql(head.name) and o.rdata.rrsig.type_covered == head.rtype and o.rdata.rrsig.signer_name.eql(key.zone) and !reservedAlgorithm(@backingInt(o.rdata.rrsig.algorithm)));
             if (covered) continue;
             var set: [rrsig.SignedData.max_entries]RR = undefined;
             var n: usize = 0;

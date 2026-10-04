@@ -6,6 +6,7 @@ const testing = std.testing;
 const Smith = testing.Smith;
 const dns = @import("dns.zig");
 const dnssec = @import("dnssec.zig");
+const proof = @import("proof.zig");
 const rrsig = @import("rrsig.zig");
 const special_use = @import("special_use.zig");
 const rebinding = @import("rebinding.zig");
@@ -131,7 +132,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
             for (section) |in| if (in.rtype != .rrsig and in.rtype == dnssec.covers(head) and in.name.eql(head.name)) return error.BoundAsBare;
             continue;
         }
-        var signer: ?dns.Name = null;
+        const apex = proof.deepestApex(head.name, head.rtype);
         var sigs: usize = 0;
         var good: usize = 0;
         for (run) |rr| {
@@ -140,8 +141,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
                 if (sigs > 0) return error.DataAfterSignature;
                 continue;
             }
-            signer = signer orelse rr.rdata.rrsig.signer_name;
-            if (!rr.rdata.rrsig.signer_name.eql(signer.?)) return error.TwoSigners;
+            if (!apex.isSubdomainOf(rr.rdata.rrsig.signer_name)) return error.SignerHoldsNoSet;
             sigs += 1;
             good += @intFromBool(usable(rr.rdata.rrsig));
         }
@@ -156,9 +156,9 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
                 floor = @min(floor, in.ttl);
                 continue;
             }
+            if (!apex.isSubdomainOf(in.rdata.rrsig.signer_name)) continue;
             any = true;
             any_good = any_good or usable(in.rdata.rrsig);
-            if (signer == null or !in.rdata.rrsig.signer_name.eql(signer.?)) continue;
             offered += 1;
             offered_good += @intFromBool(usable(in.rdata.rrsig));
             floor = @min(floor, in.ttl);
@@ -183,7 +183,7 @@ fn checkBound(alloc: std.mem.Allocator, section: []const dns.ResourceRecord, bar
 /// messages are too few and too random to reach them.
 fn pooledRR(s: *Smith) dns.ResourceRecord {
     const owners = [_]dns.Name{ .{ .labels = &.{"example"} }, .{ .labels = &.{ "a", "example" } }, .{ .labels = &.{ "b", "example" } } };
-    const signers = [_]dns.Name{ .{ .labels = &.{"example"} }, .{ .labels = &.{"other"} }, .{ .labels = &.{} } };
+    const signers = [_]dns.Name{ .{ .labels = &.{ "a", "example" } }, .{ .labels = &.{"example"} }, .{ .labels = &.{"other"} }, .{ .labels = &.{} } };
     const data = [_]dns.RType{ .a, .ns, .ds, .nsec };
     const algorithms = [_]dns.DnssecAlgorithm{ .ecdsap256sha256, .rsasha256, @fromBackingInt(200) };
     const ttls = [_]u32{ 0, 60, 300, 3600 };
