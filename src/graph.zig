@@ -181,6 +181,7 @@ pub const Cut = struct {
     servers: []const Server = &.{},
     /// How long the delegation stands, glue aside: its NS TTL, capped by
     /// the referring zone's. One that `zone`'s servers give lives no longer.
+    /// Unbounded for a name inside a zone, which is no delegation.
     placed_until_ns: i64 = std.math.maxInt(i64),
 };
 

@@ -59,6 +59,9 @@ pub const Ask = struct {
     local: bool = false,
     /// The asker's limit kept a server from being asked.
     cut_short: bool = false,
+    /// The placement of the cut whose servers this ask took: a delegation
+    /// they give lives no longer.
+    placed_until_ns: i64 = std.math.maxInt(i64),
 
     comptime {
         std.debug.assert(max_servers < 32);
@@ -155,11 +158,16 @@ pub const Ask = struct {
 
     /// The first pass, from the cut in hand: a cut learned this instant
     /// may be one the store refused, or one that lives no time.
-    fn seed(a: *Ask, g: *Graph, id: CellId, servers: []const graph.Server) !void {
+    fn seed(a: *Ask, g: *Graph, id: CellId, cut: graph.Cut) !void {
         var list: std.ArrayList(na.Address) = .empty;
         var left: Left = .{};
-        try reach(g, id, a, servers, &list, &left);
+        try reach(g, id, a, a.take(cut), &list, &left);
         a.add(g, list.items);
+    }
+
+    fn take(a: *Ask, cut: graph.Cut) []const graph.Server {
+        a.placed_until_ns = @min(a.placed_until_ns, cut.placed_until_ns);
+        return cut.servers;
     }
 
     /// Once more, skipping the dead unless all are.
@@ -408,7 +416,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone)) {
                 .referral => |ref| {
-                    const cut = try absorbReferral(g, id, ref, msg, pc.zone);
+                    const cut = try absorbReferral(g, id, ref, msg, pc.zone, g.cell(id).scratch.cut.ask.placed_until_ns);
                     try g.settle(id, cut.value, cut.expires_ns);
                 },
                 // Each puts the name inside the parent's zone. Only an
@@ -432,8 +440,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
 /// Walks below the name ask the servers of the cut above, so it lives no
 /// longer than that cut, glue and all.
 fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64) !void {
-    const placed = @min(parent.expires_ns, until_ns);
-    try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone, .placed_until_ns = placed } }, placed);
+    try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone } }, @min(parent.expires_ns, until_ns));
 }
 
 /// An authoritative NXDOMAIN at a probe name, published; when it lapses.
@@ -602,7 +609,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .cut => |cid| g.cell(cid),
         };
         s.ask.reset(cut.state.fact.cut.zone);
-        try s.ask.seed(g, id, cut.state.fact.cut.servers);
+        try s.ask.seed(g, id, cut.state.fact.cut);
         s.started = true;
     }
     while (true) {
@@ -617,7 +624,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                     // bounds the walk.
                     std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.labels.len > zone.labels.len);
                     const s2 = g.cell(id).scratch.rrset;
-                    const cut = try absorbReferral(g, id, ref, msg, zone);
+                    const cut = try absorbReferral(g, id, ref, msg, zone, s2.ask.placed_until_ns);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
@@ -625,7 +632,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     s2.ask.reset(ref.zone_cut);
-                    try s2.ask.seed(g, id, cut.value.cut.servers);
+                    try s2.ask.seed(g, id, cut.value.cut);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
@@ -752,17 +759,14 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
 /// A glued server has no other address, so the cut lives no longer than
 /// its glue. Its placement never outlives the referring zone's: that is a
 /// ghost (Jiang et al., NDSS 2012).
-fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !Graph.Fact {
+fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name, zone_placed_until_ns: i64) !Graph.Fact {
     var kb: graph.KeyBuf = undefined;
     const now = g.now();
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
     };
-    // Looked up: the asker may have followed referrals below its own cut.
-    // Null: the delegation is gone already.
-    const parent = try g.peek(Key.of(&kb, .cut, zone, .a));
-    const placed = @min(if (parent) |p| p.value.cut.placed_until_ns else now, now + @as(i64, ns_ttl) * std.time.ns_per_s);
+    const placed = @min(zone_placed_until_ns, now + @as(i64, ns_ttl) * std.time.ns_per_s);
     var expires = placed;
     const sa = g.scratch.allocator();
     const servers = try sa.alloc(graph.Server, ref.ns_count);
@@ -1115,7 +1119,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         }
         var left: Left = .{};
         // A shallower cut: no delegation here while it holds.
-        if (cut.state.fact.cut.zone.eql(zone)) try reach(g, id, a, cut.state.fact.cut.servers, &list, &left);
+        if (cut.state.fact.cut.zone.eql(zone)) try reach(g, id, a, a.take(cut.state.fact.cut), &list, &left);
         var i: usize = 0;
         while (i < list.items.len) {
             if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;

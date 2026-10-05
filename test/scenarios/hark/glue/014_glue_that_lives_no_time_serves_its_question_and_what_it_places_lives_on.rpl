@@ -1,11 +1,14 @@
 ; hark: root-hints = 127.0.10.1
 
-SCENARIO_BEGIN glue that lives no time serves the question that asked for it
+SCENARIO_BEGIN glue that lives no time serves its question, and what it places lives on
 
 ; com. delegates cdn.com. for two days and glues its server at TTL 0, good
 ; for the question in progress only (RFC 1035 §3.2.1). The cut lives no
 ; time either, so each later question asks com. again and walks on what it
 ; was given, though nothing keeps it.
+; edge.cdn.com., delegated by cdn.com.'s server for an hour, is placed by
+; cdn.com.'s two days, not by what the store kept: the next question below
+; it goes straight to its server.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -65,6 +68,39 @@ RANGE_BEGIN 0 100
       ftp.cdn.com. IN A
     SECTION ANSWER
       ftp.cdn.com. 86400 IN A 192.0.2.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      edge.cdn.com. IN A
+    SECTION AUTHORITY
+      edge.cdn.com. 3600 IN NS ns.edge.cdn.com.
+    SECTION ADDITIONAL
+      ns.edge.cdn.com. 3600 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.edge.cdn.com. IN A
+    SECTION ANSWER
+      www.edge.cdn.com. 3600 IN A 192.0.2.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.edge.cdn.com. IN A
+    SECTION ANSWER
+      mail.edge.cdn.com. 3600 IN A 192.0.2.5
   ENTRY_END
 RANGE_END
 
@@ -136,5 +172,44 @@ ENTRY_BEGIN
 ENTRY_END
 
 STEP 10 CHECK_MAX_QUERIES 7
+
+STEP 11 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.edge.cdn.com. IN A
+ENTRY_END
+
+STEP 12 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.edge.cdn.com. IN A
+  SECTION ANSWER
+    www.edge.cdn.com. 3600 IN A 192.0.2.4
+ENTRY_END
+
+STEP 13 TIME_PASSES ELAPSE 10
+
+STEP 14 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.edge.cdn.com. IN A
+ENTRY_END
+
+STEP 15 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.edge.cdn.com. IN A
+  SECTION ANSWER
+    mail.edge.cdn.com. 3600 IN A 192.0.2.5
+ENTRY_END
+
+; Only mail.edge.cdn.com. itself goes out for the last question.
+STEP 16 CHECK_MAX_QUERIES 12
 
 SCENARIO_END
