@@ -1,0 +1,96 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a denial feeds the index for its own life, not its chain's
+
+; a. CNAME c. lives 60 s; the NXDOMAIN for c. and its proofs live an hour.
+; Past a minute the chain is gone, but the spans it carried are still
+; proven: d., covered by a. NSEC f., is denied from memory.
+;
+; . NSEC a. covers the wildcard, a. NSEC f. covers c. and d.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      a. IN A
+    SECTION ANSWER
+      a. 60 IN CNAME c.
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC f. CNAME RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+; Asked, d. would claim an address the proof denies.
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      d. IN A
+    SECTION ANSWER
+      d. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    a. IN A
+  SECTION ANSWER
+    a. 60 IN CNAME c.
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 100
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    d. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer ede=29
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    d. IN A
+  SECTION ANSWER
+ENTRY_END
+
+; The chain itself is asked for again.
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    a. IN A
+  SECTION ANSWER
+    a. 60 IN CNAME c.
+ENTRY_END
+
+SCENARIO_END

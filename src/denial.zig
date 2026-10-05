@@ -163,10 +163,9 @@ fn zoneFor(g: *Graph, key: []const u8) !*Zone {
 /// wildcard); the rest is stuffing.
 const max_proofs = 8;
 
-/// A secure negative's SOA and NSECs, verified under `signer`, become
-/// facts for as long as the verdict holds, their TTL runs and the negative
-/// cap allows (RFC 8198 §5.4).
-pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, expires_ns: i64) !void {
+/// A secure negative's SOA and NSECs become facts, each for as long as
+/// its own proof holds (RFC 8198 §5.4).
+pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const i64, keys_until: i64) !void {
     var kb: graph.KeyBuf = undefined;
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     const zkey = signer.formatLower(&buf);
@@ -179,7 +178,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, expires_ns: i64) !voi
         if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
         const rrs = dnssec.setFrom(r.authorities, i);
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
-        const expires = @min(expires_ns, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
+        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         // `fact` can re-enter `evicted` and drop this zone: look it up after.
         const judged = (try g.fact(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
@@ -326,10 +325,10 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
     const soa: RR = .{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } };
     const reply: graph.Reply = .{ .kind = .nodata, .aa = true, .authorities = &.{soa}, .stored_ns = now, .zone = zone };
 
-    try absorb(&g, zone, reply, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
 
-    try absorb(&g, zone, reply, now + 3600 * std.time.ns_per_s);
+    try absorb(&g, zone, reply, &.{std.math.maxInt(i64)}, now + 3600 * std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), g.denial.zones.count());
     try testing.expect(g.denial.zones.getPtr("example").?.soa != null);
 }

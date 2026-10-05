@@ -70,6 +70,7 @@ pub const SecureScratch = struct {
     /// Per proof claim, the depth of the zone its set verified under.
     /// Only these feed a derivation (`verifiedProofs`).
     proved: [max_proof_claims]u8 = @splat(unproved),
+    proved_until: [max_proof_claims]i64 = @splat(std.math.maxInt(i64)),
     fault: ?Fault = null,
     probe: Probe = .{},
 };
@@ -463,12 +464,12 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     },
                 }
                 if (c.is == .denial) {
-                    const own = try verifiedProofs(g, r, qtype, &s.proved, signer);
-                    switch (proof.validateNegativeProof(own, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
+                    const own = try verifiedProofs(g, r, qtype, s, signer);
+                    switch (proof.validateNegativeProof(own.rrs, c.owner, c.rtype, r.kind == .nxdomain, signer, budget)) {
                         .secure => {
                             var only = r.*;
-                            only.authorities = own;
-                            try denial.absorb(g, signer, only, @min(until, kc.expires_ns, s.proven));
+                            only.authorities = own.rrs;
+                            try denial.absorb(g, signer, only, own.until, kc.expires_ns);
                         },
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
@@ -487,12 +488,13 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     // expanded (RFC 4035 §3.1.3.3).
                     if (verified.labels != rrsig.signedLabels(c.owner)) break :f .bogus;
                     s.proved[c.slot] = @intCast(signer.labels.len);
+                    s.proved_until[c.slot] = cap;
                     if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
                     break :f null;
                 }
                 if (verified.labels < rrsig.signedLabels(c.owner)) {
-                    const own = try verifiedProofs(g, r, qtype, &s.proved, verified.signer_name);
-                    switch (proof.proveNoCloserMatch(own, c.owner, verified.labels, verified.signer_name, budget)) {
+                    const own = try verifiedProofs(g, r, qtype, s, verified.signer_name);
+                    switch (proof.proveNoCloserMatch(own.rrs, c.owner, verified.labels, verified.signer_name, budget)) {
                         .secure => {},
                         .insecure => s.status = .insecure,
                         .bogus, .unchecked => break :f .bogus,
@@ -658,16 +660,20 @@ const Probe = struct {
 /// signatures: what a derivation in its zone may read. A set excused below
 /// an insecure cut or passed under insecure keys proved nothing, so it is
 /// left out. Proof claims come first, so all are judged.
-fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, proved: *const @FieldType(SecureScratch, "proved"), signer: dns.Name) ![]const RR {
+fn verifiedProofs(g: *Graph, r: *const graph.Reply, qtype: dns.RType, s: *const SecureScratch, signer: dns.Name) !struct { rrs: []const RR, until: []const i64 } {
+    const a = g.scratch.allocator();
     var keep: std.ArrayList(RR) = .empty;
+    var until: std.ArrayList(i64) = .empty;
     var it: Claims = .{ .r = r, .qtype = qtype };
     while (it.next()) |c| {
         if (c.is != .proof) break;
-        if (proved[c.slot] != signer.labels.len or !c.owner.isSubdomainOf(signer)) continue;
-        for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr|
-            if (rr.rtype != .rrsig or rr.rdata.rrsig.signer_name.eql(signer)) try keep.append(g.scratch.allocator(), rr);
+        if (s.proved[c.slot] != signer.labels.len or !c.owner.isSubdomainOf(signer)) continue;
+        for (dnssec.setAt(r.authorities, c.owner, c.rtype)) |rr| if (rr.rtype != .rrsig or rr.rdata.rrsig.signer_name.eql(signer)) {
+            try keep.append(a, rr);
+            try until.append(a, s.proved_until[c.slot]);
+        };
     }
-    return keep.items;
+    return .{ .rrs = keep.items, .until = until.items };
 }
 
 /// A proven set keeps only the signatures its zone's verifier weighs; the
