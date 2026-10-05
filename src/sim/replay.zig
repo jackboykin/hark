@@ -216,13 +216,11 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
         .cd = client.cd,
         .questions = try arena.dupe(dns.Question, &.{q}),
         .client_edns = edns,
-        .ede = served.ede,
         .client_do = client.do_bit,
         .max_udp_payload = dns.max_message_len,
         .rebinding = rb,
     };
-    const reply: response.Reply = .{ .rcode = served.rcode, .ad = served.ad, .answers = served.answers, .authorities = served.authorities, .additionals = served.additionals };
-    return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, reply, arena) orelse error.OutOfMemory;
+    return response.buildResponseWire(try arena.alloc(u8, dns.max_message_len), ctx, served.reply(), arena) orelse error.OutOfMemory;
 }
 
 /// `recall`'s backstop: what it serves from the store, the graph builds

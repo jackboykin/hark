@@ -722,8 +722,7 @@ const Server = struct {
         var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
-        ctx.ede = served.ede;
-        const wire = response.buildResponseWire(buf[2..], ctx, .{ .rcode = served.rcode, .ad = served.ad, .answers = served.answers, .authorities = served.authorities, .additionals = served.additionals }, arena) orelse
+        const wire = response.buildResponseWire(buf[2..], ctx, served.reply(), arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions[0], query.opt);
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;

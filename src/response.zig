@@ -13,6 +13,7 @@ const special_use = @import("special_use.zig");
 pub const Reply = struct {
     rcode: dns.RCode,
     ad: bool = false,
+    ede: ?dns.Ede = null,
     answers: []const dns.WireRecord = &.{},
     authorities: []const dns.WireRecord = &.{},
     additionals: []const dns.WireRecord = &.{},
@@ -33,7 +34,6 @@ pub const ResponseContext = struct {
     /// this on stream transports.
     tcp_keepalive: ?u16 = null,
     rebinding: *const rebinding.Config = &rebinding.Config.off,
-    ede: ?dns.Ede = null,
 
     pub fn fromQuery(query: dns.Message, max_udp_payload: u16) ResponseContext {
         const client_do = query.opt != null and query.opt.?.do_bit;
@@ -84,7 +84,7 @@ pub fn buildResponseWire(
         options.appendAssumeCapacity(.{ .code = dns.edns_opt_tcp_keepalive, .data = &keepalive_data });
     }
     var ede_bufs: [2][64]u8 = undefined;
-    if (ctx.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
+    if (reply.ede) |e| options.appendAssumeCapacity(e.option(&ede_bufs[0]));
     if (scrubbed) options.appendAssumeCapacity((dns.Ede{ .code = .blocked, .text = "rebinding" }).option(&ede_bufs[1]));
     const opt: ?dns.OptRecord = if (ctx.client_edns) .{
         // RFC 6891 §6.2.3: our own receive limit, not the send budget.
@@ -203,7 +203,7 @@ test "buildResponseWire carries EDE only to an EDNS client" {
     const a = arena.allocator();
 
     const questions = [_]dns.Question{.{ .name = try dns.parseDottedName(a, "example.com"), .qtype = .a, .qclass = .in }};
-    const servfail: Reply = .{ .rcode = .server_failure };
+    const servfail: Reply = .{ .rcode = .server_failure, .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" } };
     var ctx: ResponseContext = .{
         .query_id = 1,
         .opcode = .query,
@@ -213,7 +213,6 @@ test "buildResponseWire carries EDE only to an EDNS client" {
         .client_edns = true,
         .client_do = false,
         .max_udp_payload = dns.max_udp_payload,
-        .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" },
     };
 
     var buf: [dns.max_udp_payload]u8 = undefined;

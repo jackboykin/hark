@@ -9,6 +9,7 @@ const store = @import("store.zig");
 const rand = @import("rand.zig");
 const dns64 = @import("dns64.zig");
 const special_use = @import("special_use.zig");
+const response = @import("response.zig");
 
 pub const Client = struct {
     rd: bool = true,
@@ -95,6 +96,10 @@ pub const Served = struct {
 
     pub fn release(s: Served, st: *store.Store) void {
         for (s.held) |b| st.unref(b);
+    }
+
+    pub fn reply(s: Served) response.Reply {
+        return .{ .rcode = s.rcode, .ad = s.ad, .ede = s.ede, .answers = s.answers, .authorities = s.authorities, .additionals = s.additionals };
     }
 };
 
