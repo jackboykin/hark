@@ -5,7 +5,8 @@ SCENARIO_BEGIN in-zone CNAME to a missing name keeps the CNAME under NXDOMAIN
 ; RFC 2308 §2.1 chain: hark re-asks for the target and keeps the CNAME.
 ; The NXDOMAIN is the target's, not the alias's (RFC 8020 §2): a name
 ; below the alias is still minimised to its parent's servers, which
-; delegate it.
+; delegate it. The denial lives 300 s but the CNAME before it 60: past
+; that the chain is asked for again, and the zone has moved on.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -44,17 +45,6 @@ RANGE_BEGIN 0 100
     ADJUST copy_id copy_query
     REPLY QR AA NXDOMAIN
     SECTION QUESTION
-      alias.example.com. IN A
-    SECTION ANSWER
-      alias.example.com. 3600 IN CNAME gone.example.com.
-    SECTION AUTHORITY
-      example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
-  ENTRY_END
-  ENTRY_BEGIN
-    MATCH opcode qname qtype
-    ADJUST copy_id copy_query
-    REPLY QR AA NXDOMAIN
-    SECTION QUESTION
       gone.example.com. IN A
     SECTION AUTHORITY
       example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
@@ -85,6 +75,34 @@ RANGE_BEGIN 0 100
   ENTRY_END
 RANGE_END
 
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      alias.example.com. IN A
+    SECTION ANSWER
+      alias.example.com. 60 IN CNAME gone.example.com.
+    SECTION AUTHORITY
+      example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 300
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 5 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      alias.example.com. IN A
+    SECTION ANSWER
+      alias.example.com. 60 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
 STEP 1 QUERY
 ENTRY_BEGIN
   REPLY RD
@@ -99,7 +117,7 @@ ENTRY_BEGIN
   SECTION QUESTION
     alias.example.com. IN A
   SECTION ANSWER
-    alias.example.com. 3600 IN CNAME gone.example.com.
+    alias.example.com. 60 IN CNAME gone.example.com.
 ENTRY_END
 
 STEP 3 QUERY
@@ -117,6 +135,25 @@ ENTRY_BEGIN
     www.sub.alias.example.com. IN A
   SECTION ANSWER
     www.sub.alias.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 5 TIME_PASSES ELAPSE 100
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    alias.example.com. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    alias.example.com. IN A
+  SECTION ANSWER
+    alias.example.com. 60 IN A 192.0.2.9
 ENTRY_END
 
 SCENARIO_END

@@ -944,25 +944,21 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
 /// SOA above the name denied (RFC 2308 §3); one above the zone asked (a
 /// folded child's parent) counts only signed, for the validator to judge.
 pub fn replyTtl(g: *Graph, reply: Reply) u32 {
-    var ttl: u32 = 0;
+    var ttl: u32 = std.math.maxInt(u32);
+    for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
     switch (reply.kind) {
-        .answer, .alias, .yxdomain => {
-            ttl = std.math.maxInt(u32);
-            for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
-            for (reply.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
-                ttl = @min(ttl, rr.ttl);
-            };
+        .answer, .alias, .yxdomain => for (reply.authorities) |rr| if (rr.rtype == .nsec or rr.rtype == .nsec3) {
+            ttl = @min(ttl, rr.ttl);
         },
-        .nodata, .nxdomain => if (reply.aa) {
-            ttl = g.cfg.max_negative_ttl;
+        .nodata, .nxdomain => {
             var found = false;
-            for (reply.authorities) |rr| {
+            if (reply.aa) for (reply.authorities) |rr| {
                 if (rr.rtype != .soa or !reply.target.isSubdomainOf(rr.name)) continue;
                 if (!rr.name.isSubdomainOf(reply.zone) and !dnssec.signedBy(reply.authorities, rr.name, .soa, rr.name)) continue;
-                ttl = @min(ttl, @min(rr.ttl, rr.rdata.soa.minimum));
+                ttl = @min(ttl, rr.ttl, rr.rdata.soa.minimum);
                 found = true;
-            }
-            if (!found) ttl = 0;
+            };
+            ttl = if (found) @min(ttl, g.cfg.max_negative_ttl) else 0;
         },
     }
     return ttl;
