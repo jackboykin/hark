@@ -276,7 +276,7 @@ fn retainedUntil(g: *graph.Graph, ret: Retention, r: store.Rrset) i64 {
     const own = walk.replyExpiry(r);
     if (r.ttl == 0 or r.ttl >= ret.min_ttl) return own;
     var floor: i64 = ret.min_ttl;
-    if (r.kind == .nodata or r.kind == .nxdomain) floor = @min(floor, g.cfg.max_negative_ttl);
+    if (r.kind == .nodata or r.kind == .nxdomain) floor = @min(floor, dns.max_negative_ttl);
     var until = r.stored_ns + floor * std.time.ns_per_s;
     const wall = g.wallNow();
     for (r.sections[0..2]) |section| {

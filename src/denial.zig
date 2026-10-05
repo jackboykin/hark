@@ -178,7 +178,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
         const rrs = dnssec.setFrom(r.authorities, i);
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
-        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, @min(rr.ttl, g.cfg.max_negative_ttl)) * std.time.ns_per_s);
+        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, @min(rr.ttl, dns.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         // `fact` can re-enter `evicted` and drop this zone: look it up after.
         const judged = (try g.fact(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
@@ -282,7 +282,7 @@ fn denyIn(g: *Graph, z: *const Zone, id: CellId, zone: dns.Name) !bool {
         .ede = .synthesized,
         .stored_ns = now,
     };
-    reply.ttl = @min(walk.replyTtl(g, reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
+    reply.ttl = @min(walk.replyTtl(reply), @as(u32, @intCast(@divTrunc(expires - now, std.time.ns_per_s))));
     // RFC 2308 §5: the SOA's minimum may end it before its proofs do.
     const minimum = for (soa.answers) |rr| {
         if (rr.rtype == .soa) break rr.rdata.soa.minimum;

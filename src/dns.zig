@@ -23,6 +23,8 @@ const header_len = 12;
 pub const max_udp_payload = 512;
 /// A week (BIND's max-cache-ttl): a chosen 0xFFFFFFFF would outlive its delegation.
 const max_ttl: u32 = 604_800;
+/// A negative is trusted three hours at most (RFC 2308 §5, RFC 9077 §3.4).
+pub const max_negative_ttl: u32 = 10_800;
 pub const edns_udp_payload: u16 = 1232;
 /// RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix, so a single
 /// message can be at most 65535 bytes. Also the ceiling for any DNS

@@ -711,7 +711,7 @@ pub fn referralDs(g: *Graph, msg: dns.Message, zone: dns.Name, child: dns.Name) 
     const ds = dnssec.setAt(msg.authorities, child, .ds);
     if (ds.len > 0) {
         var reply: graph.Reply = .{ .kind = .answer, .aa = true, .answers = ds, .zone = zone, .stored_ns = g.now() };
-        reply.ttl = walk.replyTtl(g, reply);
+        reply.ttl = walk.replyTtl(reply);
         return reply;
     }
     var ttl: u32 = std.math.maxInt(u32);

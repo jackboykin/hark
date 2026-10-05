@@ -682,7 +682,7 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
         .zone = reply.zone,
         .stored_ns = reply.stored_ns,
     };
-    hop.ttl = replyTtl(g, hop);
+    hop.ttl = replyTtl(hop);
     try g.publish(Key.of(&kb, .rrset, name, .cname), name, by, .{ .rrset = hop }, replyExpiry(hop));
 }
 
@@ -909,7 +909,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     if (msg.header.flags.rcode == .name_error and !unread) reply.kind = .nxdomain;
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, authorities, reply);
-    reply.ttl = replyTtl(g, reply);
+    reply.ttl = replyTtl(reply);
     return .{ .reply = reply };
 }
 
@@ -928,7 +928,7 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
     // life (RFC 2308 §3), whatever TTL the server sent.
     var life: u32 = std.math.maxInt(u32);
     if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
-        life = @min(rr.ttl, rr.rdata.soa.minimum, g.cfg.max_negative_ttl);
+        life = @min(rr.ttl, rr.rdata.soa.minimum, dns.max_negative_ttl);
     };
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
     for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
@@ -963,7 +963,7 @@ fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dn
 /// a wildcard expansion's proof (RFC 9077 §4.1). A denial's comes from an
 /// SOA above the name denied (RFC 2308 §3); one above the zone asked (a
 /// folded child's parent) counts only signed, for the validator to judge.
-pub fn replyTtl(g: *Graph, reply: Reply) u32 {
+pub fn replyTtl(reply: Reply) u32 {
     var ttl: u32 = std.math.maxInt(u32);
     for (reply.answers) |rr| ttl = @min(ttl, rr.ttl);
     switch (reply.kind) {
@@ -978,7 +978,7 @@ pub fn replyTtl(g: *Graph, reply: Reply) u32 {
                 ttl = @min(ttl, rr.ttl, rr.rdata.soa.minimum);
                 found = true;
             };
-            ttl = if (found) @min(ttl, g.cfg.max_negative_ttl) else 0;
+            ttl = if (found) @min(ttl, dns.max_negative_ttl) else 0;
         },
     }
     return ttl;
