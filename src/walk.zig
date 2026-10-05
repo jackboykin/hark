@@ -914,9 +914,19 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
     var signers: std.ArrayList(dns.Name) = .empty;
     if (zone) |z| try signers.append(a, z);
     for (reply.answers) |rr| if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(rr.name)) try signers.append(a, rr.rdata.rrsig.signer_name);
+    // A denial's SOA, and the signatures over it, go out with the denial's
+    // life (RFC 2308 §3), whatever TTL the server sent.
+    var life: u32 = std.math.maxInt(u32);
+    if (zone) |z| for (rrs) |rr| if (rr.rtype == .soa and rr.name.eql(z)) {
+        life = @min(rr.ttl, rr.rdata.soa.minimum, g.cfg.max_negative_ttl);
+    };
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(a, rrs.len);
     for (rrs) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
-        .soa => if (zone) |z| if (rr.name.eql(z)) keep.appendAssumeCapacity(rr),
+        .soa => if (zone) |z| if (rr.name.eql(z)) {
+            var levelled = rr;
+            levelled.ttl = @min(rr.ttl, life);
+            keep.appendAssumeCapacity(levelled);
+        },
         .nsec, .nsec3 => for (signers.items) |sn| {
             const signed = if (rr.rtype == .rrsig) rr.rdata.rrsig.signer_name.eql(sn) else dnssec.signedBy(rrs, rr.name, rr.rtype, sn);
             if (signed) {
