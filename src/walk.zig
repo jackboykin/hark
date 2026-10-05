@@ -402,7 +402,10 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                 // NXDOMAIN is published, as deeper cuts read it (RFC 8020).
                 // An answer may be data the parent occludes (bailiwick/006);
                 // a NODATA is read by nothing and would cost a judgement.
-                .answered, .nodata => try g.settle(id, inside, parent.expires_ns),
+                .answered, .nodata => try g.settle(id, inside, @min(parent.expires_ns, switch (kept.verdict) {
+                    .reply => |r| replyExpiry(r),
+                    .loop, .none => g.now(),
+                })),
                 .nxdomain => {
                     const until = try publishNxdomain(g, id, kept, name) orelse return g.fail(id, unplaced);
                     try g.settle(id, inside, @min(parent.expires_ns, until));

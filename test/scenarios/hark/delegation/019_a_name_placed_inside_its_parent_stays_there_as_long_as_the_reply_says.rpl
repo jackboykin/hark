@@ -1,0 +1,136 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a name placed inside its parent stays there as long as the reply says
+
+; example.com.'s cut lives a day, but its NODATA for sub.example.com.
+; lives a minute. That NODATA is all that put sub.example.com. inside
+; example.com.; once it lapses the name is probed again, and finds the
+; delegation added meanwhile.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      sub.example.com. IN A
+    SECTION AUTHORITY
+      example.com. 60 IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 86400 60
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example.com. IN A
+    SECTION ANSWER
+      www.sub.example.com. 60 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.example.com. IN A
+    SECTION AUTHORITY
+      sub.example.com. 86400 IN NS ns.sub.example.com.
+    SECTION ADDITIONAL
+      ns.sub.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example.com. IN A
+    SECTION ANSWER
+      www.sub.example.com. 60 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.sub.example.com. IN A
+  SECTION ANSWER
+    www.sub.example.com. 60 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 100
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.example.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.sub.example.com. IN A
+  SECTION ANSWER
+    www.sub.example.com. 60 IN A 192.0.2.9
+ENTRY_END
+
+STEP 6 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    sub.example.com. A 127.0.10.3
+    www.sub.example.com. A 127.0.10.3
+    sub.example.com. A 127.0.10.3
+    www.sub.example.com. A 127.0.10.4
+ENTRY_END
+
+SCENARIO_END
