@@ -7,7 +7,7 @@
 # env: CCD (the last), N (resolver threads, 1), V6=0 (no AAAA servers),
 # LATENCY_MS (netem on lo), PERF=1 (counters on the resolver's cores).
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-P=$B/peers
+P=$B/config
 PORT=5354
 N=${N:-1}
 
@@ -56,7 +56,7 @@ nsd_up() { # name cpus zone addr...
 rig_up() {
   R=$(mktemp -d)
   trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$R"' EXIT
-  for w in hit miss mix; do python3 "$P/gen_queries.py" $w >"$R/$w.txt"; done
+  for w in hit miss mix; do python3 "$B/gen_queries.py" $w >"$R/$w.txt"; done
   ip link set lo up
   ip addr add 198.41.0.4/32 dev lo
   local a addrs

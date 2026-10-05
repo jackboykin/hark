@@ -6,7 +6,7 @@
 set -uo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
 ROUNDS=$1 A=$2 B=$3 NAMES=${4:-$D/tranco-400.txt} RATE=${5:-100}
-OUT=${OUT:-$D/out/$(date +%Y%m%d-%H%M%S)}
+OUT=${OUT:-$D/../out/live-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 R=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$R"' EXIT

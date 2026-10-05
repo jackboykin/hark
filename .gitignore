@@ -4,5 +4,4 @@ zig-out/
 .zig-cache/
 .claude/
 result
-bench/peers/out/
-bench/live/out/
+bench/out/

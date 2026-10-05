@@ -10,7 +10,7 @@ set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 ns "$@"
 BIN=$1 RUNS=${2:-3} LEN=${LEN:-8} LEVELS=${LEVELS:-1 2 4 8}
-OUT=${OUT:-$P/out/overload-$(date +%Y%m%d-%H%M%S)}
+OUT=${OUT:-$B/out/overload-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 rig_up
 
@@ -26,7 +26,7 @@ fi
 echo "ceiling=$ceiling len=$LEN" >"$OUT/meta"
 # Enough names that no instance wraps into ones already cached.
 top=$(tr ' ' '\n' <<<"$LEVELS" | sort -n | tail -1)
-for k in 1 2 3 4; do python3 "$P/gen_queries.py" miss "$(awk -v c="$ceiling" -v l="$top" -v t="$LEN" 'BEGIN { printf "%d", c * l * t / 4 * 1.1 }')" "$k" >"$R/flood$k.txt"; done
+for k in 1 2 3 4; do python3 "$B/gen_queries.py" miss "$(awk -v c="$ceiling" -v l="$top" -v t="$LEN" 'BEGIN { printf "%d", c * l * t / 4 * 1.1 }')" "$k" >"$R/flood$k.txt"; done
 
 for level in $LEVELS; do
   rate=$(awk -v c="$ceiling" -v l="$level" 'BEGIN { printf "%d", c * l / 4 }')
