@@ -1,0 +1,56 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN ad only to a client that asks
+
+; a. is proven secure, but AD goes only to a client that set DO or AD
+; (RFC 6840 §5.7, §5.8): one that asked for neither gets the answer bare.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a. IN A
+    SECTION ANSWER
+      a. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a. IN A
+  SECTION ANSWER
+    a. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD AD
+  SECTION QUESTION
+    a. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a. IN A
+  SECTION ANSWER
+    a. 3600 IN A 192.0.2.1
+ENTRY_END
+
+SCENARIO_END

@@ -218,7 +218,6 @@ fn wireOf(arena: Allocator, q: dns.Question, client: answer.Client, edns: bool, 
         .client_edns = edns,
         .ede = served.ede,
         .client_do = client.do_bit,
-        .client_wants_ad = client.do_bit or client.ad,
         .max_udp_payload = dns.max_message_len,
         .rebinding = rb,
     };
@@ -607,7 +606,7 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(191, r.parsed);
+    try testing.expectEqual(192, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 

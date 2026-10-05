@@ -26,7 +26,6 @@ pub const ResponseContext = struct {
     questions: []const dns.Question,
     client_edns: bool,
     client_do: bool,
-    client_wants_ad: bool,
     max_udp_payload: u16,
     /// RFC 7828 edns-tcp-keepalive TIMEOUT (100-ms units). Emitted only
     /// when non-null AND the client sent EDNS — null on UDP, or when
@@ -46,8 +45,6 @@ pub const ResponseContext = struct {
             .questions = query.questions,
             .client_edns = query.opt != null,
             .client_do = client_do,
-            // RFC 6840 §5.8: set AD only if client signalled DO or AD
-            .client_wants_ad = client_do or query.header.flags.ad,
             .max_udp_payload = max_udp_payload,
         };
     }
@@ -108,7 +105,7 @@ pub fn buildResponseWire(
             .rd = ctx.rd,
             .ra = true,
             .z = 0,
-            .ad = reply.ad and ctx.client_wants_ad and !scrubbed,
+            .ad = reply.ad and !scrubbed,
             .cd = ctx.cd,
             .rcode = reply.rcode,
         },
@@ -215,7 +212,6 @@ test "buildResponseWire carries EDE only to an EDNS client" {
         .questions = &questions,
         .client_edns = true,
         .client_do = false,
-        .client_wants_ad = false,
         .max_udp_payload = dns.max_udp_payload,
         .ede = .{ .code = .dnssec_bogus, .text = "rrsig failed to verify" },
     };
@@ -255,7 +251,6 @@ test "buildResponseWire returns null on OOM rather than an unscrubbed reply" {
         .questions = questions,
         .client_edns = false,
         .client_do = false,
-        .client_wants_ad = false,
         .max_udp_payload = dns.max_udp_payload,
         .rebinding = &scrub_on,
     }, .{ .rcode = .no_error, .answers = &answers }, failing.allocator());
@@ -375,7 +370,6 @@ test "buildResponseWire truncation cascade: additionals drop silently, authority
             .questions = questions,
             .client_edns = true,
             .client_do = false,
-            .client_wants_ad = false,
             .max_udp_payload = row.max,
         }, reply, a).?;
         try testing.expect(wire.len <= row.max);
@@ -408,7 +402,6 @@ test "buildResponseWire: an authority section past a u16 of records truncates" {
         .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
         .client_edns = false,
         .client_do = true,
-        .client_wants_ad = false,
         .max_udp_payload = dns.max_message_len,
     }, .{ .rcode = .name_error, .authorities = authorities }, a).?;
     const parsed = try dns.parseMessage(a, wire);
@@ -454,7 +447,6 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
             .questions = &.{.{ .name = zone, .qtype = .a, .qclass = .in }},
             .client_edns = false,
             .client_do = false,
-            .client_wants_ad = false,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = rb,
         }, reply, a).?;
@@ -487,7 +479,6 @@ test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME
             .questions = &.{.{ .name = c.qname, .qtype = .a, .qclass = .in }},
             .client_edns = false,
             .client_do = false,
-            .client_wants_ad = false,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = &scrub_on,
         }, .{ .rcode = .no_error, .answers = c.answers }, a).?;
@@ -515,7 +506,6 @@ test "buildResponseWire: a rebinding scrub clears AD" {
             .questions = &.{.{ .name = name, .qtype = .a, .qclass = .in }},
             .client_edns = true,
             .client_do = true,
-            .client_wants_ad = true,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = &scrub_on,
         }, .{ .rcode = .no_error, .ad = true, .answers = &answers }, a).?;
