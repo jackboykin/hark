@@ -1,0 +1,213 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a zone revoked while glued is gone once its glue lapses
+
+; com. delegates example.com. for a day with glue for a minute, then takes
+; the delegation away while example.com.'s server goes on answering. The
+; cut lapses with its glue, so two minutes on com. is asked again, and its
+; NXDOMAIN is what a cold walk finds (RFC 8020), below b.example.com. too:
+; a name inside a zone lives no longer than the zone's cut.
+; sub.example.com.'s cut holds its own servers and was placed by com.'s
+; day, not by the glue, so it stands.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 172800 IN NS ns.com.
+    SECTION ADDITIONAL
+      ns.com. 172800 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 5
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 60 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 6 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA ns.com. hostmaster.com. 2 1800 900 604800 900
+  ENTRY_END
+RANGE_END
+
+; example.com.'s server, still serving after the takedown.
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      sub.example.com. IN A
+    SECTION AUTHORITY
+      sub.example.com. 86400 IN NS ns.sub.example.com.
+    SECTION ADDITIONAL
+      ns.sub.example.com. 86400 IN A 127.0.10.4
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      b.example.com. IN A
+    SECTION AUTHORITY
+      example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 3600 900 604800 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.b.example.com. IN A
+    SECTION ANSWER
+      a.b.example.com. 3600 IN A 192.0.2.5
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      c.b.example.com. IN A
+    SECTION ANSWER
+      c.b.example.com. 3600 IN A 192.0.2.6
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.example.com. IN A
+    SECTION ANSWER
+      mail.example.com. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.4
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example.com. IN A
+    SECTION ANSWER
+      www.sub.example.com. 3600 IN A 192.0.2.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.sub.example.com. IN A
+    SECTION ANSWER
+      mail.sub.example.com. 3600 IN A 192.0.2.4
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.sub.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.sub.example.com. IN A
+  SECTION ANSWER
+    www.sub.example.com. 3600 IN A 192.0.2.3
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    a.b.example.com. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    a.b.example.com. IN A
+  SECTION ANSWER
+    a.b.example.com. 3600 IN A 192.0.2.5
+ENTRY_END
+
+STEP 5 TIME_PASSES ELAPSE 120
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    c.b.example.com. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    c.b.example.com. IN A
+ENTRY_END
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.example.com. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    mail.example.com. IN A
+ENTRY_END
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.sub.example.com. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.sub.example.com. IN A
+  SECTION ANSWER
+    mail.sub.example.com. 3600 IN A 192.0.2.4
+ENTRY_END
+
+SCENARIO_END

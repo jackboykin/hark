@@ -178,26 +178,16 @@ pub const Config = struct {
 pub const Cut = struct {
     zone: dns.Name,
     /// `zone`'s, from a referral. None at the root: hints carry addresses.
-    names: []const dns.Name = &.{},
-    /// The referral's glue, asked before the addr cells.
-    glue: []const Glue = &.{},
+    servers: []const Server = &.{},
+    /// How long the delegation stands, glue aside: its NS TTL, capped by
+    /// the referring zone's. One that `zone`'s servers give lives no longer.
+    placed_until_ns: i64 = std.math.maxInt(i64),
 };
 
-/// A glue address lives on its own TTL, never past its delegation's.
-pub const Glue = struct {
-    addr: na.Address,
-    expires_ns: i64,
-
-    /// Inclusive: a TTL-0 address serves the instant it lands.
-    pub fn live(gl: Glue, now_ns: i64) bool {
-        return gl.expires_ns >= now_ns;
-    }
-};
-
-pub const Addr = struct {
-    addrs: []const na.Address,
-    /// Seeded by glue: usable, unverified.
-    provisional: bool,
+pub const Server = struct {
+    /// Its `addr(name)` key, kept whole so no walk formats or hashes the name.
+    key: Key,
+    glue: []const na.Address = &.{},
 };
 
 /// The RRset at (name, type), as the reply sections that settled it, so
@@ -286,7 +276,7 @@ pub const Failure = struct {
 
 pub const Value = union(Kind) {
     cut: Cut,
-    addr: Addr,
+    addr: []const na.Address,
     rrset: Reply,
     answer: Answer,
     ds: trust.Chain,

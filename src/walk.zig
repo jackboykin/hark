@@ -153,6 +153,15 @@ pub const Ask = struct {
         a.have_servers = a.untried() != 0;
     }
 
+    /// The first pass, from the cut in hand: a cut learned this instant
+    /// may be one the store refused, or one that lives no time.
+    fn seed(a: *Ask, g: *Graph, id: CellId, servers: []const graph.Server) !void {
+        var list: std.ArrayList(na.Address) = .empty;
+        var left: Left = .{};
+        try reach(g, id, a, servers, &list, &left);
+        a.add(g, list.items);
+    }
+
     /// Once more, skipping the dead unless all are.
     fn retry(a: *Ask, g: *Graph) void {
         a.retried = true;
@@ -163,6 +172,11 @@ pub const Ask = struct {
         };
         if (a.tried == bit(a.nservers) - 1) a.tried = 0;
         a.have_servers = a.nservers > 0;
+    }
+
+    fn blame(a: *Ask, why: Failure) void {
+        a.local = a.local or why.cause == .host;
+        a.cut_short = a.cut_short or why.cause == .asker;
     }
 
     fn heldMsg(a: *const Ask, g: *Graph) ?dns.Message {
@@ -377,13 +391,12 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
-    const inside: graph.Value = .{ .cut = .{ .zone = pc.zone } };
     // No cut below a name that does not exist (RFC 8020).
-    if (try deniedAt(g, parent_name, pc.zone)) |until| return g.settle(id, inside, @min(parent.expires_ns, until));
+    if (try deniedAt(g, parent_name, pc.zone)) |until| return settleInside(g, id, parent, until);
     // A fresh fact at the probe name from the parent's zone answers it
     // without a packet; one from below says nothing about the parent.
     if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known| if (known.value.rrset.zone.eql(pc.zone))
-        return g.settle(id, inside, @min(parent.expires_ns, known.expires_ns));
+        return settleInside(g, id, parent, known.expires_ns);
     if (!s.started) {
         s.ask.reset(pc.zone);
         s.started = true;
@@ -393,7 +406,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         .exhausted => try g.fail(id, ended(g, &g.cell(id).scratch.cut.ask)),
         .reply => |kept| {
             const msg = kept.msg;
-            switch (delegation.probeStep(msg, name, pc.zone, g.cfg.addr_policy)) {
+            switch (delegation.probeStep(msg, name, pc.zone)) {
                 .referral => |ref| {
                     const cut = try absorbReferral(g, id, ref, msg, pc.zone);
                     try g.settle(id, cut.value, cut.expires_ns);
@@ -402,18 +415,25 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                 // NXDOMAIN is published, as deeper cuts read it (RFC 8020).
                 // An answer may be data the parent occludes (bailiwick/006);
                 // a NODATA is read by nothing and would cost a judgement.
-                .answered, .nodata => try g.settle(id, inside, @min(parent.expires_ns, switch (kept.verdict) {
+                .answered, .nodata => try settleInside(g, id, parent, switch (kept.verdict) {
                     .reply => |r| replyExpiry(r),
                     .loop, .none => g.now(),
-                })),
+                }),
                 .nxdomain => {
                     const until = try publishNxdomain(g, id, kept, name) orelse return g.fail(id, unplaced);
-                    try g.settle(id, inside, @min(parent.expires_ns, until));
+                    try settleInside(g, id, parent, until);
                 },
                 .failed => try g.fail(id, unplaced),
             }
         },
     }
+}
+
+/// Walks below the name ask the servers of the cut above, so it lives no
+/// longer than that cut, glue and all.
+fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64) !void {
+    const placed = @min(parent.expires_ns, until_ns);
+    try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone, .placed_until_ns = placed } }, placed);
 }
 
 /// An authoritative NXDOMAIN at a probe name, published; when it lapses.
@@ -481,9 +501,8 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
     return null;
 }
 
-/// `addr(host)`: glue seeds it provisionally (`absorbReferral`); else
-/// the A and AAAA RRsets one level deeper. An NS name must not be an alias
-/// (RFC 2181 §10.3): one that is has no address.
+/// `addr(host)`: the host's own A and AAAA sets. An NS name must not be an
+/// alias (RFC 2181 §10.3): one that is has no address.
 pub fn runAddr(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
@@ -549,7 +568,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
         if (failed) |why| return g.fail(id, why);
         expires = denied;
     }
-    try g.settle(id, .{ .addr = .{ .addrs = addrs.items, .provisional = false } }, expires);
+    try g.settle(id, .{ .addr = addrs.items }, expires);
 }
 
 /// `rrset(name, type)`: from the deepest known cut at or above the name,
@@ -583,9 +602,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .cut => |cid| g.cell(cid),
         };
         s.ask.reset(cut.state.fact.cut.zone);
-        var glue: std.ArrayList(na.Address) = .empty;
-        for (cut.state.fact.cut.glue) |gl| if (gl.live(g.now())) try glue.append(g.scratch.allocator(), gl.addr);
-        s.ask.add(g, glue.items);
+        try s.ask.seed(g, id, cut.state.fact.cut.servers);
         s.started = true;
     }
     while (true) {
@@ -595,12 +612,12 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .reply => |kept| {
                 const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
-                if (delegation.extractReferral(msg, name, zone, g.cfg.addr_policy)) |ref| {
+                if (delegation.extractReferral(msg, name, zone)) |ref| {
                     // Each referral descends toward the name, so its depth
                     // bounds the walk.
                     std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.labels.len > zone.labels.len);
                     const s2 = g.cell(id).scratch.rrset;
-                    _ = try absorbReferral(g, id, ref, msg, zone);
+                    const cut = try absorbReferral(g, id, ref, msg, zone);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
@@ -608,7 +625,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     s2.ask.reset(ref.zone_cut);
-                    s2.ask.add(g, ref.addrs[0..ref.addr_count]);
+                    try s2.ask.seed(g, id, cut.value.cut.servers);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
@@ -732,11 +749,12 @@ fn dnameRedirect(g: *Graph, name: dns.Name, did: CellId) !Reply {
     return .{ .kind = .yxdomain, .aa = d.aa, .answers = keep.items, .zone = d.zone, .stored_ns = d.stored_ns, .ttl = d.ttl };
 }
 
-/// Publish the child's cut with its NS names and glue, and return it. The
-/// delegation never outlives the referring zone's: that is a ghost (Jiang
-/// et al., NDSS 2012).
+/// A glued server has no other address, so the cut lives no longer than
+/// its glue. Its placement never outlives the referring zone's: that is a
+/// ghost (Jiang et al., NDSS 2012).
 fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Message, zone: dns.Name) !Graph.Fact {
     var kb: graph.KeyBuf = undefined;
+    const now = g.now();
     var ns_ttl: u32 = std.math.maxInt(u32);
     for (msg.authorities) |rr| if (rr.rtype == .ns and rr.name.eql(ref.zone_cut)) {
         ns_ttl = @min(ns_ttl, rr.ttl);
@@ -744,12 +762,24 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     // Looked up: the asker may have followed referrals below its own cut.
     // Null: the delegation is gone already.
     const parent = try g.peek(Key.of(&kb, .cut, zone, .a));
-    const expires = @min(if (parent) |p| p.expires_ns else g.now(), g.now() + @as(i64, ns_ttl) * std.time.ns_per_s);
-    const names = try g.scratch.allocator().dupe(dns.Name, ref.nsNames());
-    const glue = try g.scratch.allocator().alloc(graph.Glue, ref.addr_count);
-    for (glue, ref.addrs[0..ref.addr_count], ref.ttls[0..ref.addr_count]) |*gl, a, ttl|
-        gl.* = .{ .addr = a, .expires_ns = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s) };
-    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .names = names, .glue = glue } };
+    const placed = @min(if (parent) |p| p.value.cut.placed_until_ns else now, now + @as(i64, ns_ttl) * std.time.ns_per_s);
+    var expires = placed;
+    const sa = g.scratch.allocator();
+    const servers = try sa.alloc(graph.Server, ref.ns_count);
+    for (servers, ref.nsNames()) |*server, host| {
+        var key = Key.of(&kb, .addr, host, .a);
+        key.name = try sa.dupe(u8, key.name);
+        var glue: std.ArrayList(na.Address) = .empty;
+        // Glue is the parent's word only inside its own zone.
+        if (host.isSubdomainOf(zone)) for (msg.additionals) |rr| {
+            if (!rr.name.eql(host)) continue;
+            const addr = g.cfg.addr_policy.address(rr) orelse continue;
+            try glue.append(sa, addr);
+            expires = @min(expires, now + @as(i64, rr.ttl) * std.time.ns_per_s);
+        };
+        server.* = .{ .key = key, .glue = glue.items };
+    }
+    const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
     try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
     // The parent's word on the child's DS travels with the referral.
     if (g.cfg.trust_anchor != null) {
@@ -759,23 +789,6 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
         if (try trust.signedDown(g, ref.zone_cut)) try g.fetchKeys(by, ref.zone_cut);
-    }
-    // Glue is only a fact: never displacing an authoritative set, nor
-    // pre-empting a walk for one in progress.
-    for (names[0..ref.glued]) |host| {
-        var addrs: std.ArrayList(na.Address) = .empty;
-        var ttl: u32 = std.math.maxInt(u32);
-        for (msg.additionals) |rr| {
-            if (!rr.name.eql(host) or (rr.rtype != .a and rr.rtype != .aaaa)) continue;
-            const a = g.cfg.addr_policy.address(rr) orelse continue;
-            try addrs.append(g.scratch.allocator(), a);
-            ttl = @min(ttl, rr.ttl);
-        }
-        if (addrs.items.len == 0) continue;
-        const key = Key.of(&kb, .addr, host, .a);
-        if (try g.peek(key)) |existing| if (!existing.value.addr.provisional) continue;
-        const glue_expires = @min(expires, g.now() + @as(i64, ttl) * std.time.ns_per_s);
-        _ = try g.fact(key, .{ .addr = .{ .addrs = addrs.items, .provisional = true } }, glue_expires);
     }
     return .{ .value = cut, .expires_ns = expires };
 }
@@ -1041,7 +1054,7 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                             _ = try sendTo(g, id, a, at.server, a.noneLive(g), .tcp, .random, qname, qtype);
                         }
                     } else {
-                        const kept = if (delegation.shouldTrySibling(r.msg, a.zone, g.cfg.addr_policy)) null else try judge(g, r.msg, a.zone, qname, qtype);
+                        const kept = if (delegation.shouldTrySibling(r.msg, a.zone)) null else try judge(g, r.msg, a.zone, qname, qtype);
                         if (kept) |k| {
                             a.nattempts = 0;
                             return .{ .reply = k };
@@ -1085,55 +1098,24 @@ fn sendTo(g: *Graph, id: CellId, a: *Ask, server: u8, last: bool, transport: Tra
     return ex.est;
 }
 
-/// The server set for `a.zone`: hints at the root, else the addresses
-/// already known for the NS names. Only when none are known, or all
-/// have failed, are unglued names resolved, up to a per-depth limit.
 fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } {
     var kb: graph.KeyBuf = undefined;
+    const sa = g.scratch.allocator();
     var list: std.ArrayList(na.Address) = .empty;
-    defer list.deinit(g.gpa);
     const zone = a.zone;
     if (zone.labels.len == 0) {
-        for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(g.gpa, h);
+        for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(sa, h);
     } else {
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);
         if (!cut.settled()) return .pending;
         if (cut.failure()) |why| {
-            a.local = a.local or why.cause == .host;
-            a.cut_short = a.cut_short or why.cause == .asker;
+            a.blame(why);
             return .none;
         }
+        var left: Left = .{};
         // A shallower cut: no delegation here while it holds.
-        const names = if (cut.state.fact.cut.zone.eql(zone)) cut.state.fact.cut.names else &.{};
-        var unknown: std.ArrayList(dns.Name) = .empty;
-        defer unknown.deinit(g.gpa);
-        var busy: std.ArrayList(dns.Name) = .empty;
-        defer busy.deinit(g.gpa);
-        for (names) |host| {
-            const key = Key.of(&kb, .addr, host, .a);
-            if (try g.peek(key)) |known| {
-                try list.appendSlice(g.gpa, known.value.addr.addrs);
-                continue;
-            }
-            if (g.index.get(key)) |aid| {
-                if (g.cell(aid).settled()) {
-                    // Ours, settled TTL-0 or failed: a fact
-                    // serves its demander, a failure gives nothing.
-                    if (g.holdsInput(id, aid)) {
-                        if (g.cell(aid).failure()) |why| {
-                            a.local = a.local or why.cause == .host;
-                            a.cut_short = a.cut_short or why.cause == .asker;
-                        } else try list.appendSlice(g.gpa, g.cell(aid).state.fact.addr.addrs);
-                        continue;
-                    }
-                } else {
-                    try busy.append(g.gpa, host);
-                    continue;
-                }
-            }
-            try unknown.append(g.gpa, host);
-        }
+        if (cut.state.fact.cut.zone.eql(zone)) try reach(g, id, a, cut.state.fact.cut.servers, &list, &left);
         var i: usize = 0;
         while (i < list.items.len) {
             if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
@@ -1142,22 +1124,23 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         // nothing else is left, and only if it isn't waiting on us.
         if (list.items.len == 0) {
             var pending = false;
-            for (busy.items) |host| {
-                if (try g.demand(id, Key.of(&kb, .addr, host, .a), host) != null) pending = true;
+            for (left.busy.items) |key| {
+                if (try g.demand(id, key, try dns.parseDottedName(sa, key.name)) != null) pending = true;
             }
             if (pending) return .pending;
         }
-        if (list.items.len == 0 and !a.fetched_unglued and unknown.items.len > 0) {
+        const unknown = left.unknown.items;
+        if (list.items.len == 0 and !a.fetched_unglued and unknown.len > 0) {
             a.fetched_unglued = true;
             const limit: usize = switch (g.level(id)) {
                 0 => 3,
                 1 => 2,
                 else => 1,
             };
-            g.edge.rng.shuffle(dns.Name, unknown.items);
+            g.edge.rng.shuffle(Key, unknown);
             var demanded = false;
-            for (unknown.items[0..@min(limit, unknown.items.len)]) |host| {
-                const aid = try g.demand(id, Key.of(&kb, .addr, host, .a), host) orelse continue;
+            for (unknown[0..@min(limit, unknown.len)]) |key| {
+                const aid = try g.demand(id, key, try dns.parseDottedName(sa, key.name)) orelse continue;
                 if (!g.cell(aid).settled()) demanded = true;
             }
             if (demanded) return .pending;
@@ -1172,4 +1155,42 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         std.debug.print("  {s} at {s}: {d} servers, none left, {s}\n", .{ g.cell(id).name.formatInto(&nb), zone.formatInto(&zb), a.nservers, if (a.held != .none) "best failure held" else "no reply at all" });
     }
     return .none;
+}
+
+const Left = struct {
+    busy: std.ArrayList(Key) = .empty,
+    unknown: std.ArrayList(Key) = .empty,
+};
+
+/// The referral alone decides where a server is reached: at its glue, the
+/// parent's word, if it gave any, else at its own zone's `addr`. Nothing
+/// else held is read, so what a glued server's zone says of it never
+/// changes how it is reached.
+fn reach(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *std.ArrayList(na.Address), left: *Left) !void {
+    const sa = g.scratch.allocator();
+    for (servers) |server| {
+        if (server.glue.len > 0) {
+            try list.appendSlice(sa, server.glue);
+            continue;
+        }
+        const key = server.key;
+        if (try g.held(key)) |f| {
+            try list.appendSlice(sa, f.value.addr);
+            continue;
+        }
+        if (g.index.get(key)) |aid| {
+            if (g.cell(aid).settled()) {
+                // Ours, settled TTL-0 or failed: a fact serves its
+                // demander, a failure gives nothing.
+                if (g.holdsInput(id, aid)) {
+                    if (g.cell(aid).failure()) |why| a.blame(why) else try list.appendSlice(sa, g.cell(aid).state.fact.addr);
+                    continue;
+                }
+            } else {
+                try left.busy.append(sa, key);
+                continue;
+            }
+        }
+        try left.unknown.append(sa, key);
+    }
 }

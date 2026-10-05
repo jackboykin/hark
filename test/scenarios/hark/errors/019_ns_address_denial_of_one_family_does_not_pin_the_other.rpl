@@ -40,9 +40,9 @@ RANGE_BEGIN 0 100
     SECTION QUESTION
       hoster.com. IN A
     SECTION AUTHORITY
-      hoster.com. 86400 IN NS a.gtld.fake.
+      hoster.com. 86400 IN NS ns0.hoster.com.
     SECTION ADDITIONAL
-      a.gtld.fake. 86400 IN A 127.0.10.2
+      ns0.hoster.com. 86400 IN A 127.0.10.2
   ENTRY_END
   ENTRY_BEGIN
     MATCH opcode qname qtype

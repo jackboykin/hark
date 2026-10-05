@@ -1,7 +1,6 @@
 //! The delegation walk's pure decisions: QNAME minimisation, zone cuts, and
 //! which sibling failure a stub sees.
 const std = @import("std");
-const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
@@ -21,38 +20,29 @@ pub const ProbeStep = union(enum) {
     failed,
 };
 
-pub fn probeStep(response: dns.Message, target: dns.Name, zone: dns.Name, policy: AddrPolicy) ProbeStep {
+pub fn probeStep(response: dns.Message, target: dns.Name, zone: dns.Name) ProbeStep {
     switch (response.header.flags.rcode) {
         // Error replies can carry authority NS that delegate nothing.
         .no_error => {},
         .name_error => return .nxdomain,
         else => return .failed,
     }
-    if (extractReferral(response, target, zone, policy)) |referral| return .{ .referral = referral };
+    if (extractReferral(response, target, zone)) |referral| return .{ .referral = referral };
     return if (response.answers.len > 0) .answered else .nodata;
 }
 
-/// Names and addresses borrow from the response.
+/// Borrows from the response.
 pub const Referral = struct {
     zone_cut: dns.Name,
-    /// Names with glue come first; `unglued()` is the rest.
     ns_names: [max_servers_per_level]dns.Name,
     ns_count: usize,
-    glued: usize,
-    addrs: [max_servers_per_level]na.Address,
-    ttls: [max_servers_per_level]u32,
-    addr_count: usize,
 
     pub fn nsNames(r: *const Referral) []const dns.Name {
         return r.ns_names[0..r.ns_count];
     }
-
-    pub fn unglued(r: *const Referral) []const dns.Name {
-        return r.ns_names[r.glued..r.ns_count];
-    }
 };
 
-/// Address-construction policy applied when materializing referral glue.
+/// Which addresses a walk may send to.
 /// Defaults are production-safe; tests override to redirect at scripted
 /// authorities on non-privileged ports in 127/8.
 pub const AddrPolicy = struct {
@@ -69,12 +59,7 @@ pub const AddrPolicy = struct {
     }
 };
 
-pub fn extractReferral(
-    response: dns.Message,
-    target: dns.Name,
-    parent_zone: dns.Name,
-    policy: AddrPolicy,
-) ?Referral {
+pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns.Name) ?Referral {
     // Servers that set AA on referrals still refer: only answers or an SOA
     // make the NS the zone's own.
     if (response.header.flags.aa and response.answers.len > 0) return null;
@@ -101,50 +86,12 @@ pub fn extractReferral(
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;
     for (response.authorities) |rr| {
-        if (rr.rtype == .ns and rr.name.eql(zc)) {
-            if (ns_count < max_servers_per_level) {
-                ns_names[ns_count] = rr.rdata.ns;
-                ns_count += 1;
-            }
+        if (rr.rtype == .ns and rr.name.eql(zc) and ns_count < max_servers_per_level) {
+            ns_names[ns_count] = rr.rdata.ns;
+            ns_count += 1;
         }
     }
-
-    var glue_addrs: [max_servers_per_level]na.Address = undefined;
-    var glue_ttls: [max_servers_per_level]u32 = undefined;
-    var glue_count: usize = 0;
-    var glued: usize = 0;
-    for (response.additionals) |rr| {
-        if (rr.rtype != .a and rr.rtype != .aaaa) continue;
-        // Bailiwick: glue name must be within the parent zone (the zone
-        // the referring server is authoritative for). `isSubdomainOf`
-        // already returns true when parent is root, so all glue is
-        // accepted under root referrals.
-        if (!rr.name.isSubdomainOf(parent_zone)) continue;
-
-        for (ns_names[0..ns_count], 0..) |ns_name, i| {
-            if (ns_name.eql(rr.name)) {
-                if (glue_count < max_servers_per_level) {
-                    glue_addrs[glue_count] = policy.address(rr) orelse break;
-                    glue_ttls[glue_count] = rr.ttl;
-                    glue_count += 1;
-                    if (i >= glued) {
-                        mem.swap(dns.Name, &ns_names[i], &ns_names[glued]);
-                        glued += 1;
-                    }
-                }
-                break;
-            }
-        }
-    }
-    return .{
-        .zone_cut = zc,
-        .ns_names = ns_names,
-        .ns_count = ns_count,
-        .glued = glued,
-        .addrs = glue_addrs,
-        .ttls = glue_ttls,
-        .addr_count = glue_count,
-    };
+    return .{ .zone_cut = zc, .ns_names = ns_names, .ns_count = ns_count };
 }
 
 /// RFC 1034 §5.3.3: drop this reply and ask a sibling. Any rcode but an
@@ -154,7 +101,7 @@ pub fn extractReferral(
 /// recursor's cache, RA set and AA clear, which an RD-clear query gets
 /// only from a server that recursed on its own. A recursor's referral
 /// is still followed. validateResponse guarantees `questions[0]`.
-pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: AddrPolicy) bool {
+pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     const flags = response.header.flags;
     const rec_lame = flags.ra and !flags.aa;
     if (response.opt) |o| if (o.extended_rcode != 0) return true;
@@ -166,7 +113,7 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name, policy: Ad
     if (flags.aa) return false;
     if (response.answers.len != 0) return rec_lame;
     for (response.authorities) |rr| if (rr.rtype == .soa) return rec_lame;
-    return extractReferral(response, response.questions[0].name, parent_zone, policy) == null;
+    return extractReferral(response, response.questions[0].name, parent_zone) == null;
 }
 
 const test_header: dns.Header = .{
@@ -182,74 +129,52 @@ fn glueA(name: dns.Name, addr: [4]u8) dns.ResourceRecord {
     return .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 172800, .rdata = .{ .a = addr } };
 }
 
-const root: dns.Name = .{ .labels = &.{} };
-const example: dns.Name = .{ .labels = &.{ "example", "com" } };
 const www: dns.Name = .{ .labels = &.{ "www", "example", "com" } };
 const ns1: dns.Name = .{ .labels = &.{ "ns1", "example", "com" } };
-
-fn reply(authorities: []const dns.ResourceRecord, additionals: []const dns.ResourceRecord) dns.Message {
-    return .{ .header = test_header, .questions = &.{}, .authorities = authorities, .additionals = additionals };
-}
 
 test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral" {
     const zone: dns.Name = .{ .labels = &.{"com"} };
     const questions: []const dns.Question = &.{.{ .name = www, .qtype = .a, .qclass = .in }};
     var msg = dns.Message{ .header = test_header, .questions = questions };
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
 
     msg.header.flags.aa = true;
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
     msg.header.flags.aa = false;
 
     const soa = dns.ResourceRecord{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 600 } } };
     msg.authorities = &.{soa};
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
 
     msg.authorities = &.{nsRr(www, zone)};
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
     msg.authorities = &.{nsRr(.{ .labels = &.{"fake"} }, zone)};
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
 
     msg.authorities = &.{};
     msg.header.flags.rcode = .refused;
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
     msg.header.flags.rcode = .name_error;
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
 
     msg.header.flags.ra = true;
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
     msg.header.flags.aa = true;
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
     msg.header.flags.aa = false;
     msg.header.flags.rcode = .no_error;
     msg.authorities = &.{soa};
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
     msg.authorities = &.{};
     msg.answers = &.{glueA(www, .{ 10, 20, 30, 40 })};
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
     msg.header.flags.ra = false;
-    try testing.expect(!shouldTrySibling(msg, zone, .{}));
+    try testing.expect(!shouldTrySibling(msg, zone));
     // BADVERS: header rcode 0, extended 1.
     msg.opt = .{ .udp_payload_size = 1232, .extended_rcode = 1, .version = 0, .do_bit = false, .options = &.{} };
-    try testing.expect(shouldTrySibling(msg, zone, .{}));
+    try testing.expect(shouldTrySibling(msg, zone));
 }
 
-test "extractReferral case-insensitive glue matching" {
-    const upper: dns.Name = .{ .labels = &.{ "NS1", "EXAMPLE", "COM" } };
-    const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{glueA(upper, .{ 1, 2, 3, 4 })}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-}
-
-test "extractReferral rejects private IP glue (DNS rebinding defense)" {
-    const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{glueA(ns1, .{ 127, 0, 0, 1 })}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 0), result.addr_count);
-}
-
-test "extractReferral with AAAA glue returns IPv6 address" {
-    const ipv6 = [_]u8{ 0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-    const glue: dns.ResourceRecord = .{ .name = ns1, .rtype = .aaaa, .rclass = .in, .ttl = 172800, .rdata = .{ .aaaa = ipv6 } };
-    const result = extractReferral(reply(&.{nsRr(example, ns1)}, &.{glue}), www, root, .{}) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), result.addr_count);
-    try testing.expectEqual(@as(u16, 53), result.addrs[0].getPort());
-    try testing.expectEqual(na.initIp6(ipv6, 53, 0, 0).ip6.bytes, result.addrs[0].ip6.bytes);
+test "private glue is no address (DNS rebinding defense)" {
+    try testing.expectEqual(null, (AddrPolicy{}).address(glueA(ns1, .{ 127, 0, 0, 1 })));
 }

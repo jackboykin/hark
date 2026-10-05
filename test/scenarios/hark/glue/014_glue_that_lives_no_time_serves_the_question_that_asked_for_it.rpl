@@ -1,0 +1,140 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN glue that lives no time serves the question that asked for it
+
+; com. delegates cdn.com. for two days and glues its server at TTL 0, good
+; for the question in progress only (RFC 1035 §3.2.1). The cut lives no
+; time either, so each later question asks com. again and walks on what it
+; was given, though nothing keeps it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 172800 IN NS ns.com.
+    SECTION ADDITIONAL
+      ns.com. 172800 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      cdn.com. IN A
+    SECTION AUTHORITY
+      cdn.com. 172800 IN NS ns1.cdn.com.
+    SECTION ADDITIONAL
+      ns1.cdn.com. 0 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.cdn.com. IN A
+    SECTION ANSWER
+      www.cdn.com. 86400 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.cdn.com. IN A
+    SECTION ANSWER
+      mail.cdn.com. 86400 IN A 192.0.2.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ftp.cdn.com. IN A
+    SECTION ANSWER
+      ftp.cdn.com. 86400 IN A 192.0.2.3
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.cdn.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.cdn.com. IN A
+  SECTION ANSWER
+    www.cdn.com. 86400 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 10
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.cdn.com. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.cdn.com. IN A
+  SECTION ANSWER
+    mail.cdn.com. 86400 IN A 192.0.2.2
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 10
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ftp.cdn.com. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ftp.cdn.com. IN A
+  SECTION ANSWER
+    ftp.cdn.com. 86400 IN A 192.0.2.3
+ENTRY_END
+
+STEP 9 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    cdn.com. A 127.0.10.2
+    www.cdn.com. A 127.0.10.3
+    cdn.com. A 127.0.10.2
+    mail.cdn.com. A 127.0.10.3
+    cdn.com. A 127.0.10.2
+    ftp.cdn.com. A 127.0.10.3
+ENTRY_END
+
+STEP 10 CHECK_MAX_QUERIES 7
+
+SCENARIO_END

@@ -604,7 +604,7 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(192, r.parsed);
+    try testing.expectEqual(195, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 
@@ -620,7 +620,6 @@ test "lifted unbound walk scenarios settle to today's answers" {
         "iter_dname_ttl0.rpl",
         "iter_domain_sale.rpl",
         "iter_domain_sale_nschange.rpl",
-        "iter_cname_cache.rpl",
     });
     try testing.expectEqual(18, r.parsed);
     try testing.expectEqual(0, r.failed);

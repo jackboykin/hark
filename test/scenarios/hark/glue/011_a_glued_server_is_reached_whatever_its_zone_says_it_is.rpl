@@ -1,0 +1,206 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a glued server is reached whatever its zone says it is
+
+; com. glues example.com.'s server, ns.example.com.; net. names the same
+; server for other.net. but can give no glue for it. The zone says the
+; server is an alias. Glued, it is reached at its glue, whatever else is
+; held. Unglued, it has only its zone's word, and an NS name must not be an
+; alias (RFC 2181 §10.3): no address. Both hold whether or not a client
+; asked for the alias first.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 172800 IN NS ns.tld.
+    SECTION ADDITIONAL
+      ns.tld. 172800 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      net. IN A
+    SECTION AUTHORITY
+      net. 172800 IN NS ns.tld.
+    SECTION ADDITIONAL
+      ns.tld. 172800 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example.com. IN A
+    SECTION AUTHORITY
+      example.com. 86400 IN NS ns.example.com.
+    SECTION ADDITIONAL
+      ns.example.com. 86400 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other.net. IN A
+    SECTION AUTHORITY
+      other.net. 86400 IN NS ns.example.com.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.example.com. IN A
+    SECTION ANSWER
+      ns.example.com. 30 IN CNAME host.example.com.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      host.example.com. IN A
+    SECTION ANSWER
+      host.example.com. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example.com. IN A
+    SECTION ANSWER
+      www.example.com. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.example.com. IN A
+    SECTION ANSWER
+      mail.example.com. 3600 IN A 192.0.2.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.other.net. IN A
+    SECTION ANSWER
+      www.other.net. 3600 IN A 192.0.2.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.other.net. IN A
+    SECTION ANSWER
+      mail.other.net. 3600 IN A 192.0.2.4
+  ENTRY_END
+RANGE_END
+
+; Nothing yet says the server is an alias.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example.com. IN A
+  SECTION ANSWER
+    www.example.com. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.other.net. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.other.net. IN A
+ENTRY_END
+
+; Everything about the alias has lapsed; a client asks for it first.
+STEP 5 TIME_PASSES ELAPSE 60
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    ns.example.com. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    ns.example.com. IN A
+  SECTION ANSWER
+    ns.example.com. 30 IN CNAME host.example.com.
+    host.example.com. 3600 IN A 127.0.10.3
+ENTRY_END
+
+STEP 8 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    mail.example.com. IN A
+ENTRY_END
+
+STEP 9 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    mail.example.com. IN A
+  SECTION ANSWER
+    mail.example.com. 3600 IN A 192.0.2.2
+ENTRY_END
+
+STEP 10 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    mail.other.net. IN A
+ENTRY_END
+
+STEP 11 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    mail.other.net. IN A
+ENTRY_END
+
+SCENARIO_END

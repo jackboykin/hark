@@ -235,18 +235,20 @@ pub const Store = struct {
         switch (value) {
             .cut => |c| {
                 try w.name(c.zone);
-                try w.int(u16, @intCast(c.names.len));
-                for (c.names) |name| try w.name(name);
-                try w.int(u16, @intCast(c.glue.len));
-                for (c.glue) |gl| {
-                    try w.addr(gl.addr);
-                    try w.int(i64, gl.expires_ns);
+                try w.int(i64, c.placed_until_ns);
+                try w.int(u16, @intCast(c.servers.len));
+                var glue: usize = 0;
+                for (c.servers) |server| glue += server.glue.len;
+                try w.int(u16, @intCast(glue));
+                for (c.servers) |server| {
+                    try w.int(u16, @intCast(server.key.name.len));
+                    try w.slice(server.key.name);
+                    try w.int(u32, server.key.name_hash);
+                    try w.int(u16, @intCast(server.glue.len));
                 }
+                for (c.servers) |server| for (server.glue) |gl| try w.addr(gl);
             },
-            .addr => |a| {
-                try w.int(u8, @intFromBool(a.provisional));
-                try w.addrs(a.addrs);
-            },
+            .addr => |a| try w.addrs(a),
             .rrset => |r| {
                 // `Rrset.of` reads these in place.
                 try w.int(u8, @backingInt(r.kind));
@@ -280,16 +282,21 @@ pub const Store = struct {
         return switch (@as(Kind, @fromBackingInt(b.kind))) {
             .cut => blk: {
                 const zone = try r.name(arena);
-                const names = try arena.alloc(dns.Name, try r.int(u16));
-                for (names) |*n| n.* = try r.name(arena);
-                const glue = try arena.alloc(graph.Glue, try r.int(u16));
-                for (glue) |*gl| gl.* = .{ .addr = try r.addr(), .expires_ns = try r.int(i64) };
-                break :blk .{ .cut = .{ .zone = zone, .names = names, .glue = glue } };
+                const placed_until_ns = try r.int(i64);
+                const servers = try arena.alloc(graph.Server, try r.int(u16));
+                const glue = try arena.alloc(na.Address, try r.int(u16));
+                var at: usize = 0;
+                for (servers) |*server| {
+                    const name = try r.slice(try r.int(u16));
+                    server.key = .{ .kind = .addr, .rtype = .a, .name = name, .name_hash = try r.int(u32) };
+                    const n = try r.int(u16);
+                    server.glue = glue[at..][0..n];
+                    at += n;
+                }
+                for (glue) |*gl| gl.* = try r.addr();
+                break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
-            .addr => blk: {
-                const provisional = try r.int(u8) != 0;
-                break :blk .{ .addr = .{ .addrs = try r.addrs(arena), .provisional = provisional } };
-            },
+            .addr => .{ .addr = try r.addrs(arena) },
             .rrset => blk: {
                 var reply: graph.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
@@ -563,11 +570,11 @@ test "a fact survives the blob byte for byte" {
     }
 
     _ = blob.ref();
-    const newer = try s.build(.{ .addr = .{ .addrs = &.{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) }, .provisional = true } });
+    const newer = try s.build(.{ .addr = &.{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) } });
     try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
     const addr = (try Store.parse(arena, newer)).addr;
-    try testing.expect(addr.provisional and addr.addrs.len == 2 and na.ipEqual(addr.addrs[1], na.initIp6(@splat(1), 853, 0, 0)));
+    try testing.expect(addr.len == 2 and na.ipEqual(addr[1], na.initIp6(@splat(1), 853, 0, 0)));
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
 

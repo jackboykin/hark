@@ -4,19 +4,85 @@
 SCENARIO_BEGIN an address that could not be asked for is not a host without addresses
 
 ; x. is served by ns.y. and y. by ns.x., each delegated for thirty seconds
-; with glue for ten. Twenty seconds on both cuts stand without an address,
-; and asking for ns.x. A needs ns.y.'s address, which needs ns.x.'s: the
-; lookup waits on itself and cannot be made. The host's AAAA is a denial
-; held for an hour. One family denied and the other never asked is no
-; proof the host has no address: recorded as one, it would outlive both
-; cuts and keep other., served by ns.x. without glue, unreachable for the
-; denial's hour.
+; with glue for ten. Twenty seconds on, both cuts have lapsed with their
+; glue, and the root leaves out the sibling glue it need only send as a
+; SHOULD (RFC 9471 §3.2), so asking for ns.x. A waits on itself and cannot
+; be made. Its AAAA is denied for an hour, but one family denied and the
+; other never asked is no proof the host has no address: recorded as one,
+; it would keep other., served by ns.x. without glue, unreachable that hour.
 ;
 ; Topology
-;   root  127.0.10.1   delegates x. and y. (glue) and other. (none)
+;   root  127.0.10.1   delegates x. and y. (glue, none at steps 5-6), and
+;                      other. (none)
 ;   ns    127.0.10.2   serves all three
 
-RANGE_BEGIN 0 100
+RANGE_BEGIN 0 4
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      x. IN A
+    SECTION AUTHORITY
+      x. 30 IN NS ns.y.
+    SECTION ADDITIONAL
+      ns.y. 10 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      y. IN A
+    SECTION AUTHORITY
+      y. 30 IN NS ns.x.
+    SECTION ADDITIONAL
+      ns.x. 10 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.x.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 5 6
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      x. IN A
+    SECTION AUTHORITY
+      x. 30 IN NS ns.y.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      y. IN A
+    SECTION AUTHORITY
+      y. 30 IN NS ns.x.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.x.
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 7 100
   ADDRESS 127.0.10.1
   ENTRY_BEGIN
     MATCH opcode subdomain
@@ -121,7 +187,6 @@ ENTRY_BEGIN
     ns.y. IN AAAA
 ENTRY_END
 
-; The glue has lapsed, the cuts have not.
 STEP 5 TIME_PASSES ELAPSE 20
 
 STEP 6 QUERY
@@ -131,8 +196,8 @@ ENTRY_BEGIN
     ns.x. IN A
 ENTRY_END
 
-; The cuts have lapsed too: the root hands out the glue again.
-STEP 7 TIME_PASSES ELAPSE 20
+; The cuts lapse, and the glueless ones learned at step 6 with them.
+STEP 7 TIME_PASSES ELAPSE 40
 
 STEP 8 QUERY
 ENTRY_BEGIN

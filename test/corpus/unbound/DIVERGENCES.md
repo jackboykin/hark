@@ -114,20 +114,26 @@ past its usefulness — so hark serves cached positive answers without it.
 
 ---
 
-## 5. An NS name that is an alias — *deliberate (spec)*
+## 5. An NS name that is an alias — *passes, by another road*
 
 **Scenario:** `iter_cname_cache.rpl`
 
-`example.com.` is served by `ns.example.com.`, a CNAME to `ns.bla.nl.`, and
-by `ns2.example.com.`, which always SERVFAILs. Unbound follows the alias to
-reach the zone. RFC 2181 §10.3 says an NS name MUST NOT be an alias, and hark
-does not follow one: such a name has no address, for as long as the CNAME
-lives. With the only other server failing, the query SERVFAILs.
+`example.com.` is served by `ns.example.com.`, glued by `com.` for one
+second and a CNAME to `ns.bla.nl.` in its own zone, and by
+`ns2.example.com.`, which always SERVFAILs. Unbound follows the alias to
+reach the zone. Hark passes without following it: a glued server is reached
+at its glue alone, whatever its own zone says it is, and a referral lives no
+longer than its glue, so once the second is up `com.` is asked again and the
+glue it gives reaches the server.
 
-The breakage is the delegation's to fix, and following the alias means
-trusting an address whose cause is a record at another name, in another zone.
+An NS name with no glue is reached only through its own zone, and there hark
+still does not follow an alias: RFC 2181 §10.3 says an NS name MUST NOT be
+one, so such a name has no address for as long as the CNAME lives. Following
+it means trusting an address whose cause is a record at another name, in
+another zone. `../../scenarios/hark/glue/011_a_glued_server_is_reached_whatever_its_zone_says_it_is.rpl`
+holds both.
 
-**Verdict:** not a bug.
+**Verdict:** the same answer for a different reason; nothing to change.
 
 The broader "one failing NS must not condemn the resolution" story (RFC 1034
 §5.3.3) is covered by
@@ -165,5 +171,5 @@ may run as is. The behaviour is covered by the `isNonRoutableNs` unit test in
 ## A note on the CNAME cluster
 
 The `iter_cname_*` family (`_double`, `_minimise`, `_nx`, `_qnamecopy`)
-all pass; `_cache` is §5. If a regression reopens any of them, the gate says
-so.
+all pass, and so does `_cache`, for the reason §5 gives. If a regression
+reopens any of them, the gate says so.
