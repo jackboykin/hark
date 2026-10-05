@@ -604,7 +604,38 @@ pub fn proveNoCloserMatch(
     zone: dns.Name,
     budget: *rrsig.ValidationBudget,
 ) SecurityStatus {
-    if (labels >= qname.labels.len) return .bogus;
+    return switch (noCloserMatch(authorities, qname, labels, zone, budget)) {
+        .nsec => .secure,
+        .nsec3 => |nc| {
+            const optout = nsec3Cover(authorities, zone, &nc) orelse return .bogus;
+            return if (optout) .insecure else .secure;
+        },
+        .verdict => |v| v,
+    };
+}
+
+pub const NoCloserMatch = union(enum) {
+    nsec: dns.Name,
+    nsec3: [Sha1.digest_length]u8,
+    verdict: SecurityStatus,
+
+    pub fn restsOn(p: NoCloserMatch, rr: dns.ResourceRecord, zone: dns.Name) bool {
+        return switch (p) {
+            .nsec => |owner| rr.rtype == .nsec and rr.name.eql(owner),
+            .nsec3 => |nc| if (supportedNsec3OwnerHash(rr, zone)) |h| nsec3HashInRange(&h, rr.rdata.nsec3.next_hashed_owner, &nc) else false,
+            .verdict => false,
+        };
+    }
+};
+
+pub fn noCloserMatch(
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    labels: u8,
+    zone: dns.Name,
+    budget: *rrsig.ValidationBudget,
+) NoCloserMatch {
+    if (labels >= qname.labels.len) return .{ .verdict = .bogus };
     const ce = dns.Name{ .labels = qname.labels[qname.labels.len - labels ..] };
     for (authorities) |rr| {
         if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
@@ -615,18 +646,16 @@ pub fn proveNoCloserMatch(
         // between them too). A cover bounded below `ce` instead proves a
         // deeper name exists: wrong wildcard.
         const nsec_ce = closestEncloser(qname, rr.name, rr.rdata.nsec.next_domain_name) orelse continue;
-        if (nsec_ce.eql(ce)) return .secure;
+        if (nsec_ce.eql(ce)) return .{ .nsec = rr.name };
     }
 
     // No NSEC3 chain either: the owed proof is absent.
     const salt, const iterations = switch (nsec3ChainParams(authorities, zone)) {
         .params => |p| .{ p.salt, p.iterations },
-        .verdict => |v| return if (v == .unchecked) .bogus else v,
+        .verdict => |v| return .{ .verdict = if (v == .unchecked) .bogus else v },
     };
     const next_closer = dns.Name{ .labels = qname.labels[qname.labels.len - labels - 1 ..] };
-    const nc_hash = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .bogus;
-    const optout = nsec3Cover(authorities, zone, &nc_hash) orelse return .bogus;
-    return if (optout) .insecure else .secure;
+    return .{ .nsec3 = budgetedNsec3Hash(next_closer, salt, iterations, budget) catch return .{ .verdict = .bogus } };
 }
 
 /// Validate NSEC3 negative proofs (RFC 5155 §8.4/§8.5/§8.6/§8.7).

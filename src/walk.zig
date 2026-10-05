@@ -654,15 +654,22 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     const first = reply.answers[0];
     if (first.rtype != .cname or !first.name.eql(name)) return;
     const set = dnssec.setFrom(reply.answers, 0);
-    // A wildcard's expansion travels with its proof of no closer match.
-    var proofs: std.ArrayList(dns.ResourceRecord) = .empty;
-    const expanded = for (set) |rr| {
-        if (rr.rtype == .rrsig and rr.rdata.rrsig.labels < rrsig.signedLabels(name)) break true;
-    } else false;
-    if (expanded) for (reply.authorities) |rr| switch (if (rr.rtype == .rrsig) rr.rdata.rrsig.type_covered else rr.rtype) {
-        .nsec, .nsec3 => try proofs.append(g.scratch.allocator(), rr),
-        else => {},
+    // A wildcard's expansion carries its own no-closer-match proof; the
+    // reply's other proofs are other names' facts.
+    const a = g.scratch.allocator();
+    const kept = try a.alloc(bool, reply.authorities.len);
+    @memset(kept, false);
+    for (set) |sig| if (sig.rtype == .rrsig and sig.rdata.rrsig.labels < rrsig.signedLabels(name)) {
+        const zone = sig.rdata.rrsig.signer_name;
+        const p = proof.noCloserMatch(reply.authorities, name, sig.rdata.rrsig.labels, zone, &g.payer.validation);
+        for (reply.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and p.restsOn(rr, zone)) {
+            for (reply.authorities, kept) |of, *k| if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) {
+                k.* = true;
+            };
+        };
     };
+    var proofs: std.ArrayList(dns.ResourceRecord) = .empty;
+    for (reply.authorities, kept) |rr, k| if (k) try proofs.append(a, rr);
     var hop: Reply = .{
         .kind = .alias,
         .aa = reply.aa,

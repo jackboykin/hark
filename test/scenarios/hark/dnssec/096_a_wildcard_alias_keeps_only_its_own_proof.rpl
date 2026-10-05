@@ -1,0 +1,107 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a wildcard alias keeps only its own proof
+
+; The root holds *.w. CNAME t. and nothing else: . NSEC *.w. denies t. and
+; *. for a minute; *.w. NSEC . proves a.w. has no closer match for an
+; hour. a.w.'s alias is a fact of the hour; t.'s denial riding in the same
+; reply is t.'s, and does not end it: past the minute, a.w. A follows
+; the remembered alias and asks only for t.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    WILDCARD *.w.
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      a.w. IN A
+    SECTION ANSWER
+      a.w. 3600 IN CNAME t.
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 60 IN NSEC *.w. SOA NS DNSKEY RRSIG NSEC
+      *.w. 3600 IN NSEC . CNAME RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+; Asked again, the alias would point elsewhere; t. is denied anew.
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      a.w. IN CNAME
+    SECTION ANSWER
+      a.w. 3600 IN CNAME u.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      t. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 60 IN NSEC *.w. SOA NS DNSKEY RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.w. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    a.w. IN A
+  SECTION ANSWER
+    a.w. 3600 IN CNAME t.
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 100
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.w. IN CNAME
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    a.w. IN CNAME
+  SECTION ANSWER
+    a.w. 3600 IN CNAME t.
+ENTRY_END
+
+STEP 6 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.w. IN A
+ENTRY_END
+
+STEP 7 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    a.w. IN A
+  SECTION ANSWER
+    a.w. 3600 IN CNAME t.
+ENTRY_END
+
+SCENARIO_END
