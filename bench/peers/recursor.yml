@@ -1,6 +1,6 @@
 # The listener's receive buffer is fixed at 250000 in the source; no setting.
 recursor:
-  threads: 1
+  threads: __N__
   hint_file: __DIR__/root.hints
   socket_dir: __RUN__
   daemon: false
@@ -10,6 +10,8 @@ recursor:
   qname_minimization: false
 incoming:
   listen: [127.0.0.1:5354]
+  reuseport: true
+  pdns_distributes_queries: false
   allow_from: [127.0.0.0/8]
 dnssec:
   validation: 'off'

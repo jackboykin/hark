@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # usage: layouts.sh <dir> [n=5]
-# n code layouts of this checkout's hark for tp.sh ab (pass <dir> as a side):
+# n code layouts of this checkout's hark for tp.sh (pass <dir> as a side):
 # one ReleaseFast compile with -Dbench-layout is <dir>/hark.0, and hark.1..
 # are lld relinks of the same objects with --shuffle-sections='.text*=SEED'.
 # A relink alone moves miss qps ~1%, so a/b sides are layout distributions.
