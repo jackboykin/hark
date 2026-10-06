@@ -113,7 +113,8 @@ pub const Ask = struct {
 
     const Pick = struct {
         server: u8,
-        dead: bool,
+        /// The best untried band: a never-timed first pick ties with it.
+        band: i64,
         /// Last untried of its kind, live or dead: waits uncapped.
         last: bool,
     };
@@ -141,18 +142,17 @@ pub const Ask = struct {
         // answer, or faster: an ask's first attempt goes to it as readily.
         // Every later one goes to a server that answers while any is left.
         if (a.tried == 0) ties |= untimed;
-        const dead = best == ns_rtt.dead_band;
         // Every dead server ties in the dead band.
-        const last = if (dead) @popCount(ties) == 1 else live == 1;
+        const last = if (best == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
         var k = g.edge.rng.uintLessThan(u8, @popCount(ties));
         while (k > 0) : (k -= 1) ties &= ties - 1;
-        return .{ .server = @ctz(ties), .dead = dead, .last = last };
+        return .{ .server = @ctz(ties), .band = best, .last = last };
     }
 
-    /// The dead are hedged to only once nothing live is in flight.
-    fn liveInFlight(a: *const Ask, g: *Graph) bool {
-        for (a.attempts[0..a.nattempts]) |at| if (!g.isDead(a.servers[at.server])) return true;
-        return false;
+    fn flying(a: *const Ask, g: *Graph) i64 {
+        var best: i64 = ns_rtt.dead_band;
+        for (a.attempts[0..a.nattempts]) |at| best = @min(best, g.band(a.servers[at.server]));
+        return best;
     }
 
     fn noneLive(a: *const Ask, g: *Graph) bool {
@@ -1039,8 +1039,13 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                 },
             }
         }
-        const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
-        if (a.nattempts > 0 and !early) return .pending;
+        if (a.nattempts > 0 and (g.cfg.stagger_ms == 0 or a.nattempts == max_hedge)) return .pending;
+        // The stagger is the time a server is given before it is late. One
+        // that has only ever been silent is given none: a server with
+        // nothing against it goes at once.
+        const due = a.nattempts == 0 or g.now() >= a.hedge_at;
+        const waited = a.flying(g);
+        if (!due and waited < ns_rtt.silent_band) return .pending;
         const p = a.pick(g) orelse {
             // No server left to try or to hedge to: before a timeout is
             // sat out, gather what settled since and ask for what is unknown.
@@ -1055,7 +1060,9 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
                 },
             }
         };
-        if (a.nattempts > 0 and p.dead and a.liveInFlight(g)) return .pending;
+        if (!due and p.band >= ns_rtt.silent_band) return .pending;
+        // The dead are hedged to only once nothing live is in flight.
+        if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
         // Hark's policy, not the authorities' word: it judges sends, never facts.
         if (!g.cfg.addr_policy.allows(a.servers[p.server].toAddress())) {
             a.tried |= Ask.bit(p.server);
@@ -1065,6 +1072,9 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
         a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
+        // Sent to one that may answer, the ask waits. Behind one that never
+        // has, it goes round to gather, and to ask for what is unknown.
+        if (p.band < ns_rtt.silent_band) return .pending;
     }
 }
 

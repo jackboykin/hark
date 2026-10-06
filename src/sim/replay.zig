@@ -680,6 +680,104 @@ const siblings_rpl =
     \\SCENARIO_END
 ;
 
+/// ns1 (127.0.10.3) is glued and listens nowhere. ns2 (127.0.10.4), which
+/// answers, and ns3 (127.0.10.6), which listens nowhere, are reached only
+/// once their own zone gives their addresses.
+const unglued_rpl =
+    \\; hark: root-hints = 127.0.10.1
+    \\SCENARIO_BEGIN outranked
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.1
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR NOERROR
+    \\    SECTION QUESTION
+    \\      com. IN A
+    \\    SECTION AUTHORITY
+    \\      com. 86400 IN NS a.gtld.fake.
+    \\    SECTION ADDITIONAL
+    \\      a.gtld.fake. 86400 IN A 127.0.10.2
+    \\  ENTRY_END
+    \\RANGE_END
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.2
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR NOERROR
+    \\    SECTION QUESTION
+    \\      example.com. IN A
+    \\    SECTION AUTHORITY
+    \\      example.com. 86400 IN NS ns1.example.com.
+    \\      example.com. 86400 IN NS ns2.hosts.com.
+    \\      example.com. 86400 IN NS ns3.hosts.com.
+    \\    SECTION ADDITIONAL
+    \\      ns1.example.com. 86400 IN A 127.0.10.3
+    \\  ENTRY_END
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR NOERROR
+    \\    SECTION QUESTION
+    \\      hosts.com. IN A
+    \\    SECTION AUTHORITY
+    \\      hosts.com. 86400 IN NS ns.hosts.com.
+    \\    SECTION ADDITIONAL
+    \\      ns.hosts.com. 86400 IN A 127.0.10.5
+    \\  ENTRY_END
+    \\RANGE_END
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.5
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname qtype
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      ns2.hosts.com. IN A
+    \\    SECTION ANSWER
+    \\      ns2.hosts.com. 86400 IN A 127.0.10.4
+    \\  ENTRY_END
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname qtype
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      ns3.hosts.com. IN A
+    \\    SECTION ANSWER
+    \\      ns3.hosts.com. 86400 IN A 127.0.10.6
+    \\  ENTRY_END
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qtype
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      hosts.com. IN AAAA
+    \\    SECTION AUTHORITY
+    \\      hosts.com. 3600 IN SOA ns.hosts.com. h.hosts.com. 1 3600 600 86400 3600
+    \\  ENTRY_END
+    \\RANGE_END
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.4
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode qname qtype
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      www.example.com. IN A
+    \\    SECTION ANSWER
+    \\      www.example.com. 60 IN A 10.20.30.40
+    \\  ENTRY_END
+    \\RANGE_END
+    \\STEP 1 QUERY
+    \\ENTRY_BEGIN
+    \\  REPLY RD
+    \\  SECTION QUESTION
+    \\    www.example.com. IN A
+    \\ENTRY_END
+    \\SCENARIO_END
+;
+
 const Siblings = struct {
     ns1: ?ns_rtt.RttState = null,
     ns2: ?ns_rtt.RttState = null,
@@ -744,6 +842,8 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
 /// srtt 1.5 s: a 3 s estimate, past the 2 s cap.
 const dead: ns_rtt.RttState = .{ .srtt_us = 1500 * std.time.us_per_ms, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
 
+const silent: ns_rtt.RttState = .{ .srtt_us = 400 * std.time.us_per_ms, .consecutive_timeouts = 1 };
+
 const far: ns_rtt.RttState = .{ .srtt_us = 160 * std.time.us_per_ms, .min_rtt_us = 160 * std.time.us_per_ms };
 
 test "a silent sibling is hedged past and still records its timeout" {
@@ -794,6 +894,7 @@ test "servers all dead are hedged through like any list" {
         const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns1 = dead, .ns2 = dead });
         if (w.ns1_ms == null or w.ns2_ms.? < w.ns1_ms.?) continue;
         ns1_first_seen = true;
+        try testing.expect(w.ns2_ms.? - w.ns1_ms.? >= 150);
         try testing.expect(w.ns2_ms.? - w.ns1_ms.? < 500);
     }
     try testing.expect(ns1_first_seen);
@@ -825,6 +926,23 @@ test "a hedge goes to a server that answers before one never timed" {
         try testing.expect(w.ns1_ms == null or w.ns3_ms == null);
     }
     try testing.expect(hedged);
+}
+
+test "a server that has only been silent holds back no other, one never timed does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var both_seen = false;
+    for (1..9) |seed| {
+        const w = try walk(arena_state.allocator(), unglued_rpl, seed, 150, .{ .ns1 = silent });
+        // ns1 is all there is to ask at first: the lookups for the others
+        // start, and the first address to land is asked, with no stagger.
+        const next = @min(w.ns2_ms.?, w.ns3_ms orelse w.ns2_ms.?);
+        try testing.expect(next - w.ns1_ms.? < 150);
+        const ns3_ms = w.ns3_ms orelse continue;
+        both_seen = true;
+        try testing.expect(@abs(w.ns2_ms.? - ns3_ms) >= 150);
+    }
+    try testing.expect(both_seen);
 }
 
 test "the door counts exchanges in flight" {
