@@ -560,7 +560,7 @@ fn nsec3ClosestEncloser(
     budget: *rrsig.ValidationBudget,
 ) ClosestEncloser {
     var below_hash: [Sha1.digest_length]u8 = undefined;
-    for (0..qname.labels.len) |label_offset| {
+    for (0..qname.labels.len + 1) |label_offset| {
         // Nothing above the signer is in its chain; don't pay to hash it.
         if (qname.labels.len - label_offset < zone.labels.len) break;
         const ancestor_hash = if (label_offset == 0) qname_hash else budgetedNsec3Hash(
@@ -2096,8 +2096,9 @@ test "refuses NSEC3 floods before hashing or verifying (Knot >8-record cap)" {
 test "NSEC3 budget accumulates across negative-proof calls" {
     // One ValidationBudget is shared across resolve(); two calls must
     // accumulate. NODATA-with-no-owner-match hashes qname once, then ancestors
-    // in the CE walk; label_offset==0 reuses qname_hash, so a 2-label qname
-    // costs 2 hashes per call (qname + com).
+    // in the CE walk down to the signer; label_offset==0 reuses qname_hash,
+    // so a 2-label qname under the root costs 3 hashes per call (qname, com,
+    // the root).
     const qname = dns.Name{ .labels = &.{ "example", "com" } };
     const salt: []const u8 = &.{};
 
@@ -2106,10 +2107,10 @@ test "NSEC3 budget accumulates across negative-proof calls" {
     const owner_name = makeNsec3OwnerName(@as([20]u8, @splat(0x42)), zone_labels, &bufs);
     const authorities = [_]dns.ResourceRecord{makeNsec3Rr(owner_name, salt, &@as([20]u8, @splat(0x43)), &.{})};
 
-    var b: rrsig.ValidationBudget = .{ .max_nsec3_blocks = 2 };
+    var b: rrsig.ValidationBudget = .{ .max_nsec3_blocks = 3 };
     const first = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.unchecked, first);
-    try testing.expectEqual(@as(u32, 2), b.nsec3_blocks_spent);
+    try testing.expectEqual(@as(u32, 3), b.nsec3_blocks_spent);
     const second = validateNegativeProof(&authorities, qname, .a, false, test_root, &b);
     try testing.expectEqual(SecurityStatus.bogus, second);
 }
