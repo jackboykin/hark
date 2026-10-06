@@ -1,5 +1,6 @@
 pub const acl = @import("acl.zig");
 pub const answer = @import("answer.zig");
+pub const arena = @import("arena.zig");
 pub const config = @import("config.zig");
 pub const delegation = @import("delegation.zig");
 pub const denial = @import("denial.zig");
@@ -37,6 +38,7 @@ pub const sim = struct {
 test {
     _ = @import("acl.zig");
     _ = @import("answer.zig");
+    _ = @import("arena.zig");
     _ = @import("config.zig");
     _ = @import("delegation.zig");
     _ = @import("denial.zig");

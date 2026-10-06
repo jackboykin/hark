@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rand = @import("rand.zig");
+const Arena = @import("arena.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const dns = @import("dns.zig");
@@ -464,7 +465,7 @@ pub const Cell = struct {
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
     /// Everything the cell owns; freed with it.
-    arena: std.heap.ArenaAllocator,
+    arena: Arena,
 
     comptime {
         // Scratch is a pointer: the slot bound is not the largest kind's.
@@ -498,7 +499,7 @@ pub const Graph = struct {
     cfg: Config,
     edge: Edge,
     /// One run's transients, reset at every run.
-    scratch: std.heap.ArenaAllocator,
+    scratch: Arena,
     /// Rule-held pointers survive appends; a freed slot is reused.
     cells: std.ArrayList(*Cell) = .empty,
     free_ids: std.ArrayList(CellId) = .empty,
@@ -532,7 +533,7 @@ pub const Graph = struct {
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = std.heap.ArenaAllocator.init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
         if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
@@ -759,7 +760,7 @@ pub const Graph = struct {
         const id: CellId = reused orelse @intCast(g.cells.items.len);
         const c = if (reused != null) g.cells.items[id] else try g.gpa.create(Cell);
         errdefer if (reused == null) g.gpa.destroy(c);
-        var arena = std.heap.ArenaAllocator.init(g.work.allocator());
+        var arena: Arena = .init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
         var own_key = key;
@@ -855,7 +856,7 @@ pub const Graph = struct {
             g.unref(b);
         }
         c.arena.deinit();
-        c.arena = std.heap.ArenaAllocator.init(g.work.allocator());
+        c.arena = .init(g.work.allocator());
         c.scratch = .none;
         try g.free_ids.append(g.gpa, id);
     }
@@ -1353,7 +1354,7 @@ pub const Graph = struct {
             g.release(id);
         }
         // Debug frees it, so a read past its run fails every time, not by luck.
-        _ = g.scratch.reset(if (builtin.mode == .debug) .free_all else .retain_capacity);
+        g.scratch.reset(if (builtin.mode == .debug) .free_all else .retain_capacity);
         g.unpaid = .{ .deadline_ns = 0, .validation = .{ .max_sig_verify = 0, .max_nsec3_blocks = 0 } };
         g.payer = g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;

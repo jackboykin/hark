@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const answer = @import("answer.zig");
+const Arena = @import("arena.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -158,7 +159,7 @@ const Server = struct {
     timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
     desk: answer.Desk,
     freed: std.ArrayList(u32) = .empty,
-    scratch: std.heap.ArenaAllocator,
+    scratch: Arena,
     stopping: bool = false,
     listeners: std.ArrayList(posix.fd_t) = .empty,
     conns: u32 = 0,
@@ -366,7 +367,7 @@ const Server = struct {
         // BCP 140: a UDP reply is dropped silently, no query; over TCP `validateQuery` answers it.
         if (wire.len < 12 or (reply == .udp and wire[2] & 0x80 != 0)) return if (reply == .tcp) s.drop(reply.tcp);
         if (reply == .udp) s.clients.queries.udp += 1 else s.clients.queries.tcp += 1;
-        _ = s.scratch.reset(.retain_capacity);
+        s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = dns.parseMessage(arena, wire) catch {
             const id = mem.readInt(u16, wire[0..2], .big);
@@ -485,7 +486,7 @@ const Server = struct {
             s.clients.unanswered.late += 1;
             return s.vacate(i);
         }
-        _ = s.scratch.reset(.retain_capacity);
+        s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = try dns.parseMessage(arena, p.wire);
         const served = try s.shape(arena, p, query.questions[0], answer.Client.fromQuery(query)) orelse {
@@ -593,7 +594,7 @@ const Server = struct {
     fn impatient(s: *Server, p: *Pending) !bool {
         if (left(p.*) or p.stale_tried or s.desk.retention.serve_stale_ttl == 0 or s.e.now_ns < patience(p.*)) return false;
         p.stale_tried = true;
-        _ = s.scratch.reset(.retain_capacity);
+        s.scratch.reset(.retain_capacity);
         const arena = s.scratch.allocator();
         const query = try dns.parseMessage(arena, p.wire);
         const q = query.questions[0];
@@ -827,7 +828,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer g.deinit();
     g.attach();
     e.work = g.work.allocator();
-    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = std.heap.ArenaAllocator.init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
+    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
