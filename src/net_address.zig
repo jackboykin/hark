@@ -186,37 +186,43 @@ fn isNonRoutableIp6(b: [16]u8) bool {
 /// returning multicast to a stub is not a rebinding-attack primitive, so the
 /// answer scrub serves it; NS egress re-adds it above.
 pub fn isSpecialUseIp4(b: [4]u8) bool {
-    if (b[0] == 0) return true; // 0.0.0.0/8         (this network, RFC 1122)
-    if (b[0] == 10) return true; // 10.0.0.0/8       (RFC 1918)
-    if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT, RFC 6598)
-    if (b[0] == 127) return true; // 127.0.0.0/8     (loopback, RFC 1122)
-    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local, RFC 3927)
-    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12 (RFC 1918)
-    if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF, RFC 6890)
-    if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
-    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC 1918)
-    if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
-    if (b[0] == 198 and b[1] == 51 and b[2] == 100) return true; // 198.51.100.0/24 (TEST-NET-2)
-    if (b[0] == 203 and b[1] == 0 and b[2] == 113) return true; // 203.0.113.0/24 (TEST-NET-3)
-    if (b[0] >= 240) return true; // 240.0.0.0/4     (reserved, includes 255.255.255.255)
-    return false;
+    return switch (b[0]) {
+        0 => true, // 0.0.0.0/8 (this network, RFC 1122)
+        10 => true, // 10.0.0.0/8 (RFC 1918)
+        100 => (b[1] & 0xc0) == 64, // 100.64.0.0/10 (CGNAT, RFC 6598)
+        127 => true, // 127.0.0.0/8 (loopback, RFC 1122)
+        169 => b[1] == 254, // 169.254.0.0/16 (link-local, RFC 3927)
+        172 => (b[1] & 0xf0) == 16, // 172.16.0.0/12 (RFC 1918)
+        // 192.0.0.0/24 (IETF, RFC 6890), 192.0.2.0/24 (TEST-NET-1),
+        // 192.168.0.0/16 (RFC 1918)
+        192 => (b[1] == 0 and (b[2] == 0 or b[2] == 2)) or b[1] == 168,
+        // 198.18.0.0/15 (benchmarking), 198.51.100.0/24 (TEST-NET-2)
+        198 => (b[1] & 0xfe) == 18 or (b[1] == 51 and b[2] == 100),
+        203 => b[1] == 0 and b[2] == 113, // 203.0.113.0/24 (TEST-NET-3)
+        240...255 => true, // 240.0.0.0/4 (reserved, includes 255.255.255.255)
+        else => false,
+    };
 }
 
 /// ::/96, ULA, link-local, 2001:db8::/32, and IPv4-mapped judged as v4; no multicast.
 pub fn isSpecialUseIp6(b: [16]u8) bool {
-    if (mem.eql(u8, b[0..12], &@as([12]u8, @splat(0)))) return true;
+    const hi = mem.readInt(u64, b[0..8], .big);
+    const mid = mem.readInt(u32, b[8..12], .big);
+    if (hi == 0 and mid == 0) return true;
     // ::ffff:0:0/96 — IPv4-mapped, defer to v4 rules so a mapped 127.0.0.1
     // doesn't slip through as a "v6 address" the v6 set has no opinion on.
-    if (isIp4Mapped(&b)) return isSpecialUseIp4(b[12..16].*);
-    if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0d and b[3] == 0xb8) return true; // 2001:db8::/32 (RFC 3849)
-    if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7  (ULA, RFC 4193)
-    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 (link-local)
-    return false;
+    if (hi == 0 and mid == 0xffff) return isSpecialUseIp4(b[12..16].*);
+    return switch (b[0]) {
+        0x20 => (hi >> 32) == 0x20010db8, // 2001:db8::/32 (RFC 3849)
+        0xfc, 0xfd => true, // fc00::/7 (ULA, RFC 4193)
+        0xfe => (b[1] & 0xc0) == 0x80, // fe80::/10 (link-local)
+        else => false,
+    };
 }
 
 /// ::ffff:0:0/96 — IPv4-mapped IPv6.
 pub fn isIp4Mapped(bytes: []const u8) bool {
-    return bytes.len == 16 and mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and bytes[10] == 0xff and bytes[11] == 0xff;
+    return bytes.len == 16 and mem.readInt(u64, bytes[0..8], .big) == 0 and mem.readInt(u32, bytes[8..12], .big) == 0xffff;
 }
 
 const testing = std.testing;
