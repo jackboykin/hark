@@ -209,7 +209,9 @@ ENTRY_BEGIN
     mail.edge.cdn.com. 3600 IN A 192.0.2.5
 ENTRY_END
 
-; Only mail.edge.cdn.com. itself goes out for the last question.
-STEP 16 CHECK_MAX_QUERIES 12
+; The probe below cdn.com. walks on the cut its own question for it was
+; given: com. is asked once. Only mail.edge.cdn.com. itself goes out for
+; the last question.
+STEP 16 CHECK_MAX_QUERIES 11
 
 SCENARIO_END

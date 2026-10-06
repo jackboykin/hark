@@ -417,6 +417,7 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         return settleInside(g, id, parent, known.expires_ns);
     if (!s.started) {
         s.ask.reset(pc.zone);
+        try s.ask.seed(g, pc);
         s.started = true;
     }
     switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
