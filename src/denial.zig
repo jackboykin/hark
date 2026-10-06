@@ -214,18 +214,22 @@ fn minimal(rr: RR) bool {
     return next.labels.len == rr.name.labels.len + 1 and next.labels[0].len == 1 and next.labels[0][0] == 0 and next.isSubdomainOf(rr.name);
 }
 
+/// Never a DS: that is the parent's word at the cut alone (RFC 6840 §4.4),
+/// and a proof from before the delegation would deny it (dnssec/033).
+/// Never a DNSKEY: the chain of trust takes only keys (`trust.runDnskey`),
+/// and a denial from memory would fail it without asking.
+pub fn denies(g: *const Graph, qtype: dns.RType) bool {
+    return g.cfg.trust_anchor != null and qtype != .ds and qtype != .dnskey;
+}
+
 /// Settle `rrset(name, type)` as a denial from indexed proofs, if the
 /// closest zone holding any can prove one: a span covering the name with
 /// the wildcard at its closest encloser matched (NODATA) or covered
 /// (NXDOMAIN), an exact owner (NODATA), or a span whose next name descends
 /// below it (an empty non-terminal, NODATA). The verdict is stamped on the
-/// reply; nothing is re-verified. Never for a DS: that is the parent's
-/// word at the cut alone (RFC 6840 §4.4), and it travels with the referral;
-/// a span from before the delegation existed would judge it (dnssec/033).
-/// Keys are only ever wanted positive.
+/// reply; nothing is re-verified.
 pub fn deny(g: *Graph, id: CellId) !bool {
-    const qtype = g.cell(id).key.rtype;
-    if (g.cfg.trust_anchor == null or g.denial.zones.count() == 0 or qtype == .ds or qtype == .dnskey) return false;
+    if (g.denial.zones.count() == 0 or !denies(g, g.cell(id).key.rtype)) return false;
     const name = g.cell(id).name;
     for (0..name.labels.len + 1) |i| {
         const zone: dns.Name = .{ .labels = name.labels[i..] };
