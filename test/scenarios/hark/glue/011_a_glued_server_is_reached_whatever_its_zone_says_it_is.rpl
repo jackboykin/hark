@@ -6,8 +6,9 @@ SCENARIO_BEGIN a glued server is reached whatever its zone says it is
 ; server for other.net. but can give no glue for it. The zone says the
 ; server is an alias. Glued, it is reached at its glue, whatever else is
 ; held. Unglued, it has only its zone's word, and an NS name must not be an
-; alias (RFC 2181 §10.3): no address. Both hold whether or not a client
-; asked for the alias first.
+; alias (RFC 2181 §10.3): no address, though the zone sends the target's
+; along with the alias. Both hold whether or not a client asked for the
+; alias first.
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -69,6 +70,7 @@ RANGE_BEGIN 0 100
       ns.example.com. IN A
     SECTION ANSWER
       ns.example.com. 30 IN CNAME host.example.com.
+      host.example.com. 3600 IN A 127.0.10.3
   ENTRY_END
   ENTRY_BEGIN
     MATCH opcode qname qtype
