@@ -6,6 +6,7 @@ const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const answer = @import("answer.zig");
 const Arena = @import("arena.zig");
+const Batch = @import("batch.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -160,6 +161,8 @@ const Server = struct {
     desk: answer.Desk,
     freed: std.ArrayList(u32) = .empty,
     scratch: Arena,
+    in: *Batch,
+    out: *Batch,
     stopping: bool = false,
     listeners: std.ArrayList(posix.fd_t) = .empty,
     conns: u32 = 0,
@@ -228,17 +231,21 @@ const Server = struct {
     /// Drains the socket in one wake: an epoll call per query cost a third
     /// of the syscall time under load.
     fn readUdp(s: *Server, fd: posix.fd_t) !void {
-        var buf: [udp_recv_max]u8 = undefined;
         const crowded = crowdedQueue(fd);
         const parks = s.parks;
-        for (0..udp_per_wake) |_| {
-            if (s.parks - parks == udp_misses_per_wake) return;
-            var pa: na.PosixAddress = undefined;
-            var len: posix.socklen_t = @sizeOf(na.PosixAddress);
-            const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, &pa.any, &len);
-            if (linux.errno(rc) != .SUCCESS) return;
-            const from = na.fromSockaddr(&pa);
-            if (acl.allow(s.cfg.allow_from, from)) try s.ask(buf[0..rc], .{ .udp = .{ .fd = fd, .addr = from } }, crowded);
+        var read: usize = 0;
+        while (true) {
+            // What is read is asked, so no more is read than may still park.
+            const want = @min(udp_per_wake - read, Batch.max, udp_misses_per_wake -| (s.parks - parks));
+            if (want == 0) return;
+            const got = s.in.recv(fd, want);
+            for (0..got) |i| {
+                const from = s.in.from(i);
+                if (acl.allow(s.cfg.allow_from, from)) try s.ask(s.in.datagram(i), .{ .udp = .{ .fd = fd, .addr = from } }, crowded);
+            }
+            s.out.flush();
+            if (got < want) return;
+            read += got;
         }
     }
 
@@ -723,7 +730,7 @@ const Server = struct {
         var ctx = response.ResponseContext.fromQuery(query, payload);
         ctx.rebinding = &s.cfg.rebinding;
         if (reply == .tcp) ctx.tcp_keepalive = @intCast(s.cfg.tcp_idle_timeout_ms / 100);
-        const wire = response.buildResponseWire(buf[2..], ctx, served.reply(), arena) orelse
+        const wire = response.buildResponseWire(s.room(reply, &buf), ctx, served.reply(), arena) orelse
             return s.sendError(reply, query.header.id, query.header.flags.opcode, .server_failure, 0, query.header.flags.rd, query.questions[0], query.opt);
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
@@ -740,27 +747,29 @@ const Server = struct {
             log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
         s.count(served.rcode, served.ede);
-        s.write(reply, buf[0 .. 2 + wire.len]);
+        s.write(reply, &buf, wire.len);
     }
 
     fn sendError(s: *Server, reply: Reply, id: u16, opcode: dns.OpCode, rcode: dns.RCode, extended: u8, rd: bool, question: ?dns.Question, opt: ?dns.OptRecord) void {
         var buf: [2 + @as(usize, dns.max_udp_payload)]u8 = undefined;
-        const wire = response.serializeErrorResponse(buf[2..], id, opcode, rcode, extended, rd, question, opt);
+        const wire = response.serializeErrorResponse(s.room(reply, &buf)[0..dns.max_udp_payload], id, opcode, rcode, extended, rd, question, opt);
         s.count(rcode, null);
-        s.write(reply, buf[0 .. 2 + wire.len]);
+        s.write(reply, &buf, wire.len);
     }
 
-    /// `framed`: two bytes of room, then the wire.
-    fn write(s: *Server, reply: Reply, framed: []u8) void {
+    fn room(s: *Server, reply: Reply, frame: []u8) []u8 {
+        return switch (reply) {
+            .udp => |u| if (u.fd < 0) frame[2..] else s.out.next(u.fd),
+            .tcp => frame[2..],
+        };
+    }
+
+    fn write(s: *Server, reply: Reply, frame: []u8, len: usize) void {
         switch (reply) {
-            .udp => |u| {
-                if (u.fd < 0) return;
-                var pa: na.PosixAddress = undefined;
-                const len = na.toSockaddr(&u.addr, &pa);
-                _ = sys.sendto(u.fd, framed[2..], linux.MSG.DONTWAIT, &pa.any, len) catch {};
-            },
+            .udp => |u| if (u.fd >= 0) s.out.push(len, &u.addr),
             .tcp => |c| {
-                mem.writeInt(u16, framed[0..2], @intCast(framed.len - 2), .big);
+                const framed = frame[0 .. 2 + len];
+                mem.writeInt(u16, framed[0..2], @intCast(len), .big);
                 c.owed -= 1;
                 c.last_ns = s.e.now_ns;
                 var rest: []const u8 = framed;
@@ -828,7 +837,11 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     defer g.deinit();
     g.attach();
     e.work = g.work.allocator();
-    var s: Server = .{ .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
+    const in = try Batch.create(gpa, udp_recv_max);
+    defer in.destroy(gpa);
+    const out = try Batch.create(gpa, cfg.max_udp_payload);
+    defer out.destroy(gpa);
+    var s: Server = .{ .in = in, .out = out, .gpa = gpa, .cfg = cfg, .e = &e, .g = &g, .max_conns = fdShare(4), .desk = .{ .g = &g, .retention = .{ .min_ttl = cfg.min_ttl, .serve_stale_ttl = cfg.serve_stale_ttl }, .dns64 = cfg.dns64, .minimal = cfg.minimal_responses }, .scratch = .init(gpa), .started_ns = e.now_ns, .window = .{ .at_ns = e.now_ns, .clients = .{} } };
     defer s.deinit();
     for (cfg.listen) |addr| try s.listen(addr);
     if (cfg.drop_gid != null or cfg.drop_uid != null) {
@@ -852,6 +865,8 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
             stats_at = e.now_ns + stats_every;
             s.logSummary();
         }
+        // No reply waits out a wait.
+        s.out.flush();
         const ev = try e.next(@min(e.now_ns + std.time.ns_per_s, s.nextTimer())) orelse {
             try s.settle();
             continue;
@@ -862,6 +877,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         }
         try s.settle();
     }
+    s.out.flush();
     s.logCounters();
     s.logSummary();
     log.info("shutting down", .{});
