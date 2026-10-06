@@ -691,17 +691,23 @@ const Walked = struct {
     took_ms: i64,
     ns1_ms: ?i64,
     ns2_ms: ?i64,
+    ns3_ms: ?i64,
     ns1: ?ns_rtt.RttState,
     ns2: ?ns_rtt.RttState,
 };
 
 /// Checks the walk answers, then that the graph drains as exchanges settle.
 fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings) !Walked {
+    return walk(arena, siblings_rpl, seed, stagger_ms, planted);
+}
+
+fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted: Siblings) !Walked {
     var diag: rpl.Diag = .{};
-    const scenario = try rpl.parse(arena, siblings_rpl, &diag);
+    const scenario = try rpl.parse(arena, text, &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     const ns1 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 3 }, 53));
     const ns2 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 4 }, 53));
+    const ns3 = na.AddressKey.fromAddress(na.initIp4(.{ 127, 0, 10, 6 }, 53));
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, seed);
     defer s.deinit();
@@ -713,6 +719,7 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
     const horizon = start + 10 * std.time.ns_per_s;
     var ns1_ms: ?i64 = null;
     var ns2_ms: ?i64 = null;
+    var ns3_ms: ?i64 = null;
     const root = try g.demandRoot(q.name, q.qtype, .new);
     try g.drain();
     while (!g.cell(root).settled()) {
@@ -723,6 +730,7 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
             const key = na.AddressKey.fromAddress(row.server);
             if (key.eql(ns1) and ns1_ms == null) ns1_ms = at_ms;
             if (key.eql(ns2) and ns2_ms == null) ns2_ms = at_ms;
+            if (key.eql(ns3) and ns3_ms == null) ns3_ms = at_ms;
         }
     }
     try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
@@ -730,11 +738,13 @@ fn walkSiblings(arena: Allocator, seed: u64, stagger_ms: u32, planted: Siblings)
     const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
     while (s.next(horizon)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.live);
-    return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns1 = g.rtt.get(ns1), .ns2 = g.rtt.get(ns2) };
+    return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns3_ms = ns3_ms, .ns1 = g.rtt.get(ns1), .ns2 = g.rtt.get(ns2) };
 }
 
 /// srtt 1.5 s: a 3 s estimate, past the 2 s cap.
 const dead: ns_rtt.RttState = .{ .srtt_us = 1500 * std.time.us_per_ms, .consecutive_timeouts = 4, .dead_until_ms = std.math.maxInt(i64) };
+
+const far: ns_rtt.RttState = .{ .srtt_us = 160 * std.time.us_per_ms, .min_rtt_us = 160 * std.time.us_per_ms };
 
 test "a silent sibling is hedged past and still records its timeout" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -787,6 +797,34 @@ test "servers all dead are hedged through like any list" {
         try testing.expect(w.ns2_ms.? - w.ns1_ms.? < 500);
     }
     try testing.expect(ns1_first_seen);
+}
+
+test "a server never timed is asked as readily as the best that answers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var first: [2]bool = @splat(false);
+    for (1..9) |seed| {
+        const w = try walkSiblings(arena_state.allocator(), seed, 150, .{ .ns2 = far });
+        first[@intFromBool(w.ns1_ms == null or w.ns2_ms.? < w.ns1_ms.?)] = true;
+    }
+    try testing.expectEqual(.{ true, true }, first);
+}
+
+test "a hedge goes to a server that answers before one never timed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // ns1 at a second address, 127.0.10.6, where nothing listens either.
+    const glue = "ns1.example.com. 86400 IN A 127.0.10.3";
+    const text = try mem.replaceOwned(u8, arena, siblings_rpl, glue, glue ++ "\n ns1.example.com. 86400 IN A 127.0.10.6");
+    var hedged = false;
+    for (1..9) |seed| {
+        const w = try walk(arena, text, seed, 150, .{ .ns2 = far });
+        if (w.ns1_ms == null and w.ns3_ms == null) continue;
+        hedged = true;
+        try testing.expect(w.ns1_ms == null or w.ns3_ms == null);
+    }
+    try testing.expect(hedged);
 }
 
 test "the door counts exchanges in flight" {

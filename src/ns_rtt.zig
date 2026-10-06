@@ -44,6 +44,10 @@ const max_hedge_stagger_ms: u32 = 300;
 /// Estimates closer than this are noise.
 const band_us: i64 = 50 * std.time.us_per_ms;
 
+/// Past every band a reply reaches: never timed, then timed out and never
+/// answered, then dead.
+pub const untimed_band = dead_band - 2;
+pub const silent_band = dead_band - 1;
 pub const dead_band = std.math.maxInt(i64);
 
 /// RFC 1035 §4.2.1 ≥2 s.
@@ -99,9 +103,13 @@ pub const RttState = struct {
         return s.consecutive_timeouts >= dead_threshold and s.dead_until_ms > now_ms;
     }
 
-    /// A server never timed ranks with the fastest.
+    /// Lower is asked first. A reply alone places a server by round trip:
+    /// the estimate a timeout leaves one that has never answered is how
+    /// long to wait for it, not how far it is.
     pub fn band(s: RttState, now_ms: i64) i64 {
-        return if (s.isDead(now_ms)) dead_band else @divTrunc(s.srtt_us, band_us);
+        if (s.isDead(now_ms)) return dead_band;
+        if (s.min_rtt_us == 0) return if (s.srtt_us == 0) untimed_band else silent_band;
+        return @divTrunc(s.srtt_us, band_us);
     }
 
     pub fn timeout(s: RttState, is_last: bool, transport: Transport) u32 {
@@ -135,6 +143,22 @@ pub const RttState = struct {
         return dead_duration_ms << shift;
     }
 };
+
+test "a reply ranks above no history, and no history above silence" {
+    var slow: RttState = .unknown;
+    slow.observe(900_000, 1000);
+    var silent: RttState = .unknown;
+    _ = silent.observeTimeout(1000);
+    var dead = slow;
+    for (0..dead_threshold) |_| _ = dead.observeTimeout(1000);
+    const untimed: RttState = .unknown;
+    try testing.expect(slow.band(1000) < untimed.band(1000));
+    try testing.expect(untimed.band(1000) < silent.band(1000));
+    try testing.expect(silent.band(1000) < dead.band(1000));
+    var lossy = slow;
+    _ = lossy.observeTimeout(1000);
+    try testing.expectEqual(slow.band(1000), lossy.band(1000));
+}
 
 test "hedge stagger is 3x min_rtt clamped to [50, 300]" {
     var s: RttState = .unknown;

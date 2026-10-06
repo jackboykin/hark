@@ -123,18 +123,24 @@ pub const Ask = struct {
     fn pick(a: *const Ask, g: *Graph) ?Pick {
         var best: i64 = ns_rtt.dead_band;
         var ties: u32 = 0;
+        var untimed: u32 = 0;
         var live: u8 = 0;
         var m = a.untried();
         while (m != 0) : (m &= m - 1) {
             const i = @ctz(m);
             const b = g.band(a.servers[i]);
             live += @intFromBool(b != ns_rtt.dead_band);
+            if (b == ns_rtt.untimed_band) untimed |= bit(i);
             if (b < best) {
                 best = b;
                 ties = bit(i);
             } else if (b == best) ties |= bit(i);
         }
         if (ties == 0) return null;
+        // Nothing says a server never timed is slower than the best that
+        // answer, or faster: an ask's first attempt goes to it as readily.
+        // Every later one goes to a server that answers while any is left.
+        if (a.tried == 0) ties |= untimed;
         const dead = best == ns_rtt.dead_band;
         // Every dead server ties in the dead band.
         const last = if (dead) @popCount(ties) == 1 else live == 1;
