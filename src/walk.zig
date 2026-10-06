@@ -527,9 +527,8 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     if (!g.cell(rid).settled()) return;
     if (g.cell(rid).failure()) |why| return g.fail(id, why);
     var expires = g.cell(rid).expires_ns;
-    const kind = g.cell(rid).state.fact.rrset.kind;
-    // A bogus answer is no address.
-    if (g.cfg.trust_anchor != null and (kind == .answer or kind == .alias)) {
+    // A denial too: unjudged it is no fact, and nothing keeps it.
+    if (g.cfg.trust_anchor != null) {
         if (s.judge == .none) s.judge = .wrap(try trust.demandSecure(g, id, rid) orelse
             return g.fail(id, .unreachable_authority));
         const j = g.cell(s.judge.unwrap().?);

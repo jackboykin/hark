@@ -1,0 +1,131 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = host.
+
+SCENARIO_BEGIN a server's denied family is judged, and not asked for again
+
+; example. is served by ns.host., unglued, and host. is signed. ns.host. has
+; an A and a signed proof that it has no AAAA. The denial is judged as the
+; address is, and judged it is a fact: the host has no AAAA for the proof's
+; hour. When the host's one address then refuses, nothing is unknown about
+; it, so example. has no server and the AAAA is not asked for a second
+; time. Left unjudged, the denial would be no fact, kept by nobody, and
+; every walk that ran out of servers would ask for it again:
+; CHECK_MAX_QUERIES pins the count.
+;
+; Topology
+;   root     127.0.10.1   signed; delegates example. to ns.host., no glue;
+;                         host. to ns0.host., glued
+;   host     127.0.10.2   signed; ns.host. A, and no AAAA
+;   example  127.0.10.3   signed; answers at first, then refuses
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.host.
+      example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      host. IN A
+    SECTION AUTHORITY
+      host. 3600 IN NS ns0.host.
+      host. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns0.host. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN A
+    SECTION ANSWER
+      ns.host. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN AAAA
+    SECTION AUTHORITY
+      host. 3600 IN SOA ns0.host. nobody.invalid. 1 7200 3600 86400 3600
+      ns.host. 3600 IN NSEC ns0.host. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 2
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 3 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR REFUSED
+    SECTION QUESTION
+      example. IN A
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    mail.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_MAX_QUERIES 10
+
+SCENARIO_END
