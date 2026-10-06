@@ -1070,6 +1070,11 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         }
         const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
         if (a.nattempts == 0 or early) if (a.pick(g)) |p| if (a.nattempts == 0 or !p.dead or !a.liveInFlight(g)) {
+            // Hark's policy, not the authorities' word: it judges sends, never facts.
+            if (!g.cfg.addr_policy.allows(a.servers[p.server].toAddress())) {
+                a.tried |= Ask.bit(p.server);
+                continue;
+            }
             const state = try sendTo(g, id, a, p.server, p.last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
             a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
             if (g.cfg.stagger_ms > 0 and !p.last) try g.wake(id, a.hedge_at);

@@ -50,12 +50,15 @@ pub const AddrPolicy = struct {
     allow_loopback: bool = false,
 
     pub fn address(policy: AddrPolicy, rr: dns.ResourceRecord) ?na.Address {
-        const addr = switch (rr.rtype) {
+        return switch (rr.rtype) {
             .a => na.initIp4(rr.rdata.a, policy.upstream_port),
             .aaaa => na.initIp6(rr.rdata.aaaa, policy.upstream_port, 0, 0),
-            else => return null,
+            else => null,
         };
-        return if (!policy.allow_loopback and na.isNonRoutableNs(addr)) null else addr;
+    }
+
+    pub fn allows(policy: AddrPolicy, addr: na.Address) bool {
+        return policy.allow_loopback or !na.isNonRoutableNs(addr);
     }
 };
 
@@ -130,7 +133,6 @@ fn glueA(name: dns.Name, addr: [4]u8) dns.ResourceRecord {
 }
 
 const www: dns.Name = .{ .labels = &.{ "www", "example", "com" } };
-const ns1: dns.Name = .{ .labels = &.{ "ns1", "example", "com" } };
 
 test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral" {
     const zone: dns.Name = .{ .labels = &.{"com"} };
@@ -175,6 +177,6 @@ test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral
     try testing.expect(shouldTrySibling(msg, zone));
 }
 
-test "private glue is no address (DNS rebinding defense)" {
-    try testing.expectEqual(null, (AddrPolicy{}).address(glueA(ns1, .{ 127, 0, 0, 1 })));
+test "a private address is never sent to (DNS rebinding defense)" {
+    try testing.expect(!(AddrPolicy{}).allows(na.initIp4(.{ 127, 0, 0, 1 }, 53)));
 }
