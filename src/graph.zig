@@ -187,7 +187,8 @@ pub const Cut = struct {
 };
 
 pub const Server = struct {
-    /// Its `addr(name)` key, kept whole so no walk formats or hashes the name.
+    /// The host as a key, so no walk formats or hashes its name: each
+    /// family's `rrset` and `addr` key is `at` it.
     key: Key,
     glue: []const na.Address = &.{},
 };
@@ -877,7 +878,7 @@ pub const Graph = struct {
         c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
-            .cut, .addr, .rrset, .ds, .dnskey => {
+            .cut, .rrset, .ds, .dnskey => {
                 const clock = Tally.clock(&g.tally.store_ns);
                 defer clock.stop();
                 const blob = try g.store.build(value);
@@ -891,7 +892,7 @@ pub const Graph = struct {
                 if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
                 try g.keep(t);
             },
-            .answer, .exchange, .refresh, .ahead => {},
+            .addr, .answer, .exchange, .refresh, .ahead => {},
         }
         try g.woken(id, value == .answer);
     }
@@ -1037,6 +1038,15 @@ pub const Graph = struct {
         const e = g.store.get(key, g.now()) orelse return null;
         const verdict = key.kind == .ds or key.kind == .dnskey;
         return if (e.expires_ns > g.bound(g.payer) or (!verdict and e.stored_ns >= g.payer.refresh_ns)) e else null;
+    }
+
+    /// A stored rrset its judge would pass without running: with DNSSEC
+    /// on, an entry may outlive its verdict.
+    pub fn proven(g: *Graph, key: Key) ?*store.Blob {
+        std.debug.assert(key.kind == .rrset);
+        const e = g.stored(key) orelse return null;
+        if (g.cfg.trust_anchor != null and !e.blob.verdict.serves(g.bound(g.payer))) return null;
+        return e.blob;
     }
 
     /// Would `demand` hand the running rule a fact for `key` without

@@ -1,0 +1,94 @@
+; hark: root-hints = 127.0.10.1
+
+SCENARIO_BEGIN a server's address is asked while its other family is awaited
+
+; example. is served by ns.host., unglued. ns.host.'s A answers; its AAAA
+; is never answered. The A is the host's address whatever becomes of the
+; AAAA, so the question goes to it at once. Answered, nobody is left to
+; wait for the AAAA, and it is not asked a second time. A walk that held
+; the A until both families settled would sit out the silence, ask again,
+; and only then send: CHECK_MAX_QUERIES pins the count.
+;
+; Topology
+;   root     127.0.10.1   delegates example. to ns.host., no glue;
+;                         host. to ns0.host., glued
+;   host     127.0.10.2   ns.host. A; silent on its AAAA
+;   example  127.0.10.3   answers
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 86400 IN NS ns.host.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      host. IN A
+    SECTION AUTHORITY
+      host. 86400 IN NS ns0.host.
+    SECTION ADDITIONAL
+      ns0.host. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN A
+    SECTION ANSWER
+      ns.host. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN AAAA
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question answer
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

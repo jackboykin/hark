@@ -37,13 +37,15 @@ pub const Ask = struct {
     zone: dns.Name = .{ .labels = &.{} },
     /// Held: a TTL-0 delegation answers this ask once, not a re-probe per pass.
     cut: OptionalCellId = .none,
-    have_servers: bool = false,
     /// Every address gathered so far; a later gather appends what is new.
     servers: [max_servers]na.AddressKey = undefined,
     nservers: u8 = 0,
     /// Bit i: `servers[i]` sent to or given up on.
     tried: u32 = 0,
     fetched_unglued: bool = false,
+    /// A family not yet asked for, or a lookup still out: the last server
+    /// known is then no last resort.
+    more: bool = false,
     /// Every server silent once: one more attempt each, at the backed-off timeout.
     retried: bool = false,
     /// In flight, oldest first.
@@ -85,6 +87,13 @@ pub const Ask = struct {
         const key = na.AddressKey.fromAddress(server);
         for (a.servers[0..a.nservers]) |s| if (s.eql(key)) return true;
         return false;
+    }
+
+    fn forget(a: *const Ask, list: *std.ArrayList(na.Address)) void {
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
+        }
     }
 
     fn end(a: *Ask, i: u8) Attempt {
@@ -153,15 +162,13 @@ pub const Ask = struct {
             a.servers[a.nservers] = na.AddressKey.fromAddress(s);
             a.nservers += 1;
         }
-        a.have_servers = a.untried() != 0;
     }
 
     /// The first pass, from the cut in hand: a cut learned this instant
     /// may be one the store refused, or one that lives no time.
-    fn seed(a: *Ask, g: *Graph, id: CellId, cut: graph.Cut) !void {
+    fn seed(a: *Ask, g: *Graph, cut: graph.Cut) !void {
         var list: std.ArrayList(na.Address) = .empty;
-        var left: Left = .{};
-        try reach(g, id, a, a.take(cut), &list, &left);
+        a.more = try reach(g, a.take(cut), &list);
         a.add(g, list.items);
     }
 
@@ -179,7 +186,6 @@ pub const Ask = struct {
             a.tried |= bit(i);
         };
         if (a.tried == bit(a.nservers) - 1) a.tried = 0;
-        a.have_servers = a.nservers > 0;
     }
 
     fn blame(a: *Ask, why: Failure) void {
@@ -232,10 +238,8 @@ pub const CutScratch = struct {
 /// non-authoritative denial) still answers the rule that asked for it
 /// instead of being re-demanded on every wake.
 pub const AddrScratch = struct {
-    a: OptionalCellId = .none,
-    aaaa: OptionalCellId = .none,
-    judge_a: OptionalCellId = .none,
-    judge_aaaa: OptionalCellId = .none,
+    rrset: OptionalCellId = .none,
+    judge: OptionalCellId = .none,
 };
 
 pub const AnswerScratch = struct {
@@ -508,74 +512,45 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
     return null;
 }
 
-/// `addr(host)`: the host's own A and AAAA sets. An NS name must not be an
-/// alias (RFC 2181 §10.3): one that is has no address.
+/// `addr(host, family)`: the addresses in the host's own A or AAAA set,
+/// judged. Never stored: the fact is the rrset's, and a walk reads that
+/// (`reach`). A cell to a family, so neither's life or failure touches
+/// the other's.
 pub fn runAddr(g: *Graph, id: CellId) !void {
-    var kb: graph.KeyBuf = undefined;
     if (g.level(id) + 1 > g.cfg.max_resolve_depth) return g.fail(id, .{ .code = .no_reachable_authority, .text = "too deep" });
     const s = g.cell(id).scratch.addr;
+    const key = g.cell(id).key;
     const host = g.cell(id).name;
-    if (s.a == .none) s.a = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .a), host));
-    if (s.aaaa == .none) s.aaaa = .wrap(try g.demand(id, Key.of(&kb, .rrset, host, .aaaa), host));
+    if (s.rrset == .none) s.rrset = .wrap(try g.demand(id, key.at(.rrset, key.rtype), host) orelse
+        return g.fail(id, .unreachable_authority));
+    const rid = s.rrset.unwrap().?;
+    if (!g.cell(rid).settled()) return;
+    if (g.cell(rid).failure()) |why| return g.fail(id, why);
+    var expires = g.cell(rid).expires_ns;
+    const kind = g.cell(rid).state.fact.rrset.kind;
+    // A bogus answer is no address.
+    if (g.cfg.trust_anchor != null and (kind == .answer or kind == .alias)) {
+        if (s.judge == .none) s.judge = .wrap(try trust.demandSecure(g, id, rid) orelse
+            return g.fail(id, .unreachable_authority));
+        const j = g.cell(s.judge.unwrap().?);
+        if (!j.settled()) return;
+        if (j.failure()) |why| return g.fail(id, why);
+        expires = @min(expires, j.expires_ns);
+    }
     var addrs: std.ArrayList(na.Address) = .empty;
-    var pending = false;
-    // A denial of one family does not age the other's addresses; an
-    // empty set lives only as long as the shortest denial.
-    var expires: i64 = std.math.maxInt(i64);
-    var denied: i64 = std.math.maxInt(i64);
-    var failed: ?Failure = null;
-    for ([_]dns.RType{ .a, .aaaa }) |rtype| {
-        // Unasked is not denied.
-        const rid = (if (rtype == .a) s.a else s.aaaa).unwrap() orelse {
-            failed = failed orelse .unreachable_authority;
-            continue;
-        };
-        const c = g.cell(rid);
-        if (!c.settled()) {
-            pending = true;
-            continue;
-        }
-        var n: usize = 0;
-        if (c.failure()) |why| {
-            failed = failed orelse why;
-            continue;
-        }
-        const r = c.state.fact.rrset;
-        if (r.kind == .answer or r.kind == .alias) {
-            // A bogus answer is no address.
-            if (g.cfg.trust_anchor != null) {
-                const slot = if (rtype == .a) &s.judge_a else &s.judge_aaaa;
-                if (slot.* == .none) slot.* = .wrap(try trust.demandSecure(g, id, rid));
-                const j = g.cell(slot.*.unwrap() orelse {
-                    failed = failed orelse .unreachable_authority;
-                    continue;
-                });
-                if (!j.settled()) {
-                    pending = true;
-                    continue;
-                }
-                if (j.failure()) |why| {
-                    failed = failed orelse why;
-                    continue;
-                }
-            }
-            if (r.kind == .answer) for (r.answers) |rr| {
-                if (rr.rtype != rtype or !rr.name.eql(host)) continue;
-                if (g.cfg.addr_policy.address(rr)) |a| {
-                    try addrs.append(g.scratch.allocator(), a);
-                    n += 1;
-                }
-            };
-        }
-        if (n > 0) expires = @min(expires, c.expires_ns) else denied = @min(denied, c.expires_ns);
+    try ownAddresses(g, g.cell(rid).blob.?, key.rtype, &addrs);
+    std.debug.assert(addrs.items.len == 0 or g.cell(rid).state.fact.rrset.answers[0].name.eql(host));
+    try g.settle(id, .{ .addr = try g.cell(id).arena.allocator().dupe(na.Address, addrs.items) }, expires);
+}
+
+/// A chain is kept in the order followed (`classify`), so a set at the
+/// name asked leads its answer. One led by anything else is another
+/// name's: an NS name must not be an alias (RFC 2181 §10.3).
+fn ownAddresses(g: *Graph, blob: *store.Blob, family: dns.RType, list: *std.ArrayList(na.Address)) !void {
+    var own = store.Rrset.answered(blob) orelse return;
+    while (own.next()) |rr| {
+        if (rr.rtype() == family) try list.append(g.scratch.allocator(), g.cfg.addr_policy.wire(rr).?) else if (rr.rtype() != .rrsig) return;
     }
-    if (pending) return;
-    if (addrs.items.len == 0) {
-        // Only denials and aliases make an empty set a fact.
-        if (failed) |why| return g.fail(id, why);
-        expires = denied;
-    }
-    try g.settle(id, .{ .addr = addrs.items }, expires);
 }
 
 /// `rrset(name, type)`: from the deepest known cut at or above the name,
@@ -609,7 +584,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .cut => |cid| g.cell(cid),
         };
         s.ask.reset(cut.state.fact.cut.zone);
-        try s.ask.seed(g, id, cut.state.fact.cut);
+        try s.ask.seed(g, cut.state.fact.cut);
         s.started = true;
     }
     while (true) {
@@ -632,7 +607,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
                     s2.ask.reset(ref.zone_cut);
-                    try s2.ask.seed(g, id, cut.value.cut);
+                    try s2.ask.seed(g, cut.value.cut);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
@@ -1023,15 +998,6 @@ test "an age rounds up to the whole second" {
 
 fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
     while (true) {
-        if (!a.have_servers) switch (try gatherServers(g, id, a)) {
-            .pending => return .pending,
-            .none => {
-                if (a.retried or a.held != .none) return a.giveUp(g);
-                a.retry(g);
-                continue;
-            },
-            .ready => {},
-        };
         var i: u8 = 0;
         while (i < a.nattempts) {
             const ex = g.cell(a.attempts[i].exchange);
@@ -1069,20 +1035,31 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
             }
         }
         const early = g.cfg.stagger_ms > 0 and a.nattempts < max_hedge and g.now() >= a.hedge_at;
-        if (a.nattempts == 0 or early) if (a.pick(g)) |p| if (a.nattempts == 0 or !p.dead or !a.liveInFlight(g)) {
-            // Hark's policy, not the authorities' word: it judges sends, never facts.
-            if (!g.cfg.addr_policy.allows(a.servers[p.server].toAddress())) {
-                a.tried |= Ask.bit(p.server);
-                continue;
+        if (a.nattempts > 0 and !early) return .pending;
+        const p = a.pick(g) orelse {
+            // No server left to try or to hedge to: before a timeout is
+            // sat out, gather what settled since and ask for what is unknown.
+            switch (try gatherServers(g, id, a)) {
+                .ready => continue,
+                .pending => return .pending,
+                .none => {
+                    if (a.nattempts > 0) return .pending;
+                    if (a.retried or a.held != .none) return a.giveUp(g);
+                    a.retry(g);
+                    continue;
+                },
             }
-            const state = try sendTo(g, id, a, p.server, p.last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
-            a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
-            if (g.cfg.stagger_ms > 0 and !p.last) try g.wake(id, a.hedge_at);
-            continue;
         };
-        if (a.nattempts > 0) return .pending;
-        // Every known server tried: gather again for what settled since.
-        a.have_servers = false;
+        if (a.nattempts > 0 and p.dead and a.liveInFlight(g)) return .pending;
+        // Hark's policy, not the authorities' word: it judges sends, never facts.
+        if (!g.cfg.addr_policy.allows(a.servers[p.server].toAddress())) {
+            a.tried |= Ask.bit(p.server);
+            continue;
+        }
+        const last = p.last and !a.more;
+        const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
+        a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
+        if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
     }
 }
 
@@ -1122,13 +1099,16 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             a.blame(why);
             return .none;
         }
-        var left: Left = .{};
         // A shallower cut: no delegation here while it holds.
-        if (cut.state.fact.cut.zone.eql(zone)) try reach(g, id, a, a.take(cut.state.fact.cut), &list, &left);
-        var i: usize = 0;
-        while (i < list.items.len) {
-            if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
+        const servers: []const graph.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
+        const partial = try reach(g, servers, &list);
+        a.forget(&list);
+        var left: Left = .{};
+        if (list.items.len == 0 or a.fetched_unglued) {
+            try learn(g, id, a, servers, &list, &left);
+            a.forget(&list);
         }
+        a.more = if (a.fetched_unglued) left.awaited else partial;
         // A sibling in progress for someone is waited for only when
         // nothing else is left, and only if it isn't waiting on us.
         if (list.items.len == 0) {
@@ -1136,6 +1116,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
             for (left.busy.items) |key| {
                 if (try g.demand(id, key, try dns.parseDottedName(sa, key.name)) != null) pending = true;
             }
+            a.more = a.more or pending;
             if (pending) return .pending;
         }
         const unknown = left.unknown.items;
@@ -1146,18 +1127,23 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                 1 => 2,
                 else => 1,
             };
-            g.edge.rng.shuffle(Key, unknown);
+            g.edge.rng.shuffle(Left.Unknown, unknown);
             var demanded = false;
-            for (unknown[0..@min(limit, unknown.len)]) |key| {
-                const aid = try g.demand(id, key, try dns.parseDottedName(sa, key.name)) orelse continue;
-                if (!g.cell(aid).settled()) demanded = true;
+            for (unknown[0..@min(limit, unknown.len)]) |u| {
+                const host = try dns.parseDottedName(sa, u.host.name);
+                for (families, u.families) |family, wanted| {
+                    if (!wanted) continue;
+                    const aid = try g.demand(id, u.host.at(.addr, family), host) orelse continue;
+                    if (!g.cell(aid).settled()) demanded = true;
+                }
             }
+            a.more = demanded;
             if (demanded) return .pending;
             return gatherServers(g, id, a);
         }
     }
     a.add(g, list.items);
-    if (a.have_servers) return .ready;
+    if (a.untried() != 0) return .ready;
     if (g.cfg.trace) {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         var zb: [dns.max_dotted_len + 1]u8 = undefined;
@@ -1166,40 +1152,62 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     return .none;
 }
 
+const families = [_]dns.RType{ .a, .aaaa };
+
 const Left = struct {
     busy: std.ArrayList(Key) = .empty,
-    unknown: std.ArrayList(Key) = .empty,
+    awaited: bool = false,
+    unknown: std.ArrayList(Unknown) = .empty,
+
+    const Unknown = struct { host: Key, families: [families.len]bool };
 };
 
 /// The referral alone decides where a server is reached: at its glue, the
-/// parent's word, if it gave any, else at its own zone's `addr`. Nothing
-/// else held is read, so what a glued server's zone says of it never
-/// changes how it is reached.
-fn reach(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *std.ArrayList(na.Address), left: *Left) !void {
+/// parent's word, if it gave any, else at its own zone's stored sets, a
+/// family at a time. Nothing else held is read, so what a glued server's
+/// zone says of it never changes how it is reached.
+fn reach(g: *Graph, servers: []const graph.Server, list: *std.ArrayList(na.Address)) !bool {
     const sa = g.scratch.allocator();
+    var partial = false;
     for (servers) |server| {
         if (server.glue.len > 0) {
             try list.appendSlice(sa, server.glue);
             continue;
         }
-        const key = server.key;
-        if (try g.held(key)) |f| {
-            try list.appendSlice(sa, f.value.addr);
-            continue;
+        for (families) |family| {
+            if (g.proven(server.key.at(.rrset, family))) |blob| try ownAddresses(g, blob, family, list) else partial = true;
         }
-        if (g.index.get(key)) |aid| {
-            if (g.cell(aid).settled()) {
-                // Ours, settled TTL-0 or failed: a fact serves its
-                // demander, a failure gives nothing.
-                if (g.holdsInput(id, aid)) {
-                    if (g.cell(aid).failure()) |why| a.blame(why) else try list.appendSlice(sa, g.cell(aid).state.fact.addr);
+    }
+    return partial;
+}
+
+/// What `reach` found no stored set for: this walk's own settled lookups,
+/// lookups in progress, and the unknown. Unknown is never none: a set
+/// that lapsed, failed or was never asked for says nothing of the host.
+fn learn(g: *Graph, id: CellId, a: *Ask, servers: []const graph.Server, list: *std.ArrayList(na.Address), left: *Left) !void {
+    const sa = g.scratch.allocator();
+    for (servers) |server| {
+        if (server.glue.len > 0) continue;
+        var unknown: [families.len]bool = @splat(false);
+        for (families, &unknown) |family, *u| {
+            if (g.proven(server.key.at(.rrset, family)) != null) continue;
+            const key = server.key.at(.addr, family);
+            if (g.index.get(key)) |aid| {
+                const c = g.cell(aid);
+                if (!c.settled()) {
+                    left.awaited = left.awaited or g.holdsInput(id, aid);
+                    try left.busy.append(sa, key);
                     continue;
                 }
-            } else {
-                try left.busy.append(sa, key);
-                continue;
+                // Ours: a set that lives no time serves its demander, a
+                // failure gives nothing.
+                if (g.holdsInput(id, aid)) {
+                    if (c.failure()) |why| a.blame(why) else try list.appendSlice(sa, c.state.fact.addr);
+                    continue;
+                }
             }
+            u.* = true;
         }
-        try left.unknown.append(sa, key);
+        if (mem.indexOfScalar(bool, &unknown, true) != null) try left.unknown.append(sa, .{ .host = server.key, .families = unknown });
     }
 }

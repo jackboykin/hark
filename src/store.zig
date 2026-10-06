@@ -248,7 +248,6 @@ pub const Store = struct {
                 }
                 for (c.servers) |server| for (server.glue) |gl| try w.addr(gl);
             },
-            .addr => |a| try w.addrs(a),
             .rrset => |r| {
                 // `Rrset.of` reads these in place.
                 try w.int(u8, @backingInt(r.kind));
@@ -267,7 +266,7 @@ pub const Store = struct {
                 try w.int(u16, @intCast(c.records.len));
                 try w.records(c.records);
             },
-            .answer, .secure, .exchange, .refresh, .ahead => unreachable,
+            .addr, .answer, .secure, .exchange, .refresh, .ahead => unreachable,
         }
         const out = try s.gpa.alignedAlloc(u8, .fromByteUnits(8), w.pos);
         @memcpy(out, s.stage[0..w.pos]);
@@ -296,7 +295,6 @@ pub const Store = struct {
                 for (glue) |*gl| gl.* = try r.addr();
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
-            .addr => .{ .addr = try r.addrs(arena) },
             .rrset => blk: {
                 var reply: graph.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
@@ -324,7 +322,7 @@ pub const Store = struct {
                 c.records = try r.records(arena, try r.int(u16));
                 break :blk if (kind == .ds) .{ .ds = c } else .{ .dnskey = c };
             },
-            .answer, .secure, .exchange, .refresh, .ahead => unreachable,
+            .addr, .answer, .secure, .exchange, .refresh, .ahead => unreachable,
         };
     }
 };
@@ -347,6 +345,28 @@ pub const Rrset = struct {
         std.debug.assert(@as(Kind, @fromBackingInt(b.kind)) == .rrset);
         return read(.{ .buf = b.payload() }) catch unreachable;
     }
+
+    /// An `answer`'s answer section, without `of`'s walk over every record.
+    pub fn answered(b: *Blob) ?Answered {
+        std.debug.assert(@as(Kind, @fromBackingInt(b.kind)) == .rrset);
+        const p = b.payload();
+        if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[0])))) != .answer) return null;
+        var at: usize = 1 + 1 + 2 + 4 + 8;
+        at += dns.wireNameLen(p[at..]);
+        at += dns.wireNameLen(p[at..]);
+        return .{ .it = .{ .bytes = p[at + 6 ..] }, .left = mem.readInt(u16, p[at..][0..2], .little) };
+    }
+
+    pub const Answered = struct {
+        it: Records.Iterator,
+        left: u16,
+
+        pub fn next(a: *Answered) ?dns.WireRecord {
+            if (a.left == 0) return null;
+            a.left -= 1;
+            return a.it.next();
+        }
+    };
 
     fn read(r0: Reader) !Rrset {
         var r = r0;
@@ -429,11 +449,6 @@ const Writer = struct {
         w.pos += try dns.writeNameWire(w.buf[w.pos..], n);
     }
 
-    fn addrs(w: *Writer, list: []const na.Address) !void {
-        try w.int(u16, @intCast(list.len));
-        for (list) |a| try w.addr(a);
-    }
-
     fn addr(w: *Writer, a: na.Address) !void {
         const k = na.AddressKey.fromAddress(a);
         try w.int(u8, k.family);
@@ -468,12 +483,6 @@ const Reader = struct {
 
     fn wireName(r: *Reader) ![]const u8 {
         return r.slice(dns.wireNameLen(r.buf[r.pos..]));
-    }
-
-    fn addrs(r: *Reader, arena: Allocator) ![]na.Address {
-        const list = try arena.alloc(na.Address, try r.int(u16));
-        for (list) |*a| a.* = try r.addr();
-        return list;
     }
 
     fn addr(r: *Reader) !na.Address {
@@ -570,18 +579,15 @@ test "a fact survives the blob byte for byte" {
     }
 
     _ = blob.ref();
-    const newer = try s.build(.{ .addr = &.{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) } });
+    const glue = [_]na.Address{ na.initIp4(.{ 10, 0, 0, 1 }, 53), na.initIp6(@splat(1), 853, 0, 0) };
+    const newer = try s.build(.{ .cut = .{ .zone = zone, .servers = &.{.{ .key = .init(.addr, "ns.example.com", .a), .glue = &glue }} } });
     try s.put(key, newer, 2000, 0);
     try testing.expectEqual(1, blob.refs);
-    const addr = (try Store.parse(arena, newer)).addr;
-    try testing.expect(addr.len == 2 and na.ipEqual(addr[1], na.initIp6(@splat(1), 853, 0, 0)));
+    const cut = (try Store.parse(arena, newer)).cut;
+    try testing.expect(cut.zone.eqlExact(zone));
+    try testing.expect(cut.servers[0].glue.len == 2 and na.ipEqual(cut.servers[0].glue[1], glue[1]));
     s.unref(blob);
     try testing.expectEqual(newer.len, s.bytes);
-
-    const cut_blob = try s.build(.{ .cut = .{ .zone = zone } });
-    defer s.unref(cut_blob);
-    const cut = (try Store.parse(arena, cut_blob)).cut;
-    try testing.expect(cut.zone.eqlExact(zone));
 }
 
 test "the cap holds by eviction and admission" {

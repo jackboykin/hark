@@ -1,0 +1,178 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: dnssec-zone = host.
+
+SCENARIO_BEGIN a server's addresses end with the verdict on them
+
+; example. is served by ns.host., unglued. host. is unsigned at first: the
+; root denies its DS, a proof that lives a minute, and under it ns.host.'s
+; unsigned A, an hour long, is insecure. The address is usable only while
+; that verdict holds. Past the minute the root serves a DS for host. while
+; its data is still unsigned, so the address judged again is bogus, and a
+; bogus answer is no address: example. has no server, as a cold walk would
+; find. A resolver that kept the address for the A's hour would go on
+; using it under a verdict nothing proves any more.
+;
+; Topology
+;   root     127.0.10.1   signed; delegates example., signed, to ns.host.,
+;                         no glue; host. to ns0.host., glued: unsigned at
+;                         first, then with a DS
+;   host     127.0.10.2   ns.host. A; never signed, it has no keys
+;   example  127.0.10.3   answers, signed
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.host.
+      example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 3
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    SIGN_AS .
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      host. IN DS
+    SECTION AUTHORITY
+      . 60 IN SOA a.root. nobody.invalid. 1 7200 3600 86400 60
+      host. 60 IN NSEC zz. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      host. IN A
+    SECTION AUTHORITY
+      host. 3600 IN NS ns0.host.
+    SECTION ADDITIONAL
+      ns0.host. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 4 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    SIGN_AS .
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      host. IN DS
+    SECTION ANSWER
+      host. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      host. IN A
+    SECTION AUTHORITY
+      host. 3600 IN NS ns0.host.
+      host. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns0.host. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN A
+    SECTION ANSWER
+      ns.host. 3600 IN A 127.0.10.3
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      ns.host. IN AAAA
+    SECTION AUTHORITY
+      host. 3600 IN SOA ns0.host. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query unsigned
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      host. IN DNSKEY
+    SECTION AUTHORITY
+      host. 3600 IN SOA ns0.host. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.example. IN A
+    SECTION ANSWER
+      mail.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    www.example. IN A
+  SECTION ANSWER
+    www.example. 3600 IN A 192.0.2.1
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 61
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    mail.example. IN A
+ENTRY_END
+
+SCENARIO_END
