@@ -519,6 +519,11 @@ fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
     return null;
 }
 
+fn named(wire: []const u8, n: dns.Name) bool {
+    var labels: [dns.max_label_count][]const u8 = undefined;
+    return dns.nameOfWire(wire, &labels).eql(n);
+}
+
 /// `addr(host, family)`: the addresses in the host's own A or AAAA set,
 /// judged. Never stored: the fact is the rrset's, and a walk reads that
 /// (`reach`). A cell to a family, so neither's life or failure touches
@@ -570,7 +575,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         // RFC 6672 §3.4.1: a cached DNAME answers before any cut is sought.
         if (!s.dname_checked) {
             s.dname_checked = true;
-            if (try dnameAbove(g, name)) |owner| s.dname = .wrap(try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner));
+            if (dnameAbove(g, name)) |owner| s.dname = .wrap(try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner));
             if (s.dname.unwrap()) |did| s.dname_judge = .wrap(try trust.demandSecure(g, id, did));
         }
         if (s.dname_judge.unwrap()) |jid| {
@@ -705,13 +710,16 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
 /// The owner of the closest DNAME fact above `name`, as `demand` would
 /// hand it: the redirect never waits on a new ask nor reads a version it
 /// did not judge.
-fn dnameAbove(g: *Graph, name: dns.Name) !?dns.Name {
+fn dnameAbove(g: *Graph, name: dns.Name) ?dns.Name {
     var kb: graph.KeyBuf = undefined;
     var i: usize = 1;
     while (i < name.labels.len) : (i += 1) {
         const owner: dns.Name = .{ .labels = name.labels[i..] };
-        const d = try g.held(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
-        if (d.value.rrset.kind == .answer and dnameAt(d.value.rrset.answers, owner) != null) return owner;
+        const d = g.held(Key.of(&kb, .rrset, owner, .dname)) orelse continue;
+        const r: store.Rrset = .of(d.blob);
+        if (r.kind != .answer) continue;
+        var it = r.sections[0].iterator();
+        while (it.next()) |rr| if (rr.rtype() == .dname and named(rr.owner, owner)) return owner;
     }
     return null;
 }

@@ -1058,14 +1058,20 @@ pub const Graph = struct {
         return g.cell(id).state == .fact;
     }
 
-    /// The fact `demand` would hand the running rule for `key` without
-    /// running it: the same version, not merely a fresh one.
-    pub fn held(g: *Graph, key: Key) !?Fact {
-        const live = g.index.get(key);
-        return switch (g.served(key, live) orelse return null) {
-            .stored => |e| try g.factOf(live, e),
-            .live => |id| g.liveFact(id),
+    /// The version `demand` would hand the running rule, not merely a
+    /// fresh one.
+    pub fn held(g: *Graph, key: Key) ?store.Entry {
+        std.debug.assert(key.kind == .rrset);
+        return switch (g.served(key, g.index.get(key)) orelse return null) {
+            .stored => |e| e,
+            .live => |id| if (g.cell(id).state == .fact) g.version(id) else null,
         };
+    }
+
+    /// A settled rrset as the store keeps it.
+    pub fn version(g: *Graph, id: CellId) store.Entry {
+        const c = g.cell(id);
+        return .{ .blob = c.blob.?, .expires_ns = c.expires_ns, .stored_ns = c.state.fact.rrset.stored_ns };
     }
 
     /// A stored fact, read from its live version when there is one.
