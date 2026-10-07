@@ -1,0 +1,74 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a denial carrying no proof is not waited on: the question goes at once
+
+; A denial with no NSEC or NSEC3 can never be judged secure, so the
+; question goes out without waiting on its verdict, here two round trips
+; off: the root's keys, then com.'s DS.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      com. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      com. 3600 IN NSEC d. NS RRSIG NSEC
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      com. IN A
+    SECTION AUTHORITY
+      com. 86400 IN NS a.gtld.fake.
+    SECTION ADDITIONAL
+      a.gtld.fake. 86400 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone.com. IN A
+    SECTION AUTHORITY
+      com. 900 IN SOA a.gtld.fake. hostmaster.com. 1 1800 900 604800 900
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    a.b.gone.com. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    a.b.gone.com. IN A
+  SECTION ANSWER
+ENTRY_END
+
+STEP 3 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    a.b.gone.com. A 127.0.10.2
+    com. DS 127.0.10.1
+ENTRY_END
+
+STEP 4 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

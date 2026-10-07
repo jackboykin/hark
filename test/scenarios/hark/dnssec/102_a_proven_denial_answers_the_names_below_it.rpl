@@ -1,0 +1,64 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+
+SCENARIO_BEGIN a proven denial answers the names below it, which are never sent
+
+; RFC 8020 §2: the NSEC records proving b. gone prove every name below it
+; gone, so neither name below is sent (RFC 9156 §3 step 6d).
+;
+; . NSEC a. covers the wildcard, a. NSEC c. covers b. and all below it.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.foo.b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority ttl
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    www.foo.b. IN A
+  SECTION ANSWER
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+    a. 3600 IN NSEC c. A RRSIG NSEC
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    x.y.b. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    x.y.b. IN A
+  SECTION ANSWER
+ENTRY_END
+
+STEP 5 CHECK_MAX_QUERIES 2
+
+SCENARIO_END

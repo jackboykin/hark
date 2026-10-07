@@ -1,0 +1,139 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+
+SCENARIO_BEGIN a name denied from above lives exactly as long as that denial
+
+; Every name the denial answers for ends with it: asked 40 s in, 20 s
+; are left. Past its minute the denial is drawn again.
+;
+; 3MSE…O1 is example., B39F…PE is b.example., 99JA…05 is *.example.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 6
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b.example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 60
+      3MSEV9USMD4BR9S97V51R2TDVMR9IQO1.example. 3600 IN NSEC3 1 0 0 - 3MSEV9USMD4BR9S97V51R2TDVMR9IQO2 NS SOA RRSIG DNSKEY NSEC3PARAM
+      B39F52K2414AIT0PCPFJOSGB4BS25JPD.example. 3600 IN NSEC3 1 0 0 - B39F52K2414AIT0PCPFJOSGB4BS25JPF A RRSIG
+      99JAHPQEE6F2BU0N7I5CPSM6PBS6TP04.example. 3600 IN NSEC3 1 0 0 - 99JAHPQEE6F2BU0N7I5CPSM6PBS6TP06 A RRSIG
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 7 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b.example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 60
+      3MSEV9USMD4BR9S97V51R2TDVMR9IQO1.example. 3600 IN NSEC3 1 0 0 - 3MSEV9USMD4BR9S97V51R2TDVMR9IQO2 NS SOA RRSIG DNSKEY NSEC3PARAM
+      B39F52K2414AIT0PCPFJOSGB4BS25JPD.example. 3600 IN NSEC3 1 0 0 - B39F52K2414AIT0PCPFJOSGB4BS25JPF A RRSIG
+      99JAHPQEE6F2BU0N7I5CPSM6PBS6TP04.example. 3600 IN NSEC3 1 0 0 - 99JAHPQEE6F2BU0N7I5CPSM6PBS6TP06 A RRSIG
+  ENTRY_END
+RANGE_END
+
+; Without DO the proof stays home and the SOA alone shows the life.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD AD
+  SECTION QUESTION
+    www.foo.b.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority ttl
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    www.foo.b.example. IN A
+  SECTION ANSWER
+  SECTION AUTHORITY
+    example. 60 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 60
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 40
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD AD
+  SECTION QUESTION
+    x.y.b.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority ttl
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    x.y.b.example. IN A
+  SECTION ANSWER
+  SECTION AUTHORITY
+    example. 20 IN SOA ns.example. nobody.invalid. 1 7200 3600 86400 60
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 30
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD AD
+  SECTION QUESTION
+    x.y.b.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority ttl
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    x.y.b.example. IN A
+  SECTION ANSWER
+  SECTION AUTHORITY
+    example. 60 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 60
+ENTRY_END
+
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD AD
+  SECTION QUESTION
+    www.foo.b.example. IN A
+ENTRY_END
+
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer authority ttl
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    www.foo.b.example. IN A
+  SECTION ANSWER
+  SECTION AUTHORITY
+    example. 60 IN SOA ns.example. nobody.invalid. 2 7200 3600 86400 60
+ENTRY_END
+
+STEP 11 CHECK_MAX_QUERIES 5
+
+SCENARIO_END

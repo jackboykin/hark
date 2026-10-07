@@ -1,0 +1,69 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: prefetch = yes
+
+SCENARIO_BEGIN a refresh below a lapsing denial probes the denied name again, and sends nothing else
+
+; A refresh in the denial's last tenth sees past it: b. is probed again,
+; and the full name never goes out.
+
+RANGE_BEGIN 0 1000
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      b. IN A
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 60
+      . 3600 IN NSEC a. SOA NS DNSKEY RRSIG NSEC
+      a. 3600 IN NSEC c. A RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.foo.b. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    www.foo.b. IN A
+ENTRY_END
+
+STEP 3 TIME_PASSES ELAPSE 57
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.foo.b. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA AD NXDOMAIN
+  SECTION QUESTION
+    www.foo.b. IN A
+ENTRY_END
+
+STEP 6 TIME_PASSES ELAPSE 2
+
+STEP 7 CHECK_QUERY_LOG
+ENTRY_BEGIN
+  MATCH order
+  SECTION QUERY_LOG
+    b. A 127.0.10.1
+    b. A 127.0.10.1
+ENTRY_END
+
+STEP 8 CHECK_MAX_QUERIES 3
+
+SCENARIO_END

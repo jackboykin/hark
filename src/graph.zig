@@ -891,6 +891,20 @@ pub const Graph = struct {
         try g.woken(id, value == .answer);
     }
 
+    /// Settles on another key's judged version, its very bytes. Stores
+    /// nothing: the question's judge settles on the stamped verdict and
+    /// keeps it.
+    pub fn settleAs(g: *Graph, id: CellId, v: store.Entry) !void {
+        const c = g.cell(id);
+        std.debug.assert(!c.settled() and c.key.kind == .rrset);
+        std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.blob.verdict.judged());
+        g.tally.settles += 1;
+        c.state = .{ .fact = try store.Store.parse(c.arena.allocator(), v.blob) };
+        c.blob = v.blob.ref();
+        c.expires_ns = v.life().end_ns;
+        try g.woken(id, false);
+    }
+
     /// An rrset's bytes as its judge read them, set before the verdict is
     /// stamped on them (`trust.keepWeighed`).
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {

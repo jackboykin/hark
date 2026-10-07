@@ -225,11 +225,10 @@ const Verdict = union(enum) { reply: Reply, loop, none };
 
 pub const RrsetScratch = struct {
     cut: OptionalCellId = .none,
-    /// A fresh DNAME above the name; only a secure one redirects from
-    /// memory (Unbound's rule; dnssec/023).
-    dname: OptionalCellId = .none,
-    dname_judge: OptionalCellId = .none,
-    dname_checked: bool = false,
+    /// A held fact above the name that speaks for every name below it, and
+    /// its judge: a DNAME (RFC 6672 §3.4.1) or a denial (RFC 8020 §2).
+    above: OptionalCellId = .none,
+    above_judge: OptionalCellId = .none,
     started: bool = false,
     ask: Ask = .{},
 };
@@ -577,21 +576,23 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     const qtype = g.cell(id).key.rtype;
     const s = g.cell(id).scratch.rrset;
     if (!s.started) {
-        // RFC 6672 §3.4.1: a cached DNAME answers before any cut is sought.
-        if (!s.dname_checked) {
-            s.dname_checked = true;
-            if (dnameAbove(g, name)) |owner| s.dname = .wrap(try g.demand(id, Key.of(&kb, .rrset, owner, .dname), owner));
-            if (s.dname.unwrap()) |did| s.dname_judge = .wrap(try trust.demandSecure(g, id, did));
-        }
-        if (s.dname_judge.unwrap()) |jid| {
-            if (!g.cell(jid).settled()) return;
-            if (g.cell(jid).failure() == null and g.cell(jid).state.fact.secure.status == .secure) {
-                const reply = try dnameRedirect(g, name, s.dname.unwrap().?);
-                return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
+        if (s.cut == .none) {
+            if (s.above == .none) if (dnameAbove(g, name)) |owner| try watchAbove(g, id, s, Key.of(&kb, .rrset, owner, .dname), owner);
+            switch (aboveSays(g, s)) {
+                .waits => return,
+                .answers => {
+                    const reply = try dnameRedirect(g, name, s.above.unwrap().?);
+                    return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
+                },
+                // Let go, so past here only a denial is watched.
+                .silent => {
+                    s.above = .none;
+                    s.above_judge = .none;
+                },
             }
+            // Indexed proofs deny the name without a packet.
+            if (try denial.deny(g, id)) return;
         }
-        // Indexed proofs deny the name without a packet.
-        if (s.cut == .none and try denial.deny(g, id)) return;
         const from = proof.deepestApex(name, qtype);
         const cut = switch (try start(g, id, name, from, &s.cut)) {
             .pending => return,
@@ -599,6 +600,12 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
             .failed => |why| return g.fail(id, why),
             .cut => |cid| g.cell(cid),
         };
+        if (s.above == .none and try belowDenial(g, id, s, cut.state.fact.cut.zone)) return;
+        switch (aboveSays(g, s)) {
+            .waits => return,
+            .answers => return g.settleAs(id, g.version(s.above.unwrap().?)),
+            .silent => {},
+        }
         s.ask.reset(cut.state.fact.cut.zone);
         try s.ask.seed(g, cut.state.fact.cut);
         s.started = true;
@@ -710,6 +717,42 @@ fn publishDnames(g: *Graph, by: CellId, reply: Reply) !void {
         const dname: Reply = .{ .kind = .answer, .aa = reply.aa, .answers = dnssec.setFrom(reply.answers, i), .zone = reply.zone, .stored_ns = reply.stored_ns, .ttl = d.ttl };
         try g.publish(Key.of(&kb, .rrset, d.name, .dname), d.name, by, .{ .rrset = dname }, replyExpiry(dname));
     }
+}
+
+fn watchAbove(g: *Graph, id: CellId, s: *RrsetScratch, key: Key, at: dns.Name) !void {
+    s.above = .wrap(try g.demand(id, key, at));
+    if (s.above.unwrap()) |aid| s.above_judge = .wrap(try trust.demandSecure(g, id, aid));
+}
+
+fn aboveSays(g: *Graph, s: *const RrsetScratch) enum { waits, answers, silent } {
+    const j = g.cell(s.above_judge.unwrap() orelse return .silent);
+    if (!j.settled()) return .waits;
+    return if (j.failure() == null and j.state.fact.secure.status == .secure) .answers else .silent;
+}
+
+/// RFC 9156 §3 step 6d, below a secure denial only (RFC 8020 §2): settle
+/// on one whose verdict stands, or watch one awaiting it. One with no NSEC
+/// or NSEC3 can never be judged secure (RFC 4035 §3.1.3.2), so it is not
+/// waited on.
+fn belowDenial(g: *Graph, id: CellId, s: *RrsetScratch, zone: dns.Name) !bool {
+    var kb: graph.KeyBuf = undefined;
+    if (!denial.denies(g, g.cell(id).key.rtype)) return false;
+    const d = deniedAbove(g, g.cell(id).name, zone) orelse return false;
+    if (!provable(d.held.blob)) return false;
+    const v = d.held.blob.verdict;
+    if (v.serves(g.bound(g.payer))) {
+        if (v.chain().status != .secure) return false;
+        try g.settleAs(id, d.held);
+        return true;
+    }
+    try watchAbove(g, id, s, Key.of(&kb, .rrset, d.at, .a), d.at);
+    return false;
+}
+
+fn provable(b: *store.Blob) bool {
+    var it = store.Rrset.of(b).sections[1].iterator();
+    while (it.next()) |rr| if (rr.rtype() == .nsec or rr.rtype() == .nsec3) return true;
+    return false;
 }
 
 /// The owner of the closest DNAME fact above `name`, as `demand` would
