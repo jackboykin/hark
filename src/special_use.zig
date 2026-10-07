@@ -7,7 +7,8 @@
 ///   *.localhost.          RFC 6761 §6.3   → same as parent
 ///   invalid.              RFC 6761 §6.4   → NXDOMAIN
 ///   test.                 RFC 6761 §6.2   → NXDOMAIN
-///   home.arpa.            RFC 8375 §3     → NXDOMAIN (DNS-context only)
+///   home.arpa.            RFC 8375 §4.4.B → NODATA, DS real
+///   *.home.arpa.          RFC 8375 §4.4.B → NXDOMAIN
 ///   onion.                RFC 7686 §2     → NXDOMAIN
 ///   127.in-addr.arpa.     RFC 6761 §6.3   → PTR localhost.
 ///   <::1>.ip6.arpa.       RFC 6761 §6.3   → PTR localhost.
@@ -54,6 +55,9 @@ pub fn classify(name: []const u8, qtype: dns.RType) Action {
     if (eqlOrSubdomainOf(stripped, "invalid")) return .nxdomain;
     if (eqlOrSubdomainOf(stripped, "test")) return .nxdomain;
     if (eqlOrSubdomainOf(stripped, "onion")) return .nxdomain;
+    if (std.ascii.eqlIgnoreCase(stripped, "home.arpa")) {
+        return if (qtype == .ds) .none else .nodata;
+    }
     if (eqlOrSubdomainOf(stripped, "home.arpa")) return .nxdomain;
 
     if (std.ascii.eqlIgnoreCase(stripped, "ipv4only.arpa")) {
@@ -189,7 +193,6 @@ test "classify NXDOMAIN names" {
     try testing.expectEqual(Action.nxdomain, classify("foo.bar.invalid", .aaaa));
     try testing.expectEqual(Action.nxdomain, classify("test.", .a));
     try testing.expectEqual(Action.nxdomain, classify("something.onion.", .a));
-    try testing.expectEqual(Action.nxdomain, classify("home.arpa.", .a));
     try testing.expectEqual(Action.nxdomain, classify("foo.home.arpa", .aaaa));
 }
 

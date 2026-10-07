@@ -1,0 +1,70 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN home.arpa is answered locally, but its DS is asked
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      home.arpa. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+      home.arpa. 3600 IN NSEC in-addr.arpa. NS RRSIG NSEC
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    home.arpa. IN DS
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    home.arpa. IN DS
+  SECTION AUTHORITY
+    . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+    home.arpa. 3600 IN NSEC in-addr.arpa. NS RRSIG NSEC
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    home.arpa. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    home.arpa. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    printer.home.arpa. IN DS
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    printer.home.arpa. IN DS
+ENTRY_END
+
+SCENARIO_END
