@@ -634,7 +634,7 @@ const Server = struct {
             .held = Kib{ .bytes = g.store.held },
             .facts = g.store.map.count(),
             // Versions the map let go of that a cell or a reply still holds.
-            .pinned = Kib{ .bytes = g.store.bytes - g.store.held },
+            .pinned = Kib{ .bytes = g.store.bytes - g.store.kept },
             .evictions = g.store.evictions,
             .unadmitted = g.store.unadmitted,
         });

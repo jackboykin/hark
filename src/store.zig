@@ -47,8 +47,10 @@ pub const Verdict = extern struct {
 pub const Blob = extern struct {
     refs: u32,
     len: u32,
+    /// Map keys holding it.
+    keys: u32 = 0,
     kind: u8,
-    _pad: [7]u8 = @splat(0),
+    _pad: [3]u8 = @splat(0),
     verdict: Verdict = .{},
 
     pub fn bytes(b: *Blob) []align(8) u8 {
@@ -98,8 +100,11 @@ pub const Store = struct {
     map: std.ArrayHashMapUnmanaged(Key, Entry, Key.Context, true) = .empty,
     /// Every live blob's bytes, whoever holds it.
     bytes: usize = 0,
-    /// What the map holds; the cap is on this.
+    /// A blob once per key holding it. The cap is on this, so names
+    /// sharing one blob still fill it.
     held: usize = 0,
+    /// Each blob the map holds, once.
+    kept: usize = 0,
     cap: usize,
     visited: std.DynamicBitSetUnmanaged = .{},
     hand: usize = 0,
@@ -123,7 +128,7 @@ pub const Store = struct {
     pub fn deinit(s: *Store) void {
         for (s.map.keys(), s.map.values()) |k, e| {
             s.gpa.free(k.name);
-            s.unref(e.blob);
+            s.letGo(e.blob);
         }
         s.map.deinit(s.gpa);
         s.visited.deinit(s.gpa);
@@ -133,6 +138,7 @@ pub const Store = struct {
     pub fn unref(s: *Store, b: *Blob) void {
         b.refs -= 1;
         if (b.refs > 0) return;
+        std.debug.assert(b.keys == 0);
         s.bytes -= b.len;
         s.gpa.free(b.bytes());
     }
@@ -169,8 +175,7 @@ pub const Store = struct {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
             if (s.on_evict) |h| h.f(h.ctx, key);
-            s.held -= gop.value_ptr.blob.len;
-            s.unref(gop.value_ptr.blob);
+            s.letGo(gop.value_ptr.blob);
         } else {
             errdefer s.map.swapRemoveAt(gop.index);
             if (s.held + blob.len > s.cap and !s.knock(key)) {
@@ -183,9 +188,18 @@ pub const Store = struct {
             if (s.visited.capacity() < s.map.capacity()) try s.visited.resize(s.gpa, s.map.capacity(), false);
         }
         gop.value_ptr.* = .{ .blob = blob, .expires_ns = expires_ns, .stored_ns = now_ns };
+        if (blob.keys == 0) s.kept += blob.len;
+        blob.keys += 1;
         s.held += blob.len;
         s.visited.set(gop.index);
         while (s.held > s.cap and s.map.count() > 1) s.evict();
+    }
+
+    fn letGo(s: *Store, b: *Blob) void {
+        s.held -= b.len;
+        b.keys -= 1;
+        if (b.keys == 0) s.kept -= b.len;
+        s.unref(b);
     }
 
     fn removeAt(s: *Store, i: usize) void {
@@ -195,9 +209,8 @@ pub const Store = struct {
         const e = s.map.values()[i];
         if (s.on_evict) |h| h.f(h.ctx, key);
         s.map.swapRemoveAt(i);
-        s.held -= e.blob.len;
         s.gpa.free(key.name);
-        s.unref(e.blob);
+        s.letGo(e.blob);
         // Swap-remove moved only the last entry, into `i`.
         if (s.hand == last) s.hand = i;
     }
