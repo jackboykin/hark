@@ -69,6 +69,10 @@ pub const Entry = struct {
     blob: *Blob,
     expires_ns: i64,
     stored_ns: i64 = 0,
+
+    pub fn life(e: Entry) Life {
+        return .of(e.stored_ns, e.expires_ns, e.blob.verdict);
+    }
 };
 
 /// While a version serves: from its storing to its expiry, or from its

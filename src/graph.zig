@@ -213,12 +213,6 @@ pub const Reply = struct {
     /// Seconds the reply stays a fact (`replyTtl`).
     ttl: u32 = 0,
 
-    /// The name an NXDOMAIN says does not exist: where its chain ends,
-    /// not always the name asked (RFC 8020 §2).
-    pub fn nonexistent(r: Reply) ?dns.Name {
-        return if (r.kind == .nxdomain) r.target else null;
-    }
-
     pub const Of = enum {
         answer,
         alias,

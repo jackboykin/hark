@@ -409,12 +409,12 @@ pub fn runCut(g: *Graph, id: CellId) !void {
     if (!parent.settled()) return;
     if (parent.failure()) |why| return g.fail(id, why);
     const pc = parent.state.fact.cut;
-    // No cut below a name that does not exist (RFC 8020).
-    if (try deniedAt(g, parent_name, pc.zone)) |until| return settleInside(g, id, parent, until);
-    // A fresh fact at the probe name from the parent's zone answers it
-    // without a packet; one from below says nothing about the parent.
-    if (try g.peek(Key.of(&kb, .rrset, name, .a))) |known| if (known.value.rrset.zone.eql(pc.zone))
-        return settleInside(g, id, parent, known.expires_ns);
+    // No cut below a name that does not exist (RFC 8020), and none kept, or
+    // every name below a denial would store one. A fact from below the
+    // parent's zone says nothing about it.
+    if (deniedAbove(g, name, pc.zone) != null) return settleInside(g, id, parent, g.now());
+    if (g.held(Key.of(&kb, .rrset, name, .a))) |known| if (named(store.Rrset.of(known.blob).zone, pc.zone))
+        return settleInside(g, id, parent, serving(g, known));
     if (!s.started) {
         s.ask.reset(pc.zone);
         try s.ask.seed(g, pc);
@@ -439,8 +439,8 @@ pub fn runCut(g: *Graph, id: CellId) !void {
                     .loop, .none => g.now(),
                 }),
                 .nxdomain => {
-                    const until = try publishNxdomain(g, id, kept, name) orelse return g.fail(id, unplaced);
-                    try settleInside(g, id, parent, until);
+                    if (!try publishNxdomain(g, id, kept, name)) return g.fail(id, unplaced);
+                    try settleInside(g, id, parent, g.now());
                 },
                 .failed => try g.fail(id, unplaced),
             }
@@ -454,16 +454,16 @@ fn settleInside(g: *Graph, id: CellId, parent: *const graph.Cell, until_ns: i64)
     try g.settle(id, .{ .cut = .{ .zone = parent.state.fact.cut.zone } }, @min(parent.expires_ns, until_ns));
 }
 
-/// An authoritative NXDOMAIN at a probe name, published; when it lapses.
-fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !?i64 {
+/// An authoritative NXDOMAIN at a probe name, published.
+fn publishNxdomain(g: *Graph, id: CellId, kept: Kept, name: dns.Name) !bool {
     var kb: graph.KeyBuf = undefined;
-    if (!kept.msg.header.flags.aa) return null;
+    if (!kept.msg.header.flags.aa) return false;
     const reply = switch (kept.verdict) {
         .reply => |r| r,
-        .loop, .none => return null,
+        .loop, .none => return false,
     };
     try g.publish(Key.of(&kb, .rrset, name, .a), name, id, .{ .rrset = reply }, replyExpiry(reply));
-    return replyExpiry(reply);
+    return true;
 }
 
 const unplaced: Failure = .{ .code = .no_reachable_authority, .text = "no probe placed the cut", .unplaced = true };
@@ -506,17 +506,22 @@ pub fn start(g: *Graph, id: CellId, qname: dns.Name, from: dns.Name, slot: *Opti
     }
 }
 
-/// When the closest name from `from` up to (not including) `zone` known
-/// not to exist stops being known.
-fn deniedAt(g: *Graph, from: dns.Name, zone: dns.Name) !?i64 {
+fn deniedAbove(g: *Graph, name: dns.Name, zone: dns.Name) ?struct { at: dns.Name, held: store.Entry } {
     var kb: graph.KeyBuf = undefined;
-    var n = from;
-    while (n.labels.len > zone.labels.len) : (n = .{ .labels = n.labels[1..] }) {
-        const f = try g.peek(Key.of(&kb, .rrset, n, .a)) orelse continue;
-        const gone = f.value.rrset.nonexistent() orelse continue;
-        if (gone.eql(n)) return f.expires_ns;
+    var i: usize = 1;
+    while (i + zone.labels.len < name.labels.len) : (i += 1) {
+        const n: dns.Name = .{ .labels = name.labels[i..] };
+        const h = g.held(Key.of(&kb, .rrset, n, .a)) orelse continue;
+        const r: store.Rrset = .of(h.blob);
+        if (r.kind == .nxdomain and named(r.target, n)) return .{ .at = n, .held = h };
     }
     return null;
+}
+
+/// Bytes awaiting their verdict serve no time: it may yet find them bogus.
+fn serving(g: *const Graph, e: store.Entry) i64 {
+    if (g.awaitsVerdict(.rrset) and !e.blob.verdict.judged()) return g.now();
+    return e.life().end_ns;
 }
 
 fn named(wire: []const u8, n: dns.Name) bool {
