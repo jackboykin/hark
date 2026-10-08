@@ -9,13 +9,14 @@
 ///   test.                 RFC 6761 §6.2   → NXDOMAIN
 ///   home.arpa.            RFC 8375 §4.4.B → RFC 6303 §3 empty zone; DS with
 ///                                           DO real
+///   service.arpa.         RFC 9665 §8.4   → the same
 ///   onion.                RFC 7686 §2     → NXDOMAIN
 ///   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
 ///                                           (DS real, subdomains NXDOMAIN)
 ///
-/// Only home.arpa is specified as a zone. The rest are hark's own
-/// synthesis, AA clear and SOA-less: their RFCs want answers (RFC 6761
-/// §6.3, RFC 7686 §2, RFC 8880 §7.2) no SOA could agree with.
+/// Only home.arpa and service.arpa are specified as zones. The rest are
+/// hark's own synthesis, AA clear and SOA-less: their RFCs want answers
+/// (RFC 6761 §6.3, RFC 7686 §2, RFC 8880 §7.2) no SOA could agree with.
 ///
 /// Only forwarders must pass `ipv4only.arpa` to an upstream DNS64; hark
 /// never forwards, and NODATA for AAAA means "no NAT64" to a stub.
@@ -53,7 +54,7 @@ pub const Zone = struct {
     }
 };
 
-const home_arpa: Zone = .of(&.{ "home", "arpa" });
+const own_zones = [_]Zone{ .of(&.{ "home", "arpa" }), .of(&.{ "service", "arpa" }) };
 
 const loopback4: []const dns.RData = &.{.{ .a = .{ 127, 0, 0, 1 } }};
 const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1} }};
@@ -73,16 +74,17 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     if (is(last, "invalid") or is(last, "test") or is(last, "onion")) return .{ .is = .nxdomain };
     if (!is(last, "arpa") or n < 2) return null;
     const second = name.labels[n - 2];
-    if (is(second, "home")) {
-        const z = &home_arpa;
+    for (&own_zones) |*z| if (is(second, z.apex.labels[0])) {
         if (n > 2) return .{ .is = .nxdomain, .zone = z };
         return switch (qtype) {
             .soa => .{ .is = .{ .answer = z.soa }, .zone = z },
             .ns => .{ .is = .{ .answer = z.ns }, .zone = z },
+            // arpa delegates the apex, and its DS is asked there, with DO
+            // and only then.
             .ds => if (do_bit) null else .{ .is = .nodata, .zone = z },
             else => .{ .is = .nodata, .zone = z },
         };
-    }
+    };
     if (is(second, "ipv4only")) {
         if (n > 2) return .{ .is = .nxdomain };
         return switch (qtype) {
@@ -155,7 +157,7 @@ test "classify NXDOMAIN names" {
     try expectOwn(.{ .is = .nxdomain }, "foo.bar.invalid", .aaaa);
     try expectOwn(.{ .is = .nxdomain }, "test.", .a);
     try expectOwn(.{ .is = .nxdomain }, "something.onion.", .a);
-    try expectOwn(.{ .is = .nxdomain, .zone = &home_arpa }, "foo.home.arpa", .aaaa);
+    try expectOwn(.{ .is = .nxdomain, .zone = &own_zones[0] }, "foo.home.arpa", .aaaa);
 }
 
 test "classify ipv4only.arpa: DS falls through, apex is not its own subdomain" {

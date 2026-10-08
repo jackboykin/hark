@@ -1056,7 +1056,7 @@ test "an age rounds up to the whole second" {
 
 fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
     // A question hark answers itself never leaves the host (RFC 6761 §6,
-    // RFC 8375 §4.4.B). home.arpa's DS reaches here only for a DO client,
+    // RFC 8375 §4.4.B). An own zone's DS reaches here only for a DO client,
     // its RFC's one exception, so it is classified as one. The question never
     // changes, so it is checked until a server is touched.
     if (a.tried == 0 and special_use.classify(qname, qtype, true) != null) {

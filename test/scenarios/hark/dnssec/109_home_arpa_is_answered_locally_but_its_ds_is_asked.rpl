@@ -4,6 +4,10 @@
 
 SCENARIO_BEGIN home.arpa is answered locally, but its DS is asked
 
+; RFC 8375 §4.4.B, and RFC 9665 §8.4 in the same words: an RFC 6303 §3
+; empty zone whose questions never leave, but for its DS asked with DO.
+; The root stands in for arpa.
+
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
 
@@ -69,6 +73,23 @@ ENTRY_BEGIN
     printer.home.arpa. IN DS
   SECTION AUTHORITY
     home.arpa. 10800 IN SOA home.arpa. nobody.invalid. 1 3600 1200 604800 10800
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    _dnssd._udp.service.arpa. IN PTR
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question answer authority
+  REPLY QR RD RA AA NXDOMAIN
+  SECTION QUESTION
+    _dnssd._udp.service.arpa. IN PTR
+  SECTION AUTHORITY
+    service.arpa. 10800 IN SOA service.arpa. nobody.invalid. 1 3600 1200 604800 10800
 ENTRY_END
 
 SCENARIO_END
