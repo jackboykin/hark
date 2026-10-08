@@ -90,10 +90,14 @@ pub const Ask = struct {
         return false;
     }
 
-    fn forget(a: *const Ask, list: *std.ArrayList(na.Address)) void {
+    /// Of what a delegation handed over, what is new to this ask and may be
+    /// sent to. Hark's policy, not the authorities' word: facts keep every
+    /// address, and the public DNS never steers an ask at the inside.
+    fn sift(a: *const Ask, g: *Graph, list: *std.ArrayList(na.Address)) void {
         var i: usize = 0;
         while (i < list.items.len) {
-            if (a.knows(list.items[i])) _ = list.swapRemove(i) else i += 1;
+            const x = list.items[i];
+            if (a.knows(x) or !g.cfg.addr_policy.allows(x)) _ = list.swapRemove(i) else i += 1;
         }
     }
 
@@ -176,6 +180,7 @@ pub const Ask = struct {
     fn seed(a: *Ask, g: *Graph, cut: graph.Cut) !void {
         var list: std.ArrayList(na.Address) = .empty;
         a.more = try reach(g, a.take(cut), &list);
+        a.sift(g, &list);
         a.add(g, list.items);
     }
 
@@ -1124,11 +1129,6 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         if (!due and p.band >= ns_rtt.silent_band) return .pending;
         // The dead are hedged to only once nothing live is in flight.
         if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
-        // Hark's policy, not the authorities' word: it judges sends, never facts.
-        if (!g.cfg.addr_policy.allows(a.servers[p.server].toAddress())) {
-            a.tried |= Ask.bit(p.server);
-            continue;
-        }
         const last = p.last and !a.more;
         const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
         a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
@@ -1166,6 +1166,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     var list: std.ArrayList(na.Address) = .empty;
     const zone = a.zone;
     if (zone.labels.len == 0) {
+        // Told, not handed over: config holds them to the policy.
         for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(sa, h);
     } else {
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
@@ -1178,11 +1179,11 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
         // A shallower cut: no delegation here while it holds.
         const servers: []const graph.Server = if (cut.state.fact.cut.zone.eql(zone)) a.take(cut.state.fact.cut) else &.{};
         const partial = try reach(g, servers, &list);
-        a.forget(&list);
+        a.sift(g, &list);
         var left: Left = .{};
         if (list.items.len == 0 or a.fetched_unglued) {
             try learn(g, id, a, servers, &list, &left);
-            a.forget(&list);
+            a.sift(g, &list);
         }
         a.more = if (a.fetched_unglued) left.awaited else partial;
         // A sibling in progress for someone is waited for only when

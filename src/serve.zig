@@ -823,7 +823,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     var g = try graph.Graph.init(gpa, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),
-        .addr_policy = .{ .upstream_port = cfg.upstream_port, .allow_loopback = cfg.allow_loopback_upstreams },
+        .addr_policy = cfg.addrPolicy(),
         .stagger_ms = cfg.stagger_ms,
         .max_queries = cfg.max_queries,
         .trust_anchor = if (cfg.dnssec) anchors[0] else null,

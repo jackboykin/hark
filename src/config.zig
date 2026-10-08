@@ -9,6 +9,7 @@ const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
+const delegation = @import("delegation.zig");
 const build_options = @import("build_options");
 
 /// Error variants can't carry the offending key name, so log it at rejection
@@ -141,6 +142,10 @@ pub const ServerConfig = struct {
     /// Config-supplied if any, else the compile-time IANA defaults.
     pub fn rootHints(self: ServerConfig) []const Address {
         return if (self.root_hints.len > 0) self.root_hints else &root_hints_default;
+    }
+
+    pub fn addrPolicy(self: ServerConfig) delegation.AddrPolicy {
+        return .{ .upstream_port = self.upstream_port, .allow_loopback = self.allow_loopback_upstreams };
     }
 
     /// Effective root trust anchors: config-supplied if any, else the
@@ -384,7 +389,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     if (parsed.table.getTable("resolver")) |resolver| {
         if (resolver.getStringArray("root-hints")) |addrs| {
             const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
-            const max_hints = @import("delegation.zig").max_servers_per_level;
+            const max_hints = delegation.max_servers_per_level;
             if (new_hints.len > max_hints) {
                 errLog("config: root-hints holds at most {d} addresses, got {d}", .{ max_hints, new_hints.len });
                 allocator.free(new_hints);
@@ -488,15 +493,10 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 
     cfg.rebinding.nat64 = cfg.dns64;
 
-    // Root hints in 127/8 / private space create a self-referencing or
-    // loopback-targeting recursor — a class of operator footgun that the
-    // glue-time rebinding defence already blocks for delegated NSes. Reject
-    // unless the operator opted in via allow-loopback-upstreams (tests do).
-    if (!cfg.allow_loopback_upstreams) {
-        for (cfg.root_hints) |addr| {
-            if (net_addr.isNonRoutableNs(addr)) return error.InvalidRootHintAddress;
-        }
-    }
+    // Told servers skip the ask's policy, so the root's are held to it
+    // here: a private root hint is a footgun, not a steer. Loopback ones
+    // only if the operator opted in (tests do).
+    for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(addr)) return error.InvalidRootHintAddress;
 
     return cfg;
 }
