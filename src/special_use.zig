@@ -7,7 +7,7 @@
 ///   *.localhost.          RFC 6761 §6.3   → same as parent
 ///   invalid.              RFC 6761 §6.4   → NXDOMAIN
 ///   test.                 RFC 6761 §6.2   → NXDOMAIN
-///   home.arpa.            RFC 8375 §4.4.B → NODATA, DS real
+///   home.arpa.            RFC 8375 §4.4.B → NODATA, DS with DO real
 ///   *.home.arpa.          RFC 8375 §4.4.B → NXDOMAIN
 ///   onion.                RFC 7686 §2     → NXDOMAIN
 ///   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
@@ -38,7 +38,7 @@ const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]
 const ipv4only: []const dns.RData = &.{ .{ .a = .{ 192, 0, 0, 170 } }, .{ .a = .{ 192, 0, 0, 171 } } };
 
 /// hark's own answer to the question, or null: ask the DNS.
-pub fn classify(name: dns.Name, qtype: dns.RType) ?Own {
+pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     const n = name.labels.len;
     if (n == 0) return null;
     const last = name.labels[n - 1];
@@ -52,7 +52,7 @@ pub fn classify(name: dns.Name, qtype: dns.RType) ?Own {
     const second = name.labels[n - 2];
     if (is(second, "home")) {
         if (n > 2) return .nxdomain;
-        return if (qtype == .ds) null else .nodata;
+        return if (qtype == .ds and do_bit) null else .nodata;
     }
     if (is(second, "ipv4only")) {
         if (n > 2) return .nxdomain;
@@ -97,7 +97,7 @@ const testing = std.testing;
 fn expectOwn(want: ?Own, name: []const u8, qtype: dns.RType) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectEqual(want, classify(try dns.parseDottedName(arena.allocator(), name), qtype));
+    try testing.expectEqual(want, classify(try dns.parseDottedName(arena.allocator(), name), qtype, true));
 }
 
 test "classify localhost A → loopback" {
@@ -140,7 +140,7 @@ test "synthesize localhost A produces 127.0.0.1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const q: dns.Question = .{ .name = try dns.parseDottedName(arena.allocator(), "LocalHost."), .qtype = .a, .qclass = .in };
-    const msg = try synthesize(arena.allocator(), q, classify(q.name, q.qtype).?);
+    const msg = try synthesize(arena.allocator(), q, classify(q.name, q.qtype, false).?);
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     try testing.expectEqual(dns.RCode.no_error, msg.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);

@@ -120,7 +120,7 @@ pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dn
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
         var qa = q;
         qa.qtype = .a;
-        const of_a = special_use.classify(qa.name, qa.qtype) orelse return served;
+        const of_a = special_use.classify(qa.name, qa.qtype, false) orelse return served;
         var a = try synthesized(arena, q, try special_use.synthesize(arena, qa, of_a));
         a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
@@ -183,7 +183,7 @@ pub const Desk = struct {
     };
 
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
-        if (special_use.classify(q.name, q.qtype)) |o| return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
+        if (special_use.classify(q.name, q.qtype, c.do_bit)) |o| return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
         // RRSIGs are never signed (RFC 4035 §2.2): an answer of them can't
         // be validated, and SERVFAIL would read as bogus. Validating, the
