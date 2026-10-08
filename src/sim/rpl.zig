@@ -91,7 +91,7 @@ pub const Step = struct {
     entry: ?Entry = null,
     /// TIME_PASSES: seconds to advance.
     seconds: u32 = 0,
-    /// CHECK_MAX_QUERIES, CHECK_MAX_VERIFIES: the bound so far.
+    /// CHECK_MAX_QUERIES, CHECK_MAX_VERIFIES, CHECK_MAX_RUNS: the bound so far.
     bound: u32 = 0,
 
     pub const Kind = enum {
@@ -102,6 +102,7 @@ pub const Step = struct {
         check_max_queries,
         /// Signatures whose math ran, memo hits excluded.
         check_max_verifies,
+        check_max_runs,
         /// Drop the next upstream query as if the authority timed out.
         timeout,
         /// Refuse the next upstream query at the host, as if out of sockets.
@@ -365,7 +366,7 @@ const Parser = struct {
                 return p.fail("TIME_PASSES needs `ELAPSE <n>` or `EVAL \"<n>\"`");
             },
             .timeout, .unsent => return .{ .n = n, .kind = kind },
-            .check_max_queries, .check_max_verifies => {
+            .check_max_queries, .check_max_verifies, .check_max_runs => {
                 const bound = try p.int(u32, toks.next() orelse return p.fail("CHECK_MAX_* takes one integer"));
                 if (toks.next() != null) return p.fail("CHECK_MAX_* takes one integer");
                 return .{ .n = n, .kind = kind, .bound = bound };

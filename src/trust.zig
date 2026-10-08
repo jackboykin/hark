@@ -186,7 +186,9 @@ pub fn runDs(g: *Graph, id: CellId) !void {
             try g.keep(s.rrset.unwrap().?);
             try g.settle(id, .{ .ds = .{ .status = .insecure } }, until);
         },
-        .none => if (s.fault.?.failure(g)) |why| try g.fail(id, why) else try failChain(g, id, s.rrset.unwrap().?),
+        // Unremembered, every probe below judges this zone again, doubling
+        // per label.
+        .none => if (s.fault.?.failure(g)) |why| try g.failRemembered(id, why) else try failChain(g, id, s.rrset.unwrap().?),
     }
 }
 

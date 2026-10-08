@@ -123,6 +123,10 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
                 report.msg = "CHECK_MAX_VERIFIES exceeded";
                 return error.ScenarioFailed;
             },
+            .check_max_runs => if (g.tally.runs > st.bound) {
+                report.msg = "CHECK_MAX_RUNS exceeded";
+                return error.ScenarioFailed;
+            },
             .timeout => cursor += 1,
             .unsent => s.pending_unsent += 1,
             // What was due arrives on the way.
@@ -604,7 +608,7 @@ test "trace one scenario" {
 
 test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
-    try testing.expectEqual(211, r.parsed);
+    try testing.expectEqual(212, r.parsed);
     try testing.expectEqual(0, r.failed);
 }
 

@@ -1,0 +1,65 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: qname-minimisation = no
+; sim-only: rule runs are counted inside the engine; a live run cannot see them
+
+SCENARIO_BEGIN a failed ds is judged once per window, however deep the probe
+
+; Each label's failed DS probed the labels above it again, doubling per
+; label (65k rule runs here). Remembered, each is judged once.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qtype subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. IN A
+    SECTION AUTHORITY
+      l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. 3600 IN NS ns.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16.
+    SECTION ADDITIONAL
+      ns.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. 3600 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      . IN SOA
+    SECTION ANSWER
+      . 3600 IN SOA root. nobody.invalid. 1 7200 3600 86400 3600
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. IN A
+    SECTION ANSWER
+      www.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO EDNS
+  SECTION QUESTION
+    www.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.l11.l12.l13.l14.l15.l16. IN A
+ENTRY_END
+
+STEP 3 CHECK_MAX_RUNS 150
+
+SCENARIO_END
