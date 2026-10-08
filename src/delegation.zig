@@ -1,7 +1,6 @@
 //! The delegation walk's pure decisions: QNAME minimisation, zone cuts, and
 //! which sibling failure a stub sees.
 const std = @import("std");
-const testing = std.testing;
 const dns = @import("dns.zig");
 const na = @import("net_address.zig");
 
@@ -66,7 +65,14 @@ pub const AddrPolicy = struct {
     }
 
     pub fn allows(policy: AddrPolicy, addr: na.Address) bool {
-        return policy.allow_loopback or !na.isNonRoutableNs(addr);
+        return (policy.allow_loopback and loopback(addr)) or !na.isNonRoutableNs(addr);
+    }
+
+    fn loopback(addr: na.Address) bool {
+        return switch (addr) {
+            .ip4 => |v4| v4.bytes[0] == 127,
+            .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
+        };
     }
 };
 
@@ -123,8 +129,4 @@ pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     }
     if (!flags.ra or flags.aa) return false;
     return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.questions[0].name, parent_zone) == null;
-}
-
-test "a private address is never sent to (DNS rebinding defense)" {
-    try testing.expect(!(AddrPolicy{}).allows(na.initIp4(.{ 127, 0, 0, 1 }, 53)));
 }

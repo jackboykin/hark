@@ -1,0 +1,53 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; sim-only: live, every server binds on this host, and a LAN address is no loopback one
+
+SCENARIO_BEGIN a private NS address is never sent to
+
+; Glue pointing into the LAN would have hark query the victim's own
+; router.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 192.168.1.1
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 192.168.1.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 300 IN A 192.0.2.1
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+SCENARIO_END
