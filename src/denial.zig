@@ -1,6 +1,7 @@
 //! RFC 8198 aggressive use, NSEC only. Every NSEC a secure negative
-//! carried is the fact `rrset(owner, NSEC)`, its SOA the fact
-//! `rrset(zone, SOA)`; this index orders the spans by owner within their
+//! carried is the fact `rrset(owner, NSEC)`, or `parental(owner, NSEC)`
+//! where its zone delegates the owner; its SOA the fact
+//! `rrset(zone, SOA)`. This index orders the spans by owner within their
 //! signing zone, each holding the very bytes that were judged, so a later
 //! question inside a known span is denied from memory and no later reply
 //! can change what the span says. The index only finds candidates: the
@@ -183,8 +184,9 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
         const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, @min(rr.ttl, dns.max_negative_ttl)) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
+        const kind: graph.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up after.
-        const judged = (try g.fact(graph.Key.of(&kb, .rrset, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
+        const judged = (try g.fact(graph.Key.of(&kb, kind, rr.name, rr.rtype), .{ .rrset = fact }, expires) orelse continue).ref();
         const z = zoneFor(g, zkey) catch |e| {
             g.store.unref(judged);
             return e;
@@ -208,6 +210,12 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
             return e;
         };
     }
+}
+
+/// Of the two NSECs at a cut, the child's is the one at its own apex,
+/// whatever either bitmap claims.
+fn delegated(rr: RR, zone: dns.Name) bool {
+    return !rr.name.eql(zone) and dns.typeBitmapContains(rr.rdata.nsec.type_bit_maps, .ns);
 }
 
 /// A range of one name (`owner NSEC \000.owner`, "black lies") denies

@@ -93,7 +93,9 @@ pub const Edge = struct {
 
 /// `refresh`: `answer` derived again for the store; nobody waits.
 /// `ahead`: an rrset's judge, started before anyone asks.
-pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, ahead };
+/// `parental`: a parent's NSEC at a delegation, held for the denial index
+/// alone: the child's answers there (RFC 4035 §5.3.2). Never a cell.
+pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -282,6 +284,7 @@ pub const Value = union(Kind) {
     exchange: Outcome,
     refresh: void,
     ahead: void,
+    parental: void,
 };
 
 /// Bytes held by work in progress, counted where they are allocated: cell
@@ -430,6 +433,7 @@ pub const Scratch = union(enum) {
         return switch (kind) {
             .exchange => .none,
             .refresh => init(.answer, arena),
+            .parental => unreachable,
             inline else => |k| blk: {
                 const p = try arena.create(@typeInfo(@FieldType(Scratch, @tagName(k))).pointer.child);
                 p.* = .{};
@@ -881,7 +885,7 @@ pub const Graph = struct {
                 if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
                 try g.keep(t);
             },
-            .addr, .answer, .exchange, .refresh, .ahead => {},
+            .addr, .answer, .exchange, .refresh, .ahead, .parental => {},
         }
         try g.woken(id, value == .answer);
     }
@@ -1405,6 +1409,7 @@ pub const Graph = struct {
             .secure => try trust.runSecure(g, id),
             .ahead => try trust.runAhead(g, id),
             .exchange => {},
+            .parental => unreachable,
         }
     }
 
