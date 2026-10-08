@@ -309,25 +309,30 @@ fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob, r: store.Rrset) Hop {
 pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
     if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
+    std.debug.assert(a.hops.len > 0);
     // Secure only if every hop is judged secure; a failed verdict is bogus
     // (RFC 4035 §4.3).
-    var secure = a.judged.len == a.hops.len;
-    for (a.judged) |j| switch (g.cell(j).state) {
-        .fact => |v| secure = secure and v.secure.status == .secure,
-        .failure => |why| if (c.cd) {
-            secure = false;
-        } else return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why),
-        .pending => unreachable,
-    };
-    std.debug.assert(a.hops.len > 0);
+    var secure = true;
     const hops = try arena.alloc(Hop, a.hops.len);
-    for (hops, a.hops, 0..) |*hop, h, i| {
+    for (hops, a.hops) |*hop, h| {
         // Every rrset cell settles or loads through a blob.
-        const b = g.cell(h).blob.?;
+        const b = g.cell(h.set).blob.?;
         hop.* = hopOf(g, ret, b, .of(b));
-        // A failed verdict proved nothing, so it bounds nothing (CD only).
-        if (i < a.judged.len and g.cell(a.judged[i]).failure() == null)
-            hop.life = lifeOf(g, g.cell(a.judged[i]).state.fact.secure.proven_until_ns);
+        const j = h.judge.unwrap() orelse {
+            secure = false;
+            continue;
+        };
+        switch (g.cell(j).state) {
+            .fact => |v| {
+                secure = secure and v.secure.status == .secure;
+                hop.life = lifeOf(g, v.secure.proven_until_ns);
+            },
+            // A failed verdict proved nothing, so it bounds nothing (CD only).
+            .failure => |why| if (c.cd) {
+                secure = false;
+            } else return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why),
+            .pending => unreachable,
+        }
     }
     return shape(arena, g, q, c, minimal, hops, secure, g.cell(root).expires_ns > g.now());
 }

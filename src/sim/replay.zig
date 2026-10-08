@@ -836,7 +836,7 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
             if (key.eql(ns3) and ns3_ms == null) ns3_ms = at_ms;
         }
     }
-    try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0]).state.fact.rrset.kind);
+    try testing.expectEqual(.answer, g.cell(g.cell(root).state.fact.answer.hops[0].set).state.fact.rrset.kind);
     g.unhold(root);
     const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
     while (s.next(horizon)) |ev| try g.complete(ev.id, ev.completion);

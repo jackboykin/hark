@@ -257,11 +257,10 @@ pub const AnswerScratch = struct {
     /// The question's; set as the root is made, freed with it.
     budget: *graph.Budget = undefined,
     /// Every hop but the last is an alias, a link at least.
-    hops: [max_links + 1]CellId = undefined,
+    hops: [max_links + 1]graph.Answer.Hop = undefined,
     n: u8 = 0,
-    /// `secure(hop)` per hop.
-    judged: [max_links + 1]CellId = undefined,
-    nj: u8 = 0,
+    /// Hops whose judge is decided.
+    judged: u8 = 0,
 };
 
 // ── Rules ──────────────────────────────────────────────────────────────
@@ -322,22 +321,23 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
     while (true) {
         if (s.n > 0) {
             const i = s.n - 1;
-            const last = g.cell(s.hops[i]);
+            const hop = &s.hops[i];
+            const last = g.cell(hop.set);
             if (!last.settled()) return;
             if (last.failure()) |why| return failAnswer(g, id, why);
             // Judged as it lands, so its zone's chain of trust overlaps the
             // rest of the walk. The RRSIGs ending an RRSIG question are
             // never signed (RFC 4035 §2.2): nothing can judge them.
             const signatures = qtype == .rrsig and last.state.fact.rrset.kind == .answer;
-            if (g.cfg.trust_anchor != null and s.nj == i and !signatures) {
-                s.judged[i] = try trust.demandSecure(g, id, s.hops[i]) orelse
-                    return failAnswer(g, id, .unreachable_authority);
-                s.nj += 1;
+            if (s.judged == i) {
+                if (g.awaitsVerdict(last.key.kind) and !signatures) hop.judge = .wrap(try trust.demandSecure(g, id, hop.set) orelse
+                    return failAnswer(g, id, .unreachable_authority));
+                s.judged += 1;
             }
             var links: Links = .{};
             var step: Links.Step = .done;
             for (s.hops[0..s.n]) |h| {
-                const r = g.cell(h).state.fact.rrset;
+                const r = g.cell(h.set).state.fact.rrset;
                 step = for (r.answers) |rr| {
                     if (rr.rtype == .cname) if (links.pass(rr.name)) |why| break .{ .broken = why };
                 } else links.end(r.kind, r.target, qtype);
@@ -352,20 +352,23 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
         // The first step is at the answer's own name, keyed already.
         const own = if (s.n == 0) g.cell(id).key.at(.rrset, qtype) else Key.of(&kb, .rrset, next, qtype);
         // Nothing waits on an answer, so only an orphaned root is refused.
-        s.hops[s.n] = try g.demandHop(id, own, next) orelse
-            return failAnswer(g, id, .unreachable_authority);
+        s.hops[s.n] = .{ .set = try g.demandHop(id, own, next) orelse
+            return failAnswer(g, id, .unreachable_authority) };
         s.n += 1;
     }
     var expires: i64 = std.math.maxInt(i64);
-    for (s.hops[0..s.n]) |h| expires = @min(expires, g.cell(h).expires_ns);
-    // A verdict that failed is bogus, and lives no longer.
-    for (s.judged[0..s.nj]) |j| {
-        if (!g.cell(j).settled()) return;
-        expires = @min(expires, g.cell(j).expires_ns);
+    for (s.hops[0..s.n]) |h| {
+        expires = @min(expires, g.cell(h.set).expires_ns);
+        if (h.judge.unwrap()) |j| {
+            if (!g.cell(j).settled()) return;
+            // A verdict that failed is bogus, and lives no longer.
+            expires = @min(expires, g.cell(j).expires_ns);
+        } else if (g.awaitsVerdict(g.cell(h.set).key.kind)) {
+            // Nothing can judge RRSIGs, so nothing keeps them.
+            expires = @min(expires, g.now());
+        }
     }
-    // Nothing can judge RRSIGs, so nothing keeps them.
-    if (g.awaitsVerdict(.rrset) and s.nj < s.n) expires = g.now();
-    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n], .judged = s.judged[0..s.nj] }, expires);
+    try settleAnswer(g, id, .{ .hops = s.hops[0..s.n] }, expires);
     // Best effort.
     if (kind == .answer and g.cfg.prefetch) if (lapsing(g, s.hops[0..s.n])) |end|
         g.refresh(g.cell(id).key, g.cell(id).name, end) catch {};
@@ -375,7 +378,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
 fn settleAnswer(g: *Graph, id: CellId, a: graph.Answer, expires: i64) !void {
     if (g.cell(id).key.kind == .refresh) return g.settle(id, .refresh, g.now());
     const arena = g.cell(id).arena.allocator();
-    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(CellId, a.hops), .judged = try arena.dupe(CellId, a.judged) } }, expires);
+    try g.settle(id, .{ .answer = .{ .hops = try arena.dupe(graph.Answer.Hop, a.hops) } }, expires);
 }
 
 fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
@@ -383,10 +386,10 @@ fn failAnswer(g: *Graph, id: CellId, why: Failure) !void {
     try g.fail(id, why);
 }
 
-fn lapsing(g: *Graph, hops: []const CellId) ?i64 {
+fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
     var first: ?store.Life = null;
     for (hops) |h| {
-        const c = g.cell(h);
+        const c = g.cell(h.set);
         const life: store.Life = .of(c.state.fact.rrset.stored_ns, c.expires_ns, if (c.blob) |b| b.verdict else .{});
         if (first == null or life.end_ns < first.?.end_ns) first = life;
     }

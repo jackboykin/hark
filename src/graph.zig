@@ -238,9 +238,13 @@ pub const Reply = struct {
 /// RRset that ends it.
 pub const Answer = struct {
     /// In chain order; every one but the last is an alias.
-    hops: []const CellId,
-    /// `secure(hop)` per hop, held; empty with DNSSEC off.
-    judged: []const CellId = &.{},
+    hops: []const Hop,
+
+    pub const Hop = struct {
+        set: CellId,
+        /// `secure(set)`, held; none where no verdict is awaited.
+        judge: OptionalCellId = .none,
+    };
 };
 
 pub const Outcome = union(enum) {
