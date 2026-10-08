@@ -530,20 +530,15 @@ pub const Graph = struct {
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
         var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
+        g.store.on_evict = evicted;
         if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
         _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
     }
 
-    /// Pins the graph's address.
-    pub fn attach(g: *Graph) void {
-        g.store.on_evict = .{ .ctx = g, .f = evictedErased };
-    }
-
-    fn evictedErased(ctx: *anyopaque, key: Key, blob: *store.Blob) void {
-        const g: *Graph = @ptrCast(@alignCast(ctx));
-        denial.evicted(g, key, blob);
+    fn evicted(s: *store.Store, key: Key, blob: *store.Blob) void {
+        denial.evicted(@fieldParentPtr("store", s), key, blob);
     }
 
     pub fn deinit(g: *Graph) void {

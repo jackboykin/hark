@@ -93,7 +93,9 @@ pub const Life = struct {
     }
 };
 
-pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key, *Blob) void };
+/// Handed the store itself, so whatever embeds one finds itself by the
+/// field (`@fieldParentPtr`) and never pins its address.
+pub const OnEvict = *const fn (*Store, Key, *Blob) void;
 
 pub const Store = struct {
     gpa: Allocator,
@@ -174,7 +176,7 @@ pub const Store = struct {
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
-            if (s.on_evict) |h| h.f(h.ctx, key, gop.value_ptr.blob);
+            if (s.on_evict) |f| f(s, key, gop.value_ptr.blob);
             s.letGo(gop.value_ptr.blob);
         } else {
             errdefer s.map.swapRemoveAt(gop.index);
@@ -207,7 +209,7 @@ pub const Store = struct {
         if (i != last) s.visited.setValue(i, s.visited.isSet(last));
         const key = s.map.keys()[i];
         const e = s.map.values()[i];
-        if (s.on_evict) |h| h.f(h.ctx, key, e.blob);
+        if (s.on_evict) |f| f(s, key, e.blob);
         s.map.swapRemoveAt(i);
         s.gpa.free(key.name);
         s.letGo(e.blob);
@@ -635,25 +637,25 @@ test "the cap holds by eviction and admission" {
 
 test "a replaced version leaves as one evicted" {
     const testing = std.testing;
-    var s = try Store.init(testing.allocator, 1 << 16);
-    defer s.deinit();
-    const Gone = struct {
+    const Watched = struct {
+        store: Store,
         n: u32 = 0,
         last: ?*Blob = null,
-        fn f(ctx: *anyopaque, _: Key, b: *Blob) void {
-            const gone: *@This() = @ptrCast(@alignCast(ctx));
-            gone.n += 1;
-            gone.last = b;
+        fn evicted(s: *Store, _: Key, b: *Blob) void {
+            const w: *@This() = @fieldParentPtr("store", s);
+            w.n += 1;
+            w.last = b;
         }
     };
-    var gone: Gone = .{};
-    s.on_evict = .{ .ctx = &gone, .f = Gone.f };
+    var w: Watched = .{ .store = try Store.init(testing.allocator, 1 << 16) };
+    defer w.store.deinit();
+    w.store.on_evict = Watched.evicted;
     const zone: dns.Name = .{ .labels = &.{"x"} };
     const key: Key = .init(.cut, "x", .a);
-    const first = try s.build(.{ .cut = .{ .zone = zone } });
-    try s.put(key, first, 10, 0);
-    try testing.expectEqual(0, gone.n);
-    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
-    try testing.expectEqual(1, gone.n);
-    try testing.expectEqual(first, gone.last.?);
+    const first = try w.store.build(.{ .cut = .{ .zone = zone } });
+    try w.store.put(key, first, 10, 0);
+    try testing.expectEqual(0, w.n);
+    try w.store.put(key, try w.store.build(.{ .cut = .{ .zone = zone } }), 10, 0);
+    try testing.expectEqual(1, w.n);
+    try testing.expectEqual(first, w.last.?);
 }

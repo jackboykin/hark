@@ -835,7 +835,6 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .trace = trace,
     }, e.edge());
     defer g.deinit();
-    g.attach();
     e.work = g.work.allocator();
     const in = try Batch.create(gpa, udp_recv_max);
     defer in.destroy(gpa);

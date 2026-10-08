@@ -326,7 +326,6 @@ test "re-absorbing a spanless zone survives the store replacing its SOA" {
     var ctx: u8 = 0;
     var g = try testGraph(&ctx, &now, &wall);
     defer g.deinit();
-    g.attach();
 
     const zone: dns.Name = .{ .labels = &.{@as([]const u8, "example")} };
     const soa: RR = .{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 3600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 3600 } } };
