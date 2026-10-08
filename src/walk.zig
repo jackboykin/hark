@@ -14,6 +14,7 @@ const trust = @import("trust.zig");
 const proof = @import("proof.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
+const special_use = @import("special_use.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
@@ -1054,6 +1055,14 @@ test "an age rounds up to the whole second" {
 // ── The sibling loop ───────────────────────────────────────────────
 
 fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
+    // A question hark answers itself never leaves the host (RFC 6761 §6,
+    // RFC 8375 §4.4.B). home.arpa's DS reaches here only for a DO client,
+    // its RFC's one exception, so it is classified as one. The question never
+    // changes, so it is checked until a server is touched.
+    if (a.tried == 0 and special_use.classify(qname, qtype, true) != null) {
+        a.local = true;
+        return .exhausted;
+    }
     while (true) {
         var i: u8 = 0;
         while (i < a.nattempts) {
