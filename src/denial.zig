@@ -181,8 +181,7 @@ pub fn absorb(g: *Graph, signer: dns.Name, r: graph.Reply, proven_until: []const
         if (rr.rtype == .soa and !rr.name.eql(signer)) continue;
         if (rr.rtype == .nsec and (minimal(rr) or proofs == max_proofs)) continue;
         const rrs = dnssec.setFrom(r.authorities, i);
-        // The negative cap doubles as RFC 9077 §3's ceiling on aggressive use.
-        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, @min(rr.ttl, dns.max_negative_ttl)) * std.time.ns_per_s);
+        const expires = @min(proven_until[i], keys_until, r.stored_ns + @as(i64, rr.ttl) * std.time.ns_per_s);
         const fact: graph.Reply = .{ .kind = .answer, .aa = true, .answers = rrs, .zone = signer, .stored_ns = r.stored_ns, .ttl = rr.ttl };
         const kind: graph.Kind = if (rr.rtype == .nsec and delegated(rr, signer)) .parental else .rrset;
         // `fact` can re-enter `evicted` and drop this zone: look it up after.
