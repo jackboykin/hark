@@ -112,13 +112,16 @@ pub const Index = struct {
     }
 };
 
-/// So the index cannot outgrow its facts, nor hold a replaced version.
-pub fn evicted(g: *Graph, key: graph.Key) void {
-    if (key.kind != .rrset or (key.rtype != .nsec and key.rtype != .soa)) return;
+/// So the index cannot outgrow its facts: what goes is what was judged
+/// from `blob`.
+pub fn evicted(g: *Graph, key: graph.Key, blob: *store.Blob) void {
+    if (key.rtype != .nsec and key.rtype != .soa) return;
     const owner = dns.parseDottedName(g.scratch.allocator(), key.name) catch return;
     if (key.rtype == .soa) {
         var buf: [dns.max_dotted_len + 1]u8 = undefined;
         const i = g.denial.zones.getIndex(owner.formatLower(&buf)) orelse return;
+        const soa = g.denial.zones.values()[i].soa orelse return;
+        if (soa.judged != blob) return;
         g.denial.zones.values()[i].release(g);
         dropIfEmpty(g, i);
         return;
@@ -129,7 +132,7 @@ pub fn evicted(g: *Graph, key: graph.Key) void {
         const zi = g.denial.zones.getIndex(zone.formatLower(&buf)) orelse continue;
         const z = &g.denial.zones.values()[zi];
         const pos = z.position(owner);
-        if (pos < z.spans.items.len and z.spans.items[pos].owner.eql(owner)) {
+        if (pos < z.spans.items.len and z.spans.items[pos].judged == blob) {
             z.spans.items[pos].deinit(g.gpa, &g.store);
             _ = z.spans.orderedRemove(pos);
             dropIfEmpty(g, zi);

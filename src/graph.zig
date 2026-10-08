@@ -541,9 +541,9 @@ pub const Graph = struct {
         g.store.on_evict = .{ .ctx = g, .f = evictedErased };
     }
 
-    fn evictedErased(ctx: *anyopaque, key: Key) void {
+    fn evictedErased(ctx: *anyopaque, key: Key, blob: *store.Blob) void {
         const g: *Graph = @ptrCast(@alignCast(ctx));
-        denial.evicted(g, key);
+        denial.evicted(g, key, blob);
     }
 
     pub fn deinit(g: *Graph) void {

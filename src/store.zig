@@ -93,7 +93,7 @@ pub const Life = struct {
     }
 };
 
-pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key) void };
+pub const OnEvict = struct { ctx: *anyopaque, f: *const fn (*anyopaque, Key, *Blob) void };
 
 pub const Store = struct {
     gpa: Allocator,
@@ -115,7 +115,7 @@ pub const Store = struct {
     evictions: u64 = 0,
     unadmitted: u64 = 0,
     /// Fires as a key's version leaves the map: evicted, dropped or
-    /// replaced.
+    /// replaced. The version named is live for the call.
     on_evict: ?OnEvict = null,
     stage: []u8,
 
@@ -174,7 +174,7 @@ pub const Store = struct {
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
-            if (s.on_evict) |h| h.f(h.ctx, key);
+            if (s.on_evict) |h| h.f(h.ctx, key, gop.value_ptr.blob);
             s.letGo(gop.value_ptr.blob);
         } else {
             errdefer s.map.swapRemoveAt(gop.index);
@@ -207,7 +207,7 @@ pub const Store = struct {
         if (i != last) s.visited.setValue(i, s.visited.isSet(last));
         const key = s.map.keys()[i];
         const e = s.map.values()[i];
-        if (s.on_evict) |h| h.f(h.ctx, key);
+        if (s.on_evict) |h| h.f(h.ctx, key, e.blob);
         s.map.swapRemoveAt(i);
         s.gpa.free(key.name);
         s.letGo(e.blob);
@@ -637,18 +637,23 @@ test "a replaced version leaves as one evicted" {
     const testing = std.testing;
     var s = try Store.init(testing.allocator, 1 << 16);
     defer s.deinit();
-    var gone: u32 = 0;
-    const count = struct {
-        fn f(ctx: *anyopaque, _: Key) void {
-            const n: *u32 = @ptrCast(@alignCast(ctx));
-            n.* += 1;
+    const Gone = struct {
+        n: u32 = 0,
+        last: ?*Blob = null,
+        fn f(ctx: *anyopaque, _: Key, b: *Blob) void {
+            const gone: *@This() = @ptrCast(@alignCast(ctx));
+            gone.n += 1;
+            gone.last = b;
         }
     };
-    s.on_evict = .{ .ctx = &gone, .f = count.f };
+    var gone: Gone = .{};
+    s.on_evict = .{ .ctx = &gone, .f = Gone.f };
     const zone: dns.Name = .{ .labels = &.{"x"} };
     const key: Key = .init(.cut, "x", .a);
+    const first = try s.build(.{ .cut = .{ .zone = zone } });
+    try s.put(key, first, 10, 0);
+    try testing.expectEqual(0, gone.n);
     try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
-    try testing.expectEqual(0, gone);
-    try s.put(key, try s.build(.{ .cut = .{ .zone = zone } }), 10, 0);
-    try testing.expectEqual(1, gone);
+    try testing.expectEqual(1, gone.n);
+    try testing.expectEqual(first, gone.last.?);
 }
