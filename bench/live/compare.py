@@ -39,6 +39,11 @@ for name, rounds in passes.items():
     for p in (50, 90, 99):
         o, n = pct(ms[0], p), pct(ms[1], p)
         print(f"{name} ms p{p:<14} {o:10.2f} {n:10.2f}  {100 * (n - o) / o if o else 0:+.1f}%")
+    # Cold times cluster by hop count; a percentile on the gap between
+    # clusters swings as a few names cross it. Pairing each name's two
+    # answers in a round does not.
+    d = [r["r"][1][4] - r["r"][0][4] for rnd in rounds for r in rnd if not failed(r["r"][0]) and not failed(r["r"][1])]
+    print(f"{name} ms {B}-{A} paired   median {st.median(d):+.2f}  mean {st.mean(d):+.2f}")
 
 d = [collections.defaultdict(list), collections.defaultdict(list)]
 for rnd in passes["cold"]:
