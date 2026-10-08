@@ -43,6 +43,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     var g = try graph.Graph.init(gpa, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
+        .stub_zones = scenario.stub_zones,
         .addr_policy = .{ .allow_loopback = true },
         .stagger_ms = scenario.stagger_ms orelse 150,
         .max_queries = scenario.max_queries orelse 100,

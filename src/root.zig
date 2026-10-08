@@ -21,6 +21,7 @@ pub const rrsig = @import("rrsig.zig");
 pub const serve = @import("serve.zig");
 pub const special_use = @import("special_use.zig");
 pub const store = @import("store.zig");
+pub const stub = @import("stub.zig");
 pub const sys = @import("sys_union.zig");
 pub const toml = @import("toml.zig");
 pub const trust = @import("trust.zig");
@@ -66,6 +67,7 @@ test {
     _ = @import("sim/sim.zig");
     _ = @import("special_use.zig");
     _ = @import("store.zig");
+    _ = @import("stub.zig");
     _ = @import("sys_linux.zig");
     _ = @import("sys_union.zig");
     _ = @import("toml.zig");

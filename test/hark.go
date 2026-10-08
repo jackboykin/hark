@@ -203,6 +203,15 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 		hs = append(hs, netip.AddrPortFrom(a, port).String())
 	}
 	line("root-hints = %s", list(hs))
+	var zs []string
+	for _, z := range c.stubZones {
+		e := z.zone
+		for _, a := range z.servers {
+			e += " " + netip.AddrPortFrom(a, port).String()
+		}
+		zs = append(zs, e)
+	}
+	line("stub-zones = %s", list(zs))
 	if anchor != "" {
 		line("trust-anchors = %s", list([]string{anchor}))
 	}

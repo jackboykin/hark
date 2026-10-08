@@ -32,10 +32,16 @@ type config struct {
 	dns64Prefix                                   string
 	rebinding                                     bool
 	allowZones, extraAllow                        []string
+	stubZones                                     []stubZone
 	// Set by tests alone; zero is hark's default.
 	cacheSize, tcpIdleMs int
 	allowFrom            []string
 	nofile               int
+}
+
+type stubZone struct {
+	zone    string
+	servers []netip.Addr
 }
 
 type rangeBlock struct {
@@ -423,6 +429,20 @@ func (p *parser) directive(key, val string) error {
 			}
 			sc.rootHints = append(sc.rootHints, a)
 		}
+	case "stub-zone":
+		f := strings.Fields(val)
+		if len(f) < 2 {
+			return fmt.Errorf("stub-zone takes a zone and its servers: %q", val)
+		}
+		z := stubZone{zone: f[0]}
+		for _, s := range f[1:] {
+			a, err := netip.ParseAddr(s)
+			if err != nil {
+				return err
+			}
+			z.servers = append(z.servers, a)
+		}
+		c.stubZones = append(c.stubZones, z)
 	case "qname-minimisation":
 		c.qnameMinimization = yes
 	case "minimal-responses":

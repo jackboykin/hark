@@ -10,6 +10,8 @@ const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
 const delegation = @import("delegation.zig");
+const special_use = @import("special_use.zig");
+const stub = @import("stub.zig");
 const build_options = @import("build_options");
 
 /// Error variants can't carry the offending key name, so log it at rejection
@@ -70,6 +72,7 @@ pub const ServerConfig = struct {
     /// Tests only. Parsing of `[resolver] allow-loopback-upstreams` is gated
     /// behind `-Dtesting=true`; production binaries reject the key.
     allow_loopback_upstreams: bool,
+    stub_zones: []stub.Zone,
     cache_size: usize,
     prefetch: bool,
     serve_stale_ttl: u32,
@@ -127,6 +130,7 @@ pub const ServerConfig = struct {
     pub fn deinit(self: *ServerConfig) void {
         self.allocator.free(self.listen);
         self.allocator.free(self.root_hints);
+        freeStubZones(self.allocator, self.stub_zones);
         self.allocator.free(self.allow_from);
         for (self.trust_anchors) |ta| self.allocator.free(ta.digest);
         self.allocator.free(self.trust_anchors);
@@ -184,6 +188,7 @@ fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
         .root_hints = &.{},
         .upstream_port = 53,
         .allow_loopback_upstreams = false,
+        .stub_zones = &.{},
         .cache_size = 12 * 1024 * 1024,
         .prefetch = false,
         .serve_stale_ttl = 0,
@@ -235,6 +240,7 @@ const config_schema = [_]SectionSpec{
     } },
     .{ .name = "resolver", .keys = &.{
         .{ .name = "root-hints", .kind = .string_array },
+        .{ .name = "stub-zones", .kind = .string_array },
         .{ .name = "upstream-port", .kind = .integer },
         .{ .name = "allow-loopback-upstreams", .kind = .boolean },
         .{ .name = "trust-anchors", .kind = .string_array },
@@ -398,6 +404,11 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.root_hints);
             cfg.root_hints = new_hints;
         }
+        if (resolver.getStringArray("stub-zones")) |entries| {
+            const zones = try parseStubZones(allocator, entries);
+            freeStubZones(allocator, cfg.stub_zones);
+            cfg.stub_zones = zones;
+        }
         // Test-only knobs. Each is gated by `build_options.testing_enabled`
         // so a production binary refuses the key — adding a new one means
         // adding one block, not synchronizing two branches.
@@ -498,7 +509,26 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
     // only if the operator opted in (tests do).
     for (cfg.root_hints) |addr| if (!cfg.addrPolicy().allows(addr)) return error.InvalidRootHintAddress;
 
+    // hark recurses for any question: a stub server that is hark itself
+    // asks hark, which asks hark.
+    for (cfg.stub_zones) |z| for (z.servers) |server| for (cfg.listen) |l| if (reaches(l, server)) {
+        errLog("config: stub-zones names an address hark itself listens on", .{});
+        return error.InvalidValue;
+    };
+
     return cfg;
+}
+
+/// A socket bound to `l` would take a query sent to `to`: the same address,
+/// or, bound to the family's wildcard, one certain to be this host's. Each
+/// family listens apart (IPV6_V6ONLY).
+fn reaches(l: Address, to: Address) bool {
+    if (l.getPort() != to.getPort()) return false;
+    if (net_addr.ipEqual(l, to)) return true;
+    return switch (l) {
+        .ip4 => |b| to == .ip4 and mem.allEqual(u8, &b.bytes, 0) and (to.ip4.bytes[0] == 127 or mem.allEqual(u8, &to.ip4.bytes, 0)),
+        .ip6 => |b| to == .ip6 and mem.allEqual(u8, &b.bytes, 0) and mem.allEqual(u8, to.ip6.bytes[0..15], 0) and to.ip6.bytes[15] <= 1,
+    };
 }
 
 pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !ServerConfig {
@@ -602,6 +632,61 @@ pub fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError
         };
     }
     return list;
+}
+
+fn parseStubZones(allocator: Allocator, strs: []const []const u8) ConfigError![]stub.Zone {
+    const zones = try allocator.alloc(stub.Zone, strs.len);
+    var i: usize = 0;
+    errdefer {
+        for (zones[0..i]) |z| freeStubZone(allocator, z);
+        allocator.free(zones);
+    }
+    var fields: [1 + delegation.max_servers_per_level + 1][]const u8 = undefined;
+    while (i < strs.len) : (i += 1) {
+        var n: usize = 0;
+        var it = mem.tokenizeAny(u8, strs[i], " \t");
+        while (it.next()) |f| : (n += 1) {
+            if (n == fields.len) break;
+            fields[n] = f;
+        }
+        if (n < 2 or n == fields.len) {
+            errLog("config: stub-zones entry '{s}' must be a zone and 1 to {d} addresses", .{ strs[i], fields.len - 2 });
+            return error.InvalidValue;
+        }
+        const apex = dns.parseDottedName(allocator, fields[0]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                errLog("config: invalid zone name '{s}'", .{fields[0]});
+                return error.InvalidValue;
+            },
+        };
+        errdefer freeName(allocator, apex);
+        if (apex.labels.len == 0 or special_use.fixed(apex)) {
+            errLog("config: stub-zones cannot name '{s}'", .{fields[0]});
+            return error.InvalidValue;
+        }
+        for (zones[0..i]) |z| if (z.apex.eql(apex)) {
+            errLog("config: stub-zones names '{s}' twice", .{fields[0]});
+            return error.InvalidValue;
+        };
+        zones[i] = .{ .apex = apex, .servers = try parseAddressList(allocator, fields[1..n], 53, error.InvalidValue) };
+    }
+    return zones;
+}
+
+fn freeName(allocator: Allocator, name: dns.Name) void {
+    for (name.labels) |label| allocator.free(label);
+    allocator.free(name.labels);
+}
+
+fn freeStubZone(allocator: Allocator, z: stub.Zone) void {
+    freeName(allocator, z.apex);
+    allocator.free(z.servers);
+}
+
+fn freeStubZones(allocator: Allocator, zones: []stub.Zone) void {
+    for (zones) |z| freeStubZone(allocator, z);
+    allocator.free(zones);
 }
 
 pub fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
@@ -917,6 +1002,45 @@ test "an out-of-range integer is rejected, never clamped" {
 fn parseConfigOomProbe(allocator: Allocator, contents: []const u8) !void {
     var cfg = try parseConfig(allocator, contents);
     cfg.deinit();
+}
+
+test "stub-zones names a zone's servers, and refuses what no operator may name" {
+    var cfg = try parseConfig(testing.allocator,
+        \\[resolver]
+        \\stub-zones = ["Internal 192.168.1.1:5353  [fd00::53]", "lab.test 10.0.0.1"]
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 2), cfg.stub_zones.len);
+    try testing.expectEqual(@as(u16, 5353), cfg.stub_zones[0].servers[0].getPort());
+    try testing.expectEqual(@as(u16, 53), cfg.stub_zones[0].servers[1].getPort());
+    for ([_][]const u8{
+        "internal",
+        ". 192.0.2.1",
+        "invalid 192.0.2.1",
+        "a.onion 192.0.2.1",
+        "IPv4only.arpa 192.0.2.1",
+        "internal not-an-address",
+    }) |entry| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "[resolver]\nstub-zones = [\"{s}\"]\n", .{entry});
+        try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, text));
+    }
+    try testing.expectError(error.InvalidValue, parseConfig(testing.allocator,
+        \\[resolver]
+        \\stub-zones = ["internal 192.0.2.1", "INTERNAL 192.0.2.2"]
+    ));
+    for ([_][]const u8{ "127.0.0.1:53", "127.0.0.1:5335", "[::1]:5335", "[::]:5335" }) |server| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "[server]\nlisten = [\"127.0.0.1:53\", \"0.0.0.0:5335\", \"[::]:5335\"]\n[resolver]\nstub-zones = [\"internal {s}\"]\n", .{server});
+        try testing.expectError(error.InvalidValue, parseConfig(testing.allocator, text));
+    }
+    var other = try parseConfig(testing.allocator,
+        \\[server]
+        \\listen = ["0.0.0.0:5335", "[::]:5335"]
+        \\[resolver]
+        \\stub-zones = ["internal 192.168.1.1:5335 127.0.0.1:53 [::1]:53"]
+    );
+    other.deinit();
 }
 
 test "root-hints refuses more addresses than a walk level holds" {

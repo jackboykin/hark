@@ -27,6 +27,7 @@ const trust = @import("trust.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
+const stub = @import("stub.zig");
 
 /// CNAME and DNAME links one question may follow, a DNAME and its
 /// synthesised CNAME counting once. Chains in the wild run to 12;
@@ -156,6 +157,7 @@ pub const Key = struct {
 pub const Config = struct {
     qmin: bool = true,
     root_hints: []const na.Address,
+    stub_zones: []const stub.Zone = &.{},
     addr_policy: delegation.AddrPolicy = .{},
     max_queries: u32 = 100,
     resolve_ms: u32 = 7000,

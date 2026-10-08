@@ -823,6 +823,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     var g = try graph.Graph.init(gpa, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),
+        .stub_zones = cfg.stub_zones,
         .addr_policy = cfg.addrPolicy(),
         .stagger_ms = cfg.stagger_ms,
         .max_queries = cfg.max_queries,

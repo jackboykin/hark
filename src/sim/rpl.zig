@@ -10,6 +10,7 @@ const testing = std.testing;
 const dns = @import("../dns.zig");
 const na = @import("../net_address.zig");
 const dns64 = @import("../dns64.zig");
+const stub = @import("../stub.zig");
 
 /// testbound's default; corpus RRs mostly omit the TTL, and hark refuses
 /// to cache TTL 0.
@@ -114,6 +115,7 @@ pub const Step = struct {
 pub const Scenario = struct {
     name: []const u8 = "",
     root_hints: []const na.Address = &.{},
+    stub_zones: []const stub.Zone = &.{},
     ranges: []const Range = &.{},
     steps: []const Step = &.{},
     /// `; hark:` directives and Unbound-prelude equivalents; null is the
@@ -232,6 +234,14 @@ const Parser = struct {
                 try list.append(p.arena, try p.parseAddr(t));
             }
             s.root_hints = list.items;
+        } else if (mem.eql(u8, key, "stub-zone")) {
+            var it = mem.tokenizeAny(u8, val, " \t");
+            const apex = dns.parseDottedName(p.arena, it.next() orelse return p.fail("stub-zone: no zone")) catch return p.fail("stub-zone: bad zone");
+            var servers: std.ArrayList(na.Address) = .empty;
+            while (it.next()) |t| try servers.append(p.arena, try p.parseAddr(t));
+            if (servers.items.len == 0) return p.fail("stub-zone: no servers");
+            const z: stub.Zone = .{ .apex = apex, .servers = servers.items };
+            s.stub_zones = try mem.concat(p.arena, stub.Zone, &.{ s.stub_zones, &.{z} });
         } else if (mem.eql(u8, key, "qname-minimisation") or mem.eql(u8, key, "qname-minimization")) {
             s.qmin = yes(val);
         } else if (mem.eql(u8, key, "minimal-responses")) {

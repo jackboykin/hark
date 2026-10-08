@@ -20,6 +20,10 @@ stagger-ms = 150              # nameserver racing delay; 0 disables
 max-queries = 100             # upstream exchanges one resolution may spend
 root-hints = []               # override IANA roots ("ip" or "ip:port");
                               # empty = compiled-in defaults
+stub-zones = []               # "<zone> <addr> [<addr> ...]": a zone asked of
+                              # these servers alone, which must be its
+                              # authorities; its answers are never validated,
+                              # e.g. "internal 192.168.1.1"
 
 [cache]
 size = 12582912               # answer cache, bytes; resolutions in flight may hold

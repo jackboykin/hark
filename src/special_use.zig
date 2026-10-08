@@ -96,6 +96,19 @@ pub fn classify(name: dns.Name, qtype: dns.RType, do_bit: bool) ?Own {
     return null;
 }
 
+/// At or below a name whose answer its RFC fixes, which no operator may
+/// send elsewhere: localhost (RFC 6761 §6.3), invalid (§6.4), onion (RFC
+/// 7686 §2), ipv4only.arpa (RFC 8880 §7.1). test is the operator's "by
+/// default" only (RFC 6761 §6.2); home.arpa and service.arpa may be
+/// served (RFC 8375 §4.4.B, RFC 6303 §3).
+pub fn fixed(name: dns.Name) bool {
+    const n = name.labels.len;
+    if (n == 0) return false;
+    const last = name.labels[n - 1];
+    if (is(last, "localhost") or is(last, "invalid") or is(last, "onion")) return true;
+    return n >= 2 and is(last, "arpa") and is(name.labels[n - 2], "ipv4only");
+}
+
 fn is(label: []const u8, word: []const u8) bool {
     return std.ascii.eqlIgnoreCase(label, word);
 }
