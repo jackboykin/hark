@@ -966,6 +966,15 @@ pub const Graph = struct {
         g.release(id);
     }
 
+    /// Remembered for the window (RFC 9520 §3.2), unless the asker may have
+    /// caused it: a spent budget or deadline, an orphan, an address lookup's
+    /// depth, a refresh, or a send that never left the host.
+    pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
+        const c = g.cell(id);
+        if (why.cause == .zone and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, why);
+        try g.fail(id, why);
+    }
+
     /// Refuse new work for `key` with `why` for `servfail_ttl`; past
     /// `max_failed` keys a random other one is forgotten.
     pub fn remember(g: *Graph, key: Key, why: Failure) !void {

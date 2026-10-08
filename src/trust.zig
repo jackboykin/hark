@@ -96,7 +96,7 @@ const Fault = union(enum) {
     }
 };
 
-const refused: Failure = .{ .code = .dnssec_bogus, .text = "zone failed validation" };
+const bogus: Failure = .{ .code = .dnssec_bogus };
 /// Verified, and still no proof of the insecure cut asked about.
 const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut proven" };
 
@@ -112,7 +112,7 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
         t.expires_ns = @min(t.expires_ns, g.now());
         if (t.blob) |b| g.store.drop(t.key, b);
     }
-    try g.fail(id, .{ .code = .dnssec_bogus });
+    try g.fail(id, bogus);
 }
 
 /// A draw the validation budget refused is the asker's limit, never bogus.
@@ -128,7 +128,7 @@ fn budgetSpent(g: *Graph) ?Failure {
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (budgetSpent(g) == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, refused);
+    if (budgetSpent(g) == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
     try failBogus(g, id, rid);
 }
 

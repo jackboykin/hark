@@ -613,7 +613,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
     while (true) {
         switch (try ask(g, id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
             .pending => return,
-            .exhausted => return failAsk(g, id, ended(g, &g.cell(id).scratch.rrset.ask)),
+            .exhausted => return g.failRemembered(id, ended(g, &g.cell(id).scratch.rrset.ask)),
             .reply => |kept| {
                 const msg = kept.msg;
                 const zone = g.cell(id).scratch.rrset.ask.zone;
@@ -635,9 +635,9 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
                 }
                 const reply = switch (kept.verdict) {
                     .reply => |r| r,
-                    .loop => return failAsk(g, id, Links.loop),
+                    .loop => return g.failRemembered(id, Links.loop),
                     // No useful response (RFC 9520 §2).
-                    .none => return failAsk(g, id, ended(g, &g.cell(id).scratch.rrset.ask)),
+                    .none => return g.failRemembered(id, ended(g, &g.cell(id).scratch.rrset.ask)),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
@@ -657,18 +657,6 @@ fn ended(g: *const Graph, a: *const Ask) Failure {
 
 fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
     try g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
-}
-
-/// The fetch itself failed: the next asker in the window is refused
-/// (RFC 9520 §3.2), unless the failure may be the asker's own: a spent
-/// budget or deadline (here or in a sub-resolution), an orphan, an address
-/// sub-resolution's depth, a refresh, or something that never left the host.
-const failed_recently: Failure = .{ .code = .no_reachable_authority, .text = "failed recently" };
-
-fn failAsk(g: *Graph, id: CellId, why: Failure) !void {
-    const c = g.cell(id);
-    if (why.cause == .zone and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, failed_recently);
-    try g.fail(id, why);
 }
 
 /// A chain starting with a CNAME at `name` is also the fact
