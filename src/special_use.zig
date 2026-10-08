@@ -10,8 +10,6 @@
 ///   home.arpa.            RFC 8375 §4.4.B → NODATA, DS real
 ///   *.home.arpa.          RFC 8375 §4.4.B → NXDOMAIN
 ///   onion.                RFC 7686 §2     → NXDOMAIN
-///   127.in-addr.arpa.     RFC 6761 §6.3   → PTR localhost.
-///   <::1>.ip6.arpa.       RFC 6761 §6.3   → PTR localhost.
 ///   ipv4only.arpa.        RFC 8880 §7.1   → A 192.0.0.170/171, else NODATA
 ///                                           (DS real, subdomains NXDOMAIN)
 ///
@@ -32,7 +30,6 @@ pub const Action = enum {
     nxdomain,
     localhost_a,
     localhost_aaaa,
-    localhost_ptr,
     ipv4only_a,
     /// NOERROR with empty answer (the name exists but the qtype does not).
     nodata,
@@ -68,16 +65,6 @@ pub fn classify(name: []const u8, qtype: dns.RType) Action {
         };
     }
     if (eqlOrSubdomainOf(stripped, "ipv4only.arpa")) return .nxdomain;
-
-    // 127.0.0.0/8 reverse — RFC 6761 §6.3 says any 127/8 PTR resolves to
-    // localhost. (The narrower 1.0.0.127 special case is generalised here.)
-    if (eqlOrSubdomainOf(stripped, "127.in-addr.arpa")) {
-        return if (qtype == .ptr) .localhost_ptr else .nodata;
-    }
-    // ::1 reverse — 32 zero nibbles + 1 + ip6.arpa.
-    if (std.ascii.eqlIgnoreCase(stripped, "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa")) {
-        return if (qtype == .ptr) .localhost_ptr else .nodata;
-    }
 
     return .none;
 }
@@ -142,18 +129,6 @@ pub fn synthesize(
             };
             answers = arr;
         },
-        .localhost_ptr => {
-            const arr = try allocator.alloc(dns.ResourceRecord, 1);
-            const target = try dns.parseDottedName(allocator, "localhost.");
-            arr[0] = .{
-                .name = qname,
-                .rtype = .ptr,
-                .rclass = .in,
-                .ttl = ttl_localhost,
-                .rdata = .{ .ptr = target },
-            };
-            answers = arr;
-        },
         .ipv4only_a => {
             const arr = try allocator.alloc(dns.ResourceRecord, ipv4only_addrs.len);
             for (arr, ipv4only_addrs) |*rr, addr| rr.* = .{
@@ -200,16 +175,6 @@ test "classify ipv4only.arpa: DS falls through, apex is not its own subdomain" {
     try testing.expectEqual(Action.ipv4only_a, classify("ipv4only.arpa.", .a));
     try testing.expectEqual(Action.none, classify("ipv4only.arpa.", .ds));
     try testing.expectEqual(Action.nxdomain, classify("foo.ipv4only.arpa.", .ds));
-}
-
-test "classify reverse 127/8 PTR → localhost" {
-    try testing.expectEqual(Action.localhost_ptr, classify("1.0.0.127.in-addr.arpa.", .ptr));
-    try testing.expectEqual(Action.localhost_ptr, classify("100.50.0.127.in-addr.arpa", .ptr));
-}
-
-test "classify ::1 reverse PTR → localhost" {
-    const ipv6_one_rev = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
-    try testing.expectEqual(Action.localhost_ptr, classify(ipv6_one_rev, .ptr));
 }
 
 test "classify no match falls through" {
