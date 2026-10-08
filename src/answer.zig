@@ -92,6 +92,7 @@ pub const Served = struct {
     /// A failure of this host's or of the asker's limits, not the DNS's:
     /// never noted (`Failures`).
     theirs: bool = false,
+    local: bool = false,
     held: []const *store.Blob = &.{},
 
     pub fn release(s: Served, st: *store.Store) void {
@@ -99,7 +100,7 @@ pub const Served = struct {
     }
 
     pub fn reply(s: Served) response.Reply {
-        return .{ .rcode = s.rcode, .ad = s.ad, .ede = s.ede, .answers = s.answers, .authorities = s.authorities, .additionals = s.additionals };
+        return .{ .rcode = s.rcode, .ad = s.ad, .ede = s.ede, .local = s.local, .answers = s.answers, .authorities = s.authorities, .additionals = s.additionals };
     }
 };
 
@@ -110,19 +111,17 @@ fn wireAll(arena: Allocator, rrs: []const dns.ResourceRecord) ![]dns.WireRecord 
 }
 
 fn synthesized(arena: Allocator, q: dns.Question, s: special_use.Synthesized) !Served {
-    return .{ .rcode = s.rcode, .question = q, .answers = try wireAll(arena, s.answers), .cacheable = false };
+    return .{ .rcode = s.rcode, .question = q, .answers = try wireAll(arena, s.answers), .cacheable = false, .local = true };
 }
 
-/// RFC 6761 names, answered asking nobody; null: ask the graph.
-pub fn special(arena: Allocator, q: dns.Question, d64: ?Dns64) !?Served {
-    var buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const name = q.name.formatInto(&buf);
-    const action = special_use.classify(name, q.qtype);
-    if (action == .none) return null;
-    const served = try synthesized(arena, q, try special_use.synthesize(arena, name, action));
+pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
+    const served = try synthesized(arena, q, try special_use.synthesize(arena, q, o));
     // RFC 8880 §7.1: ipv4only.arpa's AAAA is synthesized here too.
     if (d64) |d| if (q.qtype == .aaaa and dns64.wantsSynthesis(served.rcode, served.answers)) {
-        var a = try synthesized(arena, q, try special_use.synthesize(arena, name, special_use.classify(name, .a)));
+        var qa = q;
+        qa.qtype = .a;
+        const of_a = special_use.classify(qa.name, qa.qtype) orelse return served;
+        var a = try synthesized(arena, q, try special_use.synthesize(arena, qa, of_a));
         a.answers = try dns64.synthesizeAaaa(arena, d.prefix, a.answers, &.{}) orelse return served;
         return a;
     };
@@ -184,7 +183,7 @@ pub const Desk = struct {
     };
 
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
-        if (try special(arena, q, Dns64.on(d.dns64, c))) |s| return .{ .synthesized = s };
+        if (special_use.classify(q.name, q.qtype)) |o| return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
         // RRSIGs are never signed (RFC 4035 §2.2): an answer of them can't
         // be validated, and SERVFAIL would read as bogus. Validating, the

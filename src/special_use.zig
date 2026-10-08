@@ -24,59 +24,49 @@ const std = @import("std");
 const mem = std.mem;
 const dns = @import("dns.zig");
 
-pub const Action = enum {
-    none,
+pub const Own = union(enum) {
     /// RFC 1035 §4.1.1 NXDOMAIN. No SOA synthesized; client gets RA-only.
     nxdomain,
-    localhost_a,
-    localhost_aaaa,
-    ipv4only_a,
     /// NOERROR with empty answer (the name exists but the qtype does not).
     nodata,
+    answer: []const dns.RData,
 };
 
-const localhost_label = "localhost";
+const loopback4: []const dns.RData = &.{.{ .a = .{ 127, 0, 0, 1 } }};
+const loopback6: []const dns.RData = &.{.{ .aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1} }};
+/// RFC 7050 §8.
+const ipv4only: []const dns.RData = &.{ .{ .a = .{ 192, 0, 0, 170 } }, .{ .a = .{ 192, 0, 0, 171 } } };
 
-/// Classify a query against the RFC 6761 special-use table.
-pub fn classify(name: []const u8, qtype: dns.RType) Action {
-    const stripped = dns.stripTrailingDot(name);
-
-    if (eqlOrSubdomainOf(stripped, localhost_label)) {
+/// hark's own answer to the question, or null: ask the DNS.
+pub fn classify(name: dns.Name, qtype: dns.RType) ?Own {
+    const n = name.labels.len;
+    if (n == 0) return null;
+    const last = name.labels[n - 1];
+    if (is(last, "localhost")) return switch (qtype) {
+        .a => .{ .answer = loopback4 },
+        .aaaa => .{ .answer = loopback6 },
+        else => .nodata,
+    };
+    if (is(last, "invalid") or is(last, "test") or is(last, "onion")) return .nxdomain;
+    if (!is(last, "arpa") or n < 2) return null;
+    const second = name.labels[n - 2];
+    if (is(second, "home")) {
+        if (n > 2) return .nxdomain;
+        return if (qtype == .ds) null else .nodata;
+    }
+    if (is(second, "ipv4only")) {
+        if (n > 2) return .nxdomain;
         return switch (qtype) {
-            .a => .localhost_a,
-            .aaaa => .localhost_aaaa,
+            .a => .{ .answer = ipv4only },
+            .ds => null,
             else => .nodata,
         };
     }
-
-    if (eqlOrSubdomainOf(stripped, "invalid")) return .nxdomain;
-    if (eqlOrSubdomainOf(stripped, "test")) return .nxdomain;
-    if (eqlOrSubdomainOf(stripped, "onion")) return .nxdomain;
-    if (std.ascii.eqlIgnoreCase(stripped, "home.arpa")) {
-        return if (qtype == .ds) .none else .nodata;
-    }
-    if (eqlOrSubdomainOf(stripped, "home.arpa")) return .nxdomain;
-
-    if (std.ascii.eqlIgnoreCase(stripped, "ipv4only.arpa")) {
-        return switch (qtype) {
-            .a => .ipv4only_a,
-            .ds => .none,
-            else => .nodata,
-        };
-    }
-    if (eqlOrSubdomainOf(stripped, "ipv4only.arpa")) return .nxdomain;
-
-    return .none;
+    return null;
 }
 
-/// `name` equals `tail` or is a subdomain of it. Both parameters are
-/// expected without trailing dot. ASCII case-insensitive.
-fn eqlOrSubdomainOf(name: []const u8, tail: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(name, tail)) return true;
-    if (name.len <= tail.len + 1) return false;
-    const dot = name.len - tail.len - 1;
-    if (name[dot] != '.' or dns.isEscapedAt(name, dot)) return false;
-    return std.ascii.eqlIgnoreCase(name[name.len - tail.len ..], tail);
+fn is(label: []const u8, word: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(label, word);
 }
 
 /// hark's own reply to a special-use name.
@@ -85,126 +75,74 @@ pub const Synthesized = struct {
     answers: []const dns.ResourceRecord = &.{},
 };
 
-/// The reply for the matched action; records live in `allocator`.
-pub fn synthesize(
-    allocator: mem.Allocator,
-    name: []const u8,
-    action: Action,
-) !Synthesized {
-    std.debug.assert(action != .none);
+pub fn synthesize(allocator: mem.Allocator, q: dns.Question, own: Own) !Synthesized {
+    const rdatas = switch (own) {
+        .nxdomain => return .{ .rcode = .name_error },
+        .nodata => return .{},
+        .answer => |rdatas| rdatas,
+    };
     // Lowercase the client-typed name so synthesized owners match the
     // `tryParseMessage` scrub policy.
-    var lower_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    if (name.len > lower_buf.len) return error.NameTooLong;
-    const lower = dns.lowerNameIntoBuf(&lower_buf, name);
-    const qname = try dns.parseDottedName(allocator, lower);
-
-    var answers: []dns.ResourceRecord = &.{};
-    var rcode: dns.RCode = .no_error;
-
-    switch (action) {
-        .none => unreachable,
-        .nxdomain => rcode = .name_error,
-        .nodata => {},
-        .localhost_a => {
-            const arr = try allocator.alloc(dns.ResourceRecord, 1);
-            arr[0] = .{
-                .name = qname,
-                .rtype = .a,
-                .rclass = .in,
-                .ttl = ttl_localhost,
-                .rdata = .{ .a = .{ 127, 0, 0, 1 } },
-            };
-            answers = arr;
-        },
-        .localhost_aaaa => {
-            const arr = try allocator.alloc(dns.ResourceRecord, 1);
-            const aaaa = @as([15]u8, @splat(0)) ++ [_]u8{1};
-            arr[0] = .{
-                .name = qname,
-                .rtype = .aaaa,
-                .rclass = .in,
-                .ttl = ttl_localhost,
-                .rdata = .{ .aaaa = aaaa },
-            };
-            answers = arr;
-        },
-        .ipv4only_a => {
-            const arr = try allocator.alloc(dns.ResourceRecord, ipv4only_addrs.len);
-            for (arr, ipv4only_addrs) |*rr, addr| rr.* = .{
-                .name = qname,
-                .rtype = .a,
-                .rclass = .in,
-                .ttl = ttl_localhost,
-                .rdata = .{ .a = addr },
-            };
-            answers = arr;
-        },
-    }
-
-    return .{ .rcode = rcode, .answers = answers };
+    const labels = try allocator.alloc([]const u8, q.name.labels.len);
+    for (labels, q.name.labels) |*l, from| l.* = try std.ascii.allocLowerString(allocator, from);
+    const answers = try allocator.alloc(dns.ResourceRecord, rdatas.len);
+    for (answers, rdatas) |*rr, rdata| rr.* = .{ .name = .{ .labels = labels }, .rtype = q.qtype, .rclass = .in, .ttl = fixed_ttl, .rdata = rdata };
+    return .{ .answers = answers };
 }
 
-/// Synthetic responses are stable forever — RFC 6761 names cannot be
-/// re-delegated without an RFC update. Use a long TTL.
-const ttl_localhost: u32 = 86_400;
-
-/// RFC 7050 §8.
-const ipv4only_addrs = [2][4]u8{ .{ 192, 0, 0, 170 }, .{ 192, 0, 0, 171 } };
+const fixed_ttl: u32 = 86_400;
 
 const testing = std.testing;
 
+fn expectOwn(want: ?Own, name: []const u8, qtype: dns.RType) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(want, classify(try dns.parseDottedName(arena.allocator(), name), qtype));
+}
+
 test "classify localhost A → loopback" {
-    try testing.expectEqual(Action.localhost_a, classify("localhost.", .a));
-    try testing.expectEqual(Action.localhost_a, classify("localhost", .a));
-    try testing.expectEqual(Action.localhost_a, classify("LocalHost", .a));
-    try testing.expectEqual(Action.localhost_aaaa, classify("localhost.", .aaaa));
-    try testing.expectEqual(Action.nodata, classify("localhost.", .mx));
-    try testing.expectEqual(Action.localhost_a, classify("foo.localhost.", .a));
+    try expectOwn(.{ .answer = loopback4 }, "localhost.", .a);
+    try expectOwn(.{ .answer = loopback4 }, "LocalHost", .a);
+    try expectOwn(.{ .answer = loopback6 }, "localhost.", .aaaa);
+    try expectOwn(.nodata, "localhost.", .mx);
+    try expectOwn(.{ .answer = loopback4 }, "foo.localhost.", .a);
 }
 
 test "classify NXDOMAIN names" {
-    try testing.expectEqual(Action.nxdomain, classify("invalid.", .a));
-    try testing.expectEqual(Action.nxdomain, classify("foo.bar.invalid", .aaaa));
-    try testing.expectEqual(Action.nxdomain, classify("test.", .a));
-    try testing.expectEqual(Action.nxdomain, classify("something.onion.", .a));
-    try testing.expectEqual(Action.nxdomain, classify("foo.home.arpa", .aaaa));
+    try expectOwn(.nxdomain, "invalid.", .a);
+    try expectOwn(.nxdomain, "foo.bar.invalid", .aaaa);
+    try expectOwn(.nxdomain, "test.", .a);
+    try expectOwn(.nxdomain, "something.onion.", .a);
+    try expectOwn(.nxdomain, "foo.home.arpa", .aaaa);
 }
 
 test "classify ipv4only.arpa: DS falls through, apex is not its own subdomain" {
-    try testing.expectEqual(Action.ipv4only_a, classify("ipv4only.arpa.", .a));
-    try testing.expectEqual(Action.none, classify("ipv4only.arpa.", .ds));
-    try testing.expectEqual(Action.nxdomain, classify("foo.ipv4only.arpa.", .ds));
+    try expectOwn(.{ .answer = ipv4only }, "ipv4only.arpa.", .a);
+    try expectOwn(null, "ipv4only.arpa.", .ds);
+    try expectOwn(.nxdomain, "foo.ipv4only.arpa.", .ds);
 }
 
 test "classify no match falls through" {
-    try testing.expectEqual(Action.none, classify("example.com.", .a));
-    try testing.expectEqual(Action.none, classify("invalidish.example.com", .a));
-    // notlocalhost should not match localhost (suffix-of-label, not subdomain)
-    try testing.expectEqual(Action.none, classify("notlocalhost.", .a));
-    // testing. is not test. (the dot boundary matters)
-    try testing.expectEqual(Action.none, classify("testing.com", .a));
+    try expectOwn(null, "example.com.", .a);
+    try expectOwn(null, "invalidish.example.com", .a);
+    try expectOwn(null, "notlocalhost.", .a);
+    try expectOwn(null, "testing.com", .a);
+    try expectOwn(null, "arpa", .a);
     // A literal dot inside a label is not a subdomain boundary: `foo\.invalid`
     // is one label and must resolve, not synthesize NXDOMAIN.
-    try testing.expectEqual(Action.none, classify("foo\\.invalid", .a));
-    try testing.expectEqual(Action.none, classify("bar\\.test.example.com", .a));
+    try expectOwn(null, "foo\\.invalid", .a);
+    try expectOwn(null, "bar\\.test.example.com", .a);
     // ...but an escaped backslash before the dot leaves it a real boundary.
-    try testing.expectEqual(Action.nxdomain, classify("x\\\\.invalid", .a));
+    try expectOwn(.nxdomain, "x\\\\.invalid", .a);
 }
 
 test "synthesize localhost A produces 127.0.0.1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try synthesize(arena.allocator(), "localhost.", .localhost_a);
+    const q: dns.Question = .{ .name = try dns.parseDottedName(arena.allocator(), "LocalHost."), .qtype = .a, .qclass = .in };
+    const msg = try synthesize(arena.allocator(), q, classify(q.name, q.qtype).?);
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     try testing.expectEqual(dns.RCode.no_error, msg.rcode);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &msg.answers[0].rdata.a);
-}
-
-test "synthesize nxdomain has no answers" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const msg = try synthesize(arena.allocator(), "invalid.", .nxdomain);
-    try testing.expectEqual(dns.RCode.name_error, msg.rcode);
-    try testing.expectEqual(@as(usize, 0), msg.answers.len);
+    try testing.expectEqualStrings("localhost", msg.answers[0].name.labels[0]);
 }

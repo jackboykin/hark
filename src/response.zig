@@ -7,13 +7,14 @@ const mem = std.mem;
 const testing = std.testing;
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
-const special_use = @import("special_use.zig");
 
 /// What is sent: the rcode, AD as the shaper judged it, and the records.
 pub const Reply = struct {
     rcode: dns.RCode,
     ad: bool = false,
     ede: ?dns.Ede = null,
+    /// Not the public DNS's answer, so never scrubbed for rebinding.
+    local: bool = false,
     answers: []const dns.WireRecord = &.{},
     authorities: []const dns.WireRecord = &.{},
     additionals: []const dns.WireRecord = &.{},
@@ -56,16 +57,7 @@ pub fn buildResponseWire(
     reply: Reply,
     alloc: mem.Allocator,
 ) ?[]const u8 {
-    const qtype = if (ctx.questions.len > 0) ctx.questions[0].qtype else .a;
-
-    // Special-use answers are hark's own. Keyed on qname, so a CNAME
-    // into localhost still scrubs.
-    var qname_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    const rb = (if (ctx.rebinding.enabled and ctx.questions.len > 0 and
-        special_use.classify(ctx.questions[0].name.formatInto(&qname_buf), qtype) != .none)
-        &rebinding.Config.off
-    else
-        ctx.rebinding).*;
+    const rb = (if (reply.local) &rebinding.Config.off else ctx.rebinding).*;
 
     // Every section: negatives pass authority and additional through, and
     // RFC 9460 §4.2 steers clients to Additional-section SVCB/A/AAAA. OOM
@@ -453,37 +445,28 @@ test "buildResponseWire: the rebinding scrub reaches additionals" {
     }
 }
 
-test "buildResponseWire: special-use qname bypasses the rebinding scrub; a CNAME into it does not" {
+test "buildResponseWire: a local answer bypasses the rebinding scrub; any other does not" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const scrub_on = rebinding.Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
     const localhost = try dns.parseDottedName(a, "localhost");
-    const attacker = try dns.parseDottedName(a, "attacker.com");
     const loopback: dns.WireRecord = try .from(a, .{ .name = localhost, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 127, 0, 0, 1 } } });
-    const alias: dns.WireRecord = try .from(a, .{ .name = attacker, .rtype = .cname, .rclass = .in, .ttl = 60, .rdata = .{ .cname = localhost } });
-
-    const cases = [_]struct { qname: dns.Name, answers: []const dns.WireRecord }{
-        .{ .qname = localhost, .answers = &.{loopback} },
-        .{ .qname = attacker, .answers = &.{ alias, loopback } },
-    };
-    for (cases) |c| {
+    for ([_]bool{ true, false }) |local| {
         var buf: [dns.max_udp_payload]u8 = undefined;
         const wire = buildResponseWire(&buf, .{
             .query_id = 0,
             .opcode = .query,
             .rd = true,
             .cd = false,
-            .questions = &.{.{ .name = c.qname, .qtype = .a, .qclass = .in }},
+            .questions = &.{.{ .name = localhost, .qtype = .a, .qclass = .in }},
             .client_edns = false,
             .client_do = false,
             .max_udp_payload = dns.max_udp_payload,
             .rebinding = &scrub_on,
-        }, .{ .rcode = .no_error, .answers = c.answers }, a).?;
-        const parsed = try dns.parseMessage(a, wire);
-        try testing.expectEqual(@as(u16, 1), parsed.header.an_count);
-        try testing.expectEqual(c.answers[0].rtype(), parsed.answers[0].rtype);
+        }, .{ .rcode = .no_error, .local = local, .answers = &.{loopback} }, a).?;
+        try testing.expectEqual(@intFromBool(local), (try dns.parseMessage(a, wire)).header.an_count);
     }
 }
 

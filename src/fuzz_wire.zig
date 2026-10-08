@@ -192,7 +192,7 @@ fn chain(alloc: std.mem.Allocator, input: []const u8) !void {
     var buf: [dns.max_dotted_len + 1]u8 = undefined;
     for (msg.questions) |q| {
         try checkName(alloc, q.name);
-        _ = special_use.classify(q.name.formatLower(&buf), q.qtype);
+        _ = special_use.classify(q.name, q.qtype);
     }
     for ([_][]const dns.ResourceRecord{ msg.answers, msg.authorities, msg.additionals }) |sec| for (sec) |rr| {
         try checkName(alloc, rr.name);
