@@ -1,0 +1,166 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: stub-zone = internal 127.0.20.1
+
+SCENARIO_BEGIN the public dns never speaks for a stub zone
+
+; Here the root claims internal. and answers for its names. A public
+; reply ends where the stub zone begins: the records it holds past there
+; answer nothing, its rcode speaks for none of them, and the chain into
+; the zone fails. A public delegation to a server named in the zone finds
+; no address, from the root's glue or from the stub's own server. The DS
+; at the zone's apex is the parent's data (RFC 4035 §2.4), so it is the
+; root's to answer.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 300 IN CNAME host.internal.
+      host.internal. 300 IN A 192.0.2.66
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR NOERROR
+    SECTION QUESTION
+      www.other. IN A
+    SECTION AUTHORITY
+      other. 3600 IN NS ns.internal.
+    SECTION ADDITIONAL
+      ns.internal. 3600 IN A 127.0.10.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone.example. IN A
+    SECTION ANSWER
+      gone.example. 300 IN CNAME y.internal.
+    SECTION AUTHORITY
+      . 3600 IN SOA a.root. nobody.invalid. 1 3600 1200 604800 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      internal. IN DS
+    SECTION AUTHORITY
+      . 3600 IN SOA a.root. nobody.invalid. 1 3600 1200 604800 3600
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      internal. IN A
+    SECTION ANSWER
+      host.internal. 300 IN A 192.0.2.66
+      ns.internal. 300 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.other. IN A
+    SECTION ANSWER
+      www.other. 300 IN A 192.0.2.7
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.20.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      internal. IN DS
+    SECTION AUTHORITY
+      internal. 300 IN SOA ns.internal. nobody.invalid. 1 3600 1200 604800 300
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      internal. IN A
+    SECTION ANSWER
+      host.internal. 300 IN A 10.0.0.5
+      ns.internal. 300 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.other. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.other. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    internal. IN DS
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    internal. IN DS
+ENTRY_END
+
+SCENARIO_END

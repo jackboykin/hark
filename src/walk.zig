@@ -15,6 +15,7 @@ const proof = @import("proof.zig");
 const denial = @import("denial.zig");
 const store = @import("store.zig");
 const special_use = @import("special_use.zig");
+const stub = @import("stub.zig");
 
 const Graph = graph.Graph;
 const CellId = graph.CellId;
@@ -809,7 +810,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         key.name = try sa.dupe(u8, key.name);
         var glue: std.ArrayList(na.Address) = .empty;
         // Glue is the parent's word only inside its own zone.
-        if (host.isSubdomainOf(zone)) for (msg.additionals) |rr| {
+        if (speaksFor(g, zone, host)) for (msg.additionals) |rr| {
             if (!rr.name.eql(host)) continue;
             const addr = g.cfg.addr_policy.address(rr) orelse continue;
             try glue.append(sa, addr);
@@ -883,6 +884,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
     // NXDOMAIN denies the end of the chain; records there are noise.
     const collect = msg.header.flags.rcode != .name_error;
     while (true) : (hops += 1) {
+        if (hops > 0 and !speaksFor(g, zone, cur)) break;
         for (seen[0..hops]) |n| if (n.eql(cur)) return .loop;
         seen[hops] = cur;
         passed = keep.items.len;
@@ -938,7 +940,7 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         cur = c.rdata.cname;
     }
     const yx = msg.header.flags.rcode == .yx_domain;
-    const left = !overflow and !answered and hops > 0 and !cur.isSubdomainOf(zone);
+    const left = !overflow and !answered and hops > 0 and !speaksFor(g, zone, cur);
     // The rcode is the unread end's.
     const unread = left or clipped or asked_alias != null;
     if (overflow != yx and !(yx and unread)) return null;
@@ -1009,8 +1011,15 @@ fn proofsNeeded(g: *Graph, rrs: []const dns.ResourceRecord, reply: Reply) ![]con
 
 fn inZone(g: *Graph, rrs: []const dns.ResourceRecord, zone: dns.Name) ![]const dns.ResourceRecord {
     var keep: std.ArrayList(dns.ResourceRecord) = try .initCapacity(g.scratch.allocator(), rrs.len);
-    for (rrs) |rr| if (rr.name.isSubdomainOf(zone)) keep.appendAssumeCapacity(rr);
+    for (rrs) |rr| if (speaksFor(g, zone, rr.name)) keep.appendAssumeCapacity(rr);
     return keep.items;
+}
+
+/// Whether `zone`'s servers speak for `name`: inside it, and not inside a
+/// stub zone below it, which only its own servers speak for.
+fn speaksFor(g: *const Graph, zone: dns.Name, name: dns.Name) bool {
+    const zones = g.cfg.stub_zones;
+    return name.isSubdomainOf(zone) and stub.under(zones, name) == stub.under(zones, zone);
 }
 
 fn keepSigs(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), rrs: []const dns.ResourceRecord, owner: dns.Name, covered: dns.RType) !void {
@@ -1063,11 +1072,8 @@ test "an age rounds up to the whole second" {
 // ── The sibling loop ───────────────────────────────────────────────
 
 fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
-    // A question hark answers itself never leaves the host (RFC 6761 §6,
-    // RFC 8375 §4.4.B). An own zone's DS reaches here only for a DO client,
-    // its RFC's one exception, so it is classified as one. The question never
-    // changes, so it is checked until a server is touched.
-    if (a.tried == 0 and special_use.classify(qname, qtype, true) != null) {
+    // The question never changes, so it is checked until a server is touched.
+    if (a.tried == 0 and !mayHear(g, a.zone, qname, qtype)) {
         a.local = true;
         return .exhausted;
     }
@@ -1140,6 +1146,18 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
         // has, it goes round to gather, and to ask for what is unknown.
         if (p.band < ns_rtt.silent_band) return .pending;
     }
+}
+
+/// May `zone`'s servers hear the question? A stub zone's questions go to
+/// its own servers alone, and those servers hear no other. A question hark
+/// answers itself never leaves the host (RFC 6761 §6, RFC 8375 §4.4.B);
+/// an own zone's DS reaches here only for a DO client, its RFC's one
+/// exception, so it is classified as one.
+fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) bool {
+    const zones = g.cfg.stub_zones;
+    const own = stub.of(zones, qname, qtype);
+    if (own != stub.under(zones, zone)) return false;
+    return special_use.classify(qname, qtype, true) == null;
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) bool {
