@@ -15,6 +15,7 @@ pub const Reply = struct {
     ede: ?dns.Ede = null,
     /// Not the public DNS's answer, so never scrubbed for rebinding.
     local: bool = false,
+    aa: bool = false,
     answers: []const dns.WireRecord = &.{},
     authorities: []const dns.WireRecord = &.{},
     additionals: []const dns.WireRecord = &.{},
@@ -92,7 +93,7 @@ pub fn buildResponseWire(
         .flags = .{
             .qr = true,
             .opcode = ctx.opcode,
-            .aa = false,
+            .aa = reply.aa,
             .tc = false,
             .rd = ctx.rd,
             .ra = true,

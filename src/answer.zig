@@ -93,6 +93,7 @@ pub const Served = struct {
     /// never noted (`Failures`).
     theirs: bool = false,
     local: bool = false,
+    aa: bool = false,
     held: []const *store.Blob = &.{},
 
     pub fn release(s: Served, st: *store.Store) void {
@@ -100,7 +101,7 @@ pub const Served = struct {
     }
 
     pub fn reply(s: Served) response.Reply {
-        return .{ .rcode = s.rcode, .ad = s.ad, .ede = s.ede, .local = s.local, .answers = s.answers, .authorities = s.authorities, .additionals = s.additionals };
+        return .{ .rcode = s.rcode, .ad = s.ad, .ede = s.ede, .local = s.local, .aa = s.aa, .answers = s.answers, .authorities = s.authorities, .additionals = s.additionals };
     }
 };
 
@@ -111,7 +112,7 @@ fn wireAll(arena: Allocator, rrs: []const dns.ResourceRecord) ![]dns.WireRecord 
 }
 
 fn synthesized(arena: Allocator, q: dns.Question, s: special_use.Synthesized) !Served {
-    return .{ .rcode = s.rcode, .question = q, .answers = try wireAll(arena, s.answers), .cacheable = false, .local = true };
+    return .{ .rcode = s.rcode, .aa = s.aa, .question = q, .answers = try wireAll(arena, s.answers), .authorities = try wireAll(arena, s.authorities), .cacheable = false, .local = true };
 }
 
 pub fn ownAnswer(arena: Allocator, q: dns.Question, o: special_use.Own, d64: ?Dns64) !Served {
