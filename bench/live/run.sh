@@ -2,6 +2,8 @@
 # usage (in nix develop .#bench): run.sh <rounds> <label=side> <label=side> [names] [rate/s]
 # A side is a hark binary or `unbound`. Each round starts both fresh and asks
 # them every name at once, paced open-loop, cold then hot; then compare.py.
+# Start order alternates by round and ask rotates its send order by name,
+# so neither side always goes first.
 # env: OUT, PASSES (default "cold hot")
 set -uo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
@@ -22,18 +24,18 @@ up() { # label=side port round
     sed "s|__PORT__|$2|g" "$D/hark.toml" >"$R/hark-$2.toml"
     "$side" serve --config "$R/hark-$2.toml" 2>"$log" &
   fi
-  PIDS+=($!)
+  PIDS[$2]=$!
   for _ in $(seq 100); do dig +time=1 +tries=1 @127.0.0.1 -p "$2" . NS >/dev/null 2>&1 && return; sleep 0.05; done
   echo "${1%%=*} did not start; see $log" >&2
   exit 1
 }
 for r in $(seq "$ROUNDS"); do
   PIDS=()
-  up "$A" 5361 "$r"
-  up "$B" 5362 "$r"
+  if ((r % 2)); then up "$A" 5361 "$r"; up "$B" 5362 "$r"
+  else up "$B" 5362 "$r"; up "$A" 5361 "$r"; fi
   for pass in ${PASSES:-cold hot}; do "$R/ask" "$NAMES" "$RATE" "$OUT/$r.$pass.jsonl" 5361 5362; done
-  grep -E 'VmHWM|VmRSS' "/proc/${PIDS[0]}/status" >"$OUT/${A%%=*}.$r.mem"
-  grep -E 'VmHWM|VmRSS' "/proc/${PIDS[1]}/status" >"$OUT/${B%%=*}.$r.mem"
+  grep -E 'VmHWM|VmRSS' "/proc/${PIDS[5361]}/status" >"$OUT/${A%%=*}.$r.mem"
+  grep -E 'VmHWM|VmRSS' "/proc/${PIDS[5362]}/status" >"$OUT/${B%%=*}.$r.mem"
   kill -TERM "${PIDS[@]}"
   wait "${PIDS[@]}" 2>/dev/null
   echo "round $r done"

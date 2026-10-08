@@ -95,8 +95,10 @@ func main() {
 		all.Go(func() {
 			rs := make([][]any, len(addrs))
 			var each sync.WaitGroup
-			for j, a := range addrs {
-				each.Go(func() { rs[j] = ask(a, name) })
+			// Rotate who is asked first, so no port rides first every time.
+			for k := range addrs {
+				j := (i + k) % len(addrs)
+				each.Go(func() { rs[j] = ask(addrs[j], name) })
 			}
 			each.Wait()
 			mu.Lock()
