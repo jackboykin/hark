@@ -6,7 +6,8 @@ SCENARIO_BEGIN an answer section holding only signatures authenticates nothing
 
 ; An RRSIG with no record for it to cover. A validator that reports on the
 ; RRsets it checked, and checks none, has nothing to report — AD here would be
-; an assertion about the empty set.
+; an assertion about the empty set. Its SOA rides along, so the validator
+; is what refuses it, not the SOA rule.
 ;
 ; Expected: SERVFAIL, AD=0.
 
@@ -38,6 +39,8 @@ RANGE_BEGIN 0 100
       www.example. IN A
     SECTION ANSWER
       www.example. 3600 IN RRSIG A 13 2 3600 20990101000000 20200101000000 1 example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 3600
   ENTRY_END
 RANGE_END
 

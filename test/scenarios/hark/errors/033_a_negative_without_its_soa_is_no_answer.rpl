@@ -1,0 +1,190 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+
+SCENARIO_BEGIN a negative without its SOA is no answer, NXDOMAIN or NODATA
+
+; RFC 2308 §3. The SOA must be at or above the name denied, at a chain's
+; end too, and an NXDOMAIN carrying a cut is no referral.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      gone.example. IN A
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      empty.example. IN A
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      denied.example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN SOA ns.example. root.example. 1 3600 900 604800 300
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      odd.example. IN A
+    SECTION AUTHORITY
+      other.example. 3600 IN SOA ns.example. root.example. 1 3600 900 604800 300
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NXDOMAIN
+    SECTION QUESTION
+      chain.example. IN A
+    SECTION ANSWER
+      chain.example. 3600 IN CNAME lost.example.
+  ENTRY_END
+
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR NXDOMAIN
+    SECTION QUESTION
+      www.sub.example. IN A
+    SECTION AUTHORITY
+      sub.example. 3600 IN NS ns.sub.example.
+    SECTION ADDITIONAL
+      ns.sub.example. 3600 IN A 127.0.10.3
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.3
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.sub.example. IN A
+    SECTION ANSWER
+      www.sub.example. 300 IN A 192.0.2.9
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    gone.example. IN A
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    empty.example. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    empty.example. IN A
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    denied.example. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question authority
+  REPLY QR RD RA NXDOMAIN
+  SECTION QUESTION
+    denied.example. IN A
+  SECTION AUTHORITY
+    example. 300 IN SOA ns.example. root.example. 1 3600 900 604800 300
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    www.sub.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.sub.example. IN A
+ENTRY_END
+
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    odd.example. IN A
+ENTRY_END
+
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    odd.example. IN A
+ENTRY_END
+
+STEP 11 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    chain.example. IN A
+ENTRY_END
+
+STEP 12 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    chain.example. IN A
+ENTRY_END
+
+SCENARIO_END

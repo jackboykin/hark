@@ -141,6 +141,22 @@ The broader "one failing NS must not condemn the resolution" story (RFC 1034
 
 ---
 
+## 6. A negative without its SOA is no answer — *deliberate (RFC 2308 §3)*
+
+**Scenario:** `iter_cname_nx.rpl`
+
+The fixture's `www.next.com` server answers AA NXDOMAIN with an empty
+authority section. RFC 2308 §3 says an authoritative server MUST put its
+zone's SOA there; without it the denial names no zone and carries no
+negative TTL. Unbound takes the rcode anyway; hark treats any negative
+without its SOA, NXDOMAIN or NODATA, as no answer and moves on, so with no
+other server the chain ends SERVFAIL. Pinned in hark's own suite by
+errors/033.
+
+**Verdict:** strict on a broken server, by choice. Not a bug.
+
+---
+
 ## Fixtures not vendored
 
 Upstream `.rpl`s absent from this directory rather than run as expected
@@ -170,6 +186,6 @@ may run as is. The behaviour is covered by the `isNonRoutableNs` unit test in
 
 ## A note on the CNAME cluster
 
-The `iter_cname_*` family (`_double`, `_minimise`, `_nx`, `_qnamecopy`)
-all pass, and so does `_cache`, for the reason §5 gives. If a regression
-reopens any of them, the gate says so.
+The `iter_cname_*` family (`_double`, `_minimise`, `_qnamecopy`) all
+pass, and so does `_cache`, for the reason §5 gives; `_nx` diverges (§6).
+If a regression reopens any of them, the gate says so.

@@ -858,7 +858,7 @@ fn keepDname(g: *Graph, keep: *std.ArrayList(dns.ResourceRecord), answers: []con
 /// cycle speaks for a name outside it (RFC 6604 §3): its rcode and its
 /// out-of-zone records are dropped and the reply is an alias. A CNAME
 /// question reads only the CNAME at its name, synthesised or not: the rest
-/// and its rcode go unread. Null: bizarre.
+/// and its rcode go unread. Null: bizarre, or a denial without its SOA.
 fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: dns.RType) !?Verdict {
     var keep: std.ArrayList(dns.ResourceRecord) = .empty;
     var cur = name;
@@ -949,6 +949,13 @@ fn classify(g: *Graph, msg: dns.Message, zone: dns.Name, name: dns.Name, qtype: 
         reply.target = t;
     };
     if (msg.header.flags.rcode == .name_error and !unread) reply.kind = .nxdomain;
+    // A denial names its zone by its SOA (RFC 2308 §3); an answerless
+    // NOERROR may refer instead.
+    switch (reply.kind) {
+        .nxdomain => if (!delegation.soaAbove(msg.authorities, cur)) return null,
+        .nodata => if (!delegation.soaAbove(msg.authorities, cur) and delegation.extractReferral(msg, name, zone) == null) return null,
+        else => {},
+    }
     const authorities = if (left) try inZone(g, msg.authorities, zone) else msg.authorities;
     reply.authorities = try proofsNeeded(g, authorities, reply);
     reply.ttl = replyTtl(reply);

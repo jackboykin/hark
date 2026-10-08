@@ -74,7 +74,7 @@ pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns
     // Servers that set AA on referrals still refer: only answers or an SOA
     // make the NS the zone's own.
     if (response.header.flags.aa and response.answers.len > 0) return null;
-    for (response.authorities) |rr| if (rr.rtype == .soa and target.isSubdomainOf(rr.name)) return null;
+    if (soaAbove(response.authorities, target)) return null;
     var zone_cut: ?dns.Name = null;
     var zone_cut_depth: usize = 0;
     for (response.authorities) |rr| {
@@ -105,84 +105,24 @@ pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns
     return .{ .zone_cut = zc, .ns_names = ns_names, .ns_count = ns_count };
 }
 
+pub fn soaAbove(authorities: []const dns.ResourceRecord, name: dns.Name) bool {
+    for (authorities) |rr| if (rr.rtype == .soa and name.isSubdomainOf(rr.name)) return true;
+    return false;
+}
+
 /// RFC 1034 §5.3.3: drop this reply and ask a sibling. Any rcode but an
 /// answer's, extended ones too (RFC 6891 §6.1.3; hark never retries
-/// without EDNS on FORMERR or BADVERS); a lame reply, non-AA
-/// NOERROR with no answer, no SOA and no cut below `parent_zone`; a
-/// recursor's cache, RA set and AA clear, which an RD-clear query gets
-/// only from a server that recursed on its own. A recursor's referral
-/// is still followed. validateResponse guarantees `questions[0]`.
+/// without EDNS on FORMERR or BADVERS), and a recursor's cache: RA set, AA
+/// clear. A recursor's referral is still followed.
 pub fn shouldTrySibling(response: dns.Message, parent_zone: dns.Name) bool {
     const flags = response.header.flags;
-    const rec_lame = flags.ra and !flags.aa;
     if (response.opt) |o| if (o.extended_rcode != 0) return true;
     switch (flags.rcode) {
-        .no_error => {},
-        .name_error, .yx_domain => return rec_lame,
+        .no_error, .name_error, .yx_domain => {},
         else => return true,
     }
-    if (flags.aa) return false;
-    if (response.answers.len != 0) return rec_lame;
-    for (response.authorities) |rr| if (rr.rtype == .soa) return rec_lame;
-    return extractReferral(response, response.questions[0].name, parent_zone) == null;
-}
-
-const test_header: dns.Header = .{
-    .id = 0x1234,
-    .flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = false, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .no_error },
-};
-
-fn nsRr(zone: dns.Name, ns_name: dns.Name) dns.ResourceRecord {
-    return .{ .name = zone, .rtype = .ns, .rclass = .in, .ttl = 172800, .rdata = .{ .ns = ns_name } };
-}
-
-fn glueA(name: dns.Name, addr: [4]u8) dns.ResourceRecord {
-    return .{ .name = name, .rtype = .a, .rclass = .in, .ttl = 172800, .rdata = .{ .a = addr } };
-}
-
-const www: dns.Name = .{ .labels = &.{ "www", "example", "com" } };
-
-test "shouldTrySibling: lame is empty non-AA NOERROR with no SOA and no referral" {
-    const zone: dns.Name = .{ .labels = &.{"com"} };
-    const questions: []const dns.Question = &.{.{ .name = www, .qtype = .a, .qclass = .in }};
-    var msg = dns.Message{ .header = test_header, .questions = questions };
-    try testing.expect(shouldTrySibling(msg, zone));
-
-    msg.header.flags.aa = true;
-    try testing.expect(!shouldTrySibling(msg, zone));
-    msg.header.flags.aa = false;
-
-    const soa = dns.ResourceRecord{ .name = zone, .rtype = .soa, .rclass = .in, .ttl = 600, .rdata = .{ .soa = .{ .mname = zone, .rname = zone, .serial = 1, .refresh = 1, .retry = 1, .expire = 1, .minimum = 600 } } };
-    msg.authorities = &.{soa};
-    try testing.expect(!shouldTrySibling(msg, zone));
-
-    msg.authorities = &.{nsRr(www, zone)};
-    try testing.expect(!shouldTrySibling(msg, zone));
-    msg.authorities = &.{nsRr(.{ .labels = &.{"fake"} }, zone)};
-    try testing.expect(shouldTrySibling(msg, zone));
-
-    msg.authorities = &.{};
-    msg.header.flags.rcode = .refused;
-    try testing.expect(shouldTrySibling(msg, zone));
-    msg.header.flags.rcode = .name_error;
-    try testing.expect(!shouldTrySibling(msg, zone));
-
-    msg.header.flags.ra = true;
-    try testing.expect(shouldTrySibling(msg, zone));
-    msg.header.flags.aa = true;
-    try testing.expect(!shouldTrySibling(msg, zone));
-    msg.header.flags.aa = false;
-    msg.header.flags.rcode = .no_error;
-    msg.authorities = &.{soa};
-    try testing.expect(shouldTrySibling(msg, zone));
-    msg.authorities = &.{};
-    msg.answers = &.{glueA(www, .{ 10, 20, 30, 40 })};
-    try testing.expect(shouldTrySibling(msg, zone));
-    msg.header.flags.ra = false;
-    try testing.expect(!shouldTrySibling(msg, zone));
-    // BADVERS: header rcode 0, extended 1.
-    msg.opt = .{ .udp_payload_size = 1232, .extended_rcode = 1, .version = 0, .do_bit = false, .options = &.{} };
-    try testing.expect(shouldTrySibling(msg, zone));
+    if (!flags.ra or flags.aa) return false;
+    return flags.rcode != .no_error or response.answers.len != 0 or extractReferral(response, response.questions[0].name, parent_zone) == null;
 }
 
 test "a private address is never sent to (DNS rebinding defense)" {

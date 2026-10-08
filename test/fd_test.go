@@ -25,6 +25,8 @@ RANGE_BEGIN 0 100
       example.com. IN A
     SECTION ANSWER
       example.com. 60 IN A 192.0.2.1
+    SECTION AUTHORITY
+      example.com. 0 IN SOA ns.example.com. nobody.invalid. 1 3600 900 604800 0
   ENTRY_END
 RANGE_END
 SCENARIO_END

@@ -82,6 +82,8 @@ RANGE_BEGIN 0 100
       live. IN A
     SECTION ANSWER
       live. 3600 IN A 192.0.2.1
+    SECTION AUTHORITY
+      live. 0 IN SOA ns.live. nobody.invalid. 1 3600 900 604800 0
   ENTRY_END
 RANGE_END`)
 	for _, i := range silent {
