@@ -65,6 +65,7 @@ pub const Dns64 = struct {
                 .additionals = from.additionals,
                 .cacheable = served.cacheable and from.cacheable,
                 .ede = from.ede,
+                .local = from.local,
             };
         };
         if (a) |from| out.held = try std.mem.concat(arena, *store.Blob, &.{ served.held, from.held });
@@ -343,19 +344,20 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
 
 fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool, yield_last_tenth: bool) !?Served {
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
-    const judged = g.cfg.trust_anchor != null;
-    var secure = judged;
+    var secure = true;
     var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
         hop.* = hopOf(g, ret, h.blob, h.rrset);
         const life: store.Life = .of(hop.rrset.stored_ns, h.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
-        if (judged) {
-            const v = h.blob.verdict;
-            secure = secure and v.chain().status == .secure;
-            hop.life = lifeOf(g, v.proven_until_ns);
+        if (!g.awaitsVerdict(h.kind)) {
+            secure = false;
+            continue;
         }
+        const v = h.blob.verdict;
+        secure = secure and v.chain().status == .secure;
+        hop.life = lifeOf(g, v.proven_until_ns);
     }
     if (yield_last_tenth and g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
     return try shape(arena, g, q, c, minimal, hops, secure, true);
@@ -463,6 +465,9 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     return .{
         .rcode = r.kind.rcode(),
         .ad = secure and (c.do_bit or c.ad),
+        // A stub zone's servers may give private addresses, and a chain's
+        // addresses are all in its last hop.
+        .local = @as(graph.Kind, @fromBackingInt(last.blob.kind)) == .stub,
         .question = q,
         .answers = answers.items,
         .authorities = authorities.items,

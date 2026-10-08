@@ -1,0 +1,141 @@
+; hark: root-hints = 127.0.10.1
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; hark: stub-zone = internal 192.168.1.1
+; hark: rebinding-enabled = yes
+; sim-only: live, nothing binds a LAN address
+
+SCENARIO_BEGIN a stub zone is asked of its servers and answered as given
+
+; The told server sits at a private address, which no delegation could
+; steer hark to, and answers with private addresses, which the rebinding
+; scrub keeps. Nothing it says is validated, so nothing it says is AD,
+; even where its chain leads into a signed public zone. A referral from
+; it answers nothing.
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+      example. 3600 IN DS PLACEHOLDER
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 1.2.3.4
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 192.168.1.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      nas.internal. IN A
+    SECTION ANSWER
+      nas.internal. 300 IN A 192.168.1.10
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      alias.internal. IN A
+    SECTION ANSWER
+      alias.internal. 300 IN CNAME www.example.
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      lab.internal. IN A
+    SECTION AUTHORITY
+      lab.internal. 300 IN NS ns.lab.internal.
+    SECTION ADDITIONAL
+      ns.lab.internal. 300 IN A 192.168.1.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 192.168.1.2
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      lab.internal. IN A
+    SECTION ANSWER
+      host.lab.internal. 300 IN A 192.168.1.30
+  ENTRY_END
+RANGE_END
+
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    nas.internal. IN A
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    nas.internal. IN A
+  SECTION ANSWER
+    nas.internal. 300 IN A 192.168.1.10
+ENTRY_END
+
+STEP 3 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    alias.internal. IN A
+ENTRY_END
+
+STEP 4 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    alias.internal. IN A
+  SECTION ANSWER
+    alias.internal. 300 IN CNAME www.example.
+    www.example. 3600 IN A 1.2.3.4
+ENTRY_END
+
+STEP 5 QUERY
+ENTRY_BEGIN
+  REPLY RD EDNS
+  SECTION QUESTION
+    host.lab.internal. IN A
+ENTRY_END
+
+STEP 6 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    host.lab.internal. IN A
+ENTRY_END
+
+SCENARIO_END

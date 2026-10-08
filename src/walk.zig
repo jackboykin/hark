@@ -74,7 +74,7 @@ pub const Ask = struct {
         std.debug.assert(@sizeOf(Ask) <= 640);
     }
 
-    const Result = union(enum) {
+    pub const Result = union(enum) {
         pending,
         reply: Kept,
         /// No reply from anyone: no rcode to surface.
@@ -109,7 +109,7 @@ pub const Ask = struct {
         return at;
     }
 
-    fn reset(a: *Ask, zone: dns.Name) void {
+    pub fn reset(a: *Ask, zone: dns.Name) void {
         a.* = .{ .zone = zone };
     }
 
@@ -168,7 +168,9 @@ pub const Ask = struct {
     }
 
     fn add(a: *Ask, g: *Graph, addrs: []const na.Address) void {
-        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchor != null and zoneTruncates(g, a.zone);
+        // Told servers are learned from no delegation: no DS hark holds
+        // describes them.
+        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchor != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
             a.servers[a.nservers] = na.AddressKey.fromAddress(s);
@@ -225,10 +227,10 @@ pub const Ask = struct {
 };
 
 /// A reply `ask` settled on, judged against the question it asked.
-const Kept = struct { msg: dns.Message, verdict: Verdict };
+pub const Kept = struct { msg: dns.Message, verdict: Verdict };
 
 /// `none`: an rcode that answers nothing.
-const Verdict = union(enum) { reply: Reply, loop, none };
+pub const Verdict = union(enum) { reply: Reply, loop, none };
 
 pub const RrsetScratch = struct {
     cut: OptionalCellId = .none,
@@ -309,6 +311,8 @@ pub fn cnameAnswers(qtype: dns.RType) bool {
     };
 }
 
+const into_stub: Failure = .{ .code = .no_reachable_authority, .text = "public chain into a stub zone", .cause = .host };
+
 /// `answer(name, type)`: follows aliases from `name`, one hop per name as
 /// `Graph.demandHop` picks, until an RRset ends the chain. Length and loop
 /// checks run at demand time; a chain that fails them is a resolution
@@ -329,7 +333,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             // Judged as it lands, so its zone's chain of trust overlaps the
             // rest of the walk. The RRSIGs ending an RRSIG question are
             // never signed (RFC 4035 §2.2): nothing can judge them.
-            const signatures = qtype == .rrsig and last.state.fact.rrset.kind == .answer;
+            const signatures = qtype == .rrsig and last.state.fact.reply().kind == .answer;
             if (s.judged == i) {
                 if (g.awaitsVerdict(last.key.kind) and !signatures) hop.judge = .wrap(try trust.demandSecure(g, id, hop.set) orelse
                     return failAnswer(g, id, .unreachable_authority));
@@ -338,7 +342,7 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
             var links: Links = .{};
             var step: Links.Step = .done;
             for (s.hops[0..s.n]) |h| {
-                const r = g.cell(h.set).state.fact.rrset;
+                const r = g.cell(h.set).state.fact.reply();
                 step = for (r.answers) |rr| {
                     if (rr.rtype == .cname) if (links.pass(rr.name)) |why| break .{ .broken = why };
                 } else links.end(r.kind, r.target, qtype);
@@ -350,8 +354,10 @@ pub fn runAnswer(g: *Graph, id: CellId) !void {
                 .broken => |why| return failAnswer(g, id, why),
             }
         }
+        const from: ?graph.Kind = if (s.n == 0) null else g.cell(s.hops[s.n - 1].set).key.kind;
+        const hop_kind = g.hopKind(from, next, qtype) orelse return failAnswer(g, id, into_stub);
         // The first step is at the answer's own name, keyed already.
-        const own = if (s.n == 0) g.cell(id).key.at(.rrset, qtype) else Key.of(&kb, .rrset, next, qtype);
+        const own = if (s.n == 0) g.cell(id).key.at(hop_kind, qtype) else Key.of(&kb, hop_kind, next, qtype);
         // Nothing waits on an answer, so only an orphaned root is refused.
         s.hops[s.n] = .{ .set = try g.demandHop(id, own, next) orelse
             return failAnswer(g, id, .unreachable_authority) };
@@ -391,7 +397,7 @@ fn lapsing(g: *Graph, hops: []const graph.Answer.Hop) ?i64 {
     var first: ?store.Life = null;
     for (hops) |h| {
         const c = g.cell(h.set);
-        const life: store.Life = .of(c.state.fact.rrset.stored_ns, c.expires_ns, if (c.blob) |b| b.verdict else .{});
+        const life: store.Life = .of(c.state.fact.reply().stored_ns, c.expires_ns, if (c.blob) |b| b.verdict else .{});
         if (first == null or life.end_ns < first.?.end_ns) first = life;
     }
     const life = first orelse return null;
@@ -659,7 +665,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
 
 /// Once every server was asked, running out is the servers' failure,
 /// whatever the asker had left (RFC 9520 §3.2); else it is the asker's limit.
-fn ended(g: *const Graph, a: *const Ask) Failure {
+pub fn ended(g: *const Graph, a: *const Ask) Failure {
     const asked_all = a.nservers > 0 and !a.cut_short and (a.retried or a.untried() == 0);
     const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
     return if (asked_all) zones else g.limit(g.payer) orelse zones;
@@ -1071,7 +1077,7 @@ test "an age rounds up to the whole second" {
 
 // ── The sibling loop ───────────────────────────────────────────────
 
-fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
+pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.Result {
     // The question never changes, so it is checked until a server is touched.
     if (a.tried == 0 and !mayHear(g, a.zone, qname, qtype)) {
         a.local = true;
@@ -1148,6 +1154,14 @@ fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !Ask.R
     }
 }
 
+/// Servers hark is told rather than handed by a delegation: the root's
+/// hints, a stub zone's own.
+fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
+    if (zone.labels.len == 0) return g.cfg.root_hints;
+    const z = stub.under(g.cfg.stub_zones, zone) orelse return null;
+    return if (z.apex.labels.len == zone.labels.len) z.servers else null;
+}
+
 /// May `zone`'s servers hear the question? A stub zone's questions go to
 /// its own servers alone, and those servers hear no other. A question hark
 /// answers itself never leaves the host (RFC 6761 §6, RFC 8375 §4.4.B);
@@ -1186,9 +1200,9 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
     const sa = g.scratch.allocator();
     var list: std.ArrayList(na.Address) = .empty;
     const zone = a.zone;
-    if (zone.labels.len == 0) {
-        // Told, not handed over: config holds them to the policy.
-        for (g.cfg.root_hints) |h| if (!a.knows(h)) try list.append(sa, h);
+    if (told(g, zone)) |servers| {
+        // Told, not handed over: config holds them to what it allows.
+        for (servers) |h| if (!a.knows(h)) try list.append(sa, h);
     } else {
         if (a.cut == .none) a.cut = .wrap(try g.demand(id, Key.of(&kb, .cut, zone, .a), zone) orelse return .none);
         const cut = g.cell(a.cut.unwrap().?);

@@ -67,6 +67,11 @@ pub const Blob = extern struct {
     }
 };
 
+fn isReply(b: *Blob) bool {
+    const kind: Kind = @fromBackingInt(b.kind);
+    return kind == .rrset or kind == .stub;
+}
+
 pub const Entry = struct {
     blob: *Blob,
     expires_ns: i64,
@@ -267,7 +272,7 @@ pub const Store = struct {
                 }
                 for (c.servers) |server| for (server.glue) |gl| try w.addr(gl);
             },
-            .rrset => |r| {
+            .rrset, .stub => |r| {
                 // `Rrset.of` reads these in place.
                 try w.int(u8, @backingInt(r.kind));
                 try w.int(u8, @intFromBool(r.aa) | @as(u8, @intFromBool(r.ede != null)) << 1);
@@ -314,7 +319,7 @@ pub const Store = struct {
                 for (glue) |*gl| gl.* = try r.addr();
                 break :blk .{ .cut = .{ .zone = zone, .servers = servers, .placed_until_ns = placed_until_ns } };
             },
-            .rrset => blk: {
+            .rrset, .stub => |kind| blk: {
                 var reply: graph.Reply = .{
                     .kind = @fromBackingInt(@as(u3, @intCast(try r.int(u8)))),
                     .aa = undefined,
@@ -333,7 +338,7 @@ pub const Store = struct {
                 reply.answers = try r.records(arena, an);
                 reply.authorities = try r.records(arena, ns);
                 reply.additionals = try r.records(arena, ar);
-                break :blk .{ .rrset = reply };
+                break :blk if (kind == .rrset) .{ .rrset = reply } else .{ .stub = reply };
             },
             .ds, .dnskey => |kind| blk: {
                 var c: trust.Chain = .{ .status = @fromBackingInt(try r.int(u8)) };
@@ -361,13 +366,13 @@ pub const Rrset = struct {
 
     /// `build`'s layout, which wrote it; so it cannot fail.
     pub fn of(b: *Blob) Rrset {
-        std.debug.assert(@as(Kind, @fromBackingInt(b.kind)) == .rrset);
+        std.debug.assert(isReply(b));
         return read(.{ .buf = b.payload() }) catch unreachable;
     }
 
     /// An `answer`'s answer section, without `of`'s walk over every record.
     pub fn answered(b: *Blob) ?Answered {
-        std.debug.assert(@as(Kind, @fromBackingInt(b.kind)) == .rrset);
+        std.debug.assert(isReply(b));
         const p = b.payload();
         if (@as(graph.Reply.Of, @fromBackingInt(@as(u3, @intCast(p[0])))) != .answer) return null;
         var at: usize = 1 + 1 + 2 + 4 + 8;

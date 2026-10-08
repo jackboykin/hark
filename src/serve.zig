@@ -438,7 +438,8 @@ const Server = struct {
     /// Answered once, at any age: worth new work while the core is behind,
     /// unlike a name never seen (a random-subdomain flood).
     fn known(s: *Server, q: dns.Question) bool {
-        return s.g.storedHop(q.name, q.qtype, .any) != null;
+        // A chain's first hop is always one to take.
+        return s.g.storedHop(s.g.hopKind(null, q.name, q.qtype).?, q.name, q.qtype, .any) != null;
     }
 
     /// Parks `p` on the cell it waits for; released if it cannot be.

@@ -92,11 +92,12 @@ pub const Edge = struct {
     }
 };
 
+/// `stub`: a stub zone's reply, asked of its servers alone, never judged.
 /// `refresh`: `answer` derived again for the store; nobody waits.
 /// `ahead`: an rrset's judge, started before anyone asks.
 /// `parental`: a parent's NSEC at a delegation, held for the denial index
 /// alone: the child's answers there (RFC 4035 §5.3.2). Never a cell.
-pub const Kind = enum(u8) { cut, addr, rrset, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
+pub const Kind = enum(u8) { cut, addr, rrset, stub, answer, ds, dnskey, secure, exchange, refresh, ahead, parental };
 
 /// Names are keyed by lowercase presentation form (`Name.formatLower`),
 /// which is injective.
@@ -283,6 +284,7 @@ pub const Value = union(Kind) {
     cut: Cut,
     addr: []const na.Address,
     rrset: Reply,
+    stub: Reply,
     answer: Answer,
     ds: trust.Chain,
     dnskey: trust.Chain,
@@ -291,6 +293,13 @@ pub const Value = union(Kind) {
     refresh: void,
     ahead: void,
     parental: void,
+
+    pub fn reply(v: Value) Reply {
+        return switch (v) {
+            .rrset, .stub => |r| r,
+            else => unreachable,
+        };
+    }
 };
 
 /// Bytes held by work in progress, counted where they are allocated: cell
@@ -428,6 +437,7 @@ pub const Scratch = union(enum) {
     cut: *walk.CutScratch,
     addr: *walk.AddrScratch,
     rrset: *walk.RrsetScratch,
+    stub: *stub.Scratch,
     answer: *walk.AnswerScratch,
     ds: *trust.DsScratch,
     dnskey: *trust.DnskeyScratch,
@@ -877,7 +887,7 @@ pub const Graph = struct {
         c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
-            .cut, .rrset, .ds, .dnskey => {
+            .cut, .rrset, .stub, .ds, .dnskey => {
                 const clock = Tally.clock(&g.tally.store_ns);
                 defer clock.stop();
                 const blob = try g.store.build(value);
@@ -934,7 +944,10 @@ pub const Graph = struct {
         const blob = c.blob orelse return;
         if (c.expires_ns <= g.now()) return;
         if (g.store.any(c.key)) |e| if (e.blob == blob) return;
-        const at = if (c.state.fact == .rrset) c.state.fact.rrset.stored_ns else g.now();
+        const at = switch (c.state.fact) {
+            .rrset, .stub => |r| r.stored_ns,
+            else => g.now(),
+        };
         g.store.put(c.key, blob.ref(), c.expires_ns, at) catch |err| {
             g.store.unref(blob);
             if (err != error.Refused) return err;
@@ -1143,7 +1156,7 @@ pub const Graph = struct {
 
     pub const Fact = struct { value: Value, expires_ns: i64 };
 
-    pub const Recalled = struct { blob: *store.Blob, rrset: store.Rrset, expires_ns: i64 };
+    pub const Recalled = struct { kind: Kind, blob: *store.Blob, rrset: store.Rrset, expires_ns: i64 };
 
     /// The answer rule read against the store, building no cell: the
     /// question's chain as stored, into `arena`. `.fresh` is what the rule
@@ -1156,12 +1169,14 @@ pub const Graph = struct {
         var hops: std.ArrayList(Recalled) = .empty;
         var links: walk.Links = .{};
         var next = name;
+        var kind: ?Kind = null;
         while (true) {
-            const e = g.storedHop(next, qtype, age) orelse return null;
+            kind = g.hopKind(kind, next, qtype) orelse return null;
+            const e = g.storedHop(kind.?, next, qtype, age) orelse return null;
             const v = e.blob.verdict;
-            if (g.cfg.trust_anchor != null and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
+            if (g.awaitsVerdict(kind.?) and !(if (age == .fresh) v.serves(g.now()) else v.judged())) return null;
             const r: store.Rrset = .of(e.blob);
-            try hops.append(arena, .{ .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
+            try hops.append(arena, .{ .kind = kind.?, .blob = e.blob, .rrset = r, .expires_ns = e.expires_ns });
             var pos: usize = 0;
             const target: dns.Name = if (r.kind == .alias) try dns.readNameWire(arena, r.target, &pos) else .{ .labels = &.{} };
             var it = r.sections[0].iterator();
@@ -1180,13 +1195,20 @@ pub const Graph = struct {
     pub const Age = enum { fresh, any };
 
     /// `demandHop`, read from the store. Inline: it is a hit's lookup.
-    pub inline fn storedHop(g: *Graph, name: dns.Name, qtype: dns.RType, age: Age) ?store.Entry {
+    pub inline fn storedHop(g: *Graph, kind: Kind, name: dns.Name, qtype: dns.RType, age: Age) ?store.Entry {
         var kb: KeyBuf = undefined;
-        const own = @call(.always_inline, Key.of, .{ &kb, .rrset, name, qtype });
+        const own = @call(.always_inline, Key.of, .{ &kb, kind, name, qtype });
         if (g.entry(own, age)) |e| return e;
         if (!walk.cnameAnswers(qtype)) return null;
-        const e = g.entry(own.at(.rrset, .cname), age) orelse return null;
+        const e = g.entry(own.at(kind, .cname), age) orelse return null;
         return if (store.Rrset.of(e.blob).kind == .alias) e else null;
+    }
+
+    /// The kind of the hop at `name` after one of kind `from`. Null: a
+    /// public chain would enter a stub zone.
+    pub fn hopKind(g: *const Graph, from: ?Kind, name: dns.Name, qtype: dns.RType) ?Kind {
+        const kind: Kind = if (stub.of(g.cfg.stub_zones, name, qtype) != null) .stub else .rrset;
+        return if (from == .rrset and kind == .stub) null else kind;
     }
 
     inline fn entry(g: *Graph, key: Key, age: Age) ?store.Entry {
@@ -1208,7 +1230,7 @@ pub const Graph = struct {
         return g.demandFound(by, key, name, live, g.served(key, live));
     }
 
-    /// `demand` for a step of an answer's chain, `own` the rrset at `name`:
+    /// `demand` for a step of an answer's chain, `own` the hop at `name`:
     /// the type's own set where held, as it may hold more of the chain;
     /// else an alias held at the name; else the own set, to fetch. Each key
     /// is read once.
@@ -1217,11 +1239,11 @@ pub const Graph = struct {
         const found = g.served(own, live);
         const holds_own = if (found) |s| s == .stored or g.cell(s.live).state == .fact else false;
         if (!holds_own and walk.cnameAnswers(own.rtype)) {
-            const alias = own.at(.rrset, .cname);
+            const alias = own.at(own.kind, .cname);
             const alias_live = g.index.get(alias);
             if (g.served(alias, alias_live)) |s| if (switch (s) {
                 .stored => |e| store.Rrset.of(e.blob).kind == .alias,
-                .live => |id| g.cell(id).state == .fact and g.cell(id).state.fact.rrset.kind == .alias,
+                .live => |id| g.cell(id).state == .fact and g.cell(id).state.fact.reply().kind == .alias,
             }) return g.demandFound(by, alias, name, alias_live, s);
         }
         return g.demandFound(by, own, name, live, found);
@@ -1408,6 +1430,7 @@ pub const Graph = struct {
         switch (g.cell(id).key.kind) {
             .cut => try walk.runCut(g, id),
             .rrset => try walk.runRrset(g, id),
+            .stub => try stub.run(g, id),
             .addr => try walk.runAddr(g, id),
             .answer, .refresh => try walk.runAnswer(g, id),
             .ds => try trust.runDs(g, id),
