@@ -613,10 +613,10 @@ pub const Graph = struct {
         g.release(id);
     }
 
-    /// `dnskey(zone)` ahead of need, for a question's own walk only.
-    pub fn fetchKeys(g: *Graph, by: CellId, zone: dns.Name) !void {
+    /// `dnskey(zone)` ahead of need.
+    pub fn fetchKeys(g: *Graph, zone: dns.Name) !void {
         var kb: KeyBuf = undefined;
-        if (g.spent(g.payer) or g.level(by) > 0) return;
+        if (g.spent(g.payer)) return;
         _ = try g.ahead(Key.of(&kb, .rrset, zone, .dnskey), zone);
     }
 

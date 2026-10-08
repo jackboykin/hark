@@ -422,7 +422,7 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
         while (it.next()) |c| {
             const signer = signerOf(r, c, within, no_bound) orelse continue;
             const key = graph.Key.of(&kb, .dnskey, signer, .a);
-            if (!g.holds(key) and !g.index.contains(key)) try g.fetchKeys(id, signer);
+            if (!g.holds(key) and !g.index.contains(key)) try g.fetchKeys(signer);
         }
     }
     const budget = &g.payer.validation;

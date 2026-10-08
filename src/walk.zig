@@ -818,7 +818,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
         // A signed delegation from a zone signed all the way down: whatever
         // the walk finds below, its proof runs through these keys, so they
         // are fetched as it descends.
-        if (try trust.signedDown(g, ref.zone_cut)) try g.fetchKeys(by, ref.zone_cut);
+        if (try trust.signedDown(g, ref.zone_cut)) try g.fetchKeys(ref.zone_cut);
     }
     return .{ .value = cut, .expires_ns = expires };
 }
