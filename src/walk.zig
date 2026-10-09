@@ -691,6 +691,9 @@ fn publishAlias(g: *Graph, by: CellId, name: dns.Name, qtype: dns.RType, reply: 
     for (set) |sig| if (sig.rtype == .rrsig and sig.rdata.rrsig.labels < rrsig.signedLabels(name)) {
         const zone = sig.rdata.rrsig.signer_name;
         const p = proof.noCloserMatch(reply.authorities, name, sig.rdata.rrsig.labels, zone, &g.payer.validation);
+        // A hash the budget refused chose no proof, and an alias without
+        // its own is no fact.
+        if (p == .verdict and g.payer.validation.stopped != null) return;
         for (reply.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and p.restsOn(rr, zone)) {
             for (reply.authorities, kept) |of, *k| if (of.name.eql(rr.name) and dnssec.covers(of) == rr.rtype) {
                 k.* = true;
