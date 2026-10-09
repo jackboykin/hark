@@ -28,6 +28,7 @@ const denial = @import("denial.zig");
 const store = @import("store.zig");
 const walk = @import("walk.zig");
 const stub = @import("stub.zig");
+const chaos = @import("chaos.zig");
 
 /// CNAME and DNAME links one question may follow, a DNAME and its
 /// synthesised CNAME counting once. Chains in the wild run to 12;
@@ -82,6 +83,7 @@ pub const Edge = struct {
     rng: std.Random,
     sendFn: *const fn (*anyopaque, Exchange) anyerror!void,
     wakeFn: *const fn (*anyopaque, CellId, u32, i64) anyerror!void,
+    chaos: ?*chaos.Chaos = null,
 
     pub fn send(e: Edge, ex: Exchange) !void {
         return e.sendFn(e.ctx, ex);
@@ -685,7 +687,35 @@ pub const Graph = struct {
     }
 
     pub fn drain(g: *Graph) !void {
-        while (g.ready.pop()) |id| try g.run(id);
+        while (try g.nextReady()) |id| try g.run(id);
+    }
+
+    /// A cell with nothing left to run goes first: its slot may hold no key.
+    fn nextReady(g: *Graph) !?CellId {
+        const ch = g.chaosAt(.settle) orelse return g.ready.pop();
+        const n = g.ready.items.len;
+        if (n == 0) return null;
+        var pick = n - 1;
+        var top: u64 = 0;
+        for (g.ready.items, 0..) |id, i| {
+            const c = g.cell(id);
+            if (!c.live or c.settled()) return g.ready.orderedRemove(i);
+            const draw = chaos.draw(ch.peek(.settle, c.key), std.math.maxInt(u64));
+            if (draw >= top) {
+                pick = i;
+                top = draw;
+            }
+        }
+        const id = g.ready.orderedRemove(pick);
+        try ch.spend(.settle, g.cell(id).key);
+        return id;
+    }
+
+    /// Null outside tests, so serve's every site folds to hark's own.
+    fn chaosAt(g: *const Graph, site: chaos.Site) ?*chaos.Chaos {
+        if (!builtin.is_test) return null;
+        const ch = g.edge.chaos orelse return null;
+        return if (ch.live(site)) ch else null;
     }
 
     pub fn wake(g: *Graph, id: CellId, at_ns: i64) !void {

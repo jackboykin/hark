@@ -15,24 +15,43 @@ const response = @import("../response.zig");
 const rebinding = @import("../rebinding.zig");
 const config = @import("../config.zig");
 const ns_rtt = @import("../ns_rtt.zig");
+const chaos = @import("../chaos.zig");
+
+pub const Phase = enum { steps, warm };
 
 pub const Report = struct {
     /// The failing step and why.
     step: u32 = 0,
     msg: []const u8 = "",
-    phase: enum { steps, warm } = .steps,
+    phase: Phase = .steps,
     /// The upstream query log, one `server <- qname qtype` per line,
     /// gpa-owned. Two runs of one seed must produce the same text.
     log: []const u8 = "",
     /// `Graph.schedule`: two runs of one seed must run one.
     schedule: u64 = 0,
+    answers: std.ArrayList(Answered) = .empty,
     tally: graph.Tally = .{},
     cells: usize = 0,
+
+    fn deinit(r: *Report, gpa: Allocator) void {
+        gpa.free(r.log);
+        for (r.answers.items) |a| gpa.free(a.wire);
+        r.answers.deinit(gpa);
+    }
+};
+
+pub const Answered = struct {
+    phase: Phase,
+    step: u32,
+    wire: []const u8,
+    limited: bool,
 };
 
 pub const Options = struct {
     seed: u64 = 1,
     trace: bool = false,
+    chaos: u64 = 0,
+    reference: []const Answered = &.{},
 };
 
 fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, opts: Options, report: *Report) !void {
@@ -42,6 +61,10 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
 
     var s = try sim.Sim.init(arena, gpa, scenario, mint, opts.seed);
     defer s.deinit();
+    var ch: chaos.Chaos = .{ .gpa = gpa, .seed = opts.chaos };
+    defer ch.deinit();
+    var edge = s.edge();
+    if (opts.chaos != 0) edge.chaos = &ch;
     var g = try graph.Graph.init(gpa, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
@@ -52,7 +75,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         .trust_anchor = s.signer.anchor(),
         .prefetch = scenario.prefetch orelse false,
         .trace = opts.trace,
-    }, s.edge());
+    }, edge);
     defer g.deinit();
     defer {
         report.tally = g.tally;
@@ -88,11 +111,19 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     for (scenario.steps) |st| {
         s.step = st.n;
         report.step = st.n;
+        if (opts.chaos != 0) switch (st.kind) {
+            .check_answer, .check_query_log, .check_out_query, .check_max_queries, .check_max_verifies, .check_max_runs => continue,
+            else => {},
+        };
         switch (st.kind) {
-            .query => last = (try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb) orelse {
-                report.msg = "client timed out";
-                return error.ScenarioFailed;
-            }).msg,
+            .query => {
+                const sent = try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb);
+                try answered(gpa, report, opts, .steps, st.n, sent);
+                if (sent) |x| last = x.msg else if (opts.chaos == 0) {
+                    report.msg = "client timed out";
+                    return error.ScenarioFailed;
+                }
+            },
             .check_answer => {
                 const actual = last orelse {
                     report.msg = "CHECK_ANSWER before any QUERY";
@@ -141,7 +172,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         }
     }
     report.phase = .warm;
-    try requery(arena, &g, &s, scenario, report, &held, &desk, &rb);
+    try requery(gpa, arena, &g, &s, scenario, opts, report, &held, &desk, &rb);
     // Quiescence: nothing outlives its demand.
     unholdAll(&g, &held);
     while (s.next(s.now_ns + 60 * std.time.ns_per_s)) |ev| try g.complete(ev.id, ev.completion);
@@ -157,7 +188,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
 /// chain, shows up as an upstream query or a different answer. The last
 /// check of a question is in force; TTLs have aged and are not compared,
 /// and a failure still held answers Cached Error (RFC 8914 §4.14).
-fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
+fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, opts: Options, report: *Report, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !void {
     const steps = scenario.steps;
     for (steps[0..steps.len -| 1], steps[1..], 0..) |query, check, i| {
         if (query.kind != .query or check.kind != .check_answer) continue;
@@ -170,15 +201,18 @@ fn requery(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.
         if (superseded) continue;
         report.step = query.n;
         const before = s.log.items.len;
-        const actual = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk, rb) orelse {
+        const sent = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk, rb);
+        try answered(gpa, report, opts, .warm, query.n, sent);
+        const actual = sent orelse {
+            if (opts.chaos != 0) continue;
             report.msg = "client timed out";
             return error.ScenarioFailed;
         };
-        if (answerMismatch(actual.msg, check.entry.?, .warm)) |why| {
+        if (opts.chaos == 0) if (answerMismatch(actual.msg, check.entry.?, .warm)) |why| {
             report.msg = why;
             return error.ScenarioFailed;
-        }
-        if (s.log.items.len != before and actual.cacheable) {
+        };
+        if (opts.chaos == 0 and s.log.items.len != before and actual.cacheable) {
             report.msg = "went upstream";
             return error.ScenarioFailed;
         }
@@ -195,24 +229,97 @@ fn unholdAll(g: *graph.Graph, held: *Held) void {
 }
 
 /// What the client was sent, read back off the wire serve builds.
-const Sent = struct { msg: dns.Message, cacheable: bool };
+const Sent = struct { msg: dns.Message, wire: []const u8, cacheable: bool, limited: bool };
+
+fn answered(gpa: Allocator, report: *Report, opts: Options, phase: Phase, step: u32, sent: ?Sent) !void {
+    const limited = if (sent) |x| x.limited else true;
+    const wire = try gpa.dupe(u8, if (sent) |x| x.wire else "");
+    {
+        errdefer gpa.free(wire);
+        try report.answers.append(gpa, .{ .phase = phase, .step = step, .wire = wire, .limited = limited });
+    }
+    if (opts.chaos == 0) return;
+    const ref = find(opts.reference, phase, step) orelse {
+        report.msg = "chaos asked what the reference did not";
+        return error.ScenarioFailed;
+    };
+    // A limit may only make its own answer fail.
+    if (limited or ref.limited) return;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const want = try dns.parseMessage(arena_state.allocator(), ref.wire);
+    const actual = sent.?.msg;
+    if (messageMismatch(actual, want)) |why| {
+        std.debug.print("  chaos's answer, then the reference's:\n", .{});
+        printSections(actual);
+        printSections(want);
+        report.msg = why;
+        return error.ScenarioFailed;
+    }
+}
+
+fn synthesized(m: dns.Message) bool {
+    const opt = m.opt orelse return false;
+    for (opt.options) |o| if (o.code == dns.edns_opt_ede and o.data.len >= 2 and
+        mem.readInt(u16, o.data[0..2], .big) == @backingInt(dns.Ede.Code.synthesized)) return true;
+    return false;
+}
+
+fn find(answers: []const Answered, phase: Phase, step: u32) ?Answered {
+    for (answers) |a| if (a.phase == phase and a.step == step) return a;
+    return null;
+}
+
+/// TTLs age from when each run fetched, so they are not compared. An
+/// answer's EDNS options say how hark answered (synthesized, say), which is
+/// its state's to say; a failure's say why, which is the answer. A denial
+/// synthesized from what hark holds proves the same answer with other
+/// proofs than the server sent, so its authority is not compared.
+fn messageMismatch(actual: dns.Message, want: dns.Message) ?[]const u8 {
+    const af = actual.header.flags;
+    const wf = want.header.flags;
+    if (af.rcode != wf.rcode) return "chaos moved the rcode";
+    if (af.aa != wf.aa or af.tc != wf.tc or af.ad != wf.ad or af.ra != wf.ra) return "chaos moved the flags";
+    if (!sectionEql(actual.answers, want.answers, false)) return "chaos moved the ANSWER";
+    const relayed = !synthesized(actual) and !synthesized(want);
+    if (relayed and !sectionEql(actual.authorities, want.authorities, false)) return "chaos moved the AUTHORITY";
+    if (!sectionEql(actual.additionals, want.additionals, false)) return "chaos moved the ADDITIONAL";
+    if (af.rcode != .server_failure) return null;
+    const a_opts: []const dns.EdnsOption = if (actual.opt) |o| o.options else &.{};
+    const w_opts: []const dns.EdnsOption = if (want.opt) |o| o.options else &.{};
+    if (a_opts.len != w_opts.len) return "chaos moved the EDNS options";
+    for (a_opts, w_opts) |x, y| if (x.code != y.code or !mem.eql(u8, x.data, y.data)) return "chaos moved the EDNS options";
+    return null;
+}
 
 /// Null when the client's timer fires first. The roots stay in `held`,
 /// since the answer reads their hops, until the next question.
 fn resolveClient(arena: Allocator, g: *graph.Graph, s: *sim.Sim, scenario: *const rpl.Scenario, entry: rpl.Entry, held: *Held, desk: *answer.Desk, rb: *const rebinding.Config) !?Sent {
     const q = entry.questions[0];
     const client: answer.Client = .{ .rd = entry.flags.rd, .cd = entry.flags.cd, .do_bit = entry.do_bit, .ad = entry.flags.ad };
+    var limited = false;
     const served = switch (try desk.early(arena, q, client)) {
-        .synthesized, .replayed, .held, .floored => |served| served,
+        .synthesized, .replayed, .floored => |served| served,
+        .held => |served| blk: {
+            limited = true;
+            break :blk served;
+        },
         .recalled => |served| blk: {
             errdefer served.release(&g.store);
             try agrees(arena, g, s, scenario, q, client, held, desk, rb, served);
             break :blk served;
         },
-        .graph => try desk.derived(q, client, try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null),
+        .graph => blk: {
+            const built = try shapeClient(arena, g, s, scenario, q, client, held, desk) orelse return null;
+            for (held) |h| if (h) |id| if (answer.failureOf(g, id, client.cd)) |why| {
+                limited = limited or why.cause == .asker or why.remembered;
+            };
+            break :blk try desk.derived(q, client, built);
+        },
     };
     defer served.release(&g.store);
-    return .{ .msg = try dns.parseMessage(arena, try wireOf(arena, q, client, entry.do_bit or entry.edns, rb, served)), .cacheable = served.cacheable };
+    const wire = try wireOf(arena, q, client, entry.do_bit or entry.edns, rb, served);
+    return .{ .msg = try dns.parseMessage(arena, wire), .wire = wire, .cacheable = served.cacheable, .limited = limited };
 }
 
 /// The bytes serve would send `client` for `served`, bar the query id.
@@ -289,6 +396,7 @@ fn settleBy(g: *graph.Graph, s: *sim.Sim, root: graph.CellId, until: i64) !bool 
 fn printSections(m: dns.Message) void {
     var nb: [dns.max_dotted_len + 1]u8 = undefined;
     std.debug.print("  actual: rcode={t} aa={} ad={}\n", .{ m.header.flags.rcode, m.header.flags.aa, m.header.flags.ad });
+    if (m.opt) |o| for (o.options) |x| std.debug.print("    option {d}: {x}\n", .{ x.code, x.data });
     for ([_][]const dns.ResourceRecord{ m.answers, m.authorities, m.additionals }, [_][]const u8{ "an", "ns", "ar" }) |sec, label| {
         for (sec) |rr| std.debug.print("    {s} {s} {d} {t}\n", .{ label, rr.name.formatInto(&nb), rr.ttl, rr.rtype });
     }
@@ -558,7 +666,7 @@ fn replayJob(gpa: Allocator, j: *Job) void {
 
 fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     var first: Report = .{};
-    defer gpa.free(first.log);
+    defer first.deinit(gpa);
     const result = runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &first);
     inline for (@typeInfo(graph.Tally).@"struct".field_names) |f| @field(j.tally, f) += @field(first.tally, f);
     j.cells += first.cells;
@@ -575,12 +683,19 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
         return;
     };
     var second: Report = .{};
-    defer gpa.free(second.log);
+    defer second.deinit(gpa);
     runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &second) catch {};
     if (first.schedule != second.schedule or !mem.eql(u8, first.log, second.log)) {
         j.failed = true;
         std.debug.print("{s} (seed {d}): two runs, two schedules\n", .{ j.path, seed });
     }
+    var chaotic: Report = .{};
+    defer chaotic.deinit(gpa);
+    const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items };
+    runScenario(gpa, &j.scenario, mint, held, &chaotic) catch |err| {
+        j.failed = true;
+        std.debug.print("{s} (seed {d}, chaos): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, chaotic.phase, chaotic.step, chaotic.msg, @errorName(err), chaotic.log });
+    };
 }
 
 // `zig build test -Dscenario=path/to/x.rpl` replays one scenario with
@@ -609,7 +724,7 @@ test "trace one scenario" {
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, text, &diag);
     var report: Report = .{};
-    defer testing.allocator.free(report.log);
+    defer report.deinit(testing.allocator);
     var mint = try sign.Mint.init(arena, &scenario);
     const result = runScenario(testing.allocator, &scenario, &mint, .{ .seed = 1, .trace = true }, &report);
     std.debug.print("{t} step {d}: {s}\n{s}", .{ report.phase, report.step, report.msg, report.log });
