@@ -1,6 +1,7 @@
 //! A client's response, shaped from the graph: policy over facts, no
 //! sockets. The live server and the simulator both serve through it.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const dns = @import("dns.zig");
 const graph = @import("graph.zig");
@@ -199,7 +200,7 @@ pub const Desk = struct {
         if (q.qtype == .rrsig and d.g.cfg.trust_anchor != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
-        if (d.failures.get(q, c.cd, d.g.now())) |ede| {
+        if (try d.hold(q, c)) |ede| {
             // Held, the graph is closed: memory serves the last tenth too.
             if (try d.memory(arena, q, c, .live)) |s| return .{ .recalled = try d.derived(q, c, s) };
             switch (ede.code) {
@@ -210,6 +211,13 @@ pub const Desk = struct {
         }
         if (try d.memory(arena, q, c, .floored)) |s| return .{ .floored = try d.derived(q, c, s) };
         return .graph;
+    }
+
+    fn hold(d: *Desk, q: dns.Question, c: Client) !?dns.Ede {
+        const ede = d.failures.get(q, c.cd, d.g.now()) orelse return null;
+        if (!builtin.is_test) return ede;
+        var kb: graph.KeyBuf = undefined;
+        return if (try d.g.forgets(.forget, .of(&kb, .answer, q.name, q.qtype))) null else ede;
     }
 
     /// `.fresh` is `.live` short of its last tenth, which the graph takes to prefetch.

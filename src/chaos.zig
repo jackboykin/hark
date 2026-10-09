@@ -8,7 +8,7 @@ const std = @import("std");
 const graph = @import("graph.zig");
 const na = @import("net_address.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead, forget, keep };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 
@@ -23,6 +23,9 @@ pub const Chaos = struct {
     gpa: std.mem.Allocator,
     seed: u64,
     decided: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Hark forgot something it would have held: a limit, unseen by any
+    /// one answer.
+    forgot: bool = false,
     /// Shrinking: only these events may draw other than 0.
     only: ?*const Events = null,
     /// Every event that drew other than 0.

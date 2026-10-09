@@ -280,6 +280,8 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, p
     defer arena_state.deinit();
     const want = try dns.parseMessage(arena_state.allocator(), ref.wire);
     const actual = sent.?.msg;
+    // What chaos forgot may fail any later answer of its own.
+    if (s.chaos.?.forgot and actual.header.flags.rcode == .server_failure) return;
     report.compared += 1;
     if (messageMismatch(actual, want)) |why| {
         std.debug.print("  chaos's answer, then the reference's:\n", .{});

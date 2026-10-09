@@ -748,6 +748,12 @@ pub const Graph = struct {
         return try g.decide(site, key, 2) == 1;
     }
 
+    pub fn forgets(g: *Graph, site: chaos.Site, key: Key) !bool {
+        if (try g.decide(site, key, 2) == 0) return false;
+        g.edge.chaos.?.forgot = true;
+        return true;
+    }
+
     pub fn shuffle(g: *Graph, site: chaos.Site, key: Key, comptime T: type, items: []T) !void {
         if (g.chaosAt(site) == null) return g.edge.rng.shuffle(T, items);
         var i = items.len;
@@ -1032,6 +1038,7 @@ pub const Graph = struct {
         const blob = c.blob orelse return;
         if (c.expires_ns <= g.now()) return;
         if (g.store.any(c.key)) |e| if (e.blob == blob) return;
+        if (try g.forgets(.keep, c.key)) return;
         const at = switch (c.state.fact) {
             .rrset, .stub => |r| r.stored_ns,
             else => g.now(),
@@ -1102,10 +1109,10 @@ pub const Graph = struct {
         try g.failed.put(g.gpa, own, r);
     }
 
-    fn refused(g: *Graph, key: Key) ?Failure {
+    fn refused(g: *Graph, key: Key) !?Failure {
         if (g.failed.count() == 0) return null;
         const r = g.failed.get(key) orelse return null;
-        if (r.until_ns <= g.now()) return null;
+        if (r.until_ns <= g.now() or try g.forgets(.forget, key)) return null;
         var why = r.why;
         why.remembered = true;
         return why;
@@ -1346,7 +1353,7 @@ pub const Graph = struct {
         if (g.cell(by).orphan) return null;
         const id = try g.newCell(key, name);
         try g.pin(id, by);
-        if (g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
+        if (try g.refused(key)) |why| try g.fail(id, why) else try g.ready.append(g.gpa, id);
         return id;
     }
 
