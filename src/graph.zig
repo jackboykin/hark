@@ -738,6 +738,11 @@ pub const Graph = struct {
         return @intCast(try g.decide(site, key, n));
     }
 
+    pub fn stretch(g: *Graph, site: chaos.Site, key: Key, ms: u32) !u32 {
+        const v = try g.decide(site, key, 4 * @as(u64, ms));
+        return if (v == 0) ms else @intCast(v);
+    }
+
     pub fn shuffle(g: *Graph, site: chaos.Site, key: Key, comptime T: type, items: []T) !void {
         if (g.chaosAt(site) == null) return g.edge.rng.shuffle(T, items);
         var i = items.len;

@@ -1149,7 +1149,8 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         if (p.band == ns_rtt.dead_band and waited != ns_rtt.dead_band) return .pending;
         const last = p.last and !a.more;
         const state = try sendTo(g, id, a, p.server, last, if (a.tcp_first) .tcp else .udp, .random, qname, qtype) orelse continue;
-        a.hedge_at = g.now() + @as(i64, state.hedgeStagger() orelse g.cfg.stagger_ms) * std.time.ns_per_ms;
+        const stagger = try g.stretch(.stagger, g.cell(id).key, state.hedgeStagger() orelse g.cfg.stagger_ms);
+        a.hedge_at = g.now() + @as(i64, stagger) * std.time.ns_per_ms;
         if (g.cfg.stagger_ms > 0 and !last) try g.wake(id, a.hedge_at);
         // Sent to one that may answer, the ask waits. Behind one that never
         // has, it goes round to gather, and to ask for what is unknown.
