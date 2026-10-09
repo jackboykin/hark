@@ -127,7 +127,7 @@ pub const Ask = struct {
 
     /// Uniform within the best band. Chosen per send, so a timeout earlier
     /// in this ask already counts.
-    fn pick(a: *const Ask, g: *Graph) ?Pick {
+    fn pick(a: *const Ask, g: *Graph, by: Key) !?Pick {
         var best: i64 = ns_rtt.dead_band;
         var ties: u32 = 0;
         var untimed: u32 = 0;
@@ -150,7 +150,7 @@ pub const Ask = struct {
         if (a.tried == 0) ties |= untimed;
         // Every dead server ties in the dead band.
         const last = if (best == ns_rtt.dead_band) @popCount(ties) == 1 else live == 1;
-        var k = g.edge.rng.uintLessThan(u8, @popCount(ties));
+        var k = try g.uniform(.pick, by, @popCount(ties));
         while (k > 0) : (k -= 1) ties &= ties - 1;
         return .{ .server = @ctz(ties), .band = best, .last = last };
     }
@@ -1130,7 +1130,7 @@ pub fn ask(g: *Graph, id: CellId, a: *Ask, qname: dns.Name, qtype: dns.RType) !A
         const due = a.nattempts == 0 or g.now() >= a.hedge_at;
         const waited = a.flying(g);
         if (!due and waited < ns_rtt.silent_band) return .pending;
-        const p = a.pick(g) orelse {
+        const p = try a.pick(g, g.cell(id).key) orelse {
             // No server left to try or to hedge to: before a timeout is
             // sat out, gather what settled since and ask for what is unknown.
             switch (try gatherServers(g, id, a)) {
@@ -1243,7 +1243,7 @@ fn gatherServers(g: *Graph, id: CellId, a: *Ask) !enum { pending, none, ready } 
                 1 => 2,
                 else => 1,
             };
-            g.edge.rng.shuffle(Left.Unknown, unknown);
+            try g.shuffle(.gather, g.cell(id).key, Left.Unknown, unknown);
             var demanded = false;
             for (unknown[0..@min(limit, unknown.len)]) |u| {
                 const host = try dns.parseDottedName(sa, u.host.name);

@@ -1,10 +1,13 @@
 //! Draws are keyed by the event they decide, not by draw order, so a run
-//! that decides one thing differently decides nothing else differently.
-//! A draw of 0 is what hark does without chaos.
+//! that decides one thing differently decides no other live site's
+//! differently. A site that is off and random by design (pick, gather,
+//! prefetch) draws from the edge's rng in order, as without chaos.
+//! A draw of 0 is what hark does without chaos, or, where hark draws
+//! too, the first.
 const std = @import("std");
 const graph = @import("graph.zig");
 
-pub const Site = enum(u8) { settle };
+pub const Site = enum(u8) { settle, pick, gather };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 

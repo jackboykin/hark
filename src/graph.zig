@@ -725,6 +725,28 @@ pub const Graph = struct {
         return if (ch.live(site)) ch else null;
     }
 
+    /// One of `n`, `key`'s next decision at `site`; 0 is hark's own.
+    fn decide(g: *Graph, site: chaos.Site, key: Key, n: u64) !u64 {
+        const ch = g.chaosAt(site) orelse return 0;
+        const event = ch.peek(site, key);
+        try ch.spend(site, key);
+        return ch.choose(site, event, n, .{ .key = key });
+    }
+
+    pub fn uniform(g: *Graph, site: chaos.Site, key: Key, n: usize) !usize {
+        if (g.chaosAt(site) == null) return g.edge.rng.uintLessThan(usize, n);
+        return @intCast(try g.decide(site, key, n));
+    }
+
+    pub fn shuffle(g: *Graph, site: chaos.Site, key: Key, comptime T: type, items: []T) !void {
+        if (g.chaosAt(site) == null) return g.edge.rng.shuffle(T, items);
+        var i = items.len;
+        while (i > 1) {
+            i -= 1;
+            mem.swap(T, &items[i], &items[i - try g.decide(site, key, i + 1)]);
+        }
+    }
+
     pub fn wake(g: *Graph, id: CellId, at_ns: i64) !void {
         return g.edge.wake(id, g.cell(id).gen, at_ns);
     }
