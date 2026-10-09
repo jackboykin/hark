@@ -46,6 +46,8 @@ pub const Sim = struct {
     /// Signed.
     ranges: []const rpl.Range,
     prng: std.Random.DefaultPrng,
+    seed: u64,
+    sent: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// Monotonic; starts well above zero so deadlines never wrap negative.
     now_ns: i64 = now0_ns,
     /// Wall seconds, for RRSIG windows.
@@ -68,6 +70,7 @@ pub const Sim = struct {
             .signer = undefined,
             .ranges = undefined,
             .prng = std.Random.DefaultPrng.init(seed),
+            .seed = seed,
             .gpa = gpa,
         };
         s.signer = try sign.Signer.init(arena, scenario, mint, s.wall_sec);
@@ -78,6 +81,7 @@ pub const Sim = struct {
     pub fn deinit(s: *Sim) void {
         s.events.deinit(s.gpa);
         s.log.deinit(s.gpa);
+        s.sent.deinit(s.gpa);
     }
 
     pub fn random(s: *Sim) std.Random {
@@ -113,7 +117,8 @@ pub const Sim = struct {
             s.pending_drops -= 1;
             return s.schedule(ex.id, ex.deadline_ns, .timeout);
         }
-        const delay = s.latency(ex.server, s.random());
+        const asked = try s.ask(ex.server, q, ex.transport);
+        const delay = s.latency(ex.server, asked);
         const entry = s.findEntry(ex.server, q, ex.transport) orelse {
             // No RANGE for this address: nothing listens there.
             if (!s.serves(ex.server)) return s.schedule(ex.id, ex.deadline_ns, .timeout);
@@ -179,6 +184,24 @@ pub const Sim = struct {
         try s.events.push(s.gpa, .{ .at_ns = at_ns, .seq = s.seq, .id = id, .completion = completion });
     }
 
+    /// Names a query by what it asks and how many times it was asked.
+    fn ask(s: *Sim, server: na.Address, q: dns.Question, transport: Transport) !std.hash.Wyhash {
+        var h = std.hash.Wyhash.init(0);
+        const key = na.AddressKey.fromAddress(server);
+        h.update(&key.addr);
+        h.update(mem.asBytes(&key.port));
+        h.update(mem.asBytes(&key.family));
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        h.update(q.name.formatLower(&nb));
+        h.update(mem.asBytes(&q.qtype));
+        h.update(mem.asBytes(&transport));
+        const nth = try s.sent.getOrPut(s.gpa, h.final());
+        if (!nth.found_existing) nth.value_ptr.* = 0;
+        nth.value_ptr.* += 1;
+        h.update(mem.asBytes(nth.value_ptr));
+        return h;
+    }
+
     /// Advance to the next completion, or to `until_ns` if none lies
     /// before it.
     pub fn next(s: *Sim, until_ns: i64) ?struct { id: u32, completion: Completion } {
@@ -204,9 +227,9 @@ pub const Sim = struct {
     }
 
     /// Per-server: 2–40 ms base, ±25% jitter, so seeds exercise different
-    /// interleavings.
-    fn latency(s: *Sim, server: na.Address, rng: std.Random) i64 {
-        _ = s;
+    /// interleavings. Keyed by the query rather than draw order, so a run
+    /// that asks in another order meets the same network.
+    fn latency(s: *Sim, server: na.Address, asked: std.hash.Wyhash) i64 {
         // By field: the struct has padding and AddressKey's own hash
         // folds in a per-process seed.
         var h = std.hash.Wyhash.init(0);
@@ -216,7 +239,11 @@ pub const Sim = struct {
         h.update(mem.asBytes(&key.family));
         const base_ms: i64 = 2 + @as(i64, @intCast(h.final() % 39));
         const quarter = @divTrunc(base_ms, 4);
-        const jitter = rng.intRangeAtMost(i64, -quarter, quarter);
+        const span: u64 = @intCast(2 * quarter + 1);
+        var drawn = asked;
+        drawn.update(mem.asBytes(&s.seed));
+        const draw = drawn.final();
+        const jitter = @as(i64, @intCast(std.math.mulWide(u64, draw, span) >> 64)) - quarter;
         return (base_ms + jitter) * std.time.ns_per_ms;
     }
 
