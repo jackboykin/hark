@@ -394,10 +394,16 @@ fn rdataEql(a: dns.RData, b: dns.RData) bool {
         .ds => |v| v.key_tag == b.ds.key_tag and v.algorithm == b.ds.algorithm and v.digest_type == b.ds.digest_type and mem.eql(u8, v.digest, b.ds.digest),
         .nsec => |v| v.next_domain_name.eql(b.nsec.next_domain_name) and mem.eql(u8, v.type_bit_maps, b.nsec.type_bit_maps),
         .dnskey => |v| v.flags == b.dnskey.flags and v.algorithm == b.dnskey.algorithm and mem.eql(u8, v.public_key, b.dnskey.public_key),
+        .nsec3 => |v| v.hash_algorithm == b.nsec3.hash_algorithm and v.flags == b.nsec3.flags and v.iterations == b.nsec3.iterations and
+            mem.eql(u8, v.salt, b.nsec3.salt) and mem.eql(u8, v.next_hashed_owner, b.nsec3.next_hashed_owner) and mem.eql(u8, v.type_bit_maps, b.nsec3.type_bit_maps),
+        .named => |v| blk: {
+            if (!mem.eql(u8, v.head, b.named.head) or v.names.len != b.named.names.len) break :blk false;
+            for (v.names, b.named.names) |x, y| if (!x.eql(y)) break :blk false;
+            break :blk true;
+        },
         // A scenario cannot spell a signature minted at run time.
         .rrsig => |v| v.type_covered == b.rrsig.type_covered and v.algorithm == b.rrsig.algorithm and v.labels == b.rrsig.labels and v.signer_name.eql(b.rrsig.signer_name),
         .unknown => |v| std.ascii.eqlIgnoreCase(v, b.unknown),
-        else => false,
     };
 }
 
