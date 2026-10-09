@@ -1,0 +1,150 @@
+; hark: root-hints = 127.0.10.1
+; hark: qname-minimisation = no
+; hark: dnssec-zone = .
+; hark: dnssec-zone = example.
+; sim-only: live, a UDP client is answered within 2 s or not at all, long before the silent root's waits are done
+
+SCENARIO_BEGIN a remembered failure is not remembered again by what it failed
+
+; RFC 9520 §3.2: a failure is held for servfail-ttl (5 s) at most. The
+; DS fetch for example. fails and is remembered. Inside its window a new
+; question needs ds(example.), which fails on the remembered fetch; held
+; again under its own key, the one failure would refuse example.'s DS
+; past its window, to the next asker after the root has mended.
+;
+; Topology
+;   root     127.0.10.1   drops example.'s DS through step 6, then answers it
+;   example  127.0.10.2
+
+RANGE_BEGIN 0 6
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query drop
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN DS
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 7 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      example. IN DS
+    SECTION ANSWER
+      example. 3600 IN DS PLACEHOLDER
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.1
+  ENTRY_BEGIN
+    MATCH opcode subdomain
+    ADJUST copy_id copy_query
+    REPLY QR NOERROR
+    SECTION QUESTION
+      example. IN A
+    SECTION AUTHORITY
+      example. 3600 IN NS ns.example.
+    SECTION ADDITIONAL
+      ns.example. 3600 IN A 127.0.10.2
+  ENTRY_END
+RANGE_END
+
+RANGE_BEGIN 0 100
+  ADDRESS 127.0.10.2
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      www.example. IN A
+    SECTION ANSWER
+      www.example. 3600 IN A 192.0.2.1
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      mail.example. IN A
+    SECTION ANSWER
+      mail.example. 3600 IN A 192.0.2.2
+  ENTRY_END
+RANGE_END
+
+; The DS fetch fails, and is remembered.
+STEP 1 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+STEP 2 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+; Inside its window, ds(example.) fails on it.
+STEP 3 TIME_PASSES ELAPSE 3
+
+STEP 4 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+STEP 5 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH rcode question ede=22
+  REPLY QR RD RA SERVFAIL
+  SECTION QUESTION
+    www.example. IN A
+ENTRY_END
+
+; Past the fetch's window, the root mended: example. validates.
+STEP 6 TIME_PASSES ELAPSE 3
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    mail.example. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question answer
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    mail.example. IN A
+  SECTION ANSWER
+    mail.example. 3600 IN A 192.0.2.2
+ENTRY_END
+
+; The DS that settled it answers from memory.
+STEP 9 QUERY
+ENTRY_BEGIN
+  REPLY RD DO
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+STEP 10 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags rcode question
+  REPLY QR RD RA AD NOERROR
+  SECTION QUESTION
+    example. IN DS
+ENTRY_END
+
+SCENARIO_END

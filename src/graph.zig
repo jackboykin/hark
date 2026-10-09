@@ -272,6 +272,8 @@ pub const Failure = struct {
     /// Only the zone's failures are remembered: never what failed to
     /// leave the host, nor what an asker's own limit ended.
     cause: enum { zone, host, asker } = .zone,
+    /// Refused at demand: an earlier failure, remembered.
+    remembered: bool = false,
     /// No probe could place the cut: ask in full from the deepest one known.
     unplaced: bool = false,
 
@@ -994,10 +996,11 @@ pub const Graph = struct {
 
     /// Remembered for the window (RFC 9520 §3.2), unless the asker may have
     /// caused it: a spent budget or deadline, an orphan, an address lookup's
-    /// depth, a refresh, or a send that never left the host.
+    /// depth, a refresh, or a send that never left the host. A failure
+    /// already remembered is held by its own window, never another's.
     pub fn failRemembered(g: *Graph, id: CellId, why: Failure) !void {
         const c = g.cell(id);
-        if (why.cause == .zone and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, why);
+        if (why.cause == .zone and !why.remembered and !c.orphan and g.payer.refresh_ns == 0 and g.level(id) == 0) try g.remember(c.key, why);
         try g.fail(id, why);
     }
 
@@ -1024,7 +1027,10 @@ pub const Graph = struct {
     fn refused(g: *Graph, key: Key) ?Failure {
         if (g.failed.count() == 0) return null;
         const r = g.failed.get(key) orelse return null;
-        return if (r.until_ns > g.now()) r.why else null;
+        if (r.until_ns <= g.now()) return null;
+        var why = r.why;
+        why.remembered = true;
+        return why;
     }
 
     /// RFC 4035 §5.3.3: an rrset accepted as authentic ends with the
