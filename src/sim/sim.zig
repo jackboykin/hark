@@ -9,6 +9,7 @@ const na = @import("../net_address.zig");
 const rpl = @import("rpl.zig");
 const sign = @import("sign.zig");
 const graph = @import("../graph.zig");
+const chaos = @import("../chaos.zig");
 
 const Transport = graph.Transport;
 const Exchange = graph.Exchange;
@@ -23,13 +24,17 @@ pub const LogRow = struct {
 
 const Event = struct {
     at_ns: i64,
+    tie: u64,
     seq: u32,
     id: u32,
     completion: Completion,
 
     fn before(_: void, a: Event, b: Event) std.math.Order {
         return switch (std.math.order(a.at_ns, b.at_ns)) {
-            .eq => std.math.order(a.seq, b.seq),
+            .eq => switch (std.math.order(a.tie, b.tie)) {
+                .eq => std.math.order(a.seq, b.seq),
+                else => |o| o,
+            },
             else => |o| o,
         };
     }
@@ -67,6 +72,7 @@ pub const Sim = struct {
     /// their answers may differ.
     known: ?*const Heard = null,
     departed: bool = false,
+    chaos: ?*chaos.Chaos = null,
     reply_buf: [65535]u8 = undefined,
 
     pub const Heard = std.AutoArrayHashMapUnmanaged(u64, void);
@@ -106,19 +112,20 @@ pub const Sim = struct {
     }
 
     fn wakeErased(ctx: *anyopaque, id: u32, gen: u32, at_ns: i64) anyerror!void {
-        return @as(*Sim, @ptrCast(@alignCast(ctx))).schedule(id, at_ns, .{ .wake = gen });
+        const s: *Sim = @ptrCast(@alignCast(ctx));
+        return s.schedule(id, at_ns, try s.tieOf(@as(u64, id) << 32 | gen), .{ .wake = gen });
     }
 
     /// One upstream query. Its reply or absence is scheduled now; nothing
     /// depends on later steps.
     pub fn send(s: *Sim, ex: Exchange) !void {
-        const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
-        if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
+        if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         const q = query.questions[0];
         if (s.pending_unsent > 0) {
             s.pending_unsent -= 1;
             try s.hear(q, silence);
-            return s.schedule(ex.id, s.now_ns, .unsent);
+            return s.schedule(ex.id, s.now_ns, 0, .unsent);
         }
         // RFC 8109 root priming is not logged.
         if (!(q.name.labels.len == 0 and q.qtype == .ns))
@@ -126,15 +133,16 @@ pub const Sim = struct {
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;
             try s.hear(q, silence);
-            return s.schedule(ex.id, ex.deadline_ns, .timeout);
+            return s.schedule(ex.id, ex.deadline_ns, 0, .timeout);
         }
-        const asked = try s.ask(ex.server, q, ex.transport);
+        var asked = try s.ask(ex.server, q, ex.transport);
+        const tie = try s.tieOf(asked.final());
         const delay = s.latency(ex.server, asked);
         const entry = s.findEntry(ex.server, q, ex.transport) orelse {
             // No RANGE for this address: nothing listens there.
             if (!s.serves(ex.server)) {
                 try s.hear(q, silence);
-                return s.schedule(ex.id, ex.deadline_ns, .timeout);
+                return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
             }
             var msg = query;
             msg.header.flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = query.header.flags.rd, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .refused };
@@ -150,11 +158,11 @@ pub const Sim = struct {
             msg.authorities = &.{};
             msg.additionals = &.{};
             msg.opt = null;
-            return s.deliver(ex, query, msg, delay);
+            return s.deliver(ex, query, msg, delay, tie);
         };
         if (entry.drop) {
             try s.hear(q, silence);
-            return s.schedule(ex.id, ex.deadline_ns, .timeout);
+            return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
 
         var flags = entry.flags;
@@ -179,26 +187,26 @@ pub const Sim = struct {
             .authorities = entry.authorities,
             .additionals = entry.additionals,
         };
-        return s.deliver(ex, query, msg, delay);
+        return s.deliver(ex, query, msg, delay, tie);
     }
 
-    fn deliver(s: *Sim, ex: Exchange, query: dns.Message, msg: dns.Message, latency_ns: i64) !void {
+    fn deliver(s: *Sim, ex: Exchange, query: dns.Message, msg: dns.Message, latency_ns: i64, tie: u64) !void {
         var said = msg;
         said.header.id = 0;
         said.questions = &.{};
-        const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         try s.hear(query.questions[0], std.hash.Wyhash.hash(0, content));
-        var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         // A UDP reply past the advertised payload arrives truncated.
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
         if (ex.transport == .udp and wire.len > payload) {
             var hdr = msg.header;
             hdr.flags.tc = true;
-            wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .questions = msg.questions }) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
+            wire = dns.serializeMessage(&s.reply_buf, .{ .header = hdr, .questions = msg.questions }) catch return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
         }
         const at = s.now_ns + latency_ns;
-        if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, .timeout);
-        return s.schedule(ex.id, at, .{ .reply = try s.arena.dupe(u8, wire) });
+        if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, tie, .timeout);
+        return s.schedule(ex.id, at, tie, .{ .reply = try s.arena.dupe(u8, wire) });
     }
 
     const silence: u64 = 0;
@@ -214,9 +222,15 @@ pub const Sim = struct {
         if (s.known) |known| s.departed = s.departed or !known.contains(k);
     }
 
-    fn schedule(s: *Sim, id: u32, at_ns: i64, completion: Completion) !void {
+    fn schedule(s: *Sim, id: u32, at_ns: i64, tie: u64, completion: Completion) !void {
         s.seq += 1;
-        try s.events.push(s.gpa, .{ .at_ns = at_ns, .seq = s.seq, .id = id, .completion = completion });
+        try s.events.push(s.gpa, .{ .at_ns = at_ns, .tie = tie, .seq = s.seq, .id = id, .completion = completion });
+    }
+
+    fn tieOf(s: *const Sim, event: u64) !u64 {
+        const ch = s.chaos orelse return 0;
+        if (!ch.live(.tie)) return 0;
+        return ch.choose(.tie, ch.named(.tie, event), std.math.maxInt(u64), .none);
     }
 
     /// Names a query by what it asks and how many times it was asked.

@@ -88,7 +88,10 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         if (ch.told) |*t| mem.swap(std.ArrayList([]const u8), &report.told, t);
     }
     var edge = s.edge();
-    if (opts.chaos != 0) edge.chaos = &ch;
+    if (opts.chaos != 0) {
+        edge.chaos = &ch;
+        s.chaos = &ch;
+    }
     var g = try graph.Graph.init(gpa, .{
         .qmin = scenario.qmin orelse true,
         .root_hints = scenario.root_hints,
