@@ -313,7 +313,7 @@ fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob, r: store.Rrset) Hop {
 /// hop's TTLs end with its proof, signatures only to DO, AD only when asked
 /// (RFC 6840 §5.7).
 pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
-    if (g.cell(root).failure()) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
+    if (failureOf(g, root, c.cd)) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
     std.debug.assert(a.hops.len > 0);
     // Secure only if every hop is judged secure; a failed verdict is bogus
@@ -334,13 +334,21 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
                 hop.life = lifeOf(g, v.secure.proven_until_ns);
             },
             // A failed verdict proved nothing, so it bounds nothing (CD only).
-            .failure => |why| if (c.cd) {
-                secure = false;
-            } else return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why),
+            .failure => secure = false,
             .pending => unreachable,
         }
     }
     return shape(arena, g, q, c, minimal, hops, secure, g.cell(root).expires_ns > g.now());
+}
+
+pub fn failureOf(g: *graph.Graph, root: graph.CellId, cd: bool) ?graph.Failure {
+    if (g.cell(root).failure()) |why| return why;
+    if (cd) return null;
+    for (g.cell(root).state.fact.answer.hops) |h| {
+        const j = h.judge.unwrap() orelse continue;
+        if (g.cell(j).failure()) |why| return why;
+    }
+    return null;
 }
 
 fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
