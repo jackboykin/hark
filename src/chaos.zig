@@ -7,13 +7,14 @@
 const std = @import("std");
 const graph = @import("graph.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 
 /// What an event decided about, for a shrunk failure's report.
 pub const About = union(enum) {
     key: graph.Key,
+    none,
 };
 
 pub const Chaos = struct {
@@ -94,6 +95,7 @@ pub const Chaos = struct {
             try told.ensureUnusedCapacity(c.gpa, 1);
             told.appendAssumeCapacity(switch (about) {
                 .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {t})", .{ site, k.kind, k.name, k.rtype }),
+                .none => try std.fmt.allocPrint(c.gpa, "{t}", .{site}),
             });
         }
         c.left.putAssumeCapacity(event, {});

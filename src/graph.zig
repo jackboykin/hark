@@ -566,7 +566,8 @@ pub const Graph = struct {
         var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
         errdefer g.deinit();
         g.store.on_evict = evicted;
-        if (cfg.trust_anchor != null) g.verify_memo = try .init(gpa);
+        const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
+        if (cfg.trust_anchor != null and !forgoes) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
         _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
@@ -654,7 +655,7 @@ pub const Graph = struct {
     /// One per key at a time, holding itself until its judge settles, on the
     /// running payer's budget; null once that is spent.
     fn ahead(g: *Graph, key: Key, name: dns.Name) !?CellId {
-        if (g.spent(g.payer)) return null;
+        if (g.spent(g.payer) or try g.skips(.ahead, key)) return null;
         const akey = key.at(.ahead, key.rtype);
         if (g.index.get(akey)) |id| if (!g.cell(id).settled()) return id;
         const id = try g.newCell(akey, name);
@@ -671,13 +672,13 @@ pub const Graph = struct {
     /// One per key at a time; holds itself until it settles.
     pub fn refresh(g: *Graph, key: Key, name: dns.Name, lapses_ns: i64) !void {
         const rkey = key.at(.refresh, key.rtype);
-        if (g.index.contains(rkey)) return;
+        if (g.index.contains(rkey) or try g.skips(.prefetch, rkey)) return;
         if (g.flights >= g.cfg.max_flights / 2 or g.work.bytes >= g.cfg.max_work_bytes / 2) {
             g.stats.resolver.detail.unrefreshed += 1;
             return;
         }
         const jitter = @min(refresh_jitter_ns, @divTrunc(lapses_ns - g.now(), 2));
-        const at = g.now() + if (jitter > 0) g.edge.rng.intRangeLessThan(i64, 0, jitter) else 0;
+        const at = g.now() + if (jitter > 0) @as(i64, @intCast(try g.uniform(.prefetch, rkey, @intCast(jitter)))) else 0;
         const id = try g.newRoot(rkey, name, .{ .deadline_ns = 0, .refresh_ns = g.now(), .lapses_ns = lapses_ns });
         g.cell(id).holds += 1;
         errdefer g.unhold(id);
@@ -741,6 +742,10 @@ pub const Graph = struct {
     pub fn stretch(g: *Graph, site: chaos.Site, key: Key, ms: u32) !u32 {
         const v = try g.decide(site, key, 4 * @as(u64, ms));
         return if (v == 0) ms else @intCast(v);
+    }
+
+    pub fn skips(g: *Graph, site: chaos.Site, key: Key) !bool {
+        return try g.decide(site, key, 2) == 1;
     }
 
     pub fn shuffle(g: *Graph, site: chaos.Site, key: Key, comptime T: type, items: []T) !void {
