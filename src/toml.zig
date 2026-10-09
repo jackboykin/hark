@@ -129,11 +129,24 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
         } else {
             const eq_pos = mem.indexOfScalar(u8, line, '=') orelse return error.InvalidSyntax;
             const raw_key = mem.trim(u8, line[0..eq_pos], &std.ascii.whitespace);
-            const raw_val = mem.trim(u8, line[eq_pos + 1 ..], &std.ascii.whitespace);
+            var raw_val = mem.trim(u8, line[eq_pos + 1 ..], &std.ascii.whitespace);
 
             if (raw_key.len == 0) return error.InvalidBareKey;
             if (!isValidBareKey(raw_key)) return error.InvalidBareKey;
             if (raw_val.len == 0) return error.InvalidSyntax;
+
+            // An array may span lines, with comments between its elements.
+            var joined: std.ArrayList(u8) = .empty;
+            defer joined.deinit(allocator);
+            if (raw_val[0] == '[' and unquoted(raw_val, ']') == null) {
+                try joined.appendSlice(allocator, raw_val);
+                while (unquoted(joined.items, ']') == null) {
+                    const more = lines.next() orelse return error.InvalidSyntax;
+                    try joined.append(allocator, '\n');
+                    try joined.appendSlice(allocator, stripComment(mem.trim(u8, more, &std.ascii.whitespace)));
+                }
+                raw_val = joined.items;
+            }
 
             const value = try parseValue(allocator, raw_val);
             errdefer {
@@ -158,9 +171,15 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
 }
 
 fn stripComment(line: []const u8) []const u8 {
+    const at = unquoted(line, '#') orelse return line;
+    return mem.trim(u8, line[0..at], &std.ascii.whitespace);
+}
+
+/// Where `target` first appears outside a string.
+fn unquoted(text: []const u8, target: u8) ?usize {
     var in_string = false;
     var escaped = false;
-    for (line, 0..) |c, i| {
+    for (text, 0..) |c, i| {
         if (escaped) {
             escaped = false;
             continue;
@@ -173,11 +192,9 @@ fn stripComment(line: []const u8) []const u8 {
             in_string = !in_string;
             continue;
         }
-        if (c == '#' and !in_string) {
-            return mem.trim(u8, line[0..i], &std.ascii.whitespace);
-        }
+        if (c == target and !in_string) return i;
     }
-    return line;
+    return null;
 }
 
 fn isValidBareKey(key: []const u8) bool {
@@ -394,6 +411,29 @@ test "parse string array" {
     try testing.expectEqualStrings("[::1]:53", arr[1]);
 }
 
+test "parse an array across lines" {
+    var result = try parse(testing.allocator,
+        \\zones = [
+        \\  "internal 192.0.2.1", # a comment
+        \\  "a]b#c",
+        \\]
+        \\after = 1
+    );
+    defer result.deinit();
+    const arr = result.table.getStringArray("zones").?;
+    try testing.expectEqual(@as(usize, 2), arr.len);
+    try testing.expectEqualStrings("internal 192.0.2.1", arr[0]);
+    try testing.expectEqualStrings("a]b#c", arr[1]);
+    try testing.expectEqual(@as(i64, 1), result.table.getInteger("after").?);
+}
+
+test "error on an array never closed" {
+    try testing.expectError(error.InvalidSyntax, parse(testing.allocator,
+        \\zones = [
+        \\  "internal 192.0.2.1"
+    ));
+}
+
 test "parse empty array" {
     var result = try parse(testing.allocator,
         \\items = []
@@ -490,7 +530,10 @@ fn parseOomProbe(allocator: Allocator, input: []const u8) !void {
 test "parse handles OOM without leaking" {
     const doc =
         \\[server]
-        \\listen = ["127.0.0.1:8053", "[::1]:8053"]
+        \\listen = [
+        \\  "127.0.0.1:8053",
+        \\  "[::1]:8053",
+        \\]
         \\workers = 2
         \\minimal-responses = true
         \\
