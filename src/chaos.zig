@@ -5,13 +5,19 @@ const graph = @import("graph.zig");
 
 pub const Site = enum(u8) { settle };
 
+pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
+
 pub const Chaos = struct {
     gpa: std.mem.Allocator,
     seed: u64,
     decided: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Every event that drew other than 0.
+    left: Events = .empty,
+    fired: std.EnumArray(Site, u32) = .initFill(0),
 
     pub fn deinit(c: *Chaos) void {
         c.decided.deinit(c.gpa);
+        c.left.deinit(c.gpa);
     }
 
     /// Each site is on or off for the whole run (swarm testing): a
@@ -48,6 +54,17 @@ pub const Chaos = struct {
         h.update(std.mem.asBytes(&key.rtype));
         h.update(key.name);
         return h.final();
+    }
+
+    pub fn choose(c: *Chaos, site: Site, event: u64, n: u64) !u64 {
+        const v = draw(event, n);
+        if (v != 0) try c.note(site, event);
+        return v;
+    }
+
+    fn note(c: *Chaos, site: Site, event: u64) !void {
+        if ((try c.left.getOrPut(c.gpa, event)).found_existing) return;
+        c.fired.getPtr(site).* += 1;
     }
 };
 

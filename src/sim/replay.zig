@@ -19,6 +19,9 @@ const chaos = @import("../chaos.zig");
 
 pub const Phase = enum { steps, warm };
 
+/// How many decisions each chaos site took other than hark's own.
+const Fired = std.EnumArray(chaos.Site, u32);
+
 pub const Report = struct {
     /// The failing step and why.
     step: u32 = 0,
@@ -33,6 +36,7 @@ pub const Report = struct {
     heard: sim.Sim.Heard = .empty,
     departed: u32 = 0,
     compared: u32 = 0,
+    fired: Fired = .initFill(0),
     tally: graph.Tally = .{},
     cells: usize = 0,
 
@@ -70,6 +74,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     defer mem.swap(sim.Sim.Heard, &report.heard, &s.heard);
     var ch: chaos.Chaos = .{ .gpa = gpa, .seed = opts.chaos };
     defer ch.deinit();
+    defer report.fired = ch.fired;
     var edge = s.edge();
     if (opts.chaos != 0) edge.chaos = &ch;
     var g = try graph.Graph.init(gpa, .{
@@ -570,7 +575,7 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0, compared: usize = 0, departed: usize = 0 };
+const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0, compared: usize = 0, departed: usize = 0, fired: Fired = .initFill(0) };
 
 /// One scenario under every seed, each run twice.
 const Job = struct {
@@ -583,6 +588,7 @@ const Job = struct {
     cells: usize = 0,
     compared: u32 = 0,
     departed: u32 = 0,
+    fired: Fired = .initFill(0),
 };
 
 /// Replay every scenario under `root` across `seeds`, checking
@@ -631,12 +637,18 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         r.failed += @intFromBool(j.failed);
         r.compared += j.compared;
         r.departed += j.departed;
+        for (&r.fired.values, j.fired.values) |*a, b| a.* += b;
     }
     if (leaked.load(.monotonic)) r.failed += 1;
     // Debug numbers mean nothing.
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
     std.debug.print("  chaos compared {d} answers; {d} more were past the reference's world\n", .{ r.compared, r.departed });
+    std.debug.print("  chaos fired", .{});
+    var fired = r.fired;
+    var it = fired.iterator();
+    while (it.next()) |e| std.debug.print(" {t} {d}", .{ e.key, e.value.* });
+    std.debug.print("\n", .{});
     std.debug.print("  {d} cycle checks walked {d} cells ({d:.1} each) over {d} cell slots\n", .{ t.reaches, t.reaches_visits, @as(f64, @floatFromInt(t.reaches_visits)) / @as(f64, @floatFromInt(@max(t.reaches, 1))), r.cells });
     std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
     std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries, {d} verifying and {d} in the store) vs {d} ns per parse; {d:.0} cells per run\n", .{
@@ -711,6 +723,7 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     defer {
         j.compared += chaotic.compared;
         j.departed += chaotic.departed;
+        for (&j.fired.values, chaotic.fired.values) |*a, b| a.* += b;
     }
     const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items, .known = &first.heard };
     runScenario(gpa, &j.scenario, mint, held, &chaotic) catch |err| {
@@ -768,6 +781,13 @@ test "hark walk scenarios settle to today's answers" {
     const r = try replayDir("test/scenarios/hark", 8, &.{});
     try testing.expectEqual(221, r.parsed);
     try testing.expectEqual(0, r.failed);
+    // A site that never leaves hark's own choice tests nothing.
+    var fired = r.fired;
+    var it = fired.iterator();
+    while (it.next()) |e| if (e.value.* == 0) {
+        std.debug.print("chaos site {t} never fired\n", .{e.key});
+        return error.TestUnexpectedResult;
+    };
 }
 
 // Divergences from Unbound, strict: a pass is a note in

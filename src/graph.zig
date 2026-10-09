@@ -691,19 +691,25 @@ pub const Graph = struct {
     }
 
     /// A cell with nothing left to run goes first: its slot may hold no key.
+    /// Among two or more, every priority drawn is a decision, the LIFO
+    /// top's too: replayed without it, another cell would win.
     fn nextReady(g: *Graph) !?CellId {
         const ch = g.chaosAt(.settle) orelse return g.ready.pop();
         const n = g.ready.items.len;
         if (n == 0) return null;
-        var pick = n - 1;
-        var top: u64 = 0;
         for (g.ready.items, 0..) |id, i| {
             const c = g.cell(id);
             if (!c.live or c.settled()) return g.ready.orderedRemove(i);
-            const draw = chaos.draw(ch.peek(.settle, c.key), std.math.maxInt(u64));
-            if (draw >= top) {
-                pick = i;
-                top = draw;
+        }
+        var pick = n - 1;
+        if (n > 1) {
+            var top: u64 = 0;
+            for (g.ready.items, 0..) |id, i| {
+                const draw = try ch.choose(.settle, ch.peek(.settle, g.cell(id).key), std.math.maxInt(u64));
+                if (draw >= top) {
+                    pick = i;
+                    top = draw;
+                }
             }
         }
         const id = g.ready.orderedRemove(pick);
