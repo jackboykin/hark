@@ -450,11 +450,11 @@ pub fn verifyRrsig(
             hash.final(&digest);
             const t = VerifyMemo.tag(alg, dnskey.public_key, rrsig.signature, &digest);
             if (memo.recall(&t)) {
-                // The gate runs Debug: every hit in every scenario is re-proven.
-                if (builtin.mode == .debug) verifyMath(alg, rrsig.signature, &data, &digest, dnskey.public_key) catch unreachable;
+                // The gate runs Debug: every hit meets the math, once per thread.
+                if (builtin.mode == .debug) proveMath(alg, rrsig.signature, &data, &digest, dnskey.public_key) catch unreachable;
                 return;
             }
-            try verifyMath(alg, rrsig.signature, &data, &digest, dnskey.public_key);
+            try proveMath(alg, rrsig.signature, &data, &digest, dnskey.public_key);
             memo.remember(&t);
         },
         else => return error.UnsupportedAlgorithm,
@@ -485,6 +485,35 @@ pub fn isSupportedAlgorithm(algo: dns.DnssecAlgorithm) bool {
         .rsasha256, .rsasha512, .ecdsap256sha256, .ecdsap384sha384, .ed25519, .mldsa44 => true,
         else => false,
     };
+}
+
+/// The Debug gate replays every scenario many times over, so each thread
+/// proves a signature once. Keyed apart from the memo's tag, by the signed
+/// data itself, so a hit the memo got wrong still meets the math.
+threadlocal var proven: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+
+fn proveMath(
+    comptime algorithm: dns.DnssecAlgorithm,
+    signature: []const u8,
+    data: *const SignedData,
+    digest: *const [Digest(algorithm).digest_length]u8,
+    key: []const u8,
+) VerifyError!void {
+    if (!builtin.is_test or builtin.mode != .debug) return verifyMath(algorithm, signature, data, digest, key);
+    var frame: [5]u8 = undefined;
+    frame[0] = @backingInt(algorithm);
+    mem.writeInt(u16, frame[1..3], @intCast(key.len), .big);
+    mem.writeInt(u16, frame[3..5], @intCast(signature.len), .big);
+    var h = Blake3.init(.{});
+    h.update(&frame);
+    h.update(key);
+    h.update(signature);
+    data.feed(&h);
+    var t: [32]u8 = undefined;
+    h.final(&t);
+    if (proven.contains(t)) return;
+    try verifyMath(algorithm, signature, data, digest, key);
+    proven.put(std.heap.smp_allocator, t, {}) catch {};
 }
 
 /// A function of its arguments alone, or remembered hits would bypass the
