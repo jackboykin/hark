@@ -115,13 +115,9 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, bogus);
 }
 
-/// A draw the validation budget refused is the asker's limit, never bogus.
 /// A query budget or deadline is named only where an input failed on it.
 fn budgetSpent(g: *Graph) ?Failure {
-    return switch (g.payer.validation.stopped orelse return null) {
-        .nsec3 => .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
-        .verify => .{ .code = .other, .text = "validation budget spent", .cause = .asker },
-    };
+    return g.payer.validationStop();
 }
 
 /// A zone's DS or keys proven bogus: demanding them again is refused for

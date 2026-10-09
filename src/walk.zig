@@ -668,7 +668,7 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
 pub fn ended(g: *const Graph, a: *const Ask) Failure {
     const asked_all = a.nservers > 0 and !a.cut_short and (a.retried or a.untried() == 0);
     const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
-    return if (asked_all) zones else g.limit(g.payer) orelse zones;
+    return if (asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
 }
 
 fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {

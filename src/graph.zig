@@ -356,6 +356,14 @@ pub const Budget = struct {
     lapses_ns: i64 = 0,
     /// KeyTrap: every verify the resolution does, whichever cell does it.
     validation: rrsig.ValidationBudget = .{},
+
+    /// A draw the validation budget refused is the asker's limit, never bogus.
+    pub fn validationStop(b: *const Budget) ?Failure {
+        return switch (b.validation.stopped orelse return null) {
+            .nsec3 => .{ .code = .unsupported_nsec3_iterations, .text = "nsec3 budget spent", .cause = .asker },
+            .verify => .{ .code = .other, .text = "validation budget spent", .cause = .asker },
+        };
+    }
 };
 
 /// Cumulative since start; `serve.zig` prints them.
