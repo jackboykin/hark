@@ -705,7 +705,8 @@ pub const Graph = struct {
         if (n > 1) {
             var top: u64 = 0;
             for (g.ready.items, 0..) |id, i| {
-                const draw = try ch.choose(.settle, ch.peek(.settle, g.cell(id).key), std.math.maxInt(u64));
+                const key = g.cell(id).key;
+                const draw = try ch.choose(.settle, ch.peek(.settle, key), std.math.maxInt(u64), .{ .key = key });
                 if (draw >= top) {
                     pick = i;
                     top = draw;

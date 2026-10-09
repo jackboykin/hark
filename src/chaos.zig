@@ -1,5 +1,6 @@
 //! Draws are keyed by the event they decide, not by draw order, so a run
 //! that decides one thing differently decides nothing else differently.
+//! A draw of 0 is what hark does without chaos.
 const std = @import("std");
 const graph = @import("graph.zig");
 
@@ -7,17 +8,30 @@ pub const Site = enum(u8) { settle };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 
+/// What an event decided about, for a shrunk failure's report.
+pub const About = union(enum) {
+    key: graph.Key,
+};
+
 pub const Chaos = struct {
     gpa: std.mem.Allocator,
     seed: u64,
     decided: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Shrinking: only these events may draw other than 0.
+    only: ?*const Events = null,
     /// Every event that drew other than 0.
     left: Events = .empty,
     fired: std.EnumArray(Site, u32) = .initFill(0),
+    /// Names each event that left, gpa-owned.
+    told: ?std.ArrayList([]const u8) = null,
 
     pub fn deinit(c: *Chaos) void {
         c.decided.deinit(c.gpa);
         c.left.deinit(c.gpa);
+        if (c.told) |*t| {
+            for (t.items) |s| c.gpa.free(s);
+            t.deinit(c.gpa);
+        }
     }
 
     /// Each site is on or off for the whole run (swarm testing): a
@@ -56,19 +70,30 @@ pub const Chaos = struct {
         return h.final();
     }
 
-    pub fn choose(c: *Chaos, site: Site, event: u64, n: u64) !u64 {
-        const v = draw(event, n);
-        if (v != 0) try c.note(site, event);
+    /// One of `n` for `event`, unnoted; the bias, n / 2^64, never shows.
+    pub fn draw(c: *const Chaos, event: u64, n: u64) u64 {
+        if (c.only) |only| if (!only.contains(event)) return 0;
+        return @intCast(std.math.mulWide(u64, std.hash.Wyhash.hash(event, "draw"), n) >> 64);
+    }
+
+    /// Fails having noted nothing, so a caller that takes 0 on failure
+    /// decided what a replay without this event decides.
+    pub fn choose(c: *Chaos, site: Site, event: u64, n: u64, about: About) !u64 {
+        const v = c.draw(event, n);
+        if (v != 0) try c.note(site, event, about);
         return v;
     }
 
-    fn note(c: *Chaos, site: Site, event: u64) !void {
-        if ((try c.left.getOrPut(c.gpa, event)).found_existing) return;
+    fn note(c: *Chaos, site: Site, event: u64, about: About) !void {
+        if (c.left.contains(event)) return;
+        try c.left.ensureUnusedCapacity(c.gpa, 1);
+        if (c.told) |*told| {
+            try told.ensureUnusedCapacity(c.gpa, 1);
+            told.appendAssumeCapacity(switch (about) {
+                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {t})", .{ site, k.kind, k.name, k.rtype }),
+            });
+        }
+        c.left.putAssumeCapacity(event, {});
         c.fired.getPtr(site).* += 1;
     }
 };
-
-/// One of `n` for `event`; the bias, n / 2^64, never shows.
-pub fn draw(event: u64, n: u64) u64 {
-    return @intCast(std.math.mulWide(u64, std.hash.Wyhash.hash(event, "draw"), n) >> 64);
-}

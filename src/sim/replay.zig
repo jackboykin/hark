@@ -37,6 +37,9 @@ pub const Report = struct {
     departed: u32 = 0,
     compared: u32 = 0,
     fired: Fired = .initFill(0),
+    /// The chaos decisions that left hark's own, and under `tell`, named.
+    left: chaos.Events = .empty,
+    told: std.ArrayList([]const u8) = .empty,
     tally: graph.Tally = .{},
     cells: usize = 0,
 
@@ -45,6 +48,9 @@ pub const Report = struct {
         for (r.answers.items) |a| gpa.free(a.wire);
         r.answers.deinit(gpa);
         r.heard.deinit(gpa);
+        r.left.deinit(gpa);
+        for (r.told.items) |t| gpa.free(t);
+        r.told.deinit(gpa);
     }
 };
 
@@ -61,6 +67,8 @@ pub const Options = struct {
     chaos: u64 = 0,
     reference: []const Answered = &.{},
     known: ?*const sim.Sim.Heard = null,
+    only: ?*const chaos.Events = null,
+    tell: bool = false,
 };
 
 fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, opts: Options, report: *Report) !void {
@@ -72,9 +80,13 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     defer s.deinit();
     s.known = opts.known;
     defer mem.swap(sim.Sim.Heard, &report.heard, &s.heard);
-    var ch: chaos.Chaos = .{ .gpa = gpa, .seed = opts.chaos };
+    var ch: chaos.Chaos = .{ .gpa = gpa, .seed = opts.chaos, .only = opts.only, .told = if (opts.tell) .empty else null };
     defer ch.deinit();
-    defer report.fired = ch.fired;
+    defer {
+        report.fired = ch.fired;
+        mem.swap(chaos.Events, &report.left, &ch.left);
+        if (ch.told) |*t| mem.swap(std.ArrayList([]const u8), &report.told, t);
+    }
     var edge = s.edge();
     if (opts.chaos != 0) edge.chaos = &ch;
     var g = try graph.Graph.init(gpa, .{
@@ -729,7 +741,73 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     runScenario(gpa, &j.scenario, mint, held, &chaotic) catch |err| {
         j.failed = true;
         std.debug.print("{s} (seed {d}, chaos): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, chaotic.phase, chaotic.step, chaotic.msg, @errorName(err), chaotic.log });
+        shrink(gpa, &j.scenario, mint, held, &chaotic) catch |e| std.debug.print("  shrinking failed: {t}\n", .{e});
     };
+}
+
+/// The fewest of a failing chaos run's decisions that fail it the same
+/// way, by delta debugging (Zeller and Hildebrandt) over the decisions
+/// that left hark's own; each try replays with only some of them taken.
+fn shrink(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, held: Options, failed: *const Report) !void {
+    const Try = struct {
+        gpa: Allocator,
+        scenario: *const rpl.Scenario,
+        mint: *sign.Mint,
+        held: Options,
+        failed: *const Report,
+
+        fn fails(t: @This(), decisions: []const u64, named: ?*Report) !bool {
+            var only: chaos.Events = .empty;
+            defer only.deinit(t.gpa);
+            for (decisions) |d| try only.put(t.gpa, d, {});
+            var opts = t.held;
+            opts.only = &only;
+            opts.tell = named != null;
+            var r: Report = .{};
+            defer r.deinit(t.gpa);
+            defer if (named) |n| mem.swap(Report, n, &r);
+            runScenario(t.gpa, t.scenario, t.mint, opts, &r) catch {};
+            return r.msg.len > 0 and r.phase == t.failed.phase and r.step == t.failed.step and mem.eql(u8, r.msg, t.failed.msg);
+        }
+    };
+    const t: Try = .{ .gpa = gpa, .scenario = scenario, .mint = mint, .held = held, .failed = failed };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const all = failed.left.keys();
+    if (!try t.fails(all, null)) return std.debug.print("  chaos run does not fail again: not reproducible\n", .{});
+    if (try t.fails(&.{}, null)) return std.debug.print("  fails with no decision left to chaos\n", .{});
+    var cur: []const u64 = all;
+    var n: usize = 2;
+    while (cur.len >= 2) {
+        const size = (cur.len + n - 1) / n;
+        var reduced = false;
+        var at: usize = 0;
+        while (at < cur.len and !reduced) : (at += size) {
+            const part = cur[at..@min(at + size, cur.len)];
+            if (try t.fails(part, null)) {
+                cur = part;
+                n = 2;
+                reduced = true;
+            } else if (n > 2) {
+                const rest = try mem.concat(arena, u64, &.{ cur[0..at], cur[@min(at + size, cur.len)..] });
+                if (try t.fails(rest, null)) {
+                    cur = rest;
+                    n -= 1;
+                    reduced = true;
+                }
+            }
+        }
+        if (!reduced) {
+            if (n >= cur.len) break;
+            n = @min(n * 2, cur.len);
+        }
+    }
+    var named: Report = .{};
+    defer named.deinit(gpa);
+    _ = try t.fails(cur, &named);
+    std.debug.print("  shrunk to {d} of {d} chaos decisions:\n", .{ cur.len, all.len });
+    for (named.told.items) |line| std.debug.print("    {s}\n", .{line});
 }
 
 // `zig build test -Dscenario=path/to/x.rpl` replays one scenario with
