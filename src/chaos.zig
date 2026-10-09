@@ -7,7 +7,7 @@
 const std = @import("std");
 const graph = @import("graph.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 

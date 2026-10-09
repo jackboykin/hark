@@ -1351,10 +1351,13 @@ pub const Graph = struct {
     }
 
     /// The first question waiting on `id`, depth first in pin order, whose
-    /// budget has room; else the first one at all. None for an orphan.
+    /// budget has room; under chaos, any whose budget has room. Else the
+    /// first one at all. None for an orphan.
     fn payerOf(g: *Graph, id: CellId) ?*Budget {
         g.checks += 1;
         var first: ?*Budget = null;
+        var roomy: std.ArrayList(*Budget) = .empty;
+        const ch = g.chaosAt(.payer);
         var stack: std.ArrayList(CellId) = .empty;
         stack.append(g.scratch.allocator(), id) catch return null;
         while (stack.pop()) |i| {
@@ -1362,7 +1365,10 @@ pub const Graph = struct {
             if (c.seen == g.checks or c.orphan) continue;
             c.seen = g.checks;
             if (budgetOf(c)) |b| {
-                if (!g.spent(b)) return b;
+                if (!g.spent(b)) {
+                    if (ch == null) return b;
+                    roomy.append(g.scratch.allocator(), b) catch return b;
+                }
                 first = first orelse b;
                 continue;
             }
@@ -1372,6 +1378,7 @@ pub const Graph = struct {
                 stack.append(g.scratch.allocator(), c.waiters.items[w]) catch return first;
             }
         }
+        if (roomy.items.len > 0) return roomy.items[@intCast(g.decide(.payer, g.cell(id).key, roomy.items.len) catch 0)];
         return first;
     }
 
