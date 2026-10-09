@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) !void {
         run_tests.setEnvironmentVariable("HARK_SCENARIO", path);
         run_tests.has_side_effects = true;
     }
+    if (b.option([]const u8, "seed", "With -Dscenario, the seed to replay (default 1)")) |seed| run_tests.setEnvironmentVariable("HARK_SEED", seed);
+    if (b.option(bool, "chaos", "With -Dscenario, trace the seed's chaos run, held to its reference") orelse false) run_tests.setEnvironmentVariable("HARK_CHAOS", "1");
     // The replays read their scenarios at run time: an edited one reruns
     // them, and an added or removed one reconfigures.
     for ([_][]const u8{ "test/scenarios/hark", "test/corpus/unbound" }) |root| try declareInputs(b, run_tests, root);

@@ -737,17 +737,29 @@ test "trace one scenario" {
             else => return err,
         };
     }
+    var path: ?[]const u8 = null;
+    var seed: u64 = 1;
+    var chaotic = false;
     var vars = mem.splitScalar(u8, env_buf[0..n], 0);
-    const path = while (vars.next()) |v| {
-        if (mem.startsWith(u8, v, "HARK_SCENARIO=")) break v["HARK_SCENARIO=".len..];
-    } else return error.SkipZigTest;
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    while (vars.next()) |v| {
+        if (mem.startsWith(u8, v, "HARK_SCENARIO=")) path = v["HARK_SCENARIO=".len..];
+        if (mem.startsWith(u8, v, "HARK_SEED=")) seed = try std.fmt.parseInt(u64, v["HARK_SEED=".len..], 10);
+        if (mem.eql(u8, v, "HARK_CHAOS=1")) chaotic = true;
+    }
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path orelse return error.SkipZigTest, arena, .limited(1 << 20));
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, text, &diag);
     var report: Report = .{};
     defer report.deinit(testing.allocator);
     var mint = try sign.Mint.init(arena, &scenario);
-    const result = runScenario(testing.allocator, &scenario, &mint, .{ .seed = 1, .trace = true }, &report);
+    var reference: Report = .{};
+    defer reference.deinit(testing.allocator);
+    if (chaotic) try runScenario(testing.allocator, &scenario, &mint, .{ .seed = seed }, &reference);
+    const opts: Options = if (chaotic)
+        .{ .seed = seed, .trace = true, .chaos = seed, .reference = reference.answers.items, .known = &reference.heard }
+    else
+        .{ .seed = seed, .trace = true };
+    const result = runScenario(testing.allocator, &scenario, &mint, opts, &report);
     std.debug.print("{t} step {d}: {s}\n{s}", .{ report.phase, report.step, report.msg, report.log });
     try result;
 }
