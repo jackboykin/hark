@@ -9,6 +9,7 @@ const store = @import("store.zig");
 const rand = @import("rand.zig");
 const dns64 = @import("dns64.zig");
 const special_use = @import("special_use.zig");
+const stub = @import("stub.zig");
 const response = @import("response.zig");
 
 pub const Client = struct {
@@ -185,7 +186,11 @@ pub const Desk = struct {
     };
 
     pub fn early(d: *Desk, arena: Allocator, q: dns.Question, c: Client) !Early {
-        if (special_use.classify(q.name, q.qtype, c.do_bit)) |o| return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
+        // A stub zone the operator named overrides what hark answers only by
+        // default: home.arpa's and service.arpa's empty zones (RFC 6303 §3),
+        // and test (RFC 6761 §6.2).
+        if (stub.of(d.g.cfg.stub_zones, q.name, q.qtype) == null) if (special_use.classify(q.name, q.qtype, c.do_bit)) |o|
+            return .{ .synthesized = try ownAnswer(arena, q, o, Dns64.on(d.dns64, c)) };
         if (q.qtype == .any) return .{ .synthesized = try hinfo(arena, q) };
         // RRSIGs are never signed (RFC 4035 §2.2): an answer of them can't
         // be validated, and SERVFAIL would read as bogus. Validating, the

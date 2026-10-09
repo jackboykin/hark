@@ -1164,14 +1164,15 @@ fn told(g: *const Graph, zone: dns.Name) ?[]const na.Address {
 
 /// May `zone`'s servers hear the question? A stub zone's questions go to
 /// its own servers alone, and those servers hear no other. A question hark
-/// answers itself never leaves the host (RFC 6761 §6, RFC 8375 §4.4.B);
-/// an own zone's DS reaches here only for a DO client, its RFC's one
-/// exception, so it is classified as one.
+/// answers itself never leaves the host (RFC 6761 §6, RFC 8375 §4.4.B)
+/// unless a stub zone the operator named covers it; an own zone's DS
+/// reaches here only for a DO client, its RFC's one exception, so it is
+/// classified as one.
 fn mayHear(g: *const Graph, zone: dns.Name, qname: dns.Name, qtype: dns.RType) bool {
     const zones = g.cfg.stub_zones;
     const own = stub.of(zones, qname, qtype);
     if (own != stub.under(zones, zone)) return false;
-    return special_use.classify(qname, qtype, true) == null;
+    return own != null or special_use.classify(qname, qtype, true) == null;
 }
 
 fn zoneTruncates(g: *Graph, zone: dns.Name) bool {

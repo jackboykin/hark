@@ -2,6 +2,7 @@
 ; hark: dnssec-zone = .
 ; hark: dnssec-zone = example.
 ; hark: stub-zone = internal 192.168.1.1
+; hark: stub-zone = home.arpa 192.168.1.1
 ; hark: rebinding-enabled = yes
 ; sim-only: live, nothing binds a LAN address
 
@@ -11,7 +12,8 @@ SCENARIO_BEGIN a stub zone is asked of its servers and answered as given
 ; steer hark to, and answers with private addresses, which the rebinding
 ; scrub keeps. Nothing it says is validated, so nothing it says is AD,
 ; even where its chain leads into a signed public zone. A referral from
-; it answers nothing.
+; it answers nothing. Naming home.arpa turns off its empty zone (RFC 6303
+; §3).
 
 RANGE_BEGIN 0 100
   ADDRESS 127.0.10.1
@@ -72,6 +74,15 @@ RANGE_BEGIN 0 100
       lab.internal. 300 IN NS ns.lab.internal.
     SECTION ADDITIONAL
       ns.lab.internal. 300 IN A 192.168.1.2
+  ENTRY_END
+  ENTRY_BEGIN
+    MATCH opcode qname qtype
+    ADJUST copy_id copy_query
+    REPLY QR AA NOERROR
+    SECTION QUESTION
+      printer.home.arpa. IN A
+    SECTION ANSWER
+      printer.home.arpa. 300 IN A 192.168.1.20
   ENTRY_END
 RANGE_END
 
@@ -136,6 +147,23 @@ ENTRY_BEGIN
   REPLY QR RD RA SERVFAIL
   SECTION QUESTION
     host.lab.internal. IN A
+ENTRY_END
+
+STEP 7 QUERY
+ENTRY_BEGIN
+  REPLY RD
+  SECTION QUESTION
+    printer.home.arpa. IN A
+ENTRY_END
+
+STEP 8 CHECK_ANSWER
+ENTRY_BEGIN
+  MATCH flags answer question
+  REPLY QR RD RA NOERROR
+  SECTION QUESTION
+    printer.home.arpa. IN A
+  SECTION ANSWER
+    printer.home.arpa. 300 IN A 192.168.1.20
 ENTRY_END
 
 SCENARIO_END
