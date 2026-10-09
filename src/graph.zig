@@ -1568,6 +1568,10 @@ pub const Graph = struct {
     }
 
     pub fn band(g: *Graph, server: na.AddressKey) i64 {
+        if (g.chaosAt(.dead)) |ch| {
+            const event = ch.named(.dead, std.hash.Wyhash.hash(0, &server.addr) ^ server.port);
+            if ((ch.choose(.dead, event, 4, .{ .server = server }) catch 0) == 1) return ns_rtt.dead_band;
+        }
         return (g.rtt.get(server) orelse ns_rtt.RttState.unknown).band(g.nowMs());
     }
 
@@ -1611,9 +1615,10 @@ pub const Graph = struct {
         const sc = try arena.create(ExchangeScratch);
         const est = g.rtt.getPtr(server);
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
+        const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
         // Silent past the capped wait is silent, however long this send waits.
-        const owed_at = g.now() + @as(i64, state.timeout(false, transport)) * std.time.ns_per_ms;
-        const timeout_at = g.now() + @as(i64, state.timeout(uncapped, transport)) * std.time.ns_per_ms;
+        const owed_at = g.now() + patience * state.timeout(false, transport) * std.time.ns_per_ms;
+        const timeout_at = g.now() + patience * state.timeout(uncapped, transport) * std.time.ns_per_ms;
         const deadline_ns = @min(budget.deadline_ns, timeout_at);
         if (est) |s| s.sent(@divTrunc(deadline_ns, std.time.ns_per_ms) + 1);
         const addr = server.toAddress();

@@ -6,14 +6,16 @@
 //! too, the first.
 const std = @import("std");
 const graph = @import("graph.zig");
+const na = @import("net_address.zig");
 
-pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget };
+pub const Site = enum(u8) { settle, pick, gather, stagger, memo, ahead, prefetch, payer, tie, budget, rto, dead };
 
 pub const Events = std.AutoArrayHashMapUnmanaged(u64, void);
 
 /// What an event decided about, for a shrunk failure's report.
 pub const About = union(enum) {
     key: graph.Key,
+    server: na.AddressKey,
     none,
 };
 
@@ -93,8 +95,10 @@ pub const Chaos = struct {
         try c.left.ensureUnusedCapacity(c.gpa, 1);
         if (c.told) |*told| {
             try told.ensureUnusedCapacity(c.gpa, 1);
+            var buf: [64]u8 = undefined;
             told.appendAssumeCapacity(switch (about) {
                 .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {t})", .{ site, k.kind, k.name, k.rtype }),
+                .server => |s| try std.fmt.allocPrint(c.gpa, "{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
                 .none => try std.fmt.allocPrint(c.gpa, "{t}", .{site}),
             });
         }
