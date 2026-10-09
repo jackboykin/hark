@@ -839,6 +839,12 @@ pub const Graph = struct {
         const b = try g.work.allocator().create(Budget);
         errdefer g.work.allocator().destroy(b);
         b.* = budget;
+        // Under chaos, spent in part before it starts.
+        b.queries += @intCast(try g.decide(.budget, key, g.cfg.max_queries + 1));
+        const v = &b.validation;
+        v.max_sig_verify -= @intCast(try g.decide(.budget, key, v.max_sig_verify + 1));
+        v.max_nsec3_blocks -= @intCast(try g.decide(.budget, key, v.max_nsec3_blocks + 1));
+        if (b.deadline_ns > g.now()) b.deadline_ns -= @intCast(try g.decide(.budget, key, @intCast(b.deadline_ns - g.now())));
         const id = try g.newCell(key, name);
         g.cell(id).scratch.answer.budget = b;
         g.budgets += 1;
