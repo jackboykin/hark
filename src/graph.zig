@@ -551,6 +551,9 @@ pub const Graph = struct {
     /// Per-server estimate, capped.
     rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
     tally: Tally = .{},
+    /// Under test, the keys of the cells run, in order, folded: the replay
+    /// holds one seed to one schedule.
+    schedule: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     /// Verified NSEC facts in span order (denial.zig).
     denial: denial.Index = .{},
     /// Signatures already verified, by content: a speedup, never a verdict.
@@ -1433,6 +1436,7 @@ pub const Graph = struct {
         g.payer = g.payerOf(id) orelse &g.unpaid;
         defer g.payer = &g.unpaid;
         g.tally.runs += 1;
+        if (builtin.is_test) g.schedule = std.hash.Wyhash.hash(g.schedule, mem.asBytes(&c.key.hash()));
         const clock = Tally.clock(&g.tally.rule_ns);
         defer clock.stop();
         // Ended waiting and created nothing: the model's own cost.

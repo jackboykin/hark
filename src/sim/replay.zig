@@ -24,6 +24,8 @@ pub const Report = struct {
     /// The upstream query log, one `server <- qname qtype` per line,
     /// gpa-owned. Two runs of one seed must produce the same text.
     log: []const u8 = "",
+    /// `Graph.schedule`: two runs of one seed must run one.
+    schedule: u64 = 0,
     tally: graph.Tally = .{},
     cells: usize = 0,
 };
@@ -54,6 +56,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
     defer g.deinit();
     defer {
         report.tally = g.tally;
+        report.schedule = g.schedule;
         report.cells = g.cells.items.len;
     }
 
@@ -574,9 +577,9 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     var second: Report = .{};
     defer gpa.free(second.log);
     runScenario(gpa, &j.scenario, mint, .{ .seed = seed }, &second) catch {};
-    if (!mem.eql(u8, first.log, second.log)) {
+    if (first.schedule != second.schedule or !mem.eql(u8, first.log, second.log)) {
         j.failed = true;
-        std.debug.print("{s} (seed {d}): two runs, two query logs\n", .{ j.path, seed });
+        std.debug.print("{s} (seed {d}): two runs, two schedules\n", .{ j.path, seed });
     }
 }
 
