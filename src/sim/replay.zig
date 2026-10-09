@@ -30,6 +30,9 @@ pub const Report = struct {
     /// `Graph.schedule`: two runs of one seed must run one.
     schedule: u64 = 0,
     answers: std.ArrayList(Answered) = .empty,
+    heard: sim.Sim.Heard = .empty,
+    departed: u32 = 0,
+    compared: u32 = 0,
     tally: graph.Tally = .{},
     cells: usize = 0,
 
@@ -37,6 +40,7 @@ pub const Report = struct {
         gpa.free(r.log);
         for (r.answers.items) |a| gpa.free(a.wire);
         r.answers.deinit(gpa);
+        r.heard.deinit(gpa);
     }
 };
 
@@ -52,6 +56,7 @@ pub const Options = struct {
     trace: bool = false,
     chaos: u64 = 0,
     reference: []const Answered = &.{},
+    known: ?*const sim.Sim.Heard = null,
 };
 
 fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, opts: Options, report: *Report) !void {
@@ -61,6 +66,8 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
 
     var s = try sim.Sim.init(arena, gpa, scenario, mint, opts.seed);
     defer s.deinit();
+    s.known = opts.known;
+    defer mem.swap(sim.Sim.Heard, &report.heard, &s.heard);
     var ch: chaos.Chaos = .{ .gpa = gpa, .seed = opts.chaos };
     defer ch.deinit();
     var edge = s.edge();
@@ -118,7 +125,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         switch (st.kind) {
             .query => {
                 const sent = try resolveClient(arena, &g, &s, scenario, st.entry.?, &held, &desk, &rb);
-                try answered(gpa, report, opts, .steps, st.n, sent);
+                try answered(gpa, report, opts, &s, .steps, st.n, sent);
                 if (sent) |x| last = x.msg else if (opts.chaos == 0) {
                     report.msg = "client timed out";
                     return error.ScenarioFailed;
@@ -202,7 +209,7 @@ fn requery(gpa: Allocator, arena: Allocator, g: *graph.Graph, s: *sim.Sim, scena
         report.step = query.n;
         const before = s.log.items.len;
         const sent = try resolveClient(arena, g, s, scenario, query.entry.?, held, desk, rb);
-        try answered(gpa, report, opts, .warm, query.n, sent);
+        try answered(gpa, report, opts, s, .warm, query.n, sent);
         const actual = sent orelse {
             if (opts.chaos != 0) continue;
             report.msg = "client timed out";
@@ -231,7 +238,7 @@ fn unholdAll(g: *graph.Graph, held: *Held) void {
 /// What the client was sent, read back off the wire serve builds.
 const Sent = struct { msg: dns.Message, wire: []const u8, cacheable: bool, limited: bool };
 
-fn answered(gpa: Allocator, report: *Report, opts: Options, phase: Phase, step: u32, sent: ?Sent) !void {
+fn answered(gpa: Allocator, report: *Report, opts: Options, s: *const sim.Sim, phase: Phase, step: u32, sent: ?Sent) !void {
     const limited = if (sent) |x| x.limited else true;
     const wire = try gpa.dupe(u8, if (sent) |x| x.wire else "");
     {
@@ -245,10 +252,15 @@ fn answered(gpa: Allocator, report: *Report, opts: Options, phase: Phase, step: 
     };
     // A limit may only make its own answer fail.
     if (limited or ref.limited) return;
+    if (s.departed) {
+        report.departed += 1;
+        return;
+    }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const want = try dns.parseMessage(arena_state.allocator(), ref.wire);
     const actual = sent.?.msg;
+    report.compared += 1;
     if (messageMismatch(actual, want)) |why| {
         std.debug.print("  chaos's answer, then the reference's:\n", .{});
         printSections(actual);
@@ -558,7 +570,7 @@ fn outQueryMismatch(rec: sim.LogRow, e: rpl.Entry) ?[]const u8 {
 
 // ── The suite ──────────────────────────────────────────────────────────
 
-const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0 };
+const Replayed = struct { parsed: usize, failed: usize, tally: graph.Tally = .{}, cells: usize = 0, scenarios: usize = 0, compared: usize = 0, departed: usize = 0 };
 
 /// One scenario under every seed, each run twice.
 const Job = struct {
@@ -569,6 +581,8 @@ const Job = struct {
     failed: bool = false,
     tally: graph.Tally = .{},
     cells: usize = 0,
+    compared: u32 = 0,
+    departed: u32 = 0,
 };
 
 /// Replay every scenario under `root` across `seeds`, checking
@@ -615,11 +629,14 @@ fn replayDir(root: []const u8, seeds: u64, xfail: []const []const u8) !Replayed 
         r.cells += j.cells;
         r.scenarios += j.seeds;
         r.failed += @intFromBool(j.failed);
+        r.compared += j.compared;
+        r.departed += j.departed;
     }
     if (leaked.load(.monotonic)) r.failed += 1;
     // Debug numbers mean nothing.
     if (@import("builtin").mode == .debug) return r;
     const t = r.tally;
+    std.debug.print("  chaos compared {d} answers; {d} more were past the reference's world\n", .{ r.compared, r.departed });
     std.debug.print("  {d} cycle checks walked {d} cells ({d:.1} each) over {d} cell slots\n", .{ t.reaches, t.reaches_visits, @as(f64, @floatFromInt(t.reaches_visits)) / @as(f64, @floatFromInt(@max(t.reaches, 1))), r.cells });
     std.debug.print("  {d} runs ended waiting ({d} ns each, {d} ns per settlement)\n", .{ t.reruns, t.rerun_ns / @max(t.reruns, 1), t.rerun_ns / @max(t.settles, 1) });
     std.debug.print("{s}: {d} runs / {d} settles = {d:.2} runs per settlement; {d} ns of model per settlement (rules {d}, less {d} building queries, {d} verifying and {d} in the store) vs {d} ns per parse; {d:.0} cells per run\n", .{
@@ -691,7 +708,11 @@ fn replaySeed(gpa: Allocator, j: *Job, mint: *sign.Mint, seed: u64) void {
     }
     var chaotic: Report = .{};
     defer chaotic.deinit(gpa);
-    const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items };
+    defer {
+        j.compared += chaotic.compared;
+        j.departed += chaotic.departed;
+    }
+    const held: Options = .{ .seed = seed, .chaos = seed, .reference = first.answers.items, .known = &first.heard };
     runScenario(gpa, &j.scenario, mint, held, &chaotic) catch |err| {
         j.failed = true;
         std.debug.print("{s} (seed {d}, chaos): {t} step {d}: {s} ({s})\n{s}", .{ j.path, seed, chaotic.phase, chaotic.step, chaotic.msg, @errorName(err), chaotic.log });

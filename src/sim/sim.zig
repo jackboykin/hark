@@ -61,7 +61,15 @@ pub const Sim = struct {
     events: std.PriorityQueue(Event, void, Event.before) = .empty,
     seq: u32 = 0,
     log: std.ArrayList(LogRow) = .empty,
+    heard: Heard = .empty,
+    /// A chaos run's reference: once this run hears what that one never
+    /// did, or heard at another step, the two no longer share a world and
+    /// their answers may differ.
+    known: ?*const Heard = null,
+    departed: bool = false,
     reply_buf: [65535]u8 = undefined,
+
+    pub const Heard = std.AutoArrayHashMapUnmanaged(u64, void);
 
     pub fn init(arena: Allocator, gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, seed: u64) !Sim {
         var s: Sim = .{
@@ -82,6 +90,7 @@ pub const Sim = struct {
         s.events.deinit(s.gpa);
         s.log.deinit(s.gpa);
         s.sent.deinit(s.gpa);
+        s.heard.deinit(s.gpa);
     }
 
     pub fn random(s: *Sim) std.Random {
@@ -103,25 +112,30 @@ pub const Sim = struct {
     /// One upstream query. Its reply or absence is scheduled now; nothing
     /// depends on later steps.
     pub fn send(s: *Sim, ex: Exchange) !void {
-        if (s.pending_unsent > 0) {
-            s.pending_unsent -= 1;
-            return s.schedule(ex.id, s.now_ns, .unsent);
-        }
         const query = dns.parseMessage(s.arena, ex.wire) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
         if (query.questions.len == 0) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         const q = query.questions[0];
+        if (s.pending_unsent > 0) {
+            s.pending_unsent -= 1;
+            try s.hear(q, silence);
+            return s.schedule(ex.id, s.now_ns, .unsent);
+        }
         // RFC 8109 root priming is not logged.
         if (!(q.name.labels.len == 0 and q.qtype == .ns))
             try s.log.append(s.gpa, .{ .server = ex.server, .qname = try dns.cloneNameFlat(s.arena, q.name, false), .qtype = q.qtype, .transport = ex.transport });
         if (s.pending_drops > 0) {
             s.pending_drops -= 1;
+            try s.hear(q, silence);
             return s.schedule(ex.id, ex.deadline_ns, .timeout);
         }
         const asked = try s.ask(ex.server, q, ex.transport);
         const delay = s.latency(ex.server, asked);
         const entry = s.findEntry(ex.server, q, ex.transport) orelse {
             // No RANGE for this address: nothing listens there.
-            if (!s.serves(ex.server)) return s.schedule(ex.id, ex.deadline_ns, .timeout);
+            if (!s.serves(ex.server)) {
+                try s.hear(q, silence);
+                return s.schedule(ex.id, ex.deadline_ns, .timeout);
+            }
             var msg = query;
             msg.header.flags = .{ .qr = true, .opcode = .query, .aa = false, .tc = false, .rd = query.header.flags.rd, .ra = false, .z = 0, .ad = false, .cd = false, .rcode = .refused };
             msg.answers = &.{};
@@ -138,7 +152,10 @@ pub const Sim = struct {
             msg.opt = null;
             return s.deliver(ex, query, msg, delay);
         };
-        if (entry.drop) return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        if (entry.drop) {
+            try s.hear(q, silence);
+            return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        }
 
         var flags = entry.flags;
         flags.qr = true;
@@ -166,6 +183,11 @@ pub const Sim = struct {
     }
 
     fn deliver(s: *Sim, ex: Exchange, query: dns.Message, msg: dns.Message, latency_ns: i64) !void {
+        var said = msg;
+        said.header.id = 0;
+        said.questions = &.{};
+        const content = dns.serializeMessage(&s.reply_buf, said) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
+        try s.hear(query.questions[0], std.hash.Wyhash.hash(0, content));
         var wire = dns.serializeMessage(&s.reply_buf, msg) catch return s.schedule(ex.id, ex.deadline_ns, .timeout);
         // A UDP reply past the advertised payload arrives truncated.
         const payload: usize = if (query.opt) |o| o.udp_payload_size else 512;
@@ -177,6 +199,19 @@ pub const Sim = struct {
         const at = s.now_ns + latency_ns;
         if (at > ex.deadline_ns) return s.schedule(ex.id, ex.deadline_ns, .timeout);
         return s.schedule(ex.id, at, .{ .reply = try s.arena.dupe(u8, wire) });
+    }
+
+    const silence: u64 = 0;
+
+    fn hear(s: *Sim, q: dns.Question, content: u64) !void {
+        var nb: [dns.max_dotted_len + 1]u8 = undefined;
+        var h = std.hash.Wyhash.init(content);
+        h.update(q.name.formatLower(&nb));
+        h.update(mem.asBytes(&q.qtype));
+        h.update(mem.asBytes(&s.step));
+        const k = h.final();
+        try s.heard.put(s.gpa, k, {});
+        if (s.known) |known| s.departed = s.departed or !known.contains(k);
     }
 
     fn schedule(s: *Sim, id: u32, at_ns: i64, completion: Completion) !void {
