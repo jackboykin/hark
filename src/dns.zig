@@ -1982,13 +1982,9 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
             for (d.names, names) |name, *to| to.* = try cloneNameLower(allocator, name);
             d.names = names;
         },
-        // RFC 6840 §5.1: names in NSEC RDATA are *not* case-folded when
-        // canonicalizing (RRSIG RDATA names are) — hark once did the inverse
-        // of both, so any case-preserving signer failed verification zone-wide.
-        // Still cloned, just not folded: the scrub re-anchors label bytes off
-        // the upstream wire buffer the message does not own. 0x20 never touches
-        // a signer-chosen next_domain, and range comparisons use
-        // case-insensitive cmpLabelsCI regardless.
+        // RFC 6840 §5.1: names in NSEC RDATA are not case-folded when
+        // canonicalizing (RRSIG RDATA names are). Still cloned: the scrub
+        // re-anchors label bytes off the wire buffer the message does not own.
         .nsec => |*n| n.next_domain_name = try cloneNameFlat(allocator, n.next_domain_name, false),
     }
 }

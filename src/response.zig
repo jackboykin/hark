@@ -155,9 +155,7 @@ pub fn serializeErrorResponse(
             .id = query_id,
             .flags = .{
                 .qr = true,
-                // RFC 1035 §4.1.1: response OPCODE echoes the query's OPCODE.
-                // Hardcoding .query here would mislabel NOTIMP responses to
-                // OPCODE=4/5 (Notify/Update) as ordinary QUERY replies.
+                // RFC 1035 §4.1.1: copied from the query, a NOTIMP included.
                 .opcode = opcode,
                 .aa = false,
                 .tc = false,
