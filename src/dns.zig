@@ -686,7 +686,7 @@ fn indexOfUnescapedDot(s: []const u8, start: usize) ?usize {
     return null;
 }
 
-pub fn isEscapedAt(s: []const u8, i: usize) bool {
+fn isEscapedAt(s: []const u8, i: usize) bool {
     var n: usize = 0;
     while (n < i and s[i - 1 - n] == '\\') n += 1;
     return n % 2 == 1;
@@ -836,10 +836,6 @@ pub fn buildQuery(allocator: Allocator, id: u16, name_str: []const u8, qtype: RT
 const Parser = struct {
     msg: []const u8,
     pos: usize,
-
-    fn init(msg: []const u8) Parser {
-        return .{ .msg = msg, .pos = 0 };
-    }
 
     fn readU8(self: *Parser) Error!u8 {
         if (self.pos >= self.msg.len) return error.EndOfData;
@@ -2155,12 +2151,6 @@ test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     };
 
     try testing.expectError(error.FormatError, parseMessage(alloc, &wire));
-}
-
-pub fn lowerNameIntoBuf(buf: []u8, name: []const u8) []const u8 {
-    std.debug.assert(name.len <= buf.len);
-    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..name.len];
 }
 
 /// Single-allocation clone: labels slice and every label byte share one
