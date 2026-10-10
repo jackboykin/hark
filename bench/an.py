@@ -1,9 +1,10 @@
 """an.py <tp.sh output> [side...]: each side, then each against the first.
 
 One layout a side: the per-round ratio, its median with a bootstrap 95% CI,
-and a sign test. Several (layouts.sh): the difference of per-layout means,
-bootstrapped over layouts, real only if the CI excludes 0 and |Δ| > 1%,
-the reach of a relink.
+and a sign test, for qps and for each PERF=1 counter per query. Several
+(layouts.sh): the difference of per-layout means, bootstrapped over
+layouts, real only if the CI excludes 0 and |Δ| > 1%, the reach of a
+relink.
 """
 import collections as C, math, random, statistics as st, sys
 
@@ -14,8 +15,10 @@ for line in open(sys.argv[1]):
         continue
     kv = dict(f.split('=', 1) for f in p[10:] if '=' in f)
     num = lambda k: float(kv[k]) if kv.get(k, '').replace('.', '', 1).isdigit() else None
-    runs.append(dict(r=int(p[0]), side=p[1], lay=p[2], qps=float(p[3]), done=int(p[4]), lost=int(p[5]),
-                     busy=float(p[6]), ins=num('instructions'), lat=[num(k) for k in ('p50', 'p99', 'p999')]))
+    done = int(p[4])
+    runs.append(dict(r=int(p[0]), side=p[1], lay=p[2], qps=float(p[3]), done=done, lost=int(p[5]),
+                     busy=float(p[6]), lat=[num(k) for k in ('p50', 'p99', 'p999')],
+                     ev={k: num(k) / done for k in kv if k not in ('cpu', 'p50', 'p99', 'p999') and num(k) and done}))
 sides = sys.argv[2:] or list(dict.fromkeys(r['side'] for r in runs))
 by = C.defaultdict(list)
 for r in runs:
@@ -33,14 +36,17 @@ print(sys.argv[1].split('/')[-1])
 w = max(len(s) for s in sides)
 for s in sides:
     q = [r['qps'] for r in by[s]]
-    ipq = [r['ins'] / r['done'] for r in by[s] if r['ins'] and r['done']]
     lat = [st.median(v) for v in zip(*(r['lat'] for r in by[s])) if None not in v]
     unsat = sum(r['busy'] < 97 for r in by[s])
     print(f"  {s:>{w}} median {st.median(q):9.0f} qps  cv {cv(q):.2f}%  range {min(q):.0f}-{max(q):.0f}"
           f"  {1e6 / st.median(q):.3f} µs/query  busy min {min(r['busy'] for r in by[s]):.1f}%"
-          f"  lost {sum(r['lost'] for r in by[s])}" + (f"  {st.median(ipq):.0f} ins/query" if ipq else "")
+          f"  lost {sum(r['lost'] for r in by[s])}"
           + (f"  p50 {lat[0]:.0f} p99 {lat[1]:.0f} p99.9 {lat[2]:.0f} µs" if lat else "")
           + (f"  UNSATURATED {unsat}/{len(q)} runs <97% busy" if unsat and not lat else ""))
+    evs = by[s][0]['ev']
+    if evs:
+        print(f"  {'':>{w}} per query: " + '  '.join(
+            f"{k} {st.median(r['ev'][k] for r in by[s]):.0f} cv {cv([r['ev'][k] for r in by[s]]):.2f}%" for k in evs))
 
 a = sides[0]
 for b in sides[1:]:
@@ -60,10 +66,11 @@ for b in sides[1:]:
         continue
     rounds = C.defaultdict(dict)
     for r in runs:
-        rounds[r['r']][r['side']] = r['qps']
-    ratio = [d[b] / d[a] for d in rounds.values() if a in d and b in d]
-    n, wins = len(ratio), sum(x > 1 for x in ratio)
-    p = min(1, 2 * sum(math.comb(n, k) for k in range(min(wins, n - wins) + 1)) / 2**n)
-    lo, hi = ci(ratio, st.median)
-    print(f"  paired {b}/{a} median {pct(st.median(ratio))}  95% CI [{pct(lo)}, {pct(hi)}]"
-          f"  {b} faster {wins}/{n}, sign p={p:.3f}")
+        rounds[r['r']][r['side']] = r
+    for name, f in [('qps', lambda r: r['qps'])] + [(k, lambda r, k=k: r['ev'][k]) for k in by[a][0]['ev']]:
+        ratio = [f(d[b]) / f(d[a]) for d in rounds.values() if a in d and b in d]
+        n, wins = len(ratio), sum(x > 1 for x in ratio)
+        p = min(1, 2 * sum(math.comb(n, k) for k in range(min(wins, n - wins) + 1)) / 2**n)
+        lo, hi = ci(ratio, st.median)
+        print(f"  paired {b}/{a} {name} median {pct(st.median(ratio))}  95% CI [{pct(lo)}, {pct(hi)}]"
+              f"  {b} higher {wins}/{n}, sign p={p:.3f}")

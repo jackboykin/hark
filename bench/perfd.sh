@@ -10,7 +10,7 @@
 # The rigs start and stop it themselves under PERF=1. By hand:
 #   bench/perfd.sh /tmp/pd & PERF_DIR=/tmp/pd bench/tp.sh ...; kill %1
 set -u
-W=$1 EV=${2:-cycles,instructions}
+W=$1 EV=${2:-instructions:u,cycles:u,instructions:k,cycles:k}
 perf stat -C 0 -e "$EV" -o /dev/null true || exit 1
 mkdir -p "$W"
 for f in cpu ctl ack stop out; do [[ -p $W/$f ]] || mkfifo "$W/$f"; done
