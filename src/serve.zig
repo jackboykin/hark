@@ -736,7 +736,6 @@ const Server = struct {
         if (s.cfg.log_queries) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            var tb: [24]u8 = undefined;
             const q = query.questions[0];
             const peer = switch (reply) {
                 .udp => |u| u.addr,
@@ -744,8 +743,8 @@ const Server = struct {
             };
             const rcode = served.rcode;
             var rb: [24]u8 = undefined;
-            const outcome = if (rcode == .no_error) "" else std.fmt.bufPrint(&rb, " {t}", .{rcode}) catch "";
-            log.debug("client={s} id=0x{x:0>4} {s} {s}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.safeTagName(q.qtype, &tb), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
+            const outcome = if (rcode == .no_error) "" else std.fmt.bufPrint(&rb, " {f}", .{dns.tag(rcode)}) catch "";
+            log.debug("client={s} id=0x{x:0>4} {s} {f}{s} {d}ms", .{ na.format(peer, &ab), query.header.id, q.name.formatInto(&nb), dns.tag(q.qtype), outcome, @divTrunc(s.e.now_ns - asked_ns, std.time.ns_per_ms) });
         }
         s.count(served.rcode, served.ede);
         s.write(reply, &buf, wire.len);

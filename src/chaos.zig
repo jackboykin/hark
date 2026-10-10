@@ -5,6 +5,7 @@
 //! A draw of 0 is what hark does without chaos, or, where hark draws
 //! too, the first.
 const std = @import("std");
+const dns = @import("dns.zig");
 const graph = @import("graph.zig");
 const na = @import("net_address.zig");
 
@@ -100,7 +101,7 @@ pub const Chaos = struct {
             try told.ensureUnusedCapacity(c.gpa, 1);
             var buf: [64]u8 = undefined;
             told.appendAssumeCapacity(switch (about) {
-                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {t})", .{ site, k.kind, k.name, k.rtype }),
+                .key => |k| try std.fmt.allocPrint(c.gpa, "{t} {t}({s} {f})", .{ site, k.kind, k.name, dns.tag(k.rtype) }),
                 .server => |s| try std.fmt.allocPrint(c.gpa, "{t} {s}", .{ site, na.format(s.toAddress(), &buf) }),
                 .none => try std.fmt.allocPrint(c.gpa, "{t}", .{site}),
             });

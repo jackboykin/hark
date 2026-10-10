@@ -429,10 +429,10 @@ fn settleBy(g: *graph.Graph, s: *sim.Sim, root: graph.CellId, until: i64) !bool 
 
 fn printSections(m: dns.Message) void {
     var nb: [dns.max_dotted_len + 1]u8 = undefined;
-    std.debug.print("  actual: rcode={t} aa={} ad={}\n", .{ m.header.flags.rcode, m.header.flags.aa, m.header.flags.ad });
+    std.debug.print("  actual: rcode={f} aa={} ad={}\n", .{ dns.tag(m.header.flags.rcode), m.header.flags.aa, m.header.flags.ad });
     if (m.opt) |o| for (o.options) |x| std.debug.print("    option {d}: {x}\n", .{ x.code, x.data });
     for ([_][]const dns.ResourceRecord{ m.answers, m.authorities, m.additionals }, [_][]const u8{ "an", "ns", "ar" }) |sec, label| {
-        for (sec) |rr| std.debug.print("    {s} {s} {d} {t}\n", .{ label, rr.name.formatInto(&nb), rr.ttl, rr.rtype });
+        for (sec) |rr| std.debug.print("    {s} {s} {d} {f}\n", .{ label, rr.name.formatInto(&nb), rr.ttl, dns.tag(rr.rtype) });
     }
 }
 
@@ -442,7 +442,7 @@ fn formatLog(gpa: Allocator, log: []const sim.LogRow) ![]const u8 {
     for (log) |row| {
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         var ab: [64]u8 = undefined;
-        try out.print(gpa, "    {s} <- {s} {t}\n", .{ na.format(row.server, &ab), row.qname.formatInto(&nb), row.qtype });
+        try out.print(gpa, "    {s} <- {s} {f}\n", .{ na.format(row.server, &ab), row.qname.formatInto(&nb), dns.tag(row.qtype) });
     }
     return out.toOwnedSlice(gpa);
 }

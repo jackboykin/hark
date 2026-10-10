@@ -4,12 +4,21 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 
-/// Safe replacement for `@tagName`, which is illegal on an unnamed value of a
-/// non-exhaustive enum.
-pub fn safeTagName(val: anytype, buf: *[24]u8) []const u8 {
-    return switch (val) {
-        _ => std.fmt.bufPrint(buf, "{d}", .{@backingInt(val)}) catch "?",
-        else => @tagName(val),
+/// A wire enum for `{f}`: its name, or its number where it has none. `{t}`
+/// is `@tagName`, which panics on an unnamed value.
+pub fn tag(val: anytype) Tag(@TypeOf(val)) {
+    return .{ .val = val };
+}
+
+fn Tag(comptime E: type) type {
+    return struct {
+        val: E,
+        pub fn format(t: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (t.val) {
+                _ => try w.print("{d}", .{@backingInt(t.val)}),
+                else => try w.writeAll(@tagName(t.val)),
+            }
+        }
     };
 }
 
@@ -1773,7 +1782,7 @@ test "a record written from its stored bytes is the record written from its fiel
     for (datas) |d| {
         const rtype: RType = switch (d) {
             .named, .unknown => unreachable,
-            inline else => |_, tag| @field(RType, @tagName(tag)),
+            inline else => |_, field| @field(RType, @tagName(field)),
         };
         const rr: ResourceRecord = .{ .name = owner, .rtype = rtype, .rclass = .in, .ttl = 300, .rdata = d };
         var stage: [512]u8 = undefined;
@@ -2305,20 +2314,11 @@ test "typeBitmapContains" {
     try testing.expect(!typeBitmapContains(&.{}, .a));
 }
 
-test "safeTagName handles known and unknown enum values" {
-    var buf: [24]u8 = undefined;
-    try testing.expectEqualStrings("a", safeTagName(RType.a, &buf));
-    try testing.expectEqualStrings("aaaa", safeTagName(RType.aaaa, &buf));
-    try testing.expectEqualStrings("no_error", safeTagName(RCode.no_error, &buf));
-
-    // Unknown values — CERT (37), CAA (257)
-    const cert: RType = @fromBackingInt(@intCast(37));
-    try testing.expectEqualStrings("37", safeTagName(cert, &buf));
-    const caa: RType = @fromBackingInt(@intCast(257));
-    try testing.expectEqualStrings("257", safeTagName(caa, &buf));
-
-    const rcode7: RCode = @fromBackingInt(@intCast(7));
-    try testing.expectEqualStrings("7", safeTagName(rcode7, &buf));
+test "an unnamed wire value prints as its number" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("aaaa", try std.fmt.bufPrint(&buf, "{f}", .{tag(RType.aaaa)}));
+    try testing.expectEqualStrings("999", try std.fmt.bufPrint(&buf, "{f}", .{tag(@as(RType, @fromBackingInt(999)))}));
+    try testing.expectEqualStrings("9", try std.fmt.bufPrint(&buf, "{f}", .{tag(@as(RCode, @fromBackingInt(9)))}));
 }
 
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {

@@ -664,7 +664,7 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.ready.append(g.gpa, id);
         g.stats.resolver.detail.ahead += 1;
-        if (g.cfg.trace) std.debug.print("  ahead {s} {t}\n", .{ key.name, key.rtype });
+        if (g.cfg.trace) std.debug.print("  ahead {s} {f}\n", .{ key.name, dns.tag(key.rtype) });
         return id;
     }
 
@@ -683,7 +683,7 @@ pub const Graph = struct {
         errdefer g.unhold(id);
         try g.wake(id, at);
         g.stats.resolver.early.refresh += 1;
-        if (g.cfg.trace) std.debug.print("  refresh {s} {t} in {d} ms\n", .{ key.name, key.rtype, @divTrunc(at - g.now(), std.time.ns_per_ms) });
+        if (g.cfg.trace) std.debug.print("  refresh {s} {f} in {d} ms\n", .{ key.name, dns.tag(key.rtype), @divTrunc(at - g.now(), std.time.ns_per_ms) });
     }
 
     pub fn drain(g: *Graph) !void {
@@ -815,10 +815,10 @@ pub const Graph = struct {
         if (g.cfg.trace) {
             var ab: [64]u8 = undefined;
             var nb: [dns.max_dotted_len + 1]u8 = undefined;
-            std.debug.print("  {s} {s} {t} {t} -> {t}\n", .{ na.format(sc.server, &ab), sc.sent_name.formatInto(&nb), sc.qtype, sc.transport, std.meta.activeTag(outcome) });
+            std.debug.print("  {s} {s} {f} {t} -> {t}\n", .{ na.format(sc.server, &ab), sc.sent_name.formatInto(&nb), dns.tag(sc.qtype), sc.transport, std.meta.activeTag(outcome) });
             if (outcome == .reply) {
                 const m = outcome.reply.msg;
-                std.debug.print("      aa={} tc={} ra={} rcode={t} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, m.header.flags.rcode, m.answers.len, m.authorities.len, m.additionals.len });
+                std.debug.print("      aa={} tc={} ra={} rcode={f} an={d} ns={d} ar={d}\n", .{ m.header.flags.aa, m.header.flags.tc, m.header.flags.ra, dns.tag(m.header.flags.rcode), m.answers.len, m.authorities.len, m.additionals.len });
             }
         }
         // A timeout the root's deadline cut short says nothing about the server.
@@ -1600,7 +1600,7 @@ pub const Graph = struct {
         if (stop) |why| {
             if (g.cfg.trace) {
                 var nb: [dns.max_dotted_len + 1]u8 = undefined;
-                std.debug.print("  {s} {t} refused: {s}\n", .{ qname.formatInto(&nb), qtype, why });
+                std.debug.print("  {s} {f} refused: {s}\n", .{ qname.formatInto(&nb), dns.tag(qtype), why });
             }
             return null;
         }
