@@ -14,44 +14,10 @@ pub const Value = union(enum) {
 pub const Table = struct {
     map: std.StringHashMapUnmanaged(Value),
 
-    pub fn getInteger(self: Table, key: []const u8) ?i64 {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .integer => |i| i,
-            else => null,
-        };
-    }
-
-    pub fn getBool(self: Table, key: []const u8) ?bool {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .boolean => |b| b,
-            else => null,
-        };
-    }
-
-    pub fn getString(self: Table, key: []const u8) ?[]const u8 {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .string => |s| s,
-            else => null,
-        };
-    }
-
-    pub fn getStringArray(self: Table, key: []const u8) ?[]const []const u8 {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .string_array => |a| a,
-            else => null,
-        };
-    }
-
-    pub fn getTable(self: Table, key: []const u8) ?Table {
-        const val = self.map.get(key) orelse return null;
-        return switch (val) {
-            .table => |t| t,
-            else => null,
-        };
+    /// The value at `key` if it is a `kind`.
+    pub fn get(t: Table, key: []const u8, comptime kind: std.meta.Tag(Value)) ?@FieldType(Value, @tagName(kind)) {
+        const v = t.map.get(key) orelse return null;
+        return if (v == kind) @field(v, @tagName(kind)) else null;
     }
 };
 
@@ -66,41 +32,10 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-pub const ParseResult = struct {
-    table: Table,
-    allocator: Allocator,
-
-    pub fn deinit(self: *ParseResult) void {
-        freeTable(self.allocator, &self.table);
-    }
-};
-
-fn freeValue(allocator: Allocator, value: *Value) void {
-    switch (value.*) {
-        .string => |s| allocator.free(s),
-        .integer, .boolean => {},
-        .string_array => |arr| {
-            for (arr) |s| allocator.free(s);
-            allocator.free(arr);
-        },
-        .table => |*t| freeTable(allocator, t),
-    }
-}
-
-fn freeTable(allocator: Allocator, table: *Table) void {
-    var it = table.map.iterator();
-    while (it.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        freeValue(allocator, entry.value_ptr);
-    }
-    table.map.deinit(allocator);
-}
-
-pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
+/// Allocated from `arena` and freed with it; keys point into `input`.
+pub fn parse(arena: Allocator, input: []const u8) ParseError!Table {
     var root = Table{ .map = .empty };
-    errdefer freeTable(allocator, &root);
-
-    var current_section: ?[]const u8 = null;
+    var section = &root.map;
     var lines = mem.splitScalar(u8, input, '\n');
 
     while (lines.next()) |raw_line| {
@@ -110,7 +45,6 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
 
         if (line[0] == '[') {
             const close = mem.indexOfScalar(u8, line, ']') orelse return error.InvalidSyntax;
-            if (close == 1) return error.InvalidBareKey; // empty section name
             const section_name = mem.trim(u8, line[1..close], &std.ascii.whitespace);
 
             if (!isValidBareKey(section_name)) return error.InvalidBareKey;
@@ -118,56 +52,37 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ParseResult {
             const after_close = mem.trim(u8, line[close + 1 ..], &std.ascii.whitespace);
             if (after_close.len > 0) return error.InvalidSyntax;
 
-            if (root.map.get(section_name)) |_| return error.DuplicateSection;
-
-            const duped_name = try allocator.dupe(u8, section_name);
-            errdefer allocator.free(duped_name);
-
-            const empty_table = Value{ .table = .{ .map = .empty } };
-            try root.map.put(allocator, duped_name, empty_table);
-            current_section = duped_name;
+            const entry = try root.map.getOrPut(arena, section_name);
+            if (entry.found_existing) return error.DuplicateSection;
+            entry.value_ptr.* = .{ .table = .{ .map = .empty } };
+            section = &entry.value_ptr.table.map;
         } else {
             const eq_pos = mem.indexOfScalar(u8, line, '=') orelse return error.InvalidSyntax;
-            const raw_key = mem.trim(u8, line[0..eq_pos], &std.ascii.whitespace);
+            const key = mem.trim(u8, line[0..eq_pos], &std.ascii.whitespace);
             var raw_val = mem.trim(u8, line[eq_pos + 1 ..], &std.ascii.whitespace);
 
-            if (raw_key.len == 0) return error.InvalidBareKey;
-            if (!isValidBareKey(raw_key)) return error.InvalidBareKey;
+            if (!isValidBareKey(key)) return error.InvalidBareKey;
             if (raw_val.len == 0) return error.InvalidSyntax;
 
             // An array may span lines, with comments between its elements.
-            var joined: std.ArrayList(u8) = .empty;
-            defer joined.deinit(allocator);
             if (raw_val[0] == '[' and unquoted(raw_val, ']') == null) {
-                try joined.appendSlice(allocator, raw_val);
+                var joined: std.ArrayList(u8) = .empty;
+                try joined.appendSlice(arena, raw_val);
                 while (unquoted(joined.items, ']') == null) {
                     const more = lines.next() orelse return error.InvalidSyntax;
-                    try joined.append(allocator, '\n');
-                    try joined.appendSlice(allocator, stripComment(mem.trim(u8, more, &std.ascii.whitespace)));
+                    try joined.append(arena, '\n');
+                    try joined.appendSlice(arena, stripComment(mem.trim(u8, more, &std.ascii.whitespace)));
                 }
                 raw_val = joined.items;
             }
 
-            const value = try parseValue(allocator, raw_val);
-            errdefer {
-                var v = value;
-                freeValue(allocator, &v);
-            }
-
-            const duped_key = try allocator.dupe(u8, raw_key);
-            errdefer allocator.free(duped_key);
-
-            const target = if (current_section) |sec| blk: {
-                const entry = root.map.getPtr(sec).?;
-                break :blk &entry.table.map;
-            } else &root.map;
-
-            if (target.get(duped_key) != null) return error.DuplicateKey;
-            try target.put(allocator, duped_key, value);
+            const entry = try section.getOrPut(arena, key);
+            if (entry.found_existing) return error.DuplicateKey;
+            entry.value_ptr.* = try parseValue(arena, raw_val);
         }
     }
 
-    return .{ .table = root, .allocator = allocator };
+    return root;
 }
 
 fn stripComment(line: []const u8) []const u8 {
@@ -198,353 +113,169 @@ fn unquoted(text: []const u8, target: u8) ?usize {
 }
 
 fn isValidBareKey(key: []const u8) bool {
-    for (key) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
-    }
-    return true;
+    for (key) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    return key.len > 0;
 }
 
-fn parseValue(allocator: Allocator, raw: []const u8) ParseError!Value {
-    if (raw.len == 0) return error.InvalidSyntax;
-
-    if (raw[0] == '"') return .{ .string = try parseString(allocator, raw) };
-
-    if (raw[0] == '[') return parseArray(allocator, raw);
-
+fn parseValue(arena: Allocator, raw: []const u8) ParseError!Value {
+    if (raw[0] == '"') return .{ .string = try parseString(arena, raw) };
+    if (raw[0] == '[') return .{ .string_array = try parseArray(arena, raw) };
     if (mem.eql(u8, raw, "true")) return .{ .boolean = true };
     if (mem.eql(u8, raw, "false")) return .{ .boolean = false };
-
-    return .{ .integer = parseInteger(raw) orelse return error.InvalidInteger };
+    return .{ .integer = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidInteger };
 }
 
-fn parseString(allocator: Allocator, raw: []const u8) ParseError![]const u8 {
-    if (raw.len < 2 or raw[0] != '"') return error.InvalidSyntax;
-
-    var result = std.ArrayList(u8).empty;
-    defer result.deinit(allocator);
-
+fn parseString(arena: Allocator, raw: []const u8) ParseError![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
     var i: usize = 1;
-    while (i < raw.len) {
+    while (i < raw.len) : (i += 1) {
         const c = raw[i];
         if (c == '"') {
             const after = mem.trim(u8, raw[i + 1 ..], &std.ascii.whitespace);
             if (after.len > 0) return error.InvalidSyntax;
-            return try allocator.dupe(u8, result.items);
+            return result.items;
         }
-        if (c == '\\') {
+        try result.append(arena, if (c != '\\') c else blk: {
             i += 1;
             if (i >= raw.len) return error.InvalidEscape;
-            switch (raw[i]) {
-                '\\' => try result.append(allocator, '\\'),
-                '"' => try result.append(allocator, '"'),
-                'n' => try result.append(allocator, '\n'),
-                't' => try result.append(allocator, '\t'),
+            break :blk switch (raw[i]) {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                't' => '\t',
                 else => return error.InvalidEscape,
-            }
-        } else {
-            try result.append(allocator, c);
-        }
-        i += 1;
+            };
+        });
     }
     return error.UnterminatedString;
 }
 
-fn parseInteger(raw: []const u8) ?i64 {
-    if (raw.len == 0) return null;
-    var start: usize = 0;
-    var negative = false;
-    if (raw[0] == '+') {
-        start = 1;
-    } else if (raw[0] == '-') {
-        start = 1;
-        negative = true;
-    }
-    if (start >= raw.len) return null;
-
-    // Filter underscores (TOML allows 1_000)
-    var digits: [64]u8 = undefined;
-    var len: usize = 0;
-    for (raw[start..]) |c| {
-        if (c == '_') continue;
-        if (!std.ascii.isDigit(c)) return null;
-        if (len >= digits.len) return null;
-        digits[len] = c;
-        len += 1;
-    }
-    if (len == 0) return null;
-
-    const abs = std.fmt.parseInt(i64, digits[0..len], 10) catch return null;
-    return if (negative) -abs else abs;
-}
-
-fn parseArray(allocator: Allocator, raw: []const u8) ParseError!Value {
-    if (raw.len < 2 or raw[0] != '[') return error.InvalidSyntax;
-
+/// Only arrays of strings.
+fn parseArray(arena: Allocator, raw: []const u8) ParseError![]const []const u8 {
     const close = mem.lastIndexOfScalar(u8, raw, ']') orelse return error.InvalidSyntax;
-    // Reject trailing garbage so a typo like `key = ["x"] junk` surfaces as
-    // an error instead of silently dropping the trailing characters.
+    // Trailing garbage, as in `key = ["x"] junk`, is a typo, not a comment.
     for (raw[close + 1 ..]) |c| if (!std.ascii.isWhitespace(c)) return error.InvalidSyntax;
-    const inner = mem.trim(u8, raw[1..close], &std.ascii.whitespace);
+    const inner = raw[1..close];
 
-    if (inner.len == 0) return .{ .string_array = &.{} };
-
-    // Split array elements — need to handle quoted strings with commas
-    var items = std.ArrayList([]const u8).empty;
-    defer {
-        for (items.items) |s| allocator.free(s);
-        items.deinit(allocator);
-    }
-
+    var items: std.ArrayList([]const u8) = .empty;
     var pos: usize = 0;
-    while (pos < inner.len) {
+    while (true) {
         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
         if (pos >= inner.len) break;
+        if (inner[pos] != '"') return error.InvalidSyntax;
 
-        if (inner[pos] == '"') {
-            var end = pos + 1;
-            while (end < inner.len) {
-                if (inner[end] == '\\') {
-                    if (end + 1 >= inner.len) break;
-                    end += 2;
-                    continue;
-                }
-                if (inner[end] == '"') {
-                    end += 1;
-                    break;
-                }
-                end += 1;
+        var end = pos + 1;
+        while (end < inner.len) {
+            if (inner[end] == '\\') {
+                if (end + 1 >= inner.len) break;
+                end += 2;
+                continue;
             }
-            // Reserve before parsing: `append` after a successful
-            // `parseString` had no owner for `str` if the append itself
-            // failed, stranding one element per array on OOM.
-            try items.ensureUnusedCapacity(allocator, 1);
-            const str = try parseString(allocator, inner[pos..end]);
-            items.appendAssumeCapacity(str);
-            pos = end;
-        } else {
-            return error.InvalidSyntax; // Only string arrays supported
+            end += 1;
+            if (inner[end - 1] == '"') break;
         }
+        try items.append(arena, try parseString(arena, inner[pos..end]));
+        pos = end;
 
         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
         if (pos < inner.len and inner[pos] == ',') pos += 1;
     }
-
-    // `toOwnedSlice` remaps in place rather than copying, and leaves the list
-    // untouched on failure so the `defer` above still frees every element.
-    return .{ .string_array = try items.toOwnedSlice(allocator) };
+    return items.items;
 }
 
-test "parse empty input" {
-    var result = try parse(testing.allocator, "");
-    defer result.deinit();
-    try testing.expectEqual(@as(u32, 0), result.table.map.count());
+var test_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+fn parseTest(input: []const u8) ParseError!Table {
+    return parse(test_arena.allocator(), input);
 }
 
 test "parse comments and blank lines" {
-    var result = try parse(testing.allocator,
+    try testing.expectEqual(0, (try parseTest("")).map.count());
+    try testing.expectEqual(0, (try parseTest(
         \\# This is a comment
         \\
         \\# Another comment
+    )).map.count());
+}
+
+test "parse strings" {
+    const t = try parseTest(
+        \\name = "hello#world" # a comment
+        \\path = "a\"b\\c"
     );
-    defer result.deinit();
-    try testing.expectEqual(@as(u32, 0), result.table.map.count());
+    try testing.expectEqualStrings("hello#world", t.get("name", .string).?);
+    try testing.expectEqualStrings("a\"b\\c", t.get("path", .string).?);
 }
 
-test "parse string value" {
-    var result = try parse(testing.allocator,
-        \\name = "hello"
-    );
-    defer result.deinit();
-    try testing.expectEqualStrings("hello", result.table.map.get("name").?.string);
-}
-
-test "parse string escapes" {
-    // TOML input: path = "a\"b\\c"  (with literal backslash escapes)
-    const input = "path = \"a\\\"b\\\\c\"";
-    var result = try parse(testing.allocator, input);
-    defer result.deinit();
-    try testing.expectEqualStrings("a\"b\\c", result.table.map.get("path").?.string);
-}
-
-test "parse integer value" {
-    var result = try parse(testing.allocator,
-        \\port = 8053
-    );
-    defer result.deinit();
-    try testing.expectEqual(@as(i64, 8053), result.table.getInteger("port").?);
-}
-
-test "parse negative integer" {
-    var result = try parse(testing.allocator,
+test "parse integers" {
+    const t = try parseTest(
+        \\port = 53 # standard DNS port
         \\offset = -10
-    );
-    defer result.deinit();
-    try testing.expectEqual(@as(i64, -10), result.table.getInteger("offset").?);
-}
-
-test "parse integer with underscores" {
-    var result = try parse(testing.allocator,
         \\size = 16_777_216
     );
-    defer result.deinit();
-    try testing.expectEqual(@as(i64, 16_777_216), result.table.getInteger("size").?);
+    try testing.expectEqual(53, t.get("port", .integer).?);
+    try testing.expectEqual(-10, t.get("offset", .integer).?);
+    try testing.expectEqual(16_777_216, t.get("size", .integer).?);
+    try testing.expectError(error.InvalidInteger, parseTest("size = _1"));
 }
 
 test "parse boolean values" {
-    var result = try parse(testing.allocator,
+    const t = try parseTest(
         \\enabled = true
         \\disabled = false
     );
-    defer result.deinit();
-    try testing.expectEqual(true, result.table.getBool("enabled").?);
-    try testing.expectEqual(false, result.table.getBool("disabled").?);
+    try testing.expectEqual(true, t.get("enabled", .boolean).?);
+    try testing.expectEqual(false, t.get("disabled", .boolean).?);
 }
 
-test "parse string array" {
-    var result = try parse(testing.allocator,
+test "parse string arrays" {
+    const t = try parseTest(
         \\listen = ["127.0.0.1:53", "[::1]:53"]
+        \\items = []
     );
-    defer result.deinit();
-    const arr = result.table.getStringArray("listen").?;
-    try testing.expectEqual(@as(usize, 2), arr.len);
+    const arr = t.get("listen", .string_array).?;
+    try testing.expectEqual(2, arr.len);
     try testing.expectEqualStrings("127.0.0.1:53", arr[0]);
     try testing.expectEqualStrings("[::1]:53", arr[1]);
+    try testing.expectEqual(0, t.get("items", .string_array).?.len);
 }
 
 test "parse an array across lines" {
-    var result = try parse(testing.allocator,
+    const t = try parseTest(
         \\zones = [
         \\  "internal 192.0.2.1", # a comment
         \\  "a]b#c",
         \\]
         \\after = 1
     );
-    defer result.deinit();
-    const arr = result.table.getStringArray("zones").?;
-    try testing.expectEqual(@as(usize, 2), arr.len);
+    const arr = t.get("zones", .string_array).?;
+    try testing.expectEqual(2, arr.len);
     try testing.expectEqualStrings("internal 192.0.2.1", arr[0]);
     try testing.expectEqualStrings("a]b#c", arr[1]);
-    try testing.expectEqual(@as(i64, 1), result.table.getInteger("after").?);
-}
-
-test "error on an array never closed" {
-    try testing.expectError(error.InvalidSyntax, parse(testing.allocator,
-        \\zones = [
-        \\  "internal 192.0.2.1"
-    ));
-}
-
-test "parse empty array" {
-    var result = try parse(testing.allocator,
-        \\items = []
-    );
-    defer result.deinit();
-    const arr = result.table.getStringArray("items").?;
-    try testing.expectEqual(@as(usize, 0), arr.len);
+    try testing.expectEqual(1, t.get("after", .integer).?);
 }
 
 test "parse section tables" {
-    var result = try parse(testing.allocator,
+    const t = try parseTest(
         \\[server]
         \\listen = ["127.0.0.1:53"]
         \\workers = 4
         \\
         \\[resolver]
         \\qname-minimization = true
-        \\dnssec = false
     );
-    defer result.deinit();
-
-    const server = result.table.getTable("server").?;
-    try testing.expectEqual(@as(i64, 4), server.getInteger("workers").?);
-    const arr = server.getStringArray("listen").?;
-    try testing.expectEqual(@as(usize, 1), arr.len);
-
-    const resolver = result.table.getTable("resolver").?;
-    try testing.expectEqual(true, resolver.getBool("qname-minimization").?);
-    try testing.expectEqual(false, resolver.getBool("dnssec").?);
+    const server = t.get("server", .table).?;
+    try testing.expectEqual(4, server.get("workers", .integer).?);
+    try testing.expectEqual(1, server.get("listen", .string_array).?.len);
+    try testing.expectEqual(true, t.get("resolver", .table).?.get("qname-minimization", .boolean).?);
 }
 
-test "parse inline comment" {
-    var result = try parse(testing.allocator,
-        \\port = 53 # standard DNS port
-    );
-    defer result.deinit();
-    try testing.expectEqual(@as(i64, 53), result.table.getInteger("port").?);
-}
-
-test "parse comment with hash in string" {
-    var result = try parse(testing.allocator,
-        \\name = "hello#world"
-    );
-    defer result.deinit();
-    try testing.expectEqualStrings("hello#world", result.table.map.get("name").?.string);
-}
-
-test "error on duplicate key" {
-    const result = parse(testing.allocator,
-        \\key = "a"
-        \\key = "b"
-    );
-    try testing.expectError(error.DuplicateKey, result);
-}
-
-test "error on duplicate section" {
-    const result = parse(testing.allocator,
-        \\[server]
-        \\port = 53
-        \\[server]
-        \\port = 80
-    );
-    try testing.expectError(error.DuplicateSection, result);
-}
-
-test "error on unterminated string" {
-    const result = parse(testing.allocator,
-        \\name = "hello
-    );
-    try testing.expectError(error.UnterminatedString, result);
-}
-
-test "error on invalid bare key" {
-    const result = parse(testing.allocator,
-        \\bad key = "value"
-    );
-    try testing.expectError(error.InvalidBareKey, result);
-}
-
-test "error on missing value" {
-    const result = parse(testing.allocator,
-        \\key =
-    );
-    try testing.expectError(error.InvalidSyntax, result);
-}
-
-/// Every allocating branch in one document: section names, bare keys, quoted
-/// strings, and the two-stage array parse (element slice + each element).
-fn parseOomProbe(allocator: Allocator, input: []const u8) !void {
-    var result = try parse(allocator, input);
-    result.deinit();
-}
-
-test "parse handles OOM without leaking" {
-    const doc =
-        \\[server]
-        \\listen = [
-        \\  "127.0.0.1:8053",
-        \\  "[::1]:8053",
-        \\]
-        \\workers = 2
-        \\minimal-responses = true
-        \\
-        \\[resolver]
-        \\trust-anchors = ["20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
-        \\dnssec = true
-        \\
-        \\[cache]
-        \\size = 8388608
-    ;
-    // Refusing resize makes every growth an injectable alloc and the count deterministic.
-    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
-    try testing.checkAllAllocationFailures(backing.allocator(), parseOomProbe, .{doc});
+test "parse errors" {
+    try testing.expectError(error.InvalidSyntax, parseTest("zones = [\n  \"internal 192.0.2.1\""));
+    try testing.expectError(error.DuplicateKey, parseTest("key = \"a\"\nkey = \"b\""));
+    try testing.expectError(error.DuplicateSection, parseTest("[server]\nport = 53\n[server]\nport = 80"));
+    try testing.expectError(error.UnterminatedString, parseTest("name = \"hello"));
+    try testing.expectError(error.InvalidBareKey, parseTest("bad key = \"value\""));
+    try testing.expectError(error.InvalidBareKey, parseTest("[ ]"));
+    try testing.expectError(error.InvalidSyntax, parseTest("key ="));
 }

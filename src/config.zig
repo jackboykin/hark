@@ -313,7 +313,7 @@ const max_stagger_ms: u32 = 1000;
 /// a footgun — `user = <huge>` clamped to `(uid_t)-1`, setresuid's "leave
 /// unchanged" sentinel, so the drop silently did nothing and reported success.
 fn nonNegative(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
-    const v = table.getInteger(key) orelse return null;
+    const v = table.get(key, .integer) orelse return null;
     if (v < 0) {
         errLog("config: {s} must not be negative, got {d}", .{ key, v });
         return error.InvalidValue;
@@ -344,21 +344,22 @@ fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
 }
 
 pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
-    var parsed = try toml.parse(allocator, contents);
-    defer parsed.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const root = try toml.parse(scratch.allocator(), contents);
 
-    try validateSchema(parsed.table);
+    try validateSchema(root);
 
     var cfg = try defaultConfig(allocator);
     errdefer cfg.deinit();
 
-    if (parsed.table.getTable("server")) |server| {
-        if (server.getStringArray("listen")) |addrs| {
+    if (root.get("server", .table)) |server| {
+        if (server.get("listen", .string_array)) |addrs| {
             const new_listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
             allocator.free(cfg.listen);
             cfg.listen = new_listen;
         }
-        if (server.getInteger("max-udp-payload")) |m| {
+        if (server.get("max-udp-payload", .integer)) |m| {
             const dns_mod = @import("dns.zig");
             if (m < dns_mod.max_udp_payload or m > dns_mod.max_message_len) {
                 errLog("config: max-udp-payload must be {d}-{d}, got {d}", .{ dns_mod.max_udp_payload, dns_mod.max_message_len, m });
@@ -368,7 +369,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (try credential(server, "user")) |u| cfg.drop_uid = u;
         if (try credential(server, "group")) |g| cfg.drop_gid = g;
-        if (server.getStringArray("allow-from")) |entries| {
+        if (server.get("allow-from", .string_array)) |entries| {
             const new_allow = try parseCidrList(allocator, entries);
             allocator.free(cfg.allow_from);
             cfg.allow_from = new_allow;
@@ -389,11 +390,11 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             }
             cfg.tcp_queries_per_conn = v;
         }
-        if (server.getBool("minimal-responses")) |m| cfg.minimal_responses = m;
+        if (server.get("minimal-responses", .boolean)) |m| cfg.minimal_responses = m;
     }
 
-    if (parsed.table.getTable("resolver")) |resolver| {
-        if (resolver.getStringArray("root-hints")) |addrs| {
+    if (root.get("resolver", .table)) |resolver| {
+        if (resolver.get("root-hints", .string_array)) |addrs| {
             const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
             const max_hints = delegation.max_servers_per_level;
             if (new_hints.len > max_hints) {
@@ -404,7 +405,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.root_hints);
             cfg.root_hints = new_hints;
         }
-        if (resolver.getStringArray("stub-zones")) |entries| {
+        if (resolver.get("stub-zones", .string_array)) |entries| {
             const zones = try parseStubZones(allocator, entries);
             freeStubZones(allocator, cfg.stub_zones);
             cfg.stub_zones = zones;
@@ -412,24 +413,24 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         // Test-only knobs. Each is gated by `build_options.testing_enabled`
         // so a production binary refuses the key — adding a new one means
         // adding one block, not synchronizing two branches.
-        if (resolver.getInteger("upstream-port")) |p| {
+        if (resolver.get("upstream-port", .integer)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             if (p < 1 or p > 65535) return error.InvalidValue;
             cfg.upstream_port = @intCast(p);
         }
-        if (resolver.getBool("allow-loopback-upstreams")) |b| {
+        if (resolver.get("allow-loopback-upstreams", .boolean)) |b| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             cfg.allow_loopback_upstreams = b;
         }
-        if (resolver.getStringArray("trust-anchors")) |entries| {
+        if (resolver.get("trust-anchors", .string_array)) |entries| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             const new_anchors = try parseTrustAnchors(allocator, entries);
             allocator.free(cfg.trust_anchors);
             cfg.trust_anchors = new_anchors;
         }
-        if (resolver.getBool("dnssec")) |d| cfg.dnssec = d;
-        if (resolver.getBool("qname-minimization")) |q| cfg.qname_minimization = q;
-        if (resolver.getString("dns64-prefix")) |s| if (s.len > 0) {
+        if (resolver.get("dnssec", .boolean)) |d| cfg.dnssec = d;
+        if (resolver.get("qname-minimization", .boolean)) |q| cfg.qname_minimization = q;
+        if (resolver.get("dns64-prefix", .string)) |s| if (s.len > 0) {
             cfg.dns64 = dns64.Prefix.parse(s) orelse {
                 errLog("config: dns64-prefix '{s}' is not an IPv6 /32, /40, /48, /56, /64 or /96 (RFC 6052 §2.2)", .{s});
                 return error.InvalidValue;
@@ -454,7 +455,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
     }
 
-    if (parsed.table.getTable("cache")) |cache| {
+    if (root.get("cache", .table)) |cache| {
         if (try nonNegative(usize, cache, "size")) |v| {
             if (v == 0) {
                 errLog("config: cache size must not be 0", .{});
@@ -462,7 +463,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             }
             cfg.cache_size = v;
         }
-        if (cache.getBool("prefetch")) |p| cfg.prefetch = p;
+        if (cache.get("prefetch", .boolean)) |p| cfg.prefetch = p;
         if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
         if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
         if (try nonNegative(u32, cache, "servfail-ttl")) |v| {
@@ -475,13 +476,13 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
     }
 
-    if (parsed.table.getTable("logging")) |logging| {
-        if (logging.getBool("queries")) |q| cfg.log_queries = q;
+    if (root.get("logging", .table)) |logging| {
+        if (logging.get("queries", .boolean)) |q| cfg.log_queries = q;
     }
 
-    if (parsed.table.getTable("rebinding")) |reb| {
-        if (reb.getBool("enabled")) |b| cfg.rebinding.enabled = b;
-        if (reb.getStringArray("allow-zones")) |entries| {
+    if (root.get("rebinding", .table)) |reb| {
+        if (reb.get("enabled", .boolean)) |b| cfg.rebinding.enabled = b;
+        if (reb.get("allow-zones", .string_array)) |entries| {
             const new_zones = try parseZoneList(allocator, entries);
             for (cfg.rebinding.allow_zones) |zone| {
                 for (zone.labels) |label| allocator.free(label);
@@ -490,12 +491,12 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
             allocator.free(cfg.rebinding.allow_zones);
             cfg.rebinding.allow_zones = new_zones;
         }
-        if (reb.getStringArray("extra-block")) |entries| {
+        if (reb.get("extra-block", .string_array)) |entries| {
             const new_block = try parseCidrList(allocator, entries);
             allocator.free(cfg.rebinding.extra_block);
             cfg.rebinding.extra_block = new_block;
         }
-        if (reb.getStringArray("extra-allow")) |entries| {
+        if (reb.get("extra-allow", .string_array)) |entries| {
             const new_allow = try parseCidrList(allocator, entries);
             allocator.free(cfg.rebinding.extra_allow);
             cfg.rebinding.extra_allow = new_allow;
