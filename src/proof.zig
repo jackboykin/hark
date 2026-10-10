@@ -144,15 +144,11 @@ fn cmpLabelsCI(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(a.len, b.len);
 }
 
-/// Check if `target` falls in the open range (low, high) with wrap-around.
-/// Works for both NSEC canonical name ordering and NSEC3 hash ordering.
-fn inOpenRangeWrap(low: std.math.Order, target_vs_high: std.math.Order, low_vs_high: std.math.Order) bool {
-    // low = cmp(low, target), so .lt means low < target
-    if (low == .lt and target_vs_high == .lt) return true;
-    if (low_vs_high == .gt or low_vs_high == .eq) {
-        if (low == .lt or target_vs_high == .lt) return true;
-    }
-    return false;
+/// Whether x falls in the open range (lo, hi), which past the end of the
+/// chain (lo ≥ hi) wraps around to its start. Name order for NSEC, hash
+/// order for NSEC3.
+fn inOpenRangeWrap(lo_vs_x: std.math.Order, x_vs_hi: std.math.Order, lo_vs_hi: std.math.Order) bool {
+    return if (lo_vs_hi == .lt) lo_vs_x == .lt and x_vs_hi == .lt else lo_vs_x == .lt or x_vs_hi == .lt;
 }
 
 /// RFC 6840 §4.1: an "ancestor delegation" NSEC/NSEC3 — NS bit set, SOA bit
