@@ -551,7 +551,7 @@ pub const Graph = struct {
     /// Questions settled since the server last looked: its cue, not a fact.
     answered: std.ArrayList(CellId) = .empty,
     /// Per-server estimate, capped.
-    rtt: std.HashMapUnmanaged(na.AddressKey, ns_rtt.RttState, na.AddressKey.HashCtx, 80) = .empty,
+    rtt: *ns_rtt.Table,
     tally: Tally = .{},
     /// Under test, the keys of the cells run, in order, folded: the replay
     /// holds one seed to one schedule.
@@ -563,7 +563,11 @@ pub const Graph = struct {
     store: store.Store,
 
     pub fn init(gpa: Allocator, cfg: Config, edge: Edge) !Graph {
-        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .store = try store.Store.init(gpa, cfg.store_bytes) };
+        const rtt = try ns_rtt.Table.create(gpa);
+        var g: Graph = .{ .gpa = gpa, .work = .{ .child = gpa }, .cfg = cfg, .edge = edge, .scratch = .init(gpa), .rtt = rtt, .store = store.Store.init(gpa, cfg.store_bytes) catch |err| {
+            gpa.destroy(rtt);
+            return err;
+        } };
         errdefer g.deinit();
         g.store.on_evict = evicted;
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
@@ -595,7 +599,7 @@ pub const Graph = struct {
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
         g.answered.deinit(g.gpa);
-        g.rtt.deinit(g.gpa);
+        g.gpa.destroy(g.rtt);
         for (g.failed.keys()) |k| g.gpa.free(k.name);
         g.failed.deinit(g.gpa);
         g.denial.deinit(g.gpa, &g.store);
@@ -823,10 +827,10 @@ pub const Graph = struct {
         }
         // A timeout the root's deadline cut short says nothing about the server.
         switch (outcome) {
-            .reply => |r| try g.observe(sc.server, r.rtt_ns),
+            .reply => |r| g.observe(sc.server, r.rtt_ns),
             .timeout => {
                 g.stats.resolver.faults.timeout += 1;
-                if (!sc.cut_short) try g.observeTimeout(sc.server);
+                if (!sc.cut_short) g.observeTimeout(sc.server);
             },
             .unsent => g.stats.resolver.faults.unsent += 1,
             else => {},
@@ -1547,25 +1551,12 @@ pub const Graph = struct {
         }
     }
 
-    pub fn observe(g: *Graph, server: na.Address, rtt_ns: i64) !void {
-        (try g.estimate(server)).observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
+    pub fn observe(g: *Graph, server: na.Address, rtt_ns: i64) void {
+        g.rtt.write(.fromAddress(server), g.nowMs()).observe(@divTrunc(rtt_ns, std.time.ns_per_us), g.nowMs());
     }
 
-    pub fn observeTimeout(g: *Graph, server: na.Address) !void {
-        (try g.estimate(server)).observeTimeout(g.nowMs());
-    }
-
-    /// Past `ns_rtt.max_entries` servers, an arbitrary other one is forgotten.
-    fn estimate(g: *Graph, server: na.Address) !*ns_rtt.RttState {
-        const key = na.AddressKey.fromAddress(server);
-        if (g.rtt.getPtr(key)) |s| return s;
-        if (g.rtt.count() >= ns_rtt.max_entries) {
-            var it = g.rtt.keyIterator();
-            g.rtt.removeByPtr(it.next().?);
-        }
-        const gop = try g.rtt.getOrPut(g.gpa, key);
-        gop.value_ptr.* = .unknown;
-        return gop.value_ptr;
+    pub fn observeTimeout(g: *Graph, server: na.Address) void {
+        g.rtt.write(.fromAddress(server), g.nowMs()).observeTimeout(g.nowMs());
     }
 
     fn nowMs(g: *const Graph) i64 {
@@ -1577,7 +1568,8 @@ pub const Graph = struct {
             const event = ch.named(.dead, std.hash.Wyhash.hash(0, &server.addr) ^ server.port);
             if ((ch.choose(.dead, event, 4, .{ .server = server }) catch 0) == 1) return ns_rtt.dead_band;
         }
-        return (g.rtt.get(server) orelse ns_rtt.RttState.unknown).band(g.nowMs());
+        const s = g.rtt.get(server) orelse return ns_rtt.RttState.unknown.band(g.nowMs());
+        return s.band(g.nowMs());
     }
 
     pub fn isDead(g: *Graph, server: na.AddressKey) bool {
@@ -1617,7 +1609,7 @@ pub const Graph = struct {
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);
-        const est = g.rtt.getPtr(server);
+        const est = g.rtt.get(server);
         const state = if (est) |s| s.* else ns_rtt.RttState.unknown;
         const patience: i64 = 1 + @as(i64, @intCast(try g.decide(.rto, g.cell(by).key, 4)));
         // Silent past the capped wait is silent, however long this send waits.

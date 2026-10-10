@@ -1060,8 +1060,8 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     defer s.deinit();
     var g = try graph.Graph.init(testing.allocator, .{ .root_hints = scenario.root_hints, .addr_policy = .{ .allow_loopback = true }, .stagger_ms = stagger_ms }, s.edge());
     defer g.deinit();
-    if (planted.ns1) |e| try g.rtt.put(testing.allocator, ns1, e);
-    if (planted.ns2) |e| try g.rtt.put(testing.allocator, ns2, e);
+    if (planted.ns1) |e| g.rtt.write(ns1, 0).* = e;
+    if (planted.ns2) |e| g.rtt.write(ns2, 0).* = e;
     const start = s.now_ns;
     const horizon = start + 10 * std.time.ns_per_s;
     var ns1_ms: ?i64 = null;
@@ -1085,7 +1085,7 @@ fn walk(arena: Allocator, text: []const u8, seed: u64, stagger_ms: u32, planted:
     const took_ms = @divTrunc(s.now_ns - start, std.time.ns_per_ms);
     while (s.next(horizon)) |ev| try g.complete(ev.id, ev.completion);
     try testing.expectEqual(0, g.live);
-    return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns3_ms = ns3_ms, .ns1 = g.rtt.get(ns1), .ns2 = g.rtt.get(ns2) };
+    return .{ .took_ms = took_ms, .ns1_ms = ns1_ms, .ns2_ms = ns2_ms, .ns3_ms = ns3_ms, .ns1 = if (g.rtt.get(ns1)) |e| e.* else null, .ns2 = if (g.rtt.get(ns2)) |e| e.* else null };
 }
 
 /// srtt 1.5 s: a 3 s estimate, past the 2 s cap.

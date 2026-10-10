@@ -1,5 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const AddressKey = @import("net_address.zig").AddressKey;
 
 const initial_timeout_ms: u32 = 400;
 
@@ -142,6 +144,89 @@ pub const RttState = struct {
         return dead_duration_ms << shift;
     }
 };
+
+/// Every server's estimate, in a table sized once: `ways` slots a set, the
+/// set the address's seeded hash picks. A newcomer takes an empty slot in
+/// its set, else the one written longest ago, so a flood of glue addresses
+/// displaces its own estimates before those in use, and nothing allocates
+/// or leaves a tombstone after init.
+pub const Table = struct {
+    /// A slot's hash, high bit set; zero is empty.
+    tags: [slots]u32,
+    keys: [slots]AddressKey,
+    written_ms: [slots]i64,
+    states: [slots]RttState,
+
+    const ways = 8;
+    const slots = max_entries;
+    const sets = slots / ways;
+
+    /// Only the tags are written, so a slot's page stays untouched until
+    /// a server lands in it.
+    pub fn create(gpa: Allocator) !*Table {
+        const t = try gpa.create(Table);
+        t.tags = @splat(0);
+        return t;
+    }
+
+    fn slot(key: AddressKey) struct { set: usize, tag: u32 } {
+        const h = AddressKey.HashCtx.hash(.{}, key);
+        return .{ .set = @as(usize, @intCast(h % sets)) * ways, .tag = @as(u32, @truncate(h >> 32)) | 1 << 31 };
+    }
+
+    fn find(t: *const Table, set: usize, tag: u32, key: AddressKey) ?usize {
+        for (set..set + ways) |i| if (t.tags[i] == tag and t.keys[i].eql(key)) return i;
+        return null;
+    }
+
+    pub fn get(t: *Table, key: AddressKey) ?*RttState {
+        const at = slot(key);
+        return &t.states[t.find(at.set, at.tag, key) orelse return null];
+    }
+
+    /// The estimate to write for `key`, made unknown if it had none.
+    pub fn write(t: *Table, key: AddressKey, now_ms: i64) *RttState {
+        const at = slot(key);
+        const i = t.find(at.set, at.tag, key) orelse claim: {
+            var oldest = at.set;
+            for (at.set..at.set + ways) |i| {
+                if (t.tags[i] == 0) break :claim t.claim(i, at.tag, key);
+                if (t.written_ms[i] < t.written_ms[oldest]) oldest = i;
+            }
+            break :claim t.claim(oldest, at.tag, key);
+        };
+        t.written_ms[i] = now_ms;
+        return &t.states[i];
+    }
+
+    fn claim(t: *Table, i: usize, tag: u32, key: AddressKey) usize {
+        t.tags[i] = tag;
+        t.keys[i] = key;
+        t.states[i] = .unknown;
+        return i;
+    }
+};
+
+test "a newcomer to a full set takes the slot written longest ago" {
+    const na = @import("net_address.zig");
+    const t = try Table.create(testing.allocator);
+    defer testing.allocator.destroy(t);
+    var same: [Table.ways + 1]AddressKey = undefined;
+    const set = Table.slot(.fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, 0))).set;
+    var n: usize = 0;
+    var port: u16 = 1;
+    while (n < same.len) : (port += 1) {
+        const k: AddressKey = .fromAddress(na.initIp4(.{ 192, 0, 2, 1 }, port));
+        if (Table.slot(k).set != set) continue;
+        same[n] = k;
+        n += 1;
+    }
+    for (same[0..Table.ways], 0..) |k, i| t.write(k, @intCast(i)).observe(1000, 0);
+    _ = t.write(same[0], Table.ways);
+    try testing.expectEqual(RttState.unknown, t.write(same[Table.ways], Table.ways + 1).*);
+    try testing.expectEqual(null, t.get(same[1]));
+    for (same[0..Table.ways], 0..) |k, i| if (i != 1) try testing.expectEqual(1000, t.get(k).?.srtt_us);
+}
 
 test "a reply ranks above no history, and no history above silence" {
     var slow: RttState = .unknown;
