@@ -10,14 +10,16 @@ const rrsig = @import("rrsig.zig");
 
 const Sha1 = std.crypto.hash.Sha1;
 
+/// What a section of signed records proves.
 pub const SecurityStatus = enum {
-    /// Not yet checked (DNSSEC disabled or initial state)
+    /// Nothing: the proof is incomplete, or speaks from the wrong side of a cut.
     unchecked,
-    /// Fully validated chain from root trust anchor
     secure,
-    /// Provably unsigned (no DS from signed parent) — valid, not an error
+    /// Proven only through an Opt-Out span, which may hide unsigned
+    /// delegations, so never AD (RFC 5155 §9.2).
     insecure,
-    /// Validation failed — MUST return ServFail
+    /// Contradicted by what was signed, or refused unread: a mixed or
+    /// flooded section, a spent budget.
     bogus,
 };
 
@@ -84,9 +86,7 @@ pub fn classifyDelegation(
     return if (nsec3Cover(authorities, zone, &ce.next_closer_hash) == true) .unsigned else .unproven;
 }
 
-/// Compare two DNS names in canonical ordering (RFC 4034 §6.1).
-/// Labels are compared case-insensitively from rightmost to leftmost.
-/// Returns .lt, .eq, or .gt.
+/// RFC 4034 §6.1: labels compared case-insensitively, rightmost first.
 pub fn canonicalNameOrder(a: dns.Name, b: dns.Name) std.math.Order {
     const min_labels = @min(a.labels.len, b.labels.len);
     for (0..min_labels) |i| {
@@ -360,8 +360,6 @@ fn sha1Blocks(message_len: usize) u32 {
     return @intCast((message_len + 8) / 64 + 1);
 }
 
-/// Check if a response mixes NSEC and NSEC3.
-/// Returns true if mixed (should reject the proof).
 fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
     var has_nsec = false;
     var has_nsec3 = false;
@@ -651,8 +649,6 @@ fn validateNsec3NegativeProof(
         .verdict => |v| return v,
     };
 
-    // hash(qname) is needed by both the NODATA direct-match check and the CE
-    // walk's label_offset==0 iteration; compute once.
     const qname_hash = budgetedNsec3Hash(qname, salt, iterations, budget) catch return .bogus;
 
     // Direct NODATA at hash(qname) (RFC 5155 §8.5). Bitmap contradicting
@@ -664,10 +660,7 @@ fn validateNsec3NegativeProof(
                 const nsec3 = rr.rdata.nsec3;
                 // Same side-of-cut rule as the NSEC arm (RFC 6840 §4.1/§4.4).
                 if (wrongSideOfCut(nsec3.type_bit_maps, qname, qtype)) return .unchecked;
-                if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) {
-                    return .bogus;
-                }
-                return .secure;
+                return if (bitmapContradictsNodata(nsec3.type_bit_maps, qtype)) .bogus else .secure;
             }
         }
         // No owner-match: fall through to CE proof. Handles wildcard-NODATA
@@ -746,9 +739,8 @@ fn validateNsec3NegativeProof(
     return .unchecked;
 }
 
-/// Zone argument for tests that exercise pure range geometry: root makes the
-/// qname/owner binding vacuous, so those tests keep testing exactly what they
-/// tested before it existed.
+/// Zone argument for tests of pure range geometry: under the root, every
+/// name is in the signer's zone.
 const test_root = dns.Name{ .labels = &.{} };
 pub const test_com = dns.Name{ .labels = &.{"com"} };
 
@@ -845,7 +837,7 @@ test "classifyDelegation rejects invalid NSEC proofs (RFC 6840 §4.4)" {
         .labels = &.{ @as([]const u8, "next"), @as([]const u8, "com") },
     };
 
-    // Both must return .secure — forces validation, unsigned child will SERVFAIL
+    // Neither is the parent's side of a cut, so neither proves it unsigned.
     const cases = [_][]const u8{
         &[_]u8{ 0x00, 0x01, 0x22 }, // NS + SOA (child-zone apex, not parent delegation)
         &[_]u8{ 0x00, 0x01, 0x40 }, // A only (no NS — not a delegation point)
@@ -1159,8 +1151,6 @@ test "validateNegativeProof NSEC NXDOMAIN deep CE rejects wrong-level wildcard" 
 test "validateNegativeProof NSEC NXDOMAIN deep qname still needs wildcard denial" {
     // qname = a.b.c.example.com, single NSEC covering it. CE derives to
     // example.com, so the proof needs *.example.com denied — absent here.
-    // Guards the incompleteness bar after the CE-equality check was removed:
-    // a lone covering NSEC must never validate NXDOMAIN as secure.
     const aaa = dns.Name{ .labels = &.{ "aaa", "example", "com" } };
     const zzz = dns.Name{ .labels = &.{ "zzz", "example", "com" } };
     const qname = dns.Name{ .labels = &.{ "a", "b", "c", "example", "com" } };
