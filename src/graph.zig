@@ -870,7 +870,11 @@ pub const Graph = struct {
         var own_key = key;
         own_key.name = try arena.allocator().dupe(u8, key.name);
         const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
-        if (reused == null) try g.cells.append(g.gpa, c);
+        if (reused == null) {
+            // Room for every slot to come free, so `free` cannot fail.
+            try g.free_ids.ensureTotalCapacity(g.gpa, g.cells.items.len + 1);
+            try g.cells.append(g.gpa, c);
+        }
         errdefer if (reused == null) {
             _ = g.cells.pop();
         };
@@ -935,7 +939,7 @@ pub const Graph = struct {
             c.orphan = true;
             for (c.inputs.items) |i| g.release(i);
         }
-        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled() or !c.inFlight(g))) g.free(id, c) catch {};
+        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled() or !c.inFlight(g))) g.free(id);
     }
 
     fn adopt(g: *Graph, id: CellId) void {
@@ -945,7 +949,8 @@ pub const Graph = struct {
         for (c.inputs.items) |i| g.adopt(i);
     }
 
-    fn free(g: *Graph, id: CellId, c: *Cell) !void {
+    fn free(g: *Graph, id: CellId) void {
+        const c = g.cell(id);
         std.debug.assert(c.live);
         c.live = false;
         g.live -= 1;
@@ -962,7 +967,7 @@ pub const Graph = struct {
         c.arena.deinit();
         c.arena = .init(g.work.allocator());
         c.scratch = .none;
-        try g.free_ids.append(g.gpa, id);
+        g.free_ids.appendAssumeCapacity(id);
     }
 
     /// Copies out: the value becomes the blob's parse, the blob the store's
@@ -1245,7 +1250,7 @@ pub const Graph = struct {
         const id = try g.newCell(key, name);
         const c = g.cell(id);
         c.state = .{ .fact = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
-            g.free(id, c) catch {};
+            g.free(id);
             return err;
         } };
         c.blob = e.blob.ref();
