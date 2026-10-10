@@ -477,10 +477,7 @@ pub const Scratch = union(enum) {
 pub const Cell = struct {
     key: Key,
     name: dns.Name,
-    live: bool = true,
     orphan: bool = false,
-    /// Bumped each time the slot is reused.
-    gen: u32 = 0,
     /// The cycle check that last walked through here.
     seen: u64 = 0,
     state: State = .pending,
@@ -495,7 +492,6 @@ pub const Cell = struct {
     arena: Arena,
 
     comptime {
-        // Scratch is a pointer: the slot bound is not the largest kind's.
         std.debug.assert(@sizeOf(Cell) <= 384);
     }
 
@@ -518,6 +514,13 @@ pub const Cell = struct {
     }
 };
 
+const Slot = struct {
+    cell: ?*Cell = null,
+    /// Bumped at each free, so a held id can tell its cell from the slot's next.
+    gen: u32 = 0,
+    next: OptionalCellId = .none,
+};
+
 // ── Graph ──────────────────────────────────────────────────────────────
 
 pub const Graph = struct {
@@ -527,9 +530,9 @@ pub const Graph = struct {
     edge: Edge,
     /// One run's transients, reset at every run.
     scratch: Arena,
-    /// Rule-held pointers survive appends; a freed slot is reused.
-    cells: std.ArrayList(*Cell) = .empty,
-    free_ids: std.ArrayList(CellId) = .empty,
+    /// Rule-held pointers survive appends.
+    cells: std.ArrayList(Slot) = .empty,
+    empty: OptionalCellId = .none,
     checks: u64 = 0,
     live: u32 = 0,
     budgets: u32 = 0,
@@ -583,18 +586,15 @@ pub const Graph = struct {
 
     pub fn deinit(g: *Graph) void {
         // Not `free`: in slot order a cell would unpin from inputs gone first.
-        for (g.cells.items) |c| {
-            if (c.live) {
-                c.inputs.deinit(g.gpa);
-                c.waiters.deinit(g.gpa);
-                if (c.blob) |bl| g.store.unref(bl);
-                if (budgetOf(c)) |b| g.unref(b);
-                c.arena.deinit();
-            }
+        for (g.cells.items) |s| if (s.cell) |c| {
+            c.inputs.deinit(g.gpa);
+            c.waiters.deinit(g.gpa);
+            if (c.blob) |bl| g.store.unref(bl);
+            if (budgetOf(c)) |b| g.unref(b);
+            c.arena.deinit();
             g.gpa.destroy(c);
-        }
+        };
         g.cells.deinit(g.gpa);
-        g.free_ids.deinit(g.gpa);
         g.scratch.deinit();
         g.index.deinit(g.gpa);
         g.ready.deinit(g.gpa);
@@ -617,7 +617,15 @@ pub const Graph = struct {
     }
 
     pub fn cell(g: *Graph, id: CellId) *Cell {
-        return g.cells.items[id];
+        return g.cells.items[id].cell.?;
+    }
+
+    pub fn alive(g: *Graph, id: CellId) ?*Cell {
+        return g.cells.items[id].cell;
+    }
+
+    pub fn gen(g: *const Graph, id: CellId) u32 {
+        return g.cells.items[id].gen;
     }
 
     /// What a client may start: `join`, only what is settled or in
@@ -702,8 +710,8 @@ pub const Graph = struct {
         const n = g.ready.items.len;
         if (n == 0) return null;
         for (g.ready.items, 0..) |id, i| {
-            const c = g.cell(id);
-            if (!c.live or c.settled()) return g.ready.orderedRemove(i);
+            const c = g.alive(id) orelse return g.ready.orderedRemove(i);
+            if (c.settled()) return g.ready.orderedRemove(i);
         }
         var pick = n - 1;
         if (n > 1) {
@@ -767,12 +775,13 @@ pub const Graph = struct {
     }
 
     pub fn wake(g: *Graph, id: CellId, at_ns: i64) !void {
-        return g.edge.wake(id, g.cell(id).gen, at_ns);
+        std.debug.assert(g.alive(id) != null);
+        return g.edge.wake(id, g.gen(id), at_ns);
     }
 
     pub fn complete(g: *Graph, id: CellId, completion: Completion) !void {
         if (completion == .wake) {
-            if (g.cell(id).gen == completion.wake) {
+            if (g.gen(id) == completion.wake) {
                 // A refresh's budget runs from its first wake.
                 const c = g.cell(id);
                 if (c.key.kind == .refresh and c.scratch.answer.budget.deadline_ns == 0) c.scratch.answer.budget.deadline_ns = g.now() + @as(i64, g.cfg.resolve_ms) * std.time.ns_per_ms;
@@ -781,7 +790,7 @@ pub const Graph = struct {
             return g.drain();
         }
         const c = g.cell(id);
-        std.debug.assert(c.live and c.key.kind == .exchange);
+        std.debug.assert(c.key.kind == .exchange);
         const sc = c.scratch.exchange;
         const arena = c.arena.allocator();
         const outcome: Outcome = switch (completion) {
@@ -862,25 +871,19 @@ pub const Graph = struct {
 
     /// All or nothing.
     pub fn newCell(g: *Graph, key: Key, name: dns.Name) !CellId {
-        const reused = g.free_ids.pop();
-        errdefer if (reused) |r| g.free_ids.appendAssumeCapacity(r);
-        const id: CellId = reused orelse @intCast(g.cells.items.len);
-        const c = if (reused != null) g.cells.items[id] else try g.gpa.create(Cell);
-        errdefer if (reused == null) g.gpa.destroy(c);
+        if (g.empty == .none) {
+            try g.cells.append(g.gpa, .{});
+            g.empty = .wrap(@intCast(g.cells.items.len - 1));
+        }
+        const id = g.empty.unwrap().?;
+        const c = try g.gpa.create(Cell);
+        errdefer g.gpa.destroy(c);
         var arena: Arena = .init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
         var own_key = key;
         own_key.name = try arena.allocator().dupe(u8, key.name);
         const own_name = try dns.cloneNameFlat(arena.allocator(), name, false);
-        if (reused == null) {
-            // Room for every slot to come free, so `free` cannot fail.
-            try g.free_ids.ensureTotalCapacity(g.gpa, g.cells.items.len + 1);
-            try g.cells.append(g.gpa, c);
-        }
-        errdefer if (reused == null) {
-            _ = g.cells.pop();
-        };
         if (key.kind != .exchange) {
             // In progress keeps the slot. A settled owner yields it, key too:
             // its arena dies with it.
@@ -891,8 +894,10 @@ pub const Graph = struct {
             }
         }
         // Nothing fallible past here: the errdefers assume `c` unbuilt.
+        const s = &g.cells.items[id];
+        g.empty = s.next;
+        s.cell = c;
         c.* = .{
-            .gen = if (reused != null) c.gen +% 1 else 0,
             .key = own_key,
             .name = own_name,
             .arena = arena,
@@ -937,7 +942,7 @@ pub const Graph = struct {
     /// Nothing live pins it: an orphan, and so is everything it waits on.
     fn release(g: *Graph, id: CellId) void {
         const c = g.cell(id);
-        if (!c.live or g.pins(id) > 0) return;
+        if (g.pins(id) > 0) return;
         if (!c.orphan) {
             c.orphan = true;
             for (c.inputs.items) |i| g.release(i);
@@ -954,8 +959,9 @@ pub const Graph = struct {
 
     fn free(g: *Graph, id: CellId) void {
         const c = g.cell(id);
-        std.debug.assert(c.live);
-        c.live = false;
+        const s = &g.cells.items[id];
+        s.* = .{ .gen = s.gen +% 1, .next = g.empty };
+        g.empty = .wrap(id);
         g.live -= 1;
         for (c.inputs.items) |i| g.unpin(i, id);
         c.inputs.deinit(g.gpa);
@@ -968,9 +974,7 @@ pub const Graph = struct {
             g.unref(b);
         }
         c.arena.deinit();
-        c.arena = .init(g.work.allocator());
-        c.scratch = .none;
-        g.free_ids.appendAssumeCapacity(id);
+        g.gpa.destroy(c);
     }
 
     /// Copies out: the value becomes the blob's parse, the blob the store's
@@ -1514,8 +1518,8 @@ pub const Graph = struct {
     /// Held for the run: what it publishes may settle and free its own
     /// readers while the rule still has the cell in hand.
     fn run(g: *Graph, id: CellId) !void {
-        const c = g.cell(id);
-        if (!c.live or c.settled()) return;
+        const c = g.alive(id) orelse return;
+        if (c.settled()) return;
         c.holds += 1;
         defer {
             c.holds -= 1;
@@ -1532,7 +1536,7 @@ pub const Graph = struct {
         defer clock.stop();
         // Ended waiting and created nothing: the model's own cost.
         const created_before = g.created;
-        defer if (g.cell(id).live and !g.cell(id).settled() and g.created == created_before) {
+        defer if (!c.settled() and g.created == created_before) {
             g.tally.reruns += 1;
             if (Tally.timed) g.tally.rerun_ns += @intCast(monotonic.nowNs() - clock.t0);
         };
@@ -1660,7 +1664,7 @@ test "a cell replacing an expired one takes over the index entry's key" {
     const second = try g.demandRoot(name, .a, .new);
     try testing.expect(first != second);
     g.unhold(first);
-    try testing.expect(!g.cell(first).live);
+    try testing.expect(g.alive(first) == null);
     // The entry's key must be the survivor's.
     const key = Key.of(&kb, .answer, name, .a);
     try testing.expectEqual(second, g.index.get(key).?);

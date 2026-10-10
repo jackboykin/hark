@@ -464,7 +464,9 @@ const Server = struct {
 
     fn settle(s: *Server) !void {
         while (s.g.answered.pop()) |id| {
-            if (id >= s.heads.items.len or !s.g.cell(id).settled()) continue;
+            if (id >= s.heads.items.len) continue;
+            const c = s.g.alive(id) orelse continue;
+            if (!c.settled()) continue;
             var i = s.heads.items[id];
             s.heads.items[id] = Pending.none;
             while (i != Pending.none) {
