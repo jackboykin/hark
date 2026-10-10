@@ -107,7 +107,7 @@ fn wakeErased(ctx: *anyopaque, id: CellId, gen: u32, at_ns: i64) anyerror!void {
 
 /// Time is read once per event: rules see one instant.
 fn tick(e: *Edge) void {
-    e.now_ns = @intCast(monotonic.nowNs());
+    e.now_ns = monotonic.nowNs();
     e.wall_sec = monotonic.wallclockSec();
 }
 

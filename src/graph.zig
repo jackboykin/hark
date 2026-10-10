@@ -418,7 +418,7 @@ pub const Tally = struct {
     pub const timed = builtin.is_test;
 
     pub const Clock = struct {
-        t0: i128,
+        t0: i64,
         into: *u64,
         pub fn stop(c: Clock) void {
             if (timed) c.into.* += @intCast(monotonic.nowNs() - c.t0);

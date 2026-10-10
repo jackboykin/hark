@@ -17,10 +17,10 @@ pub fn advanceTestClock(secs: i64) void {
     if (build_options.testing_enabled) test_offset_secs += secs;
 }
 
-pub fn nowNs() i128 {
+pub fn nowNs() i64 {
     var ts: std.posix.timespec = undefined;
     if (linux.errno(linux.clock_gettime(.BOOTTIME, &ts)) != .SUCCESS) return 0;
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec + @as(i128, testOffsetSec()) * std.time.ns_per_s;
+    return (ts.sec + testOffsetSec()) * std.time.ns_per_s + ts.nsec;
 }
 
 pub fn wallclockSec() i64 {
