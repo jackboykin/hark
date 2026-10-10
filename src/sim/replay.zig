@@ -824,27 +824,11 @@ test "trace one scenario" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // procfs reports size 0, so stream it.
-    const f = try std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{});
-    defer f.close(io);
-    var env_buf: [1 << 16]u8 = undefined;
-    var n: usize = 0;
-    while (true) {
-        n += f.readStreaming(io, &.{env_buf[n..]}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-    }
-    var path: ?[]const u8 = null;
-    var seed: u64 = 1;
-    var chaotic = false;
-    var vars = mem.splitScalar(u8, env_buf[0..n], 0);
-    while (vars.next()) |v| {
-        if (mem.startsWith(u8, v, "HARK_SCENARIO=")) path = v["HARK_SCENARIO=".len..];
-        if (mem.startsWith(u8, v, "HARK_SEED=")) seed = try std.fmt.parseInt(u64, v["HARK_SEED=".len..], 10);
-        if (mem.eql(u8, v, "HARK_CHAOS=1")) chaotic = true;
-    }
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path orelse return error.SkipZigTest, arena, .limited(1 << 20));
+    const env = testing.environ;
+    const path = env.getPosix("HARK_SCENARIO") orelse return error.SkipZigTest;
+    const seed = if (env.getPosix("HARK_SEED")) |v| try std.fmt.parseInt(u64, v, 10) else 1;
+    const chaotic = env.getPosix("HARK_CHAOS") != null;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
     var diag: rpl.Diag = .{};
     const scenario = try rpl.parse(arena, text, &diag);
     var report: Report = .{};
