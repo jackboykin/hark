@@ -1194,34 +1194,37 @@ test "a server that has only been silent holds back no other, one never timed do
     try testing.expect(both_seen);
 }
 
+/// The root answers every query with www.example.com's address.
+const one_hop_rpl =
+    \\; hark: root-hints = 127.0.10.1
+    \\SCENARIO_BEGIN one hop
+    \\RANGE_BEGIN 0 100
+    \\  ADDRESS 127.0.10.1
+    \\  ENTRY_BEGIN
+    \\    MATCH opcode
+    \\    ADJUST copy_id copy_query
+    \\    REPLY QR AA NOERROR
+    \\    SECTION QUESTION
+    \\      www.example.com. IN A
+    \\    SECTION ANSWER
+    \\      www.example.com. 60 IN A 10.20.30.40
+    \\  ENTRY_END
+    \\RANGE_END
+    \\STEP 1 QUERY
+    \\ENTRY_BEGIN
+    \\  REPLY RD
+    \\  SECTION QUESTION
+    \\    www.example.com. IN A
+    \\ENTRY_END
+    \\SCENARIO_END
+;
+
 test "the door counts exchanges in flight" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var diag: rpl.Diag = .{};
-    const scenario = try rpl.parse(arena,
-        \\; hark: root-hints = 127.0.10.1
-        \\SCENARIO_BEGIN admission
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.1
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR AA NOERROR
-        \\    SECTION QUESTION
-        \\      www.example.com. IN A
-        \\    SECTION ANSWER
-        \\      www.example.com. 60 IN A 10.20.30.40
-        \\  ENTRY_END
-        \\RANGE_END
-        \\STEP 1 QUERY
-        \\ENTRY_BEGIN
-        \\  REPLY RD
-        \\  SECTION QUESTION
-        \\    www.example.com. IN A
-        \\ENTRY_END
-        \\SCENARIO_END
-    , &diag);
+    const scenario = try rpl.parse(arena, one_hop_rpl, &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     const other = try dns.parseDottedName(arena, "other.example.com.");
     var mint = try sign.Mint.init(arena, &scenario);
@@ -1249,29 +1252,7 @@ test "an exchange that never left the host writes no estimate" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var diag: rpl.Diag = .{};
-    const scenario = try rpl.parse(arena,
-        \\; hark: root-hints = 127.0.10.1
-        \\SCENARIO_BEGIN unsent
-        \\RANGE_BEGIN 0 100
-        \\  ADDRESS 127.0.10.1
-        \\  ENTRY_BEGIN
-        \\    MATCH opcode
-        \\    ADJUST copy_id copy_query
-        \\    REPLY QR AA NOERROR
-        \\    SECTION QUESTION
-        \\      www.example.com. IN A
-        \\    SECTION ANSWER
-        \\      www.example.com. 60 IN A 10.20.30.40
-        \\  ENTRY_END
-        \\RANGE_END
-        \\STEP 1 QUERY
-        \\ENTRY_BEGIN
-        \\  REPLY RD
-        \\  SECTION QUESTION
-        \\    www.example.com. IN A
-        \\ENTRY_END
-        \\SCENARIO_END
-    , &diag);
+    const scenario = try rpl.parse(arena, one_hop_rpl, &diag);
     const q = scenario.steps[0].entry.?.questions[0];
     var mint = try sign.Mint.init(arena, &scenario);
     var s = try sim.Sim.init(arena, testing.allocator, &scenario, &mint, 1);
