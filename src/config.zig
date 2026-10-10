@@ -9,6 +9,7 @@ const acl = @import("acl.zig");
 const dns = @import("dns.zig");
 const rebinding = @import("rebinding.zig");
 const dns64 = @import("dns64.zig");
+const dnssec = @import("dnssec.zig");
 const delegation = @import("delegation.zig");
 const special_use = @import("special_use.zig");
 const stub = @import("stub.zig");
@@ -54,96 +55,51 @@ const root_hints_default: [26]Address = .{
     net_addr.initIp6(.{ 0x20, 0x01, 0x0d, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35 }, 53, 0, 0), // m
 };
 
+/// Each default is the value `hark.toml.example` shows.
 pub const ServerConfig = struct {
-    listen: []Address,
-    /// Override IANA root hints. Empty means "use the compile-time
-    /// defaults from root_hints_default". Tests redirect at
-    /// scripted authoritatives via this; operators in split-horizon
-    /// deployments point at private roots. Applied at boot — hark does
-    /// not hot-reload config, and the cache starts empty on restart, so
-    /// no invalidation path is needed when this value changes.
-    root_hints: []Address,
-    /// Default port for glue-extracted upstreams. Production is always 53;
-    /// the field exists so tests can point at non-privileged scripted
-    /// authoritatives. Parsing of `[resolver] upstream-port` is gated behind
-    /// `-Dtesting=true`; production binaries reject the key.
-    upstream_port: u16,
-    /// Bypass the 127/8 rebinding-defense check on upstream addresses.
-    /// Tests only. Parsing of `[resolver] allow-loopback-upstreams` is gated
-    /// behind `-Dtesting=true`; production binaries reject the key.
-    allow_loopback_upstreams: bool,
-    stub_zones: []stub.Zone,
-    cache_size: usize,
-    prefetch: bool,
-    serve_stale_ttl: u32,
-    min_ttl: u32,
+    listen: []const Address = &.{ net_addr.initIp4(.{ 127, 0, 0, 1 }, 53), net_addr.initIp6(@as([15]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0) },
+    /// Empty: the IANA roots.
+    root_hints: []const Address = &.{},
+    /// Where glue points. Test-only: production always asks port 53.
+    upstream_port: u16 = 53,
+    /// Lets upstreams sit on 127/8. Test-only.
+    allow_loopback_upstreams: bool = false,
+    stub_zones: []const stub.Zone = &.{},
+    cache_size: usize = 12 * 1024 * 1024,
+    prefetch: bool = false,
+    serve_stale_ttl: u32 = 0,
+    min_ttl: u32 = 0,
     /// The first window a failed question is answered from memory (RFC 9520 §3.2).
-    servfail_ttl: u32,
-    dnssec: bool,
-    qname_minimization: bool,
-    dns64: ?dns64.Prefix,
-    stagger_ms: u32,
+    servfail_ttl: u32 = 5,
+    dnssec: bool = true,
+    qname_minimization: bool = true,
+    dns64: ?dns64.Prefix = null,
+    stagger_ms: u32 = 150,
     /// Upstream exchanges one resolution may spend.
-    max_queries: u32,
-    log_queries: bool,
-    max_udp_payload: u16,
-    /// uid to drop to after binding privileged ports. Numeric only — looking
-    /// up names would need NSS / /etc/passwd parsing; deploy via systemd
-    /// User=hark or pass the resolved uid.
-    drop_uid: ?u32,
-    drop_gid: ?u32,
-
-    /// BCP 140: per-listener client ACL. Empty list means "no ACL" — every
-    /// client allowed. Operators binding non-loopback addresses MUST set
-    /// this or accept that they have an open recursive resolver.
-    allow_from: []acl.Cidr,
-
-    /// Operator policy: when true (default) responses to clients carry only
-    /// load-bearing records (answer, SOA on negatives, DNSSEC proofs on
-    /// DO=1). When false, the upstream's authority and additional sections
-    /// pass through, still without DNSSEC records unless DO=1. Mirrors
-    /// Unbound's `minimal-responses` knob (default-on since 1.7.x). The full
-    /// keep matrix is `answer.zig:Keep`.
-    minimal_responses: bool,
-
-    /// RFC 7766 §6.2.3: TCP idle timeout. Hark closes a TCP client
-    /// connection after this many ms of inactivity. 5000 matches the
-    /// previous hard-coded default; raise for long-lived stub clients.
-    tcp_idle_timeout_ms: u32,
-    /// Cap on queries served over a single TCP connection before the
-    /// server closes it (load-shedding + memory bound).
-    tcp_queries_per_conn: u32,
-    /// Override the IANA root trust anchors. Empty falls back to
-    /// `dnssec.root_ds_records`. Test-only; `-Dtesting=true` gates the
-    /// `[resolver] trust-anchors` config key.
-    trust_anchors: []dns.DsData,
-
-    /// DNS rebinding protection. Default-on; localhost (127/8) is the
-    /// primary attack vector and excluding it would defeat the headline
-    /// use case. DNSBL operators opt out via `extra_allow = ["127.0.0.0/8"]`.
-    /// See `src/rebinding.zig` for the policy semantics and the built-in
-    /// CIDR set.
-    rebinding: rebinding.Config,
-
-    allocator: Allocator,
+    max_queries: u32 = 100,
+    log_queries: bool = false,
+    max_udp_payload: u16 = dns.edns_udp_payload,
+    /// Numeric: names would need NSS.
+    drop_uid: ?u32 = null,
+    drop_gid: ?u32 = null,
+    /// BCP 140: empty allows every client, which off loopback is an open resolver.
+    allow_from: []const acl.Cidr = &.{},
+    /// Only what answers the question: the answer, SOA on negatives, and
+    /// DNSSEC proofs under DO (`answer.zig:Keep`).
+    minimal_responses: bool = true,
+    /// RFC 7766 §6.2.3.
+    tcp_idle_timeout_ms: u32 = 5_000,
+    tcp_queries_per_conn: u32 = 128,
+    /// Empty: the IANA root anchors. Test-only.
+    trust_anchors: []const dns.DsData = &.{},
+    rebinding: rebinding.Config = .{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} },
+    /// Owns every slice above.
+    arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *ServerConfig) void {
-        self.allocator.free(self.listen);
-        self.allocator.free(self.root_hints);
-        freeStubZones(self.allocator, self.stub_zones);
-        self.allocator.free(self.allow_from);
-        for (self.trust_anchors) |ta| self.allocator.free(ta.digest);
-        self.allocator.free(self.trust_anchors);
-        for (self.rebinding.allow_zones) |zone| {
-            for (zone.labels) |label| self.allocator.free(label);
-            self.allocator.free(zone.labels);
-        }
-        self.allocator.free(self.rebinding.allow_zones);
-        self.allocator.free(self.rebinding.extra_block);
-        self.allocator.free(self.rebinding.extra_allow);
+        self.arena.deinit();
     }
 
-    /// Config-supplied if any, else the compile-time IANA defaults.
     pub fn rootHints(self: ServerConfig) []const Address {
         return if (self.root_hints.len > 0) self.root_hints else &root_hints_default;
     }
@@ -152,12 +108,8 @@ pub const ServerConfig = struct {
         return .{ .upstream_port = self.upstream_port, .allow_loopback = self.allow_loopback_upstreams };
     }
 
-    /// Effective root trust anchors: config-supplied if any, else the
-    /// compile-time IANA defaults. The override is only reachable on
-    /// `-Dtesting=true` builds — the production branch is elided at
-    /// compile time so the IANA anchors are the sole reachable choice.
+    /// A production build has only the IANA anchors.
     pub fn trustAnchors(self: ServerConfig) []const dns.DsData {
-        const dnssec = @import("dnssec.zig");
         if (comptime !build_options.testing_enabled) return &dnssec.root_ds_records;
         return if (self.trust_anchors.len > 0) self.trust_anchors else &dnssec.root_ds_records;
     }
@@ -177,46 +129,6 @@ const ConfigError = error{
     ConfigFileTooLarge,
     OutOfMemory,
 };
-
-fn defaultConfig(allocator: Allocator) ConfigError!ServerConfig {
-    const listen = try allocator.alloc(Address, 2);
-    listen[0] = net_addr.initIp4(.{ 127, 0, 0, 1 }, 53);
-    listen[1] = net_addr.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 53, 0, 0);
-
-    return .{
-        .listen = listen,
-        .root_hints = &.{},
-        .upstream_port = 53,
-        .allow_loopback_upstreams = false,
-        .stub_zones = &.{},
-        .cache_size = 12 * 1024 * 1024,
-        .prefetch = false,
-        .serve_stale_ttl = 0,
-        .min_ttl = 0,
-        .servfail_ttl = 5,
-        .dnssec = true,
-        .qname_minimization = true,
-        .dns64 = null,
-        .stagger_ms = 150,
-        .max_queries = 100,
-        .log_queries = false,
-        .max_udp_payload = @import("dns.zig").edns_udp_payload,
-        .drop_uid = null,
-        .drop_gid = null,
-        .allow_from = &.{},
-        .minimal_responses = true,
-        .tcp_idle_timeout_ms = 5_000,
-        .tcp_queries_per_conn = 128,
-        .trust_anchors = &.{},
-        .rebinding = .{
-            .enabled = true,
-            .allow_zones = &.{},
-            .extra_block = &.{},
-            .extra_allow = &.{},
-        },
-        .allocator = allocator,
-    };
-}
 
 // ── Schema ─────────────────────────────────────────────────────────────
 // Every key the parser reads, with its expected TOML type — validated before
@@ -343,37 +255,29 @@ fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
     return v;
 }
 
-pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
-    var scratch: std.heap.ArenaAllocator = .init(allocator);
+pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || ConfigError)!ServerConfig {
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const root = try toml.parse(scratch.allocator(), contents);
 
     try validateSchema(root);
 
-    var cfg = try defaultConfig(allocator);
+    var cfg: ServerConfig = .{ .arena = .init(gpa) };
     errdefer cfg.deinit();
+    const arena = cfg.arena.allocator();
 
     if (root.get("server", .table)) |server| {
-        if (server.get("listen", .string_array)) |addrs| {
-            const new_listen = try parseAddressList(allocator, addrs, 53, error.InvalidListenAddress);
-            allocator.free(cfg.listen);
-            cfg.listen = new_listen;
-        }
+        if (server.get("listen", .string_array)) |addrs| cfg.listen = try parseAddressList(arena, addrs, error.InvalidListenAddress);
         if (server.get("max-udp-payload", .integer)) |m| {
-            const dns_mod = @import("dns.zig");
-            if (m < dns_mod.max_udp_payload or m > dns_mod.max_message_len) {
-                errLog("config: max-udp-payload must be {d}-{d}, got {d}", .{ dns_mod.max_udp_payload, dns_mod.max_message_len, m });
+            if (m < dns.max_udp_payload or m > dns.max_message_len) {
+                errLog("config: max-udp-payload must be {d}-{d}, got {d}", .{ dns.max_udp_payload, dns.max_message_len, m });
                 return error.InvalidValue;
             }
             cfg.max_udp_payload = @intCast(m);
         }
         if (try credential(server, "user")) |u| cfg.drop_uid = u;
         if (try credential(server, "group")) |g| cfg.drop_gid = g;
-        if (server.get("allow-from", .string_array)) |entries| {
-            const new_allow = try parseCidrList(allocator, entries);
-            allocator.free(cfg.allow_from);
-            cfg.allow_from = new_allow;
-        }
+        if (server.get("allow-from", .string_array)) |entries| cfg.allow_from = try parseCidrList(arena, entries);
         if (try nonNegative(u32, server, "tcp-idle-timeout-ms")) |v| {
             // RFC 7828 §3.1 caps the wire TIMEOUT field (100-ms units) at u16.
             // Reject configs that would overflow the @intCast at emit time.
@@ -395,24 +299,15 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 
     if (root.get("resolver", .table)) |resolver| {
         if (resolver.get("root-hints", .string_array)) |addrs| {
-            const new_hints = try parseAddressList(allocator, addrs, 53, error.InvalidRootHintAddress);
+            cfg.root_hints = try parseAddressList(arena, addrs, error.InvalidRootHintAddress);
             const max_hints = delegation.max_servers_per_level;
-            if (new_hints.len > max_hints) {
-                errLog("config: root-hints holds at most {d} addresses, got {d}", .{ max_hints, new_hints.len });
-                allocator.free(new_hints);
+            if (addrs.len > max_hints) {
+                errLog("config: root-hints holds at most {d} addresses, got {d}", .{ max_hints, addrs.len });
                 return error.TooManyRootHints;
             }
-            allocator.free(cfg.root_hints);
-            cfg.root_hints = new_hints;
         }
-        if (resolver.get("stub-zones", .string_array)) |entries| {
-            const zones = try parseStubZones(allocator, entries);
-            freeStubZones(allocator, cfg.stub_zones);
-            cfg.stub_zones = zones;
-        }
-        // Test-only knobs. Each is gated by `build_options.testing_enabled`
-        // so a production binary refuses the key — adding a new one means
-        // adding one block, not synchronizing two branches.
+        if (resolver.get("stub-zones", .string_array)) |entries| cfg.stub_zones = try parseStubZones(arena, entries);
+        // Test-only knobs: a production binary refuses the key.
         if (resolver.get("upstream-port", .integer)) |p| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
             if (p < 1 or p > 65535) return error.InvalidValue;
@@ -424,9 +319,7 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
         }
         if (resolver.get("trust-anchors", .string_array)) |entries| {
             if (!build_options.testing_enabled) return error.TestOnlyConfigKey;
-            const new_anchors = try parseTrustAnchors(allocator, entries);
-            allocator.free(cfg.trust_anchors);
-            cfg.trust_anchors = new_anchors;
+            cfg.trust_anchors = try parseTrustAnchors(arena, entries);
         }
         if (resolver.get("dnssec", .boolean)) |d| cfg.dnssec = d;
         if (resolver.get("qname-minimization", .boolean)) |q| cfg.qname_minimization = q;
@@ -482,25 +375,9 @@ pub fn parseConfig(allocator: Allocator, contents: []const u8) (toml.ParseError 
 
     if (root.get("rebinding", .table)) |reb| {
         if (reb.get("enabled", .boolean)) |b| cfg.rebinding.enabled = b;
-        if (reb.get("allow-zones", .string_array)) |entries| {
-            const new_zones = try parseZoneList(allocator, entries);
-            for (cfg.rebinding.allow_zones) |zone| {
-                for (zone.labels) |label| allocator.free(label);
-                allocator.free(zone.labels);
-            }
-            allocator.free(cfg.rebinding.allow_zones);
-            cfg.rebinding.allow_zones = new_zones;
-        }
-        if (reb.get("extra-block", .string_array)) |entries| {
-            const new_block = try parseCidrList(allocator, entries);
-            allocator.free(cfg.rebinding.extra_block);
-            cfg.rebinding.extra_block = new_block;
-        }
-        if (reb.get("extra-allow", .string_array)) |entries| {
-            const new_allow = try parseCidrList(allocator, entries);
-            allocator.free(cfg.rebinding.extra_allow);
-            cfg.rebinding.extra_allow = new_allow;
-        }
+        if (reb.get("allow-zones", .string_array)) |entries| cfg.rebinding.allow_zones = try parseZoneList(arena, entries);
+        if (reb.get("extra-block", .string_array)) |entries| cfg.rebinding.extra_block = try parseCidrList(arena, entries);
+        if (reb.get("extra-allow", .string_array)) |entries| cfg.rebinding.extra_allow = try parseCidrList(arena, entries);
     }
 
     cfg.rebinding.nat64 = cfg.dns64;
@@ -541,25 +418,15 @@ pub fn parseConfigFile(allocator: Allocator, io: std.Io, path: []const u8) !Serv
     return parseConfig(allocator, contents);
 }
 
-/// Parse a list of trust-anchor strings in the form
-/// `"<key-tag> <algorithm> <digest-type> <hex-digest>"` (whitespace-delimited).
-/// All four fields are required. Algorithm and digest-type are decimal IANA
-/// numbers (e.g. `8` = RSA/SHA-256, `2` = SHA-256). Owner name is implicit
-/// root — the override targets the same anchor slot as `dnssec.root_ds_records`.
-fn parseTrustAnchors(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
-    const list = try allocator.alloc(dns.DsData, strs.len);
-    var i: usize = 0;
-    errdefer {
-        for (list[0..i]) |ta| allocator.free(ta.digest);
-        allocator.free(list);
-    }
-    while (i < strs.len) : (i += 1) {
-        list[i] = try parseTrustAnchor(allocator, strs[i]);
-    }
+/// Each `"<key-tag> <algorithm> <digest-type> <hex-digest>"`, in decimal
+/// IANA numbers, for the root.
+fn parseTrustAnchors(arena: Allocator, strs: []const []const u8) ConfigError![]dns.DsData {
+    const list = try arena.alloc(dns.DsData, strs.len);
+    for (list, strs) |*ta, s| ta.* = try parseTrustAnchor(arena, s);
     return list;
 }
 
-fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData {
+fn parseTrustAnchor(arena: Allocator, s: []const u8) ConfigError!dns.DsData {
     var it = mem.tokenizeAny(u8, s, " \t");
     const tag_str = it.next() orelse return error.InvalidValue;
     const alg_str = it.next() orelse return error.InvalidValue;
@@ -570,28 +437,21 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     const key_tag = std.fmt.parseInt(u16, tag_str, 10) catch return error.InvalidValue;
     const alg_int = std.fmt.parseInt(u8, alg_str, 10) catch return error.InvalidValue;
     const dtype_int = std.fmt.parseInt(u8, dtype_str, 10) catch return error.InvalidValue;
-    // Reject unknown algorithm/digest-type at parse time. Both enums are
-    // open (`_` trailing) so @enumFromInt accepts any u8; an unchecked typo
-    // would surface as a cryptic SERVFAIL instead of a clear config error.
-    // tagName returns null for values that don't match a named variant —
-    // the cheapest known-variant check for this shape.
+    // Both enums are open: an unnamed value is a typo, refused here rather
+    // than met later as a SERVFAIL.
     const algorithm: dns.DnssecAlgorithm = @fromBackingInt(@intCast(alg_int));
     if (std.enums.tagName(dns.DnssecAlgorithm, algorithm) == null) return error.InvalidValue;
     const digest_type: dns.DigestType = @fromBackingInt(@intCast(dtype_int));
-    if (std.enums.tagName(dns.DigestType, digest_type) == null) return error.InvalidValue;
-    if (digest_str.len % 2 != 0) return error.InvalidValue;
-    const digest_len = digest_str.len / 2;
     // RFC 4034 §5.1.4 + RFC 6605 §3: digest length is fixed per digest type.
-    const expected_len: usize = switch (digest_type) {
+    const digest_len: usize = switch (digest_type) {
         .sha1 => 20,
         .sha256 => 32,
         .sha384 => 48,
-        _ => unreachable, // tagName check above rejected unknown variants
+        _ => return error.InvalidValue,
     };
-    if (digest_len != expected_len) return error.InvalidValue;
+    if (digest_str.len != 2 * digest_len) return error.InvalidValue;
 
-    const digest = try allocator.alloc(u8, digest_len);
-    errdefer allocator.free(digest);
+    const digest = try arena.alloc(u8, digest_len);
     _ = std.fmt.hexToBytes(digest, digest_str) catch return error.InvalidValue;
 
     return .{
@@ -602,66 +462,45 @@ fn parseTrustAnchor(allocator: Allocator, s: []const u8) ConfigError!dns.DsData 
     };
 }
 
-pub fn parseZoneList(allocator: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
-    const list = try allocator.alloc(dns.Name, strs.len);
-    var i: usize = 0;
-    errdefer {
-        for (list[0..i]) |zone| {
-            for (zone.labels) |label| allocator.free(label);
-            allocator.free(zone.labels);
-        }
-        allocator.free(list);
-    }
-    while (i < strs.len) : (i += 1) {
-        // Reject empty and root zone: `parseDottedName` accepts both as the
-        // zero-label name, and `isSubdomainOf` treats the zero-label parent
-        // as matching every RR — so a typo like `allow-zones = [""]` would
-        // silently disable rebinding protection entirely. Fail loudly.
-        if (strs[i].len == 0 or mem.eql(u8, strs[i], ".")) {
-            errLog("config: allow-zones entry must name a zone, got '{s}'", .{strs[i]});
+pub fn parseZoneList(arena: Allocator, strs: []const []const u8) ConfigError![]dns.Name {
+    const list = try arena.alloc(dns.Name, strs.len);
+    for (list, strs) |*zone, s| {
+        // The root holds every name: `allow-zones = [""]` would turn the
+        // scrub off entirely.
+        if (s.len == 0 or mem.eql(u8, s, ".")) {
+            errLog("config: allow-zones entry must name a zone, got '{s}'", .{s});
             return error.InvalidValue;
         }
-        list[i] = dns.parseDottedName(allocator, strs[i]) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // Any other dns parse error (invalid label, name too long, …)
-            // surfaces as InvalidValue — operators editing TOML need a clear
-            // signal, not a dns-internal error variant.
-            else => {
-                errLog("config: invalid zone name '{s}'", .{strs[i]});
-                return error.InvalidValue;
-            },
-        };
+        zone.* = try parseZone(arena, s);
     }
     return list;
 }
 
-fn parseStubZones(allocator: Allocator, strs: []const []const u8) ConfigError![]stub.Zone {
-    const zones = try allocator.alloc(stub.Zone, strs.len);
-    var i: usize = 0;
-    errdefer {
-        for (zones[0..i]) |z| freeStubZone(allocator, z);
-        allocator.free(zones);
-    }
+fn parseZone(arena: Allocator, s: []const u8) ConfigError!dns.Name {
+    return dns.parseDottedName(arena, s) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            errLog("config: invalid zone name '{s}'", .{s});
+            return error.InvalidValue;
+        },
+    };
+}
+
+fn parseStubZones(arena: Allocator, strs: []const []const u8) ConfigError![]stub.Zone {
+    const zones = try arena.alloc(stub.Zone, strs.len);
     var fields: [1 + delegation.max_servers_per_level + 1][]const u8 = undefined;
-    while (i < strs.len) : (i += 1) {
+    for (zones, strs, 0..) |*zone, s, i| {
         var n: usize = 0;
-        var it = mem.tokenizeAny(u8, strs[i], " \t");
+        var it = mem.tokenizeAny(u8, s, " \t");
         while (it.next()) |f| : (n += 1) {
             if (n == fields.len) break;
             fields[n] = f;
         }
         if (n < 2 or n == fields.len) {
-            errLog("config: stub-zones entry '{s}' must be a zone and 1 to {d} addresses", .{ strs[i], fields.len - 2 });
+            errLog("config: stub-zones entry '{s}' must be a zone and 1 to {d} addresses", .{ s, fields.len - 2 });
             return error.InvalidValue;
         }
-        const apex = dns.parseDottedName(allocator, fields[0]) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                errLog("config: invalid zone name '{s}'", .{fields[0]});
-                return error.InvalidValue;
-            },
-        };
-        errdefer freeName(allocator, apex);
+        const apex = try parseZone(arena, fields[0]);
         if (apex.labels.len == 0 or special_use.fixed(apex)) {
             errLog("config: stub-zones cannot name '{s}'", .{fields[0]});
             return error.InvalidValue;
@@ -670,48 +509,26 @@ fn parseStubZones(allocator: Allocator, strs: []const []const u8) ConfigError![]
             errLog("config: stub-zones names '{s}' twice", .{fields[0]});
             return error.InvalidValue;
         };
-        zones[i] = .{ .apex = apex, .servers = try parseAddressList(allocator, fields[1..n], 53, error.InvalidValue) };
+        zone.* = .{ .apex = apex, .servers = try parseAddressList(arena, fields[1..n], error.InvalidValue) };
     }
     return zones;
 }
 
-fn freeName(allocator: Allocator, name: dns.Name) void {
-    for (name.labels) |label| allocator.free(label);
-    allocator.free(name.labels);
-}
-
-fn freeStubZone(allocator: Allocator, z: stub.Zone) void {
-    freeName(allocator, z.apex);
-    allocator.free(z.servers);
-}
-
-fn freeStubZones(allocator: Allocator, zones: []stub.Zone) void {
-    for (zones) |z| freeStubZone(allocator, z);
-    allocator.free(zones);
-}
-
-pub fn parseCidrList(allocator: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
-    const list = try allocator.alloc(acl.Cidr, strs.len);
-    errdefer allocator.free(list);
-    for (strs, 0..) |s, i| {
-        list[i] = acl.parse(s) orelse {
-            errLog("config: invalid CIDR entry '{s}'", .{s});
-            return error.InvalidAclEntry;
-        };
-    }
+pub fn parseCidrList(arena: Allocator, strs: []const []const u8) ConfigError![]acl.Cidr {
+    const list = try arena.alloc(acl.Cidr, strs.len);
+    for (list, strs) |*c, s| c.* = acl.parse(s) orelse {
+        errLog("config: invalid CIDR entry '{s}'", .{s});
+        return error.InvalidAclEntry;
+    };
     return list;
 }
 
-fn parseAddressList(allocator: Allocator, strs: []const []const u8, default_port: u16, comptime err: ConfigError) ConfigError![]Address {
-    const addrs = try allocator.alloc(Address, strs.len);
-    errdefer allocator.free(addrs);
-
-    for (strs, 0..) |s, i| {
-        addrs[i] = parseAddress(s, default_port) orelse {
-            errLog("config: invalid address '{s}'", .{s});
-            return err;
-        };
-    }
+fn parseAddressList(arena: Allocator, strs: []const []const u8, comptime err: ConfigError) ConfigError![]Address {
+    const addrs = try arena.alloc(Address, strs.len);
+    for (addrs, strs) |*a, s| a.* = parseAddress(s, 53) orelse {
+        errLog("config: invalid address '{s}'", .{s});
+        return err;
+    };
     return addrs;
 }
 
@@ -799,18 +616,6 @@ test "parse address with explicit port" {
 
 test "bracketed address needs a colon before its port" {
     try testing.expectEqual(@as(?Address, null), parseAddress("[::1]5353", 53));
-}
-
-// Regression: parseConfig used to free `cfg.listen` then `try parseAddressList`,
-// so a malformed address left a dangling slice that cfg.deinit double-freed.
-// `listen` is the only field with a non-empty default, so it's the only site
-// where testing.allocator actually trips on the bug — the sibling fields parse
-// into zero-length defaults whose double-free is a stdlib no-op.
-test "malformed listen does not double-free default" {
-    try testing.expectError(
-        error.InvalidListenAddress,
-        parseConfig(testing.allocator, "[server]\nlisten = [\"999.999.999.999:53\"]\n"),
-    );
 }
 
 test "cache prefetch and stale config" {
@@ -908,6 +713,8 @@ test "wrong-typed key rejected, default must not silently win" {
 }
 
 test "trust-anchors rejects malformed entries" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
     for ([_][]const u8{
         "20326 8 2 ABC",
         "20326 8 2",
@@ -920,7 +727,7 @@ test "trust-anchors rejects malformed entries" {
         "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D084",
         // Digest length doesn't match digest type (SHA-256 declared, 20-byte SHA-1 supplied)
         "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E88040",
-    }) |s| try testing.expectError(error.InvalidValue, parseTrustAnchor(testing.allocator, s));
+    }) |s| try testing.expectError(error.InvalidValue, parseTrustAnchor(arena.allocator(), s));
 }
 
 test "test-only knobs gated on -Dtesting" {
@@ -996,10 +803,6 @@ test "an out-of-range integer is rejected, never clamped" {
     try testing.expectEqual(@as(?u32, 65534), cfg.drop_gid);
 }
 
-/// Exercises every allocating key at once: the address, CIDR, zone and
-/// trust-anchor list parsers, plus `defaultConfig`'s own allocations, which
-/// each overriding key frees and replaces — the ordering most likely to
-/// double-free or strand a slice when an allocation midway through fails.
 fn parseConfigOomProbe(allocator: Allocator, contents: []const u8) !void {
     var cfg = try parseConfig(allocator, contents);
     cfg.deinit();
@@ -1069,23 +872,4 @@ test "parseConfig handles OOM without leaking" {
     // Refusing resize makes every growth an injectable alloc and the count deterministic.
     var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(backing.allocator(), parseConfigOomProbe, .{contents});
-}
-
-/// `trust-anchors` is gated behind `-Dtesting=true`, so `parseConfig` cannot
-/// reach `parseTrustAnchors` in a default test build. Probe it directly:
-/// it allocates the list, then a digest per entry, and unwinds both.
-fn parseTrustAnchorsOomProbe(allocator: Allocator, strs: []const []const u8) !void {
-    const anchors = try parseTrustAnchors(allocator, strs);
-    for (anchors) |ta| allocator.free(ta.digest);
-    allocator.free(anchors);
-}
-
-test "parseTrustAnchors handles OOM without leaking" {
-    const strs = [_][]const u8{
-        "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
-        "19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5",
-    };
-    // Refusing resize makes every growth an injectable alloc and the count deterministic.
-    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
-    try testing.checkAllAllocationFailures(backing.allocator(), parseTrustAnchorsOomProbe, .{&strs});
 }
