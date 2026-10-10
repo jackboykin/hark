@@ -176,20 +176,9 @@ fn digestSupported(digest_type: dns.DigestType) bool {
 /// result borrows `records` or lives in `allocator`; free it with an arena.
 pub fn usableKeys(allocator: mem.Allocator, records: []const dns.ResourceRecord, ds_records: []const dns.DsData) ![]const dns.ResourceRecord {
     if (!hasMlDsaDs(ds_records)) return records;
-    const keep = struct {
-        fn f(rr: dns.ResourceRecord) bool {
-            return rr.rtype == .dnskey and rr.rdata.dnskey.algorithm == .mldsa44;
-        }
-    }.f;
-    var n: usize = 0;
-    for (records) |rr| n += @intFromBool(keep(rr));
-    const kept = try allocator.alloc(dns.ResourceRecord, n);
-    n = 0;
-    for (records) |rr| if (keep(rr)) {
-        kept[n] = rr;
-        n += 1;
-    };
-    return kept;
+    var kept: std.ArrayList(dns.ResourceRecord) = .empty;
+    for (records) |rr| if (rr.rtype == .dnskey and rr.rdata.dnskey.algorithm == .mldsa44) try kept.append(allocator, rr);
+    return kept.items;
 }
 
 /// RFC 4034 §5.1.4: digest of canonical owner name || DNSKEY RDATA.
