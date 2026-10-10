@@ -84,15 +84,14 @@ pub const RttState = struct {
         s.dead_until_ms = 0;
     }
 
-    pub fn observeTimeout(s: *RttState, now_ms: i64) bool {
+    pub fn observeTimeout(s: *RttState, now_ms: i64) void {
         if (s.srtt_us == 0) {
             s.srtt_us = @as(i64, initial_timeout_ms) * 1000;
             s.rttvar_us = @as(i64, initial_timeout_ms) * 500;
         }
         if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
-        if (s.consecutive_timeouts < dead_threshold) return false;
+        if (s.consecutive_timeouts < dead_threshold) return;
         s.dead_until_ms = @max(s.dead_until_ms, now_ms + s.deadWindowMs());
-        return s.consecutive_timeouts == dead_threshold;
     }
 
     pub fn sent(s: *RttState, due_ms: i64) void {
@@ -148,15 +147,15 @@ test "a reply ranks above no history, and no history above silence" {
     var slow: RttState = .unknown;
     slow.observe(900_000, 1000);
     var silent: RttState = .unknown;
-    _ = silent.observeTimeout(1000);
+    silent.observeTimeout(1000);
     var dead = slow;
-    for (0..dead_threshold) |_| _ = dead.observeTimeout(1000);
+    for (0..dead_threshold) |_| dead.observeTimeout(1000);
     const untimed: RttState = .unknown;
     try testing.expect(slow.band(1000) < untimed.band(1000));
     try testing.expect(untimed.band(1000) < silent.band(1000));
     try testing.expect(silent.band(1000) < dead.band(1000));
     var lossy = slow;
-    _ = lossy.observeTimeout(1000);
+    lossy.observeTimeout(1000);
     try testing.expectEqual(slow.band(1000), lossy.band(1000));
 }
 
@@ -187,7 +186,7 @@ test "timeouts inflate the RTO but leave the hedge stagger" {
     s.observe(20_000, 1000);
     const rto_clean = s.timeout(true, .udp);
     const hedge = s.hedgeStagger();
-    for (0..dead_threshold) |_| _ = s.observeTimeout(1000);
+    for (0..dead_threshold) |_| s.observeTimeout(1000);
     try testing.expect(s.timeout(true, .udp) > rto_clean);
     try testing.expectEqual(hedge, s.hedgeStagger());
 }
@@ -195,15 +194,16 @@ test "timeouts inflate the RTO but leave the hedge stagger" {
 test "the threshold timeout marks dead; the window lapses to one probe and escalates to a cap" {
     var s: RttState = .unknown;
     s.observe(100_000, 1000);
-    for (0..dead_threshold - 1) |_| try testing.expect(!s.observeTimeout(1000));
-    try testing.expect(s.observeTimeout(1000));
+    for (0..dead_threshold - 1) |_| s.observeTimeout(1000);
+    try testing.expect(!s.isDead(1000));
+    s.observeTimeout(1000);
     try testing.expect(s.isDead(1000));
     try testing.expectEqual(dead_probe_timeout_ms, s.timeout(true, .udp));
     try testing.expect(!s.isDead(1000 + dead_duration_ms));
     s.sent(9001);
     try testing.expect(s.isDead(9000));
     try testing.expect(!s.isDead(9001));
-    for (0..dead_max_shifts + 3) |_| try testing.expect(!s.observeTimeout(1000));
+    for (0..dead_max_shifts + 3) |_| s.observeTimeout(1000);
     try testing.expectEqual(dead_duration_ms << dead_max_shifts, s.deadWindowMs());
     s.observe(100_000, 1000);
     try testing.expect(!s.isDead(1000));
@@ -216,7 +216,7 @@ test "a cold exchange costs the transport's round trips of the estimate" {
     const udp = s.timeout(true, .udp);
     try testing.expect(udp > min_timeout_ms);
     try testing.expectEqual(udp * 2, s.timeout(true, .tcp));
-    for (0..3) |_| _ = s.observeTimeout(1000);
+    for (0..3) |_| s.observeTimeout(1000);
     try testing.expect(s.timeout(true, .udp) > failover_timeout_cap_ms);
     try testing.expectEqual(failover_timeout_cap_ms * 2, s.timeout(false, .tcp));
 }

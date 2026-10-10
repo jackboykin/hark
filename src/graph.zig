@@ -1552,7 +1552,7 @@ pub const Graph = struct {
     }
 
     pub fn observeTimeout(g: *Graph, server: na.Address) !void {
-        _ = (try g.estimate(server)).observeTimeout(g.nowMs());
+        (try g.estimate(server)).observeTimeout(g.nowMs());
     }
 
     /// Past `ns_rtt.max_entries` servers, an arbitrary other one is forgotten.
