@@ -244,12 +244,14 @@ fn bitmapContradictsNodata(type_bit_maps: []const u8, qtype: dns.RType) bool {
 /// delegation, so the span denies signed data only — hence §9.2's ban on AD.
 const nsec3_opt_out: u8 = 0x01;
 
-/// RFC 5155 §8.2: "A validator MUST ignore NSEC3 RRs with a Flag fields value
-/// other than zero or one." Ignoring beats interpreting both ways: `0x02` read
-/// as Opt-Out-clear turns a record we must discard into a forgery accusation,
-/// `0x03` read as Opt-Out-set hands over the weaker verdict.
-fn nsec3FlagsReserved(nsec3: dns.Nsec3Data) bool {
-    return nsec3.flags & ~nsec3_opt_out != 0;
+/// Whether `rr` is an NSEC3 of `zone`'s chain a validator may read. RFC
+/// 5155 §8.1 and §8.2 ignore unknown hash algorithms and any Flags value
+/// other than zero or one. Ignoring beats interpreting both ways: `0x02`
+/// read as Opt-Out-clear turns a record we must discard into a forgery
+/// accusation, `0x03` read as Opt-Out-set hands over the weaker verdict.
+fn inChain(rr: dns.ResourceRecord, zone: dns.Name) bool {
+    if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) return false;
+    return rr.rdata.nsec3.hash_algorithm == .sha1 and rr.rdata.nsec3.flags & ~nsec3_opt_out == 0;
 }
 
 /// Per-message NSEC/NSEC3 ceiling (Knot 5.7.1, Unbound NsecTrap). An honest
@@ -335,14 +337,9 @@ fn nsec3OwnerHash(name: dns.Name) ?[Sha1.digest_length]u8 {
     return result;
 }
 
-/// Decode a record's owner name as a SHA-1 NSEC3 hash. Skips records that
-/// aren't NSEC3 or use an unsupported hash algorithm — defence-in-depth so
-/// an unknown-algo NSEC3 can't contribute to a SHA-1 negative proof.
+/// The owner hash of an NSEC3 in `zone`'s chain.
 fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest_length]u8 {
-    if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) return null;
-    if (rr.rdata.nsec3.hash_algorithm != .sha1) return null;
-    if (nsec3FlagsReserved(rr.rdata.nsec3)) return null;
-    return nsec3OwnerHash(rr.name);
+    return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
 }
 
 const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
@@ -510,36 +507,23 @@ const Nsec3ChainParams = union(enum) {
 fn nsec3ChainParams(authorities: []const dns.ResourceRecord, zone: dns.Name) Nsec3ChainParams {
     if (proofFlood(authorities)) return .{ .verdict = .bogus };
 
-    var salt: []const u8 = &.{};
-    var iterations: u16 = 0;
-    var found_nsec3 = false;
-    for (authorities) |rr| {
-        if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
-        const nsec3 = rr.rdata.nsec3;
-        // §8.1 and §8.2: unknown hash algorithms and reserved flags are
-        // ignored, so they can't define the chain's parameters. A section
-        // holding only such records proves nothing and fails closed, as
-        // §8.1 expects and Unbound (filter_init) and Knot (hash_name) do.
-        if (nsec3.hash_algorithm != .sha1 or nsec3FlagsReserved(nsec3)) continue;
-        salt = nsec3.salt;
-        iterations = nsec3.iterations;
-        found_nsec3 = true;
-        break;
-    }
-    if (!found_nsec3) return .{ .verdict = .unchecked };
-
     // RFC 5155 §8.2: MAY treat disagreeing hash/iterations/salt as bogus, as
     // Unbound's `param_set_same` (`val_nsec3.c:1583`) does. One parameter set is
     // what makes Opt-Out sound: within a chain nothing covers `hash(qname)` when
     // a record owns that name, because some `next` equals it exactly and ranges
     // are open at both ends. A second chain forges next-closer coverage.
+    var first: ?dns.Nsec3Data = null;
     for (authorities) |rr| {
-        if (rr.rtype != .nsec3 or !rr.name.isSubdomainOf(zone)) continue;
+        if (!inChain(rr, zone)) continue;
         const n3 = rr.rdata.nsec3;
-        if (n3.hash_algorithm != .sha1 or nsec3FlagsReserved(n3)) continue; // §8.1/§8.2: ignored
-        if (n3.iterations != iterations or !mem.eql(u8, n3.salt, salt)) return .{ .verdict = .bogus };
+        if (first == null) first = n3;
+        if (n3.iterations != first.?.iterations or !mem.eql(u8, n3.salt, first.?.salt)) return .{ .verdict = .bogus };
     }
-    return .{ .params = .{ .salt = salt, .iterations = iterations } };
+    // A section holding only ignored records proves nothing and fails
+    // closed, as §8.1 expects and Unbound (filter_init) and Knot (hash_name)
+    // do.
+    const f = first orelse return .{ .verdict = .unchecked };
+    return .{ .params = .{ .salt = f.salt, .iterations = f.iterations } };
 }
 
 const ClosestEncloser = union(enum) {
