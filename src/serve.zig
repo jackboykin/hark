@@ -899,7 +899,12 @@ fn logCounts(comptime path: []const u8, v: anytype) void {
         return;
     }
     var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, if (@typeInfo(T) == .@"struct") "{f}" else "{d}", .{v}) catch unreachable;
+    const text = if (@typeInfo(T) == .@"struct") std.fmt.bufPrint(&buf, "{f}", .{v}) else std.fmt.bufPrint(&buf, "{d}", .{@as(u64, v)});
+    stat(path, text catch unreachable);
+}
+
+/// Out of line, or every counter inlines its own copy of the log call.
+noinline fn stat(path: []const u8, text: []const u8) void {
     log.info("stats {s: <27} {s: >12}", .{ path, text });
 }
 
