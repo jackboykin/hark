@@ -173,8 +173,7 @@ const Parser = struct {
     lineno: usize = 0,
     /// The current significant line, held until `advance`.
     cur: ?[]const u8 = null,
-    /// The lifted corpus's root hint and the default for an ADDRESS-less
-    /// RANGE.
+    /// The lifted corpus's root hint.
     first_address: ?na.Address = null,
     scenario: Scenario = .{},
 
@@ -344,9 +343,7 @@ const Parser = struct {
                 try entries.append(p.arena, try p.entry());
             } else if (mem.eql(u8, line, "RANGE_END")) {
                 p.advance();
-                // Unbound's corpus omits ADDRESS for the default server.
-                const addr = addr_seen orelse if (p.scenario.root_hints.len > 0) p.scenario.root_hints[0] else p.first_address orelse
-                    return p.fail("RANGE without ADDRESS and no root-hints to default to");
+                const addr = addr_seen orelse return p.fail("RANGE without ADDRESS");
                 return .{ .start = start, .end = end, .address = addr, .entries = entries.items };
             } else return p.fail("unexpected line in RANGE");
         }
@@ -927,14 +924,6 @@ test "unbound prelude is lifted" {
         \\K.ROOT-SERVERS.NET.   IN   A   193.0.14.129
         \\ENTRY_END
         \\RANGE_END
-        \\RANGE_BEGIN 0 100
-        \\ENTRY_BEGIN
-        \\MATCH opcode qtype qname
-        \\REPLY QR NOERROR
-        \\SECTION QUESTION
-        \\com. IN NS
-        \\ENTRY_END
-        \\RANGE_END
         \\STEP 1 QUERY
         \\ENTRY_BEGIN
         \\REPLY RD
@@ -956,7 +945,6 @@ test "unbound prelude is lifted" {
     try testing.expectEqual(false, s.minimal_responses.?);
     try testing.expectEqual(1, s.root_hints.len);
     try testing.expect(na.ipEqual(s.root_hints[0], s.ranges[0].address));
-    try testing.expect(na.ipEqual(s.ranges[1].address, s.ranges[0].address));
     try testing.expectEqual(0, s.ranges[0].entries[0].answers[0].name.labels.len);
     try testing.expectEqual(default_ttl, s.ranges[0].entries[0].answers[0].ttl);
     try testing.expect(s.steps[1].entry.?.match.all);

@@ -192,10 +192,7 @@ func (p *parser) line(raw string) error {
 			return errors.New("RANGE_END outside a RANGE")
 		}
 		if !p.rng.addr.IsValid() {
-			if len(p.sc.rootHints) == 0 {
-				return errors.New("RANGE without ADDRESS and no root-hints to default to")
-			}
-			p.rng.addr = p.sc.rootHints[0]
+			return errors.New("RANGE without ADDRESS")
 		}
 		p.sc.ranges = append(p.sc.ranges, p.rng)
 		p.rng = nil
