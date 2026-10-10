@@ -83,13 +83,8 @@ pub fn validateDnskeyRrset(
     budget: *rrsig.ValidationBudget,
     memo: *rrsig.VerifyMemo,
 ) rrsig.VerifyError!dns.RrsigData {
-    // Filter to only DNSKEY records for signature verification.
-    // Response answers may include RRSIG records alongside DNSKEYs;
-    // including them in buildSignedData would corrupt the verification.
-    // Overflow refuses instead of truncating: a signature that verifies over
-    // dnskey_only[0..64] would authenticate a *subset* while the caller keeps
-    // and caches every key in the message — appended forged keys would ride in
-    // as trusted. Same rule as validateRrset and verifyAuthorityProofSigs.
+    // Past 64 refuses, never truncates: a signature over a prefix would
+    // vouch for every key appended after it.
     var dnskey_only: [64]dns.ResourceRecord = undefined;
     var dnskey_count: usize = 0;
     for (dnskey_records) |rr| {
@@ -100,32 +95,22 @@ pub fn validateDnskeyRrset(
     }
     const filtered = dnskey_only[0..dnskey_count];
 
-    // Anchor pass: mark each usable zone key that some eligible DS
-    // authenticates (tag + algorithm match, digest verifies). The DS
-    // hashing happens once per key here, never per RRSIG attempt below.
-    var key_tags: [64]u16 = undefined;
-    var anchored: [64]bool = undefined;
-    for (filtered, 0..) |rr, i| {
-        const dk = rr.rdata.dnskey;
-        key_tags[i] = rrsig.keyTag(dk);
-        anchored[i] = blk: {
-            if (!isValidZoneKey(dk)) break :blk false;
-            for (ds_records) |ds| {
-                if (ds.key_tag != key_tags[i]) continue;
-                if (@backingInt(ds.algorithm) != @backingInt(dk.algorithm)) continue;
-                if (!dsEligible(ds, ds_records)) continue;
-                verifyDs(ds, dk, zone_name) catch continue;
-                break :blk true;
-            }
-            break :blk false;
-        };
+    var anchored: Keyset = undefined;
+    _ = anchored.init(filtered); // Fits: at most 64 DNSKEYs.
+    var n: usize = 0;
+    for (anchored.keys[0..anchored.len], anchored.tags[0..anchored.len]) |dk, tag| {
+        for (ds_records) |ds| {
+            if (ds.key_tag != tag or ds.algorithm != dk.algorithm or !dsEligible(ds, ds_records)) continue;
+            verifyDs(ds, dk, zone_name) catch continue;
+            anchored.keys[n] = dk;
+            anchored.tags[n] = tag;
+            n += 1;
+            break;
+        }
     }
+    anchored.len = n;
 
-    // RFC 6840 §5.11: try every RRSIG covering DNSKEY against every
-    // anchored key whose tag matches. One flat walk — a (rrsig, key)
-    // pair is attempted at most once, so identical attempts are never
-    // re-charged against the KeyTrap budget.
-    // Unless the DS advertises ML-DSA-44: then only an ML-DSA-44 RRSIG
+    // A DS advertising ML-DSA-44 makes an ML-DSA-44 RRSIG the only one that
     // counts (draft-westerbaan-dnssec-mldsa §7.2, RFC 4035 §5.3.3 policy).
     const pq = hasMlDsaDs(ds_records);
     var tried: usize = 0;
@@ -137,10 +122,7 @@ pub fn validateDnskeyRrset(
         if (!sig.signer_name.eql(zone_name) or !usable(sig, now_u32)) continue;
         if (tried == max_sigs_per_set) break;
         tried += 1;
-        for (filtered, 0..) |rr, i| {
-            if (!anchored[i] or key_tags[i] != sig.key_tag) continue;
-            if (try rrsig.tryVerifyRrsig(sig, rr.rdata.dnskey, filtered, now_u32, budget, memo)) return sig;
-        }
+        if (try rrsetVerifiesWithAnyKey(sig, &anchored, filtered, now_u32, budget, memo)) return sig;
     }
     return error.InvalidSignature;
 }
