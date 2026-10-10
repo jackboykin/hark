@@ -487,7 +487,7 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
             std.fmt.parseInt(u16, s[close + 2 ..], 10) catch return null
         else
             default_port;
-        const ip6 = net_addr.Ip6.parse(ip6_str, port) catch return null;
+        const ip6 = std.Io.net.Ip6Address.parse(ip6_str, port) catch return null;
         return net_addr.initIp6(ip6.bytes, port, 0, 0);
     }
 
@@ -504,7 +504,7 @@ fn parseAddress(s: []const u8, default_port: u16) ?Address {
             const ip4 = std.Io.net.Ip4Address.parse(s[0..f], port) catch return null;
             return .{ .ip4 = ip4 };
         }
-        const ip6 = net_addr.Ip6.parse(s, default_port) catch return null;
+        const ip6 = std.Io.net.Ip6Address.parse(s, default_port) catch return null;
         return net_addr.initIp6(ip6.bytes, default_port, 0, 0);
     }
 

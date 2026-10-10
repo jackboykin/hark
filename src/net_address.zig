@@ -1,6 +1,5 @@
-/// Address type and helpers, replacing std.net.Address with std.Io.net.IpAddress.
-/// Wraps std.Io.net.IpAddress with convenience constructors and sockaddr
-/// conversion for raw syscall usage (sys_union.zig).
+//! std.Io.net.IpAddress, with constructors, a hashable key, and sockaddr
+//! conversion for the raw syscalls.
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
@@ -8,7 +7,6 @@ const sys = @import("sys_union.zig");
 const rand = @import("rand.zig");
 
 pub const Address = std.Io.net.IpAddress;
-pub const Ip6 = std.Io.net.Ip6Address;
 
 pub fn initIp4(bytes: [4]u8, port: u16) Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
@@ -157,6 +155,14 @@ pub fn bindTo(fd: posix.fd_t, addr: *const Address) !void {
     var storage: PosixAddress = undefined;
     const sa_len = toSockaddr(addr, &storage);
     try sys.bind(fd, &storage.any, sa_len);
+}
+
+/// The same host, whatever the ports.
+pub fn ipEqual(a: Address, b: Address) bool {
+    return switch (a) {
+        .ip4 => |x| b == .ip4 and mem.eql(u8, &x.bytes, &b.ip4.bytes),
+        .ip6 => |x| b == .ip6 and mem.eql(u8, &x.bytes, &b.ip6.bytes),
+    };
 }
 
 /// Returns true if the address is in a private, reserved, or loopback range
@@ -329,7 +335,7 @@ test "isNonRoutableNs blocks special-use + multicast IPv6" {
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // Multicast ff00::/8 — NS-only addition over the shared table
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0xff, 0x02 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
-    // Documentation 2001:db8::/32 — widened vs the old NS-only set
+    // Documentation 2001:db8::/32
     try testing.expect(isNonRoutableNs(initIp6([_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, 53, 0, 0)));
     // IPv4-mapped ::ffff:127.0.0.1
     try testing.expect(isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 53, 0, 0)));
@@ -343,17 +349,4 @@ test "isNonRoutableNs allows routable IPv6" {
     try testing.expect(!isNonRoutableNs(initIp6([_]u8{ 0x26, 0x06 } ++ @as([14]u8, @splat(0)), 53, 0, 0)));
     // IPv4-mapped ::ffff:1.1.1.1 (routable mapped address)
     try testing.expect(!isNonRoutableNs(initIp6(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 1, 1, 1, 1 }, 53, 0, 0)));
-}
-
-pub fn ipEqual(a: Address, b: Address) bool {
-    return switch (a) {
-        .ip4 => |a4| switch (b) {
-            .ip4 => |b4| mem.eql(u8, &a4.bytes, &b4.bytes),
-            .ip6 => false,
-        },
-        .ip6 => |a6| switch (b) {
-            .ip6 => |b6| mem.eql(u8, &a6.bytes, &b6.bytes),
-            .ip4 => false,
-        },
-    };
 }
