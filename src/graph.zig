@@ -1642,23 +1642,30 @@ pub const Graph = struct {
     }
 };
 
+/// A graph whose edge sends nothing and never wakes it, its clock in hand.
+const Quiet = struct {
+    now: i64 = std.time.ns_per_s,
+    wall: i64 = 0,
+
+    fn graph(q: *Quiet, cfg: Config) !Graph {
+        return .init(std.testing.allocator, cfg, .{ .ctx = q, .now_ns = &q.now, .wall_sec = &q.wall, .rng = rand.thread, .sendFn = send, .wakeFn = wake });
+    }
+
+    fn send(_: *anyopaque, _: Exchange) anyerror!void {}
+    fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
+};
+
 test "a cell replacing an expired one takes over the index entry's key" {
     var kb: KeyBuf = undefined;
     const testing = std.testing;
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
-    const Stub = struct {
-        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
-    };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const name = try dns.parseDottedName(arena.allocator(), "example.");
     const first = try g.demandRoot(name, .a, .new);
-    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now);
+    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, q.now);
     const second = try g.demandRoot(name, .a, .new);
     try testing.expect(first != second);
     g.unhold(first);
@@ -1672,14 +1679,8 @@ test "a cell replacing an expired one takes over the index entry's key" {
 
 test "a joiner starts nothing, and past the work ceiling joins only what is settled" {
     const testing = std.testing;
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
-    const Stub = struct {
-        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
-    };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{}, .max_work_bytes = 1 }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{}, .max_work_bytes = 1 });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1689,7 +1690,7 @@ test "a joiner starts nothing, and past the work ceiling joins only what is sett
     // Its own bytes are past the ceiling: nothing unsettled is joined or started.
     try testing.expectError(error.Full, g.demandRoot(name, .a, .join));
     try testing.expectError(error.Full, g.demandRoot(try dns.parseDottedName(arena.allocator(), "other."), .a, .new));
-    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, now + std.time.ns_per_s);
+    try g.settle(first, .{ .answer = .{ .hops = &.{} } }, q.now + std.time.ns_per_s);
     try testing.expectEqual(first, try g.demandRoot(name, .a, .join));
     g.unhold(first);
     g.unhold(first);
@@ -1697,14 +1698,8 @@ test "a joiner starts nothing, and past the work ceiling joins only what is sett
 
 test "an evicted root cut is re-derived, not walked" {
     const testing = std.testing;
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
-    const Stub = struct {
-        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
-    };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
     defer g.deinit();
     const root_cut: Key = .init(.cut, "", .a);
     g.store.drop(root_cut, g.store.any(root_cut).?.blob);
@@ -1712,21 +1707,15 @@ test "an evicted root cut is re-derived, not walked" {
     defer arena.deinit();
     const root = try g.demandRoot(try dns.parseDottedName(arena.allocator(), "com."), .a, .new);
     try g.drain();
-    try testing.expect(g.store.get(root_cut, now) != null);
+    try testing.expect(g.store.get(root_cut, q.now) != null);
     g.unhold(root);
 }
 
 test "a shared cell is paid by a waiting question with room, not its first demander" {
     var kb: KeyBuf = undefined;
     const testing = std.testing;
-    var now: i64 = std.time.ns_per_s;
-    var wall: i64 = 0;
-    var ctx: u8 = 0;
-    const Stub = struct {
-        fn send(_: *anyopaque, _: Exchange) anyerror!void {}
-        fn wake(_: *anyopaque, _: CellId, _: u32, _: i64) anyerror!void {}
-    };
-    var g = try Graph.init(testing.allocator, .{ .root_hints = &.{} }, .{ .ctx = &ctx, .now_ns = &now, .wall_sec = &wall, .rng = rand.thread, .sendFn = Stub.send, .wakeFn = Stub.wake });
+    var q: Quiet = .{};
+    var g = try q.graph(.{ .root_hints = &.{} });
     defer g.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
