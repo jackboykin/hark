@@ -482,10 +482,12 @@ pub const Cell = struct {
     seen: u64 = 0,
     state: State = .pending,
     expires_ns: i64 = 0,
-    waiters: std.ArrayList(CellId) = .empty,
+    waiters: std.DoublyLinkedList = .{},
     /// Unpinned at settle; an answer's at free.
-    inputs: std.ArrayList(CellId) = .empty,
+    inputs: std.SinglyLinkedList = .{},
     holds: u32 = 0,
+    /// Waiters not orphaned.
+    backers: u32 = 0,
     scratch: Scratch = .none,
     blob: ?*store.Blob = null,
     /// Everything the cell owns; freed with it.
@@ -506,12 +508,57 @@ pub const Cell = struct {
     }
 
     fn inFlight(c: *const Cell, g: *Graph) bool {
-        for (c.inputs.items) |i| {
+        var it = c.inputIds();
+        while (it.next()) |i| {
             const in = g.cell(i);
             if (in.key.kind == .exchange and !in.settled()) return true;
         }
         return false;
     }
+
+    fn waiterIds(c: *const Cell) Pin.Waiters {
+        return .{ .at = c.waiters.first };
+    }
+
+    fn inputIds(c: *const Cell) Pin.Inputs {
+        return .{ .at = c.inputs.first };
+    }
+};
+
+/// `by` waits on `on`.
+const Pin = struct {
+    on: CellId,
+    by: CellId,
+    waiter: std.DoublyLinkedList.Node = .{},
+    input: std.SinglyLinkedList.Node = .{},
+
+    fn ofWaiter(n: *std.DoublyLinkedList.Node) *Pin {
+        return @fieldParentPtr("waiter", n);
+    }
+
+    fn ofInput(n: *std.SinglyLinkedList.Node) *Pin {
+        return @fieldParentPtr("input", n);
+    }
+
+    const Waiters = struct {
+        at: ?*std.DoublyLinkedList.Node,
+
+        fn next(w: *Waiters) ?CellId {
+            const n = w.at orelse return null;
+            w.at = n.next;
+            return ofWaiter(n).by;
+        }
+    };
+
+    const Inputs = struct {
+        at: ?*std.SinglyLinkedList.Node,
+
+        fn next(i: *Inputs) ?CellId {
+            const n = i.at orelse return null;
+            i.at = n.next;
+            return ofInput(n).on;
+        }
+    };
 };
 
 const Slot = struct {
@@ -587,8 +634,7 @@ pub const Graph = struct {
     pub fn deinit(g: *Graph) void {
         // Not `free`: in slot order a cell would unpin from inputs gone first.
         for (g.cells.items) |s| if (s.cell) |c| {
-            c.inputs.deinit(g.gpa);
-            c.waiters.deinit(g.gpa);
+            while (c.inputs.popFirst()) |n| g.gpa.destroy(Pin.ofInput(n));
             if (c.blob) |bl| g.store.unref(bl);
             if (budgetOf(c)) |b| g.unref(b);
             c.arena.deinit();
@@ -911,50 +957,61 @@ pub const Graph = struct {
     // ── Pins ───────────────────────────────────────────────────────────
 
     pub fn pin(g: *Graph, id: CellId, by: CellId) !void {
+        if (g.holdsInput(by, id)) return;
+        const p = try g.gpa.create(Pin);
+        p.* = .{ .on = id, .by = by };
         const c = g.cell(id);
-        for (c.waiters.items) |w| if (w == by) return;
-        try c.waiters.append(g.gpa, by);
-        try g.cell(by).inputs.append(g.gpa, id);
-        if (c.orphan and !g.cell(by).orphan) g.adopt(id);
+        const b = g.cell(by);
+        c.waiters.append(&p.waiter);
+        b.inputs.prepend(&p.input);
+        if (b.orphan) return;
+        c.backers += 1;
+        g.adopt(id);
     }
 
     pub fn holdsInput(g: *Graph, by: CellId, id: CellId) bool {
-        for (g.cell(by).inputs.items) |i| if (i == id) return true;
+        var it = g.cell(by).inputIds();
+        while (it.next()) |i| if (i == id) return true;
         return false;
     }
 
-    fn unpin(g: *Graph, id: CellId, by: CellId) void {
-        const c = g.cell(id);
-        for (c.waiters.items, 0..) |w, i| if (w == by) {
-            _ = c.waiters.swapRemove(i);
-            break;
-        };
-        g.release(id);
-    }
-
-    fn pins(g: *Graph, id: CellId) u32 {
-        const c = g.cell(id);
-        var n = c.holds;
-        for (c.waiters.items) |w| n += @intFromBool(!g.cell(w).orphan);
-        return n;
+    /// Takes the cell, not its id: `free` has already emptied its slot.
+    fn unpinAll(g: *Graph, by: *Cell) void {
+        while (by.inputs.popFirst()) |n| {
+            const p = Pin.ofInput(n);
+            const on = p.on;
+            const c = g.cell(on);
+            c.waiters.remove(&p.waiter);
+            if (!by.orphan) c.backers -= 1;
+            g.gpa.destroy(p);
+            g.release(on);
+        }
     }
 
     /// Nothing live pins it: an orphan, and so is everything it waits on.
     fn release(g: *Graph, id: CellId) void {
         const c = g.cell(id);
-        if (g.pins(id) > 0) return;
+        if (c.holds + c.backers > 0) return;
         if (!c.orphan) {
             c.orphan = true;
-            for (c.inputs.items) |i| g.release(i);
+            var it = c.inputIds();
+            while (it.next()) |i| {
+                g.cell(i).backers -= 1;
+                g.release(i);
+            }
         }
-        if (c.holds == 0 and c.waiters.items.len == 0 and (c.settled() or !c.inFlight(g))) g.free(id);
+        if (c.holds == 0 and c.waiters.first == null and (c.settled() or !c.inFlight(g))) g.free(id);
     }
 
     fn adopt(g: *Graph, id: CellId) void {
         const c = g.cell(id);
         if (!c.orphan) return;
         c.orphan = false;
-        for (c.inputs.items) |i| g.adopt(i);
+        var it = c.inputIds();
+        while (it.next()) |i| {
+            g.cell(i).backers += 1;
+            g.adopt(i);
+        }
     }
 
     fn free(g: *Graph, id: CellId) void {
@@ -963,9 +1020,7 @@ pub const Graph = struct {
         s.* = .{ .gen = s.gen +% 1, .next = g.empty };
         g.empty = .wrap(id);
         g.live -= 1;
-        for (c.inputs.items) |i| g.unpin(i, id);
-        c.inputs.deinit(g.gpa);
-        c.waiters.deinit(g.gpa);
+        g.unpinAll(c);
         if (c.blob) |b| g.store.unref(b);
         if (g.index.getIndex(c.key)) |i| if (g.index.values()[i] == id) g.index.swapRemoveAt(i);
         if (budgetOf(c)) |b| {
@@ -1079,13 +1134,11 @@ pub const Graph = struct {
 
     fn woken(g: *Graph, id: CellId, keep_inputs: bool) !void {
         const c = g.cell(id);
-        try g.ready.appendSlice(g.gpa, c.waiters.items);
+        var it = c.waiterIds();
+        while (it.next()) |w| try g.ready.append(g.gpa, w);
         if (c.key.kind == .answer) try g.answered.append(g.gpa, id);
         // An answer serves from its hops; everything else has copied out.
-        if (!keep_inputs) {
-            for (c.inputs.items) |i| g.unpin(i, id);
-            c.inputs.clearRetainingCapacity();
-        }
+        if (!keep_inputs) g.unpinAll(c);
         // The run's hold still pins a self-held root; one release, below.
         if (c.key.kind == .refresh or c.key.kind == .ahead) c.holds -= 1;
         g.release(id);
@@ -1248,7 +1301,8 @@ pub const Graph = struct {
             if (c.seen == g.checks) continue;
             c.seen = g.checks;
             if (budgetOf(c)) |b| if (b == g.payer) return true;
-            stack.appendSlice(g.scratch.allocator(), c.waiters.items) catch return false;
+            var it = c.waiterIds();
+            while (it.next()) |w| stack.append(g.scratch.allocator(), w) catch return false;
         }
         return false;
     }
@@ -1397,11 +1451,9 @@ pub const Graph = struct {
                 first = first orelse b;
                 continue;
             }
-            var w = c.waiters.items.len;
-            while (w > 0) {
-                w -= 1;
-                stack.append(g.scratch.allocator(), c.waiters.items[w]) catch return first;
-            }
+            // Last first, so the stack pops them in pin order.
+            var n = c.waiters.last;
+            while (n) |w| : (n = w.prev) stack.append(g.scratch.allocator(), Pin.ofWaiter(w).by) catch return first;
         }
         if (roomy.items.len > 0) return roomy.items[@intCast(g.decide(.payer, g.cell(id).key, roomy.items.len) catch 0)];
         return first;
@@ -1449,7 +1501,8 @@ pub const Graph = struct {
                 if (c.seen == g.checks or c.orphan) continue;
                 c.seen = g.checks;
                 if (budgetOf(c) != null) return d;
-                for (c.waiters.items) |w| {
+                var it = c.waiterIds();
+                while (it.next()) |w| {
                     const list = if (c.key.kind == .rrset and g.cell(w).key.kind == .addr) &next else &here;
                     list.append(gpa, w) catch return d;
                 }
@@ -1473,7 +1526,8 @@ pub const Graph = struct {
             if (c.seen == g.checks) continue;
             c.seen = g.checks;
             g.tally.reaches_visits += 1;
-            stack.appendSlice(g.scratch.allocator(), c.waiters.items) catch return true;
+            var it = c.waiterIds();
+            while (it.next()) |w| stack.append(g.scratch.allocator(), w) catch return true;
         }
         return false;
     }
