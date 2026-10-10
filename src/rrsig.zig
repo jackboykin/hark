@@ -241,18 +241,11 @@ pub fn buildSignedData(
     for (rrset, 0..) |rr, idx| {
         const rr_start = temp_pos;
 
-        // RFC 4035 §5.3.2: reconstruct wildcard owner if labels < name label count
-        // wc_labels must live in the for-loop scope (not the if-block) so the
-        // Name slice returned via break :blk remains valid for writeCanonicalNameWire.
-        var wc_labels: [dns.max_label_count][]const u8 = undefined;
-        const owner_name = if (rrsig.labels < rr.name.labels.len) blk: {
-            wc_labels[0] = "*";
-            const suffix = rr.name.labels[rr.name.labels.len - rrsig.labels ..];
-            for (suffix, 1..) |label, i| {
-                wc_labels[i] = label;
-            }
-            break :blk dns.Name{ .labels = wc_labels[0 .. rrsig.labels + 1] };
-        } else rr.name;
+        var wc_labels: [dns.max_label_count + 1][]const u8 = undefined;
+        const owner_name = if (rrsig.labels < rr.name.labels.len)
+            dns.makeWildcardName(&wc_labels, .{ .labels = rr.name.labels[rr.name.labels.len - rrsig.labels ..] }).?
+        else
+            rr.name;
 
         const owner_len = try writeCanonicalNameWire(buf[temp_pos..], owner_name);
         temp_pos += owner_len;
