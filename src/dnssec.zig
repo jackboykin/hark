@@ -277,6 +277,11 @@ pub const Weighed = struct {
     rtype: dns.RType,
     zone: dns.Name,
     now: u32,
+    /// Proof material, served under its own owner and never expanded (RFC
+    /// 4035 §3.1.3.3): a signature naming other labels is over another set,
+    /// and the proofs read the owner as served. A real `*.zone NSEC`
+    /// signature would verify under any name.
+    unexpanded: bool = false,
     at: usize = 0,
     n: usize = 0,
     passed: bool = false,
@@ -289,7 +294,9 @@ pub const Weighed = struct {
             if (rr.rtype != .rrsig) continue;
             const sig = rr.rdata.rrsig;
             if (sig.type_covered != w.rtype or !rr.name.eql(w.owner)) continue;
-            if (w.n == max_sigs_per_set or !sig.signer_name.eql(w.zone) or !usable(sig, w.now)) {
+            if (w.n == max_sigs_per_set or !sig.signer_name.eql(w.zone) or !usable(sig, w.now) or
+                (w.unexpanded and sig.labels != rrsig.signedLabels(w.owner)))
+            {
                 w.passed = true;
                 continue;
             }
@@ -397,6 +404,7 @@ pub fn validateRrset(
     records: []const dns.ResourceRecord,
     owner: dns.Name,
     covered_type: dns.RType,
+    unexpanded: bool,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *rrsig.ValidationBudget,
@@ -418,7 +426,7 @@ pub fn validateRrset(
     var keyset: Keyset = undefined;
     if (!keyset.init(dnskey_records)) return null;
 
-    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32 };
+    var it: Weighed = .{ .rrs = records, .owner = owner, .rtype = covered_type, .zone = keyset.zone orelse return null, .now = now_u32, .unexpanded = unexpanded };
     while (it.next()) |i| {
         const sig = records[i].rdata.rrsig;
         if (rrsetVerifiesWithAnyKey(sig, &keyset, filtered[0..count], now_u32, budget, memo) catch return null) {
@@ -472,13 +480,9 @@ pub fn verifyAuthorityProofSigs(
             rrset_count += 1;
         }
 
-        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32 };
+        var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32, .unexpanded = true };
         const sig = while (it.next()) |j| {
             const sig = authorities[j].rdata.rrsig;
-            // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
-            // the `*.CE` NSEC under its own owner), and the proofs read the owner
-            // as served: a real `*.zone NSEC` signature would verify under any.
-            if (sig.labels != rrsig.signedLabels(rr.name)) return null;
             if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return null) break sig;
         } else return null;
         cap = @min(cap, rrsig.ttlCap(sig, now_u32));
@@ -887,9 +891,9 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
 
     var budget: rrsig.ValidationBudget = .{};
     const moved = [_]dns.ResourceRecord{ recs[0], sig_at(.{ .labels = &.{ "other", "com" } }, signed.rrsig) };
-    try testing.expect(validateRrset(&moved, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) == null);
+    try testing.expect(validateRrset(&moved, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) == null);
     const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
-    try testing.expect(validateRrset(&home, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) != null);
+    try testing.expect(validateRrset(&home, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo) != null);
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
@@ -914,6 +918,14 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: rrsig.ValidationBudget = .{};
     try testing.expect(verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
+
+    // A stray naming fewer labels is no signature over the set, and the
+    // one that is still proves it (RFC 6840 §5.4).
+    var stray = own_sig;
+    stray.rdata.rrsig.labels -= 1;
+    const strayed = [_]dns.ResourceRecord{ real[0], stray, own_sig };
+    var budget3: rrsig.ValidationBudget = .{};
+    try testing.expect(verifyAuthorityProofSigs(&strayed, &dnskeys, 1_700_000_000, &budget3, &test_memo) != null);
 }
 
 fn testSignMlDsa(
@@ -1060,7 +1072,7 @@ test "validateRrset: the TTL cap comes from the signature that verified" {
         .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 3600, .rdata = .{ .rrsig = signed.rrsig } },
     };
     var budget: rrsig.ValidationBudget = .{};
-    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?.sig;
+    const sig = validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo).?.sig;
     // The verifying signature's own bounds: original_ttl 300 against a
     // remaining window of 100_000_000 s. Never the junk record's 1.
     try testing.expectEqual(@as(u32, 300), rrsig.ttlCap(sig, now));
@@ -1083,7 +1095,7 @@ test "validateRrset: the cap takes the RFC 4035 §5.3.3 window when it is the sh
     // 60 s before the signature dies.
     const now: u32 = 1_800_000_000 - 60;
     var budget: rrsig.ValidationBudget = .{};
-    const sig = validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo).?.sig;
+    const sig = validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, now, &budget, &test_memo).?.sig;
     try testing.expectEqual(@as(u32, 60), rrsig.ttlCap(sig, now));
 }
 
@@ -1115,12 +1127,12 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     @memcpy(answers[0..70], &recs);
     answers[70] = sig_rr;
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
+    try testing.expect(validateRrset(&answers, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 
     // Control: the signed 64 on their own still validate.
     var exact: [65]dns.ResourceRecord = undefined;
     @memcpy(exact[0..64], recs[0..64]);
     exact[64] = sig_rr;
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&exact, rrsig.test_owner, .a, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
+    try testing.expect(validateRrset(&exact, rrsig.test_owner, .a, false, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
 }

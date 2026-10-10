@@ -216,7 +216,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
     const now = g.wallNow();
     switch (r.kind) {
         .answer => {
-            const sig = (dnssec.validateRrset(r.answers, zone, .ds, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
+            const sig = (dnssec.validateRrset(r.answers, zone, .ds, false, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus).sig;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, rrsig.ttlCap(sig, now)));
             const status: Proof = if (dnssec.anySupportedDs(r.answers)) .secure else .insecure;
@@ -470,16 +470,13 @@ fn judge(g: *Graph, id: CellId, s: *SecureScratch, t: *const graph.Cell, until: 
                     break :f null;
                 }
                 const records = if (c.is == .proof) r.authorities else r.answers;
-                const v = dnssec.validateRrset(records, c.owner, c.rtype, keys.records, now, budget, &g.verify_memo) orelse
+                const v = dnssec.validateRrset(records, c.owner, c.rtype, c.is == .proof, keys.records, now, budget, &g.verify_memo) orelse
                     break :f .bogus;
                 const verified = v.sig;
                 const cap = capExpiry(g, rrsig.ttlCap(verified, now));
                 s.expires = @min(s.expires, cap);
                 s.proven = @min(s.proven, cap);
                 if (c.is == .proof) {
-                    // Proof material is served under its own owner, never
-                    // expanded (RFC 4035 §3.1.3.3).
-                    if (verified.labels != rrsig.signedLabels(c.owner)) break :f .bogus;
                     s.proved[c.slot] = @intCast(signer.labels.len);
                     s.proved_until[c.slot] = cap;
                     if (v.unweighed) try keepWeighed(g, s.target, r, &c, signer, now);
@@ -678,7 +675,7 @@ fn keepWeighed(g: *Graph, target: CellId, r: *const graph.Reply, c: *const Claim
     var keep: std.ArrayList(RR) = try .initCapacity(g.scratch.allocator(), section.len);
     keep.appendSliceAssumeCapacity(section[0..c.head]);
     for (set) |rr| if (rr.rtype != .rrsig) keep.appendAssumeCapacity(rr);
-    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .now = now };
+    var w: dnssec.Weighed = .{ .rrs = set, .owner = c.owner, .rtype = c.rtype, .zone = zone, .now = now, .unexpanded = c.is == .proof };
     while (w.next()) |i| keep.appendAssumeCapacity(set[i]);
     keep.appendSliceAssumeCapacity(section[c.head + set.len ..]);
     var narrowed = r.*;
