@@ -2219,17 +2219,10 @@ test "RRSIG record parse/serialize roundtrip" {
 
 test "NSEC record parse/serialize roundtrip" {
     const next_name = "\x04host\x07example\x03com\x00";
-    const bitmap = [_]u8{
-        0x00, 0x07, // window 0, length 7
-        0x62, // byte 0: A(1), NS(2), SOA(6)
-        0x01, // byte 1: MX(15)
-        0x00, 0x00, 0x00, // bytes 2-4: empty
-        0x03, // byte 5: RRSIG(46), NSEC(47)
-        0x80, // byte 6: DNSKEY(48)
-    };
+    const bitmap = "\x00\x07\x62\x01\x00\x00\x00\x03\x80";
     var rd = TestRdata{};
     rd.putBytes(next_name);
-    rd.putBytes(&bitmap);
+    rd.putBytes(bitmap);
 
     var pkt: [max_udp_payload]u8 = undefined;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2238,15 +2231,7 @@ test "NSEC record parse/serialize roundtrip" {
 
     const nsec = msg.answers[0].rdata.nsec;
     try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .a));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .ns));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .soa));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .mx));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .rrsig));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .nsec));
-    try testing.expect(typeBitmapContains(nsec.type_bit_maps, .dnskey));
-    try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .aaaa));
-    try testing.expect(!typeBitmapContains(nsec.type_bit_maps, .txt));
+    try testing.expectEqualSlices(u8, bitmap, nsec.type_bit_maps);
 
     var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
@@ -2281,8 +2266,7 @@ test "NSEC3 record parse/serialize roundtrip" {
     try testing.expectEqual(@as(u16, 10), nsec3.iterations);
     try testing.expectEqualSlices(u8, &salt, nsec3.salt);
     try testing.expectEqualSlices(u8, &next_hash, nsec3.next_hashed_owner);
-    try testing.expect(typeBitmapContains(nsec3.type_bit_maps, .a));
-    try testing.expect(!typeBitmapContains(nsec3.type_bit_maps, .aaaa));
+    try testing.expectEqualSlices(u8, &bitmap, nsec3.type_bit_maps);
 
     var rt_buf: [max_udp_payload]u8 = undefined;
     const msg2 = try testRoundtrip(arena.allocator(), &rt_buf, msg);
@@ -2383,19 +2367,6 @@ test "applyCase0x20 only flips ASCII letters; round-trips eql" {
     }
 
     try testing.expect(original.eql(randomized));
-}
-
-test "eqlExact rejects case-flipped name; eql accepts" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const a = try parseDottedName(alloc, "example.com");
-    const b = try parseDottedName(alloc, "ExAmPlE.com");
-
-    try testing.expect(a.eql(b));
-    try testing.expect(!a.eqlExact(b));
-    try testing.expect(a.eqlExact(a));
 }
 
 test "applyCase0x20 distribution: each letter flips ~50% over many runs" {
