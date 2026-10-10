@@ -231,8 +231,7 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
             // RFC 4034 §3.1.3.
             for (r.authorities) |rr| if ((rr.rtype == .nsec or rr.rtype == .nsec3) and !rr.name.isSubdomainOf(signer))
                 return .bogus;
-            var cap: u32 = std.math.maxInt(u32);
-            if (dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo, &cap) != .secure)
+            const cap = dnssec.verifyAuthorityProofSigs(r.authorities, keys.state.fact.dnskey.records, now, budget, &g.verify_memo) orelse
                 return .bogus;
             g.authenticUntil(s.rrset.unwrap().?, capExpiry(g, cap));
             const until = @min(rs.expires_ns, keys.expires_ns);

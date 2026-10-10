@@ -434,32 +434,25 @@ pub fn validateRrset(
     return null;
 }
 
-/// Verify that every piece of negative-answer material in the authority
-/// section — NSEC/NSEC3 proofs *and* the RFC 2308 SOA — has a valid RRSIG
-/// signed by one of the provided DNSKEYs. The SOA is what a `.secure`
-/// negative's TTL and a downstream validator's own verdict rest on; leaving
-/// it unverified made AD=1 an overclaim (RFC 4035 §3.2.3 covers the whole
-/// authority section). NS and glue stay exempt: at a zone cut they are
-/// legitimately unsigned delegation data. On `.secure`, `ttl_cap` is lowered
-/// to the tightest verified signature's bound — a proof-derived verdict must
-/// not be cached past the signatures that justify it. No NSEC/NSEC3 at all
-/// is `.unchecked`.
+/// The tightest signature bound over the authority's NSEC, NSEC3 and SOA
+/// sets, each verified under the signer's keys, or null for bogus. NS and
+/// glue are exempt: unsigned delegation data.
 pub fn verifyAuthorityProofSigs(
     authorities: []const dns.ResourceRecord,
     dnskey_records: []const dns.ResourceRecord,
     now_u32: u32,
     budget: *rrsig.ValidationBudget,
     memo: *rrsig.VerifyMemo,
-    ttl_cap: ?*u32,
-) proof.SecurityStatus {
+) ?u32 {
     for (authorities) |rr| {
         if (rr.rtype == .nsec or rr.rtype == .nsec3) break;
-    } else return .unchecked;
-    if (proof.proofFlood(authorities)) return .bogus;
+    } else return null;
+    if (proof.proofFlood(authorities)) return null;
     var keyset: Keyset = undefined;
-    if (!keyset.init(dnskey_records)) return .bogus;
-    const zone = keyset.zone orelse return .bogus;
+    if (!keyset.init(dnskey_records)) return null;
+    const zone = keyset.zone orelse return null;
 
+    var cap: u32 = std.math.maxInt(u32);
     for (authorities, 0..) |rr, i| {
         if (rr.rtype != .nsec and rr.rtype != .nsec3 and rr.rtype != .soa) continue;
         // A duplicated owner re-collects the same set; verify it once.
@@ -468,40 +461,29 @@ pub fn verifyAuthorityProofSigs(
         } else false;
         if (seen) continue;
 
-        // Collect the RRset (all records with same owner+type). Overflow is
-        // .bogus, not a truncated collect: verifying a sig over the first 16
-        // would leave the overflow records unverified while validateNegativeProof
-        // still reads them out of `authorities` as proof material.
+        // Overflow is bogus: a truncated set leaves records the proofs read
+        // unverified.
         var rrset: [16]dns.ResourceRecord = undefined;
         var rrset_count: usize = 0;
         for (authorities) |rr2| {
             if (rr2.rtype != rr.rtype or !rr2.name.eql(rr.name)) continue;
-            if (rrset_count == rrset.len) return .bogus;
+            if (rrset_count == rrset.len) return null;
             rrset[rrset_count] = rr2;
             rrset_count += 1;
         }
 
-        var sig_verified = false;
         var it: Weighed = .{ .rrs = authorities, .owner = rr.name, .rtype = rr.rtype, .zone = zone, .now = now_u32 };
-        while (it.next()) |j| {
+        const sig = while (it.next()) |j| {
             const sig = authorities[j].rdata.rrsig;
             // Proof material is never wildcard-expanded (RFC 4035 §3.1.3.3 serves
             // the `*.CE` NSEC under its own owner), and the proofs read the owner
             // as served: a real `*.zone NSEC` signature would verify under any.
-            if (sig.labels != rrsig.signedLabels(rr.name)) return .bogus;
-
-            if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return .bogus) {
-                if (ttl_cap) |cap| cap.* = @min(cap.*, rrsig.ttlCap(sig, now_u32));
-                sig_verified = true;
-                break;
-            }
-        }
-        // RFC 4035 §5.3: every NSEC owner must verify. Only-unsupported-algo
-        // owners are bogus too — see validateRrset's closing verdict.
-        if (!sig_verified) return .bogus;
+            if (sig.labels != rrsig.signedLabels(rr.name)) return null;
+            if (rrsetVerifiesWithAnyKey(sig, &keyset, rrset[0..rrset_count], now_u32, budget, memo) catch return null) break sig;
+        } else return null;
+        cap = @min(cap, rrsig.ttlCap(sig, now_u32));
     }
-
-    return .secure;
+    return cap;
 }
 
 test "isValidZoneKey (RFC 4034 §2.1.1–2)" {
@@ -675,17 +657,11 @@ test "verifyAuthorityProofSigs: oversized owner+type is refused, not truncated" 
     };
 
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, &test_memo) == null);
     // 16 is within the buffer and fails on the ordinary no-signature path,
     // so the boundary is the size check and not a signature accident.
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, &test_memo) == null);
 }
 
 test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" {
@@ -953,10 +929,10 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
         } } };
     }
     var at_cap: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(proof.SecurityStatus.bogus, verifyAuthorityProofSigs(rrs[0 .. 2 * proof.max_proof_records], &.{key}, 1700000000, &at_cap, &test_memo, null));
+    try testing.expect(verifyAuthorityProofSigs(rrs[0 .. 2 * proof.max_proof_records], &.{key}, 1700000000, &at_cap, &test_memo) == null);
     try testing.expect(at_cap.sig_verify_spent > 0);
     var past: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(proof.SecurityStatus.bogus, verifyAuthorityProofSigs(&rrs, &.{key}, 1700000000, &past, &test_memo, null));
+    try testing.expect(verifyAuthorityProofSigs(&rrs, &.{key}, 1700000000, &past, &test_memo) == null);
     try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
@@ -1038,10 +1014,7 @@ test "verifyAuthorityProofSigs: NSEC without RRSIG returns bogus" {
     const authorities = [_]dns.ResourceRecord{proof.nsecRr(owner, next)};
     // No DNSKEYs needed; iteration fails the find-RRSIG step.
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyAuthorityProofSigs: signed NSEC + unsigned NSEC returns bogus" {
@@ -1061,10 +1034,7 @@ test "verifyAuthorityProofSigs: signed NSEC + unsigned NSEC returns bogus" {
         // no RRSIG for owner2 — bogus
     };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyAuthorityProofSigs: only-unsupported-algo RRSIG returns bogus" {
@@ -1080,10 +1050,7 @@ test "verifyAuthorityProofSigs: only-unsupported-algo RRSIG returns bogus" {
         rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported
     };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bogus" {
@@ -1100,10 +1067,7 @@ test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bo
     };
     const dnskeys = [_]dns.ResourceRecord{dnskeyRr(signer, test_ecdsa_dnskey)};
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(
-        proof.SecurityStatus.bogus,
-        verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, &test_memo, null),
-    );
+    try testing.expect(verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, &test_memo) == null);
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
@@ -1159,12 +1123,12 @@ test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
     const sig_rr = dns.ResourceRecord{ .name = v, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
     const replayed = [_]dns.ResourceRecord{ proof.nsecRr(v, a), sig_rr };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(proof.SecurityStatus.bogus, verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, &test_memo, null));
+    try testing.expect(verifyAuthorityProofSigs(&replayed, &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 
     const own_sig = dns.ResourceRecord{ .name = star, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = signed.rrsig } };
     const genuine = [_]dns.ResourceRecord{ real[0], own_sig };
     var budget2: rrsig.ValidationBudget = .{};
-    try testing.expectEqual(proof.SecurityStatus.secure, verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo, null));
+    try testing.expect(verifyAuthorityProofSigs(&genuine, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
 }
 
 fn testSignMlDsa(
