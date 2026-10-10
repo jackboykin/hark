@@ -940,10 +940,6 @@ const Parser = struct {
 
     fn parseResourceRecord(self: *Parser, allocator: Allocator) Error!ResourceRecord {
         const name = try self.parseName(allocator);
-        // parseName's outer label slice is the only heap touched so far; on
-        // any subsequent failure (header reads or parseRData OOM) we must
-        // release it so non-arena callers don't leak. See freeWireParsedName.
-        errdefer freeWireParsedName(allocator, name);
         const rtype: RType = @fromBackingInt(@intCast(try self.readU16()));
         const rclass: RClass = @fromBackingInt(@intCast(try self.readU16()));
         // RFC 2181 §8: top bit set is zero. OPT's field is not a TTL (RFC 6891 §6.1.3).
@@ -986,16 +982,13 @@ const Parser = struct {
                 const rdata_end = self.pos + rdlength;
                 const preference = try self.readU16();
                 const exchange = try self.parseName(allocator);
-                errdefer freeWireParsedName(allocator, exchange);
                 if (self.pos != rdata_end) return error.FormatError;
                 return .{ .mx = .{ .preference = preference, .exchange = exchange } };
             },
             .soa => {
                 const rdata_end = self.pos + rdlength;
                 const mname = try self.parseName(allocator);
-                errdefer freeWireParsedName(allocator, mname);
                 const rname = try self.parseName(allocator);
-                errdefer freeWireParsedName(allocator, rname);
                 const serial = try self.readU32();
                 const refresh = try self.readU32();
                 const retry = try self.readU32();
@@ -1015,7 +1008,6 @@ const Parser = struct {
             .txt => {
                 const rdata_end = self.pos + rdlength;
                 var strings: ArrayList([]const u8) = .empty;
-                errdefer strings.deinit(allocator);
                 while (self.pos < rdata_end) {
                     const str_len: usize = try self.readU8();
                     if (self.pos + str_len > rdata_end) return error.FormatError;
@@ -1037,7 +1029,6 @@ const Parser = struct {
                 const key_tag = try self.readU16();
                 const name_start = self.pos;
                 const signer_name = try self.parseName(allocator);
-                errdefer freeWireParsedName(allocator, signer_name);
                 const name_len = self.pos - name_start;
                 if (18 + name_len > rdlength) return error.InvalidRDataLength;
                 const sig_len = rdlength - 18 - name_len;
@@ -1084,7 +1075,6 @@ const Parser = struct {
                 if (rdlength < 1) return error.InvalidRDataLength;
                 const name_start = self.pos;
                 const next_domain_name = try self.parseName(allocator);
-                errdefer freeWireParsedName(allocator, next_domain_name);
                 const name_len = self.pos - name_start;
                 if (name_len > rdlength) return error.InvalidRDataLength;
                 return .{ .nsec = .{
@@ -1134,7 +1124,6 @@ const Parser = struct {
         self.pos = at;
         var names: [2]Name = undefined;
         var n: usize = 0;
-        errdefer for (names[0..n]) |name| freeWireParsedName(allocator, name);
         for (0..layout.names) |_| {
             names[n] = try self.parseName(allocator);
             n += 1;
@@ -1146,7 +1135,6 @@ const Parser = struct {
     fn parseNameRdata(self: *Parser, allocator: Allocator, rdlength: usize) Error!Name {
         const rdata_end = self.pos + rdlength;
         const name = try self.parseName(allocator);
-        errdefer freeWireParsedName(allocator, name);
         if (self.pos != rdata_end) return error.FormatError;
         return name;
     }
@@ -1156,7 +1144,6 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
     if (rdata.len == 0) return &.{};
 
     var options: ArrayList(EdnsOption) = .empty;
-    errdefer options.deinit(allocator);
     var pos: usize = 0;
     while (pos + 4 <= rdata.len) {
         const code = mem.readInt(u16, rdata[pos..][0..2], .big);
@@ -1171,102 +1158,44 @@ fn parseEdnsOptions(allocator: Allocator, rdata: []const u8) Error![]const EdnsO
     return try options.toOwnedSlice(allocator);
 }
 
-/// Free a slice of wire-parsed RRs and its backing (error-path cleanup
-/// for `parseRRSection` results; success paths hand off to the Message).
-fn freeWireParsedRRSlice(allocator: Allocator, rrs: []const ResourceRecord) void {
-    for (rrs) |rr| freeWireParsedRR(allocator, rr);
-    allocator.free(rrs);
-}
-
-/// Parse `count` questions into an owned slice. On error, everything
-/// parsed so far (including backing) is freed.
 fn parseQuestionSection(allocator: Allocator, parser: *Parser, count: u16, max_questions: usize) Error![]Question {
-    var list: ArrayList(Question) = .empty;
-    try list.ensureTotalCapacity(allocator, @min(count, max_questions));
-    errdefer {
-        for (list.items) |q| freeWireParsedName(allocator, q.name);
-        list.deinit(allocator);
-    }
-    for (0..count) |_| {
-        const q = try parser.parseQuestion(allocator);
-        list.append(allocator, q) catch {
-            freeWireParsedName(allocator, q.name);
-            return error.OutOfMemory;
-        };
-    }
-    return try list.toOwnedSlice(allocator);
+    var list: ArrayList(Question) = try .initCapacity(allocator, @min(count, max_questions));
+    for (0..count) |_| try list.append(allocator, try parser.parseQuestion(allocator));
+    return list.items;
 }
 
-/// Parse `count` resource records into an owned slice. On error,
-/// everything parsed so far (including backing) is freed; a previously
-/// written `opt_out.*` is the caller's errdefer to release.
-///
 /// `opt_out` non-null marks the additional section: OPT records are
 /// extracted into it (RFC 6891) instead of appended. Null (answer /
-/// authority) keeps any OPT as an ordinary record — question-section
-/// placement rules don't apply there.
+/// authority) keeps any OPT as an ordinary record.
 fn parseRRSection(allocator: Allocator, parser: *Parser, count: u16, max_rrs: usize, opt_out: ?*?OptRecord) Error![]ResourceRecord {
-    var list: ArrayList(ResourceRecord) = .empty;
-    try list.ensureTotalCapacity(allocator, @min(count, max_rrs));
-    errdefer {
-        for (list.items) |rr| freeWireParsedRR(allocator, rr);
-        list.deinit(allocator);
-    }
+    var list: ArrayList(ResourceRecord) = try .initCapacity(allocator, @min(count, max_rrs));
     for (0..count) |_| {
         const rr = try parser.parseResourceRecord(allocator);
         if (opt_out) |opt| if (rr.rtype == .opt) {
             // RFC 6891 §6.1.1: a query with more than one OPT MUST get FORMERR.
-            if (opt.* != null) {
-                freeWireParsedRR(allocator, rr);
-                return error.MultipleOptRecords;
-            }
-            // RFC 6891 §6.1.2: OPT owner name MUST be root ("."). Non-root
-            // OPT is malformed; treat as FormatError so the server replies
-            // FORMERR rather than silently absorbing whatever owner appears.
-            if (rr.name.labels.len != 0) {
-                freeWireParsedRR(allocator, rr);
-                return error.FormatError;
-            }
-            // Parse options into a local first; assigning into the optional
-            // `opt` before this point would let Zig write the tag (Some) with
-            // the payload still undefined — the caller's opt errdefer would
-            // then dereference garbage on a later failure.
-            const opt_options = parseEdnsOptions(allocator, rr.rdata.unknown) catch |err| {
-                freeWireParsedRR(allocator, rr);
-                return err;
-            };
+            if (opt.* != null) return error.MultipleOptRecords;
+            // RFC 6891 §6.1.2: OPT owner name MUST be root.
+            if (rr.name.labels.len != 0) return error.FormatError;
+            const options = try parseEdnsOptions(allocator, rr.rdata.unknown);
             opt.* = .{
                 .udp_payload_size = @backingInt(rr.rclass),
                 .extended_rcode = @intCast(rr.ttl >> 24),
                 .version = @intCast((rr.ttl >> 16) & 0xFF),
                 .do_bit = (rr.ttl & 0x8000) != 0,
-                .options = opt_options,
+                .options = options,
             };
-            // OPT rr's name (root) and rdata (.unknown alias) carry no heap;
-            // freeing the wire-parsed OPT rr is a no-op since rr.name.labels.len == 0.
             continue;
         };
-        list.append(allocator, rr) catch {
-            freeWireParsedRR(allocator, rr);
-            return error.OutOfMemory;
-        };
+        try list.append(allocator, rr);
     }
-    return try list.toOwnedSlice(allocator);
+    return list.items;
 }
 
-/// Parse a DNS wire message.
+/// Parse a DNS wire message. Names and rdata alias `bytes`, which must
+/// outlive the Message.
 ///
-/// Lifetime contract: parsed `Name.labels[i]` byte slices and rdata byte
-/// slices (RRSIG signature, DNSKEY public_key, DS digest, NSEC bitmap,
-/// NSEC3 salt/hash/bitmap, NSEC3PARAM salt, named head, unknown,
-/// EDNS option data) alias `bytes` — the wire buffer. Caller must keep
-/// `bytes` alive for the lifetime of the returned Message.
-///
-/// `allocator` must be an arena on success: the returned Message's
-/// aliased slices point into `bytes`, so nothing in it can be freed one
-/// piece at a time. On error, per-item cleanup is
-/// skipped for the same reason — only ArrayList backing buffers are
-/// deinit'd, which is safe under any allocator.
+/// `allocator` must be an arena: nothing in the Message can be freed
+/// piece by piece, on success or on error.
 pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     if (bytes.len < header_len) return error.EndOfData;
 
@@ -1280,20 +1209,10 @@ pub fn parseMessage(allocator: Allocator, bytes: []const u8) Error!Message {
     const max_questions = payload / 5; // min question: 1 name + 2 type + 2 class
     const max_rrs = payload / 11; // min RR: 1 name + 2 type + 2 class + 4 TTL + 2 rdlength
 
-    // Each section arrives as a completed owned slice before the next
-    // parses, so error cleanup is one errdefer per section — no partial
-    // ArrayList/toOwnedSlice interleaving to reason about.
     const questions = try parseQuestionSection(allocator, &parser, hdr.qd_count, max_questions);
-    errdefer {
-        for (questions) |q| freeWireParsedName(allocator, q.name);
-        allocator.free(questions);
-    }
     const answers = try parseRRSection(allocator, &parser, hdr.an_count, max_rrs, null);
-    errdefer freeWireParsedRRSlice(allocator, answers);
     const authorities = try parseRRSection(allocator, &parser, hdr.ns_count, max_rrs, null);
-    errdefer freeWireParsedRRSlice(allocator, authorities);
     var opt: ?OptRecord = null;
-    errdefer if (opt) |o| if (o.options.len > 0) allocator.free(o.options);
     const additionals = try parseRRSection(allocator, &parser, hdr.ar_count, max_rrs, &opt);
 
     return .{
@@ -2042,7 +1961,9 @@ test "edge case: truncated question" {
     pkt[12] = 0x03; // label length 3
     pkt[13] = 'a'; // but only 1 byte of data
 
-    try testing.expectError(error.EndOfData, parseMessage(testing.allocator, &pkt));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), &pkt));
 }
 
 test "edge case: max-length label" {
@@ -2081,7 +2002,9 @@ test "edge case: oversized label" {
     @memset(pkt[13..][0..64], 'a');
 
     // 64 = 0x40, top 2 bits = 01 → invalid label type per RFC 1035
-    try testing.expectError(error.InvalidLabelType, parseMessage(testing.allocator, pkt[0..78]));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.InvalidLabelType, parseMessage(arena.allocator(), pkt[0..78]));
 }
 
 test "EDNS0: reserializing a parsed OPT response counts it once" {
@@ -2260,43 +2183,8 @@ test "validateResponse: only the one question sent, at any rcode" {
     try std.testing.expectError(bad, validateResponse(notify, sent, .a, true));
 }
 
-/// Free only the heap-allocated outer slice of a `Name` parsed from a wire
-/// buffer. Inner labels alias the wire (`parseName` collects them into a
-/// stack buffer and `dupe`s only the outer slice), so they are never
-/// freed. Used on parseMessage error paths to drain per-record interiors
-/// without touching wire-aliased data.
-fn freeWireParsedName(allocator: Allocator, name: Name) void {
-    allocator.free(name.labels);
-}
-
-/// Free the heap-allocated outer slices inside a wire-parsed `RData`.
-/// See `freeWireParsedName` for the rationale — variants whose payload
-/// consists of `readSlice` results (DNSKEY public_key, DS digest, NSEC
-/// bitmap, NSEC3 salt/hash/bitmap, NSEC3PARAM salt, unknown) reference
-/// the wire directly and are skipped.
-fn freeWireParsedRData(allocator: Allocator, rdata: RData) void {
-    switch (rdata) {
-        .a, .aaaa, .dnskey, .ds, .nsec3, .unknown => {},
-        .ns, .cname, .dname, .ptr => |n| freeWireParsedName(allocator, n),
-        .mx => |mx| freeWireParsedName(allocator, mx.exchange),
-        .soa => |s| {
-            freeWireParsedName(allocator, s.mname);
-            freeWireParsedName(allocator, s.rname);
-        },
-        .txt => |t| allocator.free(t.strings),
-        .rrsig => |r| freeWireParsedName(allocator, r.signer_name),
-        .nsec => |n| freeWireParsedName(allocator, n.next_domain_name),
-        .named => |d| {
-            for (d.names) |name| freeWireParsedName(allocator, name);
-            allocator.free(d.names);
-        },
-    }
-}
-
-/// Lowercase every embedded `Name` in `rdata` in place. Mirrors the
-/// name-bearing variants of `freeWireParsedRData` (differs only on
-/// `.txt`, which has no names). Pre-scrub label bytes are abandoned,
-/// not freed; only safe under an arena.
+/// Lowercase every embedded `Name` in `rdata` in place. Pre-scrub label
+/// bytes are abandoned, not freed; only safe under an arena.
 pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
     switch (rdata.*) {
         .a, .aaaa, .txt, .dnskey, .ds, .nsec3, .unknown => {},
@@ -2321,11 +2209,6 @@ pub fn lowercaseRDataNames(allocator: Allocator, rdata: *RData) !void {
         // case-insensitive cmpLabelsCI regardless.
         .nsec => |*n| n.next_domain_name = try cloneNameFlat(allocator, n.next_domain_name, false),
     }
-}
-
-fn freeWireParsedRR(allocator: Allocator, rr: ResourceRecord) void {
-    freeWireParsedName(allocator, rr.name);
-    freeWireParsedRData(allocator, rr.rdata);
 }
 
 test "wire TTLs: top bit set reads as zero (RFC 2181 §8), the rest cap at a week, NSEC and NSEC3 at three hours" {
@@ -2917,79 +2800,6 @@ test "parseDottedName decodes presentation escapes" {
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\12"));
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\1x2"));
     try testing.expectError(error.FormatError, parseDottedName(alloc, "a\\999"));
-}
-
-fn parseMessageOomProbe(allocator: Allocator, wire: []const u8) !void {
-    const msg = try parseMessage(allocator, wire);
-    // Inner labels and rdata byte slices alias `wire`: free only what the
-    // parser allocates from `allocator`.
-    for (msg.questions) |q| freeWireParsedName(allocator, q.name);
-    allocator.free(msg.questions);
-    for (msg.answers) |rr| freeWireParsedRR(allocator, rr);
-    allocator.free(msg.answers);
-    for (msg.authorities) |rr| freeWireParsedRR(allocator, rr);
-    allocator.free(msg.authorities);
-    for (msg.additionals) |rr| freeWireParsedRR(allocator, rr);
-    allocator.free(msg.additionals);
-    if (msg.opt) |o| if (o.options.len > 0) allocator.free(o.options);
-}
-
-test "parseMessage handles OOM at every allocation without leaking" {
-    // Question + two A answers + an RP + one NS authority + OPT — exercises
-    // per-record parseName, parseRData branches, parseEdnsOptions, and the
-    // four section ArrayList spines.
-    const example_com = Name{ .labels = &.{ "example", "com" } };
-    const ns_target = Name{ .labels = &.{ "ns", "example", "com" } };
-    const msg: Message = .{
-        .header = .{
-            .id = 0x4242,
-            .flags = .{
-                .qr = true,
-                .opcode = .query,
-                .aa = true,
-                .tc = false,
-                .rd = false,
-                .ra = false,
-                .z = 0,
-                .ad = false,
-                .cd = false,
-                .rcode = .no_error,
-            },
-        },
-        .questions = &.{
-            .{ .name = example_com, .qtype = .a, .qclass = .in },
-        },
-        .answers = &.{
-            .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 1 } } },
-            .{ .name = example_com, .rtype = .a, .rclass = .in, .ttl = 60, .rdata = .{ .a = .{ 192, 0, 2, 2 } } },
-            .{ .name = example_com, .rtype = .rp, .rclass = .in, .ttl = 60, .rdata = .{ .named = .{ .head = "", .names = &.{ ns_target, example_com } } } },
-        },
-        .authorities = &.{
-            .{ .name = example_com, .rtype = .ns, .rclass = .in, .ttl = 3600, .rdata = .{ .ns = ns_target } },
-        },
-        .additionals = &.{},
-        .opt = .{
-            .udp_payload_size = 1232,
-            .extended_rcode = 0,
-            .version = 0,
-            .do_bit = false,
-            .options = &.{.{ .code = 3, .data = &.{} }}, // NSID, empty data
-        },
-    };
-
-    var wire_buf: [max_udp_payload]u8 = undefined;
-    const wire = try serializeMessage(&wire_buf, msg);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const parsed = try parseMessage(arena.allocator(), wire);
-    try testing.expectEqual(@as(u16, 3), parsed.header.an_count);
-    try testing.expectEqual(@as(u16, 1), parsed.header.ns_count);
-    try testing.expect(parsed.opt != null);
-
-    // Refusing resize makes every growth an injectable alloc and the count deterministic.
-    var backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
-    try testing.checkAllAllocationFailures(backing.allocator(), parseMessageOomProbe, .{wire});
 }
 
 test "base32hex decode ignores case and refuses characters outside the alphabet" {
