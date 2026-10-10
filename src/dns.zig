@@ -1278,12 +1278,8 @@ fn sameWireName(out: []const u8, at: u16, wire: []const u8) bool {
 
 pub const Serializer = struct {
     buf: []u8,
-    pos: usize,
+    pos: usize = 0,
     names: ?*NameTable = null,
-
-    pub fn init(buf: []u8) Serializer {
-        return .{ .buf = buf, .pos = 0 };
-    }
 
     fn ensureSpace(self: *Serializer, n: usize) Error!void {
         if (self.pos + n > self.buf.len) return error.EndOfData;
@@ -1362,10 +1358,6 @@ pub const Serializer = struct {
         try self.writeU16(@backingInt(q.qclass));
     }
 
-    fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
-        try self.writeRecordFields(rr);
-    }
-
     /// Names compressed as `writeResourceRecord` would, the rest copied,
     /// `r.ttl` written over the stored TTL.
     fn writeWireRecord(self: *Serializer, r: WireRecord) Error!void {
@@ -1386,7 +1378,7 @@ pub const Serializer = struct {
         mem.writeInt(u16, self.buf[at + 8 ..][0..2], try castOrRDataErr(u16, self.pos - at - 10), .big);
     }
 
-    fn writeRecordFields(self: *Serializer, rr: ResourceRecord) Error!void {
+    fn writeResourceRecord(self: *Serializer, rr: ResourceRecord) Error!void {
         try self.writeName(rr.name, true);
         try self.writeU16(@backingInt(rr.rtype));
         try self.writeU16(@backingInt(rr.rclass));
@@ -1496,14 +1488,14 @@ pub const Serializer = struct {
 
 /// Uncompressed, as a stored record: `WireRecord`'s layout.
 pub fn buildResourceRecordWire(buf: []u8, rr: ResourceRecord) Error![]const u8 {
-    var ser = Serializer.init(buf);
-    try ser.writeRecordFields(rr);
+    var ser: Serializer = .{ .buf = buf };
+    try ser.writeResourceRecord(rr);
     return ser.buf[0..ser.pos];
 }
 
 /// Uncompressed, as a stored fact holds names and records.
 pub fn writeNameWire(buf: []u8, name: Name) Error!usize {
-    var ser = Serializer.init(buf);
+    var ser: Serializer = .{ .buf = buf };
     try ser.writeName(name, false);
     return ser.pos;
 }
@@ -1524,19 +1516,15 @@ pub fn readRecordsWire(allocator: Allocator, bytes: []const u8, pos: *usize, cou
     return rrs;
 }
 
-/// Where each section ended, filled progressively by `serializeMessageEnds`
+/// Where each section ended, filled progressively by `serializeEnds`
 /// so a caller can rewind to a completed boundary after an overflow.
 /// 0 = never reached.
 pub const SectionEnds = struct { questions: usize = 0, answers: usize = 0, authorities: usize = 0 };
 
 pub fn serializeMessage(buf: []u8, msg: Message) Error![]const u8 {
     var ends: SectionEnds = .{};
-    return serializeMessageEnds(buf, msg, &ends);
-}
-
-fn serializeMessageEnds(buf: []u8, msg: Message, ends: *SectionEnds) Error![]const u8 {
     const sections: Sections(ResourceRecord) = .{ .answers = msg.answers, .authorities = msg.authorities, .additionals = msg.additionals };
-    return serializeEnds(buf, msg.header, msg.questions, ResourceRecord, sections, msg.opt, ends);
+    return serializeEnds(buf, msg.header, msg.questions, ResourceRecord, sections, msg.opt, &ends);
 }
 
 /// A message's record sections, parsed (`ResourceRecord`) or as stored (`WireRecord`).
@@ -1561,7 +1549,7 @@ pub fn Sections(comptime R: type) type {
 /// so each count fits a u16.
 pub fn serializeEnds(buf: []u8, hdr: Header, questions: []const Question, comptime R: type, sections: Sections(R), opt: ?OptRecord, ends: *SectionEnds) Error![]const u8 {
     var names: NameTable = .{};
-    var ser = Serializer{ .buf = buf[0..@min(buf.len, max_message_len)], .pos = 0, .names = &names };
+    var ser: Serializer = .{ .buf = buf[0..@min(buf.len, max_message_len)], .names = &names };
     const write = if (R == WireRecord) Serializer.writeWireRecord else Serializer.writeResourceRecord;
 
     try ser.ensureSpace(12);

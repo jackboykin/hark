@@ -341,7 +341,7 @@ fn writeCanonicalRData(buf: []u8, rdata: dns.RData) error{BufferTooSmall}!usize 
             return pos;
         },
         else => {
-            var ser = dns.Serializer.init(buf);
+            var ser: dns.Serializer = .{ .buf = buf };
             ser.writeRData(rdata) catch return error.BufferTooSmall;
             return ser.pos;
         },
