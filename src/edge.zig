@@ -65,7 +65,7 @@ now_ns: i64 = 0,
 wall_sec: i64 = 0,
 timers: std.PriorityQueue(Timer, void, Timer.before) = .empty,
 seq: u32 = 0,
-flights: std.AutoHashMapUnmanaged(CellId, Flight) = .empty,
+flights: std.AutoArrayHashMapUnmanaged(CellId, Flight) = .empty,
 /// Events that own nothing.
 queue: std.ArrayList(Event) = .empty,
 head: usize = 0,
@@ -85,8 +85,7 @@ pub fn init(gpa: Allocator) !Edge {
 }
 
 pub fn deinit(e: *Edge) void {
-    var it = e.flights.valueIterator();
-    while (it.next()) |f| e.close(f.*);
+    for (e.flights.values()) |f| e.close(f);
     e.flights.deinit(e.gpa);
     e.timers.deinit(e.gpa);
     e.queue.deinit(e.gpa);
@@ -174,7 +173,7 @@ fn close(e: *Edge, f: Flight) void {
 }
 
 fn finish(e: *Edge, id: CellId, completion: Completion) Event {
-    e.close(e.flights.fetchRemove(id).?.value);
+    e.close(e.flights.fetchSwapRemove(id).?.value);
     return .{ .exchange = .{ .id = id, .completion = completion } };
 }
 
