@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
+const maxInt = std.math.maxInt;
 const Allocator = mem.Allocator;
 const toml = @import("toml.zig");
 const net_addr = @import("net_address.zig");
@@ -216,22 +217,12 @@ fn validateSchema(root: toml.Table) ConfigError!void {
     }
 }
 
-/// Upper bound for [resolver] stagger-ms. Staggering upstream probes by more
-/// than a second would exceed most stub resolvers' own patience.
-const max_stagger_ms: u32 = 1000;
-
-/// Out-of-range is rejected, not clamped: silent folding to `maxInt(T)`
-/// contradicts the strict schema the rest of this parser enforces, and it hid
-/// a footgun — `user = <huge>` clamped to `(uid_t)-1`, setresuid's "leave
-/// unchanged" sentinel, so the drop silently did nothing and reported success.
-fn nonNegative(comptime T: type, table: toml.Table, key: []const u8) ConfigError!?T {
+/// Refused outside `min` to `max`, never clamped: `stagger-ms = 5000` meant
+/// five seconds to whoever wrote it.
+fn integer(comptime T: type, table: toml.Table, key: []const u8, min: T, max: T) ConfigError!?T {
     const v = table.get(key, .integer) orelse return null;
-    if (v < 0) {
-        errLog("config: {s} must not be negative, got {d}", .{ key, v });
-        return error.InvalidValue;
-    }
-    if (v > std.math.maxInt(T)) {
-        errLog("config: {s} must be at most {d}, got {d}", .{ key, std.math.maxInt(T), v });
+    if (v < min or v > max) {
+        errLog("config: {s} must be {d} to {d}, got {d}", .{ key, min, max, v });
         return error.InvalidValue;
     }
     return @intCast(v);
@@ -240,8 +231,8 @@ fn nonNegative(comptime T: type, table: toml.Table, key: []const u8) ConfigError
 /// Neither `(uid_t)-1` (setresuid's "leave unchanged" sentinel) nor 0 is an id
 /// worth dropping to; both make the drop a no-op that reports success.
 fn credential(table: toml.Table, key: []const u8) ConfigError!?u32 {
-    const v = try nonNegative(u32, table, key) orelse return null;
-    if (v == std.math.maxInt(u32)) {
+    const v = try integer(u32, table, key, 0, maxInt(u32)) orelse return null;
+    if (v == maxInt(u32)) {
         errLog("config: {s} must be a real id, got the 'unchanged' sentinel {d}", .{ key, v });
         return error.InvalidValue;
     }
@@ -268,32 +259,13 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
 
     if (root.get("server", .table)) |server| {
         if (server.get("listen", .string_array)) |addrs| cfg.listen = try parseAddressList(arena, addrs, error.InvalidListenAddress);
-        if (server.get("max-udp-payload", .integer)) |m| {
-            if (m < dns.max_udp_payload or m > dns.max_message_len) {
-                errLog("config: max-udp-payload must be {d}-{d}, got {d}", .{ dns.max_udp_payload, dns.max_message_len, m });
-                return error.InvalidValue;
-            }
-            cfg.max_udp_payload = @intCast(m);
-        }
+        if (try integer(u16, server, "max-udp-payload", dns.max_udp_payload, dns.max_message_len)) |v| cfg.max_udp_payload = v;
         if (try credential(server, "user")) |u| cfg.drop_uid = u;
         if (try credential(server, "group")) |g| cfg.drop_gid = g;
         if (server.get("allow-from", .string_array)) |entries| cfg.allow_from = try parseCidrList(arena, entries);
-        if (try nonNegative(u32, server, "tcp-idle-timeout-ms")) |v| {
-            // RFC 7828 §3.1 caps the wire TIMEOUT field (100-ms units) at u16.
-            // Reject configs that would overflow the @intCast at emit time.
-            if (v > 6_553_500) {
-                errLog("config: tcp-idle-timeout-ms must be at most 6553500, got {d}", .{v});
-                return error.InvalidValue;
-            }
-            cfg.tcp_idle_timeout_ms = v;
-        }
-        if (try nonNegative(u32, server, "tcp-queries-per-conn")) |v| {
-            if (v == 0) {
-                errLog("config: tcp-queries-per-conn must not be 0", .{});
-                return error.InvalidValue;
-            }
-            cfg.tcp_queries_per_conn = v;
-        }
+        // RFC 7828 §3.1: the keepalive TIMEOUT is a u16 of 100 ms units.
+        if (try integer(u32, server, "tcp-idle-timeout-ms", 0, maxInt(u16) * 100)) |v| cfg.tcp_idle_timeout_ms = v;
+        if (try integer(u32, server, "tcp-queries-per-conn", 1, maxInt(u32))) |v| cfg.tcp_queries_per_conn = v;
         if (server.get("minimal-responses", .boolean)) |m| cfg.minimal_responses = m;
     }
 
@@ -329,44 +301,18 @@ pub fn parseConfig(gpa: Allocator, contents: []const u8) (toml.ParseError || Con
                 return error.InvalidValue;
             };
         };
-        if (try nonNegative(u32, resolver, "stagger-ms")) |v| {
-            // Rejected rather than clamped, for the same reason as the range
-            // check itself: `stagger-ms = 5000` meant 5 seconds to whoever
-            // wrote it.
-            if (v > max_stagger_ms) {
-                errLog("config: stagger-ms must be at most {d}, got {d}", .{ max_stagger_ms, v });
-                return error.InvalidValue;
-            }
-            cfg.stagger_ms = v;
-        }
-        if (try nonNegative(u32, resolver, "max-queries")) |v| {
-            if (v == 0) {
-                errLog("config: max-queries must not be 0", .{});
-                return error.InvalidValue;
-            }
-            cfg.max_queries = v;
-        }
+        // Past a second, most stubs have given up.
+        if (try integer(u32, resolver, "stagger-ms", 0, 1000)) |v| cfg.stagger_ms = v;
+        if (try integer(u32, resolver, "max-queries", 1, maxInt(u32))) |v| cfg.max_queries = v;
     }
 
     if (root.get("cache", .table)) |cache| {
-        if (try nonNegative(usize, cache, "size")) |v| {
-            if (v == 0) {
-                errLog("config: cache size must not be 0", .{});
-                return error.InvalidValue;
-            }
-            cfg.cache_size = v;
-        }
+        if (try integer(usize, cache, "size", 1, maxInt(usize))) |v| cfg.cache_size = v;
         if (cache.get("prefetch", .boolean)) |p| cfg.prefetch = p;
-        if (try nonNegative(u32, cache, "serve-stale-ttl")) |v| cfg.serve_stale_ttl = v;
-        if (try nonNegative(u32, cache, "min-ttl")) |v| cfg.min_ttl = v;
-        if (try nonNegative(u32, cache, "servfail-ttl")) |v| {
-            // RFC 9520 §3.2: a failure is remembered no longer than 5 minutes.
-            if (v > 300) {
-                errLog("config: servfail-ttl must not exceed 300", .{});
-                return error.InvalidValue;
-            }
-            cfg.servfail_ttl = v;
-        }
+        if (try integer(u32, cache, "serve-stale-ttl", 0, maxInt(u32))) |v| cfg.serve_stale_ttl = v;
+        if (try integer(u32, cache, "min-ttl", 0, maxInt(u32))) |v| cfg.min_ttl = v;
+        // RFC 9520 §3.2: a failure is remembered no longer than 5 minutes.
+        if (try integer(u32, cache, "servfail-ttl", 0, 300)) |v| cfg.servfail_ttl = v;
     }
 
     if (root.get("logging", .table)) |logging| {
