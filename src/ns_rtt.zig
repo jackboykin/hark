@@ -55,27 +55,28 @@ pub const dead_band = std.math.maxInt(i64);
 /// RFC 1035 §4.2.1 ≥2 s.
 const failover_timeout_cap_ms: u32 = 2000;
 
+/// Round trips in µs fit 32 bits: no reply outlives its deadline.
 pub const RttState = struct {
-    srtt_us: i64 = 0,
-    rttvar_us: i64 = 0,
+    srtt_us: u32 = 0,
+    rttvar_us: u32 = 0,
     consecutive_timeouts: u8 = 0,
     dead_until_ms: i64 = 0,
-    min_rtt_us: i64 = 0,
+    min_rtt_us: u32 = 0,
     min_rtt_stamp_ms: i64 = 0,
 
     pub const unknown: RttState = .{};
 
     /// Any reply, whatever its rcode.
     pub fn observe(s: *RttState, rtt_us: i64, now_ms: i64) void {
-        const rtt = @max(rtt_us, 1);
+        const rtt: u32 = @intCast(std.math.clamp(rtt_us, 1, std.math.maxInt(u32)));
         if (s.srtt_us == 0) {
             s.srtt_us = rtt;
-            s.rttvar_us = @divTrunc(rtt, 2);
+            s.rttvar_us = rtt / 2;
         } else {
             // RFC 6298
-            const delta: i64 = @intCast(@abs(s.srtt_us - rtt));
-            s.rttvar_us = 3 * @divTrunc(s.rttvar_us, 4) + @divTrunc(delta, 4);
-            s.srtt_us = 7 * @divTrunc(s.srtt_us, 8) + @divTrunc(rtt, 8);
+            const delta = @max(s.srtt_us, rtt) - @min(s.srtt_us, rtt);
+            s.rttvar_us = 3 * (s.rttvar_us / 4) + delta / 4;
+            s.srtt_us = 7 * (s.srtt_us / 8) + rtt / 8;
         }
         // Re-anchoring lets the floor follow a route change upward.
         if (s.min_rtt_us == 0 or rtt < s.min_rtt_us or now_ms - s.min_rtt_stamp_ms > hedge_decay_ms) {
@@ -88,8 +89,8 @@ pub const RttState = struct {
 
     pub fn observeTimeout(s: *RttState, now_ms: i64) void {
         if (s.srtt_us == 0) {
-            s.srtt_us = @as(i64, initial_timeout_ms) * 1000;
-            s.rttvar_us = @as(i64, initial_timeout_ms) * 500;
+            s.srtt_us = initial_timeout_ms * 1000;
+            s.rttvar_us = initial_timeout_ms * 500;
         }
         if (s.consecutive_timeouts < 255) s.consecutive_timeouts += 1;
         if (s.consecutive_timeouts < dead_threshold) return;
@@ -110,7 +111,7 @@ pub const RttState = struct {
     pub fn band(s: RttState, now_ms: i64) i64 {
         if (s.isDead(now_ms)) return dead_band;
         if (s.min_rtt_us == 0) return if (s.srtt_us == 0) untimed_band else silent_band;
-        return @divTrunc(s.srtt_us, band_us);
+        return @divTrunc(@as(i64, s.srtt_us), band_us);
     }
 
     pub fn timeout(s: RttState, is_last: bool, transport: Transport) u32 {
@@ -120,7 +121,7 @@ pub const RttState = struct {
     }
 
     pub fn hedgeStagger(s: RttState) ?u32 {
-        if (s.min_rtt_us <= 0) return null;
+        if (s.min_rtt_us == 0) return null;
         const stagger_ms: u32 = @intCast(@max(1, @divTrunc(@as(i64, hedge_multiplier) * s.min_rtt_us, 1000)));
         return @max(min_stagger_ms, @min(stagger_ms, max_hedge_stagger_ms));
     }
@@ -129,7 +130,8 @@ pub const RttState = struct {
         if (s.srtt_us == 0) return initial_timeout_ms;
         // RFC 6298, but never under 2× srtt: steady RTTs drive rttvar to 0
         // and then any jitter times out.
-        const base_us = @max(s.srtt_us + 4 * s.rttvar_us, 2 * s.srtt_us);
+        const srtt: i64 = s.srtt_us;
+        const base_us = @max(srtt + 4 * @as(i64, s.rttvar_us), 2 * srtt);
         const base_ms: u32 = @intCast(@max(1, @divTrunc(base_us, 1000)));
 
         const shift: u5 = @intCast(@min(s.consecutive_timeouts, max_backoff_shifts));
