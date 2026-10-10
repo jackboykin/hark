@@ -99,12 +99,8 @@ pub const Sim = struct {
         s.heard.deinit(s.gpa);
     }
 
-    pub fn random(s: *Sim) std.Random {
-        return s.prng.random();
-    }
-
     pub fn edge(s: *Sim) graph.Edge {
-        return .{ .ctx = s, .now_ns = &s.now_ns, .wall_sec = &s.wall_sec, .rng = s.random(), .sendFn = sendErased, .wakeFn = wakeErased };
+        return .{ .ctx = s, .now_ns = &s.now_ns, .wall_sec = &s.wall_sec, .rng = s.prng.random(), .sendFn = sendErased, .wakeFn = wakeErased };
     }
 
     fn sendErased(ctx: *anyopaque, ex: Exchange) anyerror!void {
