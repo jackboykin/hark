@@ -63,9 +63,9 @@ pub const Entry = struct {
     ede: ?u16 = null,
     /// ADJUST drop: a blackholed authority.
     drop: bool = false,
-    /// ADJUST force_lower_qname / force_upper_qname / drop_question: how
-    /// the responder echoes the question.
-    echo: enum { copy, lower, upper, none } = .copy,
+    /// ADJUST force_upper_qname / drop_question: how the responder echoes
+    /// the question.
+    echo: enum { copy, upper, none } = .copy,
     /// ADJUST unsigned: the signer leaves the entry alone (an unsigned zone
     /// served from a signed zone's address).
     unsigned: bool = false,
@@ -124,7 +124,6 @@ pub const Scenario = struct {
     minimal_responses: ?bool = null,
     rebinding_enabled: ?bool = null,
     rebinding_allow_zones: []const []const u8 = &.{},
-    rebinding_extra_block: []const []const u8 = &.{},
     rebinding_extra_allow: []const []const u8 = &.{},
     stagger_ms: ?u32 = null,
     max_queries: ?u32 = null,
@@ -242,7 +241,7 @@ const Parser = struct {
             if (servers.items.len == 0) return p.fail("stub-zone: no servers");
             const z: stub.Zone = .{ .apex = apex, .servers = servers.items };
             s.stub_zones = try mem.concat(p.arena, stub.Zone, &.{ s.stub_zones, &.{z} });
-        } else if (mem.eql(u8, key, "qname-minimisation") or mem.eql(u8, key, "qname-minimization")) {
+        } else if (mem.eql(u8, key, "qname-minimisation")) {
             s.qmin = yes(val);
         } else if (mem.eql(u8, key, "minimal-responses")) {
             s.minimal_responses = yes(val);
@@ -250,8 +249,6 @@ const Parser = struct {
             s.rebinding_enabled = yes(val);
         } else if (mem.eql(u8, key, "rebinding-allow-zone")) {
             s.rebinding_allow_zones = try appendStr(p.arena, s.rebinding_allow_zones, val);
-        } else if (mem.eql(u8, key, "rebinding-extra-block")) {
-            s.rebinding_extra_block = try appendStr(p.arena, s.rebinding_extra_block, val);
         } else if (mem.eql(u8, key, "rebinding-extra-allow")) {
             s.rebinding_extra_allow = try appendStr(p.arena, s.rebinding_extra_allow, val);
         } else if (mem.eql(u8, key, "stagger-ms")) {
@@ -365,15 +362,12 @@ const Parser = struct {
         const kind = enumIgnoreCase(Step.Kind, kind_str) orelse return p.fail("unknown STEP kind");
         switch (kind) {
             .time_passes => {
-                // `ELAPSE <n>` (corpus) or `EVAL "<n>"` (docs). A bare
-                // TIME_PASSES would advance by 0 and launder every check.
-                while (toks.next()) |t| {
-                    if (mem.eql(u8, t, "ELAPSE") or mem.eql(u8, t, "EVAL")) {
-                        const v = mem.trim(u8, toks.next() orelse break, "\"");
-                        return .{ .n = n, .kind = kind, .seconds = try p.int(u32, v) };
-                    }
-                }
-                return p.fail("TIME_PASSES needs `ELAPSE <n>` or `EVAL \"<n>\"`");
+                // A bare TIME_PASSES would advance by 0 and launder every
+                // check.
+                const elapse = toks.next() orelse "";
+                const seconds = toks.next() orelse "";
+                if (!mem.eql(u8, elapse, "ELAPSE") or toks.next() != null) return p.fail("TIME_PASSES needs `ELAPSE <n>`");
+                return .{ .n = n, .kind = kind, .seconds = try p.int(u32, seconds) };
             },
             .timeout, .unsent => return .{ .n = n, .kind = kind },
             .check_max_queries, .check_max_verifies, .check_max_runs => {
@@ -419,8 +413,6 @@ const Parser = struct {
                 while (toks.next()) |t| {
                     if (eqlLower(t, "drop")) {
                         e.drop = true;
-                    } else if (eqlLower(t, "force_lower_qname")) {
-                        e.echo = .lower;
                     } else if (eqlLower(t, "force_upper_qname")) {
                         e.echo = .upper;
                     } else if (eqlLower(t, "drop_question")) {
@@ -492,12 +484,6 @@ const Parser = struct {
             e.do_bit = true;
         } else if (mem.eql(u8, t, "EDNS")) {
             e.edns = true;
-        } else if (mem.eql(u8, t, "QUERY")) {
-            flags.opcode = .query;
-        } else if (mem.eql(u8, t, "NOTIFY")) {
-            flags.opcode = @fromBackingInt(4);
-        } else if (mem.eql(u8, t, "UPDATE")) {
-            flags.opcode = @fromBackingInt(5);
         } else if (rcodeFromText(t)) |rc| {
             flags.rcode = rc;
         } else return p.fail("unknown REPLY token");
@@ -836,10 +822,6 @@ fn rtypeFromText(t: []const u8) ?dns.RType {
     var buf: [16]u8 = undefined;
     if (t.len > buf.len) return null;
     const u = std.ascii.upperString(&buf, t);
-    if (mem.startsWith(u8, u, "TYPE")) {
-        const rtype: dns.RType = @fromBackingInt(std.fmt.parseInt(u16, u[4..], 10) catch return null);
-        return rtype;
-    }
     const table = .{
         .{ "A", dns.RType.a },                   .{ "NS", dns.RType.ns },         .{ "CNAME", dns.RType.cname },
         .{ "SOA", dns.RType.soa },               .{ "PTR", dns.RType.ptr },       .{ "MX", dns.RType.mx },

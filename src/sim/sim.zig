@@ -171,7 +171,6 @@ pub const Sim = struct {
         var question = q;
         switch (entry.echo) {
             .copy, .none => {},
-            .lower => question.name = try dns.cloneNameLower(s.arena, q.name),
             .upper => {
                 question.name = try dns.cloneNameFlat(s.arena, q.name, false);
                 for (question.name.labels) |l| for (@constCast(l)) |*c| {
@@ -323,7 +322,6 @@ pub const Sim = struct {
         const eq = e.questions[0];
         if (m.tcp and transport != .tcp) return false;
         if (m.udp and transport != .udp) return false;
-        if (m.opcode and e.flags.opcode != .query) return false;
         if (m.qtype and eq.qtype != q.qtype) return false;
         if (m.qname and !eq.name.eql(q.name)) return false;
         if (m.subdomain and !q.name.isSubdomainOf(eq.name)) return false;
