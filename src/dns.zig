@@ -1624,24 +1624,10 @@ test "name parsing - self pointer rejection" {
 }
 
 test "full query packet parse" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x0100, .big); // RD=1
-    mem.writeInt(u16, pkt[4..6], 1, .big); // qdcount
-    mem.writeInt(u16, pkt[6..8], 0, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-    const qname = "\x07example\x03com\x00";
-    @memcpy(pkt[12..][0..qname.len], qname);
-    var pos: usize = 12 + qname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // A
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-
+    const pkt = "\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    const msg = try parseMessage(arena.allocator(), pkt);
 
     try testing.expectEqual(@as(u16, 0x0001), msg.header.id);
     try testing.expect(msg.header.flags.rd);
@@ -1652,44 +1638,11 @@ test "full query packet parse" {
     try testing.expectEqual(RClass.in, msg.questions[0].qclass);
 }
 
-test "response with A records" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    // Header: id=0x1234, QR=1, RD=1, RA=1, qdcount=1, ancount=1
-    mem.writeInt(u16, pkt[0..2], 0x1234, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8180, .big);
-    mem.writeInt(u16, pkt[4..6], 1, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    const qname = "\x07example\x03com\x00";
-    @memcpy(pkt[12..][0..qname.len], qname);
-    var pos: usize = 12 + qname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // A
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-
-    pkt[pos] = 0xC0;
-    pkt[pos + 1] = 0x0C; // pointer to offset 12
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // A
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // TTL
-    pos += 4;
-    mem.writeInt(u16, pkt[pos..][0..2], 4, .big); // rdlength
-    pos += 2;
-    pkt[pos] = 93;
-    pkt[pos + 1] = 184;
-    pkt[pos + 2] = 216;
-    pkt[pos + 3] = 34;
-    pos += 4;
-
+test "A record parsing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    var pkt: [max_udp_payload]u8 = undefined;
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .a, &.{ 93, 184, 216, 34 }, 4));
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const rr = msg.answers[0];
@@ -1699,50 +1652,15 @@ test "response with A records" {
 }
 
 test "SOA record parsing" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big); // QR=1
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big); // 1 answer
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 6, .big); // SOA
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big); // TTL
-    pos += 4;
-
-    const mname = "\x02ns\x07example\x03com\x00";
-    const rname_data = "\x05admin\x07example\x03com\x00";
-    const rdlen = mname.len + rname_data.len + 20; // 5 x u32
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(rdlen), .big);
-    pos += 2;
-    @memcpy(pkt[pos..][0..mname.len], mname);
-    pos += mname.len;
-    @memcpy(pkt[pos..][0..rname_data.len], rname_data);
-    pos += rname_data.len;
-    mem.writeInt(u32, pkt[pos..][0..4], 2023010101, .big); // serial
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 3600, .big); // refresh
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 900, .big); // retry
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 604800, .big); // expire
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 86400, .big); // minimum
-    pos += 4;
-
+    var rd = TestRdata{};
+    rd.putBytes("\x02ns\x07example\x03com\x00");
+    rd.putBytes("\x05admin\x07example\x03com\x00");
+    for ([_]u32{ 2023010101, 3600, 900, 604800, 86400 }) |v| rd.put(u32, v);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    var pkt: [max_udp_payload]u8 = undefined;
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .soa, rd.slice(), rd.pos));
 
-    try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const soa = msg.answers[0].rdata.soa;
     try testing.expectEqualStrings("ns", soa.mname.labels[0]);
     try testing.expectEqualStrings("admin", soa.rname.labels[0]);
@@ -1754,36 +1672,13 @@ test "SOA record parsing" {
 }
 
 test "MX record parsing" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 15, .big); // MX
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big);
-    pos += 4;
-
-    const exchange = "\x04mail\x07example\x03com\x00";
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(2 + exchange.len), .big); // rdlength
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 10, .big); // preference
-    pos += 2;
-    @memcpy(pkt[pos..][0..exchange.len], exchange);
-    pos += exchange.len;
-
+    var rd = TestRdata{};
+    rd.put(u16, 10);
+    rd.putBytes("\x04mail\x07example\x03com\x00");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    var pkt: [max_udp_payload]u8 = undefined;
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .mx, rd.slice(), rd.pos));
 
     const mx = msg.answers[0].rdata.mx;
     try testing.expectEqual(@as(u16, 10), mx.preference);
@@ -1791,42 +1686,11 @@ test "MX record parsing" {
 }
 
 test "TXT record parsing" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 0x0001, .big);
-    mem.writeInt(u16, pkt[2..4], 0x8000, .big);
-    mem.writeInt(u16, pkt[4..6], 0, .big);
-    mem.writeInt(u16, pkt[6..8], 1, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 16, .big); // TXT
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big);
-    pos += 4;
-
-    const txt1 = "v=spf1 include:example.com";
-    const txt2 = "hello";
-    const rdlen = 1 + txt1.len + 1 + txt2.len;
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(rdlen), .big);
-    pos += 2;
-    pkt[pos] = @intCast(txt1.len);
-    pos += 1;
-    @memcpy(pkt[pos..][0..txt1.len], txt1);
-    pos += txt1.len;
-    pkt[pos] = @intCast(txt2.len);
-    pos += 1;
-    @memcpy(pkt[pos..][0..txt2.len], txt2);
-    pos += txt2.len;
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pos]);
+    var pkt: [max_udp_payload]u8 = undefined;
+    const rdata = "\x1av=spf1 include:example.com\x05hello";
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .txt, rdata, rdata.len));
 
     const txt = msg.answers[0].rdata.txt;
     try testing.expectEqual(@as(usize, 2), txt.strings.len);
@@ -1938,60 +1802,25 @@ test "edge case: empty message (too short)" {
 }
 
 test "edge case: truncated question" {
-    var pkt: [14]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 1, .big);
-    mem.writeInt(u16, pkt[2..4], 0, .big);
-    mem.writeInt(u16, pkt[4..6], 1, .big); // qdcount=1
-    mem.writeInt(u16, pkt[6..8], 0, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-    pkt[12] = 0x03; // label length 3
-    pkt[13] = 'a'; // but only 1 byte of data
-
+    // A three-byte label with one byte left.
+    const pkt = "\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03a";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), &pkt));
+    try testing.expectError(error.EndOfData, parseMessage(arena.allocator(), pkt));
 }
 
-test "edge case: max-length label" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 1, .big);
-    mem.writeInt(u16, pkt[2..4], 0, .big);
-    mem.writeInt(u16, pkt[4..6], 1, .big);
-    mem.writeInt(u16, pkt[6..8], 0, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    pkt[12] = 63;
-    @memset(pkt[13..][0..63], 'a');
-    pkt[76] = 0; // root
-    mem.writeInt(u16, pkt[77..79], 1, .big); // A
-    mem.writeInt(u16, pkt[79..81], 1, .big); // IN
-
+test "edge case: a 63-byte label parses, a 64-byte one is no label type" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..81]);
+    const header = "\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00";
 
-    try testing.expectEqual(@as(usize, 1), msg.questions.len);
+    const max = header ++ "\x3f" ++ @as([63]u8, @splat('a')) ++ "\x00\x00\x01\x00\x01";
+    const msg = try parseMessage(arena.allocator(), max);
     try testing.expectEqual(@as(usize, 63), msg.questions[0].name.labels[0].len);
-}
 
-test "edge case: oversized label" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    mem.writeInt(u16, pkt[0..2], 1, .big);
-    mem.writeInt(u16, pkt[2..4], 0, .big);
-    mem.writeInt(u16, pkt[4..6], 1, .big);
-    mem.writeInt(u16, pkt[6..8], 0, .big);
-    mem.writeInt(u16, pkt[8..10], 0, .big);
-    mem.writeInt(u16, pkt[10..12], 0, .big);
-
-    pkt[12] = 64;
-    @memset(pkt[13..][0..64], 'a');
-
-    // 64 = 0x40, top 2 bits = 01 → invalid label type per RFC 1035
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(error.InvalidLabelType, parseMessage(arena.allocator(), pkt[0..78]));
+    // 64 is 0x40: top bits 01, a label type RFC 1035 never defined.
+    const over = header ++ "\x40" ++ @as([64]u8, @splat('a'));
+    try testing.expectError(error.InvalidLabelType, parseMessage(arena.allocator(), over));
 }
 
 test "EDNS0: reserializing a parsed OPT response counts it once" {
@@ -2014,53 +1843,19 @@ test "EDNS0: serialized OPT has correct wire format" {
     var buf: [max_udp_payload]u8 = undefined;
     const wire = try serializeMessage(&buf, msg);
 
-    // ar_count in header should be 1 (the OPT record)
-    const ar_count = mem.readInt(u16, wire[10..12], .big);
-    try testing.expectEqual(@as(u16, 1), ar_count);
-
-    // Find the OPT record at the end: after header(12) + question section
-    // Question: \x01x\x03com\x00 (7 bytes) + qtype(2) + qclass(2) = 11 bytes
-    const opt_start = 12 + 11;
-
-    // root name
-    try testing.expectEqual(@as(u8, 0x00), wire[opt_start]);
-    // type 41
-    try testing.expectEqual(@as(u16, 41), mem.readInt(u16, wire[opt_start + 1 ..][0..2], .big));
-    // class = 4096
-    try testing.expectEqual(@as(u16, 4096), mem.readInt(u16, wire[opt_start + 3 ..][0..2], .big));
-    // TTL: DO bit set = 0x00008000
-    const ttl = mem.readInt(u32, wire[opt_start + 5 ..][0..4], .big);
-    try testing.expectEqual(@as(u32, 0x00008000), ttl);
-    // RDLENGTH = 0
-    try testing.expectEqual(@as(u16, 0), mem.readInt(u16, wire[opt_start + 9 ..][0..2], .big));
+    try testing.expectEqual(@as(u16, 1), mem.readInt(u16, wire[10..12], .big));
+    // After the 11-byte question: root owner, type 41, class 4096, a TTL
+    // holding only DO, no rdata.
+    try testing.expectEqualSlices(u8, "\x00\x00\x29\x10\x00\x00\x00\x80\x00\x00\x00", wire[12 + 11 ..]);
 }
 
 test "EDNS0: OPT with non-root owner is FORMERR (RFC 6891 §6.1.2)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Header: id=0x1234, flags=0x0100 (RD), qdcount=1, arcount=1
-    // Question: example.com A IN
-    // Additional: OPT with owner = "x." (NOT root) — RFC 6891 §6.1.2 violation.
-    const wire = [_]u8{
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        // QNAME example.com.
-        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
-        0x00,
-        // QTYPE=A, QCLASS=IN
-        0x00, 0x01, 0x00, 0x01,
-        // OPT owner "x." (label "x" then root)
-        0x01, 'x',  0x00,
-        // TYPE=OPT (41), CLASS=4096 (UDP payload)
-        0x00, 0x29, 0x10, 0x00,
-        // TTL: ext_rcode=0, version=0, flags=0
-        0x00, 0x00, 0x00, 0x00,
-        // RDLENGTH=0
-        0x00, 0x00,
-    };
-
-    try testing.expectError(error.FormatError, parseMessage(alloc, &wire));
+    // example.com A, then an OPT owned by "x.".
+    const wire = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\x00\x01\x00\x01" ++
+        "\x01x\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00";
+    try testing.expectError(error.FormatError, parseMessage(arena.allocator(), wire));
 }
 
 /// Single-allocation clone: labels slice and every label byte share one
@@ -2293,22 +2088,6 @@ test "isSubdomainOf: self, descendants and the root; case-insensitive; never a s
     try testing.expect(!(Name{ .labels = &.{ "a", "example", "com" } }).isSubdomainOf(.{ .labels = &.{ "b", "example", "com" } }));
 }
 
-fn testHeader(pkt: *[max_udp_payload]u8, opts: struct {
-    id: u16 = 0x0001,
-    flags: u16 = 0x8000,
-    qd: u16 = 0,
-    an: u16 = 1,
-    ns: u16 = 0,
-    ar: u16 = 0,
-}) void {
-    mem.writeInt(u16, pkt[0..2], opts.id, .big);
-    mem.writeInt(u16, pkt[2..4], opts.flags, .big);
-    mem.writeInt(u16, pkt[4..6], opts.qd, .big);
-    mem.writeInt(u16, pkt[6..8], opts.an, .big);
-    mem.writeInt(u16, pkt[8..10], opts.ns, .big);
-    mem.writeInt(u16, pkt[10..12], opts.ar, .big);
-}
-
 fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Message {
     const wire = try serializeMessage(wire_buf, msg);
     return parseMessage(allocator, wire);
@@ -2316,66 +2095,48 @@ fn testRoundtrip(allocator: Allocator, wire_buf: []u8, msg: Message) Error!Messa
 
 const TestRdata = struct {
     buf: [256]u8 = undefined,
-    pos: usize = 0,
+    pos: u16 = 0,
 
-    fn putU8(self: *TestRdata, v: u8) void {
-        if (self.pos + 1 > self.buf.len) @panic("TestRdata overflow");
-        self.buf[self.pos] = v;
-        self.pos += 1;
-    }
-    fn putU16(self: *TestRdata, v: u16) void {
-        if (self.pos + 2 > self.buf.len) @panic("TestRdata overflow");
-        mem.writeInt(u16, self.buf[self.pos..][0..2], v, .big);
-        self.pos += 2;
-    }
-    fn putU32(self: *TestRdata, v: u32) void {
-        if (self.pos + 4 > self.buf.len) @panic("TestRdata overflow");
-        mem.writeInt(u32, self.buf[self.pos..][0..4], v, .big);
-        self.pos += 4;
+    fn put(self: *TestRdata, comptime T: type, v: T) void {
+        mem.writeInt(T, self.buf[self.pos..][0..@sizeOf(T)], v, .big);
+        self.pos += @sizeOf(T);
     }
     fn putBytes(self: *TestRdata, v: []const u8) void {
-        if (self.pos + v.len > self.buf.len) @panic("TestRdata overflow");
         @memcpy(self.buf[self.pos..][0..v.len], v);
-        self.pos += v.len;
+        self.pos += @intCast(v.len);
     }
     fn slice(self: *const TestRdata) []const u8 {
         return self.buf[0..self.pos];
     }
 };
 
-fn testBuildAnswer(pkt: *[max_udp_payload]u8, rrname: []const u8, rtype_int: u16, ttl: u32, rdata: []const u8) usize {
-    testHeader(pkt, .{});
-    var pos: usize = 12;
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], rtype_int, .big);
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // class IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], ttl, .big);
-    pos += 4;
-    mem.writeInt(u16, pkt[pos..][0..2], @intCast(rdata.len), .big);
-    pos += 2;
-    @memcpy(pkt[pos..][0..rdata.len], rdata);
-    pos += rdata.len;
-    return pos;
+/// A response holding one answer, example.com IN 300, whose RDLENGTH
+/// says `rdlength` whatever `rdata` holds.
+fn testAnswer(pkt: *[max_udp_payload]u8, rtype: RType, rdata: []const u8, rdlength: u16) []const u8 {
+    const head = "\x00\x01\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00\x07example\x03com\x00";
+    @memcpy(pkt[0..head.len], head);
+    const at = head.len;
+    mem.writeInt(u16, pkt[at..][0..2], @backingInt(rtype), .big);
+    mem.writeInt(u16, pkt[at + 2 ..][0..2], 1, .big);
+    mem.writeInt(u32, pkt[at + 4 ..][0..4], 300, .big);
+    mem.writeInt(u16, pkt[at + 8 ..][0..2], rdlength, .big);
+    @memcpy(pkt[at + 10 ..][0..rdata.len], rdata);
+    return pkt[0 .. at + 10 + rdata.len];
 }
 
 test "DNSKEY record parse/serialize roundtrip" {
     // RDATA: flags=257 (KSK), protocol=3, algorithm=8 (RSA/SHA-256), key=16 bytes
     const key_data = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
     var rd = TestRdata{};
-    rd.putU16(257);
-    rd.putU8(3);
-    rd.putU8(8);
+    rd.put(u16, 257);
+    rd.put(u8, 3);
+    rd.put(u8, 8);
     rd.putBytes(&key_data);
 
     var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x00", 48, 172800, rd.slice());
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .dnskey, rd.slice(), rd.pos));
 
     try testing.expectEqual(@as(usize, 1), msg.answers.len);
     const dnskey = msg.answers[0].rdata.dnskey;
@@ -2399,17 +2160,15 @@ test "DS record parse/serialize roundtrip" {
     // RDATA: key_tag=20326, alg=8, digest_type=2 (SHA-256), digest=32 bytes
     const digest = [32]u8{ 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
     var rd = TestRdata{};
-    rd.putU16(20326);
-    rd.putU8(8);
-    rd.putU8(2);
+    rd.put(u16, 20326);
+    rd.put(u8, 8);
+    rd.put(u8, 2);
     rd.putBytes(&digest);
 
     var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 43, 86400, rd.slice());
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .ds, rd.slice(), rd.pos));
 
     const ds = msg.answers[0].rdata.ds;
     try testing.expectEqual(@as(u16, 20326), ds.key_tag);
@@ -2429,22 +2188,20 @@ test "RRSIG record parse/serialize roundtrip" {
     const signer_wire = "\x07example\x03com\x00";
     const fake_sig = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
     var rd = TestRdata{};
-    rd.putU16(1); // type_covered = A
-    rd.putU8(13); // algorithm = ECDSAP256SHA256
-    rd.putU8(2); // labels
-    rd.putU32(300); // original_ttl
-    rd.putU32(1700000000); // sig_expiration
-    rd.putU32(1699000000); // sig_inception
-    rd.putU16(12345); // key_tag
+    rd.put(u16, 1); // type_covered = A
+    rd.put(u8, 13); // algorithm = ECDSAP256SHA256
+    rd.put(u8, 2); // labels
+    rd.put(u32, 300); // original_ttl
+    rd.put(u32, 1700000000); // sig_expiration
+    rd.put(u32, 1699000000); // sig_inception
+    rd.put(u16, 12345); // key_tag
     rd.putBytes(signer_wire);
     rd.putBytes(&fake_sig);
 
     var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 46, 300, rd.slice());
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), rd.pos));
 
     const rrsig = msg.answers[0].rdata.rrsig;
     try testing.expectEqual(RType.a, rrsig.type_covered);
@@ -2482,11 +2239,9 @@ test "NSEC record parse/serialize roundtrip" {
     rd.putBytes(&bitmap);
 
     var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 47, 3600, rd.slice());
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, rd.slice(), rd.pos));
 
     const nsec = msg.answers[0].rdata.nsec;
     try testing.expectEqualStrings("host", nsec.next_domain_name.labels[0]);
@@ -2513,21 +2268,19 @@ test "NSEC3 record parse/serialize roundtrip" {
     const next_hash = [20]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
     const bitmap = [_]u8{ 0x00, 0x01, 0x40 }; // window 0, len 1, A bit set
     var rd = TestRdata{};
-    rd.putU8(1); // hash_algorithm (SHA-1)
-    rd.putU8(0); // flags
-    rd.putU16(10); // iterations
-    rd.putU8(@intCast(salt.len));
+    rd.put(u8, 1); // hash_algorithm (SHA-1)
+    rd.put(u8, 0); // flags
+    rd.put(u16, 10); // iterations
+    rd.put(u8, @intCast(salt.len));
     rd.putBytes(&salt);
-    rd.putU8(@intCast(next_hash.len));
+    rd.put(u8, @intCast(next_hash.len));
     rd.putBytes(&next_hash);
     rd.putBytes(&bitmap);
 
     var pkt: [max_udp_payload]u8 = undefined;
-    const pkt_len = testBuildAnswer(&pkt, "\x07example\x03com\x00", 50, 3600, rd.slice());
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const msg = try parseMessage(arena.allocator(), pkt[0..pkt_len]);
+    const msg = try parseMessage(arena.allocator(), testAnswer(&pkt, .nsec3, rd.slice(), rd.pos));
 
     const nsec3 = msg.answers[0].rdata.nsec3;
     try testing.expectEqual(Nsec3HashAlgorithm.sha1, nsec3.hash_algorithm);
@@ -2592,78 +2345,26 @@ test "safeTagName handles known and unknown enum values" {
 }
 
 test "RRSIG with signer name exceeding rdlength returns InvalidRDataLength" {
-    // Craft a packet where the RRSIG signer name extends past the declared rdlength.
-    // Before the fix this would cause an unsigned integer underflow (panic/UB).
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 46, .big); // RRSIG
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // TTL
-    pos += 4;
-
-    // Signer name "example.com." = 13 bytes on wire. 18 + 13 = 31, but set rdlength = 20.
-    const signer_wire = "\x07example\x03com\x00";
-    const rdlen: u16 = 20; // too small: 18 + signer_wire.len = 31
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // type_covered = A
-    pos += 2;
-    pkt[pos] = 13; // algorithm
-    pos += 1;
-    pkt[pos] = 2; // labels
-    pos += 1;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // original_ttl
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 1700000000, .big); // sig_expiration
-    pos += 4;
-    mem.writeInt(u32, pkt[pos..][0..4], 1699000000, .big); // sig_inception
-    pos += 4;
-    mem.writeInt(u16, pkt[pos..][0..2], 12345, .big); // key_tag
-    pos += 2;
-    @memcpy(pkt[pos..][0..signer_wire.len], signer_wire);
-    pos += signer_wire.len;
-
-    // Use arena to avoid leak detection on partial-parse error paths
+    var rd = TestRdata{};
+    rd.put(u16, 1); // type covered
+    rd.put(u8, 13); // algorithm
+    rd.put(u8, 2); // labels
+    for ([_]u32{ 300, 1700000000, 1699000000 }) |v| rd.put(u32, v);
+    rd.put(u16, 12345); // key tag
+    rd.putBytes("\x07example\x03com\x00");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const result = parseMessage(arena.allocator(), pkt[0..pos]);
-    try testing.expectError(error.InvalidRDataLength, result);
+    var pkt: [max_udp_payload]u8 = undefined;
+    // 18 fixed bytes and a 13-byte signer: 20 ends inside the signer.
+    try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .rrsig, rd.slice(), 20)));
 }
 
 test "NSEC with next domain name exceeding rdlength returns InvalidRDataLength" {
-    var pkt: [max_udp_payload]u8 = undefined;
-    testHeader(&pkt, .{});
-
-    var pos: usize = 12;
-    const rrname = "\x07example\x03com\x00";
-    @memcpy(pkt[pos..][0..rrname.len], rrname);
-    pos += rrname.len;
-    mem.writeInt(u16, pkt[pos..][0..2], 47, .big); // NSEC
-    pos += 2;
-    mem.writeInt(u16, pkt[pos..][0..2], 1, .big); // IN
-    pos += 2;
-    mem.writeInt(u32, pkt[pos..][0..4], 300, .big); // TTL
-    pos += 4;
-
-    // next domain "host.example.com." = 22 bytes, but set rdlength = 5
-    const next_domain_wire = "\x04host\x07example\x03com\x00";
-    const rdlen: u16 = 5;
-    mem.writeInt(u16, pkt[pos..][0..2], rdlen, .big);
-    pos += 2;
-    @memcpy(pkt[pos..][0..next_domain_wire.len], next_domain_wire);
-    pos += next_domain_wire.len;
-
+    const next = "\x04host\x07example\x03com\x00";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const result = parseMessage(arena.allocator(), pkt[0..pos]);
-    try testing.expectError(error.InvalidRDataLength, result);
+    var pkt: [max_udp_payload]u8 = undefined;
+    try testing.expectError(error.InvalidRDataLength, parseMessage(arena.allocator(), testAnswer(&pkt, .nsec, next, 5)));
 }
 
 test "applyCase0x20 only flips ASCII letters; round-trips eql" {
