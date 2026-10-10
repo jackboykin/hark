@@ -208,16 +208,12 @@ pub const Ask = struct {
         a.cut_short = a.cut_short or why.cause == .asker;
     }
 
-    fn heldMsg(a: *const Ask, g: *Graph) ?dns.Message {
-        return g.cell(a.held.unwrap() orelse return null).state.fact.exchange.reply.msg;
-    }
-
     /// Every server failed: bare SERVFAIL. An authority's REFUSED or
     /// FORMERR passed through reads as hark's own policy at the stub, and
     /// the randomised server order must not change what the stub sees.
     fn giveUp(a: *Ask, g: *Graph) Result {
         std.debug.assert(a.nattempts == 0);
-        var msg = a.heldMsg(g) orelse return .exhausted;
+        var msg = g.cell(a.held.unwrap() orelse return .exhausted).state.fact.exchange.reply.msg;
         msg.header.flags.rcode = .server_failure;
         msg.answers = &.{};
         msg.authorities = &.{};
