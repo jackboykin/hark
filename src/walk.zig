@@ -435,14 +435,14 @@ pub fn runCut(g: *Graph, id: CellId) !void {
         try s.ask.seed(g, pc);
         s.started = true;
     }
-    switch (try ask(g, id, &g.cell(id).scratch.cut.ask, name, .a)) {
+    switch (try ask(g, id, &s.ask, name, .a)) {
         .pending => return,
-        .exhausted => try g.fail(id, ended(g, &g.cell(id).scratch.cut.ask)),
+        .exhausted => try g.fail(id, ended(g, &s.ask)),
         .reply => |kept| {
             const msg = kept.msg;
             switch (delegation.probeStep(msg, name, pc.zone)) {
                 .referral => |ref| {
-                    const cut = try absorbReferral(g, id, ref, msg, pc.zone, g.cell(id).scratch.cut.ask.placed_until_ns);
+                    const cut = try absorbReferral(g, id, ref, msg, pc.zone, s.ask.placed_until_ns);
                     try g.settle(id, cut.value, cut.expires_ns);
                 },
                 // Each puts the name inside the parent's zone. Only an
@@ -627,37 +627,36 @@ pub fn runRrset(g: *Graph, id: CellId) !void {
         s.started = true;
     }
     while (true) {
-        switch (try ask(g, id, &g.cell(id).scratch.rrset.ask, name, qtype)) {
+        switch (try ask(g, id, &s.ask, name, qtype)) {
             .pending => return,
-            .exhausted => return g.failRemembered(id, ended(g, &g.cell(id).scratch.rrset.ask)),
+            .exhausted => return g.failRemembered(id, ended(g, &s.ask)),
             .reply => |kept| {
                 const msg = kept.msg;
-                const zone = g.cell(id).scratch.rrset.ask.zone;
+                const zone = s.ask.zone;
                 if (delegation.extractReferral(msg, name, zone)) |ref| {
                     // Each referral descends toward the name, so its depth
                     // bounds the walk.
                     std.debug.assert(name.isSubdomainOf(ref.zone_cut) and ref.zone_cut.labels.len > zone.labels.len);
-                    const s2 = g.cell(id).scratch.rrset;
-                    const cut = try absorbReferral(g, id, ref, msg, zone, s2.ask.placed_until_ns);
+                    const cut = try absorbReferral(g, id, ref, msg, zone, s.ask.placed_until_ns);
                     // The parent's referral to the zone itself is its
                     // answer about the zone's DS (RFC 4035 §3.1.4.1).
                     if (qtype == .ds and ref.zone_cut.eql(name)) {
                         const reply = try trust.referralDs(g, msg, zone, name);
                         return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
                     }
-                    s2.ask.reset(ref.zone_cut);
-                    try s2.ask.seed(g, cut.value.cut);
+                    s.ask.reset(ref.zone_cut);
+                    try s.ask.seed(g, cut.value.cut);
                     continue;
                 }
                 const reply = switch (kept.verdict) {
                     .reply => |r| r,
                     .loop => return g.failRemembered(id, Links.loop),
                     // No useful response (RFC 9520 §2).
-                    .none => return g.failRemembered(id, ended(g, &g.cell(id).scratch.rrset.ask)),
+                    .none => return g.failRemembered(id, ended(g, &s.ask)),
                 };
                 try publishAlias(g, id, name, qtype, reply);
                 try publishDnames(g, id, reply);
-                return settleRrset(g, id, reply);
+                return g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
             },
         }
     }
@@ -669,10 +668,6 @@ pub fn ended(g: *const Graph, a: *const Ask) Failure {
     const asked_all = a.nservers > 0 and !a.cut_short and (a.retried or a.untried() == 0);
     const zones: Failure = .{ .code = .no_reachable_authority, .cause = if (a.local) .host else .zone };
     return if (asked_all) zones else g.limit(g.payer) orelse g.payer.validationStop() orelse zones;
-}
-
-fn settleRrset(g: *Graph, id: CellId, reply: Reply) !void {
-    try g.settle(id, .{ .rrset = reply }, replyExpiry(reply));
 }
 
 /// A chain starting with a CNAME at `name` is also the fact
