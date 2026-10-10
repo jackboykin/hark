@@ -1501,15 +1501,9 @@ pub const Graph = struct {
             if (err != error.Refused) return err;
             return null;
         };
-        return g.kept(key, blob);
-    }
-
-    /// `blob`, if it is what the store holds for `key`: a put may refuse
-    /// it, or evict it as it lands.
-    fn kept(g: *Graph, key: Key, blob: ?*store.Blob) ?*store.Blob {
-        const b = blob orelse return null;
+        // A put may evict what it lands as it lands.
         const e = g.store.any(key) orelse return null;
-        return if (e.blob == b) b else null;
+        return if (e.blob == blob) blob else null;
     }
 
     // ── Rules ──────────────────────────────────────────────────────────
