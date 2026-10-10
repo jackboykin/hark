@@ -648,7 +648,6 @@ pub const Graph = struct {
     /// `dnskey(zone)` ahead of need.
     pub fn fetchKeys(g: *Graph, zone: dns.Name) !void {
         var kb: KeyBuf = undefined;
-        if (g.spent(g.payer)) return;
         _ = try g.ahead(Key.of(&kb, .rrset, zone, .dnskey), zone);
     }
 
