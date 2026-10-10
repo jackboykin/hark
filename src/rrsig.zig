@@ -153,27 +153,13 @@ pub const VerifyMemo = struct {
     }
 };
 
-/// Compute the key tag for a DNSKEY record per RFC 4034 Appendix B.
-/// The key tag is a checksum over the DNSKEY RDATA wire format.
+/// RFC 4034 Appendix B.
 pub fn keyTag(dnskey: dns.DnskeyData) u16 {
-    var ac: u32 = 0;
-
-    // DNSKEY RDATA wire: flags(2) + protocol(1) + algorithm(1) + public_key
-    // Accumulate 16-bit words
-    ac += @as(u32, dnskey.flags);
+    var ac: u32 = dnskey.flags;
     ac += @as(u32, dnskey.protocol) << 8 | @backingInt(dnskey.algorithm);
-
-    var i: usize = 0;
-    while (i < dnskey.public_key.len) : (i += 1) {
-        if (i & 1 == 0) {
-            ac += @as(u32, dnskey.public_key[i]) << 8;
-        } else {
-            ac += @as(u32, dnskey.public_key[i]);
-        }
-    }
-
+    for (dnskey.public_key, 0..) |b, i| ac += if (i & 1 == 0) @as(u32, b) << 8 else b;
     ac += (ac >> 16) & 0xFFFF;
-    return @intCast(ac & 0xFFFF);
+    return @truncate(ac);
 }
 
 // ── Canonical Name Wire Format (RFC 4034 §6.1) ──────────────────────
