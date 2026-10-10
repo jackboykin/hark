@@ -494,17 +494,24 @@ pub const Cell = struct {
     arena: Arena,
 
     comptime {
-        std.debug.assert(@sizeOf(Cell) <= 384);
+        std.debug.assert(@sizeOf(Cell) <= 176);
     }
 
-    pub const State = union(enum) { pending, fact: Value, failure: Failure };
+    /// What it settled on lives in its arena: pending, it carries none.
+    pub const State = union(enum) { pending, fact: *Value, failure: *const Failure };
 
     pub fn settled(c: *const Cell) bool {
         return c.state != .pending;
     }
 
     pub fn failure(c: *const Cell) ?Failure {
-        return if (c.state == .failure) c.state.failure else null;
+        return if (c.state == .failure) c.state.failure.* else null;
+    }
+
+    fn own(c: *Cell, v: anytype) !*@TypeOf(v) {
+        const p = try c.arena.allocator().create(@TypeOf(v));
+        p.* = v;
+        return p;
     }
 
     fn inFlight(c: *const Cell, g: *Graph) bool {
@@ -1045,7 +1052,6 @@ pub const Graph = struct {
             },
             else => {},
         };
-        c.state = .{ .fact = value };
         c.expires_ns = expires_ns;
         switch (value) {
             .cut, .rrset, .stub, .ds, .dnskey => {
@@ -1053,16 +1059,17 @@ pub const Graph = struct {
                 defer clock.stop();
                 const blob = try g.store.build(value);
                 c.blob = blob;
-                c.state.fact = try store.Store.parse(c.arena.allocator(), blob);
+                c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), blob)) };
                 if (!g.awaitsVerdict(c.key.kind)) try g.keep(id);
             },
+            .addr, .answer, .exchange, .refresh, .ahead, .parental => c.state = .{ .fact = try c.own(value) },
             .secure => |v| {
+                c.state = .{ .fact = try c.own(value) };
                 if (v.status == .secure) g.stats.trust.secure += 1 else g.stats.trust.insecure += 1;
                 const t = c.scratch.secure.target;
                 if (g.cell(t).blob) |b| b.verdict.stamp(v, c.expires_ns, g.now());
                 try g.keep(t);
             },
-            .addr, .answer, .exchange, .refresh, .ahead, .parental => {},
         }
         try g.woken(id, value == .answer);
     }
@@ -1075,14 +1082,15 @@ pub const Graph = struct {
         std.debug.assert(!c.settled() and c.key.kind == .rrset);
         std.debug.assert(!g.awaitsVerdict(c.key.kind) or v.blob.verdict.judged());
         g.tally.settles += 1;
-        c.state = .{ .fact = try store.Store.parse(c.arena.allocator(), v.blob) };
+        c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), v.blob)) };
         c.blob = v.blob.ref();
         c.expires_ns = v.life().end_ns;
         try g.woken(id, false);
     }
 
     /// An rrset's bytes as its judge read them, set before the verdict is
-    /// stamped on them (`trust.keepWeighed`).
+    /// stamped on them (`trust.keepWeighed`). In place: the judge reads
+    /// on through the fact it holds.
     pub fn narrow(g: *Graph, id: CellId, reply: Reply) !void {
         const c = g.cell(id);
         const blob = try g.store.build(.{ .rrset = reply });
@@ -1090,7 +1098,7 @@ pub const Graph = struct {
         const parsed = try store.Store.parse(c.arena.allocator(), blob);
         if (c.blob) |b| g.store.unref(b);
         c.blob = blob;
-        c.state.fact = parsed;
+        c.state.fact.* = parsed;
     }
 
     /// With DNSSEC on, an rrset is no fact until judged: its bytes wait in
@@ -1106,7 +1114,7 @@ pub const Graph = struct {
         if (c.expires_ns <= g.now()) return;
         if (g.store.any(c.key)) |e| if (e.blob == blob) return;
         if (try g.forgets(.keep, c.key)) return;
-        const at = switch (c.state.fact) {
+        const at = switch (c.state.fact.*) {
             .rrset, .stub => |r| r.stored_ns,
             else => g.now(),
         };
@@ -1127,7 +1135,7 @@ pub const Graph = struct {
             std.debug.print("  {t}({s}) failed: {t} {s}\n", .{ c.key.kind, c.name.formatInto(&nb), why.code, why.text });
         }
         if (c.key.kind == .secure and why.code == .dnssec_bogus) g.stats.trust.bogus += 1;
-        c.state = .{ .failure = why };
+        c.state = .{ .failure = try c.own(why) };
         c.expires_ns = g.now();
         try g.woken(id, false);
     }
@@ -1281,7 +1289,7 @@ pub const Graph = struct {
 
     fn liveFact(g: *Graph, id: CellId) ?Fact {
         const c = g.cell(id);
-        return if (c.state == .fact) .{ .value = c.state.fact, .expires_ns = c.expires_ns } else null;
+        return if (c.state == .fact) .{ .value = c.state.fact.*, .expires_ns = c.expires_ns } else null;
     }
 
     /// A live fact serves the running rule while it outlives the payer's
@@ -1309,11 +1317,9 @@ pub const Graph = struct {
 
     fn materialise(g: *Graph, key: Key, name: dns.Name, e: store.Entry) !CellId {
         const id = try g.newCell(key, name);
+        errdefer g.free(id);
         const c = g.cell(id);
-        c.state = .{ .fact = store.Store.parse(c.arena.allocator(), e.blob) catch |err| {
-            g.free(id);
-            return err;
-        } };
+        c.state = .{ .fact = try c.own(try store.Store.parse(c.arena.allocator(), e.blob)) };
         c.blob = e.blob.ref();
         c.expires_ns = e.expires_ns;
         return id;
