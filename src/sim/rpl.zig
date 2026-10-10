@@ -627,13 +627,7 @@ const Parser = struct {
                 const hash_algorithm: dns.Nsec3HashAlgorithm = @fromBackingInt(try p.int(u8, try p.word(toks)));
                 const flags = try p.int(u8, try p.word(toks));
                 const iterations = try p.int(u16, try p.word(toks));
-                const salt_text = try p.word(toks);
-                const salt = if (mem.eql(u8, salt_text, "-")) "" else salt: {
-                    if (salt_text.len % 2 != 0) return p.fail("odd-length hex");
-                    const out = try p.arena.alloc(u8, salt_text.len / 2);
-                    _ = std.fmt.hexToBytes(out, salt_text) catch return p.fail("bad hex");
-                    break :salt out;
-                };
+                const salt = try p.word(toks);
                 const next_text = try p.word(toks);
                 const hashed = try p.arena.alloc(u8, next_text.len * 5 / 8);
                 const n = dns.base32HexDecode(hashed, next_text) catch return p.fail("bad base32hex");
@@ -641,7 +635,7 @@ const Parser = struct {
                     .hash_algorithm = hash_algorithm,
                     .flags = flags,
                     .iterations = iterations,
-                    .salt = salt,
+                    .salt = if (mem.eql(u8, salt, "-")) "" else try p.unhex(salt),
                     .next_hashed_owner = hashed[0..n],
                     .type_bit_maps = try p.typeBitmap(toks),
                 } };
@@ -679,9 +673,13 @@ const Parser = struct {
     fn hex(p: *Parser, toks: *mem.TokenIterator(u8, .any)) Error![]const u8 {
         var text: std.ArrayList(u8) = .empty;
         while (toks.next()) |t| try text.appendSlice(p.arena, t);
-        if (text.items.len % 2 != 0) return p.fail("odd-length hex");
-        const out = try p.arena.alloc(u8, text.items.len / 2);
-        _ = std.fmt.hexToBytes(out, text.items) catch return p.fail("bad hex");
+        return p.unhex(text.items);
+    }
+
+    fn unhex(p: *Parser, text: []const u8) Error![]const u8 {
+        if (text.len % 2 != 0) return p.fail("odd-length hex");
+        const out = try p.arena.alloc(u8, text.len / 2);
+        _ = std.fmt.hexToBytes(out, text) catch return p.fail("bad hex");
         return out;
     }
 
