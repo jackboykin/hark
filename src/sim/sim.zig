@@ -235,10 +235,7 @@ pub const Sim = struct {
     /// Names a query by what it asks and how many times it was asked.
     fn ask(s: *Sim, server: na.Address, q: dns.Question, transport: Transport) !std.hash.Wyhash {
         var h = std.hash.Wyhash.init(0);
-        const key = na.AddressKey.fromAddress(server);
-        h.update(&key.addr);
-        h.update(mem.asBytes(&key.port));
-        h.update(mem.asBytes(&key.family));
+        hashServer(&h, server);
         var nb: [dns.max_dotted_len + 1]u8 = undefined;
         h.update(q.name.formatLower(&nb));
         h.update(mem.asBytes(&q.qtype));
@@ -278,13 +275,8 @@ pub const Sim = struct {
     /// interleavings. Keyed by the query rather than draw order, so a run
     /// that asks in another order meets the same network.
     fn latency(s: *Sim, server: na.Address, asked: std.hash.Wyhash) i64 {
-        // By field: the struct has padding and AddressKey's own hash
-        // folds in a per-process seed.
         var h = std.hash.Wyhash.init(0);
-        const key = na.AddressKey.fromAddress(server);
-        h.update(&key.addr);
-        h.update(mem.asBytes(&key.port));
-        h.update(mem.asBytes(&key.family));
+        hashServer(&h, server);
         const base_ms: i64 = 2 + @as(i64, @intCast(h.final() % 39));
         const quarter = @divTrunc(base_ms, 4);
         const span: u64 = @intCast(2 * quarter + 1);
@@ -293,6 +285,15 @@ pub const Sim = struct {
         const draw = drawn.final();
         const jitter = @as(i64, @intCast(std.math.mulWide(u64, draw, span) >> 64)) - quarter;
         return (base_ms + jitter) * std.time.ns_per_ms;
+    }
+
+    /// By field: the struct has padding and AddressKey's own hash folds in
+    /// a per-process seed.
+    fn hashServer(h: *std.hash.Wyhash, server: na.Address) void {
+        const key = na.AddressKey.fromAddress(server);
+        h.update(&key.addr);
+        h.update(mem.asBytes(&key.port));
+        h.update(mem.asBytes(&key.family));
     }
 
     fn serves(s: *const Sim, server: na.Address) bool {
