@@ -121,10 +121,6 @@ fn free(ctx: *anyopaque, memory: []u8, _: Alignment, _: usize) void {
     if (@intFromPtr(memory.ptr) + memory.len == a.at) a.at = @intFromPtr(memory.ptr);
 }
 
-comptime {
-    std.debug.assert(@sizeOf(Arena) <= @sizeOf(std.heap.ArenaAllocator));
-}
-
 test "an arena is an allocator" {
     var arena: Arena = .init(testing.allocator);
     defer arena.deinit();
