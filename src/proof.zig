@@ -372,8 +372,7 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
     return has_nsec and has_nsec3;
 }
 
-/// Validate an NXDOMAIN or NODATA response using NSEC/NSEC3 proofs.
-/// Returns the security status of the negative proof.
+/// What an authority section proves about `qname`, NODATA or NXDOMAIN.
 ///
 /// `zone` is the signer the caller authenticated these records under. It is
 /// not optional bookkeeping: geometry alone cannot tell an unrelated zone's
@@ -381,9 +380,6 @@ fn hasMixedNsecNsec3(authorities: []const dns.ResourceRecord) bool {
 /// NSEC out of any signed zone denies arbitrary names (`zzz.example.net NSEC
 /// example.net` covers victim.com, the closest encloser clamps to root, and
 /// the same record covers the wildcard).
-///
-/// Tests that exercise pure range geometry pass root, which makes the check
-/// vacuous by construction.
 pub fn validateNegativeProof(
     authorities: []const dns.ResourceRecord,
     qname: dns.Name,
@@ -394,22 +390,32 @@ pub fn validateNegativeProof(
 ) SecurityStatus {
     // A proof signed by some other zone says nothing about this name.
     if (!qname.isSubdomainOf(zone)) return .bogus;
-
     if (hasMixedNsecNsec3(authorities)) return .bogus;
+    // An owner outside the signing zone cannot be part of its chain, so it
+    // is not proof material here regardless of what its range spans.
+    for (authorities) |rr| {
+        if (rr.rtype == .nsec and rr.name.isSubdomainOf(zone))
+            return validateNsecNegativeProof(authorities, qname, qtype, is_nxdomain, zone);
+    }
+    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
+}
 
+/// RFC 4035 §5.4, RFC 6840 §4.1 and §4.3.
+fn validateNsecNegativeProof(
+    authorities: []const dns.ResourceRecord,
+    qname: dns.Name,
+    qtype: dns.RType,
+    is_nxdomain: bool,
+    zone: dns.Name,
+) SecurityStatus {
     // One scan for both shapes: matching_nsec (owner == qname) → direct NODATA;
     // covering_nsec (range covers qname) → wildcard-NODATA (§3.1.3.4) or
     // NXDOMAIN-shape-under-NOERROR (§5.4 — proof shape is signed, not rcode).
     var matching_nsec: ?dns.ResourceRecord = null;
     var covering_nsec: ?dns.ResourceRecord = null;
     var ent = false;
-    var any_nsec = false;
     for (authorities) |rr| {
-        if (rr.rtype != .nsec) continue;
-        // An owner outside the signing zone cannot be part of its chain, so
-        // it is not proof material here regardless of what its range spans.
-        if (!rr.name.isSubdomainOf(zone)) continue;
-        any_nsec = true;
+        if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
         if (matching_nsec == null and rr.name.eql(qname)) matching_nsec = rr;
         if (covering_nsec == null and
             nsecProvesNameNonexistence(rr.name, rr.rdata.nsec, qname))
@@ -419,54 +425,10 @@ pub fn validateNegativeProof(
         if (nsecProvesEnt(rr.name, rr.rdata.nsec, qname)) ent = true;
     }
 
-    // NODATA arm. Bitmap contradicting NODATA → .bogus (signed, hence forgery).
-    if (!is_nxdomain and any_nsec) {
-        if (matching_nsec) |rr| {
-            // Answered from the wrong side of its own cut: unusable, not
-            // contradictory (RFC 6840 §4.1/§4.4). A parent-side NSEC owed us
-            // a referral; a child-side one owed us nothing about DS.
-            if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
-                return .unchecked;
-            return if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype)) .bogus else .secure;
-        }
-
-        // ENT before wildcard (Unbound nsec_proves_nodata): every qmin step
-        // through ip6.arpa's nibble tree lands here.
-        if (ent) return .secure;
-
-        if (covering_nsec) |cov| {
-            const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
-                return .unchecked;
-
-            var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
-            const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
-
-            for (authorities) |rr| {
-                if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
-                if (rr.name.eql(wildcard)) {
-                    // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
-                    // A wildcard delegation's parent-side record denies
-                    // nothing (RFC 6840 §4.1).
-                    if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
-                        return .unchecked;
-                    if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
-                        return .bogus;
-                    return .secure;
-                }
-                // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
-                // A wildcard that is itself an ENT matches and owns nothing:
-                // also NODATA.
-                if (nsecCovers(rr.name, rr.rdata.nsec, wildcard))
-                    return .secure;
-            }
-            return .unchecked;
-        }
-    }
-
-    // RFC 4035 §5.4: NXDOMAIN requires both name denial AND wildcard denial at
-    // the closest encloser. The CE is the longest label-suffix of qname that is
-    // also a suffix of the covering NSEC's owner or next_domain_name.
-    if (is_nxdomain and any_nsec) {
+    // NXDOMAIN requires both name denial AND wildcard denial at the closest
+    // encloser. The CE is the longest label-suffix of qname that is also a
+    // suffix of the covering NSEC's owner or next_domain_name.
+    if (is_nxdomain) {
         const covering = covering_nsec orelse return .unchecked;
         const ce = closestEncloser(qname, covering.name, covering.rdata.nsec.next_domain_name) orelse
             return .unchecked;
@@ -490,7 +452,46 @@ pub fn validateNegativeProof(
         return if (wildcard_denied) .secure else .unchecked;
     }
 
-    return validateNsec3NegativeProof(authorities, qname, qtype, is_nxdomain, zone, budget);
+    // NODATA. Bitmap contradicting NODATA → .bogus (signed, hence forgery).
+    if (matching_nsec) |rr| {
+        // Answered from the wrong side of its own cut: unusable, not
+        // contradictory (RFC 6840 §4.1/§4.4). A parent-side NSEC owed us
+        // a referral; a child-side one owed us nothing about DS.
+        if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
+            return .unchecked;
+        return if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype)) .bogus else .secure;
+    }
+
+    // ENT before wildcard (Unbound nsec_proves_nodata): every qmin step
+    // through ip6.arpa's nibble tree lands here.
+    if (ent) return .secure;
+
+    const cov = covering_nsec orelse return .unchecked;
+    const ce = closestEncloser(qname, cov.name, cov.rdata.nsec.next_domain_name) orelse
+        return .unchecked;
+
+    var wc_labels_buf: [dns.max_label_count + 1][]const u8 = undefined;
+    const wildcard = dns.makeWildcardName(&wc_labels_buf, ce) orelse return .unchecked;
+
+    for (authorities) |rr| {
+        if (rr.rtype != .nsec or !rr.name.isSubdomainOf(zone)) continue;
+        if (rr.name.eql(wildcard)) {
+            // §3.1.3.4: *.CE exists; qtype + CNAME must be absent.
+            // A wildcard delegation's parent-side record denies
+            // nothing (RFC 6840 §4.1).
+            if (wrongSideOfCut(rr.rdata.nsec.type_bit_maps, qname, qtype))
+                return .unchecked;
+            if (bitmapContradictsNodata(rr.rdata.nsec.type_bit_maps, qtype))
+                return .bogus;
+            return .secure;
+        }
+        // §5.4 proof under NOERROR rcode: *.CE denied + qname denied.
+        // A wildcard that is itself an ENT matches and owns nothing:
+        // also NODATA.
+        if (nsecCovers(rr.name, rr.rdata.nsec, wildcard))
+            return .secure;
+    }
+    return .unchecked;
 }
 
 const Nsec3ChainParams = union(enum) {
