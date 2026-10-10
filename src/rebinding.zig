@@ -34,13 +34,6 @@ const na = @import("net_address.zig");
 
 const log = std.log.scoped(.rebinding);
 
-/// Inline cap on marks-bitmap size. Realistic sections are tiny
-/// (1–10 RRs; ~50 worst case before UDP truncation kicks in), so the
-/// common path uses a stack-resident array. TCP responses can carry far
-/// more RRs — `scrub` heap-allocates marks for those rather than falling
-/// back to a less-correct path.
-const max_inline_marks = 128;
-
 /// Operator-supplied rebinding policy. Lives in `ServerConfig` and is
 /// referenced (not copied) by `ResponseContext`.
 pub const Config = struct {
@@ -125,48 +118,33 @@ fn svcbHintsPrivate(rdata: []const u8, cfg: Config) bool {
     return false;
 }
 
-/// Single pass over one message section: mark + log drops in a marks
-/// bitmap, then copy the keep-set if anything would be dropped. Fast
-/// path (no drops) returns the input slice unchanged with zero
-/// allocation. Single evaluation of `shouldDrop` per RR — no fragility
-/// if the predicate ever gains side effects.
-///
-/// Marks live on the stack for the common case; large sections (TCP
-/// responses with hundreds of RRs) get a heap-allocated bitmap so the
-/// orphan-RRSIG sweep below applies uniformly.
+/// The section without what `shouldDrop` marks, nor the RRSIGs over a set
+/// that lost a member: they no longer match it. A section that loses
+/// nothing is returned as is, allocating nothing.
 pub fn scrub(
     alloc: mem.Allocator,
     records: []const dns.WireRecord,
     cfg: Config,
 ) mem.Allocator.Error![]const dns.WireRecord {
-    if (!cfg.enabled or records.len == 0) return records;
+    if (!cfg.enabled) return records;
+    const first = for (records, 0..) |rr, i| {
+        if (shouldDrop(rr, cfg)) break i;
+    } else return records;
 
-    var marks_inline: [max_inline_marks]bool = undefined;
-    var marks_heap: ?[]bool = null;
-    defer if (marks_heap) |h| alloc.free(h);
-    const marks: []bool = if (records.len <= max_inline_marks)
-        marks_inline[0..records.len]
-    else blk: {
-        marks_heap = try alloc.alloc(bool, records.len);
-        break :blk marks_heap.?;
-    };
-
-    var drop_count: usize = 0;
-    var first_drop: usize = 0;
-    for (records, 0..) |rr, i| {
-        marks[i] = shouldDrop(rr, cfg);
-        if (marks[i]) {
-            if (drop_count == 0) first_drop = i;
-            drop_count += 1;
-        }
+    const marks = try alloc.alloc(bool, records.len);
+    defer alloc.free(marks);
+    @memset(marks[0..first], false);
+    marks[first] = true;
+    var drop_count: usize = 1;
+    for (records[first + 1 ..], marks[first + 1 ..]) |rr, *m| {
+        m.* = shouldDrop(rr, cfg);
+        drop_count += @intFromBool(m.*);
     }
-    if (drop_count == 0) return records;
 
     var labels: [dns.max_label_count][]const u8 = undefined;
     var name_buf: [dns.max_dotted_len + 1]u8 = undefined;
-    log.info("scrub dropped={d} owner={s}", .{ drop_count, dns.nameOfWire(records[first_drop].owner, &labels).formatLower(&name_buf) });
+    log.info("scrub dropped={d} owner={s}", .{ drop_count, dns.nameOfWire(records[first].owner, &labels).formatLower(&name_buf) });
 
-    // An rrset that lost a member no longer matches its RRSIG, so the RRSIG goes too.
     for (records, 0..) |rr, i| {
         if (marks[i]) continue;
         const covered = rr.covers() orelse continue;
@@ -181,8 +159,8 @@ pub fn scrub(
 
     const out = try alloc.alloc(dns.WireRecord, records.len - drop_count);
     var j: usize = 0;
-    for (records, 0..) |rr, i| {
-        if (marks[i]) continue;
+    for (records, marks) |rr, m| {
+        if (m) continue;
         out[j] = rr;
         j += 1;
     }
@@ -329,31 +307,11 @@ test "svcb hints: malformed rdata is drop-biased past the TargetName, pass-biase
     try testing.expect(shouldDrop(rrHttps(public_name, named), cfg));
 }
 
-test "scrub heap path: >128-RR section drops private A and the orphaned RRSIG" {
+test "scrub drops a private A and the RRSIG over its set" {
     const cfg = Config{ .enabled = true, .allow_zones = &.{}, .extra_block = &.{}, .extra_allow = &.{} };
-
-    const public_count = 100;
-    const private_count = 100;
-    var answers: [public_count + private_count + 1]dns.WireRecord = undefined;
-    var idx: usize = 0;
-    for (0..public_count) |i| {
-        answers[idx] = rrA(public_name, .{ 8, 8, @intCast(i >> 8), @intCast(i & 0xff) });
-        idx += 1;
-    }
-    for (0..private_count) |i| {
-        answers[idx] = rrA(public_name, .{ 192, 168, @intCast(i >> 8), @intCast(i & 0xff) });
-        idx += 1;
-    }
-    answers[idx] = rrsigOver(.a); // orphaned once any member of its rrset is scrubbed
-
-    try testing.expect(answers.len > max_inline_marks); // guards the heap branch
-
+    const answers = [_]dns.WireRecord{ rrA(public_name, .{ 8, 8, 8, 8 }), rrA(public_name, .{ 192, 168, 0, 1 }), rrsigOver(.a) };
     const scrubbed = try scrub(testing.allocator, &answers, cfg);
     defer testing.allocator.free(scrubbed);
-
-    try testing.expectEqual(@as(usize, public_count), scrubbed.len);
-    for (scrubbed) |rr| {
-        try testing.expectEqual(dns.RType.a, rr.rtype()); // RRSIG dropped, no private survived
-        try testing.expect(!na.isSpecialUseIp4(rr.rdata()[0..4].*));
-    }
+    try testing.expectEqual(1, scrubbed.len);
+    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, scrubbed[0].rdata());
 }
