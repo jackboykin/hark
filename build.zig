@@ -5,9 +5,8 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Test-only knobs (upstream-port, allow-loopback-upstreams) only parse
-    // when this is true. Default false keeps production builds clean; the
-    // live harness runs `zig build -Dtesting=true`.
+    // Test-only config keys and the harness's clock parse only when this is
+    // true; the live harness builds with it.
     const testing_enabled = b.option(bool, "testing", "Enable test-only config knobs") orelse false;
     const strip = b.option(bool, "strip", "Omit debug info (default: on unless Debug)") orelse
         (optimize != .debug);

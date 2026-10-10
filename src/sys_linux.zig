@@ -1,6 +1,6 @@
-//! Linux syscall wrappers with error unions, matching the old posix.*
-//! signatures. Reach them through sys_union.zig; import this file directly
-//! only for what has no meaning off Linux (signalfd).
+//! Linux syscall wrappers with error unions. Reach them through
+//! sys_union.zig; import this file directly only for what has no meaning
+//! off Linux (signalfd).
 //!
 //! sendto/write retry on EINTR internally. SIGINT/SIGTERM are blocked
 //! and delivered via signalfd, but other unblocked signals (SIGPIPE,
