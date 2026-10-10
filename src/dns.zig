@@ -973,10 +973,7 @@ const Parser = struct {
                 const data = try self.readSlice(16);
                 return .{ .aaaa = data[0..16].* };
             },
-            .ns => return .{ .ns = try self.parseNameRdata(allocator, rdlength) },
-            .cname => return .{ .cname = try self.parseNameRdata(allocator, rdlength) },
-            .dname => return .{ .dname = try self.parseNameRdata(allocator, rdlength) },
-            .ptr => return .{ .ptr = try self.parseNameRdata(allocator, rdlength) },
+            inline .ns, .cname, .dname, .ptr => |t| return @unionInit(RData, @tagName(t), try self.parseNameRdata(allocator, rdlength)),
             .mx => {
                 const rdata_end = self.pos + rdlength;
                 const preference = try self.readU16();
