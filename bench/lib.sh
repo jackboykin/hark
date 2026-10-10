@@ -5,7 +5,8 @@
 # resolver's cores from the rest at random, siblings idle, and gives the
 # load what remains.
 # env: CCD (the last), N (resolver threads, 1), V6=0 (no AAAA servers),
-# LATENCY_MS (netem on lo), PERF=1 (counters on the resolver's cores).
+# LATENCY_MS (netem on lo), PERF=1 (counters on the resolver's cores),
+# PERF_EVENTS (perf stat -e list, default cycles,instructions).
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 P=$B/config
 PORT=5354
@@ -35,7 +36,7 @@ ns() {
   [[ ${IN_NS:-} ]] && return
   [[ ${PERF:-} ]] || exec env IN_NS=1 unshare -Urn "$0" "$@"
   PERF_DIR=$(mktemp -d)
-  "$B/perfd.sh" "$PERF_DIR" &
+  "$B/perfd.sh" "$PERF_DIR" ${PERF_EVENTS:-} &
   local pd=$! rc
   until [[ -p $PERF_DIR/out ]]; do kill -0 "$pd" 2>/dev/null || exit 1; sleep 0.05; done
   env IN_NS=1 PERF_DIR="$PERF_DIR" unshare -Urn "$0" "$@"; rc=$?
