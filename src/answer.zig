@@ -615,14 +615,16 @@ fn sameRecord(a: dns.WireRecord, b: dns.WireRecord) bool {
 /// RFC's 5 minutes; an answer forgets it. Keyed (qname, qtype, CD), since a
 /// CD client is owed bogus data. Policy over no fact, so it is the server's.
 pub const Failures = struct {
-    map: std.HashMapUnmanaged([]const u8, Entry, Seeded, std.hash_map.default_max_load_percentage) = .empty,
+    /// Array-backed: every answer removes, and a tombstoning map's misses
+    /// would probe ever longer.
+    map: std.ArrayHashMapUnmanaged([]const u8, Entry, Seeded, true) = .empty,
 
     const Entry = struct { until_ns: i64, window_s: u32, ede: dns.Ede };
     const Seeded = struct {
-        pub fn hash(_: Seeded, k: []const u8) u64 {
-            return std.hash.Wyhash.hash(rand.hash_seed, k);
+        pub fn hash(_: Seeded, k: []const u8) u32 {
+            return @truncate(std.hash.Wyhash.hash(rand.hash_seed, k));
         }
-        pub fn eql(_: Seeded, a: []const u8, b: []const u8) bool {
+        pub fn eql(_: Seeded, a: []const u8, b: []const u8, _: usize) bool {
             return std.mem.eql(u8, a, b);
         }
     };
@@ -630,8 +632,7 @@ pub const Failures = struct {
     const max_entries = 4096;
 
     pub fn deinit(f: *Failures, gpa: Allocator) void {
-        var it = f.map.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
+        for (f.map.keys()) |k| gpa.free(k);
         f.map.deinit(gpa);
     }
 
@@ -666,7 +667,7 @@ pub const Failures = struct {
         var buf: [dns.max_dotted_len + 4]u8 = undefined;
         const k = key(&buf, q, cd);
         if (forgets) {
-            if (f.map.fetchRemove(k)) |kv| gpa.free(kv.key);
+            if (f.map.fetchSwapRemove(k)) |kv| gpa.free(kv.key);
             return;
         }
         if (served.hold_until_ns > 0) return f.put(gpa, k, .{ .until_ns = served.hold_until_ns, .window_s = first_s, .ede = served.ede.? });
@@ -685,16 +686,17 @@ pub const Failures = struct {
         try f.put(gpa, k, .{ .until_ns = now_ns + @as(i64, first_s) * std.time.ns_per_s, .window_s = first_s, .ede = ede });
     }
 
-    /// Past `max_entries` an arbitrary other question is forgotten.
+    /// Past `max_entries` another question is forgotten, one the seeded
+    /// hash of this one picks: arbitrary, and no asker's to choose.
     fn put(f: *Failures, gpa: Allocator, k: []const u8, e: Entry) !void {
         if (f.map.getPtr(k)) |old| {
             old.* = e;
             return;
         }
         if (f.map.count() >= max_entries) {
-            var it = f.map.keyIterator();
-            const old = it.next().?.*;
-            _ = f.map.remove(old);
+            const at = Seeded.hash(.{}, k) % f.map.count();
+            const old = f.map.keys()[at];
+            f.map.swapRemoveAt(at);
             gpa.free(old);
         }
         const own = try gpa.dupe(u8, k);
@@ -787,4 +789,11 @@ test "a failure is remembered, backs off while it persists, and an answer forget
     ok.rcode = .no_error;
     try f.note(testing.allocator, q, false, ok, 5, 17 * s);
     try testing.expectEqual(0, f.map.count());
+    // Past the bound, each question remembered forgets another.
+    for (0..Failures.max_entries + 2) |t| {
+        var other = q;
+        other.qtype = @fromBackingInt(@intCast(t));
+        try f.note(testing.allocator, other, false, failed, 5, 0);
+    }
+    try testing.expectEqual(Failures.max_entries, f.map.count());
 }
