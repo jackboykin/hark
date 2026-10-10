@@ -224,10 +224,10 @@ pub const Desk = struct {
     pub fn memory(d: *Desk, arena: Allocator, q: dns.Question, c: Client, how: enum { fresh, live, floored, stale }) !?Served {
         const aq = try d.asked(arena, q, c);
         const served = try switch (how) {
-            .fresh => fresh(arena, d.g, d.retention, aq, c, d.minimal, true),
-            .live => fresh(arena, d.g, d.retention, aq, c, d.minimal, false),
-            .floored => floored(arena, d.g, d.retention, aq, c, d.minimal),
-            .stale => stale(arena, d.g, d.retention, aq, c, d.minimal),
+            .fresh => fresh(d, arena, aq, c, true),
+            .live => fresh(d, arena, aq, c, false),
+            .floored => floored(d, arena, aq, c),
+            .stale => stale(d, arena, aq, c),
         } orelse return null;
         const x = Dns64.on(d.dns64, c) orelse return served;
         // Synthesis needs the A: the graph's to fetch.
@@ -243,7 +243,7 @@ pub const Desk = struct {
     }
 
     pub fn built(d: *Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
-        return build(arena, d.g, d.retention, root, try d.asked(arena, q, c), c, d.minimal);
+        return build(d, arena, root, try d.asked(arena, q, c), c);
     }
 
     /// Under DNS64, the A to ask for behind `served`, an empty AAAA (§5.1.2).
@@ -257,7 +257,7 @@ pub const Desk = struct {
 
     pub fn finish(d: *Desk, arena: Allocator, q: dns.Question, c: Client, served: Served, a: ?graph.CellId) !Served {
         const x = Dns64.on(d.dns64, c) orelse return served;
-        const from = if (a) |id| try build(arena, d.g, d.retention, id, aOf(q), c, d.minimal) else null;
+        const from = if (a) |id| try build(d, arena, id, aOf(q), c) else null;
         return try x.shape(arena, q, served, from);
     }
 
@@ -291,7 +291,9 @@ const Hop = struct {
 
 /// When `min-ttl` lets a reply go: its TTL floored, under the negative cap
 /// and its signatures' validity. TTL 0 is never floored.
-fn retainedUntil(g: *graph.Graph, ret: Retention, r: store.Rrset) i64 {
+fn retainedUntil(d: *const Desk, r: store.Rrset) i64 {
+    const g = d.g;
+    const ret = d.retention;
     const own = walk.replyExpiry(r);
     if (r.ttl == 0 or r.ttl >= ret.min_ttl) return own;
     var floor: i64 = ret.min_ttl;
@@ -307,21 +309,19 @@ fn retainedUntil(g: *graph.Graph, ret: Retention, r: store.Rrset) i64 {
     return @max(own, until);
 }
 
-fn floorOf(g: *graph.Graph, ret: Retention, r: store.Rrset) u32 {
-    const retained = @divTrunc(retainedUntil(g, ret, r) - r.stored_ns, std.time.ns_per_s);
-    return @min(ret.min_ttl, @as(u32, @intCast(std.math.clamp(retained, 0, std.math.maxInt(u32)))));
-}
-
-fn hopOf(g: *graph.Graph, ret: Retention, b: *store.Blob, r: store.Rrset) Hop {
-    return .{ .blob = b, .rrset = r, .floor = floorOf(g, ret, r) };
+fn hopOf(d: *const Desk, b: *store.Blob, r: store.Rrset) Hop {
+    const retained = @divTrunc(retainedUntil(d, r) - r.stored_ns, std.time.ns_per_s);
+    const floor = @min(d.retention.min_ttl, @as(u32, @intCast(std.math.clamp(retained, 0, std.math.maxInt(u32)))));
+    return .{ .blob = b, .rrset = r, .floor = floor };
 }
 
 /// The answer cell shaped for a client: a failure or bogus is SERVFAIL
 /// unless serve-stale has something, bogus data only to CD; a verified
 /// hop's TTLs end with its proof, signatures only to DO, AD only when asked
 /// (RFC 6840 §5.7).
-pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.CellId, q: dns.Question, c: Client, minimal: bool) !Served {
-    if (failureOf(g, root, c.cd)) |why| return try stale(arena, g, ret, q, c, minimal) orelse servfailOf(q, why);
+fn build(d: *const Desk, arena: Allocator, root: graph.CellId, q: dns.Question, c: Client) !Served {
+    const g = d.g;
+    if (failureOf(g, root, c.cd)) |why| return try stale(d, arena, q, c) orelse servfailOf(q, why);
     const a = g.cell(root).state.fact.answer;
     std.debug.assert(a.hops.len > 0);
     // Secure only if every hop is judged secure; a failed verdict is bogus
@@ -331,7 +331,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
     for (hops, a.hops) |*hop, h| {
         // Every rrset cell settles or loads through a blob.
         const b = g.cell(h.set).blob.?;
-        hop.* = hopOf(g, ret, b, .of(b));
+        hop.* = hopOf(d, b, .of(b));
         const j = h.judge.unwrap() orelse {
             secure = false;
             continue;
@@ -346,7 +346,7 @@ pub fn build(arena: Allocator, g: *graph.Graph, ret: Retention, root: graph.Cell
             .pending => unreachable,
         }
     }
-    return shape(arena, g, q, c, minimal, hops, secure, g.cell(root).expires_ns > g.now());
+    return shape(d, arena, q, c, hops, secure, g.cell(root).expires_ns > g.now());
 }
 
 pub fn failureOf(g: *graph.Graph, root: graph.CellId, cd: bool) ?graph.Failure {
@@ -363,13 +363,14 @@ fn lifeOf(g: *graph.Graph, proven_until_ns: i64) u32 {
     return @intCast(@min(@max(@divTrunc(proven_until_ns - g.now(), std.time.ns_per_s), 0), std.math.maxInt(u32)));
 }
 
-fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool, yield_last_tenth: bool) !?Served {
+fn fresh(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, yield_last_tenth: bool) !?Served {
+    const g = d.g;
     const chain = try g.recall(arena, q.name, q.qtype, .fresh) orelse return null;
     var secure = true;
     var first: ?store.Life = null;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
-        hop.* = hopOf(g, ret, h.blob, h.rrset);
+        hop.* = hopOf(d, h.blob, h.rrset);
         const life: store.Life = .of(hop.rrset.stored_ns, h.expires_ns, h.blob.verdict);
         if (first == null or life.end_ns < first.?.end_ns) first = life;
         if (!g.awaitsVerdict(h.kind)) {
@@ -381,43 +382,45 @@ fn fresh(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: 
         hop.life = lifeOf(g, v.proven_until_ns);
     }
     if (yield_last_tenth and g.cfg.prefetch and first.?.inLastTenth(g.now())) return null;
-    return try shape(arena, g, q, c, minimal, hops, secure, true);
+    return try shape(d, arena, q, c, hops, secure, true);
 }
 
 /// `min-ttl`: a question whose facts have expired but not their floor is
 /// answered from memory, unverified, asking nobody. Null: ask the graph.
-pub fn floored(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
-    if (ret.min_ttl == 0) return null;
+fn floored(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
+    const g = d.g;
+    if (d.retention.min_ttl == 0) return null;
     const chain = try g.recall(arena, q.name, q.qtype, .any) orelse return null;
     var expired = false;
     for (chain) |h| {
-        if (g.now() >= retainedUntil(g, ret, h.rrset)) return null;
+        if (g.now() >= retainedUntil(d, h.rrset)) return null;
         expired = expired or g.now() >= walk.replyExpiry(h.rrset);
     }
     if (!expired) return null;
     const hops = try arena.alloc(Hop, chain.len);
-    for (hops, chain) |*hop, h| hop.* = hopOf(g, ret, h.blob, h.rrset);
-    return try shape(arena, g, q, c, minimal, hops, false, true);
+    for (hops, chain) |*hop, h| hop.* = hopOf(d, h.blob, h.rrset);
+    return try shape(d, arena, q, c, hops, false, true);
 }
 
 /// RFC 8767: an answer past its retention but inside the stale window,
 /// unverified, with EDE 3 or 19; the question is then held stale for
 /// `stale_hold_s`, or until the window ends. Null: nothing to serve.
-pub fn stale(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question, c: Client, minimal: bool) !?Served {
-    if (ret.serve_stale_ttl == 0) return null;
+fn stale(d: *const Desk, arena: Allocator, q: dns.Question, c: Client) !?Served {
+    const g = d.g;
+    if (d.retention.serve_stale_ttl == 0) return null;
     const chain = try g.recall(arena, q.name, q.qtype, .any) orelse return null;
     var window: i64 = std.math.maxInt(i64);
     var any = false;
     const hops = try arena.alloc(Hop, chain.len);
     for (hops, chain) |*hop, h| {
-        const until = retainedUntil(g, ret, h.rrset);
-        window = @min(window, until + @as(i64, ret.serve_stale_ttl) * std.time.ns_per_s);
-        hop.* = hopOf(g, ret, h.blob, h.rrset);
+        const until = retainedUntil(d, h.rrset);
+        window = @min(window, until + @as(i64, d.retention.serve_stale_ttl) * std.time.ns_per_s);
+        hop.* = hopOf(d, h.blob, h.rrset);
         hop.stale = g.now() >= until;
         any = any or hop.stale;
     }
     if (!any or g.now() >= window) return null;
-    var served = try shape(arena, g, q, c, minimal, hops, false, false);
+    var served = try shape(d, arena, q, c, hops, false, false);
     served.hold_until_ns = g.now() + stale_hold_s * std.time.ns_per_s;
     return served;
 }
@@ -425,7 +428,8 @@ pub fn stale(arena: Allocator, g: *graph.Graph, ret: Retention, q: dns.Question,
 /// The one shaper: every reply from the store or the graph passes here,
 /// and here only the keep rules below and the TTLs are decided. The
 /// rebinding scrub is the wire's (`response.buildResponseWire`).
-fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal: bool, hops: []const Hop, secure: bool, cacheable: bool) !Served {
+fn shape(d: *const Desk, arena: Allocator, q: dns.Question, c: Client, hops: []const Hop, secure: bool, cacheable: bool) !Served {
+    const g = d.g;
     const held = try arena.alloc(*store.Blob, hops.len);
     var answers: std.ArrayList(dns.WireRecord) = .empty;
     var n: usize = 0;
@@ -458,7 +462,7 @@ fn shape(arena: Allocator, g: *graph.Graph, q: dns.Question, c: Client, minimal:
     }
     const r = last.rrset;
     // Unbound's positive_answer() carve-out: NS asked, the NS and glue are the answer (RFC 8109 priming).
-    const trim = minimal and q.qtype != .ns;
+    const trim = d.minimal and q.qtype != .ns;
     var authorities: std.ArrayList(dns.WireRecord) = .empty;
     var seen: Seen = .{ .bound = proofs };
     var additionals: std.ArrayList(dns.WireRecord) = .empty;
