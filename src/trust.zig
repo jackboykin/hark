@@ -106,7 +106,7 @@ const no_cut: Failure = .{ .code = .dnssec_bogus, .text = "no insecure cut prove
 /// stop is the limit's, named, and a zone draining its own budget must not
 /// drop a victim's bytes.
 fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
-    if (budgetSpent(g)) |why| return g.fail(id, why);
+    if (g.payer.validationStop()) |why| return g.fail(id, why);
     if (g.limit(g.payer) == null) {
         const t = g.cell(rid);
         t.expires_ns = @min(t.expires_ns, g.now());
@@ -115,16 +115,11 @@ fn failBogus(g: *Graph, id: CellId, rid: CellId) !void {
     try g.fail(id, bogus);
 }
 
-/// A query budget or deadline is named only where an input failed on it.
-fn budgetSpent(g: *Graph) ?Failure {
-    return g.payer.validationStop();
-}
-
 /// A zone's DS or keys proven bogus: demanding them again is refused for
 /// `servfail_ttl`, since judging them again per question is KeyTrap's lever
 /// (RFC 9520 §3.4).
 fn failChain(g: *Graph, id: CellId, rid: CellId) !void {
-    if (budgetSpent(g) == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
+    if (g.payer.validationStop() == null and g.limit(g.payer) == null) try g.remember(g.cell(id).key, bogus);
     try failBogus(g, id, rid);
 }
 
@@ -173,7 +168,7 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     if (!rs.settled()) return;
     if (s.fault == null) {
         s.fault = try judgeDs(g, id, s, zone, rs) orelse return;
-        if (budgetSpent(g)) |why| return g.fail(id, why);
+        if (g.payer.validationStop()) |why| return g.fail(id, why);
     }
     switch (try s.probe.run(g, id, parent_zone, parent_name)) {
         .pending => {},
@@ -246,9 +241,9 @@ fn judgeDs(g: *Graph, id: CellId, s: *DsScratch, zone: dns.Name, rs: *const grap
                         try g.keep(s.rrset.unwrap().?);
                         try g.settle(id, .{ .ds = .{ .status = .absent, .records = r.authorities } }, until);
                     },
-                    else => try g.fail(id, budgetSpent(g) orelse no_cut),
+                    else => try g.fail(id, g.payer.validationStop() orelse no_cut),
                 },
-                .bogus => try g.fail(id, budgetSpent(g) orelse no_cut),
+                .bogus => try g.fail(id, g.payer.validationStop() orelse no_cut),
             }
         },
         .alias, .yxdomain => unreachable,
@@ -374,7 +369,7 @@ pub fn runSecure(g: *Graph, id: CellId) !void {
     while (true) {
         if (s.fault == null) {
             s.fault = try judge(g, id, s, t, @min(t.expires_ns, zd.expires_ns)) orelse return;
-            if (budgetSpent(g)) |why| return g.fail(id, why);
+            if (g.payer.validationStop()) |why| return g.fail(id, why);
         }
         const c = Claims.at(&t.state.fact.rrset, t.key.rtype, s.next);
         // A proof is excused only where the data it speaks for is: the
