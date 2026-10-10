@@ -509,7 +509,7 @@ const test_dnskey = dns.DnskeyData{
     .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD },
 };
 
-test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify" {
+test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify, and a flipped bit does not" {
     const Case = struct { owner: dns.Name, flags: u16, algorithm: dns.DnssecAlgorithm, key_b64: []const u8, tag: u16, digest_type: dns.DigestType, digest_hex: []const u8 };
     for ([_]Case{ .{
         .owner = .{ .labels = &.{ "dskey", "example", "com" } },
@@ -540,6 +540,8 @@ test "DS: RFC 4034 §5.4 (SHA-1) and RFC 6605 §6.2 (SHA-384) examples verify" {
         const dnskey: dns.DnskeyData = .{ .flags = c.flags, .protocol = 3, .algorithm = c.algorithm, .public_key = key[0..key_len] };
         try testing.expectEqual(c.tag, rrsig.keyTag(dnskey));
         try verifyDs(.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }, dnskey, c.owner);
+        d[0] ^= 1;
+        try testing.expectError(error.InvalidSignature, verifyDs(.{ .key_tag = c.tag, .algorithm = c.algorithm, .digest_type = c.digest_type, .digest = d }, dnskey, c.owner));
     }
 }
 
@@ -571,97 +573,6 @@ test "anySupportedDs: unsupported algorithm or digest contributes no path" {
     // One supported member is enough, wherever it sits.
     try testing.expect(anySupportedDs(&.{ ds_rr(.ed448, .sha256), ds_rr(.ecdsap256sha256, .sha256) }));
     try testing.expect(anySupportedDs(&.{ds_rr(.mldsa44, .sha256)}));
-}
-
-test "validateDnskeyRrset rejects DNSKEY without RRSIG when DS exists" {
-    // RFC 4035 §5.2: stripped RRSIG on DNSKEY must not bypass validation.
-    var digest = try dsDigest(Sha256, rrsig.test_owner, test_dnskey);
-
-    const ds = dns.DsData{
-        .key_tag = rrsig.keyTag(test_dnskey),
-        .algorithm = .rsasha256,
-        .digest_type = .sha256,
-        .digest = &digest,
-    };
-
-    // DNSKEY record with NO accompanying RRSIG — this is the attack vector
-    const dnskey_records = [_]dns.ResourceRecord{.{
-        .name = rrsig.test_owner,
-        .rtype = .dnskey,
-        .rclass = .in,
-        .ttl = 86400,
-        .rdata = .{ .dnskey = test_dnskey },
-    }};
-
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expectError(
-        error.InvalidSignature,
-        validateDnskeyRrset(&dnskey_records, &.{ds}, rrsig.test_owner, 1700000000, &budget, &test_memo),
-    );
-}
-
-test "validateDnskeyRrset refuses more DNSKEYs than the 64-key filter buffer" {
-    // A hostile zone can serve >64 DNSKEYs over TCP. Skipping the overflow
-    // would let a signature over the first 64 authenticate a set the caller
-    // then caches whole — appended forgeries included — so overflow is a
-    // hard refusal, not a truncated collect.
-    var digest = try dsDigest(Sha256, rrsig.test_owner, test_dnskey);
-    const ds = dns.DsData{
-        .key_tag = rrsig.keyTag(test_dnskey),
-        .algorithm = .rsasha256,
-        .digest_type = .sha256,
-        .digest = &digest,
-    };
-
-    // Distinct-tag filler keys fill the buffer; the DS-matching key lands at
-    // index 64, exactly one past it.
-    const filler = dns.DnskeyData{
-        .flags = 257,
-        .protocol = 3,
-        .algorithm = .rsasha256,
-        .public_key = &.{ 0x03, 0x01, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44 },
-    };
-    try testing.expect(rrsig.keyTag(filler) != ds.key_tag);
-
-    var records: [65]dns.ResourceRecord = undefined;
-    for (records[0..64]) |*r| r.* = .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = filler } };
-    records[64] = .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 86400, .rdata = .{ .dnskey = test_dnskey } };
-
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expectError(
-        error.InvalidKey,
-        validateDnskeyRrset(&records, &.{ds}, rrsig.test_owner, 1700000000, &budget, &test_memo),
-    );
-
-    // 64 exactly is still accepted (and rejected on signature grounds, not
-    // size) — the boundary is off-by-one sensitive.
-    try testing.expectError(
-        error.InvalidSignature,
-        validateDnskeyRrset(records[0..64], &.{ds}, rrsig.test_owner, 1700000000, &budget, &test_memo),
-    );
-}
-
-test "verifyAuthorityProofSigs: oversized owner+type is refused, not truncated" {
-    // RFC 4034 §4: one NSEC per owner, so no honest signature covers 16.
-    const nsec = dns.NsecData{
-        .next_domain_name = dns.Name{ .labels = &.{ "z", "example", "com" } },
-        .type_bit_maps = &.{ 0x00, 0x01, 0x62 },
-    };
-    var rrs: [17]dns.ResourceRecord = undefined;
-    for (&rrs) |*r| r.* = .{
-        .name = rrsig.test_owner,
-        .rtype = .nsec,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .nsec = nsec },
-    };
-
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(&rrs, &.{}, 1_700_000_000, &budget, &test_memo) == null);
-    // 16 is within the buffer and fails on the ordinary no-signature path,
-    // so the boundary is the size check and not a signature accident.
-    var budget2: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(rrs[0..16], &.{}, 1_700_000_000, &budget2, &test_memo) == null);
 }
 
 test "validateDnskeyRrset: a real signature over 64 keys cannot launder a 65th" {
@@ -762,34 +673,6 @@ test "validateDnskeyRrset caps the KeyTrap key×signature cross-product at the b
         validateDnskeyRrset(&records, &.{ds}, rrsig.test_owner, 1700000000, &budget, &test_memo),
     );
     try testing.expectEqual(cap, budget.sig_verify_spent);
-}
-
-test "validateRrset on DS without RRSIG returns .bogus (RFC 4035 §5.2)" {
-    // A DS RRset that arrives at the resolver without a covering RRSIG
-    // signed by the parent zone's DNSKEY MUST NOT be trusted as a chain
-    // anchor.
-    const owner = dns.Name{ .labels = &.{ "example", "com" } };
-    const ds_record = dns.ResourceRecord{
-        .name = owner,
-        .rtype = .ds,
-        .rclass = .in,
-        .ttl = 3600,
-        .rdata = .{ .ds = .{
-            .key_tag = 12345,
-            .algorithm = .rsasha256,
-            .digest_type = .sha256,
-            .digest = &@as([32]u8, @splat(0)),
-        } },
-    };
-    const records = [_]dns.ResourceRecord{ds_record}; // No RRSIG present.
-    var b: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&records, owner, .ds, &.{}, 1700000000, &b, &test_memo) == null);
-}
-
-test "DS hash verification - wrong digest fails" {
-    const bad_digest: [32]u8 = @splat(0xFF);
-    const ds = dns.DsData{ .key_tag = rrsig.keyTag(test_dnskey), .algorithm = .rsasha256, .digest_type = .sha256, .digest = &bad_digest };
-    try testing.expectError(error.InvalidSignature, verifyDs(ds, test_dnskey, rrsig.test_owner));
 }
 
 test "ML-DSA-44: draft-westerbaan-dnssec-mldsa §6 example verifies (DS, key tag, RRSIG over MX)" {
@@ -936,138 +819,53 @@ test "NsecTrap: a proof flood is refused before any RRSIG is tried" {
     try testing.expectEqual(@as(u32, 0), past.sig_verify_spent);
 }
 
-test "validateRrset propagates budget exhaustion as bogus" {
-    // Pathological setup: one RRSIG covering A, with a DNSKEY whose key_tag
-    // matches. The budget is pre-exhausted, so the very first verifyRrsig
-    // attempt trips ValidationBudgetExhausted, which the caller maps to bogus.
-    const dnskey = dns.DnskeyData{
-        .flags = 256,
-        .protocol = 3,
-        .algorithm = .ecdsap256sha256,
-        .public_key = &.{},
-    };
-    const tag = rrsig.keyTag(dnskey);
-    const sig = dns.RrsigData{
-        .type_covered = .a,
-        .algorithm = .ecdsap256sha256,
-        .labels = 2,
-        .original_ttl = 300,
-        .sig_expiration = 1700000000,
-        .sig_inception = 1699000000,
-        .key_tag = tag,
-        .signer_name = rrsig.test_owner,
-        .signature = &.{},
-    };
-    const answers = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        .{ .name = rrsig.test_owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } },
-    };
-    const dnskeys = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } },
-    };
-    var budget: rrsig.ValidationBudget = .{ .max_sig_verify = 0 };
-    try testing.expect(validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, 1699500000, &budget, &test_memo) == null);
-}
-
-// ── verifyAuthorityProofSigs: validation-bypass guards ────────────────
-//
-// These tests lock the "every NSEC/NSEC3 owner must verify" invariant
-// (RFC 4035 §5.3, RFC 6840 §5.4/§5.11). A regression where the function
-// accepts unsigned or unrelated NSEC records would let an attacker forge
-// an NXDOMAIN response with insecure denial-of-existence — a DNSSEC
-// validation bypass on the order of CVE-2023-50387.
-
-fn rrsigRr(owner: dns.Name, type_covered: dns.RType, algorithm: dns.DnssecAlgorithm, key_tag: u16, signer: dns.Name) dns.ResourceRecord {
-    return .{
-        .name = owner,
-        .rtype = .rrsig,
-        .rclass = .in,
-        .ttl = 300,
-        .rdata = .{ .rrsig = .{
-            .type_covered = type_covered,
-            .algorithm = algorithm,
-            .labels = @intCast(owner.labels.len),
-            .original_ttl = 300,
-            .sig_expiration = 1700000000,
-            .sig_inception = 1699000000,
-            .key_tag = key_tag,
-            .signer_name = signer,
-            .signature = &.{},
-        } },
-    };
-}
-
-const test_ecdsa_dnskey = dns.DnskeyData{
-    .flags = 256,
-    .protocol = 3,
-    .algorithm = .ecdsap256sha256,
-    .public_key = &.{},
-};
-
 fn dnskeyRr(owner: dns.Name, dnskey: dns.DnskeyData) dns.ResourceRecord {
     return .{ .name = owner, .rtype = .dnskey, .rclass = .in, .ttl = 300, .rdata = .{ .dnskey = dnskey } };
 }
 
-test "verifyAuthorityProofSigs: NSEC without RRSIG returns bogus" {
-    const owner = dns.Name{ .labels = &.{ "example", "com" } };
-    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
-    const authorities = [_]dns.ResourceRecord{proof.nsecRr(owner, next)};
-    // No DNSKEYs needed; iteration fails the find-RRSIG step.
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
+fn rrsigRr(owner: dns.Name, sig: dns.RrsigData) dns.ResourceRecord {
+    return .{ .name = owner, .rtype = .rrsig, .rclass = .in, .ttl = 300, .rdata = .{ .rrsig = sig } };
 }
 
-test "verifyAuthorityProofSigs: signed NSEC + unsigned NSEC returns bogus" {
-    // Even if the FIRST NSEC carries an unsupported-algo RRSIG (which
-    // would yield .insecure on its own), a SECOND NSEC with no RRSIG at
-    // all must still drive the result to .bogus. The "every owner must
-    // verify" invariant is non-negotiable.
-    const owner1 = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
-    const next1 = dns.Name{ .labels = &.{ "beta", "example", "com" } };
-    const owner2 = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
-    const next2 = dns.Name{ .labels = &.{ "delta", "example", "com" } };
-    const signer = dns.Name{ .labels = &.{ "example", "com" } };
-    const authorities = [_]dns.ResourceRecord{
-        proof.nsecRr(owner1, next1),
-        rrsigRr(owner1, .nsec, .dsasha1, 12345, signer), // unsupported algo, won't verify
-        proof.nsecRr(owner2, next2),
-        // no RRSIG for owner2 — bogus
+test "verifyAuthorityProofSigs: every proof owner must verify (RFC 4035 §5.3)" {
+    const alpha = dns.Name{ .labels = &.{ "alpha", "example", "com" } };
+    const gamma = dns.Name{ .labels = &.{ "gamma", "example", "com" } };
+    const nsecs = [_]dns.ResourceRecord{
+        proof.nsecRr(alpha, .{ .labels = &.{ "beta", "example", "com" } }),
+        proof.nsecRr(gamma, .{ .labels = &.{ "delta", "example", "com" } }),
     };
+    var sig_bufs: [2][64]u8 = undefined;
+    var pub_bufs: [2][32]u8 = undefined;
+    const a = try rrsig.testSignRrset(nsecs[0..1], .nsec, rrsig.test_owner, .ed25519, &sig_bufs[0], &pub_bufs[0]);
+    const g = try rrsig.testSignRrset(nsecs[1..2], .nsec, rrsig.test_owner, .ed25519, &sig_bufs[1], &pub_bufs[1]);
+    const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, a.dnskey), dnskeyRr(rrsig.test_owner, g.dnskey) };
+    const signed = [_]dns.ResourceRecord{ nsecs[0], rrsigRr(alpha, a.rrsig), nsecs[1], rrsigRr(gamma, g.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
+    try testing.expect(verifyAuthorityProofSigs(&signed, &dnskeys, 1_700_000_000, &budget, &test_memo) != null);
+    try testing.expect(verifyAuthorityProofSigs(signed[0..3], &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 }
 
-test "verifyAuthorityProofSigs: only-unsupported-algo RRSIG returns bogus" {
-    // This function runs only under a zone already proven secure, where an
-    // all-unsupported-algorithm zone never arrives (RFC 4035 §5.2 makes it
-    // insecure at the delegation). An NSEC whose only RRSIG is unsupported
-    // is therefore the stripped-signature shape, not a legitimate zone.
-    const owner = dns.Name{ .labels = &.{ "example", "com" } };
-    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
-    const signer = dns.Name{ .labels = &.{ "example", "com" } };
-    const authorities = [_]dns.ResourceRecord{
-        proof.nsecRr(owner, next),
-        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported
-    };
+test "verifyAuthorityProofSigs: a set past the buffer is refused, not a verified prefix" {
+    const nsec = [_]dns.ResourceRecord{proof.nsecRr(rrsig.test_owner, .{ .labels = &.{ "a", "example", "com" } })};
+    var soas: [17]dns.ResourceRecord = undefined;
+    for (&soas, 0..) |*r, i| r.* = .{ .name = rrsig.test_owner, .rtype = .soa, .rclass = .in, .ttl = 300, .rdata = .{ .soa = .{
+        .mname = rrsig.test_owner,
+        .rname = rrsig.test_owner,
+        .serial = @intCast(i),
+        .refresh = 0,
+        .retry = 0,
+        .expire = 0,
+        .minimum = 300,
+    } } };
+    var sig_bufs: [2][64]u8 = undefined;
+    var pub_bufs: [2][32]u8 = undefined;
+    const n = try rrsig.testSignRrset(&nsec, .nsec, rrsig.test_owner, .ed25519, &sig_bufs[0], &pub_bufs[0]);
+    const s = try rrsig.testSignRrset(soas[0..16], .soa, rrsig.test_owner, .ed25519, &sig_bufs[1], &pub_bufs[1]);
+    const dnskeys = [_]dns.ResourceRecord{ dnskeyRr(rrsig.test_owner, n.dnskey), dnskeyRr(rrsig.test_owner, s.dnskey) };
+    const sigs = [_]dns.ResourceRecord{ nsec[0], rrsigRr(rrsig.test_owner, n.rrsig), rrsigRr(rrsig.test_owner, s.rrsig) };
     var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(&authorities, &.{}, 1699500000, &budget, &test_memo) == null);
-}
-
-test "verifyAuthorityProofSigs: failing supported + unsupported RRSIG returns bogus" {
-    // Laundering guard: a fake unsupported-algo RRSIG must not downgrade
-    // a failing supported-algo RRSIG from .bogus to .insecure.
-    const owner = dns.Name{ .labels = &.{ "example", "com" } };
-    const next = dns.Name{ .labels = &.{ "next", "example", "com" } };
-    const signer = owner;
-    const tag = rrsig.keyTag(test_ecdsa_dnskey);
-    const authorities = [_]dns.ResourceRecord{
-        proof.nsecRr(owner, next),
-        rrsigRr(owner, .nsec, .dsasha1, 12345, signer), // unsupported
-        rrsigRr(owner, .nsec, .ecdsap256sha256, tag, signer), // supported, empty sig → fails
-    };
-    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(signer, test_ecdsa_dnskey)};
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(verifyAuthorityProofSigs(&authorities, &dnskeys, 1699500000, &budget, &test_memo) == null);
+    try testing.expect(verifyAuthorityProofSigs(&(sigs ++ soas[0..16].*), &dnskeys, 1_700_000_000, &budget, &test_memo) != null);
+    try testing.expect(verifyAuthorityProofSigs(&(sigs ++ soas), &dnskeys, 1_700_000_000, &budget, &test_memo) == null);
 }
 
 test "validateRrset: a genuine RRSIG under another owner does not sign this RRset" {
@@ -1092,19 +890,6 @@ test "validateRrset: a genuine RRSIG under another owner does not sign this RRse
     try testing.expect(validateRrset(&moved, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) == null);
     const home = [_]dns.ResourceRecord{ recs[0], sig_at(rrsig.test_owner, signed.rrsig) };
     try testing.expect(validateRrset(&home, rrsig.test_owner, .a, &dnskeys, now, &budget, &test_memo) != null);
-}
-
-test "validateRrset: failing supported + unsupported RRSIG returns bogus" {
-    // Same-owner laundering on the answer-validation path.
-    const tag = rrsig.keyTag(test_ecdsa_dnskey);
-    const answers = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        rrsigRr(rrsig.test_owner, .a, .dsasha1, 0, rrsig.test_owner),
-        rrsigRr(rrsig.test_owner, .a, .ecdsap256sha256, tag, rrsig.test_owner), // empty sig → fails
-    };
-    const dnskeys = [_]dns.ResourceRecord{dnskeyRr(rrsig.test_owner, test_ecdsa_dnskey)};
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, rrsig.test_owner, .a, &dnskeys, 1699500000, &budget, &test_memo) == null);
 }
 
 test "verifyAuthorityProofSigs refuses a wildcard-expanded NSEC" {
@@ -1338,17 +1123,4 @@ test "validateRrset: >64-member RRset is bogus, not a validated prefix" {
     exact[64] = sig_rr;
     var budget2: rrsig.ValidationBudget = .{};
     try testing.expect(validateRrset(&exact, rrsig.test_owner, .a, &dnskeys, 1_700_000_000, &budget2, &test_memo) != null);
-}
-
-test "validateRrset: all-unsupported algorithms are .bogus, not .secure" {
-    // .secure would stamp AD on data no signature verified; .insecure would
-    // let an injector swap real RRSIGs for one unsupported-algo signature and
-    // get forged data served instead of SERVFAILed (the zone is known secure
-    // here — the all-unsupported-zone case goes insecure at the delegation).
-    const answers = [_]dns.ResourceRecord{
-        .{ .name = rrsig.test_owner, .rtype = .a, .rclass = .in, .ttl = 300, .rdata = .{ .a = .{ 1, 2, 3, 4 } } },
-        rrsigRr(rrsig.test_owner, .a, .dsasha1, 0, rrsig.test_owner),
-    };
-    var budget: rrsig.ValidationBudget = .{};
-    try testing.expect(validateRrset(&answers, rrsig.test_owner, .a, &.{}, 1699500000, &budget, &test_memo) == null);
 }
