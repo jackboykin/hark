@@ -152,16 +152,10 @@ fn hasMlDsaDs(ds_records: []const dns.DsData) bool {
     return false;
 }
 
-/// A signature that cannot fit the 1232 B UDP payload, so every DO
-/// answer from a zone signed with it truncates. Transport only: no
-/// eligibility filter, the zone signs with it whether or not the DS
-/// digest is one hark can use.
-fn signatureExceedsUdp(alg: dns.DnssecAlgorithm) bool {
-    return alg == .mldsa44; // 2420 B
-}
-
+/// ML-DSA-44's 2420 B signatures outgrow a 1232 B UDP payload. Transport
+/// only: the zone signs with it whatever digest its DS names.
 pub fn dsExceedsUdp(rrs: []const dns.ResourceRecord) bool {
-    for (rrs) |rr| if (rr.rtype == .ds and signatureExceedsUdp(rr.rdata.ds.algorithm)) return true;
+    for (rrs) |rr| if (rr.rtype == .ds and rr.rdata.ds.algorithm == .mldsa44) return true;
     return false;
 }
 
