@@ -306,9 +306,9 @@ pub const Value = union(Kind) {
     }
 };
 
-/// Bytes held by work in progress, counted where they are allocated: cell
-/// arenas by the chunk, budgets, the edge's TCP buffers, the query bytes
-/// of clients waiting.
+/// Bytes held by work in progress, counted where they are allocated:
+/// cells, their pins and arenas (by the chunk), budgets, the edge's TCP
+/// buffers, the query bytes of clients waiting.
 pub const Work = struct {
     child: Allocator,
     bytes: usize = 0,
@@ -641,11 +641,11 @@ pub const Graph = struct {
     pub fn deinit(g: *Graph) void {
         // Not `free`: in slot order a cell would unpin from inputs gone first.
         for (g.cells.items) |s| if (s.cell) |c| {
-            while (c.inputs.popFirst()) |n| g.gpa.destroy(Pin.ofInput(n));
+            while (c.inputs.popFirst()) |n| g.work.allocator().destroy(Pin.ofInput(n));
             if (c.blob) |bl| g.store.unref(bl);
             if (budgetOf(c)) |b| g.unref(b);
             c.arena.deinit();
-            g.gpa.destroy(c);
+            g.work.allocator().destroy(c);
         };
         g.cells.deinit(g.gpa);
         g.scratch.deinit();
@@ -929,8 +929,8 @@ pub const Graph = struct {
             g.empty = .wrap(@intCast(g.cells.items.len - 1));
         }
         const id = g.empty.unwrap().?;
-        const c = try g.gpa.create(Cell);
-        errdefer g.gpa.destroy(c);
+        const c = try g.work.allocator().create(Cell);
+        errdefer g.work.allocator().destroy(c);
         var arena: Arena = .init(g.work.allocator());
         errdefer arena.deinit();
         const scratch = try Scratch.init(key.kind, arena.allocator());
@@ -965,7 +965,7 @@ pub const Graph = struct {
 
     pub fn pin(g: *Graph, id: CellId, by: CellId) !void {
         if (g.holdsInput(by, id)) return;
-        const p = try g.gpa.create(Pin);
+        const p = try g.work.allocator().create(Pin);
         p.* = .{ .on = id, .by = by };
         const c = g.cell(id);
         const b = g.cell(by);
@@ -990,7 +990,7 @@ pub const Graph = struct {
             const c = g.cell(on);
             c.waiters.remove(&p.waiter);
             if (!by.orphan) c.backers -= 1;
-            g.gpa.destroy(p);
+            g.work.allocator().destroy(p);
             g.release(on);
         }
     }
@@ -1036,7 +1036,7 @@ pub const Graph = struct {
             g.unref(b);
         }
         c.arena.deinit();
-        g.gpa.destroy(c);
+        g.work.allocator().destroy(c);
     }
 
     /// Copies out: the value becomes the blob's parse, the blob the store's

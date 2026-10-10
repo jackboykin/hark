@@ -27,8 +27,8 @@ stub-zones = []               # "<zone> <addr> [<addr> ...]": a zone asked of
 
 [cache]
 size = 12582912               # answer cache, bytes; resolutions in flight may hold
-                              # as much again (counted bytes; about twice that in RSS),
-                              # past which only what is known is served
+                              # as much again, past which only what is known is
+                              # served
 prefetch = false              # an answer asked for in the last tenth of its
                               # life is fetched again in the background
 serve-stale-ttl = 0           # serve expired answers for N seconds
