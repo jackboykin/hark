@@ -304,8 +304,7 @@ pub fn nsec3Hash(
     hasher.final(&hash);
 
     // IH(k) = H(IH(k-1) || salt)
-    var i: u16 = 0;
-    while (i < iterations) : (i += 1) {
+    for (0..iterations) |_| {
         var h2 = Sha1.init(.{});
         h2.update(&hash);
         h2.update(salt);
@@ -342,18 +341,17 @@ fn supportedNsec3OwnerHash(rr: dns.ResourceRecord, zone: dns.Name) ?[Sha1.digest
     return if (inChain(rr, zone)) nsec3OwnerHash(rr.name) else null;
 }
 
-const BudgetedHashError = error{ ValidationBudgetExhausted, HashFailed };
-
-/// Compute NSEC3 hash, charging the per-query budget. Callers map both
-/// ValidationBudgetExhausted (CVE-2023-50868, fail-closed) and HashFailed to .bogus.
+/// An NSEC3 hash charged to the query's budget. Callers fail either error
+/// closed: an exhausted budget is CVE-2023-50868's attack signal, and a name
+/// too long to hash is a wildcard no zone can hold.
 fn budgetedNsec3Hash(
     name: dns.Name,
     salt: []const u8,
     iterations: u16,
     budget: *rrsig.ValidationBudget,
-) BudgetedHashError![Sha1.digest_length]u8 {
+) ![Sha1.digest_length]u8 {
     try budget.consumeNsec3(nsec3HashBlocks(name, salt.len, iterations));
-    return nsec3Hash(name, salt, iterations) catch return error.HashFailed;
+    return nsec3Hash(name, salt, iterations);
 }
 
 fn nsec3HashBlocks(name: dns.Name, salt_len: usize, iterations: u16) u32 {
