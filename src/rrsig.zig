@@ -72,6 +72,20 @@ pub const ValidationBudget = struct {
     }
 };
 
+/// Lengths framed: an RSA key and signature are both variable, and bytes
+/// moved across their boundary must not name the same entry.
+fn framed(algorithm: dns.DnssecAlgorithm, key: []const u8, signature: []const u8) Blake3 {
+    var frame: [5]u8 = undefined;
+    frame[0] = @backingInt(algorithm);
+    mem.writeInt(u16, frame[1..3], @intCast(key.len), .big);
+    mem.writeInt(u16, frame[3..5], @intCast(signature.len), .big);
+    var h = Blake3.init(.{});
+    h.update(&frame);
+    h.update(key);
+    h.update(signature);
+    return h;
+}
+
 /// Signatures that verified, remembered by what the math saw: algorithm,
 /// key, signature and the digest of the signed data (RFC 4034 §3.1.8.1).
 /// The RRSIG header is in that data, so an entry for an expired signature
@@ -102,17 +116,8 @@ pub const VerifyMemo = struct {
         gpa.free(m.sets);
     }
 
-    /// Lengths framed: an RSA key and signature are both variable, and
-    /// bytes moved across their boundary must not name the same entry.
     fn tag(algorithm: dns.DnssecAlgorithm, key: []const u8, signature: []const u8, digest: []const u8) Tag {
-        var frame: [5]u8 = undefined;
-        frame[0] = @backingInt(algorithm);
-        mem.writeInt(u16, frame[1..3], @intCast(key.len), .big);
-        mem.writeInt(u16, frame[3..5], @intCast(signature.len), .big);
-        var h = Blake3.init(.{});
-        h.update(&frame);
-        h.update(key);
-        h.update(signature);
+        var h = framed(algorithm, key, signature);
         h.update(digest);
         var t: Tag = undefined;
         h.final(&t);
@@ -500,14 +505,7 @@ fn proveMath(
     key: []const u8,
 ) VerifyError!void {
     if (!builtin.is_test or builtin.mode != .debug) return verifyMath(algorithm, signature, data, digest, key);
-    var frame: [5]u8 = undefined;
-    frame[0] = @backingInt(algorithm);
-    mem.writeInt(u16, frame[1..3], @intCast(key.len), .big);
-    mem.writeInt(u16, frame[3..5], @intCast(signature.len), .big);
-    var h = Blake3.init(.{});
-    h.update(&frame);
-    h.update(key);
-    h.update(signature);
+    var h = framed(algorithm, key, signature);
     data.feed(&h);
     var t: [32]u8 = undefined;
     h.final(&t);
