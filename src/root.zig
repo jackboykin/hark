@@ -10,6 +10,7 @@ pub const dns64 = @import("dns64.zig");
 pub const dnssec = @import("dnssec.zig");
 pub const edge = @import("edge.zig");
 pub const graph = @import("graph.zig");
+pub const slab = @import("slab.zig");
 pub const monotonic = @import("monotonic.zig");
 pub const net_address = @import("net_address.zig");
 pub const ns_rtt = @import("ns_rtt.zig");
@@ -52,6 +53,7 @@ test {
     _ = @import("fuzz_nsec.zig");
     _ = @import("fuzz_wire.zig");
     _ = @import("graph.zig");
+    _ = @import("slab.zig");
     _ = @import("monotonic.zig");
     _ = @import("net_address.zig");
     _ = @import("ns_rtt.zig");
