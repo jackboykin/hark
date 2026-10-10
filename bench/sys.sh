@@ -21,8 +21,9 @@ if [[ ! ${SYS_DIR:-} ]]; then
   S=$(mktemp -d); mkfifo "$S/go"
   trap 'rm -rf "$S"' EXIT
   SYS_DIR=$S "$0" "$bin" "$wl" "$q" & inner=$!
-  read -r -t 60 _ <>"$S/go" || { wait "$inner"; exit 1; }
-  perf record -q -o "$S/perf.data" -e cycles -g -C "$CPU_RES" -- sleep "$W" 2>/dev/null
+  # The inner run draws the resolver's core and names it here.
+  read -r -t 60 cpu <>"$S/go" || { wait "$inner"; exit 1; }
+  perf record -q -o "$S/perf.data" -e cycles -g -C "$cpu" -- sleep "$W" 2>/dev/null
   wait "$inner" || exit 1
   perf script -i "$S/perf.data" -F comm,period,ip,sym 2>/dev/null |
     python3 "$B/sys.py" "$(basename "$bin" | cut -c1-15)" "$S/load" "$W" "$S/strace" "$S/count"
@@ -38,7 +39,7 @@ load() { # seconds qps -> dnsperf's output
 hark_start "$bin" || exit 1
 [[ $wl == hit ]] && warm
 load $((W + 3)) "$q" >"$S/load" &
-sleep 1; echo >"$S/go"
+sleep 1; echo "$CPU_RES" >"$S/go"
 wait $!; hark_stop
 
 hark_start "$bin" || exit 1
