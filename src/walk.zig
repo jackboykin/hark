@@ -170,7 +170,7 @@ pub const Ask = struct {
     fn add(a: *Ask, g: *Graph, addrs: []const na.Address) void {
         // Told servers are learned from no delegation: no DS hark holds
         // describes them.
-        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchor != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
+        if (a.nservers == 0) a.tcp_first = g.cfg.trust_anchors != null and told(g, a.zone) == null and zoneTruncates(g, a.zone);
         for (addrs) |s| {
             if (a.nservers == max_servers) break;
             a.servers[a.nservers] = na.AddressKey.fromAddress(s);
@@ -556,7 +556,7 @@ pub fn runAddr(g: *Graph, id: CellId) !void {
     if (g.cell(rid).failure()) |why| return g.fail(id, why);
     var expires = g.cell(rid).expires_ns;
     // A denial too: unjudged it is no fact, and nothing keeps it.
-    if (g.cfg.trust_anchor != null) {
+    if (g.cfg.trust_anchors != null) {
         if (s.judge == .none) s.judge = .wrap(try trust.demandSecure(g, id, rid) orelse
             return g.fail(id, .unreachable_authority));
         const j = g.cell(s.judge.unwrap().?);
@@ -821,7 +821,7 @@ fn absorbReferral(g: *Graph, by: CellId, ref: delegation.Referral, msg: dns.Mess
     const cut: graph.Value = .{ .cut = .{ .zone = ref.zone_cut, .servers = servers, .placed_until_ns = placed } };
     try g.publish(Key.of(&kb, .cut, ref.zone_cut, .a), ref.zone_cut, by, cut, expires);
     // The parent's word on the child's DS travels with the referral.
-    if (g.cfg.trust_anchor != null) {
+    if (g.cfg.trust_anchors != null) {
         const ds = try trust.referralDs(g, msg, zone, ref.zone_cut);
         if (ds.ttl > 0) try g.publish(Key.of(&kb, .rrset, ref.zone_cut, .ds), ref.zone_cut, by, .{ .rrset = ds }, replyExpiry(ds));
         // A signed delegation from a zone signed all the way down: whatever

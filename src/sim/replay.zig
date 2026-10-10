@@ -99,7 +99,7 @@ fn runScenario(gpa: Allocator, scenario: *const rpl.Scenario, mint: *sign.Mint, 
         .addr_policy = .{ .allow_loopback = true },
         .stagger_ms = scenario.stagger_ms orelse 150,
         .max_queries = scenario.max_queries orelse 100,
-        .trust_anchor = s.signer.anchor(),
+        .trust_anchors = s.signer.anchor(),
         .prefetch = scenario.prefetch orelse false,
         .trace = opts.trace,
     }, edge);

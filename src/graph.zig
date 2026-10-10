@@ -174,8 +174,8 @@ pub const Config = struct {
     servfail_ttl: u32 = 5,
     /// Refresh a fact hit just before it expires.
     prefetch: bool = false,
-    /// Null: DNSSEC off, nothing is judged.
-    trust_anchor: ?dns.DsData = null,
+    /// The root's DS set. Null: DNSSEC off, nothing is judged.
+    trust_anchors: ?[]const dns.DsData = null,
     store_bytes: usize = 12 << 20,
     trace: bool = false,
 };
@@ -567,7 +567,7 @@ pub const Graph = struct {
         errdefer g.deinit();
         g.store.on_evict = evicted;
         const forgoes = if (g.chaosAt(.memo)) |ch| try ch.choose(.memo, ch.named(.memo, 0), 2, .none) == 1 else false;
-        if (cfg.trust_anchor != null and !forgoes) g.verify_memo = try .init(gpa);
+        if (cfg.trust_anchors != null and !forgoes) g.verify_memo = try .init(gpa);
         // The root cut is an axiom; `runCut` re-derives it if evicted.
         _ = try g.fact(.init(.cut, "", .a), .{ .cut = .{ .zone = .{ .labels = &.{} } } }, std.math.maxInt(i64));
         return g;
@@ -1033,7 +1033,7 @@ pub const Graph = struct {
     /// With DNSSEC on, an rrset is no fact until judged: its bytes wait in
     /// their cell and die with it unless their judge keeps them.
     pub fn awaitsVerdict(g: *const Graph, kind: Kind) bool {
-        return kind == .rrset and g.cfg.trust_anchor != null;
+        return kind == .rrset and g.cfg.trust_anchors != null;
     }
 
     /// The one way into the store, aged from when the bytes arrived.
@@ -1183,7 +1183,7 @@ pub const Graph = struct {
     pub fn proven(g: *Graph, key: Key) ?*store.Blob {
         std.debug.assert(key.kind == .rrset);
         const e = g.stored(key) orelse return null;
-        if (g.cfg.trust_anchor != null and !e.blob.verdict.serves(g.bound(g.payer))) return null;
+        if (g.cfg.trust_anchors != null and !e.blob.verdict.serves(g.bound(g.payer))) return null;
         return e.blob;
     }
 
@@ -1613,7 +1613,7 @@ pub const Graph = struct {
         const rng = g.edge.rng;
         const qid = rng.int(u16);
         const arena = g.cell(id).arena.allocator();
-        const msg = try dns.buildQuery(arena, qid, qname, qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchor != null }, .case_rng = if (case == .random) rng else null });
+        const msg = try dns.buildQuery(arena, qid, qname, qtype, .{ .rd = false, .edns = .{ .do_bit = g.cfg.trust_anchors != null }, .case_rng = if (case == .random) rng else null });
         var wire_buf: [512]u8 = undefined;
         const wire = try arena.dupe(u8, try dns.serializeMessage(&wire_buf, msg));
         const sc = try arena.create(ExchangeScratch);

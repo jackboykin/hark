@@ -229,7 +229,7 @@ fn minimal(rr: RR) bool {
 /// Never a DNSKEY: the chain of trust takes only keys (`trust.runDnskey`),
 /// and a denial from memory would fail it without asking.
 pub fn denies(g: *const Graph, qtype: dns.RType) bool {
-    return g.cfg.trust_anchor != null and qtype != .ds and qtype != .dnskey;
+    return g.cfg.trust_anchors != null and qtype != .ds and qtype != .dnskey;
 }
 
 /// Settle `rrset(name, type)` as a denial from indexed proofs, if the

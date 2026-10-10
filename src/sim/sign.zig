@@ -72,8 +72,8 @@ pub const Signer = struct {
     }
 
     /// The first declared zone's DS: the root, by the loader's rule.
-    pub fn anchor(self: *const Signer) ?dns.DsData {
-        return if (self.mint.keys.len > 0) self.mint.keys[0].ds else null;
+    pub fn anchor(self: *const Signer) ?[]const dns.DsData {
+        return if (self.mint.keys.len > 0) (&self.mint.keys[0].ds)[0..1] else null;
     }
 
     /// The ranges with placeholder DS records filled in and RRSIGs appended.

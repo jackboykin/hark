@@ -197,7 +197,7 @@ pub const Desk = struct {
         // be validated, and SERVFAIL would read as bogus. Validating, the
         // question is a kind not supported (RFC 1035 §4.1.1); under CD, and
         // unvalidated, the RRSIGs are data.
-        if (q.qtype == .rrsig and d.g.cfg.trust_anchor != null and !c.cd)
+        if (q.qtype == .rrsig and d.g.cfg.trust_anchors != null and !c.cd)
             return .{ .synthesized = .{ .rcode = .not_implemented, .question = q, .cacheable = false, .ede = .{ .code = .not_supported } } };
         if (try d.memory(arena, q, c, .fresh)) |s| return .{ .recalled = try d.derived(q, c, s) };
         if (try d.hold(q, c)) |ede| {

@@ -139,10 +139,11 @@ pub fn runDs(g: *Graph, id: CellId) !void {
     var kb: graph.KeyBuf = undefined;
     const zone = g.cell(id).name;
     const s = g.cell(id).scratch.ds;
-    const anchor = g.cfg.trust_anchor orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
+    const anchors = g.cfg.trust_anchors orelse return g.settle(id, .{ .ds = .{ .status = .insecure } }, std.math.maxInt(i64));
     if (zone.labels.len == 0) {
-        const rr: RR = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = anchor } };
-        return g.settle(id, .{ .ds = .{ .status = .secure, .records = try g.scratch.allocator().dupe(RR, &.{rr}) } }, std.math.maxInt(i64));
+        const rrs = try g.scratch.allocator().alloc(RR, anchors.len);
+        for (rrs, anchors) |*rr, ds| rr.* = .{ .name = zone, .rtype = .ds, .rclass = .in, .ttl = 0, .rdata = .{ .ds = ds } };
+        return g.settle(id, .{ .ds = .{ .status = .secure, .records = rrs } }, std.math.maxInt(i64));
     }
     const parent_name: dns.Name = .{ .labels = zone.labels[1..] };
     const parent_zone = switch (try walk.start(g, id, zone, parent_name, &s.parent)) {

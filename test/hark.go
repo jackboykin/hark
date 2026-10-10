@@ -213,7 +213,10 @@ func (c *config) toml(listen netip.AddrPort, port uint16, hints []netip.Addr, an
 	}
 	line("stub-zones = %s", list(zs))
 	if anchor != "" {
-		line("trust-anchors = %s", list([]string{anchor}))
+		// A rollover in flight: KSK-2017 heads the set and signs nothing
+		// here, so every signed scenario rests on the anchor after it.
+		const ksk2017 = "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+		line("trust-anchors = %s", list([]string{ksk2017, anchor}))
 	}
 	line("\n[cache]")
 	line("min-ttl = %d", c.minTTL)

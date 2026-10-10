@@ -819,7 +819,6 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
     rand.randomizeHashSeed();
     var e = try Edge.init(gpa);
     defer e.deinit();
-    const anchors = cfg.trustAnchors();
     var g = try graph.Graph.init(gpa, .{
         .qmin = cfg.qname_minimization,
         .root_hints = cfg.rootHints(),
@@ -827,7 +826,7 @@ pub fn run(gpa: Allocator, cfg: *const config.ServerConfig, trace: bool) !void {
         .addr_policy = cfg.addrPolicy(),
         .stagger_ms = cfg.stagger_ms,
         .max_queries = cfg.max_queries,
-        .trust_anchor = if (cfg.dnssec) anchors[0] else null,
+        .trust_anchors = if (cfg.dnssec) cfg.trustAnchors() else null,
         .store_bytes = cfg.cache_size,
         .servfail_ttl = cfg.servfail_ttl,
         .prefetch = cfg.prefetch,
