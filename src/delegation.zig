@@ -81,24 +81,14 @@ pub fn extractReferral(response: dns.Message, target: dns.Name, parent_zone: dns
     // make the NS the zone's own.
     if (response.header.flags.aa and response.answers.len > 0) return null;
     if (soaAbove(response.authorities, target)) return null;
-    var zone_cut: ?dns.Name = null;
-    var zone_cut_depth: usize = 0;
+    // The deepest NS owner above the target, and strictly below the zone
+    // asked: NS at the zone itself are its own, not a delegation (RFC 1034
+    // §4.2.1).
+    var zc = parent_zone;
     for (response.authorities) |rr| {
-        if (rr.rtype == .ns and target.isSubdomainOf(rr.name)) {
-            if (zone_cut == null or rr.name.labels.len > zone_cut_depth) {
-                zone_cut = rr.name;
-                zone_cut_depth = rr.name.labels.len;
-            }
-        }
+        if (rr.rtype == .ns and target.isSubdomainOf(rr.name) and rr.name.labels.len > zc.labels.len) zc = rr.name;
     }
-    const zc = zone_cut orelse return null;
-
-    // A valid referral always delegates to a child zone — the zone cut must
-    // be strictly deeper than the current parent zone.  If the authority
-    // section contains NS records for the same zone (or a parent), it is
-    // not a referral (e.g. a server returning its own NS records alongside
-    // a CNAME answer).  RFC 1034 §4.2.1, RFC 8499 §7.
-    if (zc.labels.len <= parent_zone.labels.len) return null;
+    if (zc.labels.len == parent_zone.labels.len) return null;
 
     var ns_count: usize = 0;
     var ns_names: [max_servers_per_level]dns.Name = undefined;
