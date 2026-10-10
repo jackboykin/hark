@@ -176,8 +176,8 @@ pub const Store = struct {
         if (s.map.values()[i].blob == blob) s.removeAt(i);
     }
 
-    /// Takes one reference. A new key over the cap must have knocked before.
-    /// Takes the caller's reference on success; on any error it stays theirs.
+    /// Takes the caller's reference on success; on any error it stays
+    /// theirs. A new key over the cap must have knocked before.
     pub fn put(s: *Store, key: Key, blob: *Blob, expires_ns: i64, now_ns: i64) !void {
         const gop = try s.map.getOrPut(s.gpa, key);
         if (gop.found_existing) {
