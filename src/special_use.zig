@@ -129,13 +129,8 @@ pub fn synthesize(allocator: mem.Allocator, q: dns.Question, own: Own) !Synthesi
             const z = own.zone orelse return out;
             out.authorities = try records(allocator, z.apex, .soa, z.soa);
         },
-        // Lowercase the client-typed name so synthesized owners match the
-        // `tryParseMessage` scrub policy.
-        .answer => |rdatas| {
-            const labels = try allocator.alloc([]const u8, q.name.labels.len);
-            for (labels, q.name.labels) |*l, from| l.* = try std.ascii.allocLowerString(allocator, from);
-            out.answers = try records(allocator, .{ .labels = labels }, q.qtype, rdatas);
-        },
+        // Lowercased, as every owner from upstream is.
+        .answer => |rdatas| out.answers = try records(allocator, try dns.cloneNameLower(allocator, q.name), q.qtype, rdatas),
     }
     return out;
 }
